@@ -42,15 +42,15 @@ export type ChapterLearningData = {
   problem: string;
   /** Estimated reading + interaction time, in minutes. */
   minutes: number;
-  /** 6–10 terms. Start at 6, grow only if genuinely needed. */
+  /** 6–10 terms. Start at 6, grow only if genuinely needed — the merged capstone (chapter 16) runs to 12. */
   glossary: GlossaryTerm[];
-  /** Exactly 3 bullets a learner could quote in an interview. */
+  /** Usually 3 bullets a learner could quote in an interview; the merged capstone carries more. */
   takeaways: string[];
-  /** One small thing to try in the existing demo. */
+  /** One small thing to try in the existing demo (the merged capstone uses a two-part prompt). */
   exercise: {
     prompt: string;
     answer: string;
   };
-  /** Exactly 3 multiple-choice questions. */
+  /** Usually 3 multiple-choice questions; the merged capstone (chapter 16) carries 6. */
   quiz: QuizQuestion[];
 };

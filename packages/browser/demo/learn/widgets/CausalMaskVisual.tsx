@@ -113,7 +113,7 @@ export function CausalMaskVisual() {
         <p>
           <strong>At inference time</strong>, the same mask is still applied even though token <em>N + 1</em> physically
           doesn&apos;t exist yet — this keeps the math identical between train and serve, which is what makes KV caching
-          (chapter 11) valid.
+          (chapter 12) valid.
         </p>
       </div>
     </div>

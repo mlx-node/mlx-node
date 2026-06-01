@@ -16,6 +16,13 @@ export type LessonLayoutProps = {
    * full-width architecture poster).
    */
   tryItPanel?: React.ReactNode;
+  /**
+   * Only relevant for panel-less chapters. By default a panel-less chapter is a
+   * pure-reading lesson, so its body is centered at a comfortable article width.
+   * Set this when the body instead needs the full remaining width (e.g. the
+   * architecture poster, which is ~1280px wide). Ignored when `tryItPanel` is set.
+   */
+  wideBody?: boolean;
   onOpenChapter: (chapterId: string) => void;
   onBackToIndex: () => void;
   onOpenFreeChat: () => void;
@@ -25,6 +32,7 @@ export function LessonLayout({
   current,
   children,
   tryItPanel,
+  wideBody,
   onOpenChapter,
   onBackToIndex,
   onOpenFreeChat,
@@ -83,11 +91,18 @@ export function LessonLayout({
 
         <main ref={mainRef} className="min-h-0 overflow-y-auto px-8 py-10">
           {/* Chapters with a try-it panel keep their natural (narrow) reading
-              column from the 3-col grid. Panel-less chapters (the full-width
-              architecture poster) span the whole remaining width, which would
-              otherwise stretch prose and cards edge-to-edge on wide screens —
-              so cap and center the content to a comfortable poster width. */}
-          {hasTryIt ? children : <div className="mx-auto w-full max-w-[1400px]">{children}</div>}
+              column from the 3-col grid. Panel-less chapters span the whole
+              remaining width, so we cap and center their body: pure-reading
+              lessons (overview, post-training) sit at a comfortable article
+              width, while a `wideBody` chapter (the ~1280px architecture
+              poster) gets the full poster width. Without this cap a reading
+              lesson's narrow left-aligned prose strands in the left third with
+              a large empty right half. */}
+          {hasTryIt ? (
+            children
+          ) : (
+            <div className={['mx-auto w-full', wideBody ? 'max-w-[1400px]' : 'max-w-3xl'].join(' ')}>{children}</div>
+          )}
         </main>
 
         {hasTryIt ? (

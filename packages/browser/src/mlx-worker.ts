@@ -44,6 +44,25 @@ import {
 import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE, STATS_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeaderBytes, dtypeToCode, type TensorInfo } from './safetensors.js';
 import {
+  DEVICE_READY_TYPE,
+  SCATTER_SELF_TEST_ERROR_TYPE,
+  SCATTER_SELF_TEST_REQUEST_TYPE,
+  SCATTER_SELF_TEST_RESULT_TYPE,
+  TRAIN_INIT_ERROR_TYPE,
+  TRAIN_INIT_REQUEST_TYPE,
+  TRAIN_INIT_RESULT_TYPE,
+  TRAIN_RESET_ERROR_TYPE,
+  TRAIN_RESET_REQUEST_TYPE,
+  TRAIN_RESET_RESULT_TYPE,
+  TRAIN_SAMPLE_ERROR_TYPE,
+  TRAIN_SAMPLE_REQUEST_TYPE,
+  TRAIN_SAMPLE_RESULT_TYPE,
+  TRAIN_STEP_ERROR_TYPE,
+  TRAIN_STEP_REQUEST_TYPE,
+  TRAIN_STEP_RESULT_TYPE,
+  type TinyTrainerConfig,
+} from './training-types.js';
+import {
   createBridgeStub,
   POOL_STATS_SIZE_BYTES,
   BUFFER_METADATA_SIZE_BYTES,
@@ -54,6 +73,12 @@ import { workerAssetUrl } from './worker-asset-url.js';
 
 let model: any = null;
 let mlxExports: any = null;
+// Tiny in-browser trainable transformer for the Training chapter playground.
+// Held at worker scope (like `model`) and driven by the trainInit/trainStep/
+// trainSample/trainReset message handlers. Constructed lazily on `trainInit`;
+// it shares the same WASM runtime + WebGPU device as inference but does NOT
+// need the big model weights loaded.
+let trainer: any = null;
 let wasmInst: WebAssembly.Instance | null = null;
 let cppTag: any = null;
 let wasmMemory: WebAssembly.Memory | null = null;
@@ -1382,6 +1407,14 @@ async function handleInit(data: {
   wasmUrl: string;
   modelUrl: string;
   modelLabel?: string;
+  /**
+   * Bring up the WASM runtime + WebGPU device only, then post `deviceReady`
+   * and return WITHOUT fetching/loading the big model. Used by the Training
+   * chapter playground, which trains a tiny from-scratch transformer on the
+   * MLX autograd/optimizer stack and needs the device but not the 1.6 GB
+   * model weights. When false/absent, the full model-load path is unchanged.
+   */
+  deviceOnly?: boolean;
   modelFiles?: LocalModelFile[];
   hfModel?: HuggingFaceModelConfig;
   packBf16?: boolean;
@@ -1736,6 +1769,26 @@ async function handleInit(data: {
       step: 'wasm',
       message: `WASM loaded${flagSuffix ? ' (' + flagSuffix.trim() + ')' : ''}`,
     });
+
+    // Device-up milestone: the WASM runtime + WebGPU device (and all NAPI
+    // exports on `mlxExports`, including TinyTrainer) are live as of this
+    // point. Signal device readiness UNCONDITIONALLY here — in BOTH the
+    // device-only and full-model paths — so any DEVICE_ONLY chapter (e.g.
+    // Training) opened while a full-model load is already in flight is
+    // unblocked the instant the device is up, instead of waiting for the
+    // entire 1.6 GB download to finish. For the device-only path this is the
+    // final signal and we return BEFORE the model fetch/load below; for the
+    // full-model path it is an early "device is up" notice that does NOT
+    // replace the eventual model 'ready' message, and the (unchanged)
+    // model fetch/load continues afterward.
+    // Carry the actual mode so the main thread can tell a genuine device-only
+    // bring-up apart from this early "device is up" notice on a full-model load.
+    // Conflating the two makes the app treat an in-flight full load as a
+    // device-only worker and restart it forever (infinite reload loop).
+    post({ type: DEVICE_READY_TYPE, deviceOnly: data.deviceOnly === true });
+    if (data.deviceOnly === true) {
+      return;
+    }
 
     // 3. Load model files. The source can be either /model over HTTP or a
     // directory selected by the user in the browser. We process safetensors
@@ -2485,6 +2538,107 @@ async function handleEmbed(data: { id: string; tokenIds: number[] }) {
   }
 }
 
+// Training chapter playground hooks (chapter 13 — Training). Each drives the
+// worker-scoped `trainer` (a `TinyTrainer` NAPI instance) and replies with a
+// {type:'train*Result'|'train*Error', id, ...} message correlated by the
+// caller-supplied id. These mirror the inspector/tokenize/embed handlers'
+// error conventions: every backend call is wrapped so failures surface to the
+// UI as a typed error message instead of hanging the request.
+
+// Construct (or replace) the tiny trainer from a Qwen3-shaped config.
+function handleTrainInit(data: { id: string; config: TinyTrainerConfig; seed: number; learningRate?: number }) {
+  const id = data.id;
+  if (!mlxExports || typeof mlxExports.TinyTrainer !== 'function') {
+    post({
+      type: TRAIN_INIT_ERROR_TYPE,
+      id,
+      error: 'WASM runtime not ready (TinyTrainer unavailable). Initialize the device first.',
+    });
+    return;
+  }
+  try {
+    trainer = new mlxExports.TinyTrainer(data.config, data.seed, data.learningRate);
+    post({ type: TRAIN_INIT_RESULT_TYPE, id });
+  } catch (e) {
+    trainer = null;
+    const message = e instanceof Error ? e.message : String(e);
+    post({ type: TRAIN_INIT_ERROR_TYPE, id, error: message });
+  }
+}
+
+// Run one teacher-forced training step and report the (pre-update) loss.
+function handleTrainStep(data: { id: string; tokenIds: number[] }) {
+  const id = data.id;
+  if (!trainer) {
+    post({ type: TRAIN_STEP_ERROR_TYPE, id, error: 'Trainer not initialized' });
+    return;
+  }
+  try {
+    const loss = trainer.trainStep(data.tokenIds);
+    post({ type: TRAIN_STEP_RESULT_TYPE, id, step: trainer.step, loss });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    post({ type: TRAIN_STEP_ERROR_TYPE, id, error: message });
+  }
+}
+
+// Autoregressively sample new token ids from the current weights.
+function handleTrainSample(data: { id: string; promptIds: number[]; n: number; temperature: number }) {
+  const id = data.id;
+  if (!trainer) {
+    post({ type: TRAIN_SAMPLE_ERROR_TYPE, id, error: 'Trainer not initialized' });
+    return;
+  }
+  try {
+    const ids = trainer.sample(data.promptIds, data.n, data.temperature) as number[];
+    post({ type: TRAIN_SAMPLE_RESULT_TYPE, id, ids });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    post({ type: TRAIN_SAMPLE_ERROR_TYPE, id, error: message });
+  }
+}
+
+// Re-initialize the trainer's weights + optimizer + step counter from a seed.
+function handleTrainReset(data: { id: string; seed: number }) {
+  const id = data.id;
+  if (!trainer) {
+    post({ type: TRAIN_RESET_ERROR_TYPE, id, error: 'Trainer not initialized' });
+    return;
+  }
+  try {
+    trainer.reset(data.seed);
+    post({ type: TRAIN_RESET_RESULT_TYPE, id });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    post({ type: TRAIN_RESET_ERROR_TYPE, id, error: message });
+  }
+}
+
+// Direct WebGPU scatter_add kernel-correctness probe for the Training
+// playground. Calls the top-level `webgpuScatterAddSelftest()` WASM export
+// (NOT a trainer method — it runs on the shared device, no big model or
+// TinyTrainer required) and returns its length-5 number[]. A correct
+// accumulating kernel yields [0,0,0,3,0]; a broken last-write-wins kernel
+// yields [0,0,0,1,0]. The widget interprets the result; here we only relay it.
+function handleScatterSelfTest(data: { id: string }) {
+  const id = data.id;
+  if (!mlxExports || typeof mlxExports.webgpuScatterAddSelftest !== 'function') {
+    post({
+      type: SCATTER_SELF_TEST_ERROR_TYPE,
+      id,
+      error: 'WASM runtime not ready (webgpuScatterAddSelftest unavailable). Initialize the device first.',
+    });
+    return;
+  }
+  try {
+    const result = mlxExports.webgpuScatterAddSelftest() as number[];
+    post({ type: SCATTER_SELF_TEST_RESULT_TYPE, id, result });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    post({ type: SCATTER_SELF_TEST_ERROR_TYPE, id, error: message });
+  }
+}
+
 // Catch unhandled errors/rejections on this worker
 self.addEventListener('error', (e) => {
   e.preventDefault();
@@ -2533,6 +2687,21 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case EMBED_REQUEST_TYPE:
       void handleEmbed(e.data);
+      break;
+    case TRAIN_INIT_REQUEST_TYPE:
+      handleTrainInit(e.data);
+      break;
+    case TRAIN_STEP_REQUEST_TYPE:
+      handleTrainStep(e.data);
+      break;
+    case TRAIN_SAMPLE_REQUEST_TYPE:
+      handleTrainSample(e.data);
+      break;
+    case TRAIN_RESET_REQUEST_TYPE:
+      handleTrainReset(e.data);
+      break;
+    case SCATTER_SELF_TEST_REQUEST_TYPE:
+      handleScatterSelfTest(e.data);
       break;
   }
 };

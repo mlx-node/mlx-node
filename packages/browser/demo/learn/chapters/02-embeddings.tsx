@@ -9,6 +9,7 @@ import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { CosineSimilarityTool } from '../widgets/CosineSimilarityTool';
 import { ShapeProblem } from '../widgets/ShapeProblem';
+import { VectorCosine } from '../widgets/VectorCosine';
 
 /**
  * Chapter 2 — Embeddings.
@@ -30,7 +31,7 @@ import { ShapeProblem } from '../widgets/ShapeProblem';
 //
 // Each word is prefixed with a leading space because Qwen3's BPE tokenizer
 // usually emits a single token for `" word"` and 2+ tokens for the bare
-// `"word"` (chapter 1 covers this). Picking the first token id gives us the
+// `"word"` (chapter 2 covers this). Picking the first token id gives us the
 // closest single-vector representation for each word.
 
 type Category = 'animal' | 'number' | 'color' | 'country' | 'verb' | 'food';
@@ -552,6 +553,13 @@ export function EmbeddingsChapterBody() {
           <strong>nearby vectors mean related tokens</strong>, and the transformer layers spend their entire forward
           pass moving those vectors around in contextually useful ways.
         </p>
+        <p>
+          "Nearby" here means <em>pointing the same way</em>, not "a short ruler-distance apart". Before we project real
+          1024-dim vectors down to a picture, build the core intuition in a flat 2-D toy you can grab: meaning lives in a
+          vector&apos;s <em>direction</em>, and the <em>angle</em> between two vectors measures how related they are.
+        </p>
+
+        <VectorCosine />
 
         <h2>The embedding table</h2>
         <p>
@@ -588,9 +596,7 @@ export function EmbeddingsChapterBody() {
           The catch is that "as much as possible" is still very little. The top two components of a 1024-dim cloud
           typically explain just a few percent of the total variance — the rest is in the directions we threw away. So
           PCA is great for spotting <em>clusters</em> (tokens with similar overall direction in the embedding space land
-          near each other), but the <em>distances</em> between points in the picture are misleading. That's why the
-          nearest-neighbour browser computes cosine similarity in the full 1024-dim space, not the projected 2D
-          coordinates.
+          near each other), but two axes can&apos;t carry 1024 axes&apos; worth of geometry.
         </p>
 
         <h2>What you should see</h2>
@@ -627,19 +633,19 @@ export function EmbeddingsChapterBody() {
 
         <h2>The scatter is for orientation, not measurement</h2>
         <p>
-          The PCA scatter projects 1024-dim vectors onto just two axes, so it throws away 1022 dimensions of structure.
-          Two points that look close on screen might be far apart in the real space, and vice versa. The colour groups
-          still cluster (the dominant axes of variance often pick those up), but don&apos;t use the literal pixel
-          distance for similarity — use the cosine number from the panel below. Treat the scatter as a navigation aid
-          for finding clusters, not a ruler.
+          One caveat governs everything you see in the scatter: it projects 1024-dim vectors onto just two axes, so it
+          throws away 1022 dimensions of structure. Two points that look close on screen might be far apart in the real
+          space, and vice versa. The colour groups still cluster (the dominant axes of variance often pick those up), but
+          the <em>distances</em> lie — so never read similarity off the picture. That is exactly why the
+          nearest-neighbour browser computes cosine similarity in the full 1024-dim space, not the projected 2D
+          coordinates. Treat the scatter as a navigation aid for finding clusters, not a ruler.
         </p>
 
         <h2>Cosine similarity, side by side</h2>
         <p>
-          The scatter on the right is a 2D projection. The panel below skips the projection entirely: each pair&apos;s
-          cosine similarity is measured in the model&apos;s full 1024-dim embedding space and shown as a bar. The
-          ordering teaches the lesson — identical &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt;
-          unrelated.
+          The panel below skips the projection entirely: each pair&apos;s cosine similarity is measured in the
+          model&apos;s full 1024-dim embedding space and shown as a bar. The ordering teaches the lesson — identical &gt;
+          synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
         </p>
 
         <CosineSimilarityTool />
@@ -650,8 +656,7 @@ export function EmbeddingsChapterBody() {
           "countries", "colors", "verbs", "syntactic role", "register", "language", and a dozen other axes of meaning to
           vary independently in a three-axis space. Qwen3.5-0.8B uses <strong>1,024</strong> embedding dimensions, which
           gives the model a generous amount of "room" — each independent feature can occupy its own direction without
-          crowding the others. The PCA scatter above is a 2D projection of that 1024-dim space; the clusters survive the
-          projection because they really are clusters, but most of the geometry is in the axes we threw away.
+          crowding the others.
         </p>
 
         <p className="mt-6 text-muted-foreground">
@@ -1347,11 +1352,7 @@ function ScatterPlot({
           );
         })}
       </svg>
-      <div className="mt-1 flex items-center justify-between gap-2 px-2 pb-1 font-mono text-[10px] text-muted-foreground">
-        <span>
-          PC1={scatter.explainedVariance[0].toExponential(2)}, PC2=
-          {scatter.explainedVariance[1].toExponential(2)} (eigenvalues)
-        </span>
+      <div className="mt-1 flex items-center justify-end gap-2 px-2 pb-1 font-mono text-[10px] text-muted-foreground">
         <span>click a point for nearest neighbours</span>
       </div>
     </div>

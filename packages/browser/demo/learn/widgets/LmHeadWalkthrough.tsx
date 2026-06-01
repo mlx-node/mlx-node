@@ -13,8 +13,8 @@ import * as React from 'react';
  *
  * A "scan beam" sweeps left-to-right across the output strip, lighting up
  * each output cell in turn. While the beam is over column j, we highlight
- * row j of the weight matrix — that's the row being dotted with the hidden
- * vector to produce logit j. Once-through, then loops.
+ * column j of the displayed weight.T — that's the column being dotted with
+ * the hidden vector to produce logit j. Once-through, then loops.
  */
 
 const HIDDEN_CELLS = 12; // symbolic — stands in for d=1024
@@ -260,6 +260,11 @@ export function LmHeadWalkthrough() {
         <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>. Each column of the matrix is the
         "fingerprint" of one vocab token — when that column points in roughly the same direction as the hidden state,
         the logit for that token is high.
+      </p>
+
+      <p className="text-[10px] text-muted-foreground">
+        Illustrative/schematic — the 12×36 grid and bar heights are stand-ins for the real [1024 × 248,320] matmul, not
+        actual model logits.
       </p>
     </div>
   );

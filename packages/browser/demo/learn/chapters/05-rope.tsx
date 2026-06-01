@@ -5,6 +5,7 @@ import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { RopeRelativeDial } from '../widgets/RopeRelativeDial';
 
 /**
  * Chapter 5 — Positional encoding (RoPE).
@@ -34,6 +35,16 @@ const DOT_POSITION_MAX = 200;
 const DOT_QUERY_POS = 50;
 const LOW_FREQ_PAIR = NUM_PAIRS - 4; // index 28 — slow
 const HIGH_FREQ_PAIR = 0; // index 0 — fast
+
+// θ (rope_theta) simulator. The slider sweeps the base over a log range from
+// the original transformer value (1e3 region) up to Qwen3.5's 1e7. We keep
+// 1e7 as the default/anchor so the simulator opens on the real config.
+const THETA_LOG_MIN = 3; // 1e3
+const THETA_LOG_MAX = 7; // 1e7 — Qwen3.5-0.8B's rope_theta
+const ORIGINAL_ROPE_THETA = 10_000; // original 2017-style transformer base
+// Positions the separability strip samples, chosen to span "local" → "very
+// long range" without crowding the bars. All synthetic — pure m·θ_i math.
+const SEPARABILITY_POSITIONS = [1, 16, 256, 4096, 65_536];
 
 /** RoPE pair frequency: `theta_i = base ^ (-2i / rope_dims)`. */
 function pairFrequency(i: number, ropeDims: number, base: number): number {
@@ -82,7 +93,7 @@ export const learning: ChapterLearningData = {
     'Explain how RoPE injects token order into attention via per-pair rotations, without learned position embeddings.',
   problem:
     "Self-attention is permutation-invariant — without a positional signal the model cannot tell 'cat sat on mat' from 'mat sat on cat'.",
-  minutes: 7,
+  minutes: 8,
   glossary: [
     {
       term: 'RoPE',
@@ -229,8 +240,9 @@ export function RopeChapterBody() {
         </p>
         <p>
           Concretely, RoPE pairs up adjacent feature dimensions — <code>(x_0, x_1)</code>, <code>(x_2, x_3)</code>, … —
-          and treats each pair as a point in a 2D plane. For pair index <code>i</code> and head dimension <code>d</code>
-          , the frequency is:
+          and treats each pair as a point in a 2D plane. For pair index <code>i</code> and{' '}
+          <strong>rotary dimension</strong> <code>d</code> (the number of features RoPE actually rotates — not
+          necessarily the full head dimension; more on that just below), the frequency is:
         </p>
         <MathDisplay latex={String.raw`\theta_i = \text{base}^{-2i / d}`} />
         <p>
@@ -244,8 +256,8 @@ export function RopeChapterBody() {
           <strong>One implementation detail:</strong> the pairs are drawn here as neighbours (<code>x_0</code> with{' '}
           <code>x_1</code>) for clarity, but Qwen3.5 — like most Llama/HF-style models — uses the mathematically
           equivalent <em>rotate-half</em> layout: dimension <code>i</code> is paired with its counterpart{' '}
-          <code>i + d/2</code> in the second half of the vector. Same angles, same frequencies, same relative-position
-          property; only <em>which</em> two dimensions share a rotation differs.
+          <code>i + d/2</code> in the second half of the rotated block. Same angles, same frequencies, same
+          relative-position property; only <em>which</em> two dimensions share a rotation differs.
         </p>
         <p>
           Rotation is <strong>unitary</strong> — it preserves vector norms — so RoPE doesn't change how big Q and K are,
@@ -283,10 +295,14 @@ export function RopeChapterBody() {
           sharply at <code>n - m = 0</code> and decays as you move further apart. That decay is exactly the inductive
           bias that makes attention "want" nearby tokens more than distant ones, with no per-position parameters at all.
         </p>
+        <p>
+          You can feel the offset-only dependence directly. Shift both positions together and the score never budges:
+        </p>
+        <RopeRelativeDial />
 
         <p className="mt-6 text-muted-foreground">
           This chapter visualises RoPE's math directly — no model inference needed. Want to see how this plays out on
-          real attention scores? Open <em>Self-attention</em> (Chapter 3) and look at how the score map favours the
+          real attention scores? Open <em>Self-attention</em> (Chapter 4) and look at how the score map favours the
           diagonal.
         </p>
       </Prose>
@@ -402,6 +418,8 @@ export function RopeDemo(_props: RopeDemoProps) {
         format={(v) => `i = ${v}`}
       />
 
+      <RopeThetaSimulator />
+
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <RotationPanel
           title={`High frequency (pair ${HIGH_FREQ_PAIR})`}
@@ -458,6 +476,149 @@ export function RopeDemo(_props: RopeDemoProps) {
           'Relative position emerges from the rotation: token at pos 5 and key at pos 3 see the same relative angle as pos 10 → 8.',
         ]}
       />
+    </div>
+  );
+}
+
+/**
+ * θ (rope_theta) simulator — extends the chapter's frequency view with a
+ * "what does the base do?" control. Self-contained: every number is derived
+ * from the closed-form RoPE frequency `theta_i = base^(-2i / d)` (no worker,
+ * no inference). Dragging the slider rebuilds the `frequencies` array and
+ * feeds the SAME `<FrequencySpectrum>` the live demo uses, so the spectrum
+ * reshapes in place. The separability strip below then shows the practical
+ * consequence: how far each dimension pair has rotated at a range of token
+ * positions, for a fast pair (index HIGH_FREQ_PAIR) and a slow one (LOW_FREQ_PAIR).
+ */
+function RopeThetaSimulator() {
+  // Slider position is the log10 of the base so the control is uniform across
+  // 1e3 … 1e7; `theta` is the actual base fed into the RoPE frequency.
+  const [logTheta, setLogTheta] = React.useState(THETA_LOG_MAX);
+  const theta = 10 ** logTheta;
+
+  const frequencies = React.useMemo(() => {
+    const out = new Float64Array(NUM_PAIRS);
+    for (let i = 0; i < NUM_PAIRS; i++) {
+      out[i] = pairFrequency(i, ROPE_DIMS, theta);
+    }
+    return out;
+  }, [theta]);
+
+  // The spectrum's selection just highlights a bar here — wire it to the two
+  // pairs the separability strip already tracks so a click tells a story.
+  const [selectedPair, setSelectedPair] = React.useState(HIGH_FREQ_PAIR);
+
+  const fastFreq = pairFrequency(HIGH_FREQ_PAIR, ROPE_DIMS, theta);
+  const slowFreq = pairFrequency(LOW_FREQ_PAIR, ROPE_DIMS, theta);
+  const isDefault = Math.abs(logTheta - THETA_LOG_MAX) < 1e-9;
+
+  return (
+    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">Tune the base θ (rope_theta)</div>
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        Each pair's inverse frequency is <MathDisplay latex={String.raw`\theta_i = \text{base}^{-2i / d}`} inline />,
+        and at position <code>m</code> the pair has rotated by <MathDisplay latex={String.raw`m\,\theta_i`} inline />.
+        Raise the base and every <MathDisplay latex={String.raw`\theta_i`} inline /> shrinks → longer wavelengths → the
+        angles take more tokens to wrap, so positions stay distinguishable over a longer context.
+      </p>
+
+      <SliderRow
+        id="rope-theta-base"
+        label="RoPE base θ"
+        value={logTheta}
+        min={THETA_LOG_MIN}
+        max={THETA_LOG_MAX}
+        step={0.05}
+        onChange={setLogTheta}
+        format={(v) => `θ = ${(10 ** v).toExponential(1)}`}
+      />
+
+      <FrequencySpectrum frequencies={frequencies} selectedPair={selectedPair} onSelect={setSelectedPair} />
+
+      <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[11px] text-muted-foreground">
+        θ = {theta.toExponential(1)} · pair {HIGH_FREQ_PAIR} freq = {formatFreq(fastFreq)} rad/tok · pair{' '}
+        {LOW_FREQ_PAIR} freq = {formatFreq(slowFreq)} rad/tok
+        {isDefault ? ' · this is Qwen3.5-0.8B' : ''}
+      </div>
+
+      <SeparabilityStrip theta={theta} />
+
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        Qwen3.5-0.8B sets <code>rope_theta = {ROPE_THETA.toExponential(0)}</code> — a thousand times the original
+        transformer's <code>{ORIGINAL_ROPE_THETA.toExponential(0)}</code>. That larger base is what stretches the
+        spectrum and buys the long context; slide back down toward <code>1e4</code> and watch the slow pair start
+        rotating fast enough to alias over a long document.
+      </p>
+
+      <div className="text-[10px] text-muted-foreground">
+        Synthetic: every value is the closed-form RoPE frequency θ_i = base^(−2i/d) and rotation m·θ_i for Qwen3.5's{' '}
+        {NUM_PAIRS} rotated pairs (head_dim {HEAD_DIM}, {ROPE_DIMS} rotary dims) — no model is run.
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Separability strip — for a fast and a slow dimension pair, draws a small bar
+ * per sampled token position showing how many full turns the pair has spun
+ * through (m·θ_i / 2π). The fast pair fills and wraps almost immediately; the
+ * slow pair stays a sliver until very large positions. The gap between the two
+ * rows is exactly what "fine local vs. coarse global position" looks like, and
+ * it widens as θ grows. Purely synthetic m·θ_i math.
+ */
+function SeparabilityStrip({ theta }: { theta: number }) {
+  const rows = [
+    { label: `pair ${HIGH_FREQ_PAIR} · fast`, pairIndex: HIGH_FREQ_PAIR },
+    { label: `pair ${LOW_FREQ_PAIR} · slow`, pairIndex: LOW_FREQ_PAIR },
+  ];
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-background p-3">
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">
+        Rotation per position · m·θ_i as turns
+      </div>
+      <div className="space-y-2">
+        {rows.map((row) => {
+          const freq = pairFrequency(row.pairIndex, ROPE_DIMS, theta);
+          return (
+            <div key={row.pairIndex} className="space-y-1">
+              <div className="font-mono text-[11px] text-muted-foreground">
+                {row.label} · {formatFreq(freq)} rad/tok
+              </div>
+              <div className="grid grid-cols-5 gap-1.5">
+                {SEPARABILITY_POSITIONS.map((m) => {
+                  const turns = (m * freq) / (2 * Math.PI);
+                  // One full revolution fills the cell; cap the visual at a
+                  // single turn (more than that has already aliased).
+                  const fill = Math.min(1, turns);
+                  return (
+                    <div key={m} className="space-y-0.5">
+                      <div
+                        className="relative h-7 overflow-hidden rounded-sm bg-muted"
+                        title={`m=${m}: ${turns.toFixed(turns < 0.01 ? 4 : 2)} turns`}
+                      >
+                        <div
+                          className="absolute inset-x-0 bottom-0 bg-primary/60"
+                          style={{ height: `${fill * 100}%` }}
+                        />
+                      </div>
+                      <div className="text-center text-[9px] tabular-nums text-muted-foreground">
+                        m={m.toLocaleString()}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="text-[11px] leading-relaxed text-muted-foreground">
+        Bars show the fraction of a full turn each pair has rotated through at that position (capped at one turn). The
+        fast pair saturates and aliases within a handful of tokens; the slow pair stays a sliver out to tens of
+        thousands of positions — that separation is how one operation encodes both fine-grained and document-scale
+        position.
+      </div>
     </div>
   );
 }

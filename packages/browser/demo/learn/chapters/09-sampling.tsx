@@ -12,7 +12,9 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { NucleusSlider } from '../widgets/NucleusSlider';
 import { SamplingFailureModes } from '../widgets/SamplingFailureModes';
+import { SoftmaxTemperatureSteps } from '../widgets/SoftmaxTemperatureSteps';
 
 /**
  * Chapter 10 — Sampling.
@@ -39,7 +41,7 @@ export const learning: ChapterLearningData = {
     'Take a vector of logits, apply temperature and top-p, and reason about why each knob shifts the resulting distribution.',
   problem:
     'Every forward pass ends with logits; the model still needs a rule for turning that vector into one concrete next token.',
-  minutes: 6,
+  minutes: 7,
   glossary: [
     {
       term: 'logit',
@@ -195,7 +197,12 @@ export function SamplingChapterBody() {
           </li>
         </ul>
 
-        <TemperatureWorkedExample />
+        <p>
+          To see <em>why</em> a temperature comes out the way it does, here is a single temperature broken into its four
+          mechanical phases — divide by <code>T</code>, exponentiate, normalize — looping one step at a time:
+        </p>
+
+        <SoftmaxTemperatureSteps />
 
         <h2>Top-p (nucleus) sampling</h2>
         <p>
@@ -217,6 +224,13 @@ export function SamplingChapterBody() {
           room to be creative, and top-p guarantees we never sample from the absurd tail. The widget on the right lets
           you sweep both knobs over a captured run and see what would have happened.
         </p>
+
+        <p>
+          Slide the cutoff below and watch the nucleus form: tokens are kept top-down until their cumulative probability
+          reaches <code>p</code>, the tail is discarded, and the survivors are renormalized so they sum to 1 again.
+        </p>
+
+        <NucleusSlider />
 
         <h2>How the widget works</h2>
         <p>
@@ -241,83 +255,6 @@ export function SamplingChapterBody() {
         </p>
       </Prose>
     </ChapterFrame>
-  );
-}
-
-// -----------------------------------------------------------------------------
-// Inline worked example for the softmax-with-temperature formula. Kept in the
-// chapter file rather than as a separate widget — it's a quick numeric
-// reinforcement of the equation just above it, not a reusable widget.
-// -----------------------------------------------------------------------------
-
-const WORKED_LOGITS = [3.0, 1.0, 0.5, -1.0];
-
-function softmaxWithT(logits: number[], T: number): number[] {
-  const scaled = logits.map((l) => l / Math.max(T, 1e-6));
-  const m = Math.max(...scaled);
-  const exps = scaled.map((v) => Math.exp(v - m));
-  const sum = exps.reduce((s, e) => s + e, 0);
-  return exps.map((e) => (sum > 0 ? e / sum : 0));
-}
-
-function TemperatureWorkedExample() {
-  const rows = [
-    {
-      label: 'T = 1.0',
-      probs: softmaxWithT(WORKED_LOGITS, 1.0),
-      shape: 'Default. The top token wins but the others keep a meaningful slice.',
-    },
-    {
-      label: 'T = 2.0',
-      probs: softmaxWithT(WORKED_LOGITS, 2.0),
-      shape: 'Flatter. Differences between logits get washed out — diversity up.',
-    },
-    {
-      label: 'T = 0.5',
-      probs: softmaxWithT(WORKED_LOGITS, 0.5),
-      shape: 'Sharper. The top logit absorbs almost all the mass — closer to greedy.',
-    },
-  ];
-  return (
-    <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-4">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">
-        Worked softmax · 4 logits across three temperatures
-      </div>
-      <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-6 text-foreground/90">
-        p<sub>i</sub> = exp(logits<sub>i</sub> / T) / &sum;<sub>j</sub> exp(logits<sub>j</sub> / T)
-      </div>
-      <div className="font-mono text-[11px] text-muted-foreground">
-        logits = [{WORKED_LOGITS.map((l) => l.toFixed(2)).join(', ')}]
-      </div>
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse font-mono text-[11px]">
-          <thead>
-            <tr>
-              <th className="px-2 py-1 text-left text-muted-foreground">T</th>
-              {WORKED_LOGITS.map((_, i) => (
-                <th key={`h-${i}`} className="px-2 py-1 text-right text-muted-foreground">
-                  p<sub>{i}</sub>
-                </th>
-              ))}
-              <th className="px-2 py-1 text-left text-muted-foreground">shape</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, i) => (
-              <tr key={`row-${i}`} className="border-t border-border/60">
-                <td className="px-2 py-1 text-left text-foreground/90">{row.label}</td>
-                {row.probs.map((p, j) => (
-                  <td key={`cell-${i}-${j}`} className="px-2 py-1 text-right text-foreground/85">
-                    {p.toFixed(2)}
-                  </td>
-                ))}
-                <td className="px-2 py-1 text-left text-[11px] text-muted-foreground">{row.shape}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
   );
 }
 

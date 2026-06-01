@@ -4,10 +4,13 @@ import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { ExposureBias } from '../widgets/ExposureBias';
+import { GradientDescent } from '../widgets/GradientDescent';
 import { TeacherForcingAnimation } from '../widgets/TeacherForcingAnimation';
+import { TrainingPlayground } from '../widgets/TrainingPlayground';
 
 /**
- * Chapter 12 — Training objective & teacher forcing.
+ * Chapter 13 — Training objective & teacher forcing.
  *
  * The first 11 chapters are inference-first: how does a trained model do
  * one forward pass and pick one token. This chapter closes the loop with a
@@ -28,12 +31,17 @@ export const learning: ChapterLearningData = {
     'Explain what an LLM is actually trained to do: predict every next token in parallel under a causal mask, against ground-truth labels.',
   problem:
     "We've watched a trained model run. Where did all the weights come from? What was the model optimized to do?",
-  minutes: 7,
+  minutes: 13,
   glossary: [
     {
       term: 'next-token prediction',
       definition:
         'The training task: given tokens [t1..ti], predict t_{i+1}. Repeated at every position of every training sequence.',
+    },
+    {
+      term: 'gradient descent',
+      definition:
+        'The update rule behind training: the gradient points uphill — the direction that increases the loss fastest — so each weight is nudged the opposite way (downhill): w ← w − lr·gradient. The learning rate (lr) is the step size: too small crawls, too large overshoots and diverges. AdamW runs this per-parameter for all ~800M weights at once.',
     },
     {
       term: 'cross-entropy loss',
@@ -59,6 +67,16 @@ export const learning: ChapterLearningData = {
       term: 'pretraining vs fine-tuning',
       definition:
         'Pretraining: next-token prediction on trillions of tokens of generic text. Fine-tuning: same objective, smaller curated dataset, typically post-pretraining.',
+    },
+    {
+      term: 'AdamW',
+      definition:
+        'The optimizer almost universally used for LLM training. It keeps a per-parameter running average of the gradient and its square (the "moments") so each weight gets an adaptive step size, with weight decay applied separately from the gradient.',
+    },
+    {
+      term: 'backpropagation (autograd)',
+      definition:
+        'The algorithm that computes the gradient of the scalar loss with respect to every weight by applying the chain rule backward through the forward pass. The playground below runs real autograd on WebGPU — the same value_and_grad primitive the production trainer uses.',
     },
   ],
   takeaways: [
@@ -154,7 +172,12 @@ export function TrainingChapterBody() {
         <p>
           The per-position loss <code>-log p(target)</code> is called <strong>cross-entropy</strong>. When{' '}
           <code>p(target)</code> is close to 1 the loss is close to 0; when <code>p(target)</code> is small the loss
-          blows up. The optimizer's job is to push the model's probability mass onto the actual next token.
+          blows up. Why the <em>log</em> specifically? Two reasons: it turns &ldquo;multiply the probability of every
+          token across the whole sequence&rdquo; into &ldquo;add up a per-token cost&rdquo; (a product of thousands of
+          numbers below 1 would underflow to zero; a sum of logs stays well-behaved), and because{' '}
+          <code>-log p → ∞</code> as <code>p → 0</code>, a confidently-wrong prediction is punished arbitrarily hard —
+          the model is penalized most exactly when it is both wrong and certain. The optimizer&apos;s job is to push the
+          model&apos;s probability mass onto the actual next token.
         </p>
 
         <h2>Teacher forcing — the trick that makes it parallel</h2>
@@ -166,11 +189,13 @@ export function TrainingChapterBody() {
         <p>
           The fix is <strong>teacher forcing</strong>. Instead of feeding the model's own prediction back as the next
           input, feed the <em>true</em> token. Now every position's input context is correct ground-truth text, every
-          position's target is independent, and the causal mask (chapter 3) keeps each position from peeking at the
+          position's target is independent, and the causal mask (chapter 4) keeps each position from peeking at the
           target. <em>All N positions train in one parallel forward pass.</em>
         </p>
 
         <TeacherForcingAnimation />
+
+        <ExposureBias />
 
         <h2>Inference and training are the same forward pass</h2>
         <p>
@@ -181,7 +206,7 @@ export function TrainingChapterBody() {
         </p>
         <p>
           This symmetry is part of why the inference patterns from this course generalize to training. The KV cache
-          (chapter 11) is an inference-only optimization, but the operations being cached are exactly the same
+          (chapter 12) is an inference-only optimization, but the operations being cached are exactly the same
           operations that run during training, just without the cache.
         </p>
 
@@ -207,38 +232,35 @@ export function TrainingChapterBody() {
         <p>
           The loss is one scalar. Backpropagation computes its gradient with respect to every weight in the model (~800M
           of them for Qwen3.5-0.8B). An optimizer (almost always AdamW for LLM pretraining) takes a small step in the
-          direction that lowers the loss. Repeat for several million to several trillion tokens. The next chapter covers
-          the engineering tricks — warmup, cosine decay, gradient clipping, dropout — that make this loop numerically
-          stable across a stack this deep.
+          direction that lowers the loss. Strip it down to a single weight and the rule is easy to see: the gradient
+          points uphill, so step the opposite way — and the size of that step (the learning rate) has a sweet spot.
+        </p>
+
+        <GradientDescent />
+
+        <p>
+          Repeat that per-weight step for all ~800M weights at once, for several million to several trillion tokens. The
+          next chapter covers the engineering tricks — warmup, cosine decay, gradient clipping, dropout — that make this
+          loop numerically stable across a stack this deep.
         </p>
       </Prose>
     </ChapterFrame>
   );
 }
 
-// This chapter has no live demo — pure pedagogical content. The route file
-// still expects a Demo component for the right-hand panel, so we export a
-// small placeholder that explains the chapter has no live run.
+// Live training playground. The learner trains a tiny char-level transformer
+// from scratch on the WASM/WebGPU MLX autograd + AdamW stack and watches the
+// real loss curve drop + generated samples improve. The route gates this
+// chapter on the WebGPU *device* being up (device-only init), not the full
+// 1.6 GB model — see DEVICE_ONLY_CHAPTERS in routes/chapters.$chapterId.tsx.
+//
+// The props signature matches the prior placeholder so the route mount site is
+// unchanged; the TrainingPlayground widget owns the training loop.
 export type TrainingDemoProps = {
   workerRef: React.RefObject<Worker | null>;
   abortRef: React.RefObject<AbortController | null>;
 };
 
-export function TrainingDemo(_: TrainingDemoProps) {
-  return (
-    <div className="space-y-3 rounded-md border border-dashed border-border bg-background p-4">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">No live run for this chapter</div>
-      <p className="text-[13px] text-foreground/85">
-        Training in the browser would mean running backprop on hundreds of millions of parameters — the WebGPU port of
-        MLX supports inference only. Everything you need to <em>understand</em> the training step lives in the chapter
-        body's animation; everything you need to <em>reproduce</em> it lives in libraries like{' '}
-        <span className="font-mono">@mlx-node/trl</span>, which run on Apple Silicon outside the browser.
-      </p>
-      <p className="text-[12px] text-muted-foreground">
-        Try it in the inspector indirectly: visit the LM head chapter and notice how the top-K logits change between
-        runs of the same prompt. That distribution is what cross-entropy is computed against during training — the
-        sharper it gets (over time, as training progresses), the lower the loss.
-      </p>
-    </div>
-  );
+export function TrainingDemo({ workerRef, abortRef }: TrainingDemoProps) {
+  return <TrainingPlayground workerRef={workerRef} abortRef={abortRef} />;
 }

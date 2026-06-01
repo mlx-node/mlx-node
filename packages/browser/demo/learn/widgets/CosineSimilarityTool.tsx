@@ -85,7 +85,7 @@ export function CosineSimilarityTool() {
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Cosine similarity · curated pairs</div>
-        <div className="text-[11px] text-muted-foreground">Measured against Qwen3.5-0.8B&apos;s embedding matrix</div>
+        <div className="text-[11px] text-muted-foreground">Illustrative ballpark values · Qwen3.5-0.8B-style</div>
       </div>
 
       <div className="space-y-1.5">

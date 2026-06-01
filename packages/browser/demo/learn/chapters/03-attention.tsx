@@ -13,9 +13,9 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { AttentionFanout } from '../widgets/AttentionFanout';
-import { CausalMaskAsSum } from '../widgets/CausalMaskAsSum';
 import { CausalMaskToggle } from '../widgets/CausalMaskToggle';
 import { CausalMaskVisual } from '../widgets/CausalMaskVisual';
+import { ScaledSoftmax } from '../widgets/ScaledSoftmax';
 import { ToyAttentionExample } from '../widgets/ToyAttentionExample';
 
 /**
@@ -60,7 +60,7 @@ export const learning: ChapterLearningData = {
   objective: 'Read a softmax(QK^T/sqrt(d))V attention map and explain what every cell, row, and column means.',
   problem:
     "Without attention, a transformer has no way to let one token's representation depend on what came before it.",
-  minutes: 8,
+  minutes: 9,
   glossary: [
     {
       term: 'query (Q)',
@@ -167,7 +167,7 @@ export function AttentionChapterBody() {
       <Prose>
         <h1>Self-attention: how every token looks at every other token</h1>
         <p>
-          Up to this chapter we've turned text into tokens (chapter 1) and tokens into vectors (chapter 2). The
+          Up to this chapter we've turned text into tokens (chapter 2) and tokens into vectors (chapter 3). The
           interesting question is now: how does a token <em>know about the rest of the sentence?</em> The answer modern
           LLMs use is <strong>self-attention</strong>.
         </p>
@@ -200,9 +200,16 @@ export function AttentionChapterBody() {
           </li>
         </ul>
         <p>
-          Each is a vector of length <code>d_head</code>. Crucially these aren't three different tokens — they're three
-          different views of the same token, learned separately so attention can do something more interesting than just
-          "compare embeddings."
+          Each is a vector of length <code>d_head</code> (the per-head dimension — the same number the original
+          "Attention Is All You Need" paper calls <code>d_k</code> and the model's config calls <code>head_dim</code>).
+          Crucially these aren't three different tokens — they're three different views of the same token, learned
+          separately so attention can do something more interesting than just "compare embeddings."
+        </p>
+        <p>
+          One more thing a beginner has to get right: the same three matrices <code>Wq</code>, <code>Wk</code>,{' '}
+          <code>Wv</code> are applied to <em>every</em> token at <em>every</em> position — they're learned once and
+          shared across the whole sequence, so the projection itself carries no notion of <em>where</em> a token sits;
+          positional information is injected separately (by RoPE, chapter 6).
         </p>
 
         <h2>The formula</h2>
@@ -222,6 +229,13 @@ export function AttentionChapterBody() {
           scores in a regime where softmax is informative.
         </p>
         <p>
+          The widget below makes that one sentence tangible. Drag the head dimension and watch the same set of key
+          alignments: without the scale, the distribution collapses toward a single key as <code>d_head</code> grows;
+          with the <code>÷√d_head</code> scale it stays exactly the same at every width.
+        </p>
+
+        <ScaledSoftmax />
+        <p>
           <code>softmax</code> turns each row of the score matrix into a probability distribution: every row sums to 1.
           That's the per-token
           <em> attention pattern</em>. Multiplying that <code>[seq_len, seq_len]</code> distribution by <code>V</code>{' '}
@@ -237,8 +251,10 @@ export function AttentionChapterBody() {
           <em>after</em> while training, it can short-circuit the entire problem by copying.
         </p>
         <p>
-          So before the softmax we set the upper-triangle of <code>QKᵀ</code> to <code>-∞</code>. After softmax those
-          cells become exactly <code>0</code> — token <em>i</em> can only attend to keys <em>0 … i</em>. The heatmap on
+          So before the softmax we set the upper-triangle of <code>QKᵀ</code> to <code>-∞</code> (equivalently, add a
+          mask matrix that's <code>0</code> on and below the diagonal and <code>-∞</code> above, then softmax each row).
+          After softmax those cells become exactly <code>0</code> — token <em>i</em> can only attend to keys{' '}
+          <em>0 … i</em>. The heatmap on
           the right is <strong>lower-triangular</strong> for exactly this reason. The bottom row — the last token of the
           prompt — is the only row that sees the whole prompt, which is why <em>that</em> row produces the next-token
           prediction.
@@ -280,7 +296,7 @@ export function AttentionChapterBody() {
         <p>
           Different heads end up specializing — one might track "the previous token," another "the start of the
           sentence," another "syntactically related noun." Stacking attention layers lets later layers compose these
-          patterns: chapter 4 looks at heads, chapter 8 at the full stack.
+          patterns: chapter 5 looks at heads, chapter 9 at the full stack.
         </p>
 
         <h2>Working a tiny example by hand</h2>
@@ -291,16 +307,6 @@ export function AttentionChapterBody() {
         </p>
 
         <ToyAttentionExample />
-
-        <h2>The causal mask, as a matrix sum</h2>
-        <p>
-          "Set the upper triangle to <code>-∞</code>" reads more cleanly as an addition: the mask is a matrix of{' '}
-          <code>0</code> on/below the diagonal and <code>-∞</code> above. We add it elementwise to the raw scores, then
-          softmax row-by-row. The <code>-∞</code> cells become exactly zero — every row is now a probability
-          distribution over earlier positions only.
-        </p>
-
-        <CausalMaskAsSum />
 
         <h2>The causal mask, cell by cell</h2>
         <p>

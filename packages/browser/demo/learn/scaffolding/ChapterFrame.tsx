@@ -5,6 +5,7 @@ import { EngineeringTakeaways } from './EngineeringTakeaways';
 import { Glossary } from './Glossary';
 import type { ChapterLearningData } from './learning-data';
 import { MiniExercise } from './MiniExercise';
+import { PipelineCue } from './PipelineCue';
 import { QuickCheck } from './QuickCheck';
 
 export type ChapterFrameProps = {
@@ -24,6 +25,7 @@ export function ChapterFrame({ learning, children }: ChapterFrameProps) {
   return (
     <div className="space-y-8">
       <ChapterHeader objective={learning.objective} problem={learning.problem} minutes={learning.minutes} />
+      <PipelineCue chapterId={learning.chapterId} />
       <Glossary terms={learning.glossary} />
       <div>{children}</div>
       <EngineeringTakeaways takeaways={learning.takeaways} />

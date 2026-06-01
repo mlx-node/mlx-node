@@ -4,13 +4,21 @@ import * as React from 'react';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { ContextWindow } from '../widgets/ContextWindow';
+import { HallucinationDemo } from '../widgets/HallucinationDemo';
 
 /**
- * Chapter 14 — The whole model, end to end.
+ * Chapter 16 — The whole model, end to end (and what it isn't).
  *
- * A static, text-only, interactive architecture POSTER of Qwen3.5-0.8B. No
- * worker, no WASM, no inference — everything rendered here is inline SVG +
- * React state. It is a faithful dark-theme reproduction of the project's
+ * Two arcs in one capstone. First, a static, text-only, interactive architecture
+ * POSTER of Qwen3.5-0.8B. No worker, no WASM, no inference — everything rendered
+ * here is inline SVG + React state. Then a closing reflection on the honest
+ * limits that fall out of next-token prediction — hallucination, no lookup
+ * database, a finite context window, stochastic output — merged in from the
+ * former standalone "What the model isn't" chapter (its HallucinationDemo and
+ * ContextWindow widgets render inline in that reflection section).
+ *
+ * The poster is a faithful dark-theme reproduction of the project's
  * landscape architecture artifact (artifacts/qwen35-0.8b-architecture.svg):
  * a central decoder spine, an expanded Dense SwiGLU FFN panel on the left, the
  * Gated DeltaNet (linear) and Gated GQA (full) sequence-mixer panels on the
@@ -49,10 +57,10 @@ const VOCAB_LABEL = VOCAB.toLocaleString();
 export const learning: ChapterLearningData = {
   chapterId: 'architecture',
   objective:
-    "Trace a token's path through all of Qwen3.5-0.8B in one diagram, and explain how the hybrid linear/full-attention stack fits together.",
+    "Trace a token's path through all of Qwen3.5-0.8B in one diagram and explain how the hybrid linear/full-attention stack fits together — then name the core limits that fall straight out of next-token prediction: hallucination, no lookup database, a finite context, and stochastic output.",
   problem:
-    "Thirteen chapters each zoom into one component — it's easy to lose the forest for the trees. This chapter is the map that puts every piece back in its place.",
-  minutes: 6,
+    "Every prior chapter zooms into a single component — it's easy to lose the forest for the trees. This chapter is the map that puts every piece back in its place, then steps back to the honest limits of the whole thing.",
+  minutes: 12,
   glossary: [
     {
       term: 'residual stream',
@@ -84,17 +92,46 @@ export const learning: ChapterLearningData = {
       definition:
         'Reusing the embedding matrix as the LM head, so the same table maps token ids to vectors at the bottom and scores vectors into logits at the top.',
     },
+    {
+      term: 'hallucination',
+      definition:
+        "A fluent, confident output that isn't true — the result of sampling the most plausible token when no true one is available.",
+    },
+    {
+      term: 'grounding',
+      definition:
+        'Tying a model output to a verifiable source (e.g. retrieved documents); a base model has none by default.',
+    },
+    {
+      term: 'context window',
+      definition: `The maximum number of tokens the model can attend to at once (${MAX_POSITION.toLocaleString()} for Qwen3.5-0.8B).`,
+    },
+    {
+      term: 'parametric memory',
+      definition: "Knowledge stored implicitly in the model's weights during training, not in any queryable database.",
+    },
+    {
+      term: 'knowledge cutoff',
+      definition: 'The point in time after which the model knows nothing, because its training data ends there.',
+    },
+    {
+      term: 'stochastic',
+      definition: 'Random by default — sampling means the same prompt can produce different outputs run to run.',
+    },
   ],
   takeaways: [
     'Qwen3.5-0.8B is 24 pre-norm residual blocks; the only thing that changes layer to layer is the sequence mixer — linear (Gated DeltaNet) on 18 layers, full attention on 6.',
     'Full attention is global but its KV cache grows with sequence length; linear attention is cheap and recurrent with a fixed-size state. The 3:1 schedule keeps most of the quality at a fraction of the memory.',
     'The embedding matrix and the LM head are the same weights (tying) — one table both maps tokens in and scores them out. Every layer also carries a dense SwiGLU FFN — there is no mixture-of-experts anywhere.',
+    "Hallucination isn't a malfunction: the model samples the most plausible token, and plausible only equals true when the fact was well-represented in training.",
+    'The model has no database and no memory between calls — its knowledge lives in fixed weights (with a cutoff), and its working memory is only the current context window.',
+    'Sampling makes generation stochastic by default; identical prompts can diverge unless you decode greedily.',
   ],
   exercise: {
     prompt:
-      'In the poster, flip the GDN ↔ GQA toggle and read the two right-hand panels. Name two things the full-attention layer (GQA) has that the linear layer (Gated DeltaNet) doesn’t.',
+      "Two things to try on this page. (1) In the poster, flip the GDN ↔ GQA toggle and read the two right-hand panels — name two things the full-attention layer (GQA) has that the linear layer (Gated DeltaNet) doesn't. (2) In the hallucination widget below, switch to 'No real answer' and compare the top bar's height to the 'Well-known fact' case — does the flatter distribution stop the model from answering?",
     answer:
-      'Full attention (GQA) has a KV cache that grows with sequence length and uses partial RoPE + per-head Q/K norm with an all-positions softmax; the linear layer (Gated DeltaNet) instead keeps a fixed-size recurrent state plus a small conv cache and never computes an all-pairs softmax.',
+      "(1) Full attention (GQA) has a KV cache that grows with sequence length and uses partial RoPE + per-head Q/K norm with an all-positions softmax; the linear layer (Gated DeltaNet) instead keeps a fixed-size recurrent state plus a small conv cache and never computes an all-pairs softmax. (2) On the fact the top bar is ~0.93 (very sure); on the made-up paper it's ~0.16, with probability spread across many tokens — the model is less certain but still commits to the single most plausible token and produces a confident, fabricated answer. Low confidence doesn't become 'I don't know' unless the model was trained to say so.",
   },
   quiz: [
     {
@@ -132,6 +169,50 @@ export const learning: ChapterLearningData = {
       explanation:
         'The 18 non-full layers are Gated DeltaNet — recurrent linear attention with a fixed-size state, not plain convolution.',
     },
+    {
+      id: 'q1-why-hallucinate',
+      prompt: 'Why does an LLM hallucinate?',
+      options: [
+        { id: 'a', label: 'It is deliberately lying to the user.' },
+        {
+          id: 'b',
+          label:
+            'It samples the most plausible next token, and nothing in the forward pass checks that token against a source of truth.',
+        },
+        { id: 'c', label: 'Its training data was entirely false.' },
+      ],
+      correctId: 'b',
+      explanation:
+        'The model emits a likely-looking token; when no true answer is available it still produces a fluent, confident one. Plausibility is not truth.',
+    },
+    {
+      id: 'q2-knowledge',
+      prompt: "Where does an LLM's factual knowledge live at inference time?",
+      options: [
+        { id: 'a', label: 'In a database it queries for each token.' },
+        { id: 'b', label: 'In its fixed weights (parametric memory), set during training — with a knowledge cutoff.' },
+        { id: 'c', label: "In the user's previous conversations." },
+      ],
+      correctId: 'b',
+      explanation:
+        'A base model looks nothing up; its knowledge is baked into the weights and frozen after training, which is why it has a cutoff.',
+    },
+    {
+      id: 'q3-stochastic',
+      prompt: 'Why can the same prompt give two different answers on two runs?',
+      options: [
+        { id: 'a', label: 'The model rewrites its own weights between runs.' },
+        {
+          id: 'b',
+          label:
+            "Generation samples from a probability distribution, so it's stochastic unless you decode greedily (temperature 0).",
+        },
+        { id: 'c', label: 'The context window changed size.' },
+      ],
+      correctId: 'b',
+      explanation:
+        'Sampling introduces randomness by design; greedy decoding (always take the top token) is the deterministic special case.',
+    },
   ],
 };
 
@@ -149,10 +230,10 @@ export function ArchitectureChapterBody() {
             <p>
               <strong>One sentence:</strong> Qwen3.5-0.8B is a stack of {NUM_LAYERS} near-identical pre-norm residual
               blocks bookended by an embedding table at the bottom and a tied LM head at the top — and almost everything
-              you read in the last thirteen chapters lives inside one of those blocks. The poster below is the map: it
-              lays the whole text decoder out as a central spine, with the dense SwiGLU feed-forward network expanded on
-              the left and the two sequence mixers — linear (Gated DeltaNet) and full (Gated GQA) — expanded on the
-              right. Hover, click, or tab any block to read what it does in the panel underneath.
+              you read in the earlier chapters lives inside one of those blocks. The poster below is the map: it lays
+              the whole text decoder out as a central spine, with the dense SwiGLU feed-forward network expanded on the
+              left and the two sequence mixers — linear (Gated DeltaNet) and full (Gated GQA) — expanded on the right.
+              Hover, click, or tab any block to read what it does in the panel underneath.
             </p>
             <p>
               One honest caveat on “whole model”: the spine traces the <strong>text decoder</strong> — the path the
@@ -203,6 +284,137 @@ export function ArchitectureChapterBody() {
             </div>
           </div>
         </Prose>
+
+        {/* Optional deep-dive: what the GDN sub-boxes in the poster actually
+            mean, in words. Collapsed by default and skippable — beginners can
+            ignore it; the curious get the linear-attention mechanics. Centered
+            at article width (like the limitations arc below) so it doesn't
+            strand in the left third of the wide body. Native <details> so it
+            stays keyboard-focusable; styled like the project's Glossary
+            disclosure. */}
+        <div className="mx-auto w-full max-w-3xl">
+          <details className="group not-prose rounded-md border border-border bg-muted/30 px-4 py-3 text-sm">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-foreground/90 [&::-webkit-details-marker]:hidden">
+              <span className="font-medium">
+                Advanced: inside a Gated DeltaNet layer{' '}
+                <span className="text-muted-foreground">· optional, for the curious</span>
+              </span>
+              <span
+                aria-hidden="true"
+                className="text-xs text-muted-foreground transition-transform group-open:rotate-90"
+              >
+                ▸
+              </span>
+            </summary>
+            <div className="mt-3 space-y-2 text-[13px] leading-relaxed text-foreground/80">
+              <p>
+                This is what the teal Gated DeltaNet boxes in the poster above mean, unpacked. You can skip it — the 3:1
+                bargain above is the whole story for using the model. But here is what actually happens inside one of the{' '}
+                {NUM_LINEAR} linear layers:
+              </p>
+              <ul className="list-disc space-y-1.5 pl-5">
+                <li>
+                  <strong>Projections.</strong> Linear maps split the input into query/key, a value plus a{' '}
+                  <em>z-gate</em>, and a β (beta) / g (decay) pair — the knobs the recurrence below turns.
+                </li>
+                <li>
+                  <strong>A short conv.</strong> A causal <em>depthwise</em> convolution (kernel 4, so each channel only
+                  looks at the last 4 tokens) followed by a SiLU activation adds a little local mixing before the
+                  recurrence.
+                </li>
+                <li>
+                  <strong>The gated delta-rule recurrence</strong> is the heart of it. It carries one fixed-size state
+                  and walks the sequence token by token: β controls how much each new token <em>overwrites</em> that
+                  state, and g (decay) controls how fast old information is <em>forgotten</em>. That makes it O(n) in
+                  the sequence length — linear, not quadratic — with a state whose size never grows.
+                </li>
+                <li>
+                  <strong>Memory.</strong> Instead of a KV cache that grows with every token, the layer carries only a
+                  tiny conv cache (the last few tokens) plus that fixed-size recurrent state — so its memory is{' '}
+                  <em>constant regardless of context length</em>.
+                </li>
+                <li>
+                  <strong>Finish.</strong> A z-gated RMSNorm and an out-projection return the result to the{' '}
+                  {HIDDEN_DIM}-dim residual stream.
+                </li>
+              </ul>
+              <p>
+                That constant-memory recurrence is exactly what lets {NUM_LINEAR} of the {NUM_LAYERS} layers run without
+                a growing cache, leaving only the {NUM_FULL} full-attention layers to pay for one.
+              </p>
+            </div>
+          </details>
+        </div>
+
+        {/* The merged limitations arc is a reading section, not part of the
+            full-width poster — center it at article width inside the wide
+            (~1400px) body so it doesn't strand in the left third. */}
+        <div className="mx-auto w-full max-w-3xl">
+          <Prose className="lg:max-w-none">
+            <h2>What the model isn't</h2>
+            <p>
+              You've now seen the whole machine, end to end — every block, and where it sits. It's worth being equally
+              precise about what it is <em>not</em> doing, because nearly every "the LLM is broken" surprise comes from
+              expecting a capability the architecture never had. None of the limits below are bolted-on flaws — they
+              fall straight out of next-token prediction.
+            </p>
+
+            <h2>It samples the plausible, not the true</h2>
+            <p>
+              The forward pass produces a probability for every next token, and we sample one. Nowhere in that pipeline
+              is a fact checked against a source. When the true continuation was common in the training data, plausible
+              and true coincide and the model looks like it "knows." When there's no true answer — or the model simply
+              never saw it — it <em>still</em> emits a fluent, confident token. That's a <strong>hallucination</strong>:
+            </p>
+            <HallucinationDemo />
+            <p>
+              Notice it isn't lying (there's no intent) and it isn't malfunctioning — it's doing exactly what it was
+              built to do: produce a likely-looking next token. The flatter the distribution, the less sure it is, but
+              it commits to an answer regardless unless training taught it to hedge.
+            </p>
+
+            <h2>There is no lookup database</h2>
+            <p>
+              A base model's "knowledge" is <strong>parametric</strong>: baked into its weights during training, not
+              stored in a table it queries at inference time. So it can't reliably cite a source it didn't effectively
+              memorize, and it has a <strong>knowledge cutoff</strong> — anything that happened after training simply
+              isn't in the weights. (Retrieval and tools can bolt a real database on top, but that's an addition; the
+              model you've studied has none.)
+            </p>
+
+            <h2>Its memory is the context window — and it's finite</h2>
+            <ContextWindow />
+            <p>
+              The model's only working memory is the tokens currently inside its{' '}
+              <Link to="/chapters/$chapterId" params={{ chapterId: 'kv-cache' }} search={(prev) => prev}>
+                context window
+              </Link>
+              . Past that hard limit the oldest tokens have to be dropped to make room, and once dropped they're gone.
+              And between two separate conversations it remembers nothing at all — every call starts blank, apart from
+              whatever text you re-supply in the prompt.
+            </p>
+
+            <h2>Same input, different output</h2>
+            <p>
+              Because we <em>sample</em>, generation is <strong>stochastic</strong> by default: with temperature above
+              zero, the same prompt can produce different answers on different runs. That's a feature for creative
+              writing and a footgun for anything you need to reproduce — decode greedily (temperature 0) when you want
+              determinism, as the{' '}
+              <Link to="/chapters/$chapterId" params={{ chapterId: 'sampling' }} search={(prev) => prev}>
+                Sampling chapter
+              </Link>{' '}
+              showed.
+            </p>
+
+            <h2>None of this is a bug</h2>
+            <p>
+              These aren't defects waiting for a patch — they're the honest shape of a system that predicts one
+              plausible token at a time. Knowing them is exactly what separates using an LLM well from being blindsided
+              by it. That's the real payoff of having traced the whole forward pass: the model stops being magic, and
+              starts being a tool whose strengths and edges you can actually reason about.
+            </p>
+          </Prose>
+        </div>
       </div>
     </ChapterFrame>
   );

@@ -11,6 +11,8 @@ import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { FfnNeurons } from '../widgets/FfnNeurons';
+import { SiluVsRelu } from '../widgets/SiluVsRelu';
+import { SwiGluVsPlain } from '../widgets/SwiGluVsPlain';
 
 const DEFAULT_PROMPT = 'Once upon a time, in a forest far away,';
 const DEFAULT_NUM_LAYERS = 24;
@@ -50,7 +52,7 @@ export const learning: ChapterLearningData = {
     "Describe how a SwiGLU gated MLP transforms a single token's hidden state and how it relates to the residual stream.",
   problem:
     'Attention mixes information across tokens but cannot do per-token feature computation; the MLP is where that work lives.',
-  minutes: 7,
+  minutes: 8,
   glossary: [
     {
       term: 'MLP block',
@@ -222,12 +224,36 @@ export function MlpChapterBody() {
 
         <FfnNeurons />
 
+        <SiluVsRelu />
+
+        <h2>Why gated — and why it isn't any bigger</h2>
+        <p>
+          You might wonder why three matrices. The classic feed-forward block — the one in the original Transformer —
+          used just two: an up-projection, a fixed nonlinearity (ReLU or GELU), then a down-projection. SwiGLU keeps the
+          up and down matrices but adds a third, the <code>gate</code>, and replaces the fixed nonlinearity with a
+          learned, multiplicative one. Instead of applying the same threshold to every feature, the gate lets the
+          network decide — per token, per feature — <em>how much</em> of each up-projected value survives. That
+          input-dependent gating is strictly more expressive than a fixed activation, and in practice it trains to lower
+          loss.
+        </p>
+        <p>
+          The natural objection: doesn't a third matrix cost 50% more parameters? At the classic 4× intermediate it
+          would — three 4×-wide matrices come to <code>12 h²</code> against the plain block's <code>8 h²</code>. The
+          conventional fix (Llama, Mistral) shrinks the intermediate to about ⅔ of that (<code>≈ 8⁄3 · hidden</code>),
+          so three narrower matrices land right back at <code>8 h²</code> — the break-even the diagram below shows.
+          Toggle it to watch the bar re-proportion while its total length stays fixed. (Qwen3.5 doesn't shrink quite
+          that far — see the note under the diagram.)
+        </p>
+
+        <SwiGluVsPlain />
+
         <h2>The MLP contributes a small correction</h2>
         <p>
           Here is the surprising part: the MLP's raw output is <em>much smaller</em> than the residual stream it writes
-          into. The residual stream has been accumulating contributions for many layers, so its per-token L2 grows. Each
-          individual MLP's output is a small delta on top — a correction, not a replacement. Watch the chart below:{' '}
-          <strong>MLP output</strong> per-token L2 is a fraction of the layer's full output L2. The bulk of the
+          into. Because every block <em>adds</em> its output into the stream — it never overwrites — those contributions
+          accumulate layer over layer, so the residual stream's per-token L2 grows even though each individual write is
+          small. Each individual MLP's output is a small delta on top — a correction, not a replacement. Watch the chart
+          below: <strong>MLP output</strong> per-token L2 is a fraction of the layer's full output L2. The bulk of the
           magnitude in the residual stream came from the input, not from this layer's MLP.
         </p>
         <p>

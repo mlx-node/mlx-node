@@ -39,6 +39,7 @@ pub mod sampling;
 pub mod sft;
 pub mod stream;
 pub mod tensor;
+pub mod tiny_trainer;
 pub mod tokenizer;
 pub mod tools;
 #[cfg(not(target_family = "wasm"))]

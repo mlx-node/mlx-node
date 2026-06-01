@@ -10,6 +10,7 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { LearnedGainInspector } from '../widgets/LearnedGainInspector';
 
 const DEFAULT_PROMPT = 'The river flows softly through the valley.';
 const DEFAULT_NUM_LAYERS = 24;
@@ -103,7 +104,7 @@ export const learning: ChapterLearningData = {
   objective: 'Explain what RMSNorm does to a hidden vector and why pre-norm makes deep transformers trainable.',
   problem:
     "Each layer adds attention and MLP outputs back into the same residual stream — without normalization the magnitudes drift across 24 layers, softmaxes saturate, and training breaks. RMSNorm's whole job is to put the brakes on.",
-  minutes: 6,
+  minutes: 7,
   glossary: [
     {
       term: 'RMSNorm',
@@ -134,6 +135,11 @@ export const learning: ChapterLearningData = {
       term: 'learned gain (g)',
       definition:
         'A per-feature scale RMSNorm applies after dividing by RMS. The only learned parameter the normalizer carries.',
+    },
+    {
+      term: 'gradient path / identity path',
+      definition:
+        "The route the training signal takes backward through the network. The residual highway is an identity path because it passes that signal through unchanged (multiplies by 1), so it doesn't shrink toward zero (vanish) across many layers.",
     },
   ],
   takeaways: [
@@ -240,10 +246,14 @@ export function RmsNormChapterBody() {
         <p>
           The learned gain <code>g</code> is the only parameter the normalizer carries — one scalar per feature, length
           equal to <code>hidden_dim</code>. Divide by RMS first to make the vector's average squared magnitude land at
-          1, then let <code>g</code> reweight each feature however the model wants. Initially <code>g = 1</code> for
-          every feature, so before training RMSNorm just standardises magnitudes; during training the model learns which
+          1; with mean(x²) ≈ 1, the squared entries sum to ≈ hidden_dim, so the vector's length is{' '}
+          <code>L2 = √(Σx²) ≈ √hidden_dim = √1024 = 32</code> — that is where the &ldquo;about 32&rdquo; comes from.
+          Then let <code>g</code> reweight each feature however the model wants. Initially <code>g = 1</code> for every
+          feature, so before training RMSNorm just standardises magnitudes; during training the model learns which
           features matter more than others and bakes that into <code>g</code>.
         </p>
+
+        <LearnedGainInspector />
 
         <p>Side-by-side with the older LayerNorm, the simplification is obvious:</p>
         <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-[12px] leading-relaxed">

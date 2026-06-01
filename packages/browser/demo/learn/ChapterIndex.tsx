@@ -7,10 +7,15 @@ import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Textarea } from '../components/ui/textarea';
 import { runForInspector } from '../lib/inspector-client';
-import { CHAPTERS, type ChapterMeta } from './chapters';
+import { CHAPTERS, findChapter, type ChapterMeta } from './chapters';
 import { cleanupTokenText, renderTokenDisplay } from './inspector/TopKBars';
 import { RunButton } from './scaffolding/RunButton';
 import { useRunFlash } from './scaffolding/useRunFlash';
+
+/** Chapter number for a stable chapter id, looked up from the registry. The
+ *  forward-pass diagram labels its stages by id; deriving the number here (vs
+ *  hardcoding it) keeps the chips from desyncing when chapters are renumbered. */
+const chNum = (id: string): number => findChapter(id)?.number ?? 0;
 
 export type ChapterIndexProps = {
   onOpenChapter: (chapterId: string) => void;
@@ -57,8 +62,8 @@ export function ChapterIndex({
           </div>
           <h1 className="text-4xl font-semibold tracking-tight text-foreground">Chapters</h1>
           <p className="mt-3 max-w-2xl text-muted-foreground">
-            Thirteen guided lessons that explain how a modern transformer LLM works, using the real model running in
-            your browser via WebGPU. Read the prose on the left, then poke at the live model on the right.
+            {CHAPTERS.length} guided lessons that explain how a modern transformer LLM works, using the real model
+            running in your browser via WebGPU. Read the prose on the left, then poke at the live model on the right.
           </p>
         </div>
 
@@ -576,8 +581,8 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
           <div className="min-w-[16rem] flex-1">
             <label className="block font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Prompt</label>
             {/*
-              Ghost-prediction overlay — same pattern as chapter 3 (Attention)
-              and chapter 4 (GQA). A sibling div sits behind the textarea,
+              Ghost-prediction overlay — same pattern as chapter 4 (Attention)
+              and chapter 5 (GQA). A sibling div sits behind the textarea,
               mirrors the prompt invisibly (text-transparent), then renders the
               actually-sampled next token at the end with the rainbow shimmer.
               The textarea has `bg-transparent` so the ghost shows through.
@@ -715,6 +720,43 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
         Watch the stack: full-attention layers (cyan) compute Q · Kᵀ · softmax over all past tokens; linear layers
         (amber, GatedDeltaNet) maintain a recurrent state — Qwen3.5 interleaves them 1:3.
       </p>
+
+      <p className="text-xs text-muted-foreground">
+        This is one turn of the loop. The model appends that next token and runs the whole stack again — but on the next
+        pass it doesn&apos;t recompute the prefix: the{' '}
+        <button
+          type="button"
+          onClick={() => onOpenChapter('kv-cache')}
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          KV cache (chapter {chNum('kv-cache')})
+        </button>{' '}
+        is reused — the prefix isn&apos;t recomputed, so each new token is far cheaper than reprocessing the whole
+        context. Generation is this forward pass, looped.
+      </p>
+
+      <p className="text-xs text-muted-foreground">
+        Honest framing: this diagram shows <strong>greedy</strong> completion — it always takes the single highest-logit
+        token, so the same prompt gives the same answer every time here. Real generation usually{' '}
+        <button
+          type="button"
+          onClick={() => onOpenChapter('sampling')}
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          samples
+        </button>{' '}
+        from the distribution, so an identical prompt can come out differently from run to run. The revealed
+        continuation is also <strong>capped</strong> at {REVEAL_TOKEN_CAP} tokens — raw greedy decoding loops past that
+        — so this is a window onto the first few predictions, not a full reply. See the{' '}
+        <button
+          type="button"
+          onClick={() => onOpenChapter('architecture')}
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          whole-model chapter
+        </button>{' '}
+        for the finished picture and its limits.
+      </p>
     </div>
   );
 }
@@ -751,8 +793,8 @@ type StageStackProps = {
 };
 
 const FIXED_HEAD: { id: 'tokenize' | 'embedding'; label: string; chapterId: string; chapterNum: number }[] = [
-  { id: 'tokenize', label: 'Tokenize', chapterId: 'tokenization', chapterNum: 1 },
-  { id: 'embedding', label: 'Embedding lookup', chapterId: 'embeddings', chapterNum: 2 },
+  { id: 'tokenize', label: 'Tokenize', chapterId: 'tokenization', chapterNum: chNum('tokenization') },
+  { id: 'embedding', label: 'Embedding lookup', chapterId: 'embeddings', chapterNum: chNum('embeddings') },
 ];
 
 const FIXED_TAIL: {
@@ -761,9 +803,9 @@ const FIXED_TAIL: {
   chapterId: string;
   chapterNum: number;
 }[] = [
-  { id: 'final_norm', label: 'Final RMSNorm', chapterId: 'rmsnorm', chapterNum: 6 },
-  { id: 'lm_head', label: 'LM head → 152K logits', chapterId: 'lm-head', chapterNum: 9 },
-  { id: 'sampling', label: 'Sampling → next token', chapterId: 'sampling', chapterNum: 10 },
+  { id: 'final_norm', label: 'Final RMSNorm', chapterId: 'rmsnorm', chapterNum: chNum('rmsnorm') },
+  { id: 'lm_head', label: 'LM head → 248K logits', chapterId: 'lm-head', chapterNum: chNum('lm-head') },
+  { id: 'sampling', label: 'Sampling → next token', chapterId: 'sampling', chapterNum: chNum('sampling') },
 ];
 
 /** Card-stack viewport height in px. Tall enough for the front card body. */
@@ -817,7 +859,9 @@ function StageStack({
           {/* Card-stack viewport — Apple-Wallet-style coordinated shuffle. */}
           <div className="mt-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/[0.04] p-2">
             <div className="mb-2 flex items-center justify-between px-1 text-[10px] font-mono tracking-wider text-emerald-700/80 dark:text-emerald-300/80">
-              <span>× {NUM_LAYERS} LAYERS · chapter 8 (full block)</span>
+              <span>
+                × {NUM_LAYERS} LAYERS · chapter {chNum('full-block')} (full block)
+              </span>
               <span
                 className={[
                   'rounded-md border px-2 py-0.5 font-mono text-[11px] tracking-wider',
@@ -1059,7 +1103,7 @@ function LayerCard({ index, isFull, rel, activeSubId, onOpenChapter, reducedMoti
 
   const cardState = rel === 0 ? 'front' : rel > 0 ? 'peek' : 'history';
   const chapterId = isFull ? 'attention' : 'kv-cache';
-  const chapterNum = isFull ? 3 : 11;
+  const chapterNum = chNum(chapterId);
   const subs = isFull ? FULL_ATTN_SUBS : LINEAR_ATTN_SUBS;
 
   return (

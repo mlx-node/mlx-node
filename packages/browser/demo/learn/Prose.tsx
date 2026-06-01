@@ -15,8 +15,16 @@ export function Prose({ className, children, ...props }: React.ComponentProps<'d
     <div
       data-slot="prose"
       className={cn(
-        // base color + measure
-        'max-w-prose text-[15px] leading-7 text-foreground/90',
+        // base color + type scale. Width is intentionally NOT capped here: the
+        // chapter body fills its layout column so the prose right-edge lines up
+        // with the scaffolding cards (objective / pipeline / glossary), which
+        // span the same column. The reading width is set once, upstream — the
+        // panel-less reading wrapper in LessonLayout (`max-w-3xl`) and the grid
+        // reading column for try-it chapters. A separate `max-w-prose` here was
+        // ~150px narrower than that column, so the prose stranded left of the
+        // cards' right edge. (Architecture's poster opts out via `lg:max-w-none`,
+        // now a no-op, and stays full-width.)
+        'text-[15px] leading-7 text-foreground/90',
         // headings
         '[&_h1]:text-3xl [&_h1]:font-semibold [&_h1]:tracking-tight [&_h1]:mt-0 [&_h1]:mb-4 [&_h1]:text-foreground',
         '[&_h2]:text-xl [&_h2]:font-semibold [&_h2]:tracking-tight [&_h2]:mt-8 [&_h2]:mb-3 [&_h2]:text-foreground',

@@ -1888,6 +1888,58 @@ export declare class TextRecModel {
   recognizeCrop(rgbData: Uint8Array, width: number, height: number): RecResult;
 }
 
+/**
+ * A tiny, fully in-process trainable Qwen3-shaped transformer.
+ *
+ * All weights are fp32 and live in `params`, keyed by the same names the
+ * functional forward pass (`qwen3_forward_functional`) expects. Training
+ * state (the AdamW moment estimates) is held inside `optimizer` and persists
+ * across `train_step` calls.
+ */
+export declare class TinyTrainer {
+  /**
+   * Create a new trainer.
+   *
+   * * `config` - Qwen3 model shape. Use a small config; `tie_word_embeddings`
+   *   is honored (when true the lm_head reuses `embedding.weight`).
+   * * `seed` - RNG seed for **weight initialization only**. It does not affect
+   *   `sample()` draws (sampling uses a separate fixed thread-local RNG on
+   *   WASM).
+   * * `learning_rate` - AdamW learning rate (default 3e-3).
+   */
+  constructor(config: Qwen3Config, seed: number, learningRate?: number | undefined | null);
+  /**
+   * Run a single teacher-forced training step over `token_ids`.
+   *
+   * The sequence is fed as both input and labels; inside the loss closure the
+   * logits/labels are shifted by one position (predict-next-token), matching
+   * the native SFT loop. Returns the (pre-update) scalar loss for this step.
+   *
+   * Requires `token_ids.len() >= 2` (at least one shift target).
+   */
+  trainStep(tokenIds: Array<number>): number;
+  /**
+   * Autoregressively sample `n` tokens continuing `prompt_ids`.
+   *
+   * Returns only the newly generated tail (ids after the prompt). Stops early
+   * if the configured EOS id is produced. `temperature <= 0` is greedy.
+   *
+   * Note: generation draws use a fixed thread-local RNG (not seeded by the
+   * trainer `seed`), so only weight init is reproducible via `seed`.
+   */
+  sample(promptIds: Array<number>, n: number, temperature: number): Array<number>;
+  /** Re-initialize all weights from `seed` and reset the optimizer + step. */
+  reset(seed: number): void;
+  /** Number of training steps performed since construction / last `reset`. */
+  get step(): number;
+  /**
+   * The RNG seed used for the current weight initialization (set at
+   * construction or the last `reset`). Useful for the UI to display and
+   * reproduce a run. Seeds weight init only — not `sample()` draws.
+   */
+  get seed(): number;
+}
+
 /** Result from VLM chat */
 export declare class VlmChatResult {
   /** Get the response text */
@@ -3541,6 +3593,26 @@ export interface VlmChatMessage {
   /** Text content of the message */
   content: string;
 }
+
+/**
+ * Direct correctness probe for the WebGPU scatter_add (Gather::vjp) kernel.
+ *
+ * Computes d/dtable of `sum(take(table, [3, 3, 3], axis=0))` for
+ * `table = zeros([5, 1])`. The three gathers all collide on row 3, so the
+ * gradient must ACCUMULATE them into that row => `3.0`. A broken
+ * last-write-wins scatter would instead yield `1.0` there.
+ *
+ * `take` is a `Gather` whose vjp is exactly the `Scatter` Sum-reduce path,
+ * the same op the embedding-table gradient (`embedding_functional`) exercises
+ * during training. Running it through `value_and_grad` + `eval` on whatever
+ * device is active means this validates the shipped WGSL kernel end-to-end
+ * (the WebGPU device in the browser), not just the training loss curve.
+ *
+ * Returns the full gradient column flattened to `f64` (length 5). For a
+ * correct kernel that is `[0.0, 0.0, 0.0, 3.0, 0.0]`; a broken
+ * last-write-wins kernel yields `[0.0, 0.0, 0.0, 1.0, 0.0]`.
+ */
+export declare function webgpuScatterAddSelftest(): Array<number>;
 
 /** Read the current state of the GDN compute_g compile flag. */
 export declare function wgpuGetGdnGCompileEnabled(): boolean;

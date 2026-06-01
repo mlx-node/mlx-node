@@ -14,11 +14,13 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { AttentionPipeline } from '../widgets/AttentionPipeline';
+import { GqaGroupSweep } from '../widgets/GqaGroupSweep';
 import { MhaVsGqaCacheBar } from '../widgets/MhaVsGqaCacheBar';
 import { MultiheadConcat } from '../widgets/MultiheadConcat';
 import { PatternDetectorPanel } from '../widgets/PatternDetectorPanel';
 
-// Default prompt deliberately stops mid-sentence — matches chapter 3 so a
+// Default prompt deliberately stops mid-sentence — matches chapter 4 so a
 // learner sees the same "model predicts the next word" framing carry over,
 // and so the rainbow ghost prediction has something meaningful to render
 // at the end of the prompt.
@@ -26,6 +28,9 @@ const DEFAULT_PROMPT = 'The cat sat on the';
 const QWEN_NUM_HEADS = 8;
 const QWEN_NUM_KV_HEADS = 2;
 const QWEN_HEAD_DIM = 256;
+// Qwen3.5-0.8B hidden_size. Used only in prose to show head_dim is decoupled
+// from hidden / num_heads (1024 / 8 = 128 ≠ head_dim = 256).
+const QWEN_HIDDEN_DIM = 1024;
 // Realistic decode context length; makes the KV-cache savings tangible (~MB scale).
 const ASSUMED_DECODE_SEQ_LEN = 4096;
 
@@ -50,7 +55,7 @@ export const learning: ChapterLearningData = {
   objective: 'Explain why attention is run as multiple heads and how grouped-query attention shrinks the KV cache.',
   problem:
     'A single attention head can model one pattern at a time, and giving every query head its own K/V blows up cache memory at long context.',
-  minutes: 8,
+  minutes: 10,
   glossary: [
     {
       term: 'head',
@@ -151,21 +156,32 @@ export function MultiheadGqaChapterBody() {
       <Prose>
         <h1>Multi-head attention &amp; GQA</h1>
         <p>
-          Chapter 3 introduced attention as a single operation: <code>softmax(QKᵀ/√d)·V</code>. In real LLMs, that
-          operation is run <em>many times in parallel</em>, once per <strong>head</strong>, and the results are
-          concatenated and projected back together. The reason is capacity: a single head can model one type of
-          relationship at a time — say, "look at the previous token." Multiple heads in parallel let the model attend to
-          different patterns simultaneously: one head can chase the previous token, another the matching bracket,
-          another the subject—verb agreement at distance.
+          Chapter 4 introduced attention as a single operation: <code>softmax(QKᵀ/√d)·V</code> (here that{' '}
+          <code>√d</code> is <code>√head_dim</code>, the per-head width — <code>√{QWEN_HEAD_DIM} = 16</code> for Qwen3.5
+          — not the full hidden size). In real LLMs, that operation is run <em>many times in parallel</em>, once per{' '}
+          <strong>head</strong>, and the results are concatenated and projected back together. The reason is capacity: a
+          single head can model one type of relationship at a time — say, "look at the previous token." Multiple heads
+          in parallel let the model attend to different patterns simultaneously: one head can chase the previous token,
+          another the matching bracket, another the subject—verb agreement at distance.
         </p>
+
+        <p>
+          Before zooming into heads and the KV cache, here is the whole attention block on one diagram — every stage
+          this chapter and the last one taught separately, wired together end to end. Step through it, then flip the
+          toggle to see how Qwen3.5&apos;s <em>linear</em> layers replace the whole quadratic pipeline with a single
+          recurrent state.
+        </p>
+
+        <AttentionPipeline />
 
         <h2>Standard multi-head attention (MHA)</h2>
         <p>
-          For hidden size <code>d</code> and <code>H</code> heads, each head has its own slice of dimension{' '}
-          <code>d_head = d / H</code>. The model projects the token vector to a Q, K and V of shape{' '}
-          <code>[H, seq, d_head]</code> by using three full <code>d × d</code> weight matrices, then reshaping. Each
-          head runs its own attention over its own Q/K/V slice; the <code>H</code> outputs are concatenated back into a{' '}
-          <code>d</code>-wide vector that flows on through the layer.
+          For hidden size <code>d</code> and <code>H</code> heads, each head gets its own dimension <code>d_head</code>{' '}
+          — classically <code>d_head = d / H</code>, so the heads tile the hidden width exactly (many models, including
+          Qwen3.5, decouple the two — more below). The model projects the token vector to a Q, K and V of shape{' '}
+          <code>[H, seq, d_head]</code> with three weight matrices, then reshapes. Each head runs its own attention over
+          its own Q/K/V slice; the <code>H</code> outputs are concatenated and projected back into a <code>d</code>-wide
+          vector that flows on through the layer.
         </p>
         <p>
           At inference, K and V for each token are <strong>cached</strong> across generation steps — that's what makes
@@ -203,6 +219,23 @@ export function MultiheadGqaChapterBody() {
           Qwen3.5 variants keep the same <code>group_size = 4</code> ratio.
         </p>
         <p>
+          Notice that Qwen3.5 <strong>decouples</strong> <code>head_dim</code> from <code>hidden / H</code>: the classic
+          default would be{' '}
+          <code>
+            {QWEN_HIDDEN_DIM} / {QWEN_NUM_HEADS} = {QWEN_HIDDEN_DIM / QWEN_NUM_HEADS}
+          </code>
+          , but it picks <code>head_dim = {QWEN_HEAD_DIM}</code> independently — per-head width is a free
+          hyperparameter. So the query projection maps{' '}
+          <code>
+            hidden = {QWEN_HIDDEN_DIM} → H · head_dim = {QWEN_NUM_HEADS} · {QWEN_HEAD_DIM} ={' '}
+            {QWEN_NUM_HEADS * QWEN_HEAD_DIM}
+          </code>
+          , not a square <code>d × d</code> matrix. (In Qwen3.5 the full <code>q_proj</code> weight is actually twice
+          as wide — <code>{2 * QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> outputs — because it also emits a per-head{' '}
+          <em>output gate</em> next to the queries, as the pipeline diagram above shows; the{' '}
+          <code>{QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> above is the query half.)
+        </p>
+        <p>
           Layers in Qwen3.5 alternate: most are <em>linear-attention</em> (a recurrent variant outside this chapter's
           scope), and every fourth layer is the classic <em>full-attention</em> layer with softmax scores you can
           inspect. The layer selector below restricts to the latter.
@@ -222,6 +255,13 @@ export function MultiheadGqaChapterBody() {
           models (PaLM, Falcon) used MQA. The consensus today is that GQA with a moderate group size (typically 4–8)
           recovers most of MHA's quality at most of MQA's cache savings.
         </p>
+        <p>
+          Sweep the whole spectrum below. As you move from MHA (8 KV heads) down to MQA (1), the per-layer KV cache
+          shrinks linearly. Every variant keeps all eight query heads, so the query side is untouched — what shrinks is
+          the number of distinct key/value subspaces, since the query heads in a group must now share one K/V.
+        </p>
+
+        <GqaGroupSweep />
 
         <h2>What different heads end up doing</h2>
         <p>
@@ -240,7 +280,7 @@ export function MultiheadGqaChapterBody() {
         <MhaVsGqaCacheBar />
 
         <p className="mt-6 text-muted-foreground">
-          The widget on the right runs the same <code>"The cat sat on the"</code> prompt as chapter 3 and ghosts the
+          The widget on the right runs the same <code>"The cat sat on the"</code> prompt as chapter 4 and ghosts the
           model's predicted next token at the end with a rainbow shimmer. The lane diagram above shows which query heads
           share which K/V head, and the two-up heatmaps below compare two query heads in the same group — same K,
           different Q, so different attention patterns over the same keys.
@@ -284,7 +324,7 @@ function defaultHeadCounts(run: AttentionRun | null): {
 export function MultiheadGqaDemo({ workerRef, abortRef }: MultiheadGqaDemoProps) {
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
-  // Mirror of chapter 3: track the exact prompt that produced `run` so we
+  // Mirror of chapter 4: track the exact prompt that produced `run` so we
   // can ghost the prediction onto the textarea only while it's still
   // semantically valid (i.e. the user hasn't edited the prompt yet).
   const [lastRunPrompt, setLastRunPrompt] = React.useState<string | null>(null);
@@ -433,7 +473,7 @@ export function MultiheadGqaDemo({ workerRef, abortRef }: MultiheadGqaDemoProps)
           Prompt
         </label>
         {/*
-          Same ghost-prediction overlay pattern as chapter 3: a sibling div
+          Same ghost-prediction overlay pattern as chapter 4: a sibling div
           mirrors the prompt (invisibly, for layout) and renders the
           predicted next token at the end with an animated chromatic
           rainbow. Textarea sits on top with a transparent background so

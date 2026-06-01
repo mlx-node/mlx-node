@@ -27,10 +27,25 @@ const STEP_LABELS = [
   { kind: 'exit', label: 'lm_head(h₄) → logits' },
 ] as const;
 
+// In overwrite mode the same steps REPLACE instead of add, so the readout
+// formulas drop the "hₙ₋₁ +" term (h := Δ). Parallel to STEP_LABELS by index.
+const OVERWRITE_STEP_LABELS = [
+  'h₀  (embedding + RoPE)',
+  'h₁ = attn(norm(h₀))',
+  'h₂ = mlp(norm(h₁))',
+  'h₃ = attn(norm(h₂))',
+  'h₄ = mlp(norm(h₃))',
+  'lm_head(h₄) → logits',
+] as const;
+
 // Heights chosen to monotonically grow — each layer adds a contribution, so
 // L2 norm climbs. Real Qwen3.5 magnitudes climb roughly like this through
 // the 24-layer stack; we compress to 4 writes for visualization.
 const HEIGHTS = [22, 30, 38, 48, 60];
+// Overwrite mode: each sub-block REPLACES the stream with just its own output,
+// so the column jumps to roughly one block's magnitude and never accumulates.
+// Same length as HEIGHTS so every geometry helper indexes identically.
+const OVERWRITE_HEIGHTS = [22, 27, 24, 28, 23];
 const COLORS = [
   'oklch(0.65 0.13 250)', // h0 — cool blue, "input"
   'oklch(0.68 0.14 230)',
@@ -42,9 +57,37 @@ const COLORS = [
 const ATTN_COLOR = 'oklch(0.7 0.16 60)'; // warm orange
 const MLP_COLOR = 'oklch(0.62 0.18 300)'; // purple
 
+function ToggleButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={[
+        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
+      ].join(' ')}
+    >
+      {children}
+    </button>
+  );
+}
+
 export function ResidualStream() {
   const [step, setStep] = React.useState(0);
-  const [playing, setPlaying] = React.useState(true);
+  const [playing, setPlaying] = React.useState(() =>
+    typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
+  );
+  const [mode, setMode] = React.useState<'add' | 'overwrite'>('add');
+  const heights = mode === 'add' ? HEIGHTS : OVERWRITE_HEIGHTS;
 
   React.useEffect(() => {
     if (!playing) return;
@@ -72,9 +115,9 @@ export function ResidualStream() {
   // Cumulative height at each step (after k writes have happened). step=0
   // shows only the input; step=5 shows the final read by lm_head.
   const filledHeight = (s: number): number => {
-    if (s <= 0) return HEIGHTS[0]!;
-    if (s >= HEIGHTS.length) return HEIGHTS[HEIGHTS.length - 1]!;
-    return HEIGHTS[s]!;
+    if (s <= 0) return heights[0]!;
+    if (s >= heights.length) return heights[heights.length - 1]!;
+    return heights[s]!;
   };
   const filled = filledHeight(step);
 
@@ -92,6 +135,14 @@ export function ResidualStream() {
           The residual stream — one vector, written into 2× per layer
         </div>
         <div className="inline-flex items-center gap-2">
+          <div className="inline-flex rounded-md border border-border p-0.5">
+            <ToggleButton active={mode === 'add'} onClick={() => setMode('add')}>
+              Add (h += Δ)
+            </ToggleButton>
+            <ToggleButton active={mode === 'overwrite'} onClick={() => setMode('overwrite')}>
+              Overwrite (h = new)
+            </ToggleButton>
+          </div>
           <button
             type="button"
             onClick={() => setPlaying((p) => !p)}
@@ -125,15 +176,22 @@ export function ResidualStream() {
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        The hidden state for one token, drawn as a column that grows as each sub-block writes a correction into it.
-        Attention writes from the left, MLP writes from the right. Nothing ever overwrites — every operation is{' '}
-        <code>h := h + Δ</code>. Two layers shown; Qwen3.5-0.8B does this 24 times.
-      </p>
+      {mode === 'add' ? (
+        <p className="text-[12px] text-foreground/85">
+          The hidden state for one token, drawn as a column that grows as each sub-block writes a correction into it.
+          Attention writes from the left, MLP writes from the right. Nothing ever overwrites — every operation is{' '}
+          <code>h := h + Δ</code>. Two layers shown; Qwen3.5-0.8B does this 24 times.
+        </p>
+      ) : (
+        <p className="text-[12px] text-foreground/85">
+          In this mode each sub-block <strong>replaces</strong> the stream — <code>h := Δ</code> — so the running state
+          is thrown away every write. Watch the column fail to climb.
+        </p>
+      )}
 
       <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label="Residual stream animation">
         {/* baseline ticks for h0..h4 */}
-        {HEIGHTS.map((h, i) => {
+        {heights.map((h, i) => {
           const y = baseY - h * 5;
           return (
             <g key={`tick-${i}`}>
@@ -195,8 +253,8 @@ export function ResidualStream() {
         {STEP_LABELS.map((s, idx) => {
           if (s.kind === 'enter' || s.kind === 'exit') return null;
           // Step idx → which level of the stream this write lands at.
-          // Write lands at HEIGHTS[idx] (idx === 1..4 maps to the 1st..4th write).
-          const landingY = baseY - HEIGHTS[idx]! * 5;
+          // Write lands at heights[idx] (idx === 1..4 maps to the 1st..4th write).
+          const landingY = baseY - heights[idx]! * 5;
           const isActive = step === idx;
           const wasDone = step > idx;
           const isAttn = s.kind === 'attn';
@@ -239,7 +297,7 @@ export function ResidualStream() {
                 strokeWidth={isActive ? 2 : 1.2}
                 markerEnd={`url(#arrow-${isAttn ? 'attn' : 'mlp'})`}
               />
-              {/* "+= " label */}
+              {/* "+= " / ":= " label */}
               {isActive ? (
                 <text
                   x={(sideX + arrowEndX) / 2}
@@ -249,7 +307,7 @@ export function ResidualStream() {
                   fill={blockColor}
                   fontFamily="monospace"
                 >
-                  +=
+                  {mode === 'add' ? '+=' : ':='}
                 </text>
               ) : null}
             </g>
@@ -303,15 +361,34 @@ export function ResidualStream() {
       <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px]">
         <span className="text-muted-foreground">Step {step}: </span>
         <span className="font-mono text-foreground/95">
-          {step < STEP_LABELS.length ? STEP_LABELS[step]!.label : 'next token sampled →'}
+          {step < STEP_LABELS.length
+            ? mode === 'add'
+              ? STEP_LABELS[step]!.label
+              : OVERWRITE_STEP_LABELS[step]!
+            : 'next token sampled →'}
         </span>
       </div>
 
-      <p className="text-[11px] text-muted-foreground">
-        Three things to notice. First, the stream never gets <em>narrower</em> — there is no operation in the layer that
-        subtracts or replaces. Second, the same column is read and written by every sub-block; it's a single running
-        address space the whole network shares. Third, the LM head at the top reads the <em>top</em> of the stream —
-        every layer's contribution is visible to the final prediction, not just the last one.
+      {mode === 'add' ? (
+        <p className="text-[11px] text-muted-foreground">
+          Three things to notice. First, the stream never gets <em>narrower</em> — there is no operation in the layer
+          that subtracts or replaces. Second, the same column is read and written by every sub-block; it's a single
+          running address space the whole network shares. Third, the LM head at the top reads the <em>top</em> of the
+          stream — every layer's contribution is visible to the final prediction, not just the last one.
+        </p>
+      ) : (
+        <p className="text-[11px] text-muted-foreground">
+          This is a deliberately destructive toy — a pure <code>h := Δ</code> that throws the old state away on every
+          write, so the column never accumulates. Real non-residual networks aren&apos;t this extreme (they transform
+          the state, <code>h := F(h)</code>), but they still give up what the residual stream buys for free: a clean
+          identity path, every layer&apos;s contribution preserved by addition, and stable gradients straight back to
+          the input. That is why real transformers <em>add</em> (<code>h += Δ</code>) instead of replacing.
+        </p>
+      )}
+
+      <p className="text-[10px] text-muted-foreground">
+        Illustrative — heights are a synthetic stand-in for the residual-stream magnitude; Qwen3.5-0.8B does this 24
+        times. Not live output from the model.
       </p>
     </div>
   );

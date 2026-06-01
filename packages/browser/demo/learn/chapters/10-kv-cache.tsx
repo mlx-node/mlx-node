@@ -5,11 +5,14 @@ import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { GenerationLoopTrace } from '../widgets/GenerationLoopTrace';
 import { KvGrowthCurve } from '../widgets/KvGrowthCurve';
 import { PrefillVsDecodeChart } from '../widgets/PrefillVsDecodeChart';
+import { RecallFailure } from '../widgets/RecallFailure';
+import { RunningStateVsCache } from '../widgets/RunningStateVsCache';
 
 /**
- * Chapter 11 — KV cache & hybrid attention.
+ * Chapter 12 — KV cache & hybrid attention.
  *
  * JS-only: every number here is derivable from Qwen3.5-0.8B's config (see
  * packages/browser/demo/public/model/config.json and the layer_types array
@@ -44,9 +47,10 @@ const NUM_FULL_LAYERS = FULL_LAYER_INDICES.length;
 const NUM_LINEAR_LAYERS = NUM_LAYERS - NUM_FULL_LAYERS;
 
 // GatedDeltaNet per-layer recurrent state. The exact form is a fixed-size
-// tensor [num_linear_heads, head_dim, head_dim] that compresses the entire
-// history — independent of sequence length. We use the same head count as
-// the linear attention block in Qwen3.5's config.
+// tensor [linear_num_value_heads, value_head_dim, key_head_dim] = [16, 128, 128]
+// that compresses the entire history — independent of sequence length. These
+// are the linear-attention dims from Qwen3.5's config (distinct from the
+// full-attention 8 heads × 256 head-dim).
 const LINEAR_NUM_HEADS = 16;
 const LINEAR_HEAD_DIM = 128;
 const LINEAR_STATE_SIZE_BYTES = LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
@@ -85,7 +89,7 @@ function formatTokens(n: number): string {
 }
 
 /**
- * Scaffolding metadata for chapter 11 — drives the header, glossary,
+ * Scaffolding metadata for chapter 12 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
  * `chapterId` must match the 'kv-cache' entry in `learn/chapters.ts`.
  */
@@ -95,7 +99,7 @@ export const learning: ChapterLearningData = {
     "Explain why the KV cache exists, how it grows with context, and what Qwen3.5's hybrid attention buys you in memory.",
   problem:
     'Without caching K and V, each decoded token would redo all of attention from scratch — making generation quadratic in context length.',
-  minutes: 8,
+  minutes: 10,
   glossary: [
     {
       term: 'KV cache',
@@ -125,7 +129,12 @@ export const learning: ChapterLearningData = {
     {
       term: 'linear state',
       definition:
-        'Per-layer tensor [linear_heads, head_dim, head_dim] that compresses the entire history; size is independent of sequence length.',
+        'Per-layer tensor of shape [16, 128, 128] (linear value-heads × value-dim × key-dim) that compresses the entire history; size is independent of sequence length.',
+    },
+    {
+      term: 'recurrent state (RNN-style)',
+      definition:
+        'A fixed-size memory the model overwrites and rolls forward at every step — like a running total or moving average — instead of keeping every past item. Linear-attention layers use one so their memory stays constant no matter how long the context grows.',
     },
   ],
   takeaways: [
@@ -167,7 +176,7 @@ export const learning: ChapterLearningData = {
         {
           id: 'b',
           label:
-            "It doesn't — the recurrent state is a fixed-size tensor [heads, head_dim, head_dim] regardless of how many tokens have streamed by.",
+            "It doesn't — the recurrent state is a fixed-size tensor [16, 128, 128] (linear heads × value-dim × key-dim) regardless of how many tokens have streamed by.",
         },
         {
           id: 'c',
@@ -243,6 +252,8 @@ export function KvCacheChapterBody() {
           context length, and for long contexts it dwarfs the weights.
         </p>
 
+        <GenerationLoopTrace />
+
         <h2>The arithmetic for Qwen3.5-0.8B</h2>
         <p>
           Per full-attention layer, per token, the cache costs{' '}
@@ -265,12 +276,13 @@ export function KvCacheChapterBody() {
         <p>
           Qwen3.5 interleaves two different kinds of attention layer. <strong>Six</strong> of its {NUM_LAYERS} layers
           (one in every four, at indices {FULL_LAYER_INDICES.join(', ')}) are conventional full-attention layers — the
-          ones from Chapter 3, with the linear-in-
+          ones from Chapter 4, with the linear-in-
           <code>seq_len</code> KV cache. The other {NUM_LINEAR_LAYERS} layers use a{' '}
           <strong>linear attention variant called GatedDeltaNet</strong>. Instead of caching K and V per token, a
           GatedDeltaNet layer compresses the entire history into a <em>fixed-size recurrent state</em> of shape{' '}
-          <code>[num_heads, head_dim, head_dim]</code>. The state is rolled forward at each step the way an RNN's hidden
-          state is — independent of how many tokens have streamed by.
+          <code>[{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]</code> (linear value-heads × value-dim ×
+          key-dim — distinct from the {NUM_HEADS} full-attention heads of head-dim {HEAD_DIM}). The state is rolled
+          forward at each step the way an RNN's hidden state is — independent of how many tokens have streamed by.
         </p>
         <p>
           With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
@@ -278,6 +290,12 @@ export function KvCacheChapterBody() {
           Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart on the right plots that against a
           hypothetical Qwen with full attention on every layer.
         </p>
+        <p>
+          Here is that contrast at the token level: feed the same stream through both kinds of memory and watch one
+          append a box per token while the other updates a single slot in place.
+        </p>
+
+        <RunningStateVsCache />
 
         <h2>The trade-off</h2>
         <p>
@@ -287,6 +305,8 @@ export function KvCacheChapterBody() {
           six full-attention layers brings the exact-recall capability back where it's needed. Concretely: linear layers
           run the long- context flow, full layers handle "look back to <em>that</em> one specific token" jobs.
         </p>
+
+        <RecallFailure />
 
         <h2>Why this is the future</h2>
         <p>

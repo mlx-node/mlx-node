@@ -15,6 +15,7 @@ import {
   splitAssistantThinking,
 } from '../src/generated-text.js';
 import mlxWorkerUrl from '../src/mlx-worker.ts?worker&url';
+import { DEVICE_READY_TYPE } from '../src/training-types.js';
 import { workerAssetUrl } from '../src/worker-asset-url.js';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { type LoadingProgress } from './components/loading/Loading';
@@ -276,6 +277,21 @@ function App() {
   // subsequent setStatus(...) calls (e.g. "Generating...") so the banner
   // doesn't reappear while the user is reading prose.
   const [modelReady, setModelReady] = useState(false);
+  // Flips to `true` once the worker reports `deviceReady` — the WASM runtime +
+  // WebGPU device are up but the big model may NOT be loaded. The Training
+  // chapter gates on this instead of `modelReady` so it can run its tiny
+  // from-scratch trainer without the 1.6 GB model download. A full-model
+  // 'ready' also implies the device is up, so it sets this too.
+  const [deviceReady, setDeviceReady] = useState(false);
+  // Whether the *next* worker bring-up (triggered by a loadKickoff bump) should
+  // be device-only (skip the model fetch). Read inside the load-model effect at
+  // init-post time. A ref (not state) so flipping it doesn't add an effect dep:
+  // the inference path stays byte-for-byte identical when this is false.
+  const deviceOnlyRef = useRef(false);
+  // Whether the worker currently up was brought up in device-only mode. Used by
+  // kickoffLoad to detect the device-only -> full-model upgrade and force a
+  // re-init.
+  const deviceOnlyActiveRef = useRef(false);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
   const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(null);
   const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
@@ -346,6 +362,13 @@ function App() {
     const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
     event.currentTarget.value = '';
     if (!source) return;
+    // This init is meant to LOAD A MODEL. If a DEVICE_ONLY chapter (Training)
+    // previously brought the device up in device-only mode, deviceOnlyRef is
+    // still true; clear it BEFORE bumping the kickoff so startWorker reads
+    // false and the worker actually fetches/loads the picked local model
+    // instead of hitting the device-up early-return. Only kickoffDeviceOnly
+    // sets this ref to true.
+    deviceOnlyRef.current = false;
     setPendingModelSource(source);
     setErrorBannerState(null);
     setLoadingProgress(null);
@@ -1459,7 +1482,29 @@ function App() {
           setSendDisabledState(false);
           setGeneratingState(false);
           setImageCapability((data as { supportsImages?: boolean }).supportsImages === true);
+          // A loaded full model implies the device is up. Mark it ready so any
+          // device-only chapter (e.g. Training) opened later is unblocked too.
+          setDeviceReady(true);
           break;
+
+        case DEVICE_READY_TYPE: {
+          // The WebGPU device + WASM runtime are up. This fires at the device-up
+          // milestone for BOTH a device-only bring-up AND a full-model load (the
+          // latter keeps loading the model afterward). Unblocks DEVICE_ONLY
+          // chapters (Training) without the 1.6 GB download; the status pill
+          // stays in the loading/info state — intentionally NOT a model 'ready'.
+          //
+          // Only record device-only-ACTIVE when the worker is genuinely in
+          // device-only mode. If we set it for a full-model load's early
+          // deviceReady, kickoffLoad() would mistake the in-flight full load for
+          // a device-only worker and tear it down + restart it on every route
+          // effect re-run — an infinite reload loop that never reaches 'ready'.
+          const deviceOnly = (data as { deviceOnly?: boolean }).deviceOnly === true;
+          log(deviceOnly ? 'WebGPU device ready (device-only mode).' : 'WebGPU device ready (model still loading).');
+          deviceOnlyActiveRef.current = deviceOnly;
+          setDeviceReady(true);
+          break;
+        }
 
         case 'stream-sab-open': {
           if (!sharedWasmMemory) {
@@ -1712,6 +1757,10 @@ function App() {
     function resetForModelLoad(label?: string) {
       activeModelLabel = label ?? configuredModelLabel;
       setModelLine(activeModelLabel);
+      // A fresh bring-up starts: the device is not up until the worker reports
+      // back (either 'ready' for a full model or 'deviceReady' for device-only).
+      setDeviceReady(false);
+      deviceOnlyActiveRef.current = false;
       setTelemetryStats(null);
       setPrefillTokensPerSec(null);
       setDecodeTokensPerSec(null);
@@ -1748,12 +1797,21 @@ function App() {
       } = {},
     ) {
       resetForModelLoad(source.label);
+      // Read once, synchronously, at init-post time. When false (the inference
+      // path) the message is byte-for-byte the historical shape; when true the
+      // worker brings the device up and posts `deviceReady` WITHOUT fetching
+      // the model.
+      const deviceOnly = deviceOnlyRef.current;
+      if (deviceOnly) {
+        setStatus('Initializing WebGPU device...', 'info');
+      }
       worker.postMessage({
         type: 'init',
         wasmUrl: new URL(`/mlx-core.opt.wasm?v=${Date.now()}`, location.href).href,
         modelUrl: source.modelUrl ?? configuredModelUrl,
         modelLabel: source.label ?? configuredModelLabel,
         modelFiles: source.modelFiles,
+        deviceOnly,
         packBf16,
         sdpaFallback,
         profile,
@@ -1980,6 +2038,14 @@ function App() {
     // 'loading' (already in-flight) or 'ready' (already done). Routes that
     // need a local-file picker still trigger it via the #model-dir-input
     // <input> separately.
+    //
+    // Exception (device-only upgrade): if the worker is currently up in
+    // device-only mode (brought up for a DEVICE_ONLY chapter, model NOT
+    // fetched), a request for the full model must force a re-init even though
+    // loadKickoff>0 reads as "loading". We clear the device-only flag and bump
+    // the kickoff so the load-model effect tears the worker down and brings it
+    // back up with the model fetch.
+    const deviceOnlyActive = deviceOnlyActiveRef.current || deviceOnlyRef.current;
     const currentStatus =
       errorBannerRef.current != null
         ? 'error'
@@ -1988,7 +2054,25 @@ function App() {
           : loadKickoffRef.current > 0
             ? 'loading'
             : 'idle';
-    if (currentStatus === 'loading' || currentStatus === 'ready') return;
+    if (currentStatus === 'ready') return;
+    if (currentStatus === 'loading' && !deviceOnlyActive) return;
+    // Upgrade (or first load): the next bring-up loads the full model.
+    deviceOnlyRef.current = false;
+    setPendingModelSource(null);
+    setErrorBannerState(null);
+    setLoadingProgress(null);
+    setLoadKickoff((k) => k + 1);
+  }, []);
+
+  // Bring the WebGPU device up WITHOUT downloading the model. Used by
+  // DEVICE_ONLY chapters (Training). Idempotent: a no-op if a full-model load
+  // is already in-flight or done (the device is up as part of that), or if a
+  // device-only bring-up is already in-flight/complete.
+  const kickoffDeviceOnly = useCallback(() => {
+    if (errorBannerRef.current != null) return; // surfaced error; let retry go through kickoffLoad
+    if (modelReadyRef.current) return; // full model up -> device already up
+    if (loadKickoffRef.current > 0) return; // a bring-up (full or device-only) is already in-flight/done
+    deviceOnlyRef.current = true;
     setPendingModelSource(null);
     setErrorBannerState(null);
     setLoadingProgress(null);
@@ -2022,7 +2106,9 @@ function App() {
       modelLine,
       errorBanner,
       hostedModelAvailable,
+      deviceReady,
       kickoffLoad,
+      kickoffDeviceOnly,
       resetForModelLoad: resetForModelLoadCallback,
     };
   }, [
@@ -2030,6 +2116,8 @@ function App() {
     modelReady,
     loadKickoff,
     hostedModelAvailable,
+    deviceReady,
+    kickoffDeviceOnly,
     loadingText,
     loadingProgress,
     modelLine,

@@ -9,6 +9,7 @@ import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { BpeMergeWalkthrough } from '../widgets/BpeMergeWalkthrough';
+import { MultilingualTokenMap } from '../widgets/MultilingualTokenMap';
 import { TrickyCases } from '../widgets/TrickyCases';
 
 /**
@@ -18,7 +19,7 @@ import { TrickyCases } from '../widgets/TrickyCases';
  * widget that calls the real Qwen3.5 tokenizer through the loaded worker.
  * When the model isn't loaded yet a yellow banner explains the fallback
  * and the chips render a heuristic whitespace split so the lesson is still
- * legible. The console.log convention mirrors chapter 3.
+ * legible. The console.log convention mirrors chapter 4.
  */
 
 const DEFAULT_PROMPT = 'The quick brown fox jumps over the lazy dog. Antidisestablishmentarianism. 你好';
@@ -47,7 +48,7 @@ export const learning: ChapterLearningData = {
   chapterId: 'tokenization',
   objective: 'Explain why an LLM splits text into sub-word tokens instead of characters or words.',
   problem: 'Models need a finite vocabulary that balances sequence length against vocabulary size.',
-  minutes: 6,
+  minutes: 7,
   glossary: [
     {
       term: 'token',
@@ -173,7 +174,10 @@ export function TokenizationChapterBody() {
           adjacent pair into a new symbol until the vocabulary is the size you want. Common words like <code>the</code>{' '}
           end up as a single token; rarer words like <code>Antidisestablishmentarianism</code> decompose into shorter
           familiar pieces. The tokenizer doesn't know what a word means — it only knows what byte sequences are
-          statistically frequent in the training corpus.
+          statistically frequent in the training corpus. Because that base alphabet is the 256 possible byte values,
+          the tokenizer can represent literally <em>any</em> input — any Unicode character, emoji, or script, even ones
+          it never saw in training — so there is no "unknown" or out-of-vocabulary token; unfamiliar text just breaks
+          into more, smaller (byte) tokens.
         </p>
 
         <h2>What Qwen3.5 does specifically</h2>
@@ -231,6 +235,8 @@ export function TokenizationChapterBody() {
         </p>
 
         <TrickyCases />
+
+        <MultilingualTokenMap />
 
         <p className="mt-6 text-muted-foreground">
           In the next chapter (<em>Embeddings</em>) we'll see how each of these token ids becomes a high-dimensional

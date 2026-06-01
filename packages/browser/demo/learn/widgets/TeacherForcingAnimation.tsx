@@ -250,6 +250,11 @@ export function TeacherForcingAnimation() {
         training, the model never has to recover from its own mistakes. (At inference, of course, it does — which is the
         small but real reason long-form generation sometimes drifts.)
       </p>
+
+      <p className="text-[10px] text-muted-foreground">
+        Illustrative — the per-position probabilities here are hand-picked to show the shape of the loss, not live
+        output from the model.
+      </p>
     </div>
   );
 }

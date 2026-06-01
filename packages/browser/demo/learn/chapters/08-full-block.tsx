@@ -13,6 +13,7 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { GdnTeaser } from '../widgets/GdnTeaser';
 import { ResidualStream } from '../widgets/ResidualStream';
 import { StackCollapsedView } from '../widgets/StackCollapsedView';
 
@@ -55,7 +56,7 @@ export const learning: ChapterLearningData = {
   objective: 'Read a transformer layer end-to-end: pre-norm, attention, residual, pre-norm, MLP, residual, repeat.',
   problem:
     'Each sub-block was introduced in isolation; you still need to see how they wire together and how the stack composes.',
-  minutes: 7,
+  minutes: 8,
   glossary: [
     {
       term: 'decoder layer',
@@ -123,7 +124,7 @@ export const learning: ChapterLearningData = {
     },
     {
       id: 'q2-hybrid-full',
-      prompt: "How many of Qwen3.5-0.8B's 24 layers use the softmax attention you read about in chapter 3?",
+      prompt: "How many of Qwen3.5-0.8B's 24 layers use the softmax attention you read about in chapter 4?",
       options: [
         { id: 'a', label: 'All 24.' },
         { id: 'b', label: '6 — one in every four.' },
@@ -188,25 +189,25 @@ export function FullBlockChapterBody() {
         <h2>What each piece contributes</h2>
         <ul>
           <li>
-            <strong>Attention</strong> (chapter 3) — the only place in the layer where information moves{' '}
+            <strong>Attention</strong> (chapter 4) — the only place in the layer where information moves{' '}
             <em>across tokens</em>. Without it, every position would evolve independently.
           </li>
           <li>
-            <strong>Multi-head &amp; GQA</strong> (chapter 4) — attention is run in parallel by many heads sharing a
+            <strong>Multi-head &amp; GQA</strong> (chapter 5) — attention is run in parallel by many heads sharing a
             smaller pool of K/V projections, so the model can look at several patterns at once without inflating the KV
             cache.
           </li>
           <li>
-            <strong>RoPE</strong> (chapter 5) — the rotation applied to Q and K inside attention. It's how the model
+            <strong>RoPE</strong> (chapter 6) — the rotation applied to Q and K inside attention. It's how the model
             knows token 5 is later than token 3 without a separate position embedding.
           </li>
           <li>
-            <strong>RMSNorm</strong> (chapter 6) — applied <em>before</em> each sub-block. It collapses the magnitude of
+            <strong>RMSNorm</strong> (chapter 7) — applied <em>before</em> each sub-block. It collapses the magnitude of
             the input to roughly <code>sqrt(hidden_dim)</code> ≈ {Math.sqrt(HIDDEN_DIM).toFixed(0)} so the attention
             scores and MLP activations don't explode.
           </li>
           <li>
-            <strong>MLP</strong> (chapter 7) — a per-token feed-forward with the SwiGLU gated nonlinearity. It is where
+            <strong>MLP</strong> (chapter 8) — a per-token feed-forward with the SwiGLU gated nonlinearity. It is where
             most of the parameters live, and where per-token feature computation happens.
           </li>
         </ul>
@@ -230,12 +231,14 @@ export function FullBlockChapterBody() {
 
         <p>
           Two consequences fall out. First, <strong>gradients</strong>: backprop can flow straight through the identity
-          path even in a 24-layer stack, which is why deep transformers train at all. Without the residual, every layer
-          would multiply the gradient signal, and a stack this deep would vanish or explode. Second,{' '}
-          <strong>magnitudes</strong>: the residual stream grows in L2 with depth (each layer adds a non-zero
-          contribution), while every <em>individual</em> sub-block's output stays small. The 3D widget on the right
-          colors each ring by the per-token L2 of the layer output — you can see the magnitude climb as you scan up the
-          tower, exactly mirroring the bar growing in the animation.
+          path even in a 24-layer stack, which is why deep transformers train at all. Without the residual, the gradient
+          gets repeatedly multiplied by each layer's transformation (its Jacobian), and across a stack this deep it
+          <em> tends to</em> vanish or explode; the residual's identity path is what lets it survive. Second,{' '}
+          <strong>magnitudes</strong>: the residual stream grows in L2 (the vector's length — the √ of the sum of its
+          squared components) with depth, since each layer adds a non-zero contribution, while every <em>individual</em>{' '}
+          sub-block's output stays small. The 3D widget on the right colors each ring by the per-token L2 of the layer
+          output — you can see the magnitude climb as you scan up the tower, exactly mirroring the bar growing in the
+          animation.
         </p>
         <p className="text-muted-foreground">
           <strong>Mental model:</strong> think of the residual stream as a piece of working memory that the network
@@ -247,12 +250,14 @@ export function FullBlockChapterBody() {
         <p>
           Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast linear-attention variant called{' '}
           <em>GatedDeltaNet</em>; only every fourth layer (indices 3, 7, 11, 15, 19, 23 on the 0.8B model) uses the
-          classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 3. Linear-attention layers do almost all the
+          classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 4. Linear-attention layers do almost all the
           across-token mixing under the tight memory budget of long contexts; full-attention layers appear at fixed
           intervals to do the heavy modelling that linear attention can't. The 3D widget highlights full-attention
-          layers in a warmer color so you can see the interleave at a glance. Chapter 11 will dig into how this hybrid
+          layers in a warmer color so you can see the interleave at a glance. Chapter 12 will dig into how this hybrid
           recipe works and why it's the new default for high-throughput open LLMs.
         </p>
+
+        <GdnTeaser />
 
         <h2>What the widget shows</h2>
         <p>
@@ -578,7 +583,7 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
         items={[
           'Rotate the tower — each layer is Norm → Attention → Norm → MLP, with a residual skipping each sub-block.',
           'The colour ramp shows attention type: cooler colours are linear (GatedDeltaNet), warmer are full attention.',
-          "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 11.",
+          "Six of the 24 layers are full attention; the rest are linear. That's the hybrid pattern from Chapter 12.",
         ]}
       />
     </div>

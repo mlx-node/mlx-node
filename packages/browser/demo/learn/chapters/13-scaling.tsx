@@ -5,11 +5,12 @@ import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { GradClipDemo } from '../widgets/GradClipDemo';
 import { LrScheduleViz } from '../widgets/LrScheduleViz';
+import { WarmupLossCurve } from '../widgets/WarmupLossCurve';
 
 /**
- * Chapter 13 — Scaling & regularization.
+ * Chapter 14 — Scaling & regularization.
  *
- * The training objective (chapter 12) was one line. Making it actually
+ * The training objective (chapter 13) was one line. Making it actually
  * converge on a 24-layer stack with hundreds of millions of parameters needs
  * a handful of engineering tricks that aren't part of the architecture but
  * without which nothing works: LR warmup + cosine, gradient clipping,
@@ -26,7 +27,7 @@ export const learning: ChapterLearningData = {
     'Read a real LLM training config (LR, warmup, clip, weight decay) and explain what each knob is preventing from going wrong.',
   problem:
     "Cross-entropy + AdamW on a deep transformer isn't enough — the loss diverges, the gradients explode, or the model overfits without specific engineering tricks.",
-  minutes: 6,
+  minutes: 7,
   glossary: [
     {
       term: 'AdamW',
@@ -136,7 +137,7 @@ export function ScalingChapterBody() {
       <Prose>
         <h1>Scaling &amp; regularization: making the training loop actually converge</h1>
         <p>
-          Chapter 12 reduced training to one line of cross-entropy. That description is correct and it is{' '}
+          Chapter 13 reduced training to one line of cross-entropy. That description is correct and it is{' '}
           <em>spectacularly insufficient</em> as a recipe. A 24-layer transformer trained on hundreds of billions of
           tokens with naive SGD will: diverge in the first 100 steps; have its loss spike to <code>NaN</code> from a
           single bad batch; settle into a local minimum that generalizes poorly. The fix is a small handful of
@@ -177,6 +178,8 @@ export function ScalingChapterBody() {
         </p>
 
         <LrScheduleViz />
+
+        <WarmupLossCurve />
 
         <h2>Gradient clipping: the one-line guardrail</h2>
         <p>

@@ -13,8 +13,15 @@ export interface ModelLoaderContextValue {
   modelLine: string | null; // display name
   errorBanner: string | null;
   hostedModelAvailable: boolean | null; // null = probing
+  // True once the WASM runtime + WebGPU device are up, regardless of whether
+  // the big model is loaded. DEVICE_ONLY chapters (e.g. Training) gate on this
+  // instead of `status === 'ready'`. A full-model 'ready' implies this too.
+  deviceReady: boolean;
   // Imperative callbacks needed by route components:
   kickoffLoad: () => void;
+  // Bring the WebGPU device up WITHOUT downloading the model (for DEVICE_ONLY
+  // chapters). Idempotent; a no-op when a full load is already in-flight/done.
+  kickoffDeviceOnly: () => void;
   resetForModelLoad: (label?: string) => void;
 }
 

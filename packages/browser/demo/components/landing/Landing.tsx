@@ -1,3 +1,4 @@
+import { CHAPTERS } from '../../learn/chapters';
 import { DriftingLibrary } from './DriftingLibrary';
 
 export type LandingProps = {
@@ -96,7 +97,7 @@ export function Landing({
           Start learning →
         </button>
         <p className="landing-learn-hint">
-          New to LLMs? Step through 13 chapters that explain how this model actually works.
+          New to LLMs? Step through {CHAPTERS.length} chapters that explain how this model actually works.
         </p>
 
         {errorBanner && (

@@ -11,6 +11,7 @@ import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
+import { InnerProductLogit } from '../widgets/InnerProductLogit';
 import { LmHeadWalkthrough } from '../widgets/LmHeadWalkthrough';
 import { WeightTyingVisual } from '../widgets/WeightTyingVisual';
 
@@ -18,8 +19,8 @@ import { WeightTyingVisual } from '../widgets/WeightTyingVisual';
  * Chapter 9 — LM head & weight tying.
  *
  * Bridges the gap between "last hidden state" (the top of the residual
- * stream, chapter 8) and "vector of logits" (the input to sampling, chapter
- * 10). The matmul itself is one line — but it's the line readers most often
+ * stream, chapter 9) and "vector of logits" (the input to sampling, chapter
+ * 11). The matmul itself is one line — but it's the line readers most often
  * skim past, and the *tying* trick that backs it is genuinely surprising.
  *
  * The right-hand panel runs the live `runForInspector` hook with
@@ -36,8 +37,8 @@ export const learning: ChapterLearningData = {
   objective:
     'Explain how the last hidden state becomes a vector of logits, and why for Qwen3.5 the LM head is literally the embedding matrix re-used.',
   problem:
-    'Chapter 8 ends with a hidden state; chapter 10 starts with logits. Something has to turn one into the other.',
-  minutes: 5,
+    'Chapter 9 ends with a hidden state; chapter 11 starts with logits. Something has to turn one into the other.',
+  minutes: 6,
   glossary: [
     {
       term: 'LM head',
@@ -65,19 +66,19 @@ export const learning: ChapterLearningData = {
     {
       term: 'inner product',
       definition:
-        "Sum of element-wise products. logit_j = <last_hidden, W[:, j]>: the model's score for token j is how well the hidden state aligns with that token's column of the LM head.",
+        "Sum of element-wise products. logit_j = <last_hidden, W[j, :]>: the model's score for token j is how well the hidden state aligns with that token's row of the LM head.",
     },
   ],
   takeaways: [
     'The LM head is just one matmul: last_hidden @ embed_tokens.T → logits. Every vocab entry gets one score.',
-    'Each column of the weight matrix is a learned "fingerprint" for one vocab token; the highest logit is the one most aligned with the hidden state.',
+    'Each row of the weight matrix is a learned "fingerprint" for one vocab token; the highest logit is the one most aligned with the hidden state.',
     'Qwen3.5 ties embed_tokens.weight with lm_head.weight — the same ~254M-float tensor is used at the input lookup AND the output projection.',
   ],
   exercise: {
     prompt:
       "Hit Run on 'The cat sat on the' and look at the top-K logits panel. The highest bar is the model's pick. Now find a token in the top-K whose text doesn't look 'like a real continuation' to you (e.g. ' floor' on a tiny model). What does its presence in the top-K tell you about the LM head's geometry?",
     answer:
-      "Even tokens you'd consider 'unlikely' end up in the top-K because their column vectors in the LM head point in roughly the same direction as the hidden state. The model's representation of 'what should come after `the`' is broad — anything sittable, nameable, or position-of-an-object-like is geometrically close. Sampling temperature and top-p are what trim this broad cloud into one choice.",
+      "Even tokens you'd consider 'unlikely' end up in the top-K because their row vectors in the LM head point in roughly the same direction as the hidden state. The model's representation of 'what should come after `the`' is broad — anything sittable, nameable, or position-of-an-object-like is geometrically close. Sampling temperature and top-p are what trim this broad cloud into one choice.",
   },
   quiz: [
     {
@@ -116,25 +117,25 @@ export const learning: ChapterLearningData = {
     },
     {
       id: 'q3-direction',
-      prompt: "Which statement about the LM head's columns is true?",
+      prompt: "Which statement about the LM head's rows is true?",
       options: [
         {
           id: 'a',
-          label: 'Each column is the average hidden state of every prompt that ever produced that token.',
+          label: 'Each row is the average hidden state of every prompt that ever produced that token.',
         },
         {
           id: 'b',
           label:
-            "Each column is a learned vector — token j's logit is the inner product of that column with the last hidden state.",
+            "Each row is a learned vector — token j's logit is the inner product of that row with the last hidden state.",
         },
         {
           id: 'c',
-          label: 'Each column is a one-hot vector for one vocab id.',
+          label: 'Each row is a one-hot vector for one vocab id.',
         },
       ],
       correctId: 'b',
       explanation:
-        'Think of each column as a learned "direction in hidden space" associated with one vocab token. The logit is just how well the current hidden state lines up with that direction.',
+        'Think of each row as a learned "direction in hidden space" associated with one vocab token. The logit is just how well the current hidden state lines up with that direction.',
     },
   ],
 };
@@ -145,8 +146,8 @@ export function LmHeadChapterBody() {
       <Prose>
         <h1>The LM head: hidden state → logits</h1>
         <p>
-          Chapter 8 left us at the top of the residual stream: a single hidden vector of width <code>d = 1024</code> per
-          token, after the final RMSNorm. Chapter 10 (sampling) will start from a vector of <strong>logits</strong> —
+          Chapter 9 left us at the top of the residual stream: a single hidden vector of width <code>d = 1024</code> per
+          token, after the final RMSNorm. Chapter 11 (sampling) will start from a vector of <strong>logits</strong> —
           one real-valued score per vocab token. The step that connects them is one matmul, and it has a name:{' '}
           <strong>the LM head</strong>.
         </p>
@@ -161,8 +162,11 @@ export function LmHeadChapterBody() {
         </p>
         <p>
           The animation walks the matmul cell by cell. The scan beam highlights one output column at a time, with the
-          matrix row(s) that contribute to it lit up beside it. Every output entry is one independent inner product —
-          which is also why this op parallelizes so cleanly on a GPU.
+          matrix column that produces it lit up beside it. Every output entry is one independent inner product — which
+          is also why this op parallelizes so cleanly on a GPU. Note the animation draws the <em>transposed</em> matrix{' '}
+          <code>embed_tokens.weight.T = [d, V]</code>, so token <code>j</code>'s fingerprint is a <strong>column</strong>{' '}
+          there — the same vector as <strong>row j</strong> of <code>W_lm = [V, d]</code> discussed below (a row of a
+          matrix is a column of its transpose).
         </p>
 
         <LmHeadWalkthrough />
@@ -171,18 +175,27 @@ export function LmHeadChapterBody() {
           What each output cell <em>means</em>
         </h2>
         <p>
-          Think of each <strong>column</strong> of <code>W_lm</code> as a learned "fingerprint" for one vocab token. The
-          logit for token <code>j</code> is the inner product of <code>h_last</code> with that column:
+          Think of each <strong>row</strong> of <code>W_lm</code> as a learned "fingerprint" for one vocab token. The
+          logit for token <code>j</code> is the inner product of <code>h_last</code> with that row:
         </p>
-        <MathDisplay latex={String.raw`\text{logit}_j = \langle h_{\text{last}},\, W_{\text{lm}}[:, j] \rangle`} />
+        <MathDisplay latex={String.raw`\text{logit}_j = \langle h_{\text{last}},\, W_{\text{lm}}[j, :] \rangle`} />
         <p>
-          So <em>high logit ⇔ hidden state points in roughly the same direction as that token's column</em>. The
-          geometry of the hidden state is what determines the next-token distribution, and the LM head's columns are the
-          dictionary the model uses to read out that geometry.
+          So <em>high logit ⇔ hidden state points in roughly the same direction as that token's row</em>. The geometry
+          of the hidden state is what determines the next-token distribution, and the LM head's rows are the dictionary
+          the model uses to read out that geometry.
         </p>
+        <p>
+          The inner product unpacks as <code>h · w = |h|·|w|·cos θ</code>: with every token's row at a comparable
+          length, the logit is really just a readout of the <em>angle</em> between the hidden state and that row. Toggle
+          the three cases below — aligned, orthogonal, opposed — and watch the per-dimension products (which sum to the
+          logit) and the cosine move together.
+        </p>
+
+        <InnerProductLogit />
+
         <p>
           This is why you'll sometimes see plausible-looking tokens you didn't expect at the top of the top-K: their
-          columns happen to be aligned with the hidden state, even if the model wouldn't end up sampling them. The top-K
+          rows happen to be aligned with the hidden state, even if the model wouldn't end up sampling them. The top-K
           panel on the right will show this concretely once you hit Run.
         </p>
 
@@ -190,7 +203,7 @@ export function LmHeadChapterBody() {
         <p>
           Here's the surprising part. The matrix <code>W_lm</code> in the formula above isn't a separately-learned
           tensor. For Qwen3.5 (and most modern decoder LLMs sub-7B), it is <em>literally</em> the embedding matrix from
-          chapter 2 — the same <code>[248,320, 1024]</code> grid of floats that mapped token ids to vectors at the
+          chapter 3 — the same <code>[248,320, 1024]</code> grid of floats that mapped token ids to vectors at the
           bottom of the stack is reused (transposed) at the top.
         </p>
 
@@ -214,11 +227,11 @@ export function LmHeadChapterBody() {
           The panel runs one inspector call: tokenize the prompt, run a forward pass, capture the top-K logits at the
           last position, render them as bars. Each row is one of the <code>{TOP_K}</code> highest-logit vocab tokens;
           the row highlighted with the primary accent is the token the model actually sampled (greedy at this stage —
-          chapter 10 will introduce temperature and top-p).
+          chapter 11 will introduce temperature and top-p).
         </p>
         <p className="text-muted-foreground">
           <em>What to notice:</em> the bars are not yet probabilities — they are <em>logits</em>, untouched by softmax.
-          They can be negative; their absolute magnitudes are not comparable across prompts. Softmax in chapter 10 is
+          They can be negative; their absolute magnitudes are not comparable across prompts. Softmax in chapter 11 is
           what turns this into a probability distribution.
         </p>
       </Prose>
@@ -406,7 +419,7 @@ export function LmHeadDemo({ workerRef, abortRef }: LmHeadDemoProps) {
         items={[
           'Each row is one of the highest-scoring vocab tokens at the last position.',
           'The bar length is its probability after softmax — every set of bars in one panel sums to 1.',
-          "The accented row is the model's greedy pick. Chapter 10 will let you slide temperature and top-p to change that.",
+          "The accented row is the model's greedy pick. Chapter 11 will let you slide temperature and top-p to change that.",
         ]}
       />
     </div>

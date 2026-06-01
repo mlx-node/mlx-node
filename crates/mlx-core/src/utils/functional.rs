@@ -14,6 +14,7 @@ use crate::models::qwen3::Qwen3Config;
 use crate::models::qwen3_5::Qwen3_5Config;
 use crate::models::qwen3_5_moe::Qwen3_5MoeConfig;
 use crate::nn::Activations;
+#[cfg(not(target_family = "wasm"))]
 use crate::training_model::ModelType;
 use napi::bindgen_prelude::*;
 use std::collections::HashMap;
@@ -1626,6 +1627,7 @@ pub fn qwen3_5_moe_forward_hidden_states_impl(
 // ============================================
 
 /// Dispatch functional forward pass based on model type.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn forward_functional_dispatch(
     model_type: &ModelType,
     params: &HashMap<String, MxArray>,
@@ -1644,6 +1646,7 @@ pub(crate) fn forward_functional_dispatch(
 }
 
 /// Dispatch forward pass returning hidden states with optional checkpointing.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn forward_hidden_states_dispatch(
     model_type: &ModelType,
     params: &HashMap<String, MxArray>,
