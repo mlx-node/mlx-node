@@ -8202,8 +8202,9 @@ pub struct ChatConfig {
     /// depth policy. Default mode is a per-depth EMA hill-climb plus
     /// DFlash-style 3-state machine `full | reduced | probe`.
     /// `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
-    /// MTPLX-style intra-cycle expected-value gate; deeper intra-cycle
-    /// expansion is research-only behind `MLX_MTP_EV_ALLOW_DEEPEN=1`.
+    /// MTPLX-style intra-cycle expected-value gate, which deepens toward
+    /// `mtpDepth` by default (T=0 byte-parity verified); set
+    /// `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
     /// When false, the loop pins `mtpDepth` for every cycle.
     ///
     /// Default: false. An explicit value always wins over the default.

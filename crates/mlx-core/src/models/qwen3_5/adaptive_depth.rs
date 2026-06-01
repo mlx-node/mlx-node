@@ -255,12 +255,20 @@ impl ExpectedValueDepthPolicy {
             confidence_weight: env_f64("MLX_MTP_EV_CONFIDENCE_WEIGHT", 0.25).clamp(0.0, 1.0),
             min_extra_accept_probability: env_f64("MLX_MTP_EV_MIN_EXTRA_ACCEPT_PROBABILITY", 0.30)
                 .clamp(0.0, 1.0),
-            // Conservative default: real M5 Max traces showed intra-cycle
-            // deepening can violate the temperature-0 byte-equivalence safety
-            // contract even though fixed-depth and inter-cycle adaptive depth
-            // remain safe. Keep the EV cost model available for controlled
-            // experiments without making the default unsafe.
-            allow_deepen: env_bool("MLX_MTP_EV_ALLOW_DEEPEN", false),
+            // Default ON: a model-backed T=0 parity smoke (affine
+            // mtplx-optimized-speed-mtp, depth 3, counting + prose prompts;
+            // examples/_ev-deepen-probe.ts) confirmed intra-cycle deepening
+            // (mean_effective_depth 1.000 -> 1.950 counting / 1.027 prose,
+            // exercising the compiled verify graph's depth-keyed argmax)
+            // produces byte-identical T=0 output ON vs OFF on BOTH prompts,
+            // reproduced deterministically. The earlier "M5 Max traces showed
+            // deepening can violate T=0 byte-equivalence" caveat did not
+            // reproduce. The C2 unit gate
+            // (ev_deepen_t0_committed_tokens_byte_identical) continues to guard
+            // the accept/commit layer. `MLX_MTP_EV_ALLOW_DEEPEN=0` opts out.
+            // Note: only consulted in EV mode (MLX_MTP_ADAPTIVE_DEPTH_MODE=ev);
+            // the default Throughput mode never reaches this gate.
+            allow_deepen: env_bool("MLX_MTP_EV_ALLOW_DEEPEN", true),
         }
     }
 

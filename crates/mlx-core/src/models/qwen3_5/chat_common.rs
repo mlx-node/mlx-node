@@ -71,9 +71,10 @@ pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESS
 //   throughput on the bf16 MTP-head lane. If `mtpAdaptiveDepth=true`,
 //   `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` switches from the W6.8
 //   throughput state machine to the W6.23 MTPLX-style intra-cycle
-//   expected-value gate. The EV gate is conservative by default and stops at
-//   `MLX_MTP_EV_BASE_DEPTH`; deeper intra-cycle expansion is research-only via
-//   `MLX_MTP_EV_ALLOW_DEEPEN=1` until it passes the temperature-0 safety gate.
+//   expected-value gate. The EV gate starts at `MLX_MTP_EV_BASE_DEPTH` and
+//   deepens toward `mtpDepth` per the EV cost model by default (passed the
+//   temperature-0 byte-parity safety gate on a model-backed smoke); set
+//   `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
 //
 // Naming disambiguation:
 //   - `MLX_MTP_CHAINED_CYCLES` (W6.5) — CROSS-CYCLE hidden-state export.

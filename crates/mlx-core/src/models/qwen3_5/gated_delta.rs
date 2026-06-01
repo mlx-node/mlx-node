@@ -4,14 +4,20 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 /// Minimum sequence length to use the chunked prefill kernel.
-/// On M1–M4, the chunked kernel's O(BT^2) overhead outweighs memory bandwidth savings
-/// (no tensor cores to accelerate the quadratic matmuls). On M5+ (gen >= 17), the
-/// Neural Accelerators make simdgroup_matrix operations ~4x faster, so chunked wins.
+/// The chunked Metal kernel (`gated_delta_chunked.metal.inc`) is pure scalar-FMA +
+/// `simd_sum` reductions — it contains ZERO `simdgroup_matrix` / NAX matmul instructions.
+/// Its M5+ win therefore comes from M5's higher memory bandwidth plus better Metal
+/// launch-overhead amortization across the chunked tiles, NOT from tensor cores.
+/// On M1–M4 the chunked kernel's O(BT^2) overhead outweighs those bandwidth savings, so
+/// the per-step kernel wins; on M5+ (gen >= 17) chunked wins.
+/// (Future, unclaimed: converting the kernel's Phase-2/Phase-4 GEMMs to
+/// `simdgroup_matrix`/NAX `matmul2d` could speed up prefill further — not done today.)
 const CHUNK_THRESHOLD: i64 = 64;
 
 /// Minimum GPU architecture generation for the chunked kernel.
-/// M5 (gen 17) has Neural Accelerators that make chunked prefill faster than per-step.
-/// On M1–M4 (gen 13–16), the per-step kernel is faster due to simpler ALU patterns.
+/// On M5 (gen 17) the chunked tiling becomes a net win thanks to higher memory bandwidth
+/// and amortized Metal launch overhead (the kernel uses no tensor-core ops, so this is
+/// NOT a Neural Accelerator effect). On M1–M4 (gen 13–16), the per-step kernel is faster.
 const CHUNK_MIN_GPU_GEN: i32 = 17;
 
 /// Returns the GPU architecture generation, cached after first call.
@@ -430,8 +436,9 @@ pub fn gated_delta_update(
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
     if k_dim % 32 == 0 {
-        // Chunked kernel for long sequences on M5+ (Neural Accelerator-accelerated prefill).
-        // On M1–M4, per-step kernel is faster (no tensor cores for O(BT^2) matmuls).
+        // Chunked kernel for long sequences on M5+ — wins via M5's memory bandwidth +
+        // amortized Metal launch overhead, NOT tensor cores (the kernel is all scalar-FMA
+        // + simd_sum, no simdgroup_matrix). On M1–M4 the per-step kernel is faster.
         // Chunked kernel needs g in log-space directly (no exp/log roundtrip).
         if seq_len >= CHUNK_THRESHOLD
             && mask.is_none()

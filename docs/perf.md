@@ -408,7 +408,7 @@ Cross-references:
 | M4   | 16  |
 | M5   | 17  |
 
-The Qwen3.5 chunked GDN prefill kernel is gated on M5+ (`CHUNK_MIN_GPU_GEN = 17`) with a 64-token minimum sequence length — on M5, Neural Accelerators make `simdgroup_matrix` ops roughly 4× faster than the per-step kernel; on M1–M4 the per-step kernel wins.
+The Qwen3.5 chunked GDN prefill kernel is gated on M5+ (`CHUNK_MIN_GPU_GEN = 17`) with a 64-token minimum sequence length. The chunked Metal kernel (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum` reductions — it contains **zero** `simdgroup_matrix` / NAX matmul instructions, so its M5 win is **not** a tensor-core effect. It wins on M5 because of M5's higher memory bandwidth plus better Metal launch-overhead amortization across the chunked tiles; on M1–M4 the chunked tiling's O(BT²) overhead outweighs those savings and the per-step kernel wins. (Future, unclaimed: porting the kernel's Phase-2/Phase-4 GEMMs to `simdgroup_matrix`/NAX `matmul2d` is a prefill-only opportunity that has **not** been done — it is not the reason for the current M5 gate.)
 
 ## Quantization
 
