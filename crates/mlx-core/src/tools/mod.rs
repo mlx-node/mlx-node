@@ -536,15 +536,29 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 ///      spans disjoint from all reasoning are preserved verbatim.
 ///   4. Emit `text` minus the merged removal ranges.
 ///
-/// A single pass strips every paired block plus the LEADING missing-open span. The public
-/// entry point iterates the pass to a FIXPOINT so SUCCESSIVE missing-open spans (a second
-/// bare top-level close after the first) are all removed — matching the prior
-/// `strip_all_reasoning` fixpoint, but using the scrubber's own `missing_open_close` (which
-/// scans past literal closes) instead of the generic `parse_thinking`. Each pass either
-/// shrinks the text or leaves it unchanged, so the loop terminates; the with-tool cases are
-/// single-pass fixpoints, so their behavior is unchanged.
+/// A single pass strips every paired block plus the LEADING missing-open span. For the
+/// NO-TOOL case the public entry point iterates the pass to a FIXPOINT so SUCCESSIVE
+/// missing-open spans (a second bare top-level close after the first) are all removed —
+/// matching the prior `strip_all_reasoning` fixpoint, but using the scrubber's own
+/// `missing_open_close` (which scans past literal closes) instead of the generic
+/// `parse_thinking`. Each pass either shrinks the text or leaves it unchanged, so it
+/// terminates.
+///
+/// When the ORIGINAL text contains a tool span, the entry point runs exactly ONE pass. The
+/// missing-open heuristic models byte 0 as template-injected reasoning; that is true of the
+/// original generation but NOT of a later pass's output that begins with a PRESERVED tool
+/// call. Re-running would let the heuristic treat that tool call's own argument `</think>` as
+/// a straddle at byte 0 and wrongly drop the valid call. A single pass already covers the
+/// with-tool cases — including multiple in-tool straddle candidates, via last-wins in
+/// `missing_open_close` — so iteration is confined to the tool-free remainder.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
-    let mut current = text.to_string();
+    let first = strip_reasoning_once(text);
+    if !extract_tag_blocks(text, "<tool_call>", "</tool_call>").is_empty() {
+        // A tool span is present: one pass only (see above — avoids dropping a preserved call).
+        return first;
+    }
+    // No tool span: iterate to a fixpoint so successive missing-open spans are all stripped.
+    let mut current = first;
     loop {
         let next = strip_reasoning_once(&current);
         if next == current {
@@ -1346,6 +1360,26 @@ mod tests {
         assert_eq!(
             out, "final",
             "successive no-tool missing-open spans must all be stripped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_then_valid_tool_call_with_literal_close() {
+        // Adversarial (Codex No-ship on the fixpoint): a LEADING missing-open reasoning span,
+        // then a VALID standalone tool call whose argument contains a literal `</think>\n`. Pass
+        // 1 correctly strips only the leading span and preserves the tool call. The fixpoint must
+        // NOT re-run on this output — a second pass would treat the tool call (now at byte 0) as
+        // injected reasoning and drop it. With a tool span present the scrubber runs one pass, so
+        // the valid tool call survives.
+        let input = "secret </think>\n<tool_call><function=ok><parameter=q></think>\nliteral</parameter></function></tool_call> tail";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret"),
+            "the leading missing-open reasoning prefix is stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("function=ok") && out.contains("tail"),
+            "the valid post-reasoning tool call and trailing content survive the fixpoint: {out:?}"
         );
     }
 
