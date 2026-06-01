@@ -535,7 +535,27 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 ///      reasoning range (nested or straddling — entangled with reasoning, so dropped). Tool
 ///      spans disjoint from all reasoning are preserved verbatim.
 ///   4. Emit `text` minus the merged removal ranges.
+///
+/// A single pass strips every paired block plus the LEADING missing-open span. The public
+/// entry point iterates the pass to a FIXPOINT so SUCCESSIVE missing-open spans (a second
+/// bare top-level close after the first) are all removed — matching the prior
+/// `strip_all_reasoning` fixpoint, but using the scrubber's own `missing_open_close` (which
+/// scans past literal closes) instead of the generic `parse_thinking`. Each pass either
+/// shrinks the text or leaves it unchanged, so the loop terminates; the with-tool cases are
+/// single-pass fixpoints, so their behavior is unchanged.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
+    let mut current = text.to_string();
+    loop {
+        let next = strip_reasoning_once(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// One pass of the range-based reasoning scrub (see `strip_reasoning_preserving_tools`).
+fn strip_reasoning_once(text: &str) -> String {
     let tool_ranges: Vec<(usize, usize)> = extract_tag_blocks(text, "<tool_call>", "</tool_call>")
         .into_iter()
         .map(|(s, e, _)| (s, e))
@@ -675,10 +695,13 @@ fn all_positions(text: &str, needle: &str) -> Vec<usize> {
 ///     inside a raw tool parameter would otherwise be chosen falsely, dropping only its span
 ///     and leaking the trailing reasoning. So an in-tool candidate is recorded but the scan
 ///     continues; a later top-level close takes precedence, and the tentative is used only if
-///     no top-level terminator turns up.
+///     no top-level terminator turns up. When several in-tool candidates exist and no
+///     top-level terminator does, the LAST one wins: the reasoning range then reaches the
+///     latest straddle, so the overlap-drop removes EVERY straddling span (a first-wins pick
+///     would strip only the earliest and leak the later reasoning-started call).
 ///
-/// In both straddle outcomes the tool span overlapping the resulting reasoning range is dropped
-/// downstream, so the straddling call never surfaces.
+/// In every straddle outcome the tool span(s) overlapping the resulting reasoning range are
+/// dropped downstream, so the straddling call never surfaces.
 fn missing_open_close(
     text: &str,
     open: &str,
@@ -705,9 +728,13 @@ fn missing_open_close(
             if text[end..].is_empty() || text[end..].starts_with('\n') {
                 if tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e) {
                     // In-tool close → tentative straddle candidate; prefer a top-level
-                    // terminator if one appears later. Keep depth at 1 (do not consume the
-                    // implicit injected open on a merely-tentative close).
-                    straddle.get_or_insert((pos, end));
+                    // terminator if one appears later. Keep the LAST candidate (not the
+                    // first): if no top-level terminator turns up, the reasoning must reach
+                    // the latest straddle so the overlap-drop removes every straddling span;
+                    // a first-wins pick would strip only the earliest and leak the later
+                    // reasoning-started call. Keep depth at 1 (do not consume the implicit
+                    // injected open on a merely-tentative close).
+                    straddle = Some((pos, end));
                 } else {
                     return Some((pos, end)); // top-level terminator is definitive
                 }
@@ -1283,6 +1310,42 @@ mod tests {
         assert_eq!(
             out, "final",
             "only post-terminator content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_multiple_in_tool_candidates_last_wins() {
+        // Adversarial (Codex No-ship): TWO tool calls each carrying an in-tool `</think>\n` and
+        // NO top-level terminator. A first-wins pick would stop at the earlier (literal) close,
+        // strip only the first span, and leak `more secret` + the later reasoning-started
+        // `<tool_call>`. Last-wins extends the reasoning to the latest straddle so the
+        // overlap-drop removes BOTH straddling spans and the inter-call reasoning.
+        let input = "secret <tool_call><function=a><parameter=q></think>\nliteral</parameter></function></tool_call> more secret <tool_call><function=real></think>\n<parameter=q>1</parameter></function></tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret")
+                && !out.contains("literal")
+                && !out.contains("<tool_call>")
+                && !out.contains("function=real"),
+            "both straddling tool calls and all reasoning must be dropped: {out:?}"
+        );
+        assert_eq!(
+            out, "final",
+            "only post-terminator content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_successive_no_tool_spans() {
+        // Adversarial (Codex No-ship): SUCCESSIVE missing-open spans with NO tool call — two
+        // bare top-level `</think>\n` closes. A single pass strips only the first span, leaving
+        // `more secret </think>\nfinal`; the scrubber iterates to a fixpoint (matching the prior
+        // strip_all_reasoning fixpoint) so the second span is stripped too.
+        let input = "secret </think>\nmore secret </think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(
+            out, "final",
+            "successive no-tool missing-open spans must all be stripped: {out:?}"
         );
     }
 
