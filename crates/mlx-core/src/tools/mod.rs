@@ -573,21 +573,20 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
         }
     }
 
-    // Missing-open template case: the generation begins mid-reasoning (the template
-    // injected the opener into the prompt) and emits a bare close. The leading prefix up to
-    // such a close (followed by newline/EOF) is reasoning. The check is FAMILY-AWARE: a bare
-    // `</think>` is missing-open only when no top-level `<think>` opener precedes it (and
-    // likewise for longcat) — an opener of the OTHER family does not gate it. Computed
-    // independently of the paired set (not gated on emptiness) so it composes with a later
-    // paired block; closes inside tool arguments are skipped so a literal close in a tool
-    // argument cannot mask the real top-level close. The earliest qualifying close wins.
+    // Missing-open template case: the generation begins mid-reasoning (the template injected
+    // the opener into the prompt) and emits a bare close. Per family, treat the injected
+    // opener as an implicit depth-1 and bracket-match the top-level (not-in-tool) open/close
+    // tags: the close that returns depth to 0 is the one that matches the injected opener, so
+    // the leading prefix up to it is reasoning (`missing_open_close`). This is correct even
+    // when the prefix nests a same-family paired block (its open/close net out, so the
+    // *unmatched* bare close is still found) and ignores openers/closes of the other family.
+    // The earliest qualifying close across families wins; it composes with the paired set.
     let mut missing_open: Option<(usize, usize)> = None;
     for (open, close) in [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
     ] {
-        if let Some((close_pos, close_end)) = first_top_level_bare_close(text, close, &tool_ranges)
-            && first_top_level(text, open, &tool_ranges).is_none_or(|op| close_pos < op)
+        if let Some((close_pos, close_end)) = missing_open_close(text, open, close, &tool_ranges)
             && missing_open.is_none_or(|(bp, _)| close_pos < bp)
         {
             missing_open = Some((close_pos, close_end));
@@ -633,39 +632,61 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// First byte offset of `needle` in `text` that lies OUTSIDE every tool span (i.e. is a
-/// top-level token, not literal text inside a tool-call argument), if any.
-fn first_top_level(text: &str, needle: &str, tool_ranges: &[(usize, usize)]) -> Option<usize> {
+/// All byte offsets at which `needle` occurs OUTSIDE every tool span (top-level tokens,
+/// not literal text inside a tool-call argument).
+fn top_level_positions(text: &str, needle: &str, tool_ranges: &[(usize, usize)]) -> Vec<usize> {
+    let mut out = Vec::new();
     let mut from = 0;
     while let Some(rel) = text[from..].find(needle) {
         let pos = from + rel;
         if !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e) {
-            return Some(pos);
+            out.push(pos);
         }
         from = pos + needle.len();
     }
-    None
+    out
 }
 
-/// `(start, end)` of the earliest occurrence of the reasoning close tag `close` that is
-/// top-level (outside every tool span) AND followed by a newline or end-of-text — the
-/// "missing-open" close that ends a template-injected leading reasoning block of this
-/// family. Closes inside tool spans (literal argument text) and closes followed by other
-/// content are skipped.
-fn first_top_level_bare_close(
+/// `(start, end)` of the reasoning close that terminates a template-injected leading
+/// reasoning block of one family (`open`/`close`), or `None` if there is no such block.
+///
+/// The template injects the opener into the PROMPT, so the generated text begins one level
+/// deep — modelled as an implicit depth of 1. Walking the family's top-level open/close
+/// tags in position order, the first close that returns the depth to 0 is the one matching
+/// the injected opener; everything up to it is the leading reasoning. (A same-family paired
+/// block nested in the prefix nets out — its open then close — so the *unmatched* injected
+/// close is still found.) The terminator must be followed by a newline or end-of-text to
+/// distinguish a real template close from a literal close tag in content, mirroring
+/// `parse_thinking`.
+fn missing_open_close(
     text: &str,
+    open: &str,
     close: &str,
     tool_ranges: &[(usize, usize)],
 ) -> Option<(usize, usize)> {
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(close) {
-        let pos = from + rel;
-        let end = pos + close.len();
-        let top_level = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
-        if top_level && (text[end..].is_empty() || text[end..].starts_with('\n')) {
-            return Some((pos, end));
+    let mut events: Vec<(usize, bool)> = top_level_positions(text, open, tool_ranges)
+        .into_iter()
+        .map(|p| (p, true))
+        .chain(
+            top_level_positions(text, close, tool_ranges)
+                .into_iter()
+                .map(|p| (p, false)),
+        )
+        .collect();
+    events.sort_by_key(|(p, _)| *p);
+
+    let mut depth = 1i32;
+    for (pos, is_open) in events {
+        if is_open {
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                let end = pos + close.len();
+                return (text[end..].is_empty() || text[end..].starts_with('\n'))
+                    .then_some((pos, end));
+            }
         }
-        from = end;
     }
     None
 }
@@ -1118,6 +1139,60 @@ mod tests {
         assert!(
             out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("final"),
             "the content tool call and trailing content survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_think_with_nested_same_family_block() {
+        // Adversarial (Codex No-ship): a `<think>` missing-open prefix that NESTS a same-family
+        // paired `<think>inner</think>` block before the real unmatched bare `</think>`. The
+        // earlier inner opener must NOT veto the real terminator — bracket-depth matching nets
+        // the inner open/close out and finds the unmatched injected close.
+        let input = "secret <think>inner</think> more </think>\n<tool_call>{\"name\":\"f\"}</tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret") && !out.contains("inner") && !out.contains("more"),
+            "the whole think missing-open prefix (incl. nested same-family block) must be stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("final"),
+            "the content tool call and trailing content survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_longcat_with_nested_same_family_block() {
+        // Symmetric: a `<longcat_think>` missing-open prefix nesting a same-family paired block
+        // before the unmatched bare `</longcat_think>`.
+        let input = "secret <longcat_think>inner</longcat_think> more </longcat_think>\n<tool_call>{\"name\":\"f\"}</tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret") && !out.contains("inner") && !out.contains("more"),
+            "the whole longcat missing-open prefix (incl. nested same-family block) must be stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("final"),
+            "the content tool call and trailing content survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_normal_paired_block_is_not_missing_open() {
+        // Guard against regression on the range path (tool span present): a NORMAL paired
+        // `<think>r</think>` block (explicit opener, not template-injected) must be handled by
+        // paired detection and must NOT trigger missing-open (which would nuke preceding
+        // content from byte 0). Leading content before the block survives.
+        let input = "answer prefix <think>reasoning</think>\nmore answer <tool_call>{\"name\":\"f\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("reasoning") && !out.contains("<think>"),
+            "the paired reasoning block is stripped: {out:?}"
+        );
+        assert!(
+            out.contains("answer prefix")
+                && out.contains("more answer")
+                && out.contains("<tool_call>"),
+            "leading/trailing content and the tool call survive (missing-open did not fire): {out:?}"
         );
     }
 
