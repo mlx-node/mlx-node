@@ -557,7 +557,6 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
         // is exactly right.
         return strip_all_reasoning(text);
     }
-    let inside_tool = |pos: usize| tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
 
     // Paired reasoning ranges on the original text, excluding any block that is literal
     // argument text inside a tool span.
@@ -574,20 +573,22 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
         }
     }
 
-    // Missing-open template case (only when no explicit paired reasoning exists): a bare
-    // top-level close followed by newline/EOF marks a leading reasoning prefix.
-    if reasoning.is_empty() {
-        for close in ["</think>", "</longcat_think>"] {
-            if let Some(pos) = text.find(close)
-                && !inside_tool(pos)
-            {
-                let end = pos + close.len();
-                if text[end..].is_empty() || text[end..].starts_with('\n') {
-                    reasoning.push((0, end));
-                    break;
-                }
-            }
-        }
+    // Missing-open template case: the generation begins mid-reasoning (the template
+    // injected the opener into the prompt) and emits a bare close. The leading prefix up to
+    // the FIRST top-level close (followed by newline/EOF) is reasoning — but only when that
+    // close PRECEDES any top-level reasoning opener (otherwise the close belongs to a normal
+    // paired block already handled above, and the text before its opener is real content).
+    // Computed independently of the paired set (not gated on `reasoning.is_empty()`) so it
+    // composes with a later paired block; closes inside tool arguments are skipped so a
+    // literal `</think>` in a tool arg cannot mask the real top-level close.
+    let first_open = ["<think>", "<longcat_think>"]
+        .iter()
+        .filter_map(|t| first_top_level(text, t, &tool_ranges))
+        .min();
+    if let Some((close_pos, close_end)) = first_top_level_bare_close(text, &tool_ranges)
+        && first_open.is_none_or(|op| close_pos < op)
+    {
+        reasoning.push((0, close_end));
     }
 
     if reasoning.is_empty() {
@@ -624,6 +625,47 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
         out.push_str(&text[cursor..]);
     }
     out.trim().to_string()
+}
+
+/// First byte offset of `needle` in `text` that lies OUTSIDE every tool span (i.e. is a
+/// top-level token, not literal text inside a tool-call argument), if any.
+fn first_top_level(text: &str, needle: &str, tool_ranges: &[(usize, usize)]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(needle) {
+        let pos = from + rel;
+        if !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e) {
+            return Some(pos);
+        }
+        from = pos + needle.len();
+    }
+    None
+}
+
+/// `(start, end)` of the earliest top-level reasoning close (`</think>`/`</longcat_think>`)
+/// that is followed by a newline or end-of-text — the "missing-open" close that ends a
+/// template-injected leading reasoning block. Closes inside tool spans (literal argument
+/// text) and closes followed by other content are skipped.
+fn first_top_level_bare_close(
+    text: &str,
+    tool_ranges: &[(usize, usize)],
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for close in ["</think>", "</longcat_think>"] {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(close) {
+            let pos = from + rel;
+            let end = pos + close.len();
+            let top_level = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+            if top_level && (text[end..].is_empty() || text[end..].starts_with('\n')) {
+                if best.is_none_or(|(bp, _)| pos < bp) {
+                    best = Some((pos, end));
+                }
+                break; // earliest qualifying close for this family
+            }
+            from = end;
+        }
+    }
+    best
 }
 
 /// Check if text contains any thinking tags
@@ -996,6 +1038,43 @@ mod tests {
         assert!(
             !out.contains("secret") && !out.contains("<tool_call>") && !out.contains("<think>"),
             "straddling reasoning+tool must be fully dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_close_inside_tool_arg() {
+        // Adversarial (Codex No-ship): missing-open reasoning (no `<think>` opener — template
+        // injected it) whose FIRST `</think>` is literal text inside a tool argument, with
+        // the REAL top-level close later. The scan must skip the in-argument close and find
+        // the real one, so the leading reasoning AND the reasoning-internal tool call are
+        // dropped — not returned verbatim.
+        let input = "secret <tool_call>{\"name\":\"leak\",\"arguments\":{\"q\":\"</think> literal\"}}</tool_call> more secret</think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret") && !out.contains("leak") && !out.contains("<tool_call>"),
+            "missing-open reasoning + nested tool call must be dropped: {out:?}"
+        );
+        assert!(
+            out.contains("final"),
+            "post-reasoning content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_prefix_plus_later_paired_block() {
+        // Adversarial (Codex No-ship): a missing-open `</think>` prefix followed by a later
+        // paired block of the OTHER family, with a standalone tool call in the content
+        // between them. Missing-open must compose with the paired block (both stripped) while
+        // the content tool call is preserved.
+        let input = "leading reasoning </think>\n<tool_call>{\"name\":\"f\"}</tool_call> mid <longcat_think>more reasoning</longcat_think> tail";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("leading reasoning") && !out.contains("more reasoning"),
+            "both the missing-open prefix and the later paired block must be stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("tail"),
+            "the content tool call and trailing content survive: {out:?}"
         );
     }
 
