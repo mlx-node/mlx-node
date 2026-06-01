@@ -557,72 +557,15 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
         // Truncated generation (no </think> before EOS/max): all reasoning.
         return String::new();
     }
-    // No think_end_id in vocab (or tag unlocatable): text-level strip mirroring
-    // parse_thinking, keeping the post-</think> remainder verbatim.
-    strip_reasoning_span_text_level(text)
-}
-
-/// Remove the leading `<think>…</think>` (or `<longcat_think>…</longcat_think>`)
-/// reasoning span at the text level, returning the remainder verbatim. Mirrors
-/// the `tools::parse_thinking` fallback boundary. Defensive: the streaming /
-/// finalize callers virtually always have a `think_end_id`, so this path is only
-/// reached for models whose vocab lacks the close token.
-fn strip_reasoning_span_text_level(text: &str) -> String {
-    // Remove ALL paired reasoning blocks anywhere in the text, mirroring
-    // `tools::strip_tag_blocks`/`parse_thinking` (which strip every block, not
-    // just the first). A single leftover `<think>…</think>` here would leak the
-    // chain-of-thought into `raw_text` even though the parsed `thinking` field is
-    // fully suppressed. Each scan finds the earliest next pair of EITHER tag type
-    // and removes it, appending the gap text verbatim (no trimming — raw_text
-    // stays raw).
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    let mut found_any = false;
-    loop {
-        // Find the earliest opening tag of either reasoning variant at/after cursor.
-        let mut next: Option<(usize, &str, &str)> = None; // (open_pos, open, close)
-        for (open, close) in [
-            ("<think>", "</think>"),
-            ("<longcat_think>", "</longcat_think>"),
-        ] {
-            if let Some(rel) = text[cursor..].find(open) {
-                let open_pos = cursor + rel;
-                let earlier = next.map(|(p, _, _)| open_pos < p).unwrap_or(true);
-                if earlier {
-                    next = Some((open_pos, open, close));
-                }
-            }
-        }
-        let Some((open_pos, open, close)) = next else {
-            break;
-        };
-        let content_start = open_pos + open.len();
-        let Some(rel_close) = text[content_start..].find(close) else {
-            // Unterminated opening tag: no more paired blocks to strip.
-            break;
-        };
-        let close_end = content_start + rel_close + close.len();
-        // Append the gap before this block verbatim, then skip the block.
-        out.push_str(&text[cursor..open_pos]);
-        cursor = close_end;
-        found_any = true;
-    }
-    if found_any {
-        out.push_str(&text[cursor..]);
-        return out;
-    }
-    // No paired block: fall through to the missing-opening-tag branch.
-    // Missing opening tag (template injected <think> into the prompt): strip up to
-    // and including the first </think> that is followed by newline / end-of-text.
-    for close_tag in ["</think>", "</longcat_think>"] {
-        if let Some(close_pos) = text.find(close_tag) {
-            let after = &text[close_pos + close_tag.len()..];
-            if after.is_empty() || after.starts_with('\n') {
-                return after.to_string();
-            }
-        }
-    }
-    text.to_string()
+    // No think_end_id in vocab (or tag unlocatable): mirror parse_thinking_and_tools'
+    // OWN fallback, which routes through `tools::parse_thinking` (via
+    // `split_at_think_end(text, None)` -> `parse_generation_output`). Reusing the
+    // exact same function makes the raw_text reasoning boundary IDENTICAL to the
+    // parsed `thinking` boundary — no divergence is possible (a hand-rolled scanner
+    // kept re-introducing mismatches on mixed/unterminated tags). `parse_thinking`
+    // strips ALL reasoning blocks of BOTH `<think>`/`<longcat_think>` families and
+    // touches nothing else, so tool-call markup in the content is preserved.
+    tools::parse_thinking(text).0
 }
 
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.
@@ -1492,7 +1435,12 @@ mod tests {
         assert_eq!(out, text, "no-thinking mode keeps raw verbatim");
 
         // 5. Text-level fallback: no think_end_id in vocab and no tag string.
-        //    Paired <think>…</think> is stripped, remainder kept verbatim.
+        //    Paired <think>…</think> is stripped. The fallback delegates to
+        //    `tools::parse_thinking` (the SAME function parse_thinking_and_tools'
+        //    fallback uses) so the boundary is identical to the parsed `text`
+        //    field — which means the remainder is trimmed (parse_thinking's
+        //    strip_tag_blocks trims), e.g. "\nABC" -> "ABC". Boundary fidelity is
+        //    the priority here over byte-verbatimness; no reasoning leaks.
         let text = "<think>r</think>\nABC";
         let out = raw_text_with_reasoning_suppressed(
             text,
@@ -1502,9 +1450,10 @@ mod tests {
             None, // think_end_str
             false,
         );
-        assert_eq!(out, "\nABC", "text-level fallback strips reasoning span");
+        assert_eq!(out, "ABC", "text-level fallback strips reasoning span");
         assert!(!out.contains("<think>"));
         assert!(!out.contains("</think>"));
+        assert!(!out.contains('r'), "reasoning content must be gone");
     }
 
     #[test]
@@ -1537,6 +1486,39 @@ mod tests {
         assert!(
             out.contains("answer"),
             "trailing non-reasoning content must survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_raw_text_fallback_mixed_unmatched_tag() {
+        // Regression: an UNMATCHED `<think>` opener appearing BEFORE a valid
+        // `<longcat_think>…</longcat_think>` block must NOT prevent the longcat
+        // reasoning from being stripped. The earlier hand-rolled scanner picked
+        // the earliest opener of either family and bailed when it had no close,
+        // leaking the later block. Delegating to `tools::parse_thinking` (which
+        // checks each tag family separately) strips the longcat block while
+        // leaving the stray `<think>` literal — exactly matching the parsed
+        // `thinking` boundary, so no reasoning CONTENT leaks.
+        let text = "prefix <think> literal <longcat_think>secret</longcat_think> suffix";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &[101u32, 102, 103], // no think_end_id present → text-level fallback
+            true,                // thinking_enabled
+            None,                // think_end_id
+            None,                // think_end_str
+            false,               // include_reasoning
+        );
+        assert!(
+            !out.contains("secret"),
+            "longcat reasoning content must not leak: {out:?}"
+        );
+        assert!(
+            !out.contains("longcat_think"),
+            "no longcat reasoning tag may remain: {out:?}"
+        );
+        assert!(
+            out.contains("prefix") && out.contains("suffix"),
+            "non-reasoning content must survive: {out:?}"
         );
     }
 }
