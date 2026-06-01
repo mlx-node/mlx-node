@@ -2028,6 +2028,19 @@ mod tests {
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
+        // The whole point of this test is to prove the TRACED `compiled_lfm2_decode()`
+        // branch ran (via the compiled-decode counter). Under MLX_NO_COMPILE=1 the
+        // forward takes the EAGER `lfm2_decode_fn` arm, which never bumps that
+        // counter — so the engagement proof is meaningless. Skip rather than falsely
+        // pass (the generic forward_call_count would still increment in that arm).
+        if std::env::var_os("MLX_NO_COMPILE").is_some() {
+            eprintln!(
+                "[skip] production_compiled_decode_matches_native_with_conv_bias: \
+                 MLX_NO_COMPILE set — cannot prove traced compiled branch"
+            );
+            return;
+        }
+
         let config = tiny_dense_conv_bias_config();
         let params = dense_conv_bias_params(&config);
 
@@ -2184,6 +2197,7 @@ mod tests {
         // logits for the LAST token are what we compare against native_final.
         let embed_weight = seed_inner.embed_tokens.get_weight();
         let calls_before = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+        let comp_before = unsafe { mlx_sys::mlx_lfm2_moe_compiled_decode_call_count() };
 
         let mut compiled_final: Option<MxArray> = None;
         for &tok in &token_ids[prefill_p..] {
@@ -2211,6 +2225,8 @@ mod tests {
 
         let calls_after = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
         let call_delta = calls_after.saturating_sub(calls_before);
+        let comp_after = unsafe { mlx_sys::mlx_lfm2_moe_compiled_decode_call_count() };
+        let comp_delta = comp_after.saturating_sub(comp_before);
 
         let compiled_final = logits_to_vec(&compiled_final.expect("compiled ran >=1 step"));
 
@@ -2230,12 +2246,23 @@ mod tests {
              (call_delta={call_delta}, expected {expected_calls}); the production \
              compiled path silently fell back"
         );
+        // STRONGER engagement proof: the generic forward_call_count above bumps in
+        // BOTH the eager (MLX_NO_COMPILE) and the traced arm, so on its own it can
+        // pass without the compiled closure ever running. This counter increments
+        // ONLY inside the compiled `else` arm, so a matching delta is positive proof
+        // the TRACED `compiled_lfm2_decode()` closure ran once per decode token.
+        assert_eq!(
+            comp_delta, expected_calls,
+            "TRACED compiled_lfm2_decode did not run once per decode token \
+             (comp_delta={comp_delta}, expected {expected_calls}); forward entered \
+             but took the eager/no_compile branch"
+        );
 
         // ---- PARITY: compiled final-step logits vs full native reference. ----
         let d = max_abs(&native_final, &compiled_final);
         println!(
             "lfm2 PRODUCTION compiled decode parity (conv_bias=true): max_abs={d} \
-             call_delta={call_delta}"
+             call_delta={call_delta} comp_delta={comp_delta}"
         );
         assert!(
             d < 2e-2,

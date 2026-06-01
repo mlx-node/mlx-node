@@ -183,11 +183,17 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
 //   g_lfm2_inited      true iff init_from_prefill imported caches cleanly.
 //   g_lfm2_forward_calls  cumulative forward count (engagement signal; NOT
 //                      reset by mlx_lfm2_moe_reset).
+//   g_lfm2_compiled_decode_calls  cumulative count of forwards that took the
+//                      TRACED compiled_lfm2_decode() branch (i.e. NOT the eager
+//                      MLX_NO_COMPILE arm). Process-lifetime "did the traced
+//                      compiled branch run" signal; NOT reset by
+//                      mlx_lfm2_moe_reset.
 // =====================================================================
 std::vector<array> g_lfm2_caches;
 int g_lfm2_offset_int = 0;
 bool g_lfm2_inited = false;
 uint64_t g_lfm2_forward_calls = 0;
+uint64_t g_lfm2_compiled_decode_calls = 0;
 
 // ---------------------------------------------------------------------------
 // REBUILDABLE compiled-decode closure (Phase 3c hardening).
@@ -663,6 +669,10 @@ void mlx_lfm2_moe_forward(
       outputs = lfm2_decode_fn(fn_inputs);
     } else {
       auto compiled = compiled_lfm2_decode();
+      // Bump the TRACED-branch counter ONLY here (never in the no_compile arm
+      // above and never before the branch) — this is the proof that the actual
+      // compiled closure ran, not just that the forward FFI was entered.
+      g_lfm2_compiled_decode_calls++;
       outputs = compiled(fn_inputs);
     }
 
@@ -721,6 +731,14 @@ void mlx_lfm2_moe_eval_token_and_caches(mlx_array* token) {
 // mlx_lfm2_moe_reset — it is a process-lifetime "did the compiled decode path
 // ever run" signal for the e2e assertion.
 uint64_t mlx_lfm2_moe_forward_call_count() { return g_lfm2_forward_calls; }
+
+// Cumulative count of forwards that took the TRACED compiled_lfm2_decode()
+// branch (NOT the eager MLX_NO_COMPILE arm). Distinguishes "the forward FFI was
+// entered" from "the compiled closure actually ran". Like the count above, it is
+// intentionally NOT reset by mlx_lfm2_moe_reset.
+uint64_t mlx_lfm2_moe_compiled_decode_call_count() {
+  return g_lfm2_compiled_decode_calls;
+}
 
 // Export the live caches for cross-turn reuse. Copies cache arrays to caller-
 // provided output pointers (heap-allocated). Returns the number exported (the

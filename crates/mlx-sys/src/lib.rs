@@ -1886,6 +1886,13 @@ unsafe extern "C-unwind" {
     /// to assert the compiled decode path actually ran.
     pub fn mlx_lfm2_moe_forward_call_count() -> u64;
 
+    /// Cumulative count of `mlx_lfm2_moe_forward` calls that took the TRACED
+    /// `compiled_lfm2_decode()` branch — i.e. NOT the eager `MLX_NO_COMPILE`
+    /// arm (NOT reset by `mlx_lfm2_moe_reset`). Unlike
+    /// `mlx_lfm2_moe_forward_call_count`, this proves the actual compiled
+    /// closure ran, not merely that the forward FFI was entered.
+    pub fn mlx_lfm2_moe_compiled_decode_call_count() -> u64;
+
     /// Export the live compiled caches (uniform stride 2 by absolute layer
     /// idx; attn -> kv_keys/kv_values, conv -> conv_state/scalar-placeholder)
     /// into caller-provided heap pointers for cross-turn reuse. Returns the
