@@ -529,18 +529,19 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 ///      text, MINUS any block wholly contained in a tool span (those are literal argument
 ///      text). The template "missing-open" case is also handled (a bare close at the
 ///      injected depth-1 level, newline/EOF-terminated, marks a leading reasoning prefix),
-///      mirroring `parse_thinking`. The terminator applied is the earliest-qualifying one
-///      across both families (`applied_missing_open`).
+///      mirroring `parse_thinking`. The terminator applied (`applied_missing_open`) PREFERS a
+///      top-level close over an in-tool straddle across both families (see that fn).
 ///   3. The removal set is the reasoning ranges UNION every tool span that overlaps any
 ///      reasoning range (nested or straddling — entangled with reasoning, so dropped). Tool
-///      spans disjoint from all reasoning are preserved verbatim.
+///      spans disjoint from all reasoning are PRESERVED verbatim (the `kept` set).
 ///   4. Emit `text` minus the merged removal ranges.
-///   5. SYNTHESIS DEFENSE: deleting a reasoning block flanked by tool-tag fragments (e.g.
-///      `<tool` <reasoning> `_call>`) would FUSE them into a `<tool_call>` span that never
-///      existed in the input — which `parse_tool_calls` would treat as an executable call.
-///      So any output tool span that is not a verbatim substring of the pass input is
-///      dropped (`drop_synthesized_tool_spans`); genuine preserved spans are copied verbatim
-///      and always re-appear, so only fabricated spans are removed.
+///   5. SYNTHESIS DEFENSE (RANGE provenance): deleting a reasoning block flanked by tool-tag
+///      fragments (e.g. `<tool` <reasoning> `_call>`) would FUSE them into a `<tool_call>` span
+///      that never existed as a preserved call — which `parse_tool_calls` would treat as
+///      executable. Only the `kept` spans (copied verbatim and contiguously) are legitimate, so
+///      `drop_non_preserved_tool_spans` drops any output span beyond that multiset. A substring
+///      test is NOT enough: a fabricated span can equal bytes that existed only inside a deleted
+///      reasoning block.
 ///
 /// A single pass strips every paired block plus the LEADING missing-open span. The entry point
 /// then iterates the pass to a FIXPOINT so SUCCESSIVE missing-open spans (a second bare close
@@ -552,18 +553,20 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
 /// missing-open terminator (`has_top_level_missing_open_terminator`), NOT on mere tool-span
 /// presence. The missing-open heuristic models byte 0 as template-injected reasoning; that is
 /// true of the original generation and of any remainder that still LEADS with reasoning, but
-/// NOT of an output whose applied terminator is an IN-TOOL straddle — that is a PRESERVED
-/// tool call whose own argument carries `</think>`, and re-running would treat it as a byte-0
-/// straddle and wrongly drop the valid call. So a pass keeps iterating only while the next
-/// terminator it would apply is top-level (genuine reasoning remains), and halts the moment
-/// the applied terminator is in-tool (or none remains). This correctly handles a
-/// reasoning-internal tool call dropped within a pass (its tool-free remainder keeps
-/// iterating), a second missing-open span that itself contains a reasoning-internal tool call
-/// (a top-level terminator survives the first pass, so iteration continues and drops it), and
-/// a genuine post-reasoning call whose parameter holds a cross-family literal close (the
-/// applied terminator is that in-tool close, so iteration halts and preserves the call).
-/// Multiple in-tool straddle candidates within one pass are resolved by last-wins in
-/// `missing_open_close`.
+/// NOT of an output whose applied terminator is an IN-TOOL straddle with no top-level close past
+/// it — that is a PRESERVED tool call whose own argument carries `</think>`, and re-running
+/// would treat it as a byte-0 straddle and wrongly drop the valid call. So a pass keeps
+/// iterating only while the terminator it would apply is top-level (genuine reasoning remains),
+/// and halts the moment the applied terminator is in-tool (or none remains). This correctly
+/// handles: a reasoning-internal tool call dropped within a pass (its remainder keeps
+/// iterating); a second missing-open span that itself contains a reasoning-internal tool call
+/// (a top-level terminator survives the first pass, so iteration continues and drops it); a
+/// span whose tool call precedes a LATER top-level close of either family (the close extends
+/// the reasoning over the call, dropping it — `applied_missing_open` prefers that top-level
+/// close over the call's earlier in-tool argument close); and a genuine post-reasoning call
+/// whose only following close is its own in-tool argument close (no top-level close past it, so
+/// iteration halts and preserves the call). Multiple in-tool straddle candidates within one
+/// pass are resolved by last-wins in `missing_open_close`.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
     let mut current = strip_reasoning_once(text);
     while has_top_level_missing_open_terminator(&current) {
@@ -618,12 +621,17 @@ fn strip_reasoning_once(text: &str) -> String {
 
     // Removal = reasoning ranges ∪ tool spans entangled with reasoning (nested or
     // straddling). A tool span overlapping any reasoning range is part of the suppressed
-    // chain-of-thought and must not surface.
+    // chain-of-thought and must not surface. The remaining (disjoint) tool spans are the
+    // PRESERVED set — their exact byte strings are the only `<tool_call>` spans allowed to
+    // appear in the output (see the synthesis defense below).
     let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
     let mut removal = reasoning.clone();
-    for t in &tool_ranges {
-        if reasoning.iter().any(|r| overlaps(*t, *r)) {
-            removal.push(*t);
+    let mut kept: Vec<&str> = Vec::new();
+    for &(ts, te) in &tool_ranges {
+        if reasoning.iter().any(|r| overlaps((ts, te), *r)) {
+            removal.push((ts, te));
+        } else {
+            kept.push(&text[ts..te]);
         }
     }
     removal.sort_by_key(|(s, _)| *s);
@@ -644,49 +652,63 @@ fn strip_reasoning_once(text: &str) -> String {
     if cursor < text.len() {
         out.push_str(&text[cursor..]);
     }
-    // Synthesis defense: a removal seam may have fused tool-tag fragments into a `<tool_call>`
-    // span that never existed in `text`. Drop any such fabricated span before it can reach
-    // `parse_tool_calls` as an executable call.
-    let out = drop_synthesized_tool_spans(out, text);
+    // Synthesis defense (RANGE provenance): a removal seam can fuse tool-tag fragments (e.g.
+    // `<tool` <reasoning> `_call>`) into a `<tool_call>` span that never existed as a preserved
+    // call — which `parse_tool_calls` would treat as executable. Only the PRESERVED tool spans
+    // (`kept`, copied verbatim and contiguously) are legitimate, so drop any output span beyond
+    // that multiset. A substring check is NOT enough: a fabricated span can match bytes that
+    // existed only INSIDE a deleted reasoning block.
+    let out = drop_non_preserved_tool_spans(out, &kept);
     out.trim().to_string()
 }
 
-/// The missing-open terminator that `strip_reasoning_once` applies — the earliest qualifying
-/// close across both reasoning families — together with whether it is TOP-LEVEL (definitive,
-/// outside every tool span) vs an in-tool straddle. `None` if no family has a terminator.
+/// The missing-open terminator that `strip_reasoning_once` applies, together with whether it is
+/// TOP-LEVEL (definitive, outside every tool span) vs an in-tool straddle. `None` if no family
+/// has a terminator.
 ///
-/// This is the single source of truth for both the actual strip (which uses the byte range)
-/// and the fixpoint gate (which uses the top-level flag), so the two never disagree even when
-/// the families' terminators rank differently (e.g. an in-tool straddle of one family is
-/// earlier than a top-level close of the other — the earlier, in-tool one is applied, so
-/// iteration must halt to preserve the straddling call rather than chase the later top-level).
+/// Selection across families PREFERS a definitive top-level close over a tentative in-tool
+/// straddle: the earliest TOP-LEVEL close across both families wins; only if NEITHER family has
+/// a top-level close is the (latest) in-tool straddle used. This matters when one family's
+/// in-tool straddle is positionally earlier than the other family's top-level close — the
+/// reasoning genuinely extends to the top-level close (dropping any tool call that opened
+/// before it), so chasing the earlier in-tool straddle would halt early and leak. A straddle
+/// is the real terminator only when no top-level close exists at all (a tool call that opened
+/// mid-reasoning whose own argument carries the close). When the straddle IS used, the latest
+/// one wins so the reasoning range reaches every straddling span (matching `missing_open_close`'s
+/// within-family last-wins). This is the single source of truth for both the strip (byte range)
+/// and the fixpoint gate (top-level flag), so they never disagree.
 fn applied_missing_open(
     text: &str,
     tool_ranges: &[(usize, usize)],
 ) -> Option<(usize, usize, bool)> {
-    let mut best: Option<(usize, usize)> = None;
+    let mut top_level: Option<(usize, usize)> = None; // earliest top-level close
+    let mut straddle: Option<(usize, usize)> = None; // latest in-tool straddle
     for (open, close) in [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
     ] {
-        if let Some((close_pos, close_end)) = missing_open_close(text, open, close, tool_ranges)
-            && best.is_none_or(|(bp, _)| close_pos < bp)
-        {
-            best = Some((close_pos, close_end));
+        if let Some((pos, end)) = missing_open_close(text, open, close, tool_ranges) {
+            let is_top = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+            if is_top {
+                if top_level.is_none_or(|(bp, _)| pos < bp) {
+                    top_level = Some((pos, end));
+                }
+            } else if straddle.is_none_or(|(bp, _)| pos > bp) {
+                straddle = Some((pos, end));
+            }
         }
     }
-    best.map(|(pos, end)| {
-        let top_level = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
-        (pos, end, top_level)
-    })
+    top_level
+        .map(|(pos, end)| (pos, end, true))
+        .or_else(|| straddle.map(|(pos, end)| (pos, end, false)))
 }
 
 /// True iff `text` still leads with a TOP-LEVEL (definitive) missing-open reasoning span — the
-/// applied terminator (`applied_missing_open`) exists and is outside every tool span. This is
-/// the iterate-again signal for `strip_reasoning_preserving_tools`: a top-level terminator
-/// means genuine leading reasoning remains, whereas an in-tool straddle (a preserved call
-/// whose argument carries a `</think>`) must NOT drive another pass — re-running would drop the
-/// valid call.
+/// applied terminator (`applied_missing_open`) exists and is top-level. This is the
+/// iterate-again signal for `strip_reasoning_preserving_tools`: a top-level terminator means
+/// genuine leading reasoning remains, whereas an in-tool straddle (a preserved call whose
+/// argument carries a `</think>`, with no top-level close past it) must NOT drive another pass —
+/// re-running would drop the valid call.
 fn has_top_level_missing_open_terminator(text: &str) -> bool {
     let tool_ranges: Vec<(usize, usize)> = extract_tag_blocks(text, "<tool_call>", "</tool_call>")
         .into_iter()
@@ -695,27 +717,43 @@ fn has_top_level_missing_open_terminator(text: &str) -> bool {
     matches!(applied_missing_open(text, &tool_ranges), Some((_, _, true)))
 }
 
-/// Drop any `<tool_call>…</tool_call>` span in `out` that is NOT a verbatim substring of
-/// `original` (the pass input). Such a span was SYNTHESIZED by a removal seam fusing tool-tag
-/// fragments (e.g. `<tool` <reasoning> `_call>` → `<tool_call>`) and would otherwise be parsed
-/// as an executable call. A genuine preserved span is copied verbatim from `original`, so it
-/// always re-appears there and is kept; only fabricated spans are removed. Iterated to a
-/// fixpoint because dropping one span could fuse a further one; each round strictly shrinks
-/// `out`, so it terminates.
-fn drop_synthesized_tool_spans(mut out: String, original: &str) -> String {
+/// Drop any `<tool_call>…</tool_call>` span in `out` beyond the PRESERVED multiset `kept` (the
+/// tool spans that survived this pass, copied verbatim and contiguously). Anything else is a
+/// removal-seam artifact — `<tool` <reasoning> `_call>` fused into a `<tool_call>` span — and
+/// `parse_tool_calls` would treat it as executable.
+///
+/// This is RANGE provenance, not a substring test: a fabricated span can equal bytes that
+/// existed only INSIDE a deleted reasoning block, so substring matching against the input would
+/// falsely keep it. Each distinct kept string carries a budget equal to its count; output spans
+/// consume the budget left-to-right (genuine occurrences kept), and any span with no budget left
+/// — a fabricated span, or a duplicate beyond the genuine count — is dropped. Iterated to a
+/// fixpoint because dropping a span could fuse a further one at its seam; each round strictly
+/// shrinks `out`, so it terminates.
+fn drop_non_preserved_tool_spans(mut out: String, kept: &[&str]) -> String {
     loop {
-        let synthesized: Vec<(usize, usize)> =
-            extract_tag_blocks(&out, "<tool_call>", "</tool_call>")
-                .into_iter()
-                .filter(|(s, e, _)| !original.contains(&out[*s..*e]))
-                .map(|(s, e, _)| (s, e))
-                .collect();
-        if synthesized.is_empty() {
+        let spans = extract_tag_blocks(&out, "<tool_call>", "</tool_call>");
+        let mut budget: Vec<(&str, usize)> = Vec::new();
+        for k in kept {
+            if let Some(slot) = budget.iter_mut().find(|(s, _)| s == k) {
+                slot.1 += 1;
+            } else {
+                budget.push((k, 1));
+            }
+        }
+        let mut drop_ranges: Vec<(usize, usize)> = Vec::new();
+        for (s, e, _) in &spans {
+            let span = &out[*s..*e];
+            match budget.iter_mut().find(|(k, rem)| *k == span && *rem > 0) {
+                Some(slot) => slot.1 -= 1,          // genuine preserved occurrence — keep
+                None => drop_ranges.push((*s, *e)), // fabricated/excess — drop
+            }
+        }
+        if drop_ranges.is_empty() {
             return out;
         }
         let mut result = String::with_capacity(out.len());
         let mut cursor = 0usize;
-        for (s, e) in synthesized {
+        for (s, e) in drop_ranges {
             if s > cursor {
                 result.push_str(&out[cursor..s]);
             }
@@ -1557,22 +1595,42 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_reasoning_missing_open_preserves_call_with_cross_family_inner_close() {
-        // Cross-family preserved-call corner: after the leading `</think>\n` reasoning is
-        // stripped, the remainder LEADS with a genuine tool call whose parameter holds a literal
-        // `</longcat_think>\n`, with a later top-level `</think>\n` in trailing content. The
-        // applied missing-open terminator (earliest across families) is that IN-TOOL longcat
-        // close, so the fixpoint must HALT — re-running would treat the call's own argument as a
-        // byte-0 straddle and drop the valid call. The later top-level `</think>` is a literal in
-        // post-reasoning content, not a new reasoning span.
-        let input = "reasoning </think>\n<tool_call><function=ok><parameter=p></longcat_think>\nv</parameter></function></tool_call> middle </think>\nfinal";
+    fn test_strip_reasoning_missing_open_cross_family_later_top_level_drops_call() {
+        // Adversarial (Codex No-ship: cross-family ranking). After the leading `</think>\n` is
+        // stripped, the remainder LEADS with a tool call whose parameter holds a literal
+        // `</longcat_think>\n`, AND there is a LATER top-level `</think>\n` (after `more secret`).
+        // The reasoning genuinely extends to that top-level close, so the tool call — which
+        // opened before it — is reasoning-internal and must be dropped. Preferring the earlier
+        // in-tool longcat straddle over the later top-level `</think>` halted early and leaked
+        // both `more secret` and the call. `applied_missing_open` prefers the top-level close, so
+        // iteration continues and strips through it.
+        let input = "r1 </think>\n<tool_call><function=leak><parameter=p></longcat_think>\nliteral</parameter></function></tool_call> more secret </think>\nfinal";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(
+            out, "final",
+            "the reasoning-internal call before a later top-level close must be dropped: {out:?}"
+        );
+        let (_clean, calls) = parse_tool_calls(&out);
+        assert!(
+            calls.is_empty(),
+            "no leaked/executable tool call survives: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_cross_family_no_later_close_preserves_call() {
+        // Counterpart to the above: the genuine post-reasoning call's parameter holds a literal
+        // `</longcat_think>\n`, but there is NO top-level close anywhere past the call (trailing
+        // ` tail`, no `</think>`). The only candidate terminator in the remainder is the call's
+        // own in-tool argument close, so the fixpoint HALTS and the call is preserved.
+        let input = "reasoning </think>\n<tool_call><function=ok><parameter=p></longcat_think>\nv</parameter></function></tool_call> tail";
         let out = strip_reasoning_preserving_tools(input);
         assert!(
-            !out.contains("reasoning </think>") && !out.starts_with("reasoning"),
+            !out.starts_with("reasoning"),
             "the leading missing-open reasoning prefix is stripped: {out:?}"
         );
         assert!(
-            out.contains("<tool_call>") && out.contains("function=ok") && out.contains("final"),
+            out.contains("<tool_call>") && out.contains("function=ok") && out.contains("tail"),
             "the genuine post-reasoning tool call and trailing content survive: {out:?}"
         );
         let (_clean, calls) = parse_tool_calls(&out);
@@ -1580,6 +1638,27 @@ mod tests {
             calls.len(),
             1,
             "exactly the one genuine tool call is recovered: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_synthesis_duplicate_bytes_in_deleted_reasoning() {
+        // Adversarial (Codex No-ship: substring provenance was insufficient). A reasoning block
+        // CONTAINS a real-looking `<tool_call>{leak}</tool_call>` (dropped as reasoning), and a
+        // SECOND region fuses `<tool` <reasoning> `_call>` into an identical `<tool_call>{leak}…`
+        // span. A substring check would falsely keep the fused span because its bytes also occur
+        // inside the deleted reasoning. RANGE provenance keeps only the PRESERVED (kept) tool
+        // spans — here none — so the fabricated call is dropped.
+        let input = "<think><tool_call>{\"name\":\"leak\"}</tool_call></think><tool<think>secret</think>_call>{\"name\":\"leak\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("<tool_call>") && !out.contains("leak"),
+            "a fabricated span matching deleted-reasoning bytes must not survive: {out:?}"
+        );
+        let (_clean, calls) = parse_tool_calls(&out);
+        assert!(
+            calls.is_empty(),
+            "no synthesized tool call must reach parse_tool_calls: {calls:?}"
         );
     }
 
