@@ -503,6 +503,58 @@ pub fn parse_thinking(text: &str) -> (String, Option<String>) {
     (text.to_string(), None)
 }
 
+/// Remove EVERY reasoning block of BOTH families (`<think>…</think>` and
+/// `<longcat_think>…</longcat_think>`) from `text`, returning the remainder.
+///
+/// `parse_thinking` only strips the FIRST matching family and returns, so a
+/// generation mixing both families would leave the second behind. Iterating it to
+/// a fixpoint removes all families (each pass strips one family or the missing-open
+/// span; the text strictly shrinks, so it terminates). Reuses the shared, tested
+/// `parse_thinking` rather than a bespoke tag scanner.
+fn strip_all_reasoning(text: &str) -> String {
+    let mut current = text.to_string();
+    loop {
+        let next = parse_thinking(&current).0;
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// Strip reasoning (`<think>`/`<longcat_think>` blocks, both families) from `text`
+/// while preserving `<tool_call>…</tool_call>` spans VERBATIM.
+///
+/// Used to scrub reasoning from `raw_text` on the no-`</think>`-token fallback path
+/// without corrupting tool-call markup: reasoning-looking tags inside tool-call
+/// arguments (e.g. a JSON argument value containing a literal `<think>…</think>` or a
+/// bare `</think>`) must NOT be treated as reasoning delimiters, or the recovered tool
+/// call would be mangled. We split the text at tool-call spans, strip reasoning only in
+/// the gaps between them, and copy each tool-call span through unchanged.
+///
+/// Note: reasoning is structurally a leading block before any tool call, so gap-wise
+/// stripping is exact for real output. A (malformed) reasoning block that *wrapped* a
+/// tool call would only have its literal tag text survive in a gap — no tool span is
+/// ever altered.
+pub fn strip_reasoning_preserving_tools(text: &str) -> String {
+    let tool_spans = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
+    if tool_spans.is_empty() {
+        return strip_all_reasoning(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    for (start, end, _inner) in &tool_spans {
+        // Strip reasoning from the gap before this tool span, then copy the span
+        // (the full `<tool_call>…</tool_call>`) through verbatim.
+        out.push_str(&strip_all_reasoning(&text[pos..*start]));
+        out.push_str(&text[*start..*end]);
+        pos = *end;
+    }
+    // Trailing gap after the last tool span.
+    out.push_str(&strip_all_reasoning(&text[pos..]));
+    out
+}
+
 /// Check if text contains any thinking tags
 pub fn has_thinking(text: &str) -> bool {
     text.contains("<think>") || text.contains("<longcat_think>")
@@ -696,6 +748,84 @@ pub fn build_reward_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- strip_reasoning_preserving_tools (raw_text fallback scrubber) ----
+
+    #[test]
+    fn test_strip_reasoning_mixed_paired_families() {
+        // Both families must be removed (parse_thinking alone stops after the first).
+        let out = strip_reasoning_preserving_tools(
+            "<think>a</think>mid<longcat_think>secret</longcat_think>answer",
+        );
+        assert!(
+            !out.contains("secret"),
+            "longcat reasoning must not leak: {out:?}"
+        );
+        assert!(
+            !out.contains("<think>") && !out.contains("longcat_think"),
+            "no reasoning tags: {out:?}"
+        );
+        assert!(
+            out.contains("mid") && out.contains("answer"),
+            "content survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_preserves_tool_call_with_inner_think() {
+        // A literal <think>…</think> INSIDE a tool argument is tool content, not
+        // reasoning — the whole <tool_call>…</tool_call> span is copied verbatim.
+        let input = r#"<tool_call>{"name":"f","arguments":{"q":"<think>x</think>"}}</tool_call>"#;
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(out, input, "tool-call span must be byte-preserved: {out:?}");
+        assert!(out.contains("<tool_call>") && out.contains("</tool_call>"));
+    }
+
+    #[test]
+    fn test_strip_reasoning_preserves_tool_call_with_bare_close() {
+        // A bare </think> inside a tool argument must not trigger the missing-open
+        // branch and eat the <tool_call> opener.
+        let input =
+            "<tool_call>{\"name\":\"f\",\"arguments\":{\"q\":\"</think>\\nfoo\"}}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert_eq!(out, input, "tool-call span must be byte-preserved: {out:?}");
+    }
+
+    #[test]
+    fn test_strip_reasoning_before_tool_call() {
+        // Reasoning leads, a tool call follows: reasoning gone, tool span intact.
+        let input = "<think>reason</think>\n<tool_call>{\"name\":\"f\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("reason") && !out.contains("<think>"),
+            "reasoning stripped: {out:?}"
+        );
+        assert_eq!(
+            out, "<tool_call>{\"name\":\"f\"}</tool_call>",
+            "tool span preserved: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_between_tool_calls() {
+        // Reasoning between two tool calls is stripped; both tool spans survive.
+        let input = "<tool_call>{\"name\":\"a\"}</tool_call><think>mid</think><tool_call>{\"name\":\"b\"}</tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("mid") && !out.contains("<think>"),
+            "reasoning stripped: {out:?}"
+        );
+        assert!(
+            out.contains(r#"{"name":"a"}"#) && out.contains(r#"{"name":"b"}"#),
+            "both tools survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_no_tools_no_reasoning_is_verbatim() {
+        let input = "just a plain answer with no tags";
+        assert_eq!(strip_reasoning_preserving_tools(input), input);
+    }
 
     // ---- Tag extraction helpers ----
 

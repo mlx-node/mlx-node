@@ -557,15 +557,12 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
         // Truncated generation (no </think> before EOS/max): all reasoning.
         return String::new();
     }
-    // No think_end_id in vocab (or tag unlocatable): mirror parse_thinking_and_tools'
-    // OWN fallback, which routes through `tools::parse_thinking` (via
-    // `split_at_think_end(text, None)` -> `parse_generation_output`). Reusing the
-    // exact same function makes the raw_text reasoning boundary IDENTICAL to the
-    // parsed `thinking` boundary — no divergence is possible (a hand-rolled scanner
-    // kept re-introducing mismatches on mixed/unterminated tags). `parse_thinking`
-    // strips ALL reasoning blocks of BOTH `<think>`/`<longcat_think>` families and
-    // touches nothing else, so tool-call markup in the content is preserved.
-    tools::parse_thinking(text).0
+    // No think_end_id in vocab (or tag unlocatable): text-level scrub. Strips EVERY
+    // reasoning block of BOTH `<think>`/`<longcat_think>` families (parse_thinking
+    // alone only handles the first family) while preserving `<tool_call>…</tool_call>`
+    // spans verbatim — so reasoning-looking tags inside tool arguments can't corrupt
+    // the tool markup that `raw_text` consumers (e.g. server tool-call recovery) rely on.
+    tools::strip_reasoning_preserving_tools(text)
 }
 
 /// Decode tokens, parse thinking/tool_calls, build ChatResult.
