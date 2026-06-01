@@ -211,8 +211,9 @@ const GOLDEN_MIN_PREFIX_BYTES_DENSE: usize = 200;
 /// byte-identical agreement (138 bytes / 33 generated tokens) so the gate floor
 /// sits AT the divergence, not below it: a real impl bug (wrong MoE routing
 /// order / rope base 5e6 / eps) diverges at token 1-3 (< 10 bytes) and is caught
-/// far below this floor, while the single benign one-ULP flip past it is pinned
-/// separately by `GOLDEN_MOE_DIVERGENT_TAIL` (see below) rather than tolerated.
+/// far below this floor, while the single benign one-ULP flip past it (and the
+/// ENTIRE post-gate tail) is pinned exactly by `GOLDEN_RAW_TEXT_MOE_OURS` (the
+/// byte-reproducible compiled self-golden) rather than tolerated.
 ///
 /// OBSERVED + DIAGNOSED (REPRODUCIBLE — `scripts/probe_lfm2_divergence.py`, run
 /// live on the real lfm2.5-8b-a1b 2026-06-01): the compiled MoE decode is
@@ -239,19 +240,31 @@ const GOLDEN_MIN_PREFIX_BYTES_DENSE: usize = 200;
 /// ` respond`=-1.25) and step 26 (` The` vs ` "`) — that our compiled path
 /// resolves IDENTICALLY to mlx-lm; a real routing/rope/eps bug cannot reproduce
 /// 33 tokens through exact ties and then break by exactly one ULP at the single
-/// tightest tie. (2) compiled-flat MoE === eager-flat MoE (`MLX_NO_COMPILE=1`),
-/// BYTE-IDENTICAL — so the flip is inherent to our MoE bf16 math vs mlx-lm's
-/// rounding, NOT a `compile()` tracing / chunked-prefill artifact. This proves
-/// the compiled MoE routing (gate→f32→softmax→+expert_bias→argpartition top-4→
-/// norm_topk_prob), rope base, and eps are faithful to mlx-lm's lfm2_moe.py.
+/// tightest tie. (2) compiled-flat MoE agrees with eager-flat MoE
+/// (`MLX_NO_COMPILE=1`) on the GOLDEN (thinking, 80-token) trajectory through the
+/// step-33 ' So' flip — they share 346 bytes, then eager appends ~10 trailing
+/// newlines at a LATE benign tie (tail_diff <= TAIL_TOLERANCE_BYTES), proven by
+/// `lfm2_moe_golden_eager_vs_compiled`. (The unqualified "byte-identical"
+/// claim held only on the GREEDY 48-token trajectory — `run_flat_single`,
+/// thinking_budget=0 — NOT this golden trajectory where the step-33 divergence
+/// happens; the golden-trajectory test is the correct compile()-faithfulness
+/// evidence.) So the flip is inherent to our MoE bf16 math vs mlx-lm's rounding,
+/// NOT a `compile()` tracing / chunked-prefill artifact. This proves the compiled
+/// MoE routing (gate→f32→softmax→+expert_bias→argpartition top-4→norm_topk_prob),
+/// rope base, and eps are faithful to mlx-lm's lfm2_moe.py.
 const GOLDEN_MIN_PREFIX_BYTES_MOE: usize = 138;
 
-/// The benign one-ULP flip at generated step 33: our compiled MoE path picks
-/// ' So' (mlx-lm's rank-#2 token, -1.75) where the mlx-lm golden picks ' One'
-/// (rank #1, -1.50) — a 0.25-logit = 1 bf16 ULP tie (scripts/probe_lfm2_divergence.py).
-/// Pinning our divergent continuation catches a CHANGED pick at the tie (a real
-/// numerical shift) while tolerating the proven benign one.
-const GOLDEN_MOE_DIVERGENT_TAIL: &str = "So";
+/// Our COMPILED-FLAT MoE decode's FULL raw_text (80 tokens, golden config),
+/// byte-reproducible across runs on lfm2.5-8b-a1b. First 138 bytes are byte-
+/// identical to the mlx-lm golden (GOLDEN_TEXT_MOE); the remainder is our benign
+/// one-ULP ' So' continuation. Asserting the FULL text (not just the 2-byte flip)
+/// gives regression teeth across the ENTIRE decode. Regenerate alongside
+/// GOLDEN_TEXT_MOE if the checkpoint changes.
+const GOLDEN_RAW_TEXT_MOE_OURS: &str = "<think>\nThe user asks: \"What is the capital of France? Answer in one short sentence.\"\n\nWe need to answer: The capital of France is Paris. So a short sentence: \"Paris is the capital of France.\" That's one short sentence. That satisfies. No extra commentary. Provide that.\n\nThus final answer: \"Paris is the capital of France.\"\n</think>\nParis is the";
+
+/// Our COMPILED-FLAT DENSE decode's FULL raw_text (80 tokens, golden config),
+/// byte-reproducible; first 314 bytes byte-identical to the mlx-lm golden.
+const GOLDEN_RAW_TEXT_DENSE_OURS: &str = "<think> Okay, let's see. The question is asking for the capital of France, and I need to answer in one short sentence. The user specified to put only the final answer inside a box, but first I need to make sure I get it right.\n\nThe capital of France is Paris, right? Yeah, I remember that from geography class. So I need to say that in";
 
 /// Greedy / deterministic chat config (temperature 0, all penalties off).
 fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
@@ -427,37 +440,70 @@ fn resolve_source_model() -> Option<PathBuf> {
     Some(p)
 }
 
-/// Explicit MoE-checkpoint selector. When LFM2_MOE_MODEL_PATH is set, MoE coverage
-/// was REQUESTED: the MoE tests MUST run against it and FAIL (panic) — never skip —
-/// if it is missing or not an lfm2_moe checkpoint. This closes the vacuous-pass hole
-/// (a dense-only e2e run can no longer silently report the MoE oracle as green; CI is
-/// expected to set LFM2_MOE_MODEL_PATH=<lfm2.5-8b-a1b>). When UNSET, fall back to the
-/// shared resolver so the caller's is_moe SKIP keeps hosts without the 16G 8B green.
+/// Structural MoE predicate: a checkpoint dir is an lfm2_moe model iff its
+/// `config.json` sets `model_type == "lfm2_moe"` OR carries a `num_experts` field.
+/// Mirrors the inline predicate the MoE tests used; on any read/parse error
+/// returns `false` (treat an unreadable config as "not provably MoE"). Centralized
+/// here so the MoE tests share ONE source of truth instead of re-implementing it.
+fn is_moe_config(path: &Path) -> bool {
+    let cfg = path.join("config.json");
+    let Ok(raw) = fs::read_to_string(&cfg) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+        || json.get("num_experts").is_some()
+}
+
+/// Fail-closed MoE-checkpoint selector. MoE coverage is REQUIRED under
+/// `LFM2_COMPILED_E2E=1` and must never silently pass against a missing or dense
+/// default — a forgotten env var must surface as a HARD FAILURE, not a green skip.
+///
+///   * `LFM2_MOE_MODEL_PATH` set  -> MoE coverage REQUESTED: panic (never skip) if
+///     it is missing config.json or is not an lfm2_moe checkpoint.
+///   * `LFM2_SKIP_MOE_E2E` set    -> EXPLICIT opt-out: skip (returns None).
+///   * neither set                -> coverage REQUIRED: accept only if the shared
+///     resolver already points at a MoE checkpoint; otherwise PANIC so a
+///     missing/dense default can never masquerade as MoE coverage.
 fn resolve_moe_model() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("LFM2_MOE_MODEL_PATH") {
         let p = PathBuf::from(p);
-        let cfg = p.join("config.json");
         assert!(
-            cfg.exists(),
-            "LFM2_MOE_MODEL_PATH={} has no config.json — MoE coverage was explicitly \
-             requested but the checkpoint is missing (hard failure, NOT a skip)",
+            p.join("config.json").exists(),
+            "LFM2_MOE_MODEL_PATH={} has no config.json — MoE coverage requested but the \
+             checkpoint is missing (hard failure, NOT a skip)",
             p.display()
         );
-        let raw =
-            fs::read_to_string(&cfg).unwrap_or_else(|e| panic!("read {}: {e}", cfg.display()));
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", cfg.display()));
-        let is_moe = json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
-            || json.get("num_experts").is_some();
         assert!(
-            is_moe,
-            "LFM2_MOE_MODEL_PATH={} is not an lfm2_moe checkpoint — MoE coverage was \
-             requested but the path points at a non-MoE model",
+            is_moe_config(&p),
+            "LFM2_MOE_MODEL_PATH={} is not an lfm2_moe checkpoint — MoE coverage requested \
+             but the path points at a non-MoE model",
             p.display()
         );
         return Some(p);
     }
-    resolve_source_model()
+    if std::env::var_os("LFM2_SKIP_MOE_E2E").is_some() {
+        eprintln!("[skip] LFM2_SKIP_MOE_E2E set — MoE e2e explicitly opted out");
+        return None;
+    }
+    // No explicit MoE path AND no explicit opt-out: coverage is REQUIRED. Accept only
+    // if the shared resolver already points at a MoE checkpoint; otherwise HARD-FAIL so
+    // a forgotten env var never silently passes as MoE coverage.
+    match resolve_source_model() {
+        Some(src) if is_moe_config(&src) => Some(src),
+        other => panic!(
+            "MoE e2e coverage REQUIRED under LFM2_COMPILED_E2E=1 but no MoE checkpoint is \
+             available (resolved {}). Set LFM2_MOE_MODEL_PATH=<lfm2.5-8b-a1b> to run it, or \
+             LFM2_SKIP_MOE_E2E=1 to EXPLICITLY opt out (a missing/dense default must not \
+             masquerade as MoE coverage).",
+            other
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    }
 }
 
 fn gated() -> bool {
@@ -708,13 +754,7 @@ async fn lfm2_compiled_flat_vs_mlx_lm_golden() {
     // host could point MLX_TEST_MODEL_PATH at the MoE checkpoint. The dense
     // golden is byte-specific to the dense tokenizer/weights, so refuse to diff
     // it against a MoE run (the MoE golden test owns that). Non-MoE => proceed.
-    let cfg_raw = fs::read_to_string(src.join("config.json"))
-        .unwrap_or_else(|e| panic!("[golden] read config.json at {}: {e}", src.display()));
-    let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
-        .unwrap_or_else(|e| panic!("[golden] parse config.json at {}: {e}", src.display()));
-    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
-        || cfg_json.get("num_experts").is_some();
-    if is_moe {
+    if is_moe_config(&src) {
         eprintln!(
             "[skip] lfm2_compiled_flat_vs_mlx_lm_golden: MLX_TEST_MODEL_PATH points at a MoE \
              checkpoint ({}); the DENSE golden cannot be diffed against it. The MoE golden \
@@ -784,6 +824,17 @@ async fn lfm2_compiled_flat_vs_mlx_lm_golden() {
         GOLDEN_TEXT_DENSE,
         GOLDEN_MIN_PREFIX_BYTES_DENSE,
     );
+
+    // FULL-LENGTH regression teeth (closes the "short-prefix gate passes while a
+    // post-gate token corrupts" hole): the mlx-lm prefix gate above clears the
+    // first 314 bytes against the INDEPENDENT oracle; this pins the ENTIRE
+    // byte-reproducible compiled self-golden so any post-gate token flip fails.
+    assert_eq!(
+        flat.raw_text, GOLDEN_RAW_TEXT_DENSE_OURS,
+        "dense golden: compiled raw_text diverged from the byte-reproducible compiled \
+         self-golden — a real regression in the 80-token decode."
+    );
+
     eprintln!(
         "[PASS] dense compiled-flat matches the INDEPENDENT mlx-lm greedy golden on a \
          {lcp}-byte early prefix (>= {GOLDEN_MIN_PREFIX_BYTES_DENSE}); compiled path engaged \
@@ -957,14 +1008,7 @@ async fn lfm2_eager_flat_vs_compiled_capture() {
     // here would diff MoE-eager against a STALE dense-compiled artifact
     // (common_prefix=0 => a spurious "REAL compile bug" panic on the 8B). Read
     // `src/config.json` and pick the artifact that matches THIS run's topology.
-    let comp_is_moe = {
-        let cfg_raw = fs::read_to_string(src.join("config.json"))
-            .unwrap_or_else(|e| panic!("[eager-flat] read config.json at {}: {e}", src.display()));
-        let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
-            .unwrap_or_else(|e| panic!("[eager-flat] parse config.json at {}: {e}", src.display()));
-        cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
-            || cfg_json.get("num_experts").is_some()
-    };
+    let comp_is_moe = is_moe_config(&src);
     let comp_art = artifact_path(if comp_is_moe {
         "lfm2_moe_e2e_compiled_flat.txt"
     } else {
@@ -1019,6 +1063,89 @@ async fn lfm2_eager_flat_vs_compiled_capture() {
             );
         }
     }
+}
+
+// =============================================================================
+// PHASE 4 PIECE 2 (round-2): compile()-FAITHFULNESS on the GOLDEN trajectory.
+//
+// Codex round-2 [MED]: the prior eager-vs-compiled evidence
+// (`lfm2_eager_flat_vs_compiled_capture`) used the GREEDY 48-token trajectory
+// (`run_flat_single`, thinking_budget=0, `.text`) — NOT the GOLDEN 80-token
+// thinking trajectory where the step-33 ' So' divergence-from-mlx-lm actually
+// happens. These two tests close that gap: they re-run the GOLDEN config
+// (`run_flat_golden`, max_new=80, the full `<think>…` trace) under
+// `MLX_NO_COMPILE=1` (the eager C++ flat path — SAME offset/mask/cache/RoPE
+// logic, just not `mlx::core::compile`d) and assert the eager output agrees with
+// the COMMITTED compiled self-golden within `TAIL_TOLERANCE_BYTES`. Eager
+// matching the compiled self-golden on THIS trajectory proves the ' So' flip is
+// inherent to our MoE/dense bf16 math, NOT a `compile()` artifact.
+//
+// Both REQUIRE `MLX_NO_COMPILE=1` and run as a SEPARATE cargo invocation (the
+// C++ `static bool no_compile` latches once per process).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_moe_golden_eager_vs_compiled() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if !no_compile_env() {
+        eprintln!(
+            "[skip] golden eager-vs-compiled needs MLX_NO_COMPILE=1 (run as a SEPARATE invocation)"
+        );
+        return;
+    }
+    let Some(src) = resolve_moe_model() else {
+        return;
+    };
+    let eager = run_flat_golden(&src, "moe-golden-eager", GOLDEN_PROMPT, 80).await;
+    assert!(
+        eager.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "moe golden eager: C++ forward did not run (call_delta={}); eager flat fell back",
+        eager.call_delta
+    );
+    // compile() FAITHFULNESS on the GOLDEN (thinking, 80-token) trajectory: eager
+    // (no compile()) must agree with the committed COMPILED self-golden through the
+    // step-33 ' So' flip, diverging only at a late benign tie (<= TAIL_TOLERANCE_BYTES).
+    // Proves the ' So' divergence-from-mlx-lm is inherent to our MoE bf16 math, NOT a
+    // compile() artifact (closes Codex round-2: prior evidence used the 48-tok greedy path).
+    assert_tail_only_divergence(
+        "moe golden eager-vs-compiled",
+        &eager.raw_text,
+        GOLDEN_RAW_TEXT_MOE_OURS,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_dense_golden_eager_vs_compiled() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if !no_compile_env() {
+        eprintln!(
+            "[skip] golden eager-vs-compiled needs MLX_NO_COMPILE=1 (run as a SEPARATE invocation)"
+        );
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    if is_moe_config(&src) {
+        eprintln!("[skip] dense golden eager-vs-compiled: MoE checkpoint — the MoE test owns it");
+        return;
+    }
+    let eager = run_flat_golden(&src, "dense-golden-eager", GOLDEN_PROMPT, 80).await;
+    assert!(
+        eager.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "dense golden eager: C++ forward did not run (call_delta={})",
+        eager.call_delta
+    );
+    assert_tail_only_divergence(
+        "dense golden eager-vs-compiled",
+        &eager.raw_text,
+        GOLDEN_RAW_TEXT_DENSE_OURS,
+    );
 }
 
 // =============================================================================
@@ -1406,30 +1533,15 @@ async fn lfm2_moe_compiled_flat_vs_paged_e2e_parity() {
         return;
     };
 
-    // F2 guard: this test MUST exercise a real MoE checkpoint. `resolve_source_model`
-    // is SHARED with the dense tests and DEFAULTS to the dense 1.2B path when
-    // `MLX_TEST_MODEL_PATH` is unset; without this guard a dense checkpoint passes
-    // here (call_delta / model_id / weight_count are all dense-satisfiable),
-    // leaving the Phase-3c bf16+flat sparse-MoE gate-lift entirely UNGUARDED.
-    // `Lfm2Config` has no `model_type` field, so read it from config.json directly;
-    // `num_experts` present is the robust structural fallback. A non-MoE checkpoint
-    // is an env SKIP (not a failure) so `LFM2_COMPILED_E2E=1` hosts without the 8B
-    // MoE checkpoint stay green; a wrong-but-MoE topology is a hard FAIL.
+    // STRUCTURAL pins so a wrong-but-MoE topology fails hard. `resolve_moe_model`
+    // already guarantees `src` is a real lfm2_moe checkpoint (or it skipped / hard-
+    // failed), so the prior inline `is_moe` skip block is unreachable and removed;
+    // we still parse `config.json` here to assert the exact 8B topology. `Lfm2Config`
+    // has no `model_type` field, so read these from config.json directly.
     let cfg_raw = fs::read_to_string(src.join("config.json"))
         .unwrap_or_else(|e| panic!("[moe-e2e] read config.json at {}: {e}", src.display()));
     let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
         .unwrap_or_else(|e| panic!("[moe-e2e] parse config.json at {}: {e}", src.display()));
-    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
-        || cfg_json.get("num_experts").is_some();
-    if !is_moe {
-        eprintln!(
-            "[skip] lfm2_moe_compiled_flat_vs_paged_e2e_parity: MLX_TEST_MODEL_PATH must point \
-             at an lfm2_moe checkpoint (model_type=lfm2_moe / num_experts set); got non-MoE {}. \
-             This test must NOT validate against the dense default.",
-            src.display()
-        );
-        return;
-    }
     assert_eq!(
         cfg_json.get("num_experts").and_then(|x| x.as_i64()),
         Some(32),
@@ -1577,26 +1689,14 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
         return;
     };
 
-    // Same is_moe guard as lfm2_moe_compiled_flat_vs_paged_e2e_parity: the
-    // shared resolver defaults to the DENSE checkpoint; the MoE golden must
-    // never be diffed against a dense run. Non-MoE => env SKIP (stay green on
-    // hosts without the 8B checkpoint).
+    // `resolve_moe_model` already guarantees `src` is a real lfm2_moe checkpoint
+    // (or it skipped / hard-failed), so the prior inline `is_moe` skip block is
+    // unreachable and removed. We still parse `config.json` here for the STRUCTURAL
+    // pins so a wrong-but-MoE topology fails hard (mirrors the paged MoE test).
     let cfg_raw = fs::read_to_string(src.join("config.json"))
         .unwrap_or_else(|e| panic!("[moe-golden] read config.json at {}: {e}", src.display()));
     let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
         .unwrap_or_else(|e| panic!("[moe-golden] parse config.json at {}: {e}", src.display()));
-    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
-        || cfg_json.get("num_experts").is_some();
-    if !is_moe {
-        eprintln!(
-            "[skip] lfm2_moe_compiled_flat_vs_mlx_lm_golden: MLX_TEST_MODEL_PATH must point at an \
-             lfm2_moe checkpoint (got non-MoE {}). The dense golden test owns the dense default.",
-            src.display()
-        );
-        return;
-    }
-    // Structural pins so a wrong-but-MoE topology fails hard (mirrors the
-    // paged MoE test's guards).
     assert_eq!(
         cfg_json.get("num_experts").and_then(|x| x.as_i64()),
         Some(32),
@@ -1674,27 +1774,18 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
         GOLDEN_MIN_PREFIX_BYTES_MOE,
     );
 
-    // TEETH past the 138-byte floor: the floor catches an EARLY divergence (a
-    // real routing/rope/eps bug diverges at token 1-3), and this pin catches a
-    // CHANGED pick exactly at the known benign one-ULP tie (generated step 33).
-    // Together they implement "fail on unexplained tail divergence": the ONLY
-    // tolerated divergence is the one that begins with the documented ' So' flip.
-    if flat.raw_text != GOLDEN_TEXT_MOE {
-        let tail = &flat.raw_text[lcp..];
-        // Char-bounded preview (NOT a byte slice): our divergent tail can contain
-        // multi-byte UTF-8, so `&tail[..48]` could panic mid-message on an
-        // already-failing assert. `chars().take(48)` is always boundary-safe.
-        let tail_preview: String = tail.chars().take(48).collect();
-        assert!(
-            tail.starts_with(GOLDEN_MOE_DIVERGENT_TAIL),
-            "MoE golden: first divergence from the mlx-lm oracle is at byte {lcp}, but our \
-             divergent continuation {tail_preview:?} does NOT begin with the documented benign \
-             one-ULP flip {GOLDEN_MOE_DIVERGENT_TAIL:?} (mlx-lm picks ' One'=-1.50, we pick \
-             ' So'=-1.75; gap 0.25 = 1 bf16 ULP; scripts/probe_lfm2_divergence.py). A changed \
-             pick at this tie is a REAL numerical shift in the compiled MoE path, not the \
-             proven benign tie."
-        );
-    }
+    // FULL-LENGTH regression teeth: assert_golden_prefix above proves the first 138
+    // bytes match the INDEPENDENT mlx-lm oracle; this pins the ENTIRE compiled output
+    // so a regression flipping ANY token after the gate fails (closes the "passes
+    // after the 2-byte pin" hole). GOLDEN_RAW_TEXT_MOE_OURS is byte-reproducible; its
+    // 138-byte prefix == GOLDEN_TEXT_MOE; the tail is our benign ' So' continuation
+    // (compile()-faithful on THIS trajectory: see lfm2_moe_golden_eager_vs_compiled).
+    assert_eq!(
+        flat.raw_text, GOLDEN_RAW_TEXT_MOE_OURS,
+        "MoE golden: compiled raw_text diverged from the byte-reproducible compiled \
+         self-golden — a real regression somewhere in the 80-token decode (the mlx-lm \
+         prefix gate already cleared, so this is a post-prefix change)."
+    );
 
     eprintln!(
         "[PASS] MoE compiled-flat matches the INDEPENDENT mlx-lm greedy golden on a \
