@@ -1576,6 +1576,45 @@ mod tests {
         );
         assert_eq!(calls[0].name, "f");
     }
+
+    #[test]
+    fn test_fallback_straddling_tool_call_does_not_leak() {
+        // Adversarial (Codex No-ship): a `<tool_call>` opens inside `<think>` but its
+        // `</tool_call>` lands after `</think>`, so the span straddles the reasoning
+        // boundary. On the no-think_end_id fallback, neither `tool_calls` nor the `text`
+        // field may surface a call that began in reasoning, and the reasoning prefix must
+        // not leak into `text`.
+        let text = "<think>secret <tool_call><function=leak></think>\n<parameter=q>1</parameter></function></tool_call>";
+        let (clean, calls, _thinking) =
+            parse_thinking_and_tools(text, &[101u32, 102, 103], true, None, None, false);
+        assert!(
+            calls.is_empty(),
+            "straddling reasoning-started tool call must not be extracted: {calls:?}"
+        );
+        assert!(
+            !clean.contains("secret") && !clean.contains("<think>"),
+            "reasoning prefix must not leak into text: {clean:?}"
+        );
+    }
+
+    #[test]
+    fn test_raw_text_straddling_tool_call_does_not_leak() {
+        // Same straddling shape through the raw_text scrubber: with include_reasoning=false
+        // the reasoning prefix and the reasoning-started tool markup must both be gone.
+        let text = "<think>secret <tool_call><function=leak></think>\n<parameter=q>1</parameter></function></tool_call>";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &[101u32, 102, 103], // no think_end_id present → text-level fallback
+            true,                // thinking_enabled
+            None,                // think_end_id
+            None,                // think_end_str
+            false,               // include_reasoning
+        );
+        assert!(
+            !out.contains("secret") && !out.contains("<think>"),
+            "reasoning prefix must not leak into raw_text: {out:?}"
+        );
+    }
 }
 
 #[cfg(test)]

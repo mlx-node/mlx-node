@@ -527,100 +527,103 @@ fn strip_all_reasoning(text: &str) -> String {
 /// reasoning block.
 ///
 /// Used to scrub reasoning from `raw_text` on the no-`</think>`-token fallback path.
-/// Two requirements: reasoning-looking tags *inside* a tool-call argument (a literal
+/// Three requirements: reasoning-looking tags *inside* a tool-call argument (a literal
 /// `<think>…</think>` or a bare `</think>`) must NOT be treated as reasoning delimiters
-/// (else the recovered tool call is mangled); and a tool span that is itself nested
-/// inside a `<think>…</think>` reasoning block must be dropped along with the reasoning
-/// (it is part of the suppressed chain-of-thought).
+/// (else the recovered tool call is mangled); a tool span nested inside a reasoning block
+/// must be dropped along with the reasoning (it is suppressed chain-of-thought); and a tool
+/// span that STRADDLES a reasoning boundary (opens inside `<think>` but its `</tool_call>`
+/// lands after `</think>`, or vice versa) must NOT be allowed to surface — neither leaking
+/// the reasoning prefix nor presenting a tool call that began inside reasoning.
 ///
-/// Implementation: mask each complete `<tool_call>…</tool_call>` span with a SINGLE
-/// placeholder code point, run the reasoning stripper over the WHOLE masked text (so a
-/// reasoning block that wraps a tool span is matched and removed as a unit), then restore
-/// only the placeholders that survived the strip. A placeholder inside a stripped
-/// reasoning block is gone, so its tool span is correctly removed; a surviving placeholder
-/// is restored byte-for-byte.
-///
-/// Each placeholder is one DISTINCT Unicode Private-Use-Area code point chosen to be
-/// ABSENT from `text` (`tool_span_sentinels`). Two properties make restoration sound even
-/// though `strip_all_reasoning` is a DELETING transform:
-///   * Absent-from-input ⇒ the only occurrences of a placeholder in the masked text are
-///     the ones we inserted, so it can never collide with the model's own output, and no
-///     restored original (a substring of `text`) can contain a placeholder ⇒ global
-///     `str::replace` is collision- and clobber-free.
-///   * Single code point ⇒ deletion cannot SYNTHESIZE a placeholder. A multi-character
-///     delimiter could be forged by a deleting transform that concatenates model-emitted
-///     fragments around a stripped reasoning block (e.g. `…E…E…` collapsing to `…EE…`);
-///     a lone code point that is absent from the input cannot be created by removing or
-///     joining text, only carried verbatim — so a placeholder survives iff its tool span
-///     was outside all stripped reasoning.
+/// Implementation is purely RANGE-based (no placeholder substitution, so a deleting
+/// transform can never synthesize or collide with a marker):
+///   1. Tool spans are taken as opaque byte ranges.
+///   2. Reasoning ranges are the paired `<think>`/`<longcat_think>` blocks on the ORIGINAL
+///      text, MINUS any block wholly contained in a tool span (those are literal argument
+///      text). If there are no such paired blocks, the template "missing-open" case is
+///      handled (a bare top-level close followed by newline/EOF marks a leading reasoning
+///      prefix), mirroring `parse_thinking`.
+///   3. The removal set is the reasoning ranges UNION every tool span that overlaps any
+///      reasoning range (nested or straddling — entangled with reasoning, so dropped). Tool
+///      spans disjoint from all reasoning are preserved verbatim.
+///   4. Emit `text` minus the merged removal ranges.
 pub fn strip_reasoning_preserving_tools(text: &str) -> String {
-    let tool_spans = extract_tag_blocks(text, "<tool_call>", "</tool_call>");
-    if tool_spans.is_empty() {
-        return strip_all_reasoning(text);
-    }
-
-    // One distinct placeholder code point per span, each guaranteed absent from `text`.
-    // If we somehow cannot find enough (input already saturates the Private-Use Area —
-    // astronomically unlikely), strip everything rather than risk a collision.
-    let sentinels = tool_span_sentinels(text, tool_spans.len());
-    if sentinels.len() < tool_spans.len() {
-        return strip_all_reasoning(text);
-    }
-
-    // Mask tool spans with their placeholder code points.
-    let mut masked = String::with_capacity(text.len());
-    let mut originals: Vec<&str> = Vec::with_capacity(tool_spans.len());
-    let mut pos = 0usize;
-    for (i, (start, end, _inner)) in tool_spans.iter().enumerate() {
-        masked.push_str(&text[pos..*start]);
-        masked.push(sentinels[i]);
-        originals.push(&text[*start..*end]);
-        pos = *end;
-    }
-    masked.push_str(&text[pos..]);
-
-    // Strip reasoning across the whole masked text, then restore surviving placeholders.
-    // A placeholder survives iff its tool span was outside every stripped reasoning block;
-    // deletion can neither synthesize a placeholder (single absent code point) nor leave
-    // one inside a restored original (originals are substrings of `text`, placeholders are
-    // absent from `text`), so per-placeholder global replacement is exact.
-    let mut out = strip_all_reasoning(&masked);
-    for (idx, original) in originals.iter().enumerate() {
-        let sentinel = sentinels[idx];
-        if out.contains(sentinel) {
-            out = out.replace(sentinel, original);
-        }
-    }
-    out
-}
-
-/// Up to `count` DISTINCT Unicode Private-Use-Area code points that do NOT occur anywhere
-/// in `text`. The PUA spans `U+E000..=U+F8FF` plus the two supplementary-plane ranges
-/// `U+F0000..=U+FFFFD` and `U+100000..=U+10FFFD` — over 130 000 code points, far more than
-/// any realistic tool-call count — so absent ones are essentially always available; the
-/// caller treats a short result as "give up and strip everything". A single absent code
-/// point cannot collide with model text and cannot be synthesized by a deleting transform,
-/// which is what makes it a safe tool-span placeholder.
-fn tool_span_sentinels(text: &str, count: usize) -> Vec<char> {
-    let present: std::collections::HashSet<char> = text
-        .chars()
-        .filter(|c| matches!(*c as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD))
+    let tool_ranges: Vec<(usize, usize)> = extract_tag_blocks(text, "<tool_call>", "</tool_call>")
+        .into_iter()
+        .map(|(s, e, _)| (s, e))
         .collect();
-    let mut out = Vec::with_capacity(count);
-    for cp in (0xE000u32..=0xF8FF)
-        .chain(0xF0000..=0xFFFFD)
-        .chain(0x100000..=0x10FFFD)
-    {
-        if out.len() == count {
-            break;
-        }
-        if let Some(ch) = char::from_u32(cp)
-            && !present.contains(&ch)
-        {
-            out.push(ch);
+    if tool_ranges.is_empty() {
+        // No tool spans to protect — the plain stripper (which also handles missing-open)
+        // is exactly right.
+        return strip_all_reasoning(text);
+    }
+    let inside_tool = |pos: usize| tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+
+    // Paired reasoning ranges on the original text, excluding any block that is literal
+    // argument text inside a tool span.
+    let mut reasoning: Vec<(usize, usize)> = Vec::new();
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ] {
+        for (start, end, _inner) in extract_tag_blocks(text, open, close) {
+            let in_arg = tool_ranges.iter().any(|(s, e)| start >= *s && end <= *e);
+            if !in_arg {
+                reasoning.push((start, end));
+            }
         }
     }
-    out
+
+    // Missing-open template case (only when no explicit paired reasoning exists): a bare
+    // top-level close followed by newline/EOF marks a leading reasoning prefix.
+    if reasoning.is_empty() {
+        for close in ["</think>", "</longcat_think>"] {
+            if let Some(pos) = text.find(close)
+                && !inside_tool(pos)
+            {
+                let end = pos + close.len();
+                if text[end..].is_empty() || text[end..].starts_with('\n') {
+                    reasoning.push((0, end));
+                    break;
+                }
+            }
+        }
+    }
+
+    if reasoning.is_empty() {
+        // No reasoning to strip; keep everything (tool spans verbatim).
+        return text.to_string();
+    }
+
+    // Removal = reasoning ranges ∪ tool spans entangled with reasoning (nested or
+    // straddling). A tool span overlapping any reasoning range is part of the suppressed
+    // chain-of-thought and must not surface.
+    let overlaps = |a: (usize, usize), b: (usize, usize)| a.0 < b.1 && b.0 < a.1;
+    let mut removal = reasoning.clone();
+    for t in &tool_ranges {
+        if reasoning.iter().any(|r| overlaps(*t, *r)) {
+            removal.push(*t);
+        }
+    }
+    removal.sort_by_key(|(s, _)| *s);
+
+    // Emit `text` minus the merged removal ranges.
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (s, e) in removal {
+        let s = s.max(cursor);
+        if s >= e {
+            continue; // already consumed by an earlier overlapping range
+        }
+        if s > cursor {
+            out.push_str(&text[cursor..s]);
+        }
+        cursor = e.max(cursor);
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out.trim().to_string()
 }
 
 /// Check if text contains any thinking tags
@@ -930,11 +933,11 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_reasoning_literal_sentinel_in_prose_is_not_restored() {
+    fn test_strip_reasoning_pua_prose_is_preserved_no_fabrication() {
         // The model emits Private-Use-Area characters in ordinary prose, plus one real
-        // tool call. Because placeholders are chosen ABSENT from the input, the real
-        // span's placeholder differs from any PUA char in the prose, so the prose is
-        // preserved verbatim and NOT fabricated into a second tool call by restoration.
+        // tool call, with no reasoning. The range-based scrubber removes nothing and keeps
+        // the text verbatim — the PUA prose must NOT be fabricated into a second tool call
+        // (a regression that the old PUA-placeholder schemes were prone to).
         let input = "\u{E000}TOOLCALL0\u{E000} look <tool_call>{\"name\":\"real\"}</tool_call>";
         let out = strip_reasoning_preserving_tools(input);
         assert_eq!(
@@ -953,28 +956,22 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_reasoning_literal_sentinel_inside_tool_args_is_preserved() {
-        // A tool call whose argument contains Private-Use-Area characters, followed by a
-        // second real tool call. Restoring span 0 must not let span 1's placeholder clobber
-        // bytes inside span 0's restored argument (the ordering hazard). Because placeholders
-        // are absent from the input, no original contains any placeholder, so both spans
-        // round-trip byte-for-byte regardless of restore order.
+    fn test_strip_reasoning_pua_in_tool_args_round_trips() {
+        // Two real tool calls (no reasoning); the first's argument contains Private-Use-Area
+        // characters. The range-based scrubber removes nothing and both spans round-trip
+        // byte-for-byte — no placeholder substitution that could clobber or mis-restore.
         let input = "<tool_call>{\"name\":\"a\",\"args\":\"\u{E000}TOOLCALL1\u{E000}\"}</tool_call><tool_call>{\"name\":\"b\"}</tool_call>";
         let out = strip_reasoning_preserving_tools(input);
-        assert_eq!(
-            out, input,
-            "both tool spans restored byte-for-byte: {out:?}"
-        );
+        assert_eq!(out, input, "both tool spans preserved verbatim: {out:?}");
     }
 
     #[test]
-    fn test_strip_reasoning_deletion_cannot_synthesize_sentinel() {
-        // Adversarial (Codex No-ship on the multi-char-delimiter scheme): the model
+    fn test_strip_reasoning_deletion_cannot_resurrect_nested_tool_call() {
+        // Adversarial (prior Codex No-ship on the multi-char-delimiter scheme): the model
         // surrounds a reasoning-nested tool call with U+E000 fragments so that DELETING the
-        // reasoning blocks concatenates them into what a multi-char delimiter would treat as
-        // a synthesized sentinel — resurrecting the suppressed `secret` call. With single
-        // absent-code-point placeholders, deletion cannot synthesize a placeholder, so the
-        // reasoning-nested tool call stays dropped.
+        // reasoning blocks would concatenate them into a synthesized placeholder, resurrecting
+        // the suppressed `secret` call. The range-based scrubber never substitutes a marker,
+        // so deletion cannot synthesize one and the nested call stays dropped.
         let e = '\u{E000}';
         let input = format!(
             "{e}<think>x</think>{e}TOOLCALL0{e}<think>y <tool_call>{{\"name\":\"secret\"}}</tool_call> z</think>{e}"
@@ -983,6 +980,22 @@ mod tests {
         assert!(
             !out.contains("<tool_call>") && !out.contains("secret"),
             "reasoning-nested tool call must NOT be resurrected by deletion: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_straddling_tool_span_is_dropped() {
+        // Adversarial (Codex No-ship on the masking scheme): a <tool_call> opens INSIDE a
+        // <think> block but its </tool_call> lands after </think>, so first-open→first-close
+        // makes the tool span swallow the </think>. Masking then hid the reasoning close and
+        // leaked the `<think>secret` prefix + a tool call that began in reasoning. Range-based
+        // removal computes the reasoning boundary on the ORIGINAL text, sees the tool span
+        // overlaps it, and drops BOTH — no reasoning prefix and no straddling tool call leak.
+        let input = "<think>secret <tool_call><function=leak></think>\n<parameter=q>1</parameter></function></tool_call>";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret") && !out.contains("<tool_call>") && !out.contains("<think>"),
+            "straddling reasoning+tool must be fully dropped: {out:?}"
         );
     }
 
