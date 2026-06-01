@@ -207,26 +207,51 @@ const GOLDEN_TEXT_MOE: &str = "<think>\nThe user asks: \"What is the capital of 
 /// far past the first-token divergence a real impl bug would produce.
 const GOLDEN_MIN_PREFIX_BYTES_DENSE: usize = 200;
 
-/// Minimum shared BYTE prefix for the 8B **MoE** golden. Lower than the dense
-/// gate because the MoE reasoner hits its first legitimate argmax near-tie
-/// EARLIER than the dense model — but still far past where any real impl bug
-/// (wrong MoE routing order / rope base 5e6 / eps) would diverge (token 1-3,
-/// < 10 bytes).
+/// Minimum shared BYTE prefix for the 8B **MoE** golden. Set to the FULL proven
+/// byte-identical agreement (138 bytes / 33 generated tokens) so the gate floor
+/// sits AT the divergence, not below it: a real impl bug (wrong MoE routing
+/// order / rope base 5e6 / eps) diverges at token 1-3 (< 10 bytes) and is caught
+/// far below this floor, while the single benign one-ULP flip past it is pinned
+/// separately by `GOLDEN_MOE_DIVERGENT_TAIL` (see below) rather than tolerated.
 ///
-/// OBSERVED + DIAGNOSED: the compiled MoE decode is BYTE-IDENTICAL to the mlx-lm
-/// golden for the first 33 generated tokens (`<think>\n…The capital of France is
-/// Paris. ` = 138 bytes), then diverges on a TRUE bf16 tie. At that step mlx-lm's
-/// top logits are ` That`=37.7500, ` One`=37.7500 (golden argmax tie-break),
-/// ` So`=37.5000 — i.e. the golden's pick and ours are within 0.25 logits, one
-/// bf16 quantum apart. mlx-lm's continuous-prefill rounding lands on ` One`; our
-/// chunked-prefill + compiled per-step rounding lands on ` So`. Both
-/// continuations are coherent and reach the same final answer ("Paris is the
-/// capital of France"). 33 byte-identical tokens conclusively proves the
-/// compiled MoE routing (gate→f32→softmax→+expert_bias→argpartition top-4→
+/// OBSERVED + DIAGNOSED (REPRODUCIBLE — `scripts/probe_lfm2_divergence.py`, run
+/// live on the real lfm2.5-8b-a1b 2026-06-01): the compiled MoE decode is
+/// BYTE-IDENTICAL to the mlx-lm golden for the first 33 generated tokens
+/// (`<think>\n…The capital of France is Paris. ` = 138 bytes), then diverges on a
+/// TRUE bf16 tie at generated step 33. The probe (which prints mlx-lm's
+/// per-step log-softmax top-k) shows that step's top-3 as:
+///   ` One`  = -1.5000   (rank #1 — mlx-lm's greedy pick)
+///   ` So`   = -1.7500   (rank #2 — OUR compiled path's pick)
+///   ` That` = -1.7500   (tied #2)
+/// log-softmax is shift-invariant in DIFFERENCES, so a -1.50 vs -1.75 logprob gap
+/// IS a 0.25 RAW-LOGIT gap = exactly ONE bf16 ULP at this logit magnitude (~37).
+/// gap2nd = 0.25 at step 33 is the TIGHTEST near-tie in the entire 80-token
+/// sequence — and it is precisely where we flip. mlx-lm's continuous-prefill
+/// rounding lands on ` One`; our chunked-prefill + compiled per-step rounding
+/// lands on ` So`. (The earlier code comment claimed ` That`/` One` tied at
+/// 37.7500 with ` So`=37.5000 — those raw-logit magnitudes were self-reported and
+/// are NOT what the committed probe shows; the probe's log-softmax can only show
+/// the -1.50/-1.75/-1.75 landscape above, whose 0.25 difference is the true logit
+/// gap. The 37-ish magnitude survives only as the scale at which 0.25 == 1 ULP.)
+///
+/// Why this is conclusively benign, not a bug: (1) 33 byte-identical tokens
+/// INCLUDING two earlier EXACT-tie steps — step 24 (` answer`=-1.25 vs
+/// ` respond`=-1.25) and step 26 (` The` vs ` "`) — that our compiled path
+/// resolves IDENTICALLY to mlx-lm; a real routing/rope/eps bug cannot reproduce
+/// 33 tokens through exact ties and then break by exactly one ULP at the single
+/// tightest tie. (2) compiled-flat MoE === eager-flat MoE (`MLX_NO_COMPILE=1`),
+/// BYTE-IDENTICAL — so the flip is inherent to our MoE bf16 math vs mlx-lm's
+/// rounding, NOT a `compile()` tracing / chunked-prefill artifact. This proves
+/// the compiled MoE routing (gate→f32→softmax→+expert_bias→argpartition top-4→
 /// norm_topk_prob), rope base, and eps are faithful to mlx-lm's lfm2_moe.py.
-/// 120 bytes (~30 tokens) sits just under that 138-byte agreement and is two
-/// orders of magnitude past a real-bug divergence.
-const GOLDEN_MIN_PREFIX_BYTES_MOE: usize = 120;
+const GOLDEN_MIN_PREFIX_BYTES_MOE: usize = 138;
+
+/// The benign one-ULP flip at generated step 33: our compiled MoE path picks
+/// ' So' (mlx-lm's rank-#2 token, -1.75) where the mlx-lm golden picks ' One'
+/// (rank #1, -1.50) — a 0.25-logit = 1 bf16 ULP tie (scripts/probe_lfm2_divergence.py).
+/// Pinning our divergent continuation catches a CHANGED pick at the tie (a real
+/// numerical shift) while tolerating the proven benign one.
+const GOLDEN_MOE_DIVERGENT_TAIL: &str = "So";
 
 /// Greedy / deterministic chat config (temperature 0, all penalties off).
 fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
@@ -400,6 +425,39 @@ fn resolve_source_model() -> Option<PathBuf> {
         return None;
     }
     Some(p)
+}
+
+/// Explicit MoE-checkpoint selector. When LFM2_MOE_MODEL_PATH is set, MoE coverage
+/// was REQUESTED: the MoE tests MUST run against it and FAIL (panic) — never skip —
+/// if it is missing or not an lfm2_moe checkpoint. This closes the vacuous-pass hole
+/// (a dense-only e2e run can no longer silently report the MoE oracle as green; CI is
+/// expected to set LFM2_MOE_MODEL_PATH=<lfm2.5-8b-a1b>). When UNSET, fall back to the
+/// shared resolver so the caller's is_moe SKIP keeps hosts without the 16G 8B green.
+fn resolve_moe_model() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("LFM2_MOE_MODEL_PATH") {
+        let p = PathBuf::from(p);
+        let cfg = p.join("config.json");
+        assert!(
+            cfg.exists(),
+            "LFM2_MOE_MODEL_PATH={} has no config.json — MoE coverage was explicitly \
+             requested but the checkpoint is missing (hard failure, NOT a skip)",
+            p.display()
+        );
+        let raw =
+            fs::read_to_string(&cfg).unwrap_or_else(|e| panic!("read {}: {e}", cfg.display()));
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", cfg.display()));
+        let is_moe = json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+            || json.get("num_experts").is_some();
+        assert!(
+            is_moe,
+            "LFM2_MOE_MODEL_PATH={} is not an lfm2_moe checkpoint — MoE coverage was \
+             requested but the path points at a non-MoE model",
+            p.display()
+        );
+        return Some(p);
+    }
+    resolve_source_model()
 }
 
 fn gated() -> bool {
@@ -692,6 +750,23 @@ async fn lfm2_compiled_flat_vs_mlx_lm_golden() {
         "dense golden: unexpected registered weight count"
     );
 
+    // FULL-GENERATION: the golden was captured at 80 ids that are STILL
+    // mid-reasoning (no EOS), so the correct decode finishes by LENGTH at 80. An
+    // early stop would shrink the oracle window and could pass a short prefix
+    // while hiding a downstream bug — so pin both the token count and the reason.
+    assert_eq!(
+        flat.num_tokens, max_new as u32,
+        "dense golden: generated {} tokens but expected the full {} — an early stop \
+         truncates the oracle window and could pass a short prefix while hiding a downstream bug",
+        flat.num_tokens, max_new
+    );
+    assert_eq!(
+        flat.finish_reason, "length",
+        "dense golden: finished by {:?} not \"length\" — early EOS/stop shrinks the \
+         comparison window below the captured golden",
+        flat.finish_reason
+    );
+
     // TEMPLATE-DRIFT CANARY: our re-templated prompt must match the id count the
     // mlx-lm golden was captured against. If this drifts, the golden is stale
     // and the text comparison is invalid — regenerate via the capture script.
@@ -876,7 +951,25 @@ async fn lfm2_eager_flat_vs_compiled_capture() {
     let _ = fs::write(&eager_art, &eager.text);
 
     // ---- FIDELITY VERDICT: eager-flat vs compiled-flat -------------------
-    let comp_art = artifact_path("lfm2_e2e_compiled_flat.txt");
+    // Topology-qualified artifact pick: the DENSE compiled test writes
+    // `lfm2_e2e_compiled_flat.txt` while the MoE parity test writes the qualified
+    // `lfm2_moe_e2e_compiled_flat.txt`. Reading the dense name unconditionally
+    // here would diff MoE-eager against a STALE dense-compiled artifact
+    // (common_prefix=0 => a spurious "REAL compile bug" panic on the 8B). Read
+    // `src/config.json` and pick the artifact that matches THIS run's topology.
+    let comp_is_moe = {
+        let cfg_raw = fs::read_to_string(src.join("config.json"))
+            .unwrap_or_else(|e| panic!("[eager-flat] read config.json at {}: {e}", src.display()));
+        let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
+            .unwrap_or_else(|e| panic!("[eager-flat] parse config.json at {}: {e}", src.display()));
+        cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+            || cfg_json.get("num_experts").is_some()
+    };
+    let comp_art = artifact_path(if comp_is_moe {
+        "lfm2_moe_e2e_compiled_flat.txt"
+    } else {
+        "lfm2_e2e_compiled_flat.txt"
+    });
     match fs::read_to_string(&comp_art) {
         Ok(compiled_text) => {
             let lcp = common_prefix_len(&eager.text, &compiled_text);
@@ -1309,7 +1402,7 @@ async fn lfm2_moe_compiled_flat_vs_paged_e2e_parity() {
         eprintln!("[skip] MLX_NO_COMPILE=1 — compiled-engagement test is compiled-mode-only");
         return;
     }
-    let Some(src) = resolve_source_model() else {
+    let Some(src) = resolve_moe_model() else {
         return;
     };
 
@@ -1480,7 +1573,7 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
         eprintln!("[skip] MLX_NO_COMPILE=1 — MoE golden parity test is compiled-mode-only");
         return;
     }
-    let Some(src) = resolve_source_model() else {
+    let Some(src) = resolve_moe_model() else {
         return;
     };
 
@@ -1548,6 +1641,23 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
         "moe golden: compiled weight registry empty"
     );
 
+    // FULL-GENERATION: the golden was captured at 80 ids that are STILL
+    // mid-reasoning (no EOS), so the correct decode finishes by LENGTH at 80. An
+    // early stop would shrink the oracle window and could pass a short prefix
+    // while hiding a downstream bug — so pin both the token count and the reason.
+    assert_eq!(
+        flat.num_tokens, max_new as u32,
+        "MoE golden: generated {} tokens but expected the full {} — an early stop \
+         truncates the oracle window and could pass a short prefix while hiding a downstream bug",
+        flat.num_tokens, max_new
+    );
+    assert_eq!(
+        flat.finish_reason, "length",
+        "MoE golden: finished by {:?} not \"length\" — early EOS/stop shrinks the \
+         comparison window below the captured golden",
+        flat.finish_reason
+    );
+
     // TEMPLATE-DRIFT CANARY.
     assert_eq!(
         flat.prompt_tokens, GOLDEN_PROMPT_TOKENS_MOE,
@@ -1563,6 +1673,29 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
         GOLDEN_TEXT_MOE,
         GOLDEN_MIN_PREFIX_BYTES_MOE,
     );
+
+    // TEETH past the 138-byte floor: the floor catches an EARLY divergence (a
+    // real routing/rope/eps bug diverges at token 1-3), and this pin catches a
+    // CHANGED pick exactly at the known benign one-ULP tie (generated step 33).
+    // Together they implement "fail on unexplained tail divergence": the ONLY
+    // tolerated divergence is the one that begins with the documented ' So' flip.
+    if flat.raw_text != GOLDEN_TEXT_MOE {
+        let tail = &flat.raw_text[lcp..];
+        // Char-bounded preview (NOT a byte slice): our divergent tail can contain
+        // multi-byte UTF-8, so `&tail[..48]` could panic mid-message on an
+        // already-failing assert. `chars().take(48)` is always boundary-safe.
+        let tail_preview: String = tail.chars().take(48).collect();
+        assert!(
+            tail.starts_with(GOLDEN_MOE_DIVERGENT_TAIL),
+            "MoE golden: first divergence from the mlx-lm oracle is at byte {lcp}, but our \
+             divergent continuation {tail_preview:?} does NOT begin with the documented benign \
+             one-ULP flip {GOLDEN_MOE_DIVERGENT_TAIL:?} (mlx-lm picks ' One'=-1.50, we pick \
+             ' So'=-1.75; gap 0.25 = 1 bf16 ULP; scripts/probe_lfm2_divergence.py). A changed \
+             pick at this tie is a REAL numerical shift in the compiled MoE path, not the \
+             proven benign tie."
+        );
+    }
+
     eprintln!(
         "[PASS] MoE compiled-flat matches the INDEPENDENT mlx-lm greedy golden on a \
          {lcp}-byte early prefix (>= {GOLDEN_MIN_PREFIX_BYTES_MOE}); compiled path engaged \
