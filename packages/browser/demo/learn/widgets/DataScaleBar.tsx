@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
+
 /**
  * Chapter 15 supplement — the staggering scale gulf between pretraining data
  * and post-training (SFT) data.
@@ -17,7 +19,7 @@ import * as React from 'react';
  *     multiple-orders-of-magnitude gap reads clearly.
  *
  * Numbers are illustrative orders of magnitude (real corpora vary widely). The
- * Segment / ToggleButton idiom mirrors SwiGluVsPlain.
+ * bar idiom mirrors SwiGluVsPlain.
  */
 
 type Scale = 'linear' | 'log';
@@ -34,30 +36,6 @@ const PRETRAIN_BG = 'oklch(0.7 0.13 220 / 0.32)';
 const SFT_BG = 'oklch(0.7 0.13 60 / 0.4)';
 
 const EASE = 'cubic-bezier(0.4, 0, 0.2, 1)';
-
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
 
 function Bar({
   label,
@@ -121,14 +99,14 @@ export function DataScaleBar() {
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Pretraining vs SFT — data scale</div>
-        <div className="inline-flex rounded-md border border-border p-0.5">
-          <ToggleButton active={!log} onClick={() => setScale('linear')}>
-            Linear
-          </ToggleButton>
-          <ToggleButton active={log} onClick={() => setScale('log')}>
-            Log
-          </ToggleButton>
-        </div>
+        <SegmentedToggle
+          value={scale}
+          onChange={setScale}
+          options={[
+            { value: 'linear', label: 'Linear' },
+            { value: 'log', label: 'Log' },
+          ]}
+        />
       </div>
 
       <Bar

@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 5 supplement — the WHOLE attention data flow, end to end, on one
@@ -226,30 +227,15 @@ export function AttentionPipeline() {
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Attention, end to end</div>
-        <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="Sequence mixer">
-          <button
-            type="button"
-            aria-pressed={mixer === 'full'}
-            onClick={() => selectMixer('full')}
-            className={[
-              'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-              mixer === 'full' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-            ].join(' ')}
-          >
-            Full attention (GQA)
-          </button>
-          <button
-            type="button"
-            aria-pressed={mixer === 'linear'}
-            onClick={() => selectMixer('linear')}
-            className={[
-              'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-              mixer === 'linear' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-            ].join(' ')}
-          >
-            Linear (GatedDeltaNet)
-          </button>
-        </div>
+        <SegmentedToggle
+          value={mixer}
+          onChange={selectMixer}
+          ariaLabel="Sequence mixer"
+          options={[
+            { value: 'full', label: 'Full attention (GQA)' },
+            { value: 'linear', label: 'Linear (GatedDeltaNet)' },
+          ]}
+        />
       </div>
 
       <MathDisplay

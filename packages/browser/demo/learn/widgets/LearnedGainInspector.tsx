@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 7 supplement — RMSNorm's only learned parameter is the per-feature
@@ -68,30 +69,6 @@ const SUPPRESSED = GAINS.filter((g) => g < BASELINE).length;
 const GAIN_MIN_OBSERVED = Math.min(...GAINS);
 const GAIN_MAX_OBSERVED = Math.max(...GAINS);
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 /** One feature: a bar that grows up (amplified) or down (suppressed) from the baseline. */
 function GainBar({ gain, on }: { gain: number; on: boolean }) {
   const dev = on ? gain - BASELINE : 0;
@@ -130,18 +107,15 @@ export function LearnedGainInspector() {
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
           Learned gain γ — the only trained parameter
         </div>
-        <div
-          className="inline-flex rounded-md border border-border p-0.5"
-          role="group"
-          aria-label="Toggle learned gain"
-        >
-          <ToggleButton active={on} onClick={() => setOn(true)}>
-            Gain on (learned γ)
-          </ToggleButton>
-          <ToggleButton active={!on} onClick={() => setOn(false)}>
-            Gain off (γ = 1)
-          </ToggleButton>
-        </div>
+        <SegmentedToggle
+          value={on}
+          onChange={setOn}
+          ariaLabel="Toggle learned gain"
+          options={[
+            { value: true, label: 'Gain on (learned γ)' },
+            { value: false, label: 'Gain off (γ = 1)' },
+          ]}
+        />
       </div>
 
       <MathDisplay latex={String.raw`y_i=\dfrac{x_i}{\mathrm{RMS}(x)}\cdot g_i`} />

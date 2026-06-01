@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
+
 /**
  * Chapter 7 supplement — why a 3-matrix SwiGLU FFN costs about the same as
  * the classic 2-matrix FFN.
@@ -48,30 +50,6 @@ function Segment({ label, units, widthPct, bg }: { label: string; units: string;
   );
 }
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 export function SwiGluVsPlain() {
   const [mode, setMode] = React.useState<Mode>('swiglu');
   const swiglu = mode === 'swiglu';
@@ -86,14 +64,14 @@ export function SwiGluVsPlain() {
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Three matrices, same budget</div>
-        <div className="inline-flex rounded-md border border-border p-0.5">
-          <ToggleButton active={!swiglu} onClick={() => setMode('plain')}>
-            Plain FFN
-          </ToggleButton>
-          <ToggleButton active={swiglu} onClick={() => setMode('swiglu')}>
-            SwiGLU
-          </ToggleButton>
-        </div>
+        <SegmentedToggle
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: 'plain', label: 'Plain FFN' },
+            { value: 'swiglu', label: 'SwiGLU' },
+          ]}
+        />
       </div>
 
       {/* Formula — cross-fades between the two designs. The two lines are

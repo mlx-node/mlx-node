@@ -11,6 +11,7 @@ import {
 } from '../../lib/training-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { RunButton } from '../scaffolding/RunButton';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 import { LiveLossCurve } from './LiveLossCurve';
 
 /**
@@ -467,30 +468,14 @@ export function TrainingPlayground({ workerRef, abortRef }: TrainingPlaygroundPr
     <div className="space-y-4">
       <div className="space-y-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Training corpus</div>
-        <div
-          className="inline-flex flex-wrap gap-1 rounded-md border border-border p-0.5"
-          role="group"
-          aria-label="Corpus preset"
-        >
-          {CORPUS_PRESETS.map((preset) => {
-            const active = preset.id === corpusId;
-            return (
-              <button
-                key={preset.id}
-                type="button"
-                aria-pressed={active}
-                disabled={running}
-                onClick={() => setCorpusId(preset.id)}
-                className={[
-                  'rounded px-2.5 py-1 text-xs font-medium transition-colors disabled:opacity-50',
-                  active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-                ].join(' ')}
-              >
-                {preset.label}
-              </button>
-            );
-          })}
-        </div>
+        <SegmentedToggle
+          value={corpusId}
+          onChange={setCorpusId}
+          ariaLabel="Corpus preset"
+          disabled={running}
+          wrap
+          options={CORPUS_PRESETS.map((preset) => ({ value: preset.id, label: preset.label }))}
+        />
         <p className="text-[12px] text-foreground/80">{corpus.description}</p>
         <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-2 font-mono text-[11px] text-foreground/80">
           {corpus.text}

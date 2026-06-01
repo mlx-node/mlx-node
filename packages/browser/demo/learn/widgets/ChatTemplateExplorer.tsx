@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
+
 /**
  * Chapter 15 (post-training) — the chat template, made literal.
  *
@@ -41,30 +43,6 @@ function Special({ children }: { children: React.ReactNode }) {
   );
 }
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 export function ChatTemplateExplorer() {
   const [mode, setMode] = React.useState<Mode>('raw');
 
@@ -72,14 +50,14 @@ export function ChatTemplateExplorer() {
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">The chat template</div>
-        <div className="inline-flex rounded-md border border-border p-0.5">
-          <ToggleButton active={mode === 'raw'} onClick={() => setMode('raw')}>
-            Raw text the model sees
-          </ToggleButton>
-          <ToggleButton active={mode === 'chat'} onClick={() => setMode('chat')}>
-            Chat view
-          </ToggleButton>
-        </div>
+        <SegmentedToggle
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: 'raw', label: 'Raw text the model sees' },
+            { value: 'chat', label: 'Chat view' },
+          ]}
+        />
       </div>
 
       {mode === 'raw' ? (

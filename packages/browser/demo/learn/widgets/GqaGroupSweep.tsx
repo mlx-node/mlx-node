@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
+
 /**
  * Chapter 5 supplement — the GQA tradeoff as a sweep over #KV heads.
  *
@@ -68,31 +70,24 @@ export function GqaGroupSweep() {
       {/* Selector over #KV heads (divisors of 8). */}
       <div className="space-y-1">
         <span className="block text-xs text-muted-foreground">Number of KV heads</span>
-        <div
-          className="inline-flex flex-wrap gap-1 rounded-md border border-border p-0.5"
-          role="group"
-          aria-label="Number of KV heads"
-        >
-          {KV_OPTIONS.map((option) => {
-            const active = option === kv;
+        <SegmentedToggle
+          value={kv}
+          onChange={setKv}
+          ariaLabel="Number of KV heads"
+          wrap
+          options={KV_OPTIONS.map((option) => {
             const v = VARIANTS[option]!;
-            return (
-              <button
-                key={option}
-                type="button"
-                aria-pressed={active}
-                onClick={() => setKv(option)}
-                className={[
-                  'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-                  active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-                ].join(' ')}
-              >
-                {option} — {v.name}
-                {option === QWEN_NUM_KV_HEADS ? ' ★' : ''}
-              </button>
-            );
+            return {
+              value: option,
+              label: (
+                <>
+                  {option} — {v.name}
+                  {option === QWEN_NUM_KV_HEADS ? ' ★' : ''}
+                </>
+              ),
+            };
           })}
-        </div>
+        />
         <p className="text-[11px] text-muted-foreground">
           ★ = Qwen3.5-0.8B&apos;s choice. <span className="font-mono">1</span> = MQA (one shared K/V),{' '}
           <span className="font-mono">8</span> = MHA (one K/V per query head).

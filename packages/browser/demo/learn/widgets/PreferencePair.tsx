@@ -1,6 +1,7 @@
+import { cn } from '@/lib/utils';
 import * as React from 'react';
 
-import { cn } from '@/lib/utils';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 15 (post-training) supplement — what "preference tuning" actually
@@ -47,7 +48,8 @@ const PROMPT = 'Explain recursion to a 5-year-old.';
 // they're plausibly comparable, so "picking" the better one feels real.
 const RESPONSE_A =
   "It's like a tiny robot that, to do a big job, makes a smaller copy of itself to do a smaller piece — until the piece is so small it just does it.";
-const RESPONSE_B = "Recursion is when a function is recursive. It's a standard concept; you'll understand it eventually.";
+const RESPONSE_B =
+  "Recursion is when a function is recursive. It's a standard concept; you'll understand it eventually.";
 
 // Bar colors (winner / loser read clearly in the dark theme).
 const A_BG = 'oklch(0.72 0.15 150 / 0.5)'; // green-ish
@@ -110,7 +112,9 @@ function ProbBar({
             transition: animate ? `width 320ms ${EASE}` : undefined,
           }}
         >
-          {pct > 14 ? <span className="truncate font-mono text-[10px] text-foreground/90">{pct.toFixed(0)}%</span> : null}
+          {pct > 14 ? (
+            <span className="truncate font-mono text-[10px] text-foreground/90">{pct.toFixed(0)}%</span>
+          ) : null}
         </div>
       </div>
     </div>
@@ -180,7 +184,12 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
       : 'flows directly into the model update; the reward model is bypassed and greyed out.');
 
   return (
-    <svg role="img" aria-label={ariaLabel} viewBox={`0 0 ${PW} ${PH}`} className="block h-auto w-full rounded-md bg-muted/20">
+    <svg
+      role="img"
+      aria-label={ariaLabel}
+      viewBox={`0 0 ${PW} ${PH}`}
+      className="block h-auto w-full rounded-md bg-muted/20"
+    >
       <defs>
         <marker id="pp-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
           <path d="M 0 0 L 10 5 L 0 10 Z" fill="currentColor" />
@@ -210,10 +219,24 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           stroke="currentColor"
           strokeOpacity={0.45}
         />
-        <text x={pairBox.x + pairBox.w / 2} y={cy - 6} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.9}>
+        <text
+          x={pairBox.x + pairBox.w / 2}
+          y={cy - 6}
+          fontSize={11}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.9}
+        >
           prompt + pair
         </text>
-        <text x={pairBox.x + pairBox.w / 2} y={cy + 9} fontSize={9.5} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
+        <text
+          x={pairBox.x + pairBox.w / 2}
+          y={cy + 9}
+          fontSize={9.5}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.6}
+        >
           A vs B, human picked {preferred}
         </text>
       </g>
@@ -231,10 +254,24 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           strokeOpacity={rlhf ? 0.55 : 0.35}
           strokeDasharray={rlhf ? undefined : '4 4'}
         />
-        <text x={rewardBox.x + rewardBox.w / 2} y={cy - 6} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.9}>
+        <text
+          x={rewardBox.x + rewardBox.w / 2}
+          y={cy - 6}
+          fontSize={11}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.9}
+        >
           reward model
         </text>
-        <text x={rewardBox.x + rewardBox.w / 2} y={cy + 9} fontSize={9.5} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
+        <text
+          x={rewardBox.x + rewardBox.w / 2}
+          y={cy + 9}
+          fontSize={9.5}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.6}
+        >
           {rlhf ? 'scores responses' : 'skipped'}
         </text>
       </g>
@@ -251,10 +288,24 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           stroke="currentColor"
           strokeOpacity={0.45}
         />
-        <text x={updateBox.x + updateBox.w / 2} y={cy - 6} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.9}>
+        <text
+          x={updateBox.x + updateBox.w / 2}
+          y={cy - 6}
+          fontSize={11}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.9}
+        >
           model update
         </text>
-        <text x={updateBox.x + updateBox.w / 2} y={cy + 9} fontSize={9.5} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
+        <text
+          x={updateBox.x + updateBox.w / 2}
+          y={cy + 9}
+          fontSize={9.5}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.6}
+        >
           {rlhf ? 'RL step' : 'preference loss'}
         </text>
       </g>
@@ -368,7 +419,9 @@ export function PreferencePair() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">Preference tuning — pick a winner, nudge</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Preference tuning — pick a winner, nudge
+        </div>
         <div className="text-[11px] text-muted-foreground">
           A human prefers one response; the update raises <span className="font-mono">P(chosen)</span>
         </div>
@@ -392,9 +445,13 @@ export function PreferencePair() {
               >
                 <div className="mb-1 flex items-center justify-between">
                   <span className="font-mono text-[11px] font-medium text-foreground/90">Response {side}</span>
-                  {isWinner ? <span className="text-[10px] uppercase tracking-wider text-primary">👤 preferred</span> : null}
+                  {isWinner ? (
+                    <span className="text-[10px] uppercase tracking-wider text-primary">👤 preferred</span>
+                  ) : null}
                 </div>
-                <p className="text-[11px] leading-relaxed text-foreground/80">{side === 'A' ? RESPONSE_A : RESPONSE_B}</p>
+                <p className="text-[11px] leading-relaxed text-foreground/80">
+                  {side === 'A' ? RESPONSE_A : RESPONSE_B}
+                </p>
               </div>
             );
           })}
@@ -413,8 +470,20 @@ export function PreferencePair() {
 
       {/* ---- BEAT 1: probability bars + update controls + readout ---- */}
       <div className="space-y-2">
-        <ProbBar label="P(A) — model probability of response A" pct={pAPct} bg={A_BG} isWinner={preferred === 'A'} animate={!reducedMotion} />
-        <ProbBar label="P(B) — model probability of response B" pct={pBPct} bg={B_BG} isWinner={preferred === 'B'} animate={!reducedMotion} />
+        <ProbBar
+          label="P(A) — model probability of response A"
+          pct={pAPct}
+          bg={A_BG}
+          isWinner={preferred === 'A'}
+          animate={!reducedMotion}
+        />
+        <ProbBar
+          label="P(B) — model probability of response B"
+          pct={pBPct}
+          bg={B_BG}
+          isWinner={preferred === 'B'}
+          animate={!reducedMotion}
+        />
       </div>
 
       <div className="flex flex-wrap items-center gap-1.5">
@@ -465,30 +534,15 @@ export function PreferencePair() {
       <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="text-[11px] uppercase tracking-wider text-muted-foreground">How the update is computed</div>
-          <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="Preference-tuning method">
-            <button
-              type="button"
-              onClick={() => setMethod('RLHF')}
-              aria-pressed={method === 'RLHF'}
-              className={cn(
-                'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-                method === 'RLHF' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              RLHF
-            </button>
-            <button
-              type="button"
-              onClick={() => setMethod('DPO')}
-              aria-pressed={method === 'DPO'}
-              className={cn(
-                'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-                method === 'DPO' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              DPO
-            </button>
-          </div>
+          <SegmentedToggle
+            value={method}
+            onChange={setMethod}
+            ariaLabel="Preference-tuning method"
+            options={[
+              { value: 'RLHF', label: 'RLHF' },
+              { value: 'DPO', label: 'DPO' },
+            ]}
+          />
         </div>
 
         <PipelineDiagram method={method} preferred={preferred} pA={pA} />
@@ -496,8 +550,8 @@ export function PreferencePair() {
         <p className="text-[11px] leading-relaxed text-foreground/85">
           {method === 'RLHF' ? (
             <>
-              <strong>RLHF</strong> trains a <strong>separate reward model</strong> from the human comparisons, then uses
-              reinforcement learning to optimize the model against that reward.
+              <strong>RLHF</strong> trains a <strong>separate reward model</strong> from the human comparisons, then
+              uses reinforcement learning to optimize the model against that reward.
             </>
           ) : (
             <>

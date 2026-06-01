@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
+
 /**
  * Chapter 8 supplement — make the "residual stream" name concrete.
  *
@@ -57,30 +59,6 @@ const COLORS = [
 const ATTN_COLOR = 'oklch(0.7 0.16 60)'; // warm orange
 const MLP_COLOR = 'oklch(0.62 0.18 300)'; // purple
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 export function ResidualStream() {
   const [step, setStep] = React.useState(0);
   const [playing, setPlaying] = React.useState(() =>
@@ -135,14 +113,14 @@ export function ResidualStream() {
           The residual stream — one vector, written into 2× per layer
         </div>
         <div className="inline-flex items-center gap-2">
-          <div className="inline-flex rounded-md border border-border p-0.5">
-            <ToggleButton active={mode === 'add'} onClick={() => setMode('add')}>
-              Add (h += Δ)
-            </ToggleButton>
-            <ToggleButton active={mode === 'overwrite'} onClick={() => setMode('overwrite')}>
-              Overwrite (h = new)
-            </ToggleButton>
-          </div>
+          <SegmentedToggle
+            value={mode}
+            onChange={setMode}
+            options={[
+              { value: 'add', label: 'Add (h += Δ)' },
+              { value: 'overwrite', label: 'Overwrite (h = new)' },
+            ]}
+          />
           <button
             type="button"
             onClick={() => setPlaying((p) => !p)}

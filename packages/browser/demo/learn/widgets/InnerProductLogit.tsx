@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 10 (LM head) supplement — the *geometry* of one logit.
@@ -63,30 +64,6 @@ const CANDIDATES: Record<Angle, { label: string; w: number[] }> = {
 
 const ORDER: Angle[] = ['aligned', 'orthogonal', 'opposed'];
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 export function InnerProductLogit() {
   const [angle, setAngle] = React.useState<Angle>('aligned');
   const w = CANDIDATES[angle].w;
@@ -106,13 +83,11 @@ export function InnerProductLogit() {
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">A logit is an inner product</div>
-        <div className="inline-flex rounded-md border border-border p-0.5">
-          {ORDER.map((key) => (
-            <ToggleButton key={key} active={angle === key} onClick={() => setAngle(key)}>
-              {CANDIDATES[key].label}
-            </ToggleButton>
-          ))}
-        </div>
+        <SegmentedToggle
+          value={angle}
+          onChange={setAngle}
+          options={ORDER.map((key) => ({ value: key, label: CANDIDATES[key].label }))}
+        />
       </div>
 
       <p className="text-[12px] text-foreground/85">

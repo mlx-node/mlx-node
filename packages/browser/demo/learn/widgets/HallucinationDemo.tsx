@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { TopKBars } from '../inspector/TopKBars';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 16 (architecture) — why the model hallucinates, shown with the same
@@ -48,30 +49,6 @@ const SCENARIOS: Scenario[] = [
   },
 ];
 
-function ToggleButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={[
-        'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
-  );
-}
-
 export function HallucinationDemo() {
   const [idx, setIdx] = React.useState(0);
   const s = SCENARIOS[idx];
@@ -83,13 +60,11 @@ export function HallucinationDemo() {
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Plausible ≠ true</div>
-        <div className="inline-flex rounded-md border border-border p-0.5">
-          {SCENARIOS.map((sc, i) => (
-            <ToggleButton key={sc.key} active={idx === i} onClick={() => setIdx(i)}>
-              {sc.label}
-            </ToggleButton>
-          ))}
-        </div>
+        <SegmentedToggle
+          value={idx}
+          onChange={setIdx}
+          options={SCENARIOS.map((sc, i) => ({ value: i, label: sc.label }))}
+        />
       </div>
 
       <div className="rounded-md border border-border/60 bg-muted/30 p-2 font-mono text-[12px] text-foreground/90">

@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 14 (Scaling) supplement — why learning-rate warmup matters, drawn as
@@ -120,34 +121,18 @@ export function WarmupLossCurve() {
       <MathDisplay latex={String.raw`\text{lr}(t)=\text{lr}_{\max}\cdot \frac{t}{W}\quad (t<W)`} />
 
       {/* Toggle: with warmup <-> no warmup. */}
-      <div
-        className="inline-flex flex-wrap gap-1 rounded-md border border-border p-0.5"
-        role="group"
-        aria-label="Warmup toggle"
-      >
-        {(
+      <SegmentedToggle
+        value={mode}
+        onChange={setMode}
+        ariaLabel="Warmup toggle"
+        wrap
+        options={(
           [
             { id: 'warmup', label: 'with warmup' },
             { id: 'none', label: 'no warmup' },
           ] as const
-        ).map((opt) => {
-          const active = mode === opt.id;
-          return (
-            <button
-              key={opt.id}
-              type="button"
-              aria-pressed={active}
-              onClick={() => setMode(opt.id)}
-              className={[
-                'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-                active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-              ].join(' ')}
-            >
-              {opt.label}
-            </button>
-          );
-        })}
-      </div>
+        ).map((opt) => ({ value: opt.id, label: opt.label }))}
+      />
 
       <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={ariaLabel}>
         {/* axes */}

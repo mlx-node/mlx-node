@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
+import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
  * Chapter 12 (KV cache & hybrid attention) — the generation loop with KV
@@ -127,28 +128,15 @@ export function GenerationLoopTrace() {
       {/* Cache toggle. */}
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[11px] uppercase tracking-wider text-muted-foreground">KV cache</span>
-        <div className="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="KV cache toggle">
-          {[
-            { on: true, label: 'on' },
-            { on: false, label: 'off' },
-          ].map((opt) => {
-            const active = cacheOn === opt.on;
-            return (
-              <button
-                key={opt.label}
-                type="button"
-                aria-pressed={active}
-                onClick={() => setCacheOn(opt.on)}
-                className={[
-                  'rounded px-2.5 py-1 text-xs font-medium transition-colors',
-                  active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
-                ].join(' ')}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
-        </div>
+        <SegmentedToggle
+          value={cacheOn}
+          onChange={setCacheOn}
+          ariaLabel="KV cache toggle"
+          options={[
+            { value: true, label: 'on' },
+            { value: false, label: 'off' },
+          ]}
+        />
         <span className="text-[11px] text-muted-foreground">
           {cacheOn
             ? 'prefix K/V reused — no re-projecting the prefix each step'
