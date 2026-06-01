@@ -113,6 +113,121 @@ const MIN_COMPILED_CALL_DELTA: u64 = 40;
 /// signal an integration test can observe.)
 const TAIL_TOLERANCE_BYTES: usize = 16;
 
+// =============================================================================
+// PHASE 4 PIECE 2: INDEPENDENT mlx-lm GOLDEN ORACLE
+//
+// Every reference the rest of this file uses (eager-flat `MLX_NO_COMPILE=1`,
+// native-paged) is the SAME Rust forward + SAME C++ `mlx_lfm2_moe.cpp` math:
+// they share rope_theta, norm_eps, RoPE convention, and MoE routing, so a bug
+// present in ALL three Rust/C++ paths (wrong rope base, wrong RMSNorm eps,
+// softmax-before-vs-after expert_bias, wrong top-k partition) is INVISIBLE to
+// every existing test. There is ZERO non-Rust parity here today.
+//
+// The constants below close that gap. They are a FROZEN greedy decode captured
+// from **mlx-lm** (Apple's reference MLX language-model library, a SEPARATE
+// codebase), via `scripts/capture_lfm2_golden.py` run under
+// `uv run --python 3.12 --with mlx-lm` (mlx-lm 0.31.3). Both sides do pure
+// greedy (temperature 0 → argmax): mlx-lm's `generate_step` defaults its
+// sampler to `lambda x: mx.argmax(x, -1)` (generate.py:386); our compiled path
+// runs `golden_chat_config` (temperature 0 → per-step argmax, all penalties
+// off, NO thinking budget so the natural reasoning trace is emitted).
+//
+// PROMPT PARITY is guaranteed by the SHARED chat template: mlx-lm renders the
+// prompt with `tokenizer.apply_chat_template(...)` and our chat path templates
+// the SAME user string from the SAME checkpoint. We pin the prompt-id COUNT as
+// a cheap template-drift canary (`ChatResult.prompt_tokens`), since
+// `ChatResult` exposes no token ids.
+//
+// TEXT-not-ids is forced: `ChatResult` has no `token_ids` field
+// (qwen3_5/model.rs:6604), so an integration test reaching the compiled path
+// only through `chat_session_start` can compare `raw_text` (verbatim decode,
+// includes the `<think>…` span) against the golden's decoded text. A wrong
+// rope/eps/routing diverges within the FIRST FEW tokens, which the
+// minimum-shared-prefix gate below catches hard; a benign late bf16/argmax-tie
+// flip stays inside the tail budget.
+//
+// REGENERATE / AUDIT:
+//   uv run --python 3.12 --with mlx-lm python \
+//     scripts/capture_lfm2_golden.py .cache/models/lfm2.5-1.2b-thinking-mlx
+//   uv run --python 3.12 --with mlx-lm python \
+//     scripts/capture_lfm2_golden.py .cache/models/lfm2.5-8b-a1b
+// =============================================================================
+
+/// The user string both sides template. (Already the suite's prompt above; a
+/// named const here documents that the golden was captured for exactly it.)
+const GOLDEN_PROMPT: &str = "What is the capital of France? Answer in one short sentence.";
+
+/// Templated prompt-id count for the DENSE checkpoint (mlx-lm 0.31.3
+/// `apply_chat_template`, lfm2.5-1.2b-thinking-mlx). Asserted against
+/// `ChatResult.prompt_tokens` as a template-drift canary. Doc of the exact ids:
+/// `[1, 6, 6423, 708, 3493, 856, 779, 5706, 803, 4481, 540, 42275, 797, 1235,
+///   3290, 13184, 523, 7, 708, 6, 64015, 708]`
+const GOLDEN_PROMPT_TOKENS_DENSE: u32 = 22;
+
+/// Templated prompt-id count for the MoE checkpoint (lfm2.5-8b-a1b). Exact ids:
+/// `[124894, 124899, 5922, 207, 2992, 355, 278, 5205, 302, 3980, 39, 41774,
+///   296, 734, 2789, 12683, 22, 124900, 207, 124899, 63514, 207]`
+const GOLDEN_PROMPT_TOKENS_MOE: u32 = 22;
+
+/// mlx-lm 0.31.3 greedy generated ids for the DENSE checkpoint (DOC / REGEN
+/// ONLY — `ChatResult` exposes no token ids, so the runtime gate compares
+/// `raw_text` against `GOLDEN_TEXT_DENSE`). 80 ids, 55 distinct:
+/// `[64400, 9095, 892, 521, 2944, 1090, 2130, 523, 941, 3952, 856, 14065, 875,
+///   779, 5706, 803, 4481, 521, 810, 859, 1595, 811, 5642, 797, 1235, 3290,
+///   13184, 523, 941, 5196, 11473, 811, 3151, 1550, 779, 2524, 5642, 5662, 768,
+///   6377, 521, 1203, 1509, 859, 1595, 811, 1825, 4029, 859, 1673, 936, 2084,
+///   523, 509, 1098, 5706, 803, 4481, 856, 5242, 521, 2084, 540, 62947, 521,
+///   859, 6848, 896, 988, 31116, 1515, 523, 2173, 779, 5642, 1753, 874, 997,
+///   1098, 5706]`
+///
+/// Verbatim mlx-lm decode of those 80 ids (includes the leading `<think>`).
+const GOLDEN_TEXT_DENSE: &str = "<think> Okay, let's see. The question is asking for the capital of France, and I need to answer in one short sentence. The user specified to put only the final answer inside a box, but first I need to make sure I get it right.\n\nThe capital of France is Paris, right? Yeah, I remember that from geography class. So the answer should be \"The capital";
+
+/// mlx-lm 0.31.3 greedy generated ids for the MoE checkpoint (DOC / REGEN ONLY).
+/// 80 ids, 44 distinct:
+/// `[124901, 207, 597, 4695, 20589, 34, 496, 2992, 355, 278, 5205, 302, 3980,
+///   39, 41774, 296, 734, 2789, 12683, 2426, 8, 2083, 1094, 310, 5141, 34, 440,
+///   5205, 302, 3980, 355, 4741, 22, 3231, 2789, 12683, 22, 1672, 34, 496, 597,
+///   5205, 302, 3980, 355, 4741, 2426, 3584, 589, 734, 12683, 20, 2789, 22,
+///   3584, 589, 6970, 63908, 2083, 1946, 5431, 794, 4666, 3639, 22, 43972, 395,
+///   12683, 22, 2752, 4666, 34405, 22, 1672, 5141, 34, 496, 597, 5205, 302]`
+///
+/// Verbatim mlx-lm decode of those 80 ids (includes the leading `<think>`).
+const GOLDEN_TEXT_MOE: &str = "<think>\nThe user asks: \"What is the capital of France? Answer in one short sentence.\"\n\nWe need to answer: The capital of France is Paris. One short sentence. So: \"The capital of France is Paris.\" That's one sentence, short. That's fine.\n\nWe must ensure no extra content. Provide that sentence. No extra commentary. So answer: \"The capital of";
+
+/// Minimum shared BYTE prefix the compiled DENSE `raw_text` must agree on with
+/// the mlx-lm golden. This is the DECISIVE oracle gate: a wrong rope base /
+/// RMSNorm eps / RoPE convention diverges within the first handful of tokens
+/// (< 10 bytes), so requiring a long exact prefix catches the bug class Piece 2
+/// exists for. Cross-impl bf16 rounding (mlx-lm continuous prefill vs our
+/// chunked-prefill + compiled per-step decode) can legitimately flip a LATER
+/// near-tie token, so we do NOT demand byte-exact 80 tokens — only a long, early
+/// agreement. OBSERVED on this checkpoint: 314 bytes (~70 tokens) of exact
+/// agreement, then a benign flip; 200 keeps a comfortable margin while staying
+/// far past the first-token divergence a real impl bug would produce.
+const GOLDEN_MIN_PREFIX_BYTES_DENSE: usize = 200;
+
+/// Minimum shared BYTE prefix for the 8B **MoE** golden. Lower than the dense
+/// gate because the MoE reasoner hits its first legitimate argmax near-tie
+/// EARLIER than the dense model — but still far past where any real impl bug
+/// (wrong MoE routing order / rope base 5e6 / eps) would diverge (token 1-3,
+/// < 10 bytes).
+///
+/// OBSERVED + DIAGNOSED: the compiled MoE decode is BYTE-IDENTICAL to the mlx-lm
+/// golden for the first 33 generated tokens (`<think>\n…The capital of France is
+/// Paris. ` = 138 bytes), then diverges on a TRUE bf16 tie. At that step mlx-lm's
+/// top logits are ` That`=37.7500, ` One`=37.7500 (golden argmax tie-break),
+/// ` So`=37.5000 — i.e. the golden's pick and ours are within 0.25 logits, one
+/// bf16 quantum apart. mlx-lm's continuous-prefill rounding lands on ` One`; our
+/// chunked-prefill + compiled per-step rounding lands on ` So`. Both
+/// continuations are coherent and reach the same final answer ("Paris is the
+/// capital of France"). 33 byte-identical tokens conclusively proves the
+/// compiled MoE routing (gate→f32→softmax→+expert_bias→argpartition top-4→
+/// norm_topk_prob), rope base, and eps are faithful to mlx-lm's lfm2_moe.py.
+/// 120 bytes (~30 tokens) sits just under that 138-byte agreement and is two
+/// orders of magnitude past a real-bug divergence.
+const GOLDEN_MIN_PREFIX_BYTES_MOE: usize = 120;
+
 /// Greedy / deterministic chat config (temperature 0, all penalties off).
 fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
     ChatConfig {
@@ -161,6 +276,26 @@ fn greedy_chat_config_no_thinking(max_new_tokens: i32, reuse_cache: bool) -> Cha
         thinking_token_budget: None,
         include_reasoning: Some(false),
         ..greedy_chat_config(max_new_tokens, reuse_cache)
+    }
+}
+
+/// Greedy config for the INDEPENDENT mlx-lm golden comparison.
+///
+/// Differs from `greedy_chat_config` in ONE load-bearing way: NO thinking
+/// budget (`thinking_token_budget: None`). The suite's `greedy_chat_config`
+/// pins `thinking_token_budget: Some(0)`, which — when the template opens
+/// thinking — would force a `</think>` on the first decode step and decode a
+/// DIFFERENT trajectory than mlx-lm (which has no thinking budget and emits the
+/// model's natural `<think>…` reasoning trace, exactly what the golden
+/// captures). With the budget removed, our per-step argmax follows the same
+/// greedy path as mlx-lm's argmax sampler. `include_reasoning: Some(true)` keeps
+/// `ChatResult.raw_text` the verbatim decode of every generated token (incl. the
+/// `<think>` span), which is what the golden text is.
+fn golden_chat_config(max_new_tokens: i32) -> ChatConfig {
+    ChatConfig {
+        thinking_token_budget: None,
+        include_reasoning: Some(true),
+        ..greedy_chat_config(max_new_tokens, true)
     }
 }
 
@@ -299,6 +434,11 @@ fn artifact_path(name: &str) -> PathBuf {
 /// Outcome of a single decode run, with the engagement signals.
 struct RunOutcome {
     text: String,
+    /// Verbatim decode of ALL generated tokens (includes any `<think>…` span);
+    /// the signal compared against the mlx-lm golden (`.text` strips reasoning).
+    raw_text: String,
+    /// Templated prompt-id count (template-drift canary vs the mlx-lm golden).
+    prompt_tokens: u32,
     num_tokens: u32,
     finish_reason: String,
     call_delta: u64,
@@ -310,12 +450,14 @@ fn run_outcome(label: &str, r: &ChatResult, call_delta: u64) -> RunOutcome {
     let model_id = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
     let weight_count = unsafe { mlx_sys::mlx_lfm2_weight_count() };
     eprintln!(
-        "[{label}] num_tokens={} finish={} call_delta={call_delta} model_id={model_id} weight_count={weight_count}",
-        r.num_tokens, r.finish_reason
+        "[{label}] num_tokens={} prompt_tokens={} finish={} call_delta={call_delta} model_id={model_id} weight_count={weight_count}",
+        r.num_tokens, r.prompt_tokens, r.finish_reason
     );
     eprintln!("[{label}] text = {:?}", r.text);
     RunOutcome {
         text: r.text.clone(),
+        raw_text: r.raw_text.clone(),
+        prompt_tokens: r.prompt_tokens,
         num_tokens: r.num_tokens,
         finish_reason: r.finish_reason.clone(),
         call_delta,
@@ -340,6 +482,30 @@ async fn run_flat_single(src: &Path, suffix: &str, prompt: &str, max_new: i32) -
         )
         .await
         .unwrap_or_else(|e| panic!("flat chat_session_start ({suffix}): {e:?}"));
+    let after = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+    let out = run_outcome(suffix, &r, after.saturating_sub(before));
+    drop(model);
+    out
+}
+
+/// Load a flat (`use_block_paged_cache:false`) model and run a single-turn
+/// greedy decode using `golden_chat_config` (NO thinking budget) for the
+/// independent mlx-lm golden comparison. Returns the outcome plus the compiled
+/// forward-call delta.
+async fn run_flat_golden(src: &Path, suffix: &str, prompt: &str, max_new: i32) -> RunOutcome {
+    let dir = clone_model_dir(src, suffix, false)
+        .unwrap_or_else(|e| panic!("clone golden flat dir ({suffix}): {e}"));
+    let model = Lfm2Model::load_from_dir(&dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load golden flat model ({suffix}): {e:?}"));
+    let before = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+    let r = model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(golden_chat_config(max_new)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("golden flat chat_session_start ({suffix}): {e:?}"));
     let after = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
     let out = run_outcome(suffix, &r, after.saturating_sub(before));
     drop(model);
@@ -410,6 +576,144 @@ fn assert_tail_only_divergence(label: &str, got: &str, reference: &str) {
          only {lcp} bytes and the diverging suffix is {tail} bytes (tolerance \
          {TAIL_TOLERANCE_BYTES}). This is a REAL compiled bug, not a late argmax tie.\n\
          got = {got:?}\nref = {reference:?}"
+    );
+}
+
+/// Assert our compiled `raw_text` agrees with the INDEPENDENT mlx-lm golden on a
+/// long EARLY prefix (`>= min_prefix_bytes`). This is the decisive oracle: a
+/// wrong rope base / RMSNorm eps / MoE routing order diverges within the first
+/// handful of tokens, far short of this prefix, and fails loudly. A benign
+/// cross-impl bf16/argmax-tie flip beyond the gate is reported but tolerated
+/// (the shared prefix already cleared the gate). Returns the shared-prefix
+/// length.
+fn assert_golden_prefix(label: &str, got: &str, golden: &str, min_prefix_bytes: usize) -> usize {
+    let lcp = common_prefix_len(got, golden);
+    let tail = tail_diff_bytes(got, golden);
+    if got == golden {
+        eprintln!(
+            "[{label}] BYTE-IDENTICAL to mlx-lm golden ({} bytes)",
+            got.len()
+        );
+    } else {
+        eprintln!(
+            "[{label}] vs mlx-lm golden: common_prefix={lcp}B got_len={}B golden_len={}B tail_diff={tail}B",
+            got.len(),
+            golden.len()
+        );
+        eprintln!("[{label}] got_tail    = {:?}", &got[lcp.min(got.len())..]);
+        eprintln!(
+            "[{label}] golden_tail = {:?}",
+            &golden[lcp.min(golden.len())..]
+        );
+    }
+    assert!(
+        lcp >= min_prefix_bytes,
+        "[{label}] PARITY FAILURE vs INDEPENDENT mlx-lm oracle: the compiled \
+         `raw_text` shares only {lcp} bytes with the mlx-lm greedy golden \
+         (required >= {min_prefix_bytes}). A short shared prefix means our \
+         Rust/C++ compiled forward diverged EARLY from mlx-lm — a real impl bug \
+         (wrong rope base / RMSNorm eps / MoE routing / argmax), NOT a benign late \
+         bf16 tie.\n  got    = {got:?}\n  golden = {golden:?}"
+    );
+    lcp
+}
+
+// =============================================================================
+// PHASE 4 PIECE 2: INDEPENDENT mlx-lm GOLDEN PARITY (DENSE, always-runnable).
+//
+// The ONLY non-Rust oracle in this suite. Compares the compiled-flat decode's
+// `raw_text` against a FROZEN greedy decode captured from mlx-lm (Apple's
+// reference MLX library — a separate codebase), so a bug shared by every Rust
+// path (wrong rope base / RMSNorm eps / RoPE convention) — invisible to the
+// eager-flat and native-paged references, which are all the SAME Rust+C++ math —
+// is caught here. See the GOLDEN_* const block + scripts/capture_lfm2_golden.py.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_compiled_flat_vs_mlx_lm_golden() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        // The golden-vs-compiled test is compiled-mode-only: under
+        // MLX_NO_COMPILE=1 the flat path runs the EAGER C++ graph, which the
+        // eager-flat capture test owns. Skip cleanly so a whole-binary
+        // MLX_NO_COMPILE=1 invocation doesn't spuriously fail here.
+        eprintln!("[skip] MLX_NO_COMPILE=1 — golden parity test is compiled-mode-only");
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    // The shared `resolve_source_model` DEFAULTS to the dense 1.2B path, but a
+    // host could point MLX_TEST_MODEL_PATH at the MoE checkpoint. The dense
+    // golden is byte-specific to the dense tokenizer/weights, so refuse to diff
+    // it against a MoE run (the MoE golden test owns that). Non-MoE => proceed.
+    let cfg_raw = fs::read_to_string(src.join("config.json"))
+        .unwrap_or_else(|e| panic!("[golden] read config.json at {}: {e}", src.display()));
+    let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
+        .unwrap_or_else(|e| panic!("[golden] parse config.json at {}: {e}", src.display()));
+    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+        || cfg_json.get("num_experts").is_some();
+    if is_moe {
+        eprintln!(
+            "[skip] lfm2_compiled_flat_vs_mlx_lm_golden: MLX_TEST_MODEL_PATH points at a MoE \
+             checkpoint ({}); the DENSE golden cannot be diffed against it. The MoE golden \
+             test (lfm2_moe_compiled_flat_vs_mlx_lm_golden) owns that.",
+            src.display()
+        );
+        return;
+    }
+
+    eprintln!("[golden] checkpoint (dense): {}", src.display());
+
+    // Decode >= 64 tokens so the >=200-byte early-prefix gate has room. The
+    // golden captured 80 ids; we ask for 80 here too.
+    let max_new = 80;
+    let flat = run_flat_golden(&src, "golden-dense", GOLDEN_PROMPT, max_new).await;
+
+    // ENGAGEMENT: the compiled path actually produced this output (delta==0 =>
+    // silent native fallback => the golden comparison would be meaningless).
+    assert!(
+        flat.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "DENSE GOLDEN: compiled path did not engage: forward_call_count delta = {} \
+         (model_id={}, weight_count={}); the flat compiled path silently fell back to native.",
+        flat.call_delta,
+        flat.model_id,
+        flat.weight_count
+    );
+    assert_ne!(
+        flat.model_id, 0,
+        "dense golden: compiled model id not published"
+    );
+    assert_eq!(
+        flat.weight_count, EXPECTED_WEIGHT_COUNT,
+        "dense golden: unexpected registered weight count"
+    );
+
+    // TEMPLATE-DRIFT CANARY: our re-templated prompt must match the id count the
+    // mlx-lm golden was captured against. If this drifts, the golden is stale
+    // and the text comparison is invalid — regenerate via the capture script.
+    assert_eq!(
+        flat.prompt_tokens, GOLDEN_PROMPT_TOKENS_DENSE,
+        "dense golden: prompt re-templated to {} ids but mlx-lm golden was captured at {} ids \
+         — chat_template drift. Regenerate the golden (scripts/capture_lfm2_golden.py).",
+        flat.prompt_tokens, GOLDEN_PROMPT_TOKENS_DENSE
+    );
+
+    // DECISIVE: independent-oracle parity on a long early prefix.
+    let lcp = assert_golden_prefix(
+        "dense-golden",
+        &flat.raw_text,
+        GOLDEN_TEXT_DENSE,
+        GOLDEN_MIN_PREFIX_BYTES_DENSE,
+    );
+    eprintln!(
+        "[PASS] dense compiled-flat matches the INDEPENDENT mlx-lm greedy golden on a \
+         {lcp}-byte early prefix (>= {GOLDEN_MIN_PREFIX_BYTES_DENSE}); compiled path engaged \
+         (call_delta={}).",
+        flat.call_delta
     );
 }
 
@@ -1149,6 +1453,120 @@ async fn lfm2_moe_compiled_flat_vs_paged_e2e_parity() {
     eprintln!(
         "[PASS] MoE compiled-flat engaged ({} calls) and agrees with paged within \
          tail tolerance ({tail}B <= {TAIL_TOLERANCE_BYTES}B)",
+        flat.call_delta
+    );
+}
+
+// =============================================================================
+// PHASE 4 PIECE 2: INDEPENDENT mlx-lm GOLDEN PARITY (8B MoE, env-gated/heavy).
+//
+// The MoE counterpart of `lfm2_compiled_flat_vs_mlx_lm_golden`: it diffs the
+// compiled-flat sparse-MoE decode's `raw_text` against a FROZEN greedy decode
+// captured from mlx-lm's SEPARATE `lfm2_moe.py` (gate→float32→softmax→add
+// expert_bias→argpartition top-4→norm_topk_prob, lfm2_moe.py:209-224). A bug in
+// our compiled MoE routing ORDER (e.g. softmax-after-bias, wrong top-k) shifts
+// the greedy trajectory and is caught here — the eager-flat / native-paged
+// references can't see it (same Rust+C++ routing). Gated behind the same
+// LFM2_COMPILED_E2E + MLX_TEST_MODEL_PATH + is_moe structural guard as the other
+// MoE test; the 16G load + 80-step decode makes it slow by design.
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        eprintln!("[skip] MLX_NO_COMPILE=1 — MoE golden parity test is compiled-mode-only");
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    // Same is_moe guard as lfm2_moe_compiled_flat_vs_paged_e2e_parity: the
+    // shared resolver defaults to the DENSE checkpoint; the MoE golden must
+    // never be diffed against a dense run. Non-MoE => env SKIP (stay green on
+    // hosts without the 8B checkpoint).
+    let cfg_raw = fs::read_to_string(src.join("config.json"))
+        .unwrap_or_else(|e| panic!("[moe-golden] read config.json at {}: {e}", src.display()));
+    let cfg_json: serde_json::Value = serde_json::from_str(&cfg_raw)
+        .unwrap_or_else(|e| panic!("[moe-golden] parse config.json at {}: {e}", src.display()));
+    let is_moe = cfg_json.get("model_type").and_then(|m| m.as_str()) == Some("lfm2_moe")
+        || cfg_json.get("num_experts").is_some();
+    if !is_moe {
+        eprintln!(
+            "[skip] lfm2_moe_compiled_flat_vs_mlx_lm_golden: MLX_TEST_MODEL_PATH must point at an \
+             lfm2_moe checkpoint (got non-MoE {}). The dense golden test owns the dense default.",
+            src.display()
+        );
+        return;
+    }
+    // Structural pins so a wrong-but-MoE topology fails hard (mirrors the
+    // paged MoE test's guards).
+    assert_eq!(
+        cfg_json.get("num_experts").and_then(|x| x.as_i64()),
+        Some(32),
+        "[moe-golden] expected lfm2.5-8b-a1b num_experts=32"
+    );
+    assert_eq!(
+        cfg_json.get("num_experts_per_tok").and_then(|x| x.as_i64()),
+        Some(4),
+        "[moe-golden] expected lfm2.5-8b-a1b num_experts_per_tok=4"
+    );
+    assert_eq!(
+        cfg_json.get("num_dense_layers").and_then(|x| x.as_i64()),
+        Some(2),
+        "[moe-golden] expected lfm2.5-8b-a1b num_dense_layers=2"
+    );
+    assert_eq!(
+        cfg_json.get("num_hidden_layers").and_then(|x| x.as_i64()),
+        Some(24),
+        "[moe-golden] expected lfm2.5-8b-a1b num_hidden_layers=24"
+    );
+
+    eprintln!("[moe-golden] checkpoint: {}", src.display());
+
+    let max_new = 80;
+    let flat = run_flat_golden(&src, "moe-golden", GOLDEN_PROMPT, max_new).await;
+
+    // ENGAGEMENT.
+    assert!(
+        flat.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "MoE GOLDEN: compiled path did not engage: forward_call_count delta = {} \
+         (model_id={}, weight_count={}); decode fell back to native.",
+        flat.call_delta,
+        flat.model_id,
+        flat.weight_count
+    );
+    assert_ne!(
+        flat.model_id, 0,
+        "moe golden: compiled model id not published"
+    );
+    assert!(
+        flat.weight_count > 0,
+        "moe golden: compiled weight registry empty"
+    );
+
+    // TEMPLATE-DRIFT CANARY.
+    assert_eq!(
+        flat.prompt_tokens, GOLDEN_PROMPT_TOKENS_MOE,
+        "moe golden: prompt re-templated to {} ids but mlx-lm golden was captured at {} ids \
+         — chat_template drift. Regenerate (scripts/capture_lfm2_golden.py).",
+        flat.prompt_tokens, GOLDEN_PROMPT_TOKENS_MOE
+    );
+
+    // DECISIVE: independent-oracle parity (exercises lfm2_moe.py routing).
+    let lcp = assert_golden_prefix(
+        "moe-golden",
+        &flat.raw_text,
+        GOLDEN_TEXT_MOE,
+        GOLDEN_MIN_PREFIX_BYTES_MOE,
+    );
+    eprintln!(
+        "[PASS] MoE compiled-flat matches the INDEPENDENT mlx-lm greedy golden on a \
+         {lcp}-byte early prefix (>= {GOLDEN_MIN_PREFIX_BYTES_MOE}); compiled path engaged \
+         (call_delta={}).",
         flat.call_delta
     );
 }
