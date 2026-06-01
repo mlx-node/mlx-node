@@ -575,19 +575,25 @@ pub fn strip_reasoning_preserving_tools(text: &str) -> String {
 
     // Missing-open template case: the generation begins mid-reasoning (the template
     // injected the opener into the prompt) and emits a bare close. The leading prefix up to
-    // the FIRST top-level close (followed by newline/EOF) is reasoning — but only when that
-    // close PRECEDES any top-level reasoning opener (otherwise the close belongs to a normal
-    // paired block already handled above, and the text before its opener is real content).
-    // Computed independently of the paired set (not gated on `reasoning.is_empty()`) so it
-    // composes with a later paired block; closes inside tool arguments are skipped so a
-    // literal `</think>` in a tool arg cannot mask the real top-level close.
-    let first_open = ["<think>", "<longcat_think>"]
-        .iter()
-        .filter_map(|t| first_top_level(text, t, &tool_ranges))
-        .min();
-    if let Some((close_pos, close_end)) = first_top_level_bare_close(text, &tool_ranges)
-        && first_open.is_none_or(|op| close_pos < op)
-    {
+    // such a close (followed by newline/EOF) is reasoning. The check is FAMILY-AWARE: a bare
+    // `</think>` is missing-open only when no top-level `<think>` opener precedes it (and
+    // likewise for longcat) — an opener of the OTHER family does not gate it. Computed
+    // independently of the paired set (not gated on emptiness) so it composes with a later
+    // paired block; closes inside tool arguments are skipped so a literal close in a tool
+    // argument cannot mask the real top-level close. The earliest qualifying close wins.
+    let mut missing_open: Option<(usize, usize)> = None;
+    for (open, close) in [
+        ("<think>", "</think>"),
+        ("<longcat_think>", "</longcat_think>"),
+    ] {
+        if let Some((close_pos, close_end)) = first_top_level_bare_close(text, close, &tool_ranges)
+            && first_top_level(text, open, &tool_ranges).is_none_or(|op| close_pos < op)
+            && missing_open.is_none_or(|(bp, _)| close_pos < bp)
+        {
+            missing_open = Some((close_pos, close_end));
+        }
+    }
+    if let Some((_, close_end)) = missing_open {
         reasoning.push((0, close_end));
     }
 
@@ -641,31 +647,27 @@ fn first_top_level(text: &str, needle: &str, tool_ranges: &[(usize, usize)]) -> 
     None
 }
 
-/// `(start, end)` of the earliest top-level reasoning close (`</think>`/`</longcat_think>`)
-/// that is followed by a newline or end-of-text — the "missing-open" close that ends a
-/// template-injected leading reasoning block. Closes inside tool spans (literal argument
-/// text) and closes followed by other content are skipped.
+/// `(start, end)` of the earliest occurrence of the reasoning close tag `close` that is
+/// top-level (outside every tool span) AND followed by a newline or end-of-text — the
+/// "missing-open" close that ends a template-injected leading reasoning block of this
+/// family. Closes inside tool spans (literal argument text) and closes followed by other
+/// content are skipped.
 fn first_top_level_bare_close(
     text: &str,
+    close: &str,
     tool_ranges: &[(usize, usize)],
 ) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
-    for close in ["</think>", "</longcat_think>"] {
-        let mut from = 0;
-        while let Some(rel) = text[from..].find(close) {
-            let pos = from + rel;
-            let end = pos + close.len();
-            let top_level = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
-            if top_level && (text[end..].is_empty() || text[end..].starts_with('\n')) {
-                if best.is_none_or(|(bp, _)| pos < bp) {
-                    best = Some((pos, end));
-                }
-                break; // earliest qualifying close for this family
-            }
-            from = end;
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(close) {
+        let pos = from + rel;
+        let end = pos + close.len();
+        let top_level = !tool_ranges.iter().any(|(s, e)| pos >= *s && pos < *e);
+        if top_level && (text[end..].is_empty() || text[end..].starts_with('\n')) {
+            return Some((pos, end));
         }
+        from = end;
     }
-    best
+    None
 }
 
 /// Check if text contains any thinking tags
@@ -1074,6 +1076,47 @@ mod tests {
         );
         assert!(
             out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("tail"),
+            "the content tool call and trailing content survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_longcat_close_after_think_block() {
+        // Adversarial (Codex No-ship): a longcat missing-open prefix that contains a NESTED
+        // paired `<think>` block, then ends with a bare `</longcat_think>`. The `<think>`
+        // opener is a different family and must NOT gate the `</longcat_think>` missing-open
+        // close, else the whole longcat reasoning prefix leaks.
+        let input = "secret <think>inner</think> more </longcat_think>\n<tool_call>{\"name\":\"f\"}</tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret")
+                && !out.contains("inner")
+                && !out.contains("more")
+                && !out.contains("longcat_think"),
+            "the whole longcat missing-open prefix (incl. nested think) must be stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("final"),
+            "the content tool call and trailing content survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_strip_reasoning_missing_open_think_close_after_longcat_block() {
+        // Symmetric to the above: a `<think>` missing-open prefix containing a nested paired
+        // `<longcat_think>` block, ended by a bare `</think>`.
+        let input = "secret <longcat_think>inner</longcat_think> more </think>\n<tool_call>{\"name\":\"f\"}</tool_call> final";
+        let out = strip_reasoning_preserving_tools(input);
+        assert!(
+            !out.contains("secret")
+                && !out.contains("inner")
+                && !out.contains("more")
+                && !out.contains("<think>")
+                && !out.contains("</think>"),
+            "the whole think missing-open prefix (incl. nested longcat) must be stripped: {out:?}"
+        );
+        assert!(
+            out.contains("<tool_call>") && out.contains("\"f\"") && out.contains("final"),
             "the content tool call and trailing content survive: {out:?}"
         );
     }
