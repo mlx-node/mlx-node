@@ -155,7 +155,10 @@ export function PostTrainingChapterBody() {
           optimizes the preference directly, skipping the reward model. Either way the objective is no longer plain
           next-token cross-entropy — this is the one stage that genuinely departs from the loss you've seen.
         </p>
-        <p>Pick which response a human prefers and apply the update a few times to see what "training on a preference" does:</p>
+        <p>
+          Pick which response a human prefers and apply the update a few times to see what "training on a preference"
+          does:
+        </p>
         <PreferencePair />
 
         <h2>Chat templates: how turns are wired</h2>

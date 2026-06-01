@@ -254,10 +254,9 @@ export function AttentionChapterBody() {
           So before the softmax we set the upper-triangle of <code>QKᵀ</code> to <code>-∞</code> (equivalently, add a
           mask matrix that's <code>0</code> on and below the diagonal and <code>-∞</code> above, then softmax each row).
           After softmax those cells become exactly <code>0</code> — token <em>i</em> can only attend to keys{' '}
-          <em>0 … i</em>. The heatmap on
-          the right is <strong>lower-triangular</strong> for exactly this reason. The bottom row — the last token of the
-          prompt — is the only row that sees the whole prompt, which is why <em>that</em> row produces the next-token
-          prediction.
+          <em>0 … i</em>. The heatmap on the right is <strong>lower-triangular</strong> for exactly this reason. The
+          bottom row — the last token of the prompt — is the only row that sees the whole prompt, which is why{' '}
+          <em>that</em> row produces the next-token prediction.
         </p>
         <p>
           The toggle widget below makes this concrete: flip the mask off, and watch the model's attention for the very

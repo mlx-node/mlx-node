@@ -555,8 +555,8 @@ export function EmbeddingsChapterBody() {
         </p>
         <p>
           "Nearby" here means <em>pointing the same way</em>, not "a short ruler-distance apart". Before we project real
-          1024-dim vectors down to a picture, build the core intuition in a flat 2-D toy you can grab: meaning lives in a
-          vector&apos;s <em>direction</em>, and the <em>angle</em> between two vectors measures how related they are.
+          1024-dim vectors down to a picture, build the core intuition in a flat 2-D toy you can grab: meaning lives in
+          a vector&apos;s <em>direction</em>, and the <em>angle</em> between two vectors measures how related they are.
         </p>
 
         <VectorCosine />
@@ -635,8 +635,8 @@ export function EmbeddingsChapterBody() {
         <p>
           One caveat governs everything you see in the scatter: it projects 1024-dim vectors onto just two axes, so it
           throws away 1022 dimensions of structure. Two points that look close on screen might be far apart in the real
-          space, and vice versa. The colour groups still cluster (the dominant axes of variance often pick those up), but
-          the <em>distances</em> lie — so never read similarity off the picture. That is exactly why the
+          space, and vice versa. The colour groups still cluster (the dominant axes of variance often pick those up),
+          but the <em>distances</em> lie — so never read similarity off the picture. That is exactly why the
           nearest-neighbour browser computes cosine similarity in the full 1024-dim space, not the projected 2D
           coordinates. Treat the scatter as a navigation aid for finding clusters, not a ruler.
         </p>
@@ -644,8 +644,8 @@ export function EmbeddingsChapterBody() {
         <h2>Cosine similarity, side by side</h2>
         <p>
           The panel below skips the projection entirely: each pair&apos;s cosine similarity is measured in the
-          model&apos;s full 1024-dim embedding space and shown as a bar. The ordering teaches the lesson — identical &gt;
-          synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
+          model&apos;s full 1024-dim embedding space and shown as a bar. The ordering teaches the lesson — identical
+          &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
         </p>
 
         <CosineSimilarityTool />

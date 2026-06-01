@@ -164,9 +164,9 @@ export function LmHeadChapterBody() {
           The animation walks the matmul cell by cell. The scan beam highlights one output column at a time, with the
           matrix column that produces it lit up beside it. Every output entry is one independent inner product — which
           is also why this op parallelizes so cleanly on a GPU. Note the animation draws the <em>transposed</em> matrix{' '}
-          <code>embed_tokens.weight.T = [d, V]</code>, so token <code>j</code>'s fingerprint is a <strong>column</strong>{' '}
-          there — the same vector as <strong>row j</strong> of <code>W_lm = [V, d]</code> discussed below (a row of a
-          matrix is a column of its transpose).
+          <code>embed_tokens.weight.T = [d, V]</code>, so token <code>j</code>'s fingerprint is a{' '}
+          <strong>column</strong> there — the same vector as <strong>row j</strong> of <code>W_lm = [V, d]</code>{' '}
+          discussed below (a row of a matrix is a column of its transpose).
         </p>
 
         <LmHeadWalkthrough />

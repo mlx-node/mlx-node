@@ -280,9 +280,12 @@ export function KvCacheChapterBody() {
           <code>seq_len</code> KV cache. The other {NUM_LINEAR_LAYERS} layers use a{' '}
           <strong>linear attention variant called GatedDeltaNet</strong>. Instead of caching K and V per token, a
           GatedDeltaNet layer compresses the entire history into a <em>fixed-size recurrent state</em> of shape{' '}
-          <code>[{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]</code> (linear value-heads × value-dim ×
-          key-dim — distinct from the {NUM_HEADS} full-attention heads of head-dim {HEAD_DIM}). The state is rolled
-          forward at each step the way an RNN's hidden state is — independent of how many tokens have streamed by.
+          <code>
+            [{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]
+          </code>{' '}
+          (linear value-heads × value-dim × key-dim — distinct from the {NUM_HEADS} full-attention heads of head-dim{' '}
+          {HEAD_DIM}). The state is rolled forward at each step the way an RNN's hidden state is — independent of how
+          many tokens have streamed by.
         </p>
         <p>
           With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state

@@ -1,6 +1,5 @@
-import * as React from 'react';
-
 import { cn } from '@/lib/utils';
+import * as React from 'react';
 
 /**
  * Chapter 2 supplement — the GEOMETRY behind cosine similarity.
@@ -178,7 +177,7 @@ export function VectorCosine() {
     const [sx, sy] = toPx(Math.cos(a0) * r, Math.sin(a0) * r);
     const [ex, ey] = toPx(Math.cos(a1) * r, Math.sin(a1) * r);
     // Walk the SHORT way around so the arc matches the reported θ.
-    let delta = ((a1 - a0) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI);
+    let delta = (((a1 - a0) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
     if (delta > Math.PI) delta -= 2 * Math.PI;
     const sweep = delta >= 0 ? 1 : 0;
     const largeArc = 0; // θ ≤ 180 by construction
@@ -194,7 +193,9 @@ export function VectorCosine() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">Direction = meaning, angle = similarity</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">
+          Direction = meaning, angle = similarity
+        </div>
         <div className="text-[11px] text-muted-foreground">Drag the teal arrow, or use the sliders</div>
       </div>
 
@@ -238,14 +239,38 @@ export function VectorCosine() {
                 <path d="M 0 0 L 10 5 L 0 10 Z" fill={w.color} />
               </marker>
             ))}
-            <marker id="vc-head-probe" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+            <marker
+              id="vc-head-probe"
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="6.5"
+              markerHeight="6.5"
+              orient="auto"
+            >
               <path d="M 0 0 L 10 5 L 0 10 Z" fill={PROBE_COLOR} />
             </marker>
           </defs>
 
           {/* Axes through the origin. */}
-          <line x1={0} y1={CENTER} x2={SIZE} y2={CENTER} stroke="currentColor" strokeOpacity={0.1} strokeDasharray="2 4" />
-          <line x1={CENTER} y1={0} x2={CENTER} y2={SIZE} stroke="currentColor" strokeOpacity={0.1} strokeDasharray="2 4" />
+          <line
+            x1={0}
+            y1={CENTER}
+            x2={SIZE}
+            y2={CENTER}
+            stroke="currentColor"
+            strokeOpacity={0.1}
+            strokeDasharray="2 4"
+          />
+          <line
+            x1={CENTER}
+            y1={0}
+            x2={CENTER}
+            y2={SIZE}
+            stroke="currentColor"
+            strokeOpacity={0.1}
+            strokeDasharray="2 4"
+          />
           <circle cx={ringCx} cy={ringCy} r={2.5} fill="currentColor" fillOpacity={0.4} />
 
           {/* Angle arc between the probe and the compared word — drawn first so
@@ -308,10 +333,16 @@ export function VectorCosine() {
                     aria-pressed={active}
                     className={cn(
                       'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-xs',
-                      active ? 'border-foreground/30 bg-background' : 'border-border/60 bg-muted/40 text-muted-foreground',
+                      active
+                        ? 'border-foreground/30 bg-background'
+                        : 'border-border/60 bg-muted/40 text-muted-foreground',
                     )}
                   >
-                    <span aria-hidden="true" className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: w.color }} />
+                    <span
+                      aria-hidden="true"
+                      className="inline-block h-2.5 w-2.5 rounded-full"
+                      style={{ backgroundColor: w.color }}
+                    />
                     {w.label}
                   </button>
                 );
@@ -352,8 +383,8 @@ export function VectorCosine() {
               aria-valuetext={`probe length ${probeLen.toFixed(2)}`}
             />
             <p className="text-[11px] text-muted-foreground">
-              Slide the length and watch <span className="font-mono">cos θ</span> below stay put — magnitude doesn’t change
-              the angle.
+              Slide the length and watch <span className="font-mono">cos θ</span> below stay put — magnitude doesn’t
+              change the angle.
             </p>
           </div>
 
@@ -390,8 +421,8 @@ export function VectorCosine() {
         Swing the probe to line up with <span className="font-mono">{compare.label}</span> →{' '}
         <span className="font-mono">cos θ → 1</span> (“related”). Turn it to a right angle →{' '}
         <span className="font-mono">cos θ → 0</span> (“unrelated”). Point it the opposite way →{' '}
-        <span className="font-mono">cos θ → −1</span> (“contrary”). The length never enters the cosine — which is exactly
-        why embedding similarity uses the <strong>angle</strong>, not straight-line (Euclidean) distance.
+        <span className="font-mono">cos θ → −1</span> (“contrary”). The length never enters the cosine — which is
+        exactly why embedding similarity uses the <strong>angle</strong>, not straight-line (Euclidean) distance.
       </p>
 
       <p className="text-[10px] text-muted-foreground">

@@ -174,10 +174,10 @@ export function TokenizationChapterBody() {
           adjacent pair into a new symbol until the vocabulary is the size you want. Common words like <code>the</code>{' '}
           end up as a single token; rarer words like <code>Antidisestablishmentarianism</code> decompose into shorter
           familiar pieces. The tokenizer doesn't know what a word means — it only knows what byte sequences are
-          statistically frequent in the training corpus. Because that base alphabet is the 256 possible byte values,
-          the tokenizer can represent literally <em>any</em> input — any Unicode character, emoji, or script, even ones
-          it never saw in training — so there is no "unknown" or out-of-vocabulary token; unfamiliar text just breaks
-          into more, smaller (byte) tokens.
+          statistically frequent in the training corpus. Because that base alphabet is the 256 possible byte values, the
+          tokenizer can represent literally <em>any</em> input — any Unicode character, emoji, or script, even ones it
+          never saw in training — so there is no "unknown" or out-of-vocabulary token; unfamiliar text just breaks into
+          more, smaller (byte) tokens.
         </p>
 
         <h2>What Qwen3.5 does specifically</h2>

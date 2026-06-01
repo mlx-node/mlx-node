@@ -1,6 +1,5 @@
-import * as React from 'react';
-
 import { cn } from '@/lib/utils';
+import * as React from 'react';
 
 /**
  * Chapter 12 (KV cache & hybrid attention) supplement — the MECHANISM at the
@@ -154,9 +153,7 @@ export function RunningStateVsCache() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Appending vs. updating in place
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Appending vs. updating in place</div>
         <div className="text-[11px] text-muted-foreground">
           Same token stream, two memories: <span className="font-mono">cache grows</span> vs.{' '}
           <span className="font-mono">S ← decay·S + u</span>
@@ -256,14 +253,10 @@ export function RunningStateVsCache() {
                     key={`kv-${i}`}
                     className={cn(
                       'flex w-[56px] flex-col items-center rounded border px-1 py-1 text-center',
-                      isNewest
-                        ? 'border-amber-500/70 bg-amber-500/20'
-                        : 'border-border/60 bg-background',
+                      isNewest ? 'border-amber-500/70 bg-amber-500/20' : 'border-border/60 bg-background',
                     )}
                   >
-                    <span className="font-mono text-[10px] leading-tight text-foreground/90">
-                      {t.text.trim()}
-                    </span>
+                    <span className="font-mono text-[10px] leading-tight text-foreground/90">{t.text.trim()}</span>
                     <span className="font-mono text-[9px] text-muted-foreground">
                       K,V<sub>{i + 1}</sub>
                     </span>
@@ -293,40 +286,39 @@ export function RunningStateVsCache() {
                 multiplies. The stacked fill shows each past token's decayed
                 share u_i · decay^age, so older tokens visibly fade. */}
             <div className="flex items-baseline justify-between">
-              <span className="font-mono text-[11px] text-foreground/85">
-                S = {S.toFixed(2)}
-              </span>
+              <span className="font-mono text-[11px] text-foreground/85">S = {S.toFixed(2)}</span>
               <span className="text-[10px] text-muted-foreground">one fixed slot</span>
             </div>
-            <div className="flex h-12 w-full overflow-hidden rounded border border-violet-500/70 bg-muted/30" aria-hidden="true">
-              {fed === 0 ? null : (
-                shares.map((share, i) => {
-                  const frac = S > 0 ? share / S : 0;
-                  const age = fed - (i + 1);
-                  const isNewest = i === fed - 1;
-                  // Older contributions fade toward the background; the freshest
-                  // sits at full strength. decay^age also literally scales width
-                  // (via share), so old tokens get both narrower and dimmer.
-                  const opacity = 0.3 + 0.7 * decay ** age;
-                  return (
-                    <div
-                      key={`share-${i}`}
-                      className={cn('h-full', isNewest && 'ring-1 ring-inset ring-violet-200/80')}
-                      style={{
-                        width: `${(frac * 100).toFixed(2)}%`,
-                        backgroundColor: 'var(--color-violet-500, #8b5cf6)',
-                        opacity,
-                      }}
-                      title={`${STREAM[i]?.text.trim()}: ${(frac * 100).toFixed(0)}% of S (decay^${age})`}
-                    />
-                  );
-                })
-              )}
+            <div
+              className="flex h-12 w-full overflow-hidden rounded border border-violet-500/70 bg-muted/30"
+              aria-hidden="true"
+            >
+              {fed === 0
+                ? null
+                : shares.map((share, i) => {
+                    const frac = S > 0 ? share / S : 0;
+                    const age = fed - (i + 1);
+                    const isNewest = i === fed - 1;
+                    // Older contributions fade toward the background; the freshest
+                    // sits at full strength. decay^age also literally scales width
+                    // (via share), so old tokens get both narrower and dimmer.
+                    const opacity = 0.3 + 0.7 * decay ** age;
+                    return (
+                      <div
+                        key={`share-${i}`}
+                        className={cn('h-full', isNewest && 'ring-1 ring-inset ring-violet-200/80')}
+                        style={{
+                          width: `${(frac * 100).toFixed(2)}%`,
+                          backgroundColor: 'var(--color-violet-500, #8b5cf6)',
+                          opacity,
+                        }}
+                        title={`${STREAM[i]?.text.trim()}: ${(frac * 100).toFixed(0)}% of S (decay^${age})`}
+                      />
+                    );
+                  })}
             </div>
             <div className="text-[10px] text-muted-foreground">
-              {fed === 0
-                ? 'one slot, currently zero'
-                : 'newest token brightest, older contributions fade as decayᵃᵍᵉ'}
+              {fed === 0 ? 'one slot, currently zero' : 'newest token brightest, older contributions fade as decayᵃᵍᵉ'}
             </div>
           </div>
 
@@ -406,10 +398,9 @@ export function RunningStateVsCache() {
       <p className="text-[10px] text-muted-foreground">
         Illustrative — a scalar cartoon. GatedDeltaNet&apos;s real state is a matrix per head — shape{' '}
         <span className="font-mono">[16, 128, 128]</span> (value-heads × value-dim × key-dim) for the 0.8B model — and
-        its real update is a gated <em>delta rule</em>,{' '}
-        <span className="font-mono">S ← g·S + β·(v − (g·S)·k)·kᵀ</span>: it decays the old state by{' '}
-        <span className="font-mono">g</span> and writes a β-weighted <em>correction</em> toward the new value, not a
-        plain outer product. But the fixed-size-vs-growing contrast is exactly right.
+        its real update is a gated <em>delta rule</em>, <span className="font-mono">S ← g·S + β·(v − (g·S)·k)·kᵀ</span>:
+        it decays the old state by <span className="font-mono">g</span> and writes a β-weighted <em>correction</em>{' '}
+        toward the new value, not a plain outer product. But the fixed-size-vs-growing contrast is exactly right.
       </p>
     </div>
   );

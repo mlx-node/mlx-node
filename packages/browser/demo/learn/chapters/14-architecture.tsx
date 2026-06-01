@@ -309,8 +309,8 @@ export function ArchitectureChapterBody() {
             <div className="mt-3 space-y-2 text-[13px] leading-relaxed text-foreground/80">
               <p>
                 This is what the teal Gated DeltaNet boxes in the poster above mean, unpacked. You can skip it — the 3:1
-                bargain above is the whole story for using the model. But here is what actually happens inside one of the{' '}
-                {NUM_LINEAR} linear layers:
+                bargain above is the whole story for using the model. But here is what actually happens inside one of
+                the {NUM_LINEAR} linear layers:
               </p>
               <ul className="list-disc space-y-1.5 pl-5">
                 <li>
@@ -334,8 +334,8 @@ export function ArchitectureChapterBody() {
                   <em>constant regardless of context length</em>.
                 </li>
                 <li>
-                  <strong>Finish.</strong> A z-gated RMSNorm and an out-projection return the result to the{' '}
-                  {HIDDEN_DIM}-dim residual stream.
+                  <strong>Finish.</strong> A z-gated RMSNorm and an out-projection return the result to the {HIDDEN_DIM}
+                  -dim residual stream.
                 </li>
               </ul>
               <p>

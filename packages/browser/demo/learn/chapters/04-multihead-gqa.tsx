@@ -230,8 +230,8 @@ export function MultiheadGqaChapterBody() {
             hidden = {QWEN_HIDDEN_DIM} → H · head_dim = {QWEN_NUM_HEADS} · {QWEN_HEAD_DIM} ={' '}
             {QWEN_NUM_HEADS * QWEN_HEAD_DIM}
           </code>
-          , not a square <code>d × d</code> matrix. (In Qwen3.5 the full <code>q_proj</code> weight is actually twice
-          as wide — <code>{2 * QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> outputs — because it also emits a per-head{' '}
+          , not a square <code>d × d</code> matrix. (In Qwen3.5 the full <code>q_proj</code> weight is actually twice as
+          wide — <code>{2 * QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> outputs — because it also emits a per-head{' '}
           <em>output gate</em> next to the queries, as the pipeline diagram above shows; the{' '}
           <code>{QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> above is the query half.)
         </p>

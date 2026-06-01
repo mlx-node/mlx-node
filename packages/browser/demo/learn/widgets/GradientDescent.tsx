@@ -1,6 +1,5 @@
-import * as React from 'react';
-
 import { cn } from '@/lib/utils';
+import * as React from 'react';
 
 /**
  * Chapter 13 (Training) supplement — gradient descent on ONE weight.
@@ -224,9 +223,7 @@ export function GradientDescent() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Gradient descent on one weight
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Gradient descent on one weight</div>
         <div className="text-[11px] text-muted-foreground">
           Step downhill: <span className="font-mono">w ← w − lr·L&apos;(w)</span>
         </div>
@@ -255,14 +252,7 @@ export function GradientDescent() {
           </defs>
 
           {/* axes */}
-          <line
-            x1={PAD_L}
-            y1={H - PAD_B}
-            x2={W - PAD_R}
-            y2={H - PAD_B}
-            stroke="currentColor"
-            strokeOpacity={0.4}
-          />
+          <line x1={PAD_L} y1={H - PAD_B} x2={W - PAD_R} y2={H - PAD_B} stroke="currentColor" strokeOpacity={0.4} />
           <line x1={PAD_L} y1={PAD_T} x2={PAD_L} y2={H - PAD_B} stroke="currentColor" strokeOpacity={0.4} />
 
           {/* x ticks: w = −5 … 5 */}
@@ -300,7 +290,14 @@ export function GradientDescent() {
           </text>
 
           {/* y axis label (loss) */}
-          <text x={PAD_L - 6} y={PAD_T + PLOT_H + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
+          <text
+            x={PAD_L - 6}
+            y={PAD_T + PLOT_H + 3}
+            fontSize={9}
+            textAnchor="end"
+            fill="currentColor"
+            fillOpacity={0.55}
+          >
             0
           </text>
           <text x={PAD_L - 6} y={PAD_T + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
@@ -407,7 +404,9 @@ export function GradientDescent() {
             <div className="flex justify-between font-mono text-[10px] text-muted-foreground">
               <span>0</span>
               <span title="lands on the minimum in one step">{LR_CRITICAL.toFixed(1)} (1-step)</span>
-              <span title="at lr = 2 the weight oscillates forever; past it the weight diverges">{LR_DIVERGE.toFixed(1)} (oscillate)</span>
+              <span title="at lr = 2 the weight oscillates forever; past it the weight diverges">
+                {LR_DIVERGE.toFixed(1)} (oscillate)
+              </span>
             </div>
           </div>
 
@@ -497,8 +496,8 @@ export function GradientDescent() {
           pink arrow
         </span>
         ) moves <span className="font-mono">w</span> the opposite way, downhill. A <strong>tiny</strong>{' '}
-        <span className="font-mono">lr</span> barely moves and crawls; a <strong>good</strong> one drops to the bottom in
-        a few steps; push <span className="font-mono">lr</span> past{' '}
+        <span className="font-mono">lr</span> barely moves and crawls; a <strong>good</strong> one drops to the bottom
+        in a few steps; push <span className="font-mono">lr</span> past{' '}
         <span className="font-mono">{LR_DIVERGE.toFixed(1)}</span> and each step{' '}
         <strong>overshoots farther than the last</strong> — the weight bounces out of the bowl and the loss explodes.
       </p>

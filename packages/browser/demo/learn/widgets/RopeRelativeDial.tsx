@@ -1,6 +1,5 @@
-import * as React from 'react';
-
 import { cn } from '@/lib/utils';
+import * as React from 'react';
 
 /**
  * Chapter 6 supplement — RoPE's RELATIVE-POSITION property, made tangible.
@@ -211,22 +210,62 @@ export function RopeRelativeDial() {
           className="mx-auto block h-auto w-full max-w-[320px] rounded-md bg-muted/20"
         >
           <defs>
-            <marker id="rrd-head-q" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+            <marker
+              id="rrd-head-q"
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="6.5"
+              markerHeight="6.5"
+              orient="auto"
+            >
               <path d="M 0 0 L 10 5 L 0 10 Z" fill={Q_COLOR} />
             </marker>
-            <marker id="rrd-head-k" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+            <marker
+              id="rrd-head-k"
+              viewBox="0 0 10 10"
+              refX="8"
+              refY="5"
+              markerWidth="6.5"
+              markerHeight="6.5"
+              orient="auto"
+            >
               <path d="M 0 0 L 10 5 L 0 10 Z" fill={K_COLOR} />
             </marker>
           </defs>
 
           {/* Unit circle + axes through the origin. */}
           <circle cx={ringCx} cy={ringCy} r={R} fill="none" stroke="currentColor" strokeOpacity={0.2} />
-          <line x1={0} y1={CENTER} x2={SIZE} y2={CENTER} stroke="currentColor" strokeOpacity={0.1} strokeDasharray="2 4" />
-          <line x1={CENTER} y1={0} x2={CENTER} y2={SIZE} stroke="currentColor" strokeOpacity={0.1} strokeDasharray="2 4" />
+          <line
+            x1={0}
+            y1={CENTER}
+            x2={SIZE}
+            y2={CENTER}
+            stroke="currentColor"
+            strokeOpacity={0.1}
+            strokeDasharray="2 4"
+          />
+          <line
+            x1={CENTER}
+            y1={0}
+            x2={CENTER}
+            y2={SIZE}
+            stroke="currentColor"
+            strokeOpacity={0.1}
+            strokeDasharray="2 4"
+          />
 
           {/* Shared base unit vector (position 0) — the common origin of both
               rotations, so the gap between the arrows is purely Δ·ω. */}
-          <circle cx={baseTx} cy={baseTy} r={2.6} fill="none" stroke="currentColor" strokeOpacity={0.45} strokeWidth={1} />
+          <circle
+            cx={baseTx}
+            cy={baseTy}
+            r={2.6}
+            fill="none"
+            stroke="currentColor"
+            strokeOpacity={0.45}
+            strokeWidth={1}
+          />
           <text x={baseTx + 6} y={baseTy + 12} fontSize="9" className="select-none fill-foreground/45">
             base (pos 0)
           </text>
@@ -349,20 +388,19 @@ export function RopeRelativeDial() {
       <p className="text-[12px] text-foreground/85">
         Both arrows start from the same base vector; RoPE turns the query by <span className="font-mono">m·ω</span> and
         the key by <span className="font-mono">n·ω</span>, so the query&apos;s relative rotation is exactly{' '}
-        <span className="font-mono">Δ·ω = (m − n)·ω</span> and{' '}
-        <span className="font-mono">q·k = cos((m − n)·ω)</span>. Increase <span className="font-mono">m</span> and{' '}
-        <span className="font-mono">n</span> together and the whole picture rotates, but the gap — and the score —
-        stays frozen. Move just one and the gap opens or closes: align them (<span className="font-mono">Δ → 0</span>)
-        and <span className="font-mono">q·k → 1</span>.
+        <span className="font-mono">Δ·ω = (m − n)·ω</span> and <span className="font-mono">q·k = cos((m − n)·ω)</span>.
+        Increase <span className="font-mono">m</span> and <span className="font-mono">n</span> together and the whole
+        picture rotates, but the gap — and the score — stays frozen. Move just one and the gap opens or closes: align
+        them (<span className="font-mono">Δ → 0</span>) and <span className="font-mono">q·k → 1</span>.
       </p>
 
       <p className="text-[10px] text-muted-foreground">
         Illustrative — this uses ONE representative frequency (<span className="font-mono">ω = {OMEGA}</span> rad/token)
         and simplifies the content vectors to a shared base so we isolate the positional part. As positions grow the
-        relative rotation <span className="font-mono">Δ·ω</span> can exceed a full turn, but because cosine repeats every
-        turn the score still depends only on the offset <span className="font-mono">Δ</span>. The real model combines
-        this with the actual query and key content across many frequency pairs at many different speeds (see the
-        frequency spectrum below).
+        relative rotation <span className="font-mono">Δ·ω</span> can exceed a full turn, but because cosine repeats
+        every turn the score still depends only on the offset <span className="font-mono">Δ</span>. The real model
+        combines this with the actual query and key content across many frequency pairs at many different speeds (see
+        the frequency spectrum below).
       </p>
     </div>
   );
