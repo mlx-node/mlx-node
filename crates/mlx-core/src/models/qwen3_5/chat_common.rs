@@ -568,21 +568,50 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
 /// finalize callers virtually always have a `think_end_id`, so this path is only
 /// reached for models whose vocab lacks the close token.
 fn strip_reasoning_span_text_level(text: &str) -> String {
-    // Paired block anywhere: <think>…</think> (or longcat).
-    for (open, close) in [
-        ("<think>", "</think>"),
-        ("<longcat_think>", "</longcat_think>"),
-    ] {
-        if let Some(open_pos) = text.find(open)
-            && let Some(rel_close) = text[open_pos + open.len()..].find(close)
-        {
-            let close_end = open_pos + open.len() + rel_close + close.len();
-            let mut out = String::with_capacity(text.len());
-            out.push_str(&text[..open_pos]);
-            out.push_str(&text[close_end..]);
-            return out;
+    // Remove ALL paired reasoning blocks anywhere in the text, mirroring
+    // `tools::strip_tag_blocks`/`parse_thinking` (which strip every block, not
+    // just the first). A single leftover `<think>…</think>` here would leak the
+    // chain-of-thought into `raw_text` even though the parsed `thinking` field is
+    // fully suppressed. Each scan finds the earliest next pair of EITHER tag type
+    // and removes it, appending the gap text verbatim (no trimming — raw_text
+    // stays raw).
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut found_any = false;
+    loop {
+        // Find the earliest opening tag of either reasoning variant at/after cursor.
+        let mut next: Option<(usize, &str, &str)> = None; // (open_pos, open, close)
+        for (open, close) in [
+            ("<think>", "</think>"),
+            ("<longcat_think>", "</longcat_think>"),
+        ] {
+            if let Some(rel) = text[cursor..].find(open) {
+                let open_pos = cursor + rel;
+                let earlier = next.map(|(p, _, _)| open_pos < p).unwrap_or(true);
+                if earlier {
+                    next = Some((open_pos, open, close));
+                }
+            }
         }
+        let Some((open_pos, open, close)) = next else {
+            break;
+        };
+        let content_start = open_pos + open.len();
+        let Some(rel_close) = text[content_start..].find(close) else {
+            // Unterminated opening tag: no more paired blocks to strip.
+            break;
+        };
+        let close_end = content_start + rel_close + close.len();
+        // Append the gap before this block verbatim, then skip the block.
+        out.push_str(&text[cursor..open_pos]);
+        cursor = close_end;
+        found_any = true;
     }
+    if found_any {
+        out.push_str(&text[cursor..]);
+        return out;
+    }
+    // No paired block: fall through to the missing-opening-tag branch.
     // Missing opening tag (template injected <think> into the prompt): strip up to
     // and including the first </think> that is followed by newline / end-of-text.
     for close_tag in ["</think>", "</longcat_think>"] {
@@ -1476,6 +1505,39 @@ mod tests {
         assert_eq!(out, "\nABC", "text-level fallback strips reasoning span");
         assert!(!out.contains("<think>"));
         assert!(!out.contains("</think>"));
+    }
+
+    #[test]
+    fn test_strip_reasoning_span_multi_block() {
+        // Text-level fallback (think_end_id == None && think_end_str == None)
+        // must strip ALL paired <think>…</think> blocks, not just the first.
+        // A single leftover block would leak chain-of-thought into raw_text even
+        // though the parsed `thinking` field is fully suppressed.
+        let text = "<think>a</think>\nmid\n<think>b</think>\nanswer";
+        let out = raw_text_with_reasoning_suppressed(
+            text,
+            &[101u32, 102, 103], // no think_end_id present (forces fallback anyway)
+            true,                // thinking_enabled
+            None,                // think_end_id → text-level fallback
+            None,                // think_end_str
+            false,               // include_reasoning
+        );
+        assert!(
+            !out.contains("<think>"),
+            "no opening think tag may remain: {out:?}"
+        );
+        assert!(
+            !out.contains("</think>"),
+            "no closing think tag may remain: {out:?}"
+        );
+        assert!(
+            out.contains("mid"),
+            "non-reasoning content between blocks must survive: {out:?}"
+        );
+        assert!(
+            out.contains("answer"),
+            "trailing non-reasoning content must survive: {out:?}"
+        );
     }
 }
 

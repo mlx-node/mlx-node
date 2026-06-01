@@ -1080,9 +1080,38 @@ impl Qwen3Inner {
 
         // Decode text
         let generated_ids_vec: Vec<u32> = generated_tokens.clone();
-        let raw_text = tokenizer.decode_sync(&generated_ids_vec, true)?;
-
-        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+        let raw_text_full = tokenizer.decode_sync(&generated_ids_vec, true)?;
+        let include_reasoning = chat_common::resolve_include_reasoning(&config);
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str();
+        // Parse with reasoning INCLUDED so the reasoning-token count reflects the
+        // true thinking span, THEN apply the include_reasoning suppression
+        // contract to `thinking` and `raw_text` (matches finalize_chat_result /
+        // the streaming paths).
+        let (cleaned_text, tool_calls, thinking_full) = chat_common::parse_thinking_and_tools(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            true,
+        );
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking_full, &generated_tokens, think_end_id);
+        let thinking = if include_reasoning {
+            thinking_full
+        } else {
+            None
+        };
+        let raw_text = chat_common::raw_text_with_reasoning_suppressed(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            include_reasoning,
+        );
 
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
@@ -1113,9 +1142,6 @@ impl Qwen3Inner {
         } else {
             None
         };
-
-        let reasoning_tokens =
-            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
 
         Ok(ChatResult {
             text: cleaned_text,
@@ -1210,7 +1236,6 @@ impl Qwen3Inner {
         let max_ngram_repeats: i32 = gen_config.max_ngram_repeats.unwrap_or(3);
         let ngram_size: i32 = gen_config.ngram_size.unwrap_or(64);
         let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
-        let _ = config; // currently no per-call options consumed beyond gen_config
 
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),
@@ -1429,8 +1454,39 @@ impl Qwen3Inner {
         let gen_elapsed = gen_start.map(|s| s.elapsed());
 
         // Decode text + tool/thinking parsing (mirrors chat_sync_core).
-        let raw_text = tokenizer.decode_sync(&generated_tokens, true)?;
-        let (cleaned_text, tool_calls, thinking) = tools::parse_generation_output(&raw_text);
+        let raw_text_full = tokenizer.decode_sync(&generated_tokens, true)?;
+        let include_reasoning = chat_common::resolve_include_reasoning(&config);
+        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str();
+        // Parse with reasoning INCLUDED so the reasoning-token count reflects the
+        // true thinking span, THEN apply the include_reasoning suppression
+        // contract to `thinking` and `raw_text` (matches finalize_chat_result /
+        // the streaming paths).
+        let (cleaned_text, tool_calls, thinking_full) = chat_common::parse_thinking_and_tools(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            true,
+        );
+        let reasoning_tokens =
+            tools::count_reasoning_tokens(&thinking_full, &generated_tokens, think_end_id);
+        let thinking = if include_reasoning {
+            thinking_full
+        } else {
+            None
+        };
+        let raw_text = chat_common::raw_text_with_reasoning_suppressed(
+            &raw_text_full,
+            &generated_tokens,
+            thinking_enabled,
+            think_end_id,
+            think_end_str,
+            include_reasoning,
+        );
         let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
         } else {
@@ -1461,9 +1517,6 @@ impl Qwen3Inner {
         } else {
             None
         };
-
-        let reasoning_tokens =
-            tools::count_reasoning_tokens(&thinking, &generated_tokens, tokenizer.think_end_id());
 
         // generated_logprobs intentionally dropped here — the flat path
         // (chat_sync_core) also collects them but does not surface them
