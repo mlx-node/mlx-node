@@ -97,6 +97,55 @@ fn sanitize_weights(
         // Only standard layer/attention norms need the +1.0 shift for MTP checkpoints.
     ];
 
+    // MTP-norm robustness probe. The `mtp.*` bypass below keeps MTP norms in
+    // final (already +1.0-shifted) form, on the assumption that `mlx convert`
+    // applied that shift. A RAW (unconverted) HF checkpoint never went through
+    // convert, so its MTP norms are still in deviation-from-1 form (~0); loading
+    // it directly leaves them un-shifted → the draft head sees ~0 RMSNorm
+    // weights → garbage logits → 0 accepted tokens. Because `enableMtp`
+    // auto-defaults ON for any checkpoint with MTP heads, that turns into a
+    // silent *slowdown* (draft cost with no accepts). Replicate convert's
+    // independent MTP-norm probe (`convert.rs` `is_mtp_norm` /
+    // `mtp_norms_need_shift`): if the sampled MTP norm sits near 0, shift the
+    // seven MTP norm tensors by +1.0 at load. A converted checkpoint reads
+    // near 1 → no shift → byte-identical to today. Note `mtp.norm` and the two
+    // `pre_fc_norm_*` tensors match none of `norm_suffixes`, so they need this
+    // dedicated set.
+    let mtp_norm_suffixes = [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".pre_fc_norm_hidden.weight",
+        ".pre_fc_norm_embedding.weight",
+    ];
+    let is_mtp_norm = |k: &str| {
+        k.starts_with("mtp.")
+            && (k == "mtp.norm.weight" || mtp_norm_suffixes.iter().any(|s| k.ends_with(s)))
+    };
+    let mtp_norms_need_shift = match params
+        .iter()
+        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
+    {
+        Some((_, v)) => {
+            let f32_v = v.astype(DType::Float32)?;
+            let m = f32_v.mean(None, None)?;
+            m.eval();
+            let mean = m.item_at_float32(0).unwrap_or(1.0);
+            let need = mean < 0.5;
+            if need {
+                warn!(
+                    "Qwen3.5-MoE: raw (unconverted) MTP norms detected (mean={:.4} ≈ 0); \
+                     applying +1.0 shift at load so the MTP draft head functions. \
+                     Prefer running `mlx convert` on the checkpoint.",
+                    mean
+                );
+            }
+            need
+        }
+        None => false,
+    };
+
     for (name, array) in params.drain() {
         if name.contains("model.visual") || name.contains("visual_encoder") {
             continue;
@@ -136,22 +185,42 @@ fn sanitize_weights(
         // MTP layers reuse the main DecoderLayer architecture which includes
         // conv1d.
         //
-        // KNOWN LIMITATION (2026-06): this normalization unblocks *loading* the
-        // compiled MoE-MTP draft path (and the eager `mtp.apply_weights`, which
-        // also reads `switch_mlp.*`). It does NOT make MoE-MTP *functional*. The
-        // compiled draft head (`mlx_qwen35_moe_mtp_compiled.cpp`) — never executed
-        // before this fix — currently drafts 0 accepted tokens even on maximally-
-        // predictable prompts: the draft INPUTS are valid (verified: prev_hidden
-        // sumabs ~3000 / sane shape / advancing offsets, valid prev_emb), but the
-        // draft HEAD computation produces wrong logits, so MoE-MTP falls back to
-        // byte-correct AR output with no speedup. Separately, the WIP single-kernel
-        // GDN tape-replay rollback on the MoE path is ~12x slower than per-cycle
-        // rewind. Both are tracked as follow-ups; MTP ships dense-only today.
+        // MoE-MTP IS functional once the MTP norms are in final (+1.0-shifted)
+        // form: on a `mlx convert`-ed checkpoint the compiled draft head drafts
+        // ~2-2.25 tokens/cycle and is a ~1.25x win at the default depth 1 (proven
+        // 2026-06-01, byte-identical to AR). The earlier "0-accept draft-head bug"
+        // was REFUTED — it was a raw-checkpoint artifact: the loader shifts MAIN
+        // norms by +1.0 (HF stores RMSNorm weights in deviation-from-1 form) but
+        // this `mtp.*` bypass keeps them as-is, assuming convert already shifted
+        // them. A raw (unconverted) checkpoint therefore loaded its MTP norms
+        // un-shifted (≈0) → corrupted RMSNorm → garbage draft logits → 0 accept.
+        // The `mtp_norms_need_shift` branch below closes that gap: when the probe
+        // detects raw MTP norms it applies the same +1.0 shift convert would have,
+        // so a raw checkpoint now drafts correctly instead of silently slowing
+        // down. (Converted checkpoints are already ≈1 → probe is false → no shift
+        // → byte-identical, zero regression.)
+        //
+        // MTP still ships dense-only (qwen3.6-27b) for a PERF reason, not a
+        // correctness one: the per-cycle 256-expert MoE verify is costly enough
+        // relative to a single-token AR step that MoE has a structurally worse
+        // speculative-decode ratio than dense. The WIP single-kernel GDN
+        // tape-replay rollback on the MoE path is also ~12x slower than per-cycle
+        // rewind. Both are tracked as follow-ups.
         if name.starts_with("mtp.") && !name.contains(".mlp.experts.") {
             let array = if name.contains("conv1d.weight") {
                 let shape = array.shape()?;
                 if shape.len() == 3 && shape[2] != 1 {
                     array.transpose(Some(&[0, 2, 1]))?
+                } else {
+                    array
+                }
+            } else if mtp_norms_need_shift && is_mtp_norm(&name) {
+                // Raw-checkpoint MTP norm: apply the +1.0 shift convert would
+                // have applied (see the `mtp_norms_need_shift` probe above).
+                let ndim = array.ndim()?;
+                if ndim == 1 {
+                    let one = MxArray::scalar_float(1.0)?.astype(array.dtype()?)?;
+                    array.add(&one)?
                 } else {
                     array
                 }
