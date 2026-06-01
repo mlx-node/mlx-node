@@ -12,8 +12,9 @@ use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
-    extract_chat_params, finalize_chat_result, parse_thinking_and_tools, resolve_enable_thinking,
-    resolve_include_reasoning, send_stream_error,
+    default_thinking_budget_for_effort, extract_chat_params, finalize_chat_result,
+    parse_thinking_and_tools, resolve_enable_thinking, resolve_include_reasoning,
+    send_stream_error,
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -673,6 +674,7 @@ impl Lfm2Inner {
                 include_reasoning,
                 p,
                 enable_thinking,
+                config.reasoning_effort.clone(),
                 report_perf,
                 eos_token_id,
             );
@@ -737,9 +739,15 @@ impl Lfm2Inner {
         let prompt_token_count = tokens.len();
 
         // Reasoning tracker
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Prefill: process prompt tokens through chunked forward pass
         let token_arr: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
@@ -1161,7 +1169,8 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: crate::models::qwen3_5::chat_common::ChatParams,
-        enable_thinking: Option<bool>,
+        _enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
@@ -1175,9 +1184,15 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // === Adapter lifecycle: warm continuation OR cold start. ===
         // See `PagedKVCacheAdapter::finalize_turn_keep_live` for why the
@@ -1786,7 +1801,8 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: crate::models::qwen3_5::chat_common::ChatParams,
-        enable_thinking: Option<bool>,
+        _enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
         cb: &StreamSender,
@@ -1802,9 +1818,15 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -2213,6 +2235,7 @@ impl Lfm2Inner {
                 include_reasoning,
                 p,
                 enable_thinking,
+                config.reasoning_effort.clone(),
                 report_perf,
                 eos_token_id,
                 cb,
@@ -2258,9 +2281,15 @@ impl Lfm2Inner {
         let prompt_token_count = tokens.len();
 
         // Reasoning tracker
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -2563,9 +2592,14 @@ impl Lfm2Inner {
         let p = extract_chat_params(&config);
         let report_perf = p.report_performance;
         let max_new_tokens = p.max_new_tokens;
-        let enable_thinking = resolve_enable_thinking(&config);
         let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
 
         // Capture the full prior-cached length BEFORE appending the
         // delta so we can report it as `cached_tokens` on the returned
@@ -2603,7 +2637,7 @@ impl Lfm2Inner {
         let save_tokens = full_token_history.clone();
 
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Prefill: chunked forward pass of the delta on top of existing caches.
         let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
@@ -3060,9 +3094,14 @@ impl Lfm2Inner {
         let p = extract_chat_params(&config);
         let report_perf = p.report_performance;
         let max_new_tokens = p.max_new_tokens;
-        let enable_thinking = resolve_enable_thinking(&config);
         let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked AND
+        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
+        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
+        let effective_budget = p
+            .thinking_token_budget
+            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
 
         // Build full token history = cached_history + delta.
         // Capture `prior_cached_len` BEFORE the extend — this is the
@@ -3089,7 +3128,7 @@ impl Lfm2Inner {
         let save_tokens = full_token_history.clone();
 
         let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);

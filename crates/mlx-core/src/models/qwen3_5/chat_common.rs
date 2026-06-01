@@ -269,6 +269,16 @@ pub(crate) fn resolve_enable_thinking(config: &ChatConfig) -> Option<bool> {
     }
 }
 
+/// Default thinking-token budget for models whose chat template CANNOT suppress thinking
+/// (e.g. LFM2). None = unlimited. Qwen3.5 must NOT call this (its template honors enable_thinking).
+pub(crate) fn default_thinking_budget_for_effort(reasoning_effort: Option<&str>) -> Option<i32> {
+    match reasoning_effort {
+        Some("none") => Some(0),  // force </think> ASAP → minimal thinking
+        Some("low") => Some(256), // small cap; short reasoning still leaves room to answer
+        _ => None,                // medium/high/unset → unlimited (preserves current default)
+    }
+}
+
 /// Resolve `include_reasoning` from config, with `reasoning_effort: "none"` default.
 pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
     config
@@ -1136,6 +1146,19 @@ mod tests {
         assert!(tracker.observe_token(300)); // count→3, 3>=3 → force!
         assert!(tracker.should_force_think_end());
         assert_eq!(tracker.forced_token_id(), THINK_END_ID);
+    }
+
+    #[test]
+    fn test_default_thinking_budget_for_effort() {
+        // none → Some(0): force </think> ASAP (minimal thinking).
+        assert_eq!(default_thinking_budget_for_effort(Some("none")), Some(0));
+        // low → Some(256): small cap.
+        assert_eq!(default_thinking_budget_for_effort(Some("low")), Some(256));
+        // medium / high / unset / unknown → None (unlimited; preserves default).
+        assert_eq!(default_thinking_budget_for_effort(Some("medium")), None);
+        assert_eq!(default_thinking_budget_for_effort(Some("high")), None);
+        assert_eq!(default_thinking_budget_for_effort(None), None);
+        assert_eq!(default_thinking_budget_for_effort(Some("bogus")), None);
     }
 
     #[test]
