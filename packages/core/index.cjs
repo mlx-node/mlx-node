@@ -787,7 +787,6 @@ module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;
 module.exports.memoryStats = nativeBinding.memoryStats;
-module.exports.multi3Qmv4Microbench = nativeBinding.multi3Qmv4Microbench;
 module.exports.OutputFormat = nativeBinding.OutputFormat;
 module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;
