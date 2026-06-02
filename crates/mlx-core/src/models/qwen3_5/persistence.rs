@@ -258,13 +258,9 @@ fn sanitize_weights(
 
         // Strip prefixes (VL models use model.language_model.*, text-only use model.*).
         // After this, MTP keys land under `mtp.*`, e.g. `mtp.layers.0.input_layernorm.weight`.
-        let name = name
-            .strip_prefix("model.language_model.")
-            .or_else(|| name.strip_prefix("language_model.model."))
-            .or_else(|| name.strip_prefix("language_model."))
-            .or_else(|| name.strip_prefix("model."))
-            .unwrap_or(&name)
-            .to_string();
+        // Shared longest-first chain so raw VLM-wrapped `model.language_model.model.mtp.*`
+        // keys are not silently dropped — see `mtp_drafter::strip_wrapper_prefix`.
+        let name = crate::models::mtp_drafter::strip_wrapper_prefix(&name).to_string();
 
         // `mtp.*` keys bypass the lm_head/embed_tokens renames below and the
         // LM-body `will_shift` path. MTP norms instead get a separate,
@@ -384,12 +380,10 @@ fn sanitize_weights(
 }
 
 fn normalize_mtp_weight_key(name: &str) -> Option<String> {
-    let stripped = name
-        .strip_prefix("model.language_model.")
-        .or_else(|| name.strip_prefix("language_model.model."))
-        .or_else(|| name.strip_prefix("language_model."))
-        .or_else(|| name.strip_prefix("model."))
-        .unwrap_or(name);
+    // Shared longest-first chain (incl. `model.language_model.model.`) so raw
+    // VLM-wrapped triple-prefix `mtp.*` keys survive — see
+    // `mtp_drafter::strip_wrapper_prefix`.
+    let stripped = crate::models::mtp_drafter::strip_wrapper_prefix(name);
 
     stripped.starts_with("mtp.").then(|| stripped.to_string())
 }
@@ -2096,6 +2090,13 @@ mod tests {
         );
         assert_eq!(
             normalize_mtp_weight_key("model.language_model.mtp.fc.weight").as_deref(),
+            Some("mtp.fc.weight")
+        );
+        // Triple-wrap (raw, un-converted HF VLM checkpoint with inline MTP):
+        // the longest `model.language_model.model.` prefix must be stripped
+        // first so the key is NOT silently dropped.
+        assert_eq!(
+            normalize_mtp_weight_key("model.language_model.model.mtp.fc.weight").as_deref(),
             Some("mtp.fc.weight")
         );
         assert_eq!(

@@ -526,6 +526,24 @@ unsafe extern "C-unwind" {
         sampler_mode: i32,
     ) -> *mut mlx_array;
 
+    /// Return the normalized probability distribution the compiled sampler
+    /// (`mlx_compiled_sample_full`) draws from, using the SAME filter chain and
+    /// `sampler_mode`. Output is `softmax(filtered_logits * inv_temp)` over the
+    /// last axis (filtered-out tokens are exactly 0). Stochastic MTP acceptance
+    /// consumes this as the proposal density `q` (draft logits) and target
+    /// density `p` (verify logits) so accept/reject + residual resampling match
+    /// the draw distribution by construction. At temperature == 0 it returns a
+    /// one-hot argmax distribution (callers must not rely on it at T=0 — the
+    /// accept path takes its argmax-only shortcut and ignores q/p).
+    pub fn mlx_compiled_sampling_distribution(
+        logits: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        sampler_mode: i32,
+    ) -> *mut mlx_array;
+
     /// Compiled sampling using mlx::core::compile for the categorical step
     /// This matches mlx-lm's @partial(mx.compile, ...) approach
     pub fn mlx_compiled_sample_and_logprobs(
@@ -1649,6 +1667,19 @@ unsafe extern "C-unwind" {
     /// a per-reload invalidation that prevents a second same-shape model
     /// from verifying with the first model's baked weights.
     pub fn mlx_qwen35_invalidate_compiled_graphs();
+
+    /// PR #65 (mtp-reload P1): invalidate the compiled MoE dispatch
+    /// graphs (the MTP-verify graph plus the flat + paged AR-decode
+    /// graphs) so the next call re-traces against the CURRENT weight
+    /// registry. These graphs read expert/attention weights inside the
+    /// traced closure, so `compile()` bakes them in. MUST be called on
+    /// every MoE model reload, after `mlx_clear_weights()` and inside the
+    /// `COMPILED_WEIGHTS_RWLOCK` write critical section, alongside the
+    /// dense `mlx_qwen35_invalidate_compiled_graphs` (which only clears
+    /// the dense bucket/paged verify tables the MoE path does not use).
+    /// Prevents a second same-shape MoE model from decoding/verifying
+    /// with the first model's baked weights.
+    pub fn mlx_qwen35_moe_invalidate_compiled_graphs();
 
     /// Export compiled caches for PromptCache reuse.
     pub fn mlx_qwen35_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;

@@ -420,19 +420,27 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   return result;
 }
 
-// Wrapped in mlx::core::compile (modeled on mlx_qwen35.cpp:286-289 /
-// mlx_qwen35_moe.cpp:549). Safe because mtp_draft_decode_fn takes
+// MTP draft graph. Safe to compile because `mtp_draft_decode_fn` takes
 // offset_arr as an array input — see comment at line 166-169.
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `mtp_draft_decode_fn` reads the MTP
-// head weights via `get_weight("mtp.*")` inside the trace, so a model
-// reload in the same process leaves this draft graph baked with the
-// previous model's MTP weights. Cannot null a local static; left as a
-// documented gap (the confirmed P1 — MTP-verify — is fixed in
-// mlx_qwen35.cpp via `mlx_qwen35_invalidate_compiled_graphs`).
-static auto& compiled_mtp_draft_decode() {
-  static auto fn = mlx::core::compile(mtp_draft_decode_fn);
-  return fn;
+//
+// `mtp_draft_decode_fn` reads the MTP head weights via `get_weight("mtp.*")`
+// inside the trace, so the weights are baked into the cached tape. Held in a
+// resettable FILE-SCOPE global (NOT a function-local static, which cannot be
+// nulled) and compiled through `compile_resettable_weight_graph` so a model
+// reload can null it via `mlx_qwen35_mtp_invalidate_compiled_graphs()` and
+// force a re-trace against the live registry. Deliberately survives the
+// per-turn `mlx_qwen35_mtp_compiled_reset()` (cross-turn reuse) — nulled ONLY
+// on reload.
+static std::function<std::vector<array>(const std::vector<array>&)>
+    g_mtp_draft_decode_compiled{};
+
+static std::function<std::vector<array>(const std::vector<array>&)>&
+compiled_mtp_draft_decode() {
+  if (!g_mtp_draft_decode_compiled) {
+    g_mtp_draft_decode_compiled =
+        compile_resettable_weight_graph(mtp_draft_decode_fn);
+  }
+  return g_mtp_draft_decode_compiled;
 }
 
 // =====================================================================
@@ -578,23 +586,6 @@ static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
   return result;
 }
 
-// Per-M compiled commit graph. One `mlx::core::compile` entry per
-// M ∈ {1..7}. The one-token case is needed when chained committed-history
-// rejects every draft and only the residual boundary is newly committed.
-// The unrolled body differs per M, so
-// each gets its own static-function-local compile cache (survives
-// reset).
-// TODO(mtp-reload): function-local compiled static (per template M) not
-// invalidated on weight change — see PR #65 review. `mtp_commit_fn<M>`
-// reads MTP weights via `get_weight("mtp.*")` inside the trace, so a model
-// reload leaves each per-M commit graph baked with the previous model's
-// MTP weights. Cannot null a local static; left as a documented gap.
-template <int M>
-static auto& compiled_mtp_commit() {
-  static auto fn = mlx::core::compile(mtp_commit_fn<M>);
-  return fn;
-}
-
 using CommitFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
 // Valid committed-token counts:
@@ -602,6 +593,32 @@ using CommitFn = std::function<std::vector<array>(const std::vector<array>&)>;
 //   * Chained committed-history path: M = K+1 → [1, 6].
 constexpr int MIN_COMMIT_M = 1;
 constexpr int MAX_COMMIT_M = 7;
+
+// Per-M compiled commit graph table. One entry per M ∈ {1..7}; the one-token
+// case is needed when chained committed-history rejects every draft and only
+// the residual boundary is newly committed. The unrolled body differs per M.
+//
+// `mtp_commit_fn<M>` reads MTP weights via `get_weight("mtp.*")` inside the
+// trace, so the weights are baked into the cached tape. This table is the
+// resettable backing for those weight-baking graphs: each slot is lazily
+// compiled through `compile_resettable_weight_graph` (UNIQUE erasable fun_id)
+// and nulled ONLY on reload by `mlx_qwen35_mtp_invalidate_compiled_graphs()`.
+// It deliberately SURVIVES the per-turn `mlx_qwen35_mtp_compiled_reset()`
+// (cross-turn reuse) — DO NOT null it there (that reset nulls only the cheap
+// `g_commit_compiled_by_m` dispatcher table below).
+static std::array<CommitFn, MAX_COMMIT_M - MIN_COMMIT_M + 1>
+    g_commit_graph_by_m{};
+
+template <int M>
+static CommitFn& compiled_mtp_commit() {
+  static_assert(M >= MIN_COMMIT_M && M <= MAX_COMMIT_M,
+                "compiled_mtp_commit: M out of range");
+  auto& slot = g_commit_graph_by_m[M - MIN_COMMIT_M];
+  if (!slot) {
+    slot = compile_resettable_weight_graph(&mtp_commit_fn<M>);
+  }
+  return slot;
+}
 
 static CommitFn make_commit_dispatcher(int m) {
   switch (m) {
@@ -1495,8 +1512,10 @@ void mlx_qwen35_mtp_compiled_reset() {
   // capture only the static depth and call through the current global
   // compiled state, so retaining them avoids re-running heavy prewarm on
   // the next turn.
-  // Phase C — drop the per-M commit dispatchers (the underlying
-  // compiled-graph cache is static-function-local and survives reset).
+  // Phase C — drop the per-M commit dispatchers. The underlying
+  // weight-baking commit graphs live in the file-scope `g_commit_graph_by_m`
+  // table and are deliberately retained across the per-turn reset (they are
+  // nulled only on model reload via mlx_qwen35_mtp_invalidate_compiled_graphs).
   for (auto& slot : g_commit_compiled_by_m) {
     slot = nullptr;
   }
@@ -1731,6 +1750,36 @@ void mlx_qwen35_mtp_set_position_base(int position_base) {
 
 int mlx_qwen35_mtp_get_position_base() {
   return g_mtp_position_base_int;
+}
+
+// PR #65 (mtp-reload P1 follow-up) — invalidate the compiled dense MTP draft
+// graph and the per-M commit graphs so the next call re-traces against the
+// CURRENT weight registry.
+//
+// Both `mtp_draft_decode_fn` and `mtp_commit_fn<M>` read the MTP head weights
+// via `get_weight("mtp.*")` INSIDE the traced closure (NOT as compile inputs),
+// so the captured weight arrays are baked into the cached tape. These graphs
+// are PROCESS-WIDE and deliberately survive the per-turn
+// `mlx_qwen35_mtp_compiled_reset()` (cross-turn reuse). On a model RELOAD the
+// baked weights are stale, so a second same-shape MTP model loaded in the same
+// process would draft/commit with the FIRST model's weights — silent
+// corruption.
+//
+// Because every graph is compiled through `compile_resettable_weight_graph`,
+// each carries a UNIQUE, erasable `fun_id`; assigning an empty
+// `std::function{}` destroys the wrapper, ERASES its compile-cache entry, and
+// forces a re-trace against the live registry on the next call. We null the
+// RELOAD-scoped `g_commit_graph_by_m` (the actual weight-baking graphs), NOT
+// the per-turn `g_commit_compiled_by_m` dispatcher table (cleared by the
+// per-turn reset). Called transitively from
+// `mlx_qwen35_invalidate_compiled_graphs()` (the dense reload entry point), so
+// it runs INSIDE the Rust `COMPILED_WEIGHTS_RWLOCK` write critical section.
+void mlx_qwen35_mtp_invalidate_compiled_graphs() {
+  g_mtp_draft_decode_compiled =
+      std::function<std::vector<array>(const std::vector<array>&)>{};
+  for (auto& slot : g_commit_graph_by_m) {
+    slot = CommitFn{};
+  }
 }
 
 }  // extern "C"

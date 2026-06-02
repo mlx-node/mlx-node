@@ -858,7 +858,7 @@ fn trace_acceptance_dense(
         0.0
     };
 
-    let greedy = sampling_config.temperature.unwrap_or(1.0) <= 1e-6;
+    let greedy = crate::sampling::is_greedy_temperature(sampling_config.temperature.unwrap_or(1.0));
     let accept_prob = if greedy {
         if target_top1_id == draft_id { 1.0 } else { 0.0 }
     } else {
@@ -2313,7 +2313,6 @@ where
     RU: FnMut(usize),
 {
     use crate::array::{DType, MxArray as A};
-    use crate::nn::Activations;
     use crate::sampling;
 
     debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
@@ -2344,9 +2343,10 @@ where
     let penalties_no_op = params.repetition_penalty == 1.0
         && params.presence_penalty == 0.0
         && params.frequency_penalty == 0.0;
-    let use_sparse_accept = sparse_accept_gate() && temperature <= 1e-6 && penalties_no_op;
+    let use_sparse_accept =
+        sparse_accept_gate() && sampling::is_greedy_temperature(temperature) && penalties_no_op;
     let use_sparse_stochastic_accept = mtp_batch_target_arrays_enabled()
-        && temperature > 1e-6
+        && !sampling::is_greedy_temperature(temperature)
         && penalties_no_op
         && sampling::sparse_distribution_supported(&sampling_cfg)
         && sampling::sparse_distribution_supported(&draft_sampling_cfg);
@@ -2381,16 +2381,45 @@ where
         let probs = if use_sparse_accept || use_sparse_stochastic_accept {
             None
         } else {
+            // PR #65 mtp-reload P2 (codex): the legacy stochastic accept
+            // path consumes this `probs` as the proposal density `q` inside
+            // `accept_with_residual` (`min(1, p/q)` + `(p - q)+` residual).
+            // For Leviathan-Chen exactness `q` MUST be the distribution the
+            // draft token was actually drawn from. The draft id below (T>0
+            // branch) is drawn via `sampling::sample(&draft_logits, ..)`
+            // → `mlx_compiled_sample_full`, which converts logits→logprobs,
+            // applies the top_k/top_p/min_p filters ON THE LOGPROBS, then
+            // applies temperature ONLY at the final categorical draw.
+            //
+            // A `softmax(apply_sampling(logits))` rebuild did NOT match that
+            // draw: `apply_sampling` scales by temperature FIRST and then
+            // filters (and it ERRORS at T=0 because `apply_temperature`
+            // rejects `temperature <= 0`). Build `q` from the SAME compiled
+            // filter chain instead, via `sampling::sampling_distribution`,
+            // which returns `softmax(filtered_logits / temperature)` under the
+            // active `sampler_parity_mode()` — matching the draw by
+            // construction for ALL configs (incl. the common `top_k==0` plain
+            // temperature/top_p case) and both parity modes.
+            //
+            // NOTE: at T=0 the legacy `else` accept branch is only reached
+            // when `MLX_MTP_SPARSE_ACCEPT` is disabled; in that case
+            // `accept_with_residual` takes its argmax-only shortcut and never
+            // reads `q`. `sampling_distribution` at T=0 returns the (valid,
+            // 1D `[vocab]`) one-hot argmax distribution — it does NOT error,
+            // and is ignored by the accept shortcut — so every T=0 commit
+            // decision stays byte-identical. Only the T>0 probability-ratio
+            // path is corrected.
+            let raw_1d = logits_1d.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "MTP draft logits_1d unexpectedly None (sparse-accept gating mismatch)",
+                )
+            })?;
+            // `sample()` at the draw site uses `params.sampling_config` (the
+            // target config), so build `q` from the SAME config — not
+            // `draft_sampling_cfg`, which only feeds the sparse path's draw.
             Some(
-                Activations::softmax(
-                    logits_1d.as_ref().ok_or_else(|| {
-                        Error::from_reason(
-                            "MTP draft logits_1d unexpectedly None (sparse-accept gating mismatch)",
-                        )
-                    })?,
-                    Some(-1),
-                )?
-                .astype(DType::Float32)?,
+                sampling::sampling_distribution(raw_1d, params.sampling_config)?
+                    .astype(DType::Float32)?,
             )
         };
         let mut sparse_draft = None;
@@ -2916,7 +2945,24 @@ where
             let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
             let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
             let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-            let p_target = Activations::softmax(&penalized, Some(-1))?.astype(DType::Float32)?;
+            // PR #65 mtp-reload P2 (codex): the target density `p` consumed by
+            // `accept_with_residual` (`min(1, p/q)` + `(p - q)+` residual) MUST
+            // match the distribution the verify/bonus token is drawn from. The
+            // bonus on full-accept (and the residual draw on rejection) is
+            // sampled via `sampling::sample(&penalized, ..)` →
+            // `mlx_compiled_sample_full`, which filters logprobs then applies
+            // temperature at the categorical draw. A raw `softmax(penalized)`
+            // (no temperature, no top_k/top_p/min_p) did NOT match that draw,
+            // biasing accept/reject and the residual resample whenever
+            // temperature != 1 and/or filters are active. Build `p` from the
+            // SAME compiled filter chain via `sampling::sampling_distribution`.
+            //
+            // At T=0 `accept_with_residual` only reads `argmax(p_target)`;
+            // `sampling_distribution` returns the one-hot argmax there, so the
+            // argmax (and thus the T=0 commit decision) is byte-identical to
+            // the prior `softmax` while never erroring at T=0.
+            let p_target = sampling::sampling_distribution(&penalized, params.sampling_config)?
+                .astype(DType::Float32)?;
             p_target.eval();
 
             let sampling_cfg = params.sampling_config.unwrap_or_default();

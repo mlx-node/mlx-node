@@ -40,6 +40,15 @@ bool mlx_compile_clear_cache() {
   }
 }
 
+// Temperatures in `[0, GREEDY_TEMPERATURE_EPS]` are treated as greedy (argmax)
+// by every sampler below. This MUST match the Rust MTP accept gates in
+// chat_common.rs / sampling.rs (`temperature <= 1e-6` == greedy): keeping the
+// threshold identical makes the draft draw, target/bonus draw,
+// sampling_distribution, the AR sampler, and the accept gates byte-consistent
+// for tiny T (otherwise a tiny nonzero T would draw stochastically but accept
+// greedily, or AR would diverge from MTP).
+constexpr float GREEDY_TEMPERATURE_EPS = 1e-6f;
+
 // ============================================================================
 // Compiled sampling filters — each filter compiled separately (matches Python mlx-lm)
 // ============================================================================
@@ -170,33 +179,39 @@ static array categorical_with_temp(const array& logprobs, const array& inv_temp)
 }
 
 // ============================================================================
-// Main compiled sampling function — uses compiled filters
+// Shared filter chain — the SINGLE source of truth for the distribution the
+// compiled sampler draws from.
 // ============================================================================
-mlx_array* mlx_compiled_sample_full(
-    mlx_array* logits_handle,
+//
+// `mlx_compiled_sample_full` (the categorical draw) and
+// `mlx_compiled_sampling_distribution` (the normalized proposal/target
+// density consumed by stochastic MTP acceptance) MUST sample from the exact
+// same distribution. Factoring the filter chain here makes them impossible to
+// drift: both call this helper, then either draw via `categorical_with_temp`
+// or normalize via `softmax`.
+//
+// The returned pair is `(filtered_logits, inv_temp)`; the distribution the
+// sampler draws from is `softmax(filtered_logits * inv_temp)` along the last
+// axis (this is exactly what `random::categorical` evaluates after the
+// `multiply` in `categorical_with_temp`).
+//
+// `needs_filters` mirrors the caller's fast-path gate. When false the caller
+// short-circuits to the no-filter path (raw logits + 1/temperature); this
+// helper is only invoked on the filtered path so the two callers stay
+// byte-identical to their respective fast paths.
+struct CompiledSamplerLogits {
+  array filtered_logits;
+  array inv_temp;
+};
+
+static CompiledSamplerLogits compiled_sampler_logits(
+    const array& logits,
     float temperature,
     int top_k,
     float top_p,
     float min_p,
     int sampler_mode
 ) {
-  auto logits = *reinterpret_cast<array*>(logits_handle);
-
-  // Fast path: temperature == 0 means argmax (greedy)
-  if (temperature == 0.0f) {
-    auto result = mlx::core::argmax(logits, -1);
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  }
-
-  bool needs_filters = (top_k > 0) || (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f);
-
-  // Fast path: no filters — categorical only
-  if (!needs_filters) {
-    auto inv_temp = mlx::core::array(1.0f / temperature);
-    auto result = categorical_with_temp(logits, inv_temp);
-    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
-  }
-
   // Default mode filters on raw model probabilities, then applies temperature
   // only for the final categorical draw. MTPLX parity mode filters on the
   // temperature-scaled distribution, matching its sparse MTP proposal path.
@@ -229,10 +244,116 @@ mlx_array* mlx_compiled_sample_full(
     logprobs = compiled_min_p_fn()({logprobs, mlx::core::array(min_p)})[0];
   }
 
-  // Apply temperature and sample — uncompiled categorical. In MTPLX parity mode
-  // `logprobs` is already temperature-scaled, so the final scale is 1.0.
+  // In MTPLX parity mode `logprobs` is already temperature-scaled, so the
+  // final scale is 1.0.
   auto inv_temp = mlx::core::array(temperature_first ? 1.0f : (1.0f / temperature));
-  auto result = categorical_with_temp(logprobs, inv_temp);
+  return CompiledSamplerLogits{std::move(logprobs), std::move(inv_temp)};
+}
+
+// ============================================================================
+// Main compiled sampling function — uses compiled filters
+// ============================================================================
+mlx_array* mlx_compiled_sample_full(
+    mlx_array* logits_handle,
+    float temperature,
+    int top_k,
+    float top_p,
+    float min_p,
+    int sampler_mode
+) {
+  auto logits = *reinterpret_cast<array*>(logits_handle);
+
+  // Fast path: tiny temperature means argmax (greedy). Treat the whole
+  // [0, GREEDY_TEMPERATURE_EPS] band as greedy so the draft draw matches the
+  // Rust accept gate (temperature <= 1e-6).
+  if (temperature <= GREEDY_TEMPERATURE_EPS) {
+    auto result = mlx::core::argmax(logits, -1);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  }
+
+  bool needs_filters = (top_k > 0) || (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f);
+
+  // Fast path: no filters — categorical only
+  if (!needs_filters) {
+    auto inv_temp = mlx::core::array(1.0f / temperature);
+    auto result = categorical_with_temp(logits, inv_temp);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  }
+
+  auto sampler =
+      compiled_sampler_logits(logits, temperature, top_k, top_p, min_p, sampler_mode);
+  // Apply temperature and sample — uncompiled categorical.
+  auto result = categorical_with_temp(sampler.filtered_logits, sampler.inv_temp);
+  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+}
+
+// ============================================================================
+// Compiled sampling distribution — the normalized probability vector the
+// compiled sampler draws from.
+// ============================================================================
+//
+// Returns `softmax(filtered_logits * inv_temp)` over the last axis, i.e. the
+// EXACT distribution `mlx_compiled_sample_full` samples its token from, using
+// the SAME `sampler_mode` filter ordering. Stochastic MTP acceptance consumes
+// this as the proposal density `q` (draft logits) and the target density `p`
+// (verify logits) so the probability-ratio accept/reject and residual resample
+// match the draw distribution by construction — preserving Leviathan-Chen
+// exactness for arbitrary temperature/top_k/top_p/min_p and both parity modes.
+//
+// Filtered-out tokens (`-inf` logits) softmax to exactly 0, matching the
+// categorical draw's support. The output dtype follows `softmax` on the input
+// dtype; callers cast to f32 for the accept math.
+//
+// At temperature == 0 the sampler is argmax-only and accept/reject ignores the
+// proposal density, so callers MUST NOT call this at T=0; this function still
+// returns a defined one-hot argmax distribution (so a stray call is benign).
+mlx_array* mlx_compiled_sampling_distribution(
+    mlx_array* logits_handle,
+    float temperature,
+    int top_k,
+    float top_p,
+    float min_p,
+    int sampler_mode
+) {
+  auto logits = *reinterpret_cast<array*>(logits_handle);
+
+  // Tiny T (greedy): argmax-only sampler. Return a one-hot distribution so a
+  // stray caller sees a defined, normalized vector (accept/reject ignores q/p
+  // when greedy). The whole [0, GREEDY_TEMPERATURE_EPS] band is greedy to match
+  // the Rust accept gate (temperature <= 1e-6).
+  //
+  // Build the one-hot in int32 index space (NOT the logits dtype): for bf16/f16
+  // logits with a large vocab, integer token IDs (e.g. ~150k) are not exactly
+  // representable, so a float `arange == idx` comparison could place the `1.0`
+  // at the wrong position and shift `argmax(p_target)`. Comparing int32 indices
+  // is exact; only the final 0/1 mask is cast to the logits dtype.
+  if (temperature <= GREEDY_TEMPERATURE_EPS) {
+    auto idx = mlx::core::argmax(logits, -1, true);
+    int vocab = logits.shape().back();
+    auto positions = mlx::core::arange(0, vocab, mlx::core::int32);
+    auto one_hot = mlx::core::equal(positions, mlx::core::astype(idx, mlx::core::int32));
+    auto result = mlx::core::astype(one_hot, logits.dtype());
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  }
+
+  bool needs_filters = (top_k > 0) || (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f);
+
+  // Fast path: no filters — softmax(logits / temperature), matching the
+  // no-filter `categorical_with_temp(logits, 1/temperature)` draw.
+  if (!needs_filters) {
+    auto scaled = mlx::core::multiply(logits, mlx::core::array(1.0f / temperature));
+    auto result = mlx::core::softmax(scaled, std::vector<int>{-1}, true);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  }
+
+  auto sampler =
+      compiled_sampler_logits(logits, temperature, top_k, top_p, min_p, sampler_mode);
+  // The categorical draw is over `softmax(filtered_logits * inv_temp)`; return
+  // that normalized distribution instead of drawing from it. `precise=true`
+  // softmax: the draw distribution is analytically softmax, and precise f32
+  // probabilities matter for the `min(1, p/q)` accept ratio downstream.
+  auto scaled = mlx::core::multiply(sampler.filtered_logits, sampler.inv_temp);
+  auto result = mlx::core::softmax(scaled, std::vector<int>{-1}, true);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
 }
 
@@ -257,8 +378,10 @@ void mlx_compiled_sample_and_logprobs(
   auto logsumexp_val = mlx::core::logsumexp(logits, std::vector<int>{-1}, true);
   auto logprobs = mlx::core::subtract(logits, logsumexp_val);
 
-  // Greedy fast path
-  if (temperature == 0.0f) {
+  // Greedy fast path. Treat the whole [0, GREEDY_TEMPERATURE_EPS] band as
+  // greedy so the AR sampler stays byte-identical with the MTP samplers and the
+  // Rust accept gate (temperature <= 1e-6) at tiny T.
+  if (temperature <= GREEDY_TEMPERATURE_EPS) {
     auto result = mlx::core::argmax(logits, -1);
     *out_token = reinterpret_cast<mlx_array*>(new array(std::move(result)));
     *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(logprobs)));

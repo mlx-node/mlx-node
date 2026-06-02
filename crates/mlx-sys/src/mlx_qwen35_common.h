@@ -17,6 +17,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -24,6 +25,13 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+
+// Cross-TU reload-invalidation hooks for the MTP compiled draft/commit graphs.
+// Defined in mlx_qwen35_mtp_compiled.cpp / mlx_qwen35_moe_mtp_compiled.cpp;
+// called transitively from the dense / MoE main `*_invalidate_compiled_graphs`
+// reload entry points so a model reload re-traces every weight-baking graph.
+extern "C" void mlx_qwen35_mtp_invalidate_compiled_graphs();
+extern "C" void mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
 
 namespace qwen35_common {
 
@@ -331,6 +339,24 @@ struct BaseConfig {
 // =====================================================================
 // Compiled helper functions
 // =====================================================================
+
+// Wrap a weight-baking compiled-graph function so MLX assigns it a UNIQUE,
+// erasable compile-cache identity. The graph reads model weights via
+// get_weight() at trace time, so the weights are baked into the cached tape.
+// MLX keys its compile cache on a fun_id: a free function (or captureless
+// lambda) yields a STABLE code-address fun_id with NO eviction hook, so
+// assigning {} to the std::function does NOT erase the tape — a reloaded model
+// silently replays the previous model's baked weights. Capturing `fn` makes the
+// closure non-convertible to a function pointer, routing through
+// compile(std::function) -> get_function_address()==0 -> a heap shared_ptr
+// fun_id whose deleter calls compile_erase(): assigning {} frees the tape and
+// the next compile re-traces against the live weights. See compile.cpp:1205-1241.
+inline std::function<std::vector<array>(const std::vector<array>&)>
+compile_resettable_weight_graph(
+    std::vector<array> (*fn)(const std::vector<array>&)) {
+  return mlx::core::compile(
+      [fn](const std::vector<array>& inputs) { return fn(inputs); });
+}
 
 inline array rms_norm_no_weight(const array& x, float eps) {
   return fast::rms_norm(x, std::nullopt, eps);

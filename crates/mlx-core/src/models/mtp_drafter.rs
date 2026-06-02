@@ -124,17 +124,16 @@ const REQUIRED_TOP_LEVEL: [&str; 4] = [
 /// the prefix before writing.
 ///
 /// Idempotent + prefix-tolerant: a key that ALREADY carries `mtp.` (or any of
-/// the wrapper prefixes the loaders strip, e.g. `model.`, `language_model.`)
-/// resolves to the canonical `mtp.<bare>` form rather than double-prefixing.
+/// the wrapper prefixes the loaders strip, e.g. `model.`, `language_model.`,
+/// `model.language_model.`, `language_model.model.`, or the longest
+/// `model.language_model.model.`) resolves to the canonical `mtp.<bare>` form
+/// rather than double-prefixing. The wrapper list + longest-first order are kept
+/// in lockstep with the authoritative `normalize_mtp_prefix` in `convert.rs`.
 pub fn reprefix_drafter_key(key: &str) -> String {
-    // Strip the same wrapper prefixes the dense/MoE sanitize loops strip, so a
-    // (defensively) wrapped key normalizes the same way.
-    let stripped = key
-        .strip_prefix("model.language_model.")
-        .or_else(|| key.strip_prefix("language_model.model."))
-        .or_else(|| key.strip_prefix("language_model."))
-        .or_else(|| key.strip_prefix("model."))
-        .unwrap_or(key);
+    // Delegate to the shared `strip_wrapper_prefix` so this stays byte-for-byte
+    // in lockstep with `convert.rs::normalize_mtp_prefix` and the loader body
+    // strips (one authoritative wrapper list + order).
+    let stripped = strip_wrapper_prefix(key);
 
     if stripped.starts_with("mtp.") {
         // Already canonical (or carried mtp. inside a wrapper prefix).
@@ -142,6 +141,32 @@ pub fn reprefix_drafter_key(key: &str) -> String {
     } else {
         format!("mtp.{stripped}")
     }
+}
+
+/// Strip the HF VLM wrapper prefixes from a weight key, longest-first.
+///
+/// This is the SINGLE authoritative wrapper-prefix chain shared by
+/// `convert.rs::normalize_mtp_prefix`, [`reprefix_drafter_key`], and the dense
+/// and MoE persistence body/MTP strips. The wrapper list and order MUST be kept
+/// identical across all of them so a key normalizes to the same bare form on
+/// every path.
+///
+/// ORDER IS LOAD-BEARING: the longest wrapper (`model.language_model.model.`)
+/// MUST be tried before the shorter overlapping `model.language_model.`. Per
+/// PR #65 review (Cursor Bugbot), omitting the longest variant let the shorter
+/// strip fire on `model.language_model.model.mtp.fc.weight`, leaving
+/// `model.mtp.fc.weight` — which doesn't start with `mtp.` — so the key was
+/// silently dropped (or wrongly re-prefixed). Longest-first is strictly safe
+/// for the generic body strips too: a longer match is only attempted before
+/// the shorter ones, so the existing double-wrap `model.language_model.`
+/// handling is preserved.
+pub(crate) fn strip_wrapper_prefix(key: &str) -> &str {
+    key.strip_prefix("model.language_model.model.")
+        .or_else(|| key.strip_prefix("model.language_model."))
+        .or_else(|| key.strip_prefix("language_model.model."))
+        .or_else(|| key.strip_prefix("language_model."))
+        .or_else(|| key.strip_prefix("model."))
+        .unwrap_or(key)
 }
 
 /// Resolve the drafter `model.safetensors` for a model directory, if a valid
@@ -456,6 +481,83 @@ mod tests {
             reprefix_drafter_key("model.layers.0.input_layernorm.weight"),
             "mtp.layers.0.input_layernorm.weight"
         );
+    }
+
+    /// PR #65 review (Cursor Bugbot) regression: the longest wrapper
+    /// `model.language_model.model.` must be stripped BEFORE the shorter
+    /// overlapping `model.language_model.`. Previously the function omitted the
+    /// longest variant, so the shorter strip fired first and left
+    /// `model.mtp.fc.weight` — which doesn't start with `mtp.` — getting wrongly
+    /// reprefixed to `mtp.model.mtp.fc.weight`. The wrapper set + longest-first
+    /// order now mirror `normalize_mtp_prefix` in `convert.rs`.
+    #[test]
+    fn reprefix_strips_longest_wrapper_first() {
+        // The exact reported bug case (already-mtp key under the longest wrapper).
+        assert_eq!(
+            reprefix_drafter_key("model.language_model.model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        // Bare key under the longest wrapper gains the prefix after the strip.
+        assert_eq!(
+            reprefix_drafter_key("model.language_model.model.layers.0.self_attn.q_proj.weight"),
+            "mtp.layers.0.self_attn.q_proj.weight"
+        );
+        // Each wrapper variant `normalize_mtp_prefix` handles must normalize to
+        // the canonical `mtp.<bare>` form here too (one regression case per
+        // prefix, longest → shortest).
+        assert_eq!(
+            reprefix_drafter_key("model.language_model.norm.weight"),
+            "mtp.norm.weight"
+        );
+        assert_eq!(
+            reprefix_drafter_key("language_model.model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        assert_eq!(
+            reprefix_drafter_key("language_model.model.norm.weight"),
+            "mtp.norm.weight"
+        );
+        assert_eq!(
+            reprefix_drafter_key("language_model.fc.weight"),
+            "mtp.fc.weight"
+        );
+        assert_eq!(reprefix_drafter_key("model.fc.weight"), "mtp.fc.weight");
+    }
+
+    /// Direct coverage of the shared `strip_wrapper_prefix`: all five wrapper
+    /// prefixes (longest → shortest), the triple-wrap raw-VLM case, and the
+    /// no-prefix passthrough. This is the single authoritative chain delegated
+    /// to by `convert.rs::normalize_mtp_prefix`, `reprefix_drafter_key`, and the
+    /// dense/MoE persistence body + MTP strips.
+    #[test]
+    fn strip_wrapper_prefix_all_variants_longest_first() {
+        // Triple-wrap (raw HF VLM checkpoint with inline MTP) — longest first.
+        assert_eq!(
+            strip_wrapper_prefix("model.language_model.model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        // The remaining four wrappers, longest → shortest.
+        assert_eq!(
+            strip_wrapper_prefix("model.language_model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        assert_eq!(
+            strip_wrapper_prefix("language_model.model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        assert_eq!(
+            strip_wrapper_prefix("language_model.mtp.fc.weight"),
+            "mtp.fc.weight"
+        );
+        assert_eq!(strip_wrapper_prefix("model.mtp.fc.weight"), "mtp.fc.weight");
+        // Generic (non-mtp) body key under the longest wrapper.
+        assert_eq!(
+            strip_wrapper_prefix("model.language_model.model.layers.0.self_attn.q_proj.weight"),
+            "layers.0.self_attn.q_proj.weight"
+        );
+        // No wrapper → unchanged.
+        assert_eq!(strip_wrapper_prefix("mtp.fc.weight"), "mtp.fc.weight");
+        assert_eq!(strip_wrapper_prefix("fc.weight"), "fc.weight");
     }
 
     fn write_config(dir: &Path, model_type: &str) {

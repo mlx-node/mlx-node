@@ -98,15 +98,16 @@ pub fn resolve_default_mode(top_level_mode: Option<PerLayerMode>, is_mxfp8: bool
 
 /// Normalize a per-layer override key by stripping common HuggingFace prefixes.
 ///
-/// All three model families (qwen3_5, qwen3_5_moe, gemma4) use the same set
-/// of prefixes, so this helper is shared instead of duplicated.
+/// All three model families (qwen3_5, qwen3_5_moe, gemma4) use the same set of
+/// prefixes, so this helper delegates to the authoritative longest-first
+/// [`strip_wrapper_prefix`](crate::models::mtp_drafter::strip_wrapper_prefix) —
+/// keeping convert + load + quant in lockstep on the exact wrapper list and
+/// order. A previous hand-rolled chain omitted the longest
+/// `model.language_model.model.` variant, so a triple-wrapped per-layer override
+/// key mis-normalized (the shorter `model.language_model.` fired first, leaving
+/// `model.layers.*`).
 pub fn normalize_per_layer_key(k: &str) -> String {
-    k.strip_prefix("model.language_model.")
-        .or_else(|| k.strip_prefix("language_model.model."))
-        .or_else(|| k.strip_prefix("language_model."))
-        .or_else(|| k.strip_prefix("model."))
-        .unwrap_or(k)
-        .to_string()
+    crate::models::mtp_drafter::strip_wrapper_prefix(k).to_string()
 }
 
 /// Parse the `quantization` (or legacy `quantization_config`) block from a
@@ -310,6 +311,34 @@ pub fn merge_per_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `normalize_per_layer_key` delegates to the authoritative longest-first
+    /// `strip_wrapper_prefix`, so per-layer override keys collapse to the same
+    /// bare key at EVERY wrapper depth. The triple-wrap case is the regression:
+    /// a prior hand-rolled chain omitted the longest
+    /// `model.language_model.model.` variant → stripped only
+    /// `model.language_model.`, leaving `model.layers.*`.
+    #[test]
+    fn normalize_per_layer_key_strips_all_wrapper_depths() {
+        let bare = "layers.0.self_attn.q_proj";
+        // Triple-wrap regression: was `model.layers.0...` before the fix.
+        assert_eq!(
+            normalize_per_layer_key("model.language_model.model.layers.0.self_attn.q_proj"),
+            bare
+        );
+        // Double-wrap.
+        assert_eq!(
+            normalize_per_layer_key("model.language_model.layers.0.self_attn.q_proj"),
+            bare
+        );
+        // `model.`-only.
+        assert_eq!(
+            normalize_per_layer_key("model.layers.0.self_attn.q_proj"),
+            bare
+        );
+        // Already-bare.
+        assert_eq!(normalize_per_layer_key("layers.0.self_attn.q_proj"), bare);
+    }
 
     #[test]
     fn parse_mode_str_recognises_nvfp4() {

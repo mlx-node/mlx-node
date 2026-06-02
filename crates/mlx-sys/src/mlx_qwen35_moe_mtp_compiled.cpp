@@ -602,20 +602,28 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
   return result;
 }
 
-// Wrapped in mlx::core::compile (mirrors mlx_qwen35_moe.cpp:549) — the
-// MoE main path takes `offset_arr` as an array input, same as us, so the
-// compile cache is stable across decode steps. The dense MTP file makes
-// the same choice (see `compiled_mtp_draft_decode` there).
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `moe_mtp_draft_decode_fn` reads the
-// MoE MTP head weights via `get_weight(...)` inside the trace, so a model
-// reload in the same process leaves this draft graph baked with the
-// previous model's MTP weights. Cannot null a local static; left as a
-// documented gap (the confirmed P1 — MTP-verify — is fixed via
-// `mlx_qwen35_invalidate_compiled_graphs`).
-static auto& compiled_moe_mtp_draft_decode() {
-  static auto fn = mlx::core::compile(moe_mtp_draft_decode_fn);
-  return fn;
+// MoE MTP draft graph. The MoE main path takes `offset_arr` as an array input,
+// same as us, so the compile cache is stable across decode steps. The dense MTP
+// file makes the same choice (see `compiled_mtp_draft_decode` there).
+//
+// `moe_mtp_draft_decode_fn` reads the MoE MTP head weights via `get_weight(...)`
+// inside the trace, so the weights are baked into the cached tape. Held in a
+// resettable FILE-SCOPE global (NOT a function-local static, which cannot be
+// nulled) and compiled through `compile_resettable_weight_graph` so a model
+// reload can null it via `mlx_qwen35_moe_mtp_invalidate_compiled_graphs()` and
+// force a re-trace against the live registry. Deliberately survives the
+// per-turn `mlx_qwen35_moe_mtp_compiled_reset()` (cross-turn reuse) — nulled
+// ONLY on reload.
+static std::function<std::vector<array>(const std::vector<array>&)>
+    g_moe_mtp_draft_decode_compiled{};
+
+static std::function<std::vector<array>(const std::vector<array>&)>&
+compiled_moe_mtp_draft_decode() {
+  if (!g_moe_mtp_draft_decode_compiled) {
+    g_moe_mtp_draft_decode_compiled =
+        compile_resettable_weight_graph(moe_mtp_draft_decode_fn);
+  }
+  return g_moe_mtp_draft_decode_compiled;
 }
 
 // =====================================================================
@@ -1164,6 +1172,28 @@ void mlx_qwen35_moe_mtp_compiled_begin_cycle(int main_offset) {
 // -----------------------------------------------------------------------------
 int mlx_qwen35_moe_mtp_get_offset() {
   return g_mtp_offset_int;
+}
+
+// PR #65 (mtp-reload P1 follow-up) — invalidate the compiled MoE MTP draft
+// graph so the next call re-traces against the CURRENT weight registry.
+//
+// `moe_mtp_draft_decode_fn` reads the MoE MTP head weights via `get_weight(...)`
+// INSIDE the traced closure (NOT as compile inputs), so the captured weight
+// arrays are baked into the cached tape. The graph is PROCESS-WIDE and
+// deliberately survives the per-turn `mlx_qwen35_moe_mtp_compiled_reset()`
+// (cross-turn reuse). On a model RELOAD the baked weights are stale, so a
+// second same-shape MoE-MTP model loaded in the same process would draft with
+// the FIRST model's weights — silent corruption.
+//
+// Because the graph is compiled through `compile_resettable_weight_graph`, it
+// carries a UNIQUE, erasable `fun_id`; assigning an empty `std::function{}`
+// destroys the wrapper, ERASES its compile-cache entry, and forces a re-trace
+// against the live registry on the next call. Called transitively from
+// `mlx_qwen35_moe_invalidate_compiled_graphs()` (the MoE reload entry point),
+// so it runs INSIDE the Rust `COMPILED_WEIGHTS_RWLOCK` write critical section.
+void mlx_qwen35_moe_mtp_invalidate_compiled_graphs() {
+  g_moe_mtp_draft_decode_compiled =
+      std::function<std::vector<array>(const std::vector<array>&)>{};
 }
 
 }  // extern "C"

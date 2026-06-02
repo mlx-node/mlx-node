@@ -586,15 +586,35 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
   return result;
 }
 
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `moe_compiled_decode_fn` reads expert
-// + attention weights via `get_weight(...)` inside the trace, so a model
-// reload in the same process leaves this MoE AR-decode graph baked with the
-// previous model's weights. Cannot null a local static; left as a
-// documented gap (the confirmed P1 is MTP-verify).
-static auto& compiled_moe_decode() {
-  static auto fn = mlx::core::compile(moe_compiled_decode_fn);
-  return fn;
+// Dispatch-table type for the compiled MoE graphs. `BatchedVerifyFn` itself
+// lives in mlx_qwen35.cpp's anonymous namespace (a separate translation
+// unit), so we re-declare the identical signature here. All three MoE
+// compiled bodies share `std::vector<array>(const std::vector<array>&)`.
+using MoeCompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
+
+// PR #65 (mtp-reload P1) — resettable file-scope globals. These compiled MoE
+// graphs read expert + attention weights via `get_weight(...)` INSIDE the
+// traced closure, so `mlx::core::compile(...)` bakes the captured weight
+// arrays into a process-lifetime cache. On a model RELOAD they would be
+// stale, so a second same-shape model would decode/verify with the FIRST
+// model's weights (silent corruption). The slots start empty and are lazily
+// assigned `compile(...)` on first call (on the inference thread, under the
+// Rust `COMPILED_WEIGHTS_RWLOCK.read()`); `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// nulls them under the write lock so the next call re-traces against the live
+// registry. (Empty-function default is well-formed; `array` has no default
+// ctor but `std::function<>` does.)
+static MoeCompiledFn g_moe_decode_compiled;
+static MoeCompiledFn g_moe_verify_batched_compiled;
+static MoeCompiledFn g_moe_decode_paged_compiled;
+
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// MoE AR-decode graph.
+static MoeCompiledFn& compiled_moe_decode() {
+  if (!g_moe_decode_compiled) {
+    g_moe_decode_compiled = compile_resettable_weight_graph(moe_compiled_decode_fn);
+  }
+  return g_moe_decode_compiled;
 }
 
 // =====================================================================
@@ -853,27 +873,27 @@ static std::vector<array> moe_verify_batched_decode_fn(
   return result;
 }
 
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `moe_verify_batched_decode_fn` reads
-// weights via `get_weight(...)` inside the trace; this is the MoE
-// MTP-verify graph (sibling of the dense bucket tables that ARE invalidated
-// by `mlx_qwen35_invalidate_compiled_graphs`). A model reload leaves it
-// baked with the previous model's weights. Cannot null a local static;
-// left as a documented gap — the MoE verify path needs the same
-// resettable-global treatment as the dense bucket tables in a follow-up.
-static auto& compiled_moe_verify_batched() {
-  static auto fn = mlx::core::compile(moe_verify_batched_decode_fn);
-  return fn;
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// MoE MTP-verify graph (the explicit PR #65 P1, sibling of the dense bucket
+// tables that ARE invalidated by `mlx_qwen35_invalidate_compiled_graphs`).
+static MoeCompiledFn& compiled_moe_verify_batched() {
+  if (!g_moe_verify_batched_compiled) {
+    g_moe_verify_batched_compiled =
+        compile_resettable_weight_graph(moe_verify_batched_decode_fn);
+  }
+  return g_moe_verify_batched_compiled;
 }
 
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `moe_compiled_decode_fn_paged` reads
-// weights via `get_weight(...)` inside the trace, so a model reload leaves
-// this paged MoE AR-decode graph baked with the previous model's weights.
-// Cannot null a local static; left as a documented gap.
-static auto& compiled_moe_decode_paged() {
-  static auto fn = mlx::core::compile(moe_compiled_decode_fn_paged);
-  return fn;
+// Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
+// on reload — see the `g_moe_decode_compiled` declaration above. This is the
+// paged MoE AR-decode graph.
+static MoeCompiledFn& compiled_moe_decode_paged() {
+  if (!g_moe_decode_paged_compiled) {
+    g_moe_decode_paged_compiled =
+        compile_resettable_weight_graph(moe_compiled_decode_fn_paged);
+  }
+  return g_moe_decode_paged_compiled;
 }
 
 }  // namespace
@@ -1237,9 +1257,10 @@ void mlx_qwen35_moe_forward_batched_verify(
 // in {1..5}. MoE has only ONE variant (no tape-replay — W6.6 deferred for MoE)
 // so this prewarms 5 graph shapes total.
 //
-// PRIOR (W6.7): `compiled_moe_verify_batched()`'s static initializer fires on
-// first call, so the first verify cycle of each MoE prompt pays the trace+
-// compile cost for its depth-D shape.
+// PRIOR (W6.7): `compiled_moe_verify_batched()` lazily compiles its graph on
+// first call (now a resettable file-scope global; previously a function-local
+// static — same fire-on-first-call timing), so the first verify cycle of each
+// MoE prompt pays the trace+compile cost for its depth-D shape.
 //
 // NOW: this entry point runs ONE dummy verify forward per depth to force
 // `mlx::core::eval` of the compiled-graph outputs, populating MLX's
@@ -2230,6 +2251,47 @@ int mlx_qwen35_moe_trace_paged_attn_helper() {
     fflush(stderr);
     return -2;
   }
+}
+
+// PR #65 (mtp-reload P1) — invalidate ALL compiled MoE dispatch graphs (the
+// MTP-verify graph plus the flat + paged AR-decode graphs) so the next call
+// re-traces against the CURRENT weight registry.
+//
+// The compiled MoE bodies read expert + attention weights via `get_weight(...)`
+// INSIDE the traced closure (NOT as compile inputs), so `mlx::core::compile(...)`
+// bakes the captured weight arrays into the cached tape and reuses them verbatim
+// on every later call. These globals are PROCESS-WIDE and deliberately survive
+// the per-turn `mlx_qwen35_moe_reset()` (cross-turn reuse). On a model RELOAD
+// (weights swapped in the registry) the baked weights are stale, so a second
+// same-shape MoE model loaded in the same process would decode/verify with the
+// FIRST model's weights — silent corruption.
+//
+// Each graph is compiled through `compile_resettable_weight_graph` (see
+// `mlx_qwen35_common.h`), which wraps the free function in a CAPTURING lambda so
+// MLX hands it a heap-allocated, UNIQUE `fun_id` whose shared_ptr deleter calls
+// `compile_erase()`. Assigning an empty `std::function{}` therefore destroys the
+// wrapper, ERASES its compile-cache entry (freeing the baked tape), and forces a
+// NEW wrapper (new `fun_id`) to be built on the next call — which re-traces
+// against the live registry on whatever thread next calls `compiled_moe_*`.
+// (A plain `mlx::core::compile(free_fn)` would NOT work here: it keys on the
+// function's stable code address with no eviction hook, so nulling the
+// std::function would silently replay the stale tape.) This is correct
+// regardless of thread because the re-trace is lazy on the inference thread; we
+// do NOT rely on cross-thread `compile_clear_cache()` (MLX's CompilerCache is
+// thread_local).
+//
+// Called by the Rust MoE loader (`register_moe_weights_with_cpp`) on EVERY model
+// reload, immediately after the dense `mlx_qwen35_invalidate_compiled_graphs()`
+// call and INSIDE the `COMPILED_WEIGHTS_RWLOCK` write critical section, so it is
+// serialized against in-flight compiled reads. This mirrors the dense
+// `mlx_qwen35_invalidate_compiled_graphs()` (which nulls the dense bucket/paged
+// verify tables that the MoE path does not use). Also transitively invalidates
+// the MoE MTP draft graph in `mlx_qwen35_moe_mtp_compiled.cpp`.
+void mlx_qwen35_moe_invalidate_compiled_graphs() {
+  g_moe_decode_compiled = MoeCompiledFn{};
+  g_moe_verify_batched_compiled = MoeCompiledFn{};
+  g_moe_decode_paged_compiled = MoeCompiledFn{};
+  mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
 }
 
 }  // extern "C"

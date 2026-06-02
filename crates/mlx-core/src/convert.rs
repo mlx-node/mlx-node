@@ -567,16 +567,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // head silently gets loaded as e.g. NVFP4-4 group_size=16. Fail loudly
     // here rather than emit a checkpoint that diverges at load time.
     if do_quantize && has_custom_sanitizer {
-        let has_pre_quantized_mtp = tensors.keys().any(|k| {
-            let bare = k
-                .strip_prefix("model.language_model.")
-                .or_else(|| k.strip_prefix("language_model.model."))
-                .or_else(|| k.strip_prefix("language_model."))
-                .or_else(|| k.strip_prefix("model."))
-                .unwrap_or(k);
-            (bare.starts_with("mtp.") || bare.starts_with("mtp_"))
-                && (k.ends_with(".scales") || k.ends_with(".biases"))
-        });
+        let has_pre_quantized_mtp = tensors.keys().any(|k| is_pre_quantized_mtp_key(k.as_str()));
         if has_pre_quantized_mtp {
             return Err(Error::from_reason(
                 "Source checkpoint ships pre-quantized MTP weights (mtp.*.scales / .biases). \
@@ -1300,13 +1291,39 @@ fn is_mtp_key(key: &str) -> bool {
     bare.starts_with("mtp.") || bare.starts_with("mtp_") || key.contains(".mtp.")
 }
 
+/// Whether `key` is a pre-quantized MTP weight (`mtp.*.scales` / `mtp.*.biases`).
+///
+/// Used by the `--quantize` refuse-pre-quantized-MTP guard. The bare-key strip
+/// goes through [`normalize_mtp_prefix`] (the shared longest-first chain) so a
+/// triple-wrapped `model.language_model.model.mtp.*.scales` is detected rather
+/// than slipping past the guard; see `strip_wrapper_prefix` for why the order
+/// is load-bearing.
+fn is_pre_quantized_mtp_key(key: &str) -> bool {
+    let bare = normalize_mtp_prefix(key);
+    (bare.starts_with("mtp.") || bare.starts_with("mtp_"))
+        && (key.ends_with(".scales") || key.ends_with(".biases"))
+}
+
 fn normalize_mtp_prefix(key: &str) -> &str {
-    key.strip_prefix("model.language_model.model.")
-        .or_else(|| key.strip_prefix("model.language_model."))
-        .or_else(|| key.strip_prefix("language_model.model."))
-        .or_else(|| key.strip_prefix("language_model."))
-        .or_else(|| key.strip_prefix("model."))
-        .unwrap_or(key)
+    // Delegate to the shared authoritative chain so convert + load stay in
+    // lockstep on the exact wrapper list + longest-first order.
+    crate::models::mtp_drafter::strip_wrapper_prefix(key)
+}
+
+/// Remap a non-MTP, non-vision Qwen3.5 language-model body key to the canonical
+/// mlx-vlm layout (`language_model.model.<bare>`, or `language_model.<bare>` for
+/// `lm_head`). Strips ALL HF wrapper prefixes via the authoritative longest-first
+/// [`strip_wrapper_prefix`](crate::models::mtp_drafter::strip_wrapper_prefix) so a
+/// triple-wrapped `model.language_model.model.layers.*` collapses to the bare key
+/// BEFORE re-prefixing (a shorter hand-rolled chain left `model.layers.*`,
+/// producing a doubled `language_model.model.model.*`).
+fn remap_qwen35_body_key(key: &str) -> String {
+    let bare = crate::models::mtp_drafter::strip_wrapper_prefix(key);
+    if bare.starts_with("lm_head") {
+        format!("language_model.{bare}")
+    } else {
+        format!("language_model.model.{bare}")
+    }
 }
 
 fn is_mtp_sidecar_key(key: &str) -> bool {
@@ -3209,20 +3226,11 @@ fn sanitize_qwen35_moe(
             continue;
         }
 
-        // Language model: strip all known prefixes to bare key
-        let bare = key
-            .strip_prefix("model.language_model.")
-            .or_else(|| key.strip_prefix("language_model.model."))
-            .or_else(|| key.strip_prefix("language_model."))
-            .or_else(|| key.strip_prefix("model."))
-            .unwrap_or(&key);
-
-        // Re-prefix: lm_head directly under language_model., everything else under language_model.model.
-        let new_key = if bare.starts_with("lm_head") {
-            format!("language_model.{}", bare)
-        } else {
-            format!("language_model.model.{}", bare)
-        };
+        // Language model: strip all known prefixes (longest-first) to the bare
+        // key, then re-prefix to the canonical mlx-vlm layout. See
+        // `remap_qwen35_body_key` for why the shorter hand-rolled chain that
+        // lived here doubled `model.model.` on triple-wrapped body keys.
+        let new_key = remap_qwen35_body_key(&key);
 
         new_weights.insert(new_key, value);
     }
@@ -4326,6 +4334,75 @@ pub(crate) fn infer_num_layers_from_weights(weights: &HashMap<String, MxArray>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding B regression: the `--quantize` refuse-pre-quantized-MTP guard
+    /// (`is_pre_quantized_mtp_key`) must detect MTP `scales`/`biases` under ALL
+    /// wrapper depths, including the longest triple-wrap
+    /// `model.language_model.model.`. Before the fix the hand-rolled strip chain
+    /// omitted that variant, so `model.language_model.` stripped first, leaving
+    /// `model.mtp.…` (which doesn't start with `mtp.`) → the guard missed it and
+    /// conversion could emit a corrupt checkpoint (MTP scales retained while the
+    /// body quant config was rewritten). The triple-wrapped case below is THE
+    /// regression — it was FALSE before, must be TRUE now.
+    #[test]
+    fn is_pre_quantized_mtp_key_detects_all_wrapper_depths() {
+        // Pre-quantized MTP keys across every wrapper depth → TRUE.
+        assert!(is_pre_quantized_mtp_key(
+            "model.language_model.model.mtp.layers.0.self_attn.q_proj.scales"
+        ));
+        assert!(is_pre_quantized_mtp_key(
+            "model.language_model.mtp.fc.scales"
+        ));
+        assert!(is_pre_quantized_mtp_key(
+            "language_model.model.mtp.norm.biases"
+        ));
+        assert!(is_pre_quantized_mtp_key("mtp.embed.scales"));
+        assert!(is_pre_quantized_mtp_key("model.mtp_proj.weight.scales"));
+
+        // Non-MTP body key with quant suffix → FALSE.
+        assert!(!is_pre_quantized_mtp_key(
+            "model.language_model.model.layers.0.mlp.gate_proj.scales"
+        ));
+        // MTP key without a quant suffix (not pre-quantized) → FALSE.
+        assert!(!is_pre_quantized_mtp_key(
+            "model.language_model.model.mtp.fc.weight"
+        ));
+    }
+
+    /// `remap_qwen35_body_key` must strip ALL wrapper depths via the
+    /// authoritative longest-first chain before re-prefixing to the canonical
+    /// mlx-vlm body layout. The triple-wrap case is the round-3 adversarial
+    /// regression: the prior hand-rolled chain stripped only the shorter
+    /// `model.language_model.`, leaving `model.layers.*` → it re-emitted a
+    /// DOUBLED `language_model.model.model.layers.*`.
+    #[test]
+    fn remap_qwen35_body_key_strips_all_wrapper_depths() {
+        // Round-3 adversarial regression: triple-wrap must NOT double `model.model.`.
+        assert_eq!(
+            remap_qwen35_body_key("model.language_model.model.layers.0.self_attn.q_proj.weight"),
+            "language_model.model.layers.0.self_attn.q_proj.weight"
+        );
+        // Double-wrap.
+        assert_eq!(
+            remap_qwen35_body_key("model.language_model.layers.0.mlp.gate_proj.weight"),
+            "language_model.model.layers.0.mlp.gate_proj.weight"
+        );
+        // `model.`-only.
+        assert_eq!(
+            remap_qwen35_body_key("model.layers.0.input_layernorm.weight"),
+            "language_model.model.layers.0.input_layernorm.weight"
+        );
+        // Already-bare.
+        assert_eq!(
+            remap_qwen35_body_key("layers.0.post_attention_layernorm.weight"),
+            "language_model.model.layers.0.post_attention_layernorm.weight"
+        );
+        // lm_head goes directly under `language_model.`, even triple-wrapped.
+        assert_eq!(
+            remap_qwen35_body_key("model.language_model.model.lm_head.weight"),
+            "language_model.lm_head.weight"
+        );
+    }
 
     /// Convenience: classify a key under a given mode.
     fn classify(

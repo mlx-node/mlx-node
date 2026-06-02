@@ -453,6 +453,14 @@ pub(crate) struct AdaptiveDepthPolicy {
     /// Per-depth observation count. EMA-decay only kicks in once a
     /// depth has been observed at least `MIN_COLD_SAMPLES` times.
     sample_count: [u32; MAX_DEPTH as usize],
+    /// Per-depth `total_cycles` value at the most recent observation of
+    /// that depth. Drives the age-based freshness gate in
+    /// `stale_neighbor` — a neighbor whose EMA has not been refreshed
+    /// for `>= FULL_REPROBE_INTERVAL` cycles is considered drifted and
+    /// becomes a reprobe candidate. `0` means "never sampled" (which,
+    /// once `total_cycles >= FULL_REPROBE_INTERVAL`, also reads as
+    /// aged-out, matching the under-seeded path). Indexed by `depth - 1`.
+    last_sampled_cycle: [u64; MAX_DEPTH as usize],
     /// The depth currently being used (and the depth the policy would
     /// commit to in `Full` state).
     current_depth: u8,
@@ -500,6 +508,7 @@ impl AdaptiveDepthPolicy {
         Self {
             rate_ema: [0.0; MAX_DEPTH as usize],
             sample_count: [0; MAX_DEPTH as usize],
+            last_sampled_cycle: [0; MAX_DEPTH as usize],
             current_depth: d,
             state: AdaptiveState::Explore,
             window: WindowStats::default(),
@@ -557,6 +566,11 @@ impl AdaptiveDepthPolicy {
         self.total_cycles += 1;
         let d = c.depth.clamp(MIN_DEPTH, MAX_DEPTH);
         let idx = (d - 1) as usize;
+        // Stamp the freshness clock for this depth: it was just sampled
+        // at the current cycle count. Read by `stale_neighbor`'s
+        // age-based drift gate. Done for EVERY sampled depth regardless
+        // of which EMA branch runs below.
+        self.last_sampled_cycle[idx] = self.total_cycles;
 
         // Per-depth rate EMA: cold-start exact mean for first
         // MIN_COLD_SAMPLES samples, then EMA.
@@ -664,7 +678,7 @@ impl AdaptiveDepthPolicy {
         // Third: periodic NeighborProbe to keep adjacent depths' EMA
         // fresh in case the optimum drifted. Probes are spaced
         // `FULL_REPROBE_INTERVAL` cycles apart; pick the most-stale
-        // neighbor (lowest sample_count) within ±1.
+        // neighbor within ±1 (under-seeded first, else oldest EMA).
         if self.cycles_in_state >= FULL_REPROBE_INTERVAL {
             if let Some(neighbor) = self.stale_neighbor() {
                 self.probe_depth = neighbor;
@@ -677,9 +691,48 @@ impl AdaptiveDepthPolicy {
         }
     }
 
-    /// Return the neighbor of `current_depth` (`±1` clamped to
-    /// `[MIN_DEPTH, MAX_DEPTH]`) whose EMA is most stale, or `None` if
-    /// both neighbors are well-seeded.
+    /// Return the most-stale neighbor of `current_depth` (`±1` clamped
+    /// to `[MIN_DEPTH, MAX_DEPTH]`), or `None` if no in-range neighbor
+    /// warrants a reprobe right now.
+    ///
+    /// Freshness is age-based. A neighbor `d` is a reprobe *candidate*
+    /// when it is EITHER under-seeded — `sample_count[d-1] <
+    /// MIN_COLD_SAMPLES`, i.e. still on the cold-start cumulative-mean
+    /// path — OR aged out:
+    /// `total_cycles - last_sampled_cycle[d-1] >= FULL_REPROBE_INTERVAL`,
+    /// i.e. its EMA has not been refreshed for a full reprobe interval so
+    /// the optimum may have drifted out from under it.
+    ///
+    /// Of the candidates we refresh the most-stale: an under-seeded
+    /// neighbor is always preferred over a merely-aged one, and among
+    /// equally-seeded neighbors the one with the oldest (smallest)
+    /// `last_sampled_cycle` wins. When NO in-range neighbor qualifies —
+    /// e.g. a neighbor was just touched by a hill-climb move or a recent
+    /// probe — we return `None`, which lets `maybe_full_transition` take
+    /// its "both neighbors fresh enough" branch (so that branch is
+    /// genuinely reachable). The age subtraction is underflow-safe:
+    /// `last_sampled_cycle` is only ever assigned a past `total_cycles`,
+    /// so `total_cycles >= last_sampled_cycle` always holds — and we use
+    /// `saturating_sub` to make that obvious at the call site.
+    ///
+    /// Historical note (PR #65, Cursor Bugbot, Low): the ORIGINAL code
+    /// pushed *every* in-range neighbor unconditionally and returned the
+    /// min-by-count, so — because `current_depth ∈ [MIN_DEPTH, MAX_DEPTH]`
+    /// and `MIN_DEPTH != MAX_DEPTH` — at least one candidate always
+    /// existed and the function never returned `None`, making the "both
+    /// neighbors fresh enough" branch dead code. The first fix gated
+    /// purely on `sample_count < MIN_COLD_SAMPLES`, which over-corrected:
+    /// `record_cycle` SATURATES `sample_count` at `MIN_COLD_SAMPLES` (it
+    /// increments only on the cold-start branch, then switches to the EMA
+    /// branch and never increments again), so after a normal `Explore`
+    /// sweep every depth sits at exactly `MIN_COLD_SAMPLES`, the filter
+    /// is always empty, and the count-only `stale_neighbor` returned
+    /// `None` FOREVER — silently killing the documented periodic drift
+    /// refresh. Gating on freshness (under-seeded OR aged out by
+    /// `FULL_REPROBE_INTERVAL` cycles) (a) restores that periodic drift
+    /// reprobe the count-only fix had killed, and (b) still lets
+    /// `stale_neighbor` return `None` when a neighbor was recently
+    /// sampled, keeping the else-branch live.
     fn stale_neighbor(&self) -> Option<u8> {
         let cur = self.current_depth;
         let mut candidates: Vec<u8> = Vec::with_capacity(2);
@@ -691,7 +744,24 @@ impl AdaptiveDepthPolicy {
         }
         candidates
             .into_iter()
-            .min_by_key(|&d| self.sample_count[(d - 1) as usize])
+            .filter(|&d| {
+                let i = (d - 1) as usize;
+                // Under-seeded (never left the cold-start path) OR the
+                // EMA has aged out (>= a full reprobe interval since the
+                // last observation) ⇒ worth a refresh.
+                let under_seeded = self.sample_count[i] < MIN_COLD_SAMPLES;
+                let age = self.total_cycles.saturating_sub(self.last_sampled_cycle[i]);
+                under_seeded || age >= FULL_REPROBE_INTERVAL as u64
+            })
+            // Most-stale first: prefer the under-seeded neighbor (sorts
+            // before any seeded one), then — among equally-seeded
+            // neighbors — the one with the oldest (smallest)
+            // `last_sampled_cycle`.
+            .min_by_key(|&d| {
+                let i = (d - 1) as usize;
+                let seeded = self.sample_count[i] >= MIN_COLD_SAMPLES;
+                (seeded, self.last_sampled_cycle[i])
+            })
     }
 
     /// `NeighborProbe` → `Full`. Just run for the configured number of
@@ -1013,25 +1083,132 @@ mod tests {
     }
 
     /// Periodic `NeighborProbe` fires after `FULL_REPROBE_INTERVAL`
-    /// cycles in `Full` and pushes fresh observations through the
-    /// neighbor's EMA.
+    /// cycles in `Full` *when a neighbor is under-seeded*, and pushes
+    /// fresh observations through that neighbor's EMA.
+    ///
+    /// Under the age-based `stale_neighbor` rule, under-seeded is still a
+    /// trigger AND ranks ahead of a merely-aged neighbor. We hand-seed
+    /// the policy into `Full` at depth 3 with the upper neighbor (depth
+    /// 4) left under-seeded. The lower neighbor (depth 2) is seeded; by
+    /// the time the interval fires it has also aged out (it is never
+    /// re-sampled in `Full`), but the under-seeded-first tie-break makes
+    /// depth 4 the unambiguous probe target regardless.
     #[test]
     fn full_launches_neighbor_probe_at_interval() {
         let mut p = AdaptiveDepthPolicy::new(3);
-        // Constant-rate exploration ⇒ Full at depth 1 (ties broken
-        // by lowest depth in `best_seeded_depth`).
-        drive_cycles(&mut p, EXPLORE_TOTAL, |_d| (3, 30_000_000));
-        assert_eq!(p.state, AdaptiveState::Full);
+        // Seed depths 1,2,3 (and 5) to the seeding bar but leave the
+        // upper neighbor (depth 4) under-seeded so a reprobe is owed.
+        for d in [MIN_DEPTH, 2, 3, MAX_DEPTH] {
+            p.sample_count[(d - 1) as usize] = MIN_COLD_SAMPLES;
+            p.rate_ema[(d - 1) as usize] = 100.0;
+        }
+        // Depth 4 stays at 0 samples (the stale neighbor). Make sure
+        // the hill-climb keeps `current_depth` at 3 by giving it the
+        // strictly-best rate among seeded depths.
+        p.rate_ema[(3 - 1) as usize] = 200.0;
+        p.current_depth = 3;
+        p.enter_full();
         let cur_before = p.current_depth;
+        assert_eq!(cur_before, 3);
 
         // Drive `FULL_REPROBE_INTERVAL` cycles in Full. We should
         // enter NeighborProbe at least once.
+        let mut entered_probe = false;
+        let mut probe_target = None;
+        for _ in 0..(FULL_REPROBE_INTERVAL + NEIGHBOR_PROBE_CYCLES + 4) {
+            let d = p.pick_depth();
+            // Full accept (committed = depth + 1) keeps acceptance at
+            // 1.0 so the policy never drops to Reduced before the
+            // reprobe interval fires.
+            p.record_cycle(CycleStats {
+                depth: d,
+                committed: (d as u32) + 1,
+                wall_ns: 30_000_000,
+            });
+            if p.state == AdaptiveState::NeighborProbe {
+                entered_probe = true;
+                probe_target = Some(p.pick_depth());
+            }
+        }
+        assert!(
+            entered_probe,
+            "NeighborProbe must fire within FULL_REPROBE_INTERVAL + buffer cycles when a neighbor is under-seeded"
+        );
+        // The under-seeded neighbor (depth 4) must be the probe target.
+        assert_eq!(
+            probe_target,
+            Some(4),
+            "the stale (under-seeded) neighbor must be the reprobe target"
+        );
+    }
+
+    /// PR #65 / age-based-fix regression test (B) — **else-branch
+    /// reachable**: `stale_neighbor` returns `None` (and so
+    /// `maybe_full_transition` takes its "both neighbors fresh enough"
+    /// branch) when both in-range neighbors are well-seeded AND were
+    /// sampled recently (within the last `FULL_REPROBE_INTERVAL`
+    /// cycles). This proves a recently-sampled, well-seeded neighbor is
+    /// NOT a reprobe candidate, so the else-branch is live — the
+    /// original unconditional-`Some` made it dead code.
+    ///
+    /// Hand-seeds the per-depth state and calls `stale_neighbor`
+    /// directly (the "both fresh" configuration is unreachable via the
+    /// production Explore sweep, which leaves the current depth's
+    /// neighbors un-sampled in `Full`).
+    #[test]
+    fn stale_neighbor_none_when_neighbors_seeded_and_fresh() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        p.current_depth = 3;
+        // Both neighbors (depths 2 and 4) seeded to the bar...
+        for d in MIN_DEPTH..=MAX_DEPTH {
+            p.sample_count[(d - 1) as usize] = MIN_COLD_SAMPLES;
+        }
+        // ...and freshly sampled: their last-sampled cycle equals the
+        // current cycle count, so age == 0 < FULL_REPROBE_INTERVAL.
+        p.total_cycles = 100;
+        p.last_sampled_cycle[(2 - 1) as usize] = p.total_cycles;
+        p.last_sampled_cycle[(4 - 1) as usize] = p.total_cycles;
+
+        assert_eq!(
+            p.stale_neighbor(),
+            None,
+            "stale_neighbor must return None when both neighbors are well-seeded AND freshly sampled"
+        );
+    }
+
+    /// PR #65 / age-based-fix regression test (C) — **drift reprobe
+    /// restored** (the anti-regression for this finding). With every
+    /// depth seeded to `MIN_COLD_SAMPLES`, the policy enters `Full` at
+    /// depth 3 and runs constant-rate, full-accept cycles at depth 3
+    /// only. The neighbors (depths 2 and 4) therefore go un-sampled, and
+    /// once they age out by `>= FULL_REPROBE_INTERVAL` cycles the
+    /// periodic drift `NeighborProbe` MUST fire. This is exactly the
+    /// test that FAILS under the broken count-only filter (which never
+    /// re-fires once every depth saturates at `MIN_COLD_SAMPLES`).
+    /// Acceptance is kept maximal (committed = depth + 1) so the policy
+    /// never drops to `Reduced` before the reprobe fires.
+    #[test]
+    fn full_relaunches_neighbor_probe_on_drift() {
+        let mut p = AdaptiveDepthPolicy::new(3);
+        // Seed every depth to the bar; make depth 3 the strict winner so
+        // the hill-climb pins current_depth at 3 (its neighbors are the
+        // ones that drift).
+        for d in MIN_DEPTH..=MAX_DEPTH {
+            p.sample_count[(d - 1) as usize] = MIN_COLD_SAMPLES;
+            p.rate_ema[(d - 1) as usize] = 100.0;
+        }
+        p.rate_ema[(3 - 1) as usize] = 200.0;
+        p.current_depth = 3;
+        p.enter_full();
+
+        // Run depth-3-only cycles past the reprobe interval. Neighbors 2
+        // and 4 are never re-sampled ⇒ they age out ⇒ drift reprobe.
         let mut entered_probe = false;
         for _ in 0..(FULL_REPROBE_INTERVAL + NEIGHBOR_PROBE_CYCLES + 4) {
             let d = p.pick_depth();
             p.record_cycle(CycleStats {
                 depth: d,
-                committed: 3,
+                committed: (d as u32) + 1,
                 wall_ns: 30_000_000,
             });
             if p.state == AdaptiveState::NeighborProbe {
@@ -1040,24 +1217,8 @@ mod tests {
         }
         assert!(
             entered_probe,
-            "NeighborProbe must fire within FULL_REPROBE_INTERVAL + buffer cycles"
+            "drift reprobe must fire: aged-out neighbors trigger a NeighborProbe even when every depth is seeded to MIN_COLD_SAMPLES"
         );
-        // Probe target must be an adjacent depth.
-        // Sanity: the candidate neighbor pool for cur_before is
-        // within ±1 of cur_before (clamped to [MIN_DEPTH, MAX_DEPTH]).
-        // We pick the one with the lowest sample count.
-        let mut candidates: Vec<u8> = Vec::with_capacity(2);
-        if cur_before > MIN_DEPTH {
-            candidates.push(cur_before - 1);
-        }
-        if cur_before < MAX_DEPTH {
-            candidates.push(cur_before + 1);
-        }
-        let chosen = candidates
-            .into_iter()
-            .min_by_key(|&d| p.sample_count[(d - 1) as usize])
-            .unwrap_or(cur_before);
-        assert!((MIN_DEPTH..=MAX_DEPTH).contains(&chosen));
     }
 
     /// Bounds: `pick_depth` always returns a value in

@@ -322,6 +322,16 @@ pub(crate) struct Qwen35Inner {
     /// The compiled C++ forward path is bypassed entirely on the paged
     /// path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// PR #65 (mtp-reload P2) — true when a paged-core turn has populated
+    /// the paged adapter's `LayerKVPool` since the last flat full-attention
+    /// prefill, so the flat `self.caches` full-attention slots do NOT
+    /// reflect the conversation history. The streaming dense-MTP fallback
+    /// (`chat_stream_tokens_delta_sync_inner`) consults this to decide
+    /// whether it must rebuild the flat caches from the full history before
+    /// decoding. Set by the paged cores; cleared after a flat prefill. This
+    /// keeps the rebuild a ONE-TIME cost on the paged→dense transition
+    /// instead of re-prefilling the whole history on every MTP turn.
+    pub(crate) paged_full_attn_caches_dirty: bool,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -912,6 +922,7 @@ impl Qwen35Inner {
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_adapter,
+            paged_full_attn_caches_dirty: false,
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
@@ -3026,6 +3037,13 @@ impl Qwen35Inner {
             return Err(Error::from_reason("Empty prompt"));
         }
 
+        // PR #65 (mtp-reload P2) — this paged turn writes full-attention K/V
+        // into the paged adapter pool, NOT the flat `self.caches`, so the flat
+        // full-attention slots no longer reflect the conversation. A later
+        // streaming dense-MTP fallback must rebuild the flat caches before
+        // decoding. See `paged_full_attn_caches_dirty`.
+        self.paged_full_attn_caches_dirty = true;
+
         let prompt_token_count = tokens.len() as u32;
         let sampling_config = p.sampling_config;
 
@@ -4050,6 +4068,12 @@ impl Qwen35Inner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+
+        // PR #65 (mtp-reload P2) — this paged turn writes full-attention K/V
+        // into the paged adapter pool, NOT the flat `self.caches`, so a later
+        // streaming dense-MTP fallback must rebuild the flat caches before
+        // decoding. See `paged_full_attn_caches_dirty`.
+        self.paged_full_attn_caches_dirty = true;
 
         let prompt_token_count = tokens.len() as u32;
         let sampling_config = p.sampling_config;
@@ -5114,22 +5138,94 @@ impl Qwen35Inner {
 
         let mut profiler =
             crate::decode_profiler::DecodeProfiler::new("chat_stream_delta", "qwen3_5");
-        profiler.set_prompt_tokens(delta_tokens.len() as u32);
+        // Prefill token count is reported below per-branch: the paged→dense
+        // fallback re-prefills the FULL history (see `rebuild_full_flat_prefill`),
+        // every other delta turn prefills only the delta.
         profiler.snapshot_memory_before();
 
-        // Text-only prefill of the delta on top of the existing caches.
+        // PR #65 mtp-reload P2 — paged→dense-MTP cache-source transition.
+        //
+        // When `mtp_takes_dense_path` is true we arrived here off a PAGED
+        // session (`self.paged_adapter.is_some()`) that fell through the
+        // paged streaming core because it carries no MTP gate yet. On the
+        // paged path the authoritative FULL-ATTENTION K/V lives in the
+        // paged adapter's `LayerKVPool`, NOT in the flat `self.caches`
+        // (which only ever received GDN linear conv/recurrent state). A
+        // prior NON-streaming paged turn (`send()` → `chat_tokens_delta_sync`
+        // → `chat_sync_core_paged`) therefore leaves `self.caches`'
+        // full-attention slots EMPTY/STALE for the prior turn's tokens.
+        // Delta-prefilling only `delta_tokens` on top of that and exporting
+        // `self.caches` into the compiled/MTP graph would decode from an
+        // incomplete flat prefix (missing the prior turn's attention KV).
+        //
+        // Fix: when taking this dense fallback AND the flat caches are dirty
+        // (a paged-core turn ran since the last flat prefill —
+        // `paged_full_attn_caches_dirty`), rebuild the flat caches from
+        // scratch over the FULL token history: reset to fresh caches and
+        // prefill `full_token_history` instead of just the delta. This
+        // mirrors how the dense session-start path recovers from a
+        // cache-prefix miss (full reset + full re-prefill). The GDN recurrent
+        // state cannot be rewound mid-sequence, so a full reset + full
+        // prefill is the only coherent way to seed both the GDN linear and
+        // full-attention flat caches for the compiled/MTP decode.
+        //
+        // The dirty gate keeps this a ONE-TIME cost on the paged→dense
+        // transition: the flag is cleared once at end-of-turn success (atomic
+        // with the `cached_token_history` commit), so subsequent streaming MTP
+        // turns delta-prefill on the now-authoritative flat caches (no O(n²)
+        // full re-prefill every turn). It re-arms only if a later paged-core
+        // turn runs again. The common non-paged dense
+        // session (`paged_adapter.is_none()`, `mtp_takes_dense_path == false`,
+        // flag never set) is untouched: it keeps the delta-on-existing-caches
+        // prefill below, byte-identical.
+        let rebuild_full_flat_prefill = mtp_takes_dense_path && self.paged_full_attn_caches_dirty;
+        profiler.set_prompt_tokens(if rebuild_full_flat_prefill {
+            full_token_history.len() as u32
+        } else {
+            delta_tokens.len() as u32
+        });
         profiler.begin_prefill();
-        let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
-        let mut last_logits = chunked_prefill(
-            &prompt,
-            &embedding_weight,
-            &mut self.layers,
-            &mut self.caches,
-            &self.final_norm,
-            &self.lm_head,
-            Some(&embedding_weight_t),
-            generation_stream,
-        )?;
+        let mut last_logits = if rebuild_full_flat_prefill {
+            // Discard the paged-session flat caches (full-attn slots are
+            // stale, GDN state belongs to the released paged request) and
+            // re-prefill the entire conversation into fresh flat caches.
+            self.caches = Some(fresh_dense_layer_caches(&self.config));
+            let prompt =
+                MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
+            chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?
+        } else {
+            // Text-only prefill of the delta on top of the existing caches.
+            let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
+            chunked_prefill(
+                &prompt,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &self.final_norm,
+                &self.lm_head,
+                Some(&embedding_weight_t),
+                generation_stream,
+            )?
+        };
+        // The flat full-attention caches now cover the full history (rebuild
+        // branch) or were already authoritative (delta branch). We do NOT
+        // clear `paged_full_attn_caches_dirty` here: the clear is co-located
+        // with the `cached_token_history` commit at the end-of-turn success
+        // boundary (`save_cache_state_after_delta` below), so that ANY
+        // mid-turn error — prefill OR decode — leaves the flag dirty. That
+        // way the next paged→dense turn still performs the protective one-time
+        // full rebuild over the authoritative history rather than trusting
+        // half-advanced flat caches paired with a stale `cached_token_history`.
+        // (mtp-reload P2)
         let seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
@@ -5629,6 +5725,13 @@ impl Qwen35Inner {
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
+        // Clear the paged-dirty flag ATOMICALLY with the
+        // `cached_token_history` commit above: a successful turn updates the
+        // committed history and the flat caches together, so the one-time
+        // protective rebuild is no longer needed until a later paged-core turn
+        // re-dirties it. Placing the clear here (not after prefill) guarantees
+        // any mid-turn `?`-error leaves the flag dirty. (mtp-reload P2)
+        self.paged_full_attn_caches_dirty = false;
 
         // Decode the full reply text and emit the final done chunk.
         let text = tokenizer_for_decode
@@ -5867,6 +5970,41 @@ impl Qwen35Inner {
             self.caches.is_some(),
         );
 
+        // PR #65 mtp-reload P2 — same paged→dense-MTP stale-flat-cache hazard
+        // as the streaming delta path, but for the stream-START dense
+        // fallback. A prior paged-core turn wrote full-attention K/V into the
+        // paged adapter pool, leaving the flat `self.caches` full-attention
+        // slots empty/stale (only GDN linear state was imported). A prefix
+        // hit from `verify_cache_prefix_direct` (matched against
+        // `cached_token_history`) would then decode from an incomplete flat
+        // prefix. When the flat caches are dirty, drop any prefix reuse so the
+        // branch below does a full reset + re-prefill (cached_prefix_len = 0),
+        // rebuilding the flat full-attention caches over the whole prompt.
+        //
+        // Reachability note: the flag is set ONLY by the two paged cores, and
+        // a non-MTP paged turn returns earlier at the
+        // `self.paged_adapter.is_some() && !mtp_takes_dense_path` branch above.
+        // So whenever control reaches here the flag can be true only on the
+        // paged+MTP (`mtp_takes_dense_path`) fallback; a non-paged dense start
+        // (`paged_adapter.is_none()`) never sets it → this is a no-op and the
+        // common path stays byte-identical. The ungated read is therefore
+        // equivalent to gating on `mtp_takes_dense_path`.
+        //
+        // The flag is cleared at the END-OF-TURN success boundary, co-located
+        // with the `cached_token_history` commit (`save_cache_state_direct`
+        // below), NOT here and NOT right after prefill. This makes the clear
+        // atomic with the history commit: ANY mid-turn `?`-error — prefill OR
+        // decode — aborts the turn with the flat caches still un-rebuilt and
+        // `cached_token_history` still holding the prior paged turn's tokens,
+        // so the flag stays dirty and the NEXT paged→dense turn performs the
+        // protective one-time full rebuild instead of decoding from an
+        // incomplete flat prefix. Mirrors the reviewed delta path.
+        let cached_prefix_len = if self.paged_full_attn_caches_dirty {
+            0
+        } else {
+            cached_prefix_len
+        };
+
         let prefill_tokens = if cached_prefix_len > 0 {
             if has_images {
                 info!(
@@ -6042,6 +6180,18 @@ impl Qwen35Inner {
             (last_logits, total_seq_len, false)
         };
         profiler.end_prefill();
+
+        // PR #65 mtp-reload P2 — on a paged→dense-MTP transition the dirty gate
+        // forced `cached_prefix_len = 0`, so the prefill above was a full reset
+        // + full re-prefill and the flat full-attention caches now cover the
+        // entire prompt. We do NOT clear `paged_full_attn_caches_dirty` here:
+        // the clear is co-located with the `cached_token_history` commit at the
+        // end-of-turn success boundary (`save_cache_state_direct` below), so it
+        // is atomic with the history write. That way ANY mid-turn `?`-error —
+        // prefill OR decode — leaves the flag dirty and the next paged→dense
+        // turn still performs the protective one-time full rebuild rather than
+        // trusting half-advanced flat caches against a stale committed history.
+        // (No-op on the common non-paged path, where the flag is never set.)
 
         // Phase C — pair the captured prompt hiddens with the exact
         // `prefill_tokens` whose hiddens they hold. `Some` iff the
@@ -6581,6 +6731,15 @@ impl Qwen35Inner {
             &mut self.cached_rope_deltas,
             &mut self.caches,
         );
+        // Clear the paged-dirty flag ATOMICALLY with the
+        // `cached_token_history` commit above: a successful turn updates the
+        // committed history and the rebuilt flat caches together, so the
+        // one-time protective rebuild is no longer needed until a later
+        // paged-core turn re-dirties it. Placing the clear here (not after
+        // prefill) guarantees any mid-turn `?`-error — prefill OR decode —
+        // leaves the flag dirty so the next paged→dense turn rebuilds.
+        // (mtp-reload P2)
+        self.paged_full_attn_caches_dirty = false;
 
         let text = tokenizer_for_decode
             .decode_sync(&generated_tokens, true)

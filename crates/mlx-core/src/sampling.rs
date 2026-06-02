@@ -43,6 +43,28 @@ impl Default for SamplingConfig {
 
 const SPARSE_DISTRIBUTION_MAX_TOP_K: i32 = 256;
 
+/// f32 epsilon at or below which a `temperature` selects the greedy (argmax)
+/// sampler path. MUST equal the C++ `GREEDY_TEMPERATURE_EPS` (`1e-6f`) in
+/// `crates/mlx-sys/src/mlx_misc_ops.cpp`.
+pub(crate) const GREEDY_TEMPERATURE_EPS: f32 = 1e-6;
+
+/// Whether `temperature` selects the greedy (argmax) sampler path.
+///
+/// CRITICAL — this MUST reproduce the C++ greedy guard BIT-FOR-BIT. The
+/// sampler FFIs (`mlx_compiled_sample_full`, `mlx_compiled_sampling_distribution`,
+/// `mlx_compiled_sample_and_logprobs`) take `temperature` as `f32`, and C++
+/// compares `(f32)temperature <= GREEDY_TEMPERATURE_EPS` (`1e-6f`). If the Rust
+/// accept/sparse gates compared the *f64* temperature against an f64 `1e-6`
+/// instead, a value in the narrow window `(1e-6_f64, 1e-6f-as-real ≈ 1.0000000117e-6]`
+/// would be stochastic to Rust but greedy to C++ — reintroducing the
+/// draw-vs-accept distribution mismatch the q/p (proposal/target) path exists to
+/// prevent. Casting to f32 BEFORE the comparison reproduces the C++ decision
+/// exactly (same IEEE round-to-nearest cast, same `1e-6f` threshold bit pattern,
+/// same `<=`).
+pub(crate) fn is_greedy_temperature(temperature: f64) -> bool {
+    (temperature as f32) <= GREEDY_TEMPERATURE_EPS
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SamplerParityMode {
     Current,
@@ -390,7 +412,10 @@ pub(crate) fn sparse_distribution_supported(config: &SamplingConfig) -> bool {
     let temperature = config.temperature.unwrap_or(1.0);
     let top_k = config.top_k.unwrap_or(0);
     let min_p = config.min_p.unwrap_or(0.0);
-    temperature > 1e-6 && top_k > 0 && top_k <= SPARSE_DISTRIBUTION_MAX_TOP_K && min_p <= 0.0
+    !is_greedy_temperature(temperature)
+        && top_k > 0
+        && top_k <= SPARSE_DISTRIBUTION_MAX_TOP_K
+        && min_p <= 0.0
 }
 
 /// Apply temperature scaling to logits
@@ -711,6 +736,48 @@ pub(crate) fn sample_compiled(logits: &MxArray, config: Option<SamplingConfig>) 
         )
     };
     MxArray::from_handle(handle, "compiled_sample_full")
+}
+
+/// Build the normalized probability distribution that `sample`/`sample_compiled`
+/// draws from, using the EXACT same compiled filter chain (`top_k`, `top_p`,
+/// `min_p`) and active `sampler_parity_mode()`.
+///
+/// The returned array is `softmax(filtered_logits * inv_temp)` over the last
+/// axis (filtered-out tokens are exactly 0). `inv_temp` is `1/temperature` in
+/// the default mode and `1.0` in MTPLX parity mode (where temperature is folded
+/// into `filtered_logits` upstream), matching the compiled sampler exactly. Use
+/// it for stochastic MTP
+/// acceptance so the proposal density `q` (draft logits) and target density `p`
+/// (verify logits) match the distribution the token was actually drawn from —
+/// preserving Leviathan-Chen exactness for arbitrary temperature/top_k/top_p/
+/// min_p and both parity modes.
+///
+/// NOTE: at `temperature <= 1e-6` the sampler is argmax-only and the acceptance
+/// path ignores `q`/`p`. This wrapper forwards `temperature == 0.0` to the C++
+/// argmax one-hot path; callers on the greedy accept shortcut should simply not
+/// call this. Shape and dtype mirror `logits` (last-axis softmax); cast to f32
+/// for the accept math.
+pub(crate) fn sampling_distribution(
+    logits: &MxArray,
+    config: Option<SamplingConfig>,
+) -> Result<MxArray> {
+    let cfg = config.unwrap_or_default();
+    let temperature = cfg.temperature.unwrap_or(1.0);
+    let top_k = cfg.top_k.unwrap_or(0);
+    let top_p = cfg.top_p.unwrap_or(1.0);
+    let min_p = cfg.min_p.unwrap_or(0.0);
+
+    let handle = unsafe {
+        sys::mlx_compiled_sampling_distribution(
+            logits.handle.0,
+            temperature as f32,
+            top_k,
+            top_p as f32,
+            min_p as f32,
+            sampler_parity_mode().ffi_code(),
+        )
+    };
+    MxArray::from_handle(handle, "compiled_sampling_distribution")
 }
 
 /// Sample and return both token and logprobs (eliminates redundant computation)
@@ -1136,7 +1203,7 @@ pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     // parity. `sampling_config.temperature` is `Option<f64>` with the
     // default = 1.0; `None` also routes here as 1.0 (no shortcut).
     let temperature = sampling_config.temperature.unwrap_or(1.0);
-    if temperature <= 1e-6 {
+    if is_greedy_temperature(temperature) {
         // fp32 for the argmax so we read from a deterministic dtype.
         let p_target_f32 = p_target.astype(DType::Float32)?;
         let argmax_arr = p_target_f32.argmax(0, None)?;
@@ -2544,5 +2611,213 @@ mod accept_with_residual_tests {
             .expect("accept_with_residual");
         assert!(!accepted, "T=0: argmax(p_target) != draft_id must reject");
         assert_eq!(out, 1, "T=0 reject must emit argmax(p_target)");
+    }
+
+    fn dist_vec(arr: &MxArray) -> Vec<f32> {
+        arr.astype(DType::Float32)
+            .expect("astype f32")
+            .to_float32()
+            .expect("to_float32")
+            .to_vec()
+    }
+
+    /// FINDING 1 regression: `sampling_distribution` (the legacy-accept
+    /// proposal/target builder) must NOT error at temperature == 0 — the prior
+    /// `apply_sampling` rebuild did, turning a supported greedy MTP config into
+    /// a hard error. At T=0 it returns the one-hot argmax distribution.
+    #[test]
+    fn sampling_distribution_t_zero_is_one_hot_argmax_no_error() {
+        let logits = MxArray::from_float32(&[0.1f32, 2.0, 0.5, -1.0], &[4]).expect("logits");
+        let dist = sampling_distribution(&logits, Some(greedy_cfg()))
+            .expect("sampling_distribution must not error at T=0");
+        let v = dist_vec(&dist);
+        // argmax index = 1.
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+    }
+
+    /// T6 regression: the C++ samplers must treat the whole `[0, 1e-6]`
+    /// temperature band as greedy (argmax), matching the Rust accept gates
+    /// (`temperature <= 1e-6`). At a tiny but NON-zero `T = 1e-7`, `sample`
+    /// must return the argmax DETERMINISTICALLY across many draws.
+    ///
+    /// The logit gaps are sized to the temperature on purpose: with
+    /// `inv_temp = 1e7`, gaps of `1e-7`/`2e-7` scale to O(1) (`[0, 2, 1, …]`),
+    /// so the OLD stochastic path (`categorical(logits·1e7)`) would draw the
+    /// argmax only ~66% of the time and would pick a non-argmax token within a
+    /// handful of the 32 draws. The NEW argmax band returns index 1 every time.
+    /// (A larger gap would underflow `softmax(·1e7)` to one-hot and the test
+    /// would no longer distinguish stochastic-vs-greedy — i.e. be a tautology.)
+    #[test]
+    fn sample_tiny_temperature_is_deterministic_argmax() {
+        // argmax is index 1 (2e-7); index 2 (1e-7) is the temperature-scaled
+        // runner-up that a stochastic draw would frequently select.
+        let logits =
+            MxArray::from_float32(&[0.0f32, 2e-7, 1e-7, -1.0, -3.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1e-7),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        for draw in 0..32 {
+            let tok = sample(&logits, Some(cfg)).expect("sample tiny-T");
+            tok.eval();
+            let id = tok.item_at_int32(0).expect("token id");
+            assert_eq!(
+                id, 1,
+                "tiny-T sample must be deterministic argmax (draw {draw} returned {id})"
+            );
+        }
+    }
+
+    /// T6 regression: `sampling_distribution` at a tiny but non-zero
+    /// `T = 1e-7` must return the one-hot argmax (the greedy band must extend
+    /// past exactly 0.0), so AR and MTP stay byte-consistent at tiny T.
+    ///
+    /// The gaps are temperature-scaled (`inv_temp = 1e7`) so this is NOT a
+    /// tautology: under the OLD `== 0.0f` guard this path returned
+    /// `softmax(logits·1e7) = softmax([0, 2, 1, …]) ≈ [0.09, 0.665, 0.245, …]`
+    /// — clearly NOT one-hot. The NEW `<= 1e-6` band returns an exact one-hot
+    /// at the argmax, which the assertions below pin.
+    #[test]
+    fn sampling_distribution_tiny_temperature_is_one_hot_argmax() {
+        let logits =
+            MxArray::from_float32(&[0.0f32, 2e-7, 1e-7, -1.0, -3.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1e-7),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let v = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist tiny-T"));
+        // One-hot at argmax index 1 — under the old softmax path v[1] would be
+        // ~0.665 and v[0]/v[2] non-zero, so these assertions genuinely fail
+        // unless the greedy band extends past exactly 0.0.
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+        assert_close(v[4], 0.0, 1e-6);
+    }
+
+    /// FINDING 2 (no-filter): with `top_k==0`, `top_p==1`, `min_p==0` and a
+    /// non-unit temperature, the compiled draw is `categorical(logits/temp)` =
+    /// `softmax(logits/temp)`. `sampling_distribution` must return exactly that
+    /// distribution so the legacy proposal/target density matches the draw.
+    /// This is the COMMON case (default `top_k==0`).
+    #[test]
+    fn sampling_distribution_no_filter_matches_softmax_over_temperature() {
+        let logits = MxArray::from_float32(&[1.0f32, 2.0, 3.0], &[3]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(0.5),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let dist = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist"));
+
+        // Reference: softmax([1,2,3] / 0.5) = softmax([2,4,6]).
+        let scaled = [2.0f64, 4.0, 6.0];
+        let max = 6.0f64;
+        let exps: Vec<f64> = scaled.iter().map(|x| (x - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        for i in 0..3 {
+            assert_close(dist[i], (exps[i] / sum) as f32, 1e-5);
+        }
+    }
+
+    /// FINDING 2 (filtered): for a sparse-supported config, the per-token
+    /// proposal density built by `sampling_distribution` must agree with the
+    /// `sparse_distributions_from_logits` probabilities the draft path already
+    /// uses — they describe the SAME compiled draw, so accept/reject is
+    /// consistent whether the cycle takes the legacy or sparse branch.
+    #[test]
+    fn sampling_distribution_agrees_with_sparse_helper_on_supported_config() {
+        let logits = MxArray::from_float32(&[3.0f32, 2.0, 1.0, 0.0, -1.0], &[5]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(0.7),
+            top_k: Some(3),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        // Dense distribution from the compiled sampler path.
+        let dense = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dense dist"));
+
+        // Sparse helper rows for the SAME config + parity mode.
+        let logits_row = logits.reshape(&[1, 5]).expect("reshape");
+        let sparse =
+            sparse_distributions_from_logits_with_mode(&logits_row, &cfg, sampler_parity_mode())
+                .expect("sparse dist")
+                .expect("supported");
+        let row = sparse.row(0).expect("row0");
+
+        // Top-3 support is {0,1,2}; tokens 3 and 4 must be filtered out (0).
+        assert_close(dense[3], 0.0, 1e-6);
+        assert_close(dense[4], 0.0, 1e-6);
+        for (tok, &d) in dense.iter().take(3).enumerate() {
+            assert_close(d, row.probability(tok as i32) as f32, 1e-5);
+        }
+    }
+
+    /// FINDING A regression (predicate): `is_greedy_temperature` must agree
+    /// with the C++ greedy guard `(f32)temperature <= 1e-6f` BIT-FOR-BIT. The
+    /// boundary value `1.00000001e-6` is the exact case Codex flagged: as a
+    /// real f64 it is `> 1e-6` (stochastic under the OLD f64 gate), but its
+    /// nearest f32 rounds to `1e-6f`, so C++ takes its greedy branch. Casting
+    /// to f32 before the comparison reproduces that — this test locks the two
+    /// precisions together so the draw-vs-accept distribution can't desync.
+    #[test]
+    fn is_greedy_temperature_matches_cpp_f32_boundary() {
+        // 1.00000001e-6 is > 1e-6 as a real f64, but rounds to 1e-6f → greedy.
+        assert!(is_greedy_temperature(1.00000001e-6));
+        assert!(is_greedy_temperature(0.0));
+        assert!(is_greedy_temperature(1e-7));
+        assert!(!is_greedy_temperature(1e-3));
+        assert!(!is_greedy_temperature(1.0));
+    }
+
+    /// FINDING A regression (end-to-end): at the flagged boundary
+    /// `T = 1.00000001e-6`, the C++ `sampling_distribution` must take its
+    /// GREEDY branch — i.e. return the exact one-hot at the argmax — matching
+    /// `is_greedy_temperature(1.00000001e-6) == true`. This proves the f32 cast
+    /// in the predicate reproduces the actual C++ sampler decision (not just an
+    /// f32 reinterpretation in Rust), so the Rust accept gates and the C++ draw
+    /// agree across the whole `(1e-6_f64, 1e-6f-as-real]` window.
+    #[test]
+    fn sampling_distribution_at_f32_boundary_is_greedy_one_hot() {
+        // Clear unique max at index 1.
+        let logits = MxArray::from_float32(&[0.0f32, 3.0, 1.0, -1.0], &[4]).expect("logits");
+        let cfg = SamplingConfig {
+            temperature: Some(1.00000001e-6),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        // Predicate says greedy; the compiled sampler must agree (one-hot).
+        assert!(is_greedy_temperature(1.00000001e-6));
+        let v = dist_vec(&sampling_distribution(&logits, Some(cfg)).expect("dist boundary-T"));
+        assert_close(v[0], 0.0, 1e-6);
+        assert_close(v[1], 1.0, 1e-6);
+        assert_close(v[2], 0.0, 1e-6);
+        assert_close(v[3], 0.0, 1e-6);
+
+        // Contrast: at T = 1.0 (clearly stochastic) the same logits spread
+        // mass — the argmax does NOT carry probability 1.0. This is
+        // deterministic (it asserts on the DISTRIBUTION, not a draw).
+        let stochastic_cfg = SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let s = dist_vec(&sampling_distribution(&logits, Some(stochastic_cfg)).expect("dist T=1"));
+        assert!(
+            s[1] < 0.999,
+            "T=1 distribution must not be one-hot at argmax (got {})",
+            s[1]
+        );
     }
 }

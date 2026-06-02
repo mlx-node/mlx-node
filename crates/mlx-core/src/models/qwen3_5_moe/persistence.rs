@@ -151,13 +151,10 @@ fn sanitize_weights(
             continue;
         }
 
-        let name = name
-            .strip_prefix("model.language_model.")
-            .or_else(|| name.strip_prefix("language_model.model."))
-            .or_else(|| name.strip_prefix("language_model."))
-            .or_else(|| name.strip_prefix("model."))
-            .unwrap_or(&name)
-            .to_string();
+        // Shared longest-first chain so raw VLM-wrapped
+        // `model.language_model.model.mtp.*` keys are not silently dropped —
+        // see `mtp_drafter::strip_wrapper_prefix`.
+        let name = crate::models::mtp_drafter::strip_wrapper_prefix(&name).to_string();
 
         // Rename special keys (including quantization metadata .scales/.biases)
         let name = if let Some(suffix) = name.strip_prefix("embed_tokens.") {
@@ -1434,6 +1431,14 @@ fn register_moe_weights_with_cpp(
     // (`register_weights_with_cpp`) for the full rationale.
     unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
 
+    // PR #65 (mtp-reload P1) — also invalidate the MoE-specific compiled
+    // graphs (the MTP-verify graph plus the flat + paged AR-decode graphs
+    // in `mlx_qwen35_moe.cpp`), which bake expert/attention weights inside
+    // their traced closures and are NOT touched by the dense invalidation
+    // above. Same write-lock critical section so no in-flight compiled read
+    // overlaps.
+    unsafe { sys::mlx_qwen35_moe_invalidate_compiled_graphs() };
+
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {
@@ -1537,4 +1542,23 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
         drop(thread);
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::mtp_drafter::strip_wrapper_prefix;
+
+    /// T7 regression: the MoE body strip (`sanitize_weights`) delegates to the
+    /// shared longest-first `strip_wrapper_prefix`, so a raw, un-converted HF
+    /// VLM-wrapped checkpoint's triple-prefixed inline-MTP key is normalized to
+    /// the canonical `mtp.*` form instead of being silently dropped (the
+    /// shorter `model.language_model.` strip would have left
+    /// `model.mtp.layers.0...`).
+    #[test]
+    fn moe_body_strip_survives_triple_wrapped_mtp_key() {
+        assert_eq!(
+            strip_wrapper_prefix("model.language_model.model.mtp.layers.0.input_layernorm.weight"),
+            "mtp.layers.0.input_layernorm.weight"
+        );
+    }
 }

@@ -629,6 +629,12 @@ struct SparseVerifyFnSlot {
 static std::array<std::array<SparseVerifyFnSlot, 2>, kTotalBucketSlots>
     g_verify_sparse_compiled_by_bucket{};
 
+// Dense paged AR-decode graph (Phase 5 piece 1). Defined here so the reload
+// path `invalidate_verify_compiled_tables()` (below) can null it. Lazily
+// compiled in `compiled_dense_decode_paged()` and deliberately survives the
+// per-turn reset — see that getter for the full rationale.
+static BatchedVerifyFn g_dense_decode_paged_compiled{};
+
 static bool same_sparse_target_spec(const SparseTargetSpec& a,
                                     const SparseTargetSpec& b) {
   return a.enabled == b.enabled &&
@@ -939,14 +945,13 @@ static std::array<BatchedVerifyFn, 2> g_verify_compiled_paged{};
 static BatchedVerifyFn& get_or_compile_verify_paged(bool with_tape) {
   auto& slot = g_verify_compiled_paged[with_tape ? 1 : 0];
   if (!slot) {
+    // Route through the capturing-lambda helper so the baked-weight tape gets
+    // a UNIQUE erasable fun_id; a captureless lambda would decay to a stable
+    // free-fn address with no eviction hook and the reload-null would no-op.
     if (with_tape) {
-      slot = mlx::core::compile([](const std::vector<array>& inputs) {
-        return qwen35_verify_batched_decode_fn_paged<true>(inputs);
-      });
+      slot = compile_resettable_weight_graph(&qwen35_verify_batched_decode_fn_paged<true>);
     } else {
-      slot = mlx::core::compile([](const std::vector<array>& inputs) {
-        return qwen35_verify_batched_decode_fn_paged<false>(inputs);
-      });
+      slot = compile_resettable_weight_graph(&qwen35_verify_batched_decode_fn_paged<false>);
     }
   }
   return slot;
@@ -990,6 +995,9 @@ static void invalidate_verify_compiled_tables() {
   }
   g_verify_compiled_paged[0] = BatchedVerifyFn{};
   g_verify_compiled_paged[1] = BatchedVerifyFn{};
+  // Dense paged AR-decode graph (also a weight-baking graph; compiled via the
+  // capturing-lambda helper so this null actually erases the baked tape).
+  g_dense_decode_paged_compiled = BatchedVerifyFn{};
 }
 
 }  // namespace
@@ -1136,15 +1144,20 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
   return result;
 }
 
-// TODO(mtp-reload): function-local compiled static not invalidated on
-// weight change — see PR #65 review. `dense_compiled_decode_fn_paged`
-// reads weights via `get_weight(...)` inside the trace, so a model reload
-// in the same process leaves this paged AR-decode graph baked with the
-// previous model's weights. Cannot null a local static; left as a
-// documented gap (the confirmed P1 is MTP-verify, handled above).
-static auto& compiled_dense_decode_paged() {
-  static auto fn = mlx::core::compile(dense_compiled_decode_fn_paged);
-  return fn;
+// Dense paged AR-decode graph. `dense_compiled_decode_fn_paged` reads weights
+// via `get_weight(...)` inside the trace, so the weights are baked into the
+// cached tape. Backed by the resettable FILE-SCOPE global
+// `g_dense_decode_paged_compiled` (declared near the verify-bucket tables) and
+// compiled through `compile_resettable_weight_graph` so the reload path
+// (`invalidate_verify_compiled_tables()`) can null it and force a re-trace
+// against the live registry. Deliberately survives the per-turn
+// `mlx_qwen35_compiled_reset()` (cross-turn reuse) — nulled ONLY on reload.
+static BatchedVerifyFn& compiled_dense_decode_paged() {
+  if (!g_dense_decode_paged_compiled) {
+    g_dense_decode_paged_compiled =
+        compile_resettable_weight_graph(dense_compiled_decode_fn_paged);
+  }
+  return g_dense_decode_paged_compiled;
 }
 
 } // namespace
@@ -2724,9 +2737,13 @@ void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
 // tokens with the FIRST model's baked weights (silent corruption).
 //
 // See `invalidate_verify_compiled_tables()` for the slot-nulling →
-// lazy-re-trace mechanism and its thread-safety rationale.
+// lazy-re-trace mechanism and its thread-safety rationale. That helper also
+// nulls the dense paged AR-decode graph. We additionally invalidate the dense
+// MTP draft/commit graphs (defined in `mlx_qwen35_mtp_compiled.cpp`) so EVERY
+// weight-baking graph re-traces against the reloaded registry.
 void mlx_qwen35_invalidate_compiled_graphs() {
   invalidate_verify_compiled_tables();
+  mlx_qwen35_mtp_invalidate_compiled_graphs();
 }
 
 // Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1
