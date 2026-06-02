@@ -49,9 +49,22 @@ const { values, positionals } = parseArgs({
     'max-tokens': { type: 'string' },
     cooldown: { type: 'string' },
     warmup: { type: 'string' },
+    prompt: { type: 'string' },
   },
   allowPositionals: true,
 });
+
+// Prompt presets — MTP acceptance is PROMPT-GATED, so the bench prompt picks the
+// regime: `essay` is prose (hard, low acceptance, the conservative worst case);
+// `counting`/`code` are predictable spans (high acceptance, MTP's best case).
+// `--prompt` also accepts a raw string. The chosen prompt propagates to children
+// automatically (the parent forwards `...process.argv.slice(2)` in `spawnChild`).
+const PROMPT_PRESETS: Record<string, string> = {
+  essay:
+    'Write a concise three-paragraph essay on why deterministic sampling at temperature 0 is useful for testing speculative decoding implementations.',
+  counting: 'Count from 1 to 120, one number per line, with no other text.',
+  code: 'Write a Python function that implements binary search over a sorted list, then merge sort, then quicksort. Include docstrings and a complexity table.',
+};
 
 const MODEL_NAME = positionals[0] || 'qwen3.6-27b-nvfp4-mtp';
 const DEPTHS = (values.depths ?? '1,3')
@@ -62,6 +75,9 @@ const REPEATS = Number(values.repeats ?? '6');
 const MAX_TOKENS = Number(values['max-tokens'] ?? '160');
 const COOLDOWN_MS = Number(values.cooldown ?? '1500');
 const WARMUP = Number(values.warmup ?? '2');
+const PROMPT_ARG = values.prompt ?? 'essay';
+const PROMPT = PROMPT_PRESETS[PROMPT_ARG] ?? PROMPT_ARG;
+const PROMPT_LABEL = PROMPT_ARG in PROMPT_PRESETS ? PROMPT_ARG : 'custom';
 const MODEL_PATH = resolve(process.cwd(), '.cache', 'models', MODEL_NAME);
 const IS_CHILD = process.env.__MTP_BENCH_CHILD === '1';
 const RESULT_SENTINEL = '__BENCH_RESULT__';
@@ -107,8 +123,7 @@ async function runChild(): Promise<void> {
     return;
   }
 
-  const prompt =
-    'Write a concise three-paragraph essay on why deterministic sampling at temperature 0 is useful for testing speculative decoding implementations.';
+  const prompt = PROMPT;
 
   async function gen(depth: number, enableMtp: boolean): Promise<ChatResult> {
     const cfg: ChatConfig = {
@@ -208,7 +223,7 @@ function spawnChild(chained: number): ChildResult {
 
 async function runParent(): Promise<void> {
   console.error(
-    `Controlled MTP verdict: model=${MODEL_NAME} depths=[${DEPTHS}] repeats=${REPEATS} maxTokens=${MAX_TOKENS} cooldown=${COOLDOWN_MS}ms warmup=${WARMUP}`,
+    `Controlled MTP verdict: model=${MODEL_NAME} prompt=${PROMPT_LABEL} depths=[${DEPTHS}] repeats=${REPEATS} maxTokens=${MAX_TOKENS} cooldown=${COOLDOWN_MS}ms warmup=${WARMUP}`,
   );
   // chained=0 first then chained=1; ratio is self-normalized so run order does
   // not bias the verdict, but we still report cross-child AR drift.
@@ -229,7 +244,7 @@ async function runParent(): Promise<void> {
   const trustworthy = arCv <= 0.1 && arDrift <= 0.1;
 
   console.log('\n================ CONTROLLED MTP VERDICT ================');
-  console.log(`model=${MODEL_NAME}  repeats=${REPEATS}/cell  maxTokens=${MAX_TOKENS}`);
+  console.log(`model=${MODEL_NAME}  prompt=${PROMPT_LABEL}  repeats=${REPEATS}/cell  maxTokens=${MAX_TOKENS}`);
   console.log(
     `AR-stability gate: CV(all AR)=${(arCv * 100).toFixed(1)}%  cross-child AR drift=${(arDrift * 100).toFixed(1)}%  ` +
       `(AR off-med=${arOffMed.toFixed(2)} on-med=${arOnMed.toFixed(2)})  => ${trustworthy ? 'TRUSTWORTHY' : 'THERMALLY UNSTABLE (ratios still self-normalized; absolute tok/s untrustworthy)'}`,
