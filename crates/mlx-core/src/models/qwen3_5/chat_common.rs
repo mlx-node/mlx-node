@@ -1367,6 +1367,7 @@ pub(crate) fn compute_performance_metrics(
         // via `DecodeProfiler::fill_mtp_acceptance` — the profiler is in
         // scope there but not here. Stays `None` on autoregressive runs.
         mtp_mean_accepted_tokens: None,
+        mtp_mean_accepted_tokens_total: None,
         mtp_acceptance_by_position: None,
         mtp_cycles: None,
         mtp_mean_depth: None,

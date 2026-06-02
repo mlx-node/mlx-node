@@ -866,8 +866,35 @@ fn apply_weights_moe_inner(
     // gate-prefix routing through `default_gate_plq` (router gates
     // are 8-bit affine for canonical recipes even when the global
     // default is 4-bit affine).
-    if let Some(mtp) = inner.mtp.as_mut() {
-        mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+    // Gate the MTP head on a COMPLETE required-weight set before loading,
+    // mirroring the dense loader (`qwen3_5/persistence.rs`). The module is
+    // constructed purely from `config.n_mtp_layers > 0`, so an incomplete inline
+    // checkpoint (a wrong-variant or partial drafter is already rejected at merge
+    // time) would otherwise leave the head default-initialized while
+    // `has_mtp_weights()` still reported active — silently corrupting speculative
+    // decode. On an incomplete set, warn + disable MTP (leave
+    // `mtp_weights_loaded = false`) rather than feeding garbage to the head.
+    if inner.mtp.is_some() {
+        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+            params,
+            crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+            config.n_mtp_layers,
+        );
+        if missing.is_empty() {
+            if let Some(mtp) = inner.mtp.as_mut() {
+                mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+            }
+            inner.mtp_weights_loaded = true;
+        } else {
+            inner.mtp_weights_loaded = false;
+            warn!(
+                "Qwen3.5-MoE config declares {} MTP layer(s), but MTP weights are incomplete; \
+                 disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                config.n_mtp_layers,
+                &missing[..missing.len().min(12)],
+                missing.len()
+            );
+        }
     }
 
     // Verify mandatory weights
@@ -999,7 +1026,39 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     );
 
                     // Load all weights
-                    let raw_params = load_all_safetensors(path, false)?;
+                    let mut raw_params = load_all_safetensors(path, false)?;
+                    // MTP head discovery precedence (backward-compat mandatory):
+                    //   1. inline `mtp.*` tensors in the body shards (existing
+                    //      MoE-MTP checkpoints — kept as-is by sanitize);
+                    //   2. mlx-vlm split `mtp-drafter/` directory (Phase 1 convert).
+                    // MoE has no legacy `mtp.safetensors` sidecar path; the
+                    // drafter merge only fires when the body carries NO inline
+                    // `mtp.*` tensors so inline always wins. The re-prefixed
+                    // `mtp.layers.{i}.mlp.switch_mlp.*` + `...gate.weight` keys
+                    // feed the existing sanitize + head module unchanged
+                    // (the drafter already ships experts STACKED into
+                    // switch_mlp.*, not per-expert `experts.*`).
+                    let has_inline_mtp = raw_params.keys().any(|name| name.contains("mtp."));
+                    if has_inline_mtp {
+                        info!(
+                            "Using inline mtp.* tensors from body shards (drafter merge skipped)"
+                        );
+                    } else if let Some(drafter_path) =
+                        crate::models::mtp_drafter::detect_drafter_safetensors(path)
+                        && let Some(drafter_params) =
+                            crate::models::mtp_drafter::load_drafter_tensors(
+                                &drafter_path,
+                                crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                                config.n_mtp_layers,
+                            )?
+                    {
+                        let drafter_count = drafter_params.len();
+                        raw_params.extend(drafter_params);
+                        info!(
+                            "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
+                            drafter_count
+                        );
+                    }
                     info!("Loaded {} raw tensors", raw_params.len());
 
                     // Split vision/text weights

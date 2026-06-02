@@ -65,11 +65,16 @@ Quantization Arguments:
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
-  --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi, all.
-                        Writes MTP tensors to an MTPLX-style mtp.safetensors
-                        sidecar. cyankiwi keeps mtp.fc dense and quantizes MTP
-                        layer linears as 4-bit affine group_size=32; all also
-                        quantizes mtp.fc.
+  --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi,
+                        all, or split (alias drafter).
+                        cyankiwi/all write MTP tensors to an MTPLX-style
+                        mtp.safetensors sidecar. cyankiwi keeps mtp.fc dense and
+                        quantizes MTP layer linears as 4-bit affine
+                        group_size=32; all also quantizes mtp.fc.
+                        split/drafter emit a body checkpoint with NO mtp.*
+                        tensors plus a separate mtp-drafter/ directory in
+                        mlx-vlm's qwen3_5_mtp format (bf16 head). split does NOT
+                        require --quantize/--q-recipe.
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
                         Required for "unsloth" recipe
@@ -161,11 +166,14 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
-  const validQuantMtpPolicies = ['off', 'cyankiwi', 'all'];
+  const validQuantMtpPolicies = ['off', 'cyankiwi', 'all', 'split', 'drafter'];
   if (!validQuantMtpPolicies.includes(quantMtp)) {
     console.error(`Error: --q-mtp must be one of ${validQuantMtpPolicies.join(', ')}`);
     process.exit(1);
   }
+  // "split"/"drafter" emits a standalone bf16 drafter directory and does NOT
+  // require body quantization.
+  const isSplitMtp = quantMtp === 'split' || quantMtp === 'drafter';
   if (args['q-mxfp'] && !args.quantize) {
     console.error('Error: --q-mxfp requires --quantize');
     process.exit(1);
@@ -179,7 +187,7 @@ export async function run(argv: string[]) {
   }
 
   const quantRecipe = args['q-recipe'];
-  if (quantMtp !== 'off' && (!args.quantize || quantRecipe === undefined)) {
+  if (quantMtp !== 'off' && !isSplitMtp && (!args.quantize || quantRecipe === undefined)) {
     console.error('Error: --q-mtp requires --quantize and --q-recipe');
     process.exit(1);
   }

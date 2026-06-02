@@ -2673,10 +2673,15 @@ export interface ConversionOptions {
    */
   quantMxfp?: boolean;
   /**
-   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", or "all".
+   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", "all",
+   * or "split" (alias "drafter").
    * "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
    * 4-bit affine group_size=32 in an MTPLX-compatible mtp.safetensors sidecar.
    * "all" additionally quantizes mtp.fc.
+   * "split"/"drafter" emits a body checkpoint with NO mtp.* tensors plus a
+   * separate `mtp-drafter/` directory in mlx-vlm's `qwen3_5_mtp` format
+   * (bare-keyed MTP head, format:mlx). It does NOT require --quantize/--q-recipe;
+   * the body may be bf16 or already-quantized and the MTP head stays bf16.
    */
   quantMtp?: string;
 }
@@ -3106,8 +3111,18 @@ export interface GenerationProfile {
   timeToFirstTokenMs: number;
   /** Per-phase breakdown. */
   phases: Array<PhaseProfile>;
-  /** MTP speculative decode: mean accepted draft tokens per cycle. */
+  /**
+   * MTP speculative decode: mean accepted *draft* tokens per cycle
+   * (excludes the always-verified token). Historical drafts-only metric.
+   */
   mtpMeanAcceptedTokens?: number;
+  /**
+   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+   * the always-verified token (`mtp_accepted_drafts_total / mtp_cycles
+   * + 1.0`). mlx-vlm-comparable headline; equals mlx-vlm's
+   * `(accepted_drafts + rounds) / rounds` (`common.py:247`).
+   */
+  mtpMeanAcceptedTokensTotal?: number;
   /** MTP speculative decode: per-draft-position acceptance rate. */
   mtpAcceptanceByPosition?: Array<number>;
   /** MTP speculative decode: number of draft+verify cycles executed. */
@@ -3715,11 +3730,31 @@ export interface PerformanceMetrics {
    */
   decodeTokensPerSecond: number;
   /**
-   * MTP speculative decode: mean accepted draft tokens per cycle
-   * (range `[0, depth]`). `None` on plain autoregressive runs where
-   * no MTP cycle executed.
+   * MTP speculative decode: mean accepted *draft* tokens per cycle
+   * (range `[0, depth]`). EXCLUDES the always-verified token each cycle
+   * commits. `None` on plain autoregressive runs where no MTP cycle
+   * executed. This is the historical drafts-only metric; for the
+   * mlx-vlm-comparable headline see [`Self::mtp_mean_accepted_tokens_total`].
    */
   mtpMeanAcceptedTokens?: number;
+  /**
+   * MTP speculative decode: mean *committed* tokens per cycle, INCLUDING
+   * the single always-verified token each cycle emits — i.e.
+   * `mtp_accepted_drafts_total / mtp_cycles + 1.0`. This is the
+   * mlx-vlm-comparable headline accept rate: it equals mlx-vlm's
+   * `mean_accepted_tokens = (accepted_drafts + rounds) / rounds`
+   * (`mlx-vlm/mlx_vlm/speculative/common.py:247`), where our
+   * `mtp_cycles` is the 1:1 analog of mlx-vlm's `rounds` (one
+   * draft+verify iteration; `record_mtp_cycle` is called exactly once
+   * per cycle). The per-cycle `+1.0` matches mlx-vlm's `+rounds`
+   * assumption — every round commits exactly one verified token
+   * (the residual on partial-accept, the bonus on full-accept), even
+   * when the final cycle's tail is EOS/length-truncated downstream
+   * (mlx-vlm makes the same assumption: it appends to `accept_lens`
+   * once per round regardless of truncation). `None` on plain
+   * autoregressive runs.
+   */
+  mtpMeanAcceptedTokensTotal?: number;
   /**
    * MTP speculative decode: per-draft-position acceptance rate
    * (index = draft position). `None` on plain autoregressive runs.

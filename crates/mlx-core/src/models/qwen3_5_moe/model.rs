@@ -315,6 +315,15 @@ pub(crate) struct Qwen35MoeInner {
     /// directly. Weight loading happens after construction in
     /// `apply_weights_moe_inner`.
     pub(crate) mtp: Option<Qwen3_5MoeMTPModule>,
+    /// W7 (MTP): set `true` by `apply_weights_moe_inner` ONLY after the MTP
+    /// head's required weight set was found COMPLETE. Mirrors the dense
+    /// `Qwen35Inner::mtp_weights_loaded`. The module itself is constructed
+    /// purely from config (`n_mtp_layers > 0`), so `mtp.is_some()` alone does
+    /// NOT prove the head has real weights — a partial/incompatible drafter or
+    /// a truncated inline checkpoint would leave the module default-initialized.
+    /// `has_mtp_weights()` AND-gates on this flag so speculative decode never
+    /// runs against a half-loaded head.
+    pub(crate) mtp_weights_loaded: bool,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -821,6 +830,7 @@ impl Qwen35MoeInner {
             gdn_last_history_checkpoint: None,
             paged_adapter,
             mtp,
+            mtp_weights_loaded: false,
             training_state: None,
         })
     }
@@ -7386,7 +7396,7 @@ impl Qwen35MoeInner {
     /// MTP-accelerated path to take over. Mirrors the dense
     /// `Qwen35Inner::has_mtp_weights`.
     pub(crate) fn has_mtp_weights(&self) -> bool {
-        self.mtp.is_some()
+        self.mtp.is_some() && self.mtp_weights_loaded
     }
 }
 

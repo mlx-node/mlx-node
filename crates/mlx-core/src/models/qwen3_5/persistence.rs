@@ -1310,7 +1310,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // the sidecar and drop embedded MTP tensors so key normalization
                 // cannot leave duplicate `mtp.*` entries racing during sanitize.
                 let mut raw_params = load_all_safetensors(path, true)?;
-                if let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)? {
+                // MTP head discovery precedence (backward-compat mandatory):
+                //   1. inline `mtp.*` tensors in the body shards (existing
+                //      checkpoints — handled implicitly by sanitize keeping them);
+                //   2. legacy `mtp.safetensors`-style sidecar (existing path);
+                //   3. mlx-vlm split `mtp-drafter/` directory (Phase 1 convert).
+                // Only attempt the sidecar/drafter merge when the body itself
+                // carries NO inline `mtp.*` tensors so inline always wins.
+                let has_inline_mtp = raw_params
+                    .keys()
+                    .any(|name| normalize_mtp_weight_key(name).is_some());
+                if has_inline_mtp {
+                    info!("Using inline mtp.* tensors from body shards (drafter merge skipped)");
+                } else if let Some(mtp_sidecar_params) = load_external_mtp_sidecar(path, &raw)? {
                     let before = raw_params.len();
                     raw_params.retain(|name, _| normalize_mtp_weight_key(name).is_none());
                     let removed_embedded = before.saturating_sub(raw_params.len());
@@ -1319,6 +1331,20 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     info!(
                         "Merged external MTP sidecar tensors: added={}, removed_embedded_mtp={}",
                         sidecar_count, removed_embedded
+                    );
+                } else if let Some(drafter_path) =
+                    crate::models::mtp_drafter::detect_drafter_safetensors(path)
+                    && let Some(drafter_params) = crate::models::mtp_drafter::load_drafter_tensors(
+                        &drafter_path,
+                        crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+                        config.n_mtp_layers,
+                    )?
+                {
+                    let drafter_count = drafter_params.len();
+                    raw_params.extend(drafter_params);
+                    info!(
+                        "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
+                        drafter_count
                     );
                 }
                 info!("Loaded {} raw tensors", raw_params.len());

@@ -183,7 +183,17 @@ if (mtpPerf?.mtpCycles != null) {
   const perPos = mtpPerf.mtpAcceptanceByPosition ?? [];
   const perPosStr = perPos.map((p) => p.toFixed(3)).join(', ');
   const meanAcc = mtpPerf.mtpMeanAcceptedTokens ?? 0;
-  console.log(`cycles=${mtpPerf.mtpCycles} mean_accepted=${meanAcc.toFixed(2)}/cycle ` + `per_position=[${perPosStr}]`);
+  // Headline: mlx-vlm-comparable mean accepted tokens/cycle, INCLUDING the
+  // always-verified token each cycle commits — matches mlx-vlm's
+  // `mean_accepted_tokens = (accepted_drafts + rounds)/rounds`. The
+  // drafts-only `mean_accepted` is kept alongside as the historical value.
+  const meanAccTotal = mtpPerf.mtpMeanAcceptedTokensTotal ?? meanAcc + 1;
+  console.log(
+    `cycles=${mtpPerf.mtpCycles} ` +
+      `mean accepted tokens/cycle (incl. verified, mlx-vlm-comparable)=${meanAccTotal.toFixed(2)} ` +
+      `mean_accepted(drafts-only)=${meanAcc.toFixed(2)}/cycle ` +
+      `per_position=[${perPosStr}]`,
+  );
   console.log(
     'Reference (MTPLX, stock Qwen3.6-27B native MTP heads, T=0, depth=3): ' +
       'per_position≈[0.73, 0.43, 0.17] cycle-history / [0.90, 0.78, 0.62] committed-history.',

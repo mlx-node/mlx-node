@@ -354,6 +354,22 @@ impl DecodeProfiler {
         ))
     }
 
+    /// Mean *committed* tokens per MTP cycle INCLUDING the always-verified
+    /// token: `mtp_accepted_drafts_total / mtp_cycles + 1.0`. `None` when
+    /// no MTP cycle ran. This is the mlx-vlm-comparable headline accept
+    /// rate — it equals mlx-vlm's `mean_accepted_tokens =
+    /// (accepted_drafts + rounds) / rounds`
+    /// (`mlx-vlm/mlx_vlm/speculative/common.py:247`), with `mtp_cycles`
+    /// the 1:1 analog of mlx-vlm's `rounds`. The drafts-only value
+    /// (`mtp_acceptance_summary().0`) stays available as the historical
+    /// secondary metric.
+    pub fn mtp_mean_accepted_tokens_total(&self) -> Option<f64> {
+        if self.mtp_cycles == 0 {
+            return None;
+        }
+        Some(self.mtp_accepted_drafts_total as f64 / self.mtp_cycles as f64 + 1.0)
+    }
+
     /// Mean attempted draft depth per MTP cycle. `None` when no MTP
     /// cycle ran.
     pub fn mtp_mean_depth(&self) -> Option<f64> {
@@ -385,6 +401,7 @@ impl DecodeProfiler {
     pub fn fill_mtp_acceptance(&self, m: &mut crate::profiling::PerformanceMetrics) {
         if let Some((mean, per_pos, cycles)) = self.mtp_acceptance_summary() {
             m.mtp_mean_accepted_tokens = Some(mean);
+            m.mtp_mean_accepted_tokens_total = self.mtp_mean_accepted_tokens_total();
             m.mtp_acceptance_by_position = Some(per_pos);
             m.mtp_cycles = Some(cycles);
             m.mtp_mean_depth = self.mtp_mean_depth();
@@ -446,6 +463,7 @@ impl DecodeProfiler {
                 time_to_first_token_ms: ttft_ms,
                 phases,
                 mtp_mean_accepted_tokens,
+                mtp_mean_accepted_tokens_total: self.mtp_mean_accepted_tokens_total(),
                 mtp_acceptance_by_position,
                 mtp_cycles,
                 mtp_mean_depth: self.mtp_mean_depth(),
@@ -501,11 +519,17 @@ impl DecodeProfiler {
 
         if let Some((mean, per_pos, cycles)) = self.mtp_acceptance_summary() {
             let mean_depth = self.mtp_depth_total as f64 / self.mtp_cycles as f64;
+            let mean_total = self.mtp_mean_accepted_tokens_total().unwrap_or(mean + 1.0);
             let per_pos_str: Vec<String> = per_pos.iter().map(|p| format!("{:.3}", p)).collect();
+            // Headline: mlx-vlm-comparable mean accepted tokens/cycle
+            // (incl. the always-verified token) — matches mlx-vlm's
+            // `(accepted_drafts + rounds)/rounds` (common.py:247).
             lines.push(format!(
-                "  [PROFILE] MTP accept: cycles={} mean_accepted={:.2}/cycle \
+                "  [PROFILE] MTP accept: cycles={} mean accepted tokens/cycle={:.2} \
+                 (incl. verified, mlx-vlm-comparable) mean_drafts/cycle={:.2} \
                  mean_depth={:.2} per_position=[{}]",
                 cycles,
+                mean_total,
                 mean,
                 mean_depth,
                 per_pos_str.join(", "),
@@ -910,11 +934,23 @@ mod tests {
         assert!((per_pos[2] - 1.0 / 3.0).abs() < 1e-9);
 
         // fill_mtp_acceptance copies the summary onto PerformanceMetrics.
+        // mlx-vlm-comparable: drafts-only mean (2.0) + 1.0 always-verified.
+        assert!(
+            (profiler
+                .mtp_mean_accepted_tokens_total()
+                .expect("total after 3 cycles")
+                - 3.0)
+                .abs()
+                < 1e-9,
+            "mlx-vlm-comparable total should be drafts-only + 1.0"
+        );
+
         let mut m = crate::profiling::PerformanceMetrics {
             ttft_ms: 0.0,
             prefill_tokens_per_second: 0.0,
             decode_tokens_per_second: 0.0,
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -924,6 +960,10 @@ mod tests {
         assert_eq!(m.mtp_cycles, Some(3));
         assert!((m.mtp_mean_depth.expect("mean depth") - 3.0).abs() < 1e-9);
         assert!((m.mtp_mean_accepted_tokens.expect("mean") - 2.0).abs() < 1e-9);
+        assert!(
+            (m.mtp_mean_accepted_tokens_total.expect("total") - 3.0).abs() < 1e-9,
+            "PerformanceMetrics total == drafts-only + 1.0"
+        );
         assert_eq!(
             m.mtp_acceptance_by_position
                 .as_ref()
@@ -948,6 +988,7 @@ mod tests {
                 prefill_tokens_per_second: 0.0,
                 decode_tokens_per_second: 0.0,
                 mtp_mean_accepted_tokens: None,
+                mtp_mean_accepted_tokens_total: None,
                 mtp_acceptance_by_position: None,
                 mtp_cycles: None,
                 mtp_mean_depth: None,
@@ -973,6 +1014,35 @@ mod tests {
         assert_eq!(cycles, 1);
         assert!((mean - 2.0).abs() < 1e-9);
         assert_eq!(per_pos, vec![1.0, 1.0]);
+    }
+
+    /// The mlx-vlm-comparable total is exactly the drafts-only mean + 1.0
+    /// for any non-zero-cycle state, and `None` when no cycle ran.
+    #[test]
+    fn test_mtp_mean_accepted_tokens_total_is_drafts_plus_one() {
+        let mut profiler = DecodeProfiler::new("test_mtp_total", "qwen3_5");
+        // No cycle recorded yet → total is None (matches drafts-only None).
+        assert!(profiler.mtp_mean_accepted_tokens_total().is_none());
+        assert!(profiler.mtp_acceptance_summary().is_none());
+
+        // Mixed depths/accepts: drafts-only mean = (2 + 0 + 1) / 3 = 1.0.
+        profiler.record_mtp_cycle(2, 2);
+        profiler.record_mtp_cycle(1, 0);
+        profiler.record_mtp_cycle(2, 1);
+
+        let (drafts_only, _per_pos, cycles) = profiler.mtp_acceptance_summary().expect("summary");
+        assert_eq!(cycles, 3);
+        assert!((drafts_only - 1.0).abs() < 1e-9);
+
+        let total = profiler
+            .mtp_mean_accepted_tokens_total()
+            .expect("total after cycles");
+        // mlx-vlm: (accepted_drafts + rounds) / rounds == drafts_only + 1.0.
+        assert!(
+            (total - (drafts_only + 1.0)).abs() < 1e-9,
+            "total {total} != drafts_only {drafts_only} + 1.0"
+        );
+        assert!((total - 2.0).abs() < 1e-9);
     }
 
     #[test]

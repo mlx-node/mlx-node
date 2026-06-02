@@ -2122,6 +2122,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -2581,6 +2582,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -2985,6 +2987,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -3295,6 +3298,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -5078,6 +5082,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,
@@ -5539,6 +5544,7 @@ impl Gemma4Inner {
             },
             // Gemma4 has no MTP heads — acceptance fields stay None.
             mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
             mtp_acceptance_by_position: None,
             mtp_cycles: None,
             mtp_mean_depth: None,

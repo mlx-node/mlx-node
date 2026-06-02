@@ -90,7 +90,13 @@ interface Sample {
   arTps: number;
   mtpTps: number;
   ratio: number;
+  // drafts-only mean accepted per cycle (historical; excludes the
+  // always-verified token).
   meanAccepted: number;
+  // mlx-vlm-comparable: mean accepted tokens/cycle INCLUDING the
+  // always-verified token = drafts-only + 1.0 = mlx-vlm's
+  // `(accepted_drafts + rounds)/rounds`.
+  meanAcceptedTotal: number;
   accByPosition: number[];
   cycles: number;
 }
@@ -173,12 +179,13 @@ async function runChild(): Promise<void> {
         mtpTps,
         ratio: arTps > 0 ? mtpTps / arTps : 0,
         meanAccepted: p?.mtpMeanAcceptedTokens ?? 0,
+        meanAcceptedTotal: p?.mtpMeanAcceptedTokensTotal ?? (p?.mtpMeanAcceptedTokens ?? 0) + 1,
         accByPosition: p?.mtpAcceptanceByPosition ?? [],
         cycles: p?.mtpCycles ?? 0,
       };
       samples.push(sample);
       log(
-        `depth=${depth} r=${r + 1}/${REPEATS} (${arFirst ? 'AR,MTP' : 'MTP,AR'}) AR=${arTps.toFixed(2)} MTP=${mtpTps.toFixed(2)} ratio=${sample.ratio.toFixed(3)} acc=${sample.meanAccepted.toFixed(2)}`,
+        `depth=${depth} r=${r + 1}/${REPEATS} (${arFirst ? 'AR,MTP' : 'MTP,AR'}) AR=${arTps.toFixed(2)} MTP=${mtpTps.toFixed(2)} ratio=${sample.ratio.toFixed(3)} acc/cyc(incl.verified)=${sample.meanAcceptedTotal.toFixed(2)} drafts-only=${sample.meanAccepted.toFixed(2)}`,
       );
       await sleep(COOLDOWN_MS);
     }
@@ -250,11 +257,14 @@ async function runParent(): Promise<void> {
       `(AR off-med=${arOffMed.toFixed(2)} on-med=${arOnMed.toFixed(2)})  => ${trustworthy ? 'TRUSTWORTHY' : 'THERMALLY UNSTABLE (ratios still self-normalized; absolute tok/s untrustworthy)'}`,
   );
   console.log('');
+  // `acc/cyc(incl.verified)` is the mlx-vlm-comparable headline
+  // (mlx-vlm's `(accepted_drafts + rounds)/rounds`); `drafts` is the
+  // historical drafts-only value kept alongside.
   console.log(
-    'depth | cfg      | median ratio | ratio[min..max] | median MTP tok/s | meanAccepted | per-position acceptance',
+    'depth | cfg      | median ratio | ratio[min..max] | median MTP tok/s | acc/cyc(incl.verified) | drafts | per-position acceptance',
   );
   console.log(
-    '------|----------|--------------|-----------------|------------------|--------------|------------------------',
+    '------|----------|--------------|-----------------|------------------|------------------------|--------|------------------------',
   );
 
   interface DepthVerdict {
@@ -282,7 +292,8 @@ async function runParent(): Promise<void> {
         `  ${depth}   | chained ${cfg} | ${med.toFixed(3)}        | ` +
           `${Math.min(...rs).toFixed(3)}..${Math.max(...rs).toFixed(3)}   | ` +
           `${median(d.map((s) => s.mtpTps)).toFixed(2)}            | ` +
-          `${acc.meanAccepted.toFixed(2)}         | [${acc.accByPosition.map((p) => p.toFixed(3)).join(', ')}]`,
+          `${acc.meanAcceptedTotal.toFixed(2)}                   | ` +
+          `${acc.meanAccepted.toFixed(2)}   | [${acc.accByPosition.map((p) => p.toFixed(3)).join(', ')}]`,
       );
     }
     // Verdict: ON wins only if its median ratio clears OFF's median by more than
