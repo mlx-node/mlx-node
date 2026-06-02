@@ -898,9 +898,26 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         HashMap::new()
     };
     let mtp_sidecar_weight_count = mtp_sidecar_weight_count(&mtp_sidecar_tensors);
-    if quant_mtp != "off" && mtp_sidecar_tensors.is_empty() {
+    // Dense sidecar safety check: a dense --q-mtp request that produced no
+    // sidecar tensors must fail loudly. Scoped to the dense sidecar path
+    // (`emit_mtp_sidecar`) so it does not fire for MoE, whose MTP weights are
+    // retained inline and quantized by `apply_mtp_quant_policy` (sidecar is
+    // always empty by design there).
+    if emit_mtp_sidecar && mtp_sidecar_tensors.is_empty() {
         return Err(Error::from_reason(
             "--q-mtp requested but no mtp.* tensors were found after Qwen sanitization".to_string(),
+        ));
+    }
+    // MoE inline safety check: keep the "no MTP tensors" protection for MoE so
+    // a non-off --q-mtp on a MoE checkpoint with zero mtp.* tensors still fails
+    // loudly instead of silently no-op'ing. The inline MTP keys have already
+    // been populated into `converted_tensors` by sanitization/expert-stacking.
+    if quant_mtp != "off"
+        && matches!(model_type.as_deref(), Some("qwen3_5_moe"))
+        && !converted_tensors.keys().any(|k| is_mtp_key(k))
+    {
+        return Err(Error::from_reason(
+            "--q-mtp requested but the MoE checkpoint contains no mtp.* tensors".to_string(),
         ));
     }
     if !mtp_sidecar_tensors.is_empty() {
@@ -2794,13 +2811,14 @@ fn sanitize_qwen35_moe(
     // prefix set the language-model branch handles below. Normalising MTP
     // to the bare form here is also what makes the Step 4 `starts_with("mtp.")`
     // bypass for the +1.0 norm shift load-bearing.
+    // Delegate prefix handling to the module-level `normalize_mtp_prefix` so
+    // the complete prefix set — including the VLM-wrapped
+    // `model.language_model.model.` form — is stripped before the bare-prefix
+    // test. A hand-rolled strip-chain here previously missed that prefix,
+    // letting a key like `model.language_model.model.mtp.…` escape MTP
+    // detection and fall through to the language-model branch.
     let is_mtp_key = |k: &str| -> bool {
-        let bare = k
-            .strip_prefix("model.language_model.")
-            .or_else(|| k.strip_prefix("language_model.model."))
-            .or_else(|| k.strip_prefix("language_model."))
-            .or_else(|| k.strip_prefix("model."))
-            .unwrap_or(k);
+        let bare = normalize_mtp_prefix(k);
         bare.starts_with("mtp.") || bare.starts_with("mtp_")
     };
 
@@ -2823,13 +2841,7 @@ fn sanitize_qwen35_moe(
         // `should_quantize` excludes MTP so the quantize pass leaves them
         // at the source / target dtype.
         if is_mtp_key(&key) {
-            let bare = key
-                .strip_prefix("model.language_model.")
-                .or_else(|| key.strip_prefix("language_model.model."))
-                .or_else(|| key.strip_prefix("language_model."))
-                .or_else(|| key.strip_prefix("model."))
-                .unwrap_or(&key)
-                .to_string();
+            let bare = normalize_mtp_prefix(&key).to_string();
             new_weights.insert(bare, value);
             continue;
         }
