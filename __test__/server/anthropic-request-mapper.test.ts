@@ -4,6 +4,7 @@ import {
   canonicalizeSystemForCacheKey,
   mapAnthropicRequest,
 } from '../../packages/server/src/mappers/anthropic-request.js';
+import type { AnthropicContentBlock } from '../../packages/server/src/types-anthropic.js';
 
 describe('mapAnthropicRequest', () => {
   it('maps a simple string user message to a single user ChatMessage', () => {
@@ -1328,6 +1329,201 @@ describe('mapAnthropicRequest', () => {
         extra_body: { mtp_depth: 2 },
       });
       expect(config.mtpDepth).toBe(2);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // system-role message folding
+  //
+  // `system` is not a role in the Anthropic Messages spec, but Claude
+  // Code's SessionStart hooks (e.g. superpowers) inject a
+  // `{ role: 'system' }` message carrying "additional context" into the
+  // `messages` array. The mapper previously rejected this with HTTP 400
+  // ("Unsupported message role"). It now folds such a message's text into
+  // the single leading system prompt instead. The content is positionless
+  // additional context, so its location in the array does not matter — we
+  // accumulate in encounter order and prepend after the message loop.
+  // -------------------------------------------------------------------
+  describe('system-role message folding', () => {
+    it('folds a trailing system-role message into a leading system prompt (the 400 repro)', () => {
+      // Exact shape that produced `400 Unsupported message role: "system"`:
+      // a SessionStart hook appends a `{ role: 'system' }` message after the
+      // user turn. It must now be accepted and hoisted to the front.
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          { role: 'user', content: 'Hi' },
+          { role: 'system', content: 'Additional context: the repo is mlx-node.' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'Additional context: the repo is mlx-node.' },
+        { role: 'user', content: 'Hi' },
+      ]);
+    });
+
+    it('joins a top-level system and a folded system-role message with a blank line', () => {
+      // The separator between distinct contributions is `'\n\n'`. Pin it.
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system: 'You are a helpful assistant.',
+        messages: [
+          { role: 'user', content: 'Hi' },
+          { role: 'system', content: 'Session note: be concise.' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'You are a helpful assistant.\n\nSession note: be concise.' },
+        { role: 'user', content: 'Hi' },
+      ]);
+    });
+
+    it('folds multiple system-role messages in encounter order after the top-level system', () => {
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system: 'Base prompt.',
+        messages: [
+          { role: 'system', content: 'context A' },
+          { role: 'user', content: 'Hi' },
+          { role: 'system', content: 'context B' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'Base prompt.\n\ncontext A\n\ncontext B' },
+        { role: 'user', content: 'Hi' },
+      ]);
+    });
+
+    it('concatenates a system-role array content with no separator within the message, tolerating extra block fields', () => {
+      // Within a single array-content message, text blocks join with `''`
+      // (matching the top-level `system`-array behaviour); the `'\n\n'`
+      // separator only appears BETWEEN distinct contributions. Extra block
+      // fields a client may attach (e.g. `cache_control`) are ignored — the
+      // cast models the wire shape Claude Code can send even though the
+      // text-block type does not declare the field.
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system: 'Base prompt.',
+        messages: [
+          {
+            role: 'system',
+            content: [
+              { type: 'text', text: 'part one ', cache_control: { type: 'ephemeral' } },
+              { type: 'text', text: 'part two' },
+            ] as unknown as AnthropicContentBlock[],
+          },
+          { role: 'user', content: 'Hi' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'Base prompt.\n\npart one part two' },
+        { role: 'user', content: 'Hi' },
+      ]);
+    });
+
+    it('hoists a mid-conversation system-role message to the front while preserving the rest of the order', () => {
+      // CONTRACT: a system-role message is positionless and hoisted to the
+      // single leading system prompt regardless of where it appears. This is
+      // deliberate — the Anthropic wire format defines no positional `system`
+      // role, the only known producer (Claude Code SessionStart hooks) emits
+      // positionless additional context, and the internal
+      // `ChatMessage`/`primeHistory` pipeline can represent only a single
+      // leading system message. See the matching block comment in the mapper.
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          { role: 'user', content: 'What is 2+2?' },
+          { role: 'assistant', content: '4' },
+          { role: 'system', content: 'midstream note' },
+          { role: 'user', content: 'Are you sure?' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'midstream note' },
+        { role: 'user', content: 'What is 2+2?' },
+        { role: 'assistant', content: '4' },
+        { role: 'user', content: 'Are you sure?' },
+      ]);
+    });
+
+    it('drops an empty system-role message rather than corrupting the system prompt with a trailing blank line', () => {
+      // An empty hook context message must neither append a dangling `'\n\n'`
+      // to a real system prompt nor synthesise a bare empty system message.
+      const withTopLevel = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system: 'Real system prompt.',
+        messages: [
+          { role: 'user', content: 'Hi' },
+          { role: 'system', content: '' },
+        ],
+      });
+      expect(withTopLevel.messages).toEqual([
+        { role: 'system', content: 'Real system prompt.' },
+        { role: 'user', content: 'Hi' },
+      ]);
+
+      // With no top-level system and only an empty folded message, no system
+      // message is emitted at all (mirrors the all-stripped-array contract).
+      const withoutTopLevel = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [
+          { role: 'user', content: 'Hi' },
+          { role: 'system', content: '' },
+        ],
+      });
+      expect(withoutTopLevel.messages).toEqual([{ role: 'user', content: 'Hi' }]);
+    });
+
+    it('rejects a non-text content block inside a system-role message', () => {
+      const imageData =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 1024,
+          messages: [
+            {
+              role: 'system',
+              content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } }],
+            },
+          ],
+        }),
+      ).toThrow(/Unsupported content block type "image" in system-role message/i);
+    });
+
+    it('regression: a request with no system-role message is unaffected by the folding path', () => {
+      // The folding path must be inert for normal traffic — a top-level
+      // system plus an ordinary multi-turn conversation maps exactly as
+      // before, with no `'\n\n'` artifacts introduced.
+      const { messages } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        system: 'You are a helpful assistant.',
+        messages: [
+          { role: 'user', content: 'What is 2+2?' },
+          { role: 'assistant', content: '4' },
+          { role: 'user', content: 'Are you sure?' },
+        ],
+      });
+
+      expect(messages).toEqual([
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: 'What is 2+2?' },
+        { role: 'assistant', content: '4' },
+        { role: 'user', content: 'Are you sure?' },
+      ]);
     });
   });
 });

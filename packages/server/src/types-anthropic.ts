@@ -56,7 +56,12 @@ export interface SystemBlock {
 // ---------------------------------------------------------------------------
 
 export interface AnthropicMessage {
-  role: 'user' | 'assistant';
+  // `system` is not part of the Anthropic Messages spec (system prompts go in
+  // the top-level `system` field), but Claude Code's SessionStart hooks inject
+  // a `{ role: 'system' }` message carrying "additional context" into the
+  // `messages` array. We tolerate it by folding its text into the system
+  // prompt (see `mapAnthropicRequest`) rather than rejecting the request.
+  role: 'user' | 'assistant' | 'system';
   content: string | AnthropicContentBlock[];
 }
 

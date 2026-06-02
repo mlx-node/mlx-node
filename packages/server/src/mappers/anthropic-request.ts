@@ -124,9 +124,15 @@ export function mapAnthropicRequest(
 ): MappedAnthropicRequest {
   const messages: ChatMessage[] = [];
 
+  // The leading system message is assembled and `unshift`ed AFTER the message
+  // loop so that any `system`-role message folded out of `req.messages` (see
+  // the `role === 'system'` branch below) is concatenated with the top-level
+  // `system` field into a single leading system prompt. We compute the
+  // top-level contribution here but defer the push.
+  let topLevelSystem: string | null = null;
   if (req.system != null) {
     if (typeof req.system === 'string') {
-      messages.push({ role: 'system', content: req.system });
+      topLevelSystem = req.system;
     } else {
       // Validate first — throw early on unsupported block types so the
       // request fails fast (this is the validation gate). Stripping of
@@ -145,18 +151,21 @@ export function mapAnthropicRequest(
       // Helper returns `null` when every block was stripped (e.g. a
       // request whose only system block is the rotating
       // `x-anthropic-billing-header` line). An all-stripped array is
-      // semantically equivalent to "no system", so skip the push
-      // entirely — emitting `{ role: 'system', content: '' }` would
+      // semantically equivalent to "no system", so it contributes
+      // nothing — emitting `{ role: 'system', content: '' }` would
       // otherwise have the chat template wrap it with two extra
       // `<|im_start|>system\n<|im_end|>\n` tokens, perturbing the
       // prefix vs. an absent-system request and breaking prefix
       // caching across the two semantically-equivalent shapes.
-      const content = canonicalizeSystemForCacheKey(req.system);
-      if (content !== null) {
-        messages.push({ role: 'system', content });
-      }
+      topLevelSystem = canonicalizeSystemForCacheKey(req.system);
     }
   }
+
+  // Text folded out of any `system`-role message(s) in `req.messages`, in
+  // encounter order. Anthropic has no system role in `messages`, but Claude
+  // Code hooks inject one; its content is positionless "additional context"
+  // so we fold it into the leading system prompt regardless of position.
+  const foldedSystemParts: string[] = [];
 
   for (const msg of req.messages) {
     const { role, content } = msg;
@@ -345,9 +354,66 @@ export function mapAnthropicRequest(
         }
         messages.push(assistantMsg);
       }
+    } else if (role === 'system') {
+      // `system` is not a role in the Anthropic Messages spec, but Claude
+      // Code's SessionStart hooks (e.g. superpowers) inject a
+      // `{ role: 'system' }` message carrying "additional context" into the
+      // `messages` array. Rather than rejecting the request (HTTP 400), fold
+      // its text into the leading system prompt (assembled after the loop).
+      //
+      // CONTRACT — position-agnostic hoist (deliberate): a `system`-role
+      // message is folded to the SINGLE leading system prompt regardless of
+      // where it appears in `messages`. This is intentional, not incidental:
+      //   1. The Anthropic wire format has no positional `system` role, so
+      //      any `{ role: 'system' }` here is non-spec tooling injection with
+      //      no defined positional semantics to preserve.
+      //   2. The only known producer (Claude Code SessionStart hooks) emits
+      //      positionless "additional context" — conceptually system-level,
+      //      not a turn-point instruction.
+      //   3. The internal `ChatMessage`/`primeHistory` pipeline represents
+      //      only a SINGLE leading system message; a mid-history system turn
+      //      is not representable, so hoisting is the sole non-rejecting
+      //      option. Multiple system-role messages accumulate in encounter
+      //      order (handled at assembly below).
+      if (typeof content === 'string') {
+        foldedSystemParts.push(content);
+      } else {
+        let text = '';
+        for (const block of content as AnthropicContentBlock[]) {
+          if (block.type !== 'text') {
+            throw new Error(`Unsupported content block type "${block.type}" in system-role message`);
+          }
+          text += block.text;
+        }
+        foldedSystemParts.push(text);
+      }
     } else {
       throw new Error(`Unsupported message role: "${role as string}"`);
     }
+  }
+
+  // Assemble the single leading system prompt from the top-level `system`
+  // field plus any folded `system`-role message text. Joined with `'\n\n'`
+  // between distinct contributions (a single string when there is only one),
+  // so a request with ONLY a top-level system — the overwhelmingly common
+  // case — stays byte-identical to the pre-folding behaviour.
+  //
+  // Empty folded contributions are dropped so an empty hook context message
+  // ({ role: 'system', content: '' }) neither corrupts a real top-level
+  // system prompt with a trailing `'\n\n'` separator nor synthesises a bare
+  // empty system message. The top-level `system` field itself is preserved
+  // verbatim (an explicit empty string still emits, matching prior behaviour).
+  const systemParts: string[] = [];
+  if (topLevelSystem !== null) {
+    systemParts.push(topLevelSystem);
+  }
+  for (const part of foldedSystemParts) {
+    if (part.length > 0) {
+      systemParts.push(part);
+    }
+  }
+  if (systemParts.length > 0) {
+    messages.unshift({ role: 'system', content: systemParts.join('\n\n') });
   }
 
   const config: ChatConfig = {
