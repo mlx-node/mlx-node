@@ -886,8 +886,8 @@ fn compiled_moe_decode_seq_matches_native() {
         num_experts: Some(n_exp),
         num_experts_per_tok: Some(top_k),
         num_dense_layers: Some(num_dense_layers),
-        norm_topk_prob: true,
-        use_expert_bias: true,
+        norm_topk_prob: Some(true),
+        use_expert_bias: Some(true),
     };
 
     // FFN holder: dense SwiGLU MLP (dense layers) or sparse MoE block (MoE layers).

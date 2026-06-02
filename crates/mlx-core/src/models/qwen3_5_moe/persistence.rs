@@ -259,7 +259,7 @@ fn sanitize_weights(
     Ok(result)
 }
 
-fn try_build_quantized_switch_linear(
+pub(crate) fn try_build_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     group_size: i32,

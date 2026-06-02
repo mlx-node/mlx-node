@@ -3470,10 +3470,22 @@ export interface Lfm2Config {
   numExpertsPerTok?: number | undefined;
   /** Number of leading DENSE layers before MoE layers begin. */
   numDenseLayers?: number | undefined;
-  /** Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`). */
-  normTopkProb: boolean;
-  /** Add the learned per-expert bias to the post-softmax gates BEFORE top-k. */
-  useExpertBias: boolean;
+  /**
+   * Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
+   *
+   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+   * required). Absent (None) is read as `true` everywhere via
+   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   */
+  normTopkProb?: boolean | undefined;
+  /**
+   * Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
+   *
+   * `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+   * required). Absent (None) is read as `true` everywhere via
+   * `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+   */
+  useExpertBias?: boolean | undefined;
 }
 
 export interface MemorySnapshot {

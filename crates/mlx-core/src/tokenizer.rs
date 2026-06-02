@@ -2421,13 +2421,24 @@ mod tests {
     /// End-to-end: load the real LFM2.5-8B-A1B chat_template.jinja (which uses
     /// `{%- generation -%}` / `{%- endgeneration -%}`), render a single
     /// user-message conversation with `add_generation_prompt=true`, and assert
-    /// it parses, renders, and ends with the assistant prompt prefix. Skips
-    /// silently when the model isn't checked out locally.
+    /// it parses, renders, and ends with the assistant prompt prefix.
+    /// `#[ignore]`-gated because the template lives in a local checkout;
+    /// point `MLX_TEST_LFM2_TEMPLATE_PATH` at the LFM2.5-8B-A1B
+    /// `chat_template.jinja` and opt in with
+    /// `cargo test lfm2_full_template_renders -- --include-ignored`.
     #[test]
+    #[ignore = "requires local LFM2.5 checkpoint; set MLX_TEST_LFM2_TEMPLATE_PATH to its chat_template.jinja"]
     fn lfm2_full_template_renders_with_generation_tags() {
-        let path = "/Users/brooklyn/.cache/huggingface/models--LiquidAI--LFM2.5-8B-A1B/snapshots/e20b8981cea25d2758f541d2cdadccf4906334bd/chat_template.jinja";
-        let Ok(tmpl) = std::fs::read_to_string(path) else {
-            // Fixture not present on this machine — nothing to assert.
+        let Ok(path) = std::env::var("MLX_TEST_LFM2_TEMPLATE_PATH") else {
+            eprintln!(
+                "skipping: MLX_TEST_LFM2_TEMPLATE_PATH unset (point it at the \
+                 LFM2.5-8B-A1B chat_template.jinja)"
+            );
+            return;
+        };
+        let Ok(tmpl) = std::fs::read_to_string(&path) else {
+            // Fixture not present at the given path — nothing to assert.
+            eprintln!("skipping: MLX_TEST_LFM2_TEMPLATE_PATH file not readable: {path}");
             return;
         };
         // LFM2.5's template calls strftime_now() only inside the `if tools`

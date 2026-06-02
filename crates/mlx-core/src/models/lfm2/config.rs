@@ -123,12 +123,22 @@ pub struct Lfm2Config {
     pub num_dense_layers: Option<i32>,
 
     /// Renormalize the top-k routing weights to sum to 1 (`/(sum+1e-20)`).
-    #[serde(default = "default_true")]
-    pub norm_topk_prob: bool,
+    ///
+    /// `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+    /// required). Absent (None) is read as `true` everywhere via
+    /// `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub norm_topk_prob: Option<bool>,
 
     /// Add the learned per-expert bias to the post-softmax gates BEFORE top-k.
-    #[serde(default = "default_true")]
-    pub use_expert_bias: bool,
+    ///
+    /// `Option<bool>` so TS callers may omit it (napi renders bare `bool` as
+    /// required). Absent (None) is read as `true` everywhere via
+    /// `.unwrap_or(true)`, matching the prior `default = "default_true"`.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub use_expert_bias: Option<bool>,
 }
 
 impl Lfm2Config {
@@ -243,8 +253,8 @@ mod tests {
             num_experts: None,
             num_experts_per_tok: None,
             num_dense_layers: None,
-            norm_topk_prob: true,
-            use_expert_bias: true,
+            norm_topk_prob: Some(true),
+            use_expert_bias: Some(true),
         }
     }
 
@@ -374,9 +384,9 @@ mod tests {
         for i in 0..(cfg.num_hidden_layers as usize) {
             assert!(!cfg.is_moe_layer(i));
         }
-        // serde defaults preserved
-        assert!(cfg.norm_topk_prob);
-        assert!(cfg.use_expert_bias);
+        // serde defaults preserved (None reads as true via unwrap_or(true))
+        assert!(cfg.norm_topk_prob.unwrap_or(true));
+        assert!(cfg.use_expert_bias.unwrap_or(true));
         assert_eq!(cfg.num_experts, None);
     }
 
@@ -446,8 +456,8 @@ mod tests {
             "use_expert_bias": false
         }"#;
         let cfg: Lfm2Config = serde_json::from_str(json).unwrap();
-        assert!(!cfg.norm_topk_prob);
-        assert!(!cfg.use_expert_bias);
+        assert_eq!(cfg.norm_topk_prob, Some(false));
+        assert_eq!(cfg.use_expert_bias, Some(false));
         // num_dense_layers=0 → every layer is MoE
         assert!(cfg.is_moe_layer(0));
         assert!(cfg.is_moe_layer(1));

@@ -68,7 +68,7 @@ impl Lfm2SparseMoeBlock {
 
         let gate = Linear::new(hidden as u32, num_experts as u32, Some(false))?;
         let switch_mlp = SwitchGLU::new(hidden as u32, moe_inter as u32, num_experts as u32)?;
-        let expert_bias = if config.use_expert_bias {
+        let expert_bias = if config.use_expert_bias.unwrap_or(true) {
             Some(MxArray::zeros(&[num_experts as i64], Some(DType::Float32))?)
         } else {
             None
@@ -80,7 +80,7 @@ impl Lfm2SparseMoeBlock {
             expert_bias,
             num_experts,
             top_k,
-            norm_topk_prob: config.norm_topk_prob,
+            norm_topk_prob: config.norm_topk_prob.unwrap_or(true),
         })
     }
 
@@ -221,8 +221,8 @@ mod tests {
             num_experts: Some(4),
             num_experts_per_tok: Some(2),
             num_dense_layers: Some(num_dense_layers),
-            norm_topk_prob,
-            use_expert_bias,
+            norm_topk_prob: Some(norm_topk_prob),
+            use_expert_bias: Some(use_expert_bias),
         }
     }
 

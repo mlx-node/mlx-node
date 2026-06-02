@@ -13,6 +13,7 @@ use crate::models::quant_dispatch::{
     load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence_common::{dequant_fp8_weights, load_all_safetensors};
+use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
@@ -30,29 +31,6 @@ use crate::nn::{Embedding, Linear};
 use super::config::Lfm2Config;
 use super::model::{Lfm2Inner, Lfm2Model, handle_lfm2_cmd};
 
-/// Build an affine-mode `QuantizedSwitchLinear` for the LFM2 expert stack.
-///
-/// Duplicated from qwen3_5_moe's private `try_build_quantized_switch_linear`
-/// (it is `pub(self)` there) to avoid touching the qwen3_5_moe module.
-fn try_build_lfm2_quantized_switch_linear(
-    params: &HashMap<String, MxArray>,
-    key_prefix: &str,
-    group_size: i32,
-    bits: i32,
-) -> Option<QuantizedSwitchLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
-    let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
-    Some(QuantizedSwitchLinear::new(
-        weight.clone(),
-        scales.clone(),
-        biases,
-        group_size,
-        bits,
-        "affine".to_string(),
-    ))
-}
-
 /// Build the quantized expert SwitchLinear for `prefix`, dispatching on the
 /// per-layer quant mode. Mirrors qwen3_5_moe's `try_build_qsl`.
 fn build_lfm2_qsl(
@@ -68,7 +46,7 @@ fn build_lfm2_qsl(
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
         PerLayerMode::Affine => {
-            try_build_lfm2_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+            try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
     }
 }
@@ -171,13 +149,16 @@ fn load_linear_proj_quantized_or_bf16(
 }
 
 /// Load a NON-MoE dense `MLPVariant` (gate/up/down projections) either
-/// quantized (ANY mode) or plain bf16, keyed off the presence of the
-/// gate-proj's `.scales`.
+/// quantized (ANY mode) or plain bf16, keyed off the presence of ANY
+/// projection's `.scales` (via the shared `dense_mlp_is_quantized` helper).
 ///
 /// Non-MoE quant is PER-TENSOR independent, but a dense MLP's three
 /// projections are co-quantized by `mlx_lm.convert` (all or none), so we key
-/// the variant swap off `{base}.gate_proj.scales` and then require the whole
-/// group via `build_lfm2_non_moe_ql` (fail loud on any missing half). When
+/// the variant swap off ANY of the three `{base}.scales` companions (NOT just
+/// `gate_proj.scales` — a checkpoint missing exactly that one sentinel while
+/// carrying packed weights + the other `.scales` must NOT misclassify as bf16)
+/// and then require the whole group via `build_lfm2_non_moe_ql` (fail loud on
+/// any missing half). When
 /// quantized, the `MLPVariant` is swapped in place to `Quantized`, whose
 /// forward runs three `QuantizedLinear::forward` + swiglu with NO dense
 /// `get_weight()` copy. When not, the existing `Standard(MLP)` arm loads its
@@ -193,7 +174,7 @@ fn load_dense_mlp_variant(
     let up_base = format!("{prefix}.up_proj");
     let down_base = format!("{prefix}.down_proj");
 
-    if params.contains_key(&format!("{gate_base}.scales")) {
+    if dense_mlp_is_quantized(params, prefix) {
         // Quantized dense MLP: build all three projections and swap the variant
         // to `Quantized` in place. A missing half on ANY projection fails loud
         // (validate_mandatory_weights already rejects lone-half groups, but the
@@ -458,10 +439,10 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
     if let Some(b) = raw.get("norm_topk_prob").and_then(|v| v.as_bool()) {
-        config.norm_topk_prob = b;
+        config.norm_topk_prob = Some(b);
     }
     if let Some(b) = raw.get("use_expert_bias").and_then(|v| v.as_bool()) {
-        config.use_expert_bias = b;
+        config.use_expert_bias = Some(b);
     }
 
     // Parse eos_token_id from generation_config.json if available
@@ -657,6 +638,38 @@ fn moe_layer_is_quantized(params: &HashMap<String, MxArray>, prefix: &str) -> bo
         .any(|base| params.contains_key(&format!("{base}.scales")))
 }
 
+/// The three dense-MLP projection bases for a `{prefix}.feed_forward` prefix.
+///
+/// Centralized — like `moe_proj_bases` — so the quant-detection helper and the
+/// validate-path stray-`.scales` rejection scan the identical key set.
+fn dense_mlp_proj_bases(ff_prefix: &str) -> [String; 3] {
+    [
+        format!("{ff_prefix}.gate_proj"),
+        format!("{ff_prefix}.up_proj"),
+        format!("{ff_prefix}.down_proj"),
+    ]
+}
+
+/// Decide whether the DENSE MLP at `{prefix}.feed_forward` is quantized.
+///
+/// A dense MLP is quantized iff ANY of its gate/up/down projections ships a
+/// `.scales` companion tensor — not just `gate_proj.scales`. Keying off the
+/// single `gate_proj.scales` sentinel let a checkpoint that carried
+/// `up_proj.scales` / `down_proj.scales` (plus packed uint32 `.weight`s) but
+/// happened to be missing exactly `gate_proj.scales` misclassify as plain bf16
+/// and silently install packed weights through the dense `Linear` setters,
+/// producing corrupted output instead of failing loud. Mirrors
+/// `moe_layer_is_quantized`.
+///
+/// SHARED between `load_dense_mlp_variant` (the load path) and
+/// `validate_mandatory_weights` so the two can never diverge on the
+/// dense-vs-quantized determination.
+fn dense_mlp_is_quantized(params: &HashMap<String, MxArray>, ff_prefix: &str) -> bool {
+    dense_mlp_proj_bases(ff_prefix)
+        .iter()
+        .any(|base| params.contains_key(&format!("{base}.scales")))
+}
+
 /// Apply sanitized weights to an Lfm2Inner.
 ///
 /// `quant_bits` / `quant_group_size` / `top_level_mode` / `per_layer_quant`
@@ -683,7 +696,7 @@ fn apply_weights(
 
     // Captured before the `inner.layers.iter_mut()` borrow below so the
     // per-layer loop can consult it without re-borrowing `inner`.
-    let use_expert_bias = inner.config.use_expert_bias;
+    let use_expert_bias = inner.config.use_expert_bias.unwrap_or(true);
 
     // Embedding (PACKED-quantized when `embed_tokens.scales` is present, ANY
     // mode; else plain bf16). A fully quantized checkpoint (incl. the embedding)
@@ -1064,23 +1077,29 @@ fn validate_mandatory_weights(
         }
     };
 
-    // NON-MoE linears + the embedding are quantized INDEPENDENTLY per tensor.
-    // A fully quantized `mlx_lm.convert --quantize` checkpoint quantizes every
-    // attention / conv-proj / dense-MLP linear (the embedding stays bf16 until
-    // #1b); the loader (`load_linear_proj_quantized_or_bf16` /
-    // `load_dense_mlp_variant` / `load_embedding_affine_or_bf16`) resolves each
-    // tensor on its OWN `.scales` presence:
+    // The attention / conv-proj linears + the embedding are quantized
+    // INDEPENDENTLY per tensor. A fully quantized `mlx_lm.convert --quantize`
+    // checkpoint quantizes every attention / conv-proj linear (the embedding
+    // stays bf16 until #1b); the loader (`load_linear_proj_quantized_or_bf16` /
+    // `load_embedding_affine_or_bf16`) resolves each tensor on its OWN
+    // `.scales` presence:
     //   - `.scales` present → load quantized (ANY mode for the non-MoE linears;
     //     affine-only for the embedding) from the `.weight`+`.scales` group (a
     //     lone `.scales` with no packed `.weight` is caught by the mandatory
     //     `.weight` checks below, which fail loud naming the missing packed
     //     weight).
     //   - `.scales` absent  → load plain bf16 from `.weight`.
-    // There is no group-level coupling for non-MoE tensors, so a `.scales`
-    // companion alongside its `.weight` is simply accepted (quantized) — no
-    // extra rejection rule is needed beyond the existing per-key `.weight`
-    // requirements. The depthwise `conv.conv.weight` is never quantized and is
-    // required as a plain `.weight`.
+    // There is no group-level coupling for these per-tensor non-MoE linears, so
+    // a `.scales` companion alongside its `.weight` is simply accepted
+    // (quantized) — no extra rejection rule is needed beyond the existing
+    // per-key `.weight` requirements. The depthwise `conv.conv.weight` is never
+    // quantized and is required as a plain `.weight`.
+    //
+    // The DENSE MLP is the exception: its three projections are co-quantized
+    // all-or-none by `mlx_lm.convert`, so `load_dense_mlp_variant` builds the
+    // whole group or none (keyed off the shared `dense_mlp_is_quantized` — ANY
+    // projection's `.scales`). The dense-MLP branch below mirrors that group
+    // determination via `push_missing_proj`, exactly like the MoE branch.
 
     // Per-layer weights
     for i in 0..num_layers {
@@ -1110,14 +1129,17 @@ fn validate_mandatory_weights(
                 push_missing_proj(&mut missing, &base, quantized);
             }
         } else {
-            for key in [
-                format!("{}.feed_forward.gate_proj.weight", prefix),
-                format!("{}.feed_forward.up_proj.weight", prefix),
-                format!("{}.feed_forward.down_proj.weight", prefix),
-            ] {
-                if !params.contains_key(&key) {
-                    missing.push(key);
-                }
+            // Dense MLP: gate/up/down projections. A dense MLP is quantized iff
+            // ANY projection ships a `.scales` — the SAME `dense_mlp_is_quantized`
+            // predicate `load_dense_mlp_variant` uses on the apply path. On a
+            // quantized MLP every projection must be a full weight+scales group;
+            // on a plain MLP each needs a plain weight and NO stray `.scales`
+            // (`push_missing_proj` rejects the partial-quant case so a
+            // misclassified MLP can never load packed uint32 weights as bf16).
+            let ff_prefix = format!("{}.feed_forward", prefix);
+            let quantized = dense_mlp_is_quantized(params, &ff_prefix);
+            for base in dense_mlp_proj_bases(&ff_prefix) {
+                push_missing_proj(&mut missing, &base, quantized);
             }
         }
 
@@ -1258,8 +1280,8 @@ impl Lfm2Inner {
                 config.num_experts_per_tok,
                 config.num_dense_layers,
                 config.moe_intermediate_size,
-                config.use_expert_bias,
-                config.norm_topk_prob,
+                config.use_expert_bias.unwrap_or(true),
+                config.norm_topk_prob.unwrap_or(true),
             );
         }
 
@@ -1462,7 +1484,7 @@ fn register_weights_with_cpp_locked(
     // already ships expert_bias, so `contains_key` makes this a strict no-op for
     // it; this is purely additive robustness. f32 dtype + `[num_experts]` shape
     // match native exactly (do NOT use bf16: native keeps expert_bias f32).
-    if config.use_expert_bias
+    if config.use_expert_bias.unwrap_or(true)
         && let Some(num_experts) = config.num_experts
         && num_experts > 0
     {
@@ -1584,8 +1606,8 @@ mod tests {
             num_experts: Some(4),
             num_experts_per_tok: Some(2),
             num_dense_layers: Some(0),
-            norm_topk_prob: true,
-            use_expert_bias,
+            norm_topk_prob: Some(true),
+            use_expert_bias: Some(use_expert_bias),
         }
     }
 
@@ -1869,8 +1891,8 @@ mod tests {
             num_experts: None,
             num_experts_per_tok: None,
             num_dense_layers: None,
-            norm_topk_prob: true,
-            use_expert_bias: false,
+            norm_topk_prob: Some(true),
+            use_expert_bias: Some(false),
         }
     }
 
@@ -2174,8 +2196,8 @@ mod tests {
                 config.num_experts.unwrap_or(0),
                 config.num_experts_per_tok.unwrap_or(0),
                 config.num_dense_layers.unwrap_or(0),
-                i32::from(config.norm_topk_prob),
-                i32::from(config.use_expert_bias),
+                i32::from(config.norm_topk_prob.unwrap_or(true)),
+                i32::from(config.use_expert_bias.unwrap_or(true)),
                 i32::from(config.tie_embedding),
                 i32::from(config.conv_bias),
                 max_kv_len,

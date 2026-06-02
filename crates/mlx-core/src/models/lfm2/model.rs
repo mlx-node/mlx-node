@@ -949,8 +949,8 @@ impl Lfm2Inner {
                         self.config.num_experts.unwrap_or(0),
                         self.config.num_experts_per_tok.unwrap_or(0),
                         self.config.num_dense_layers.unwrap_or(0),
-                        i32::from(self.config.norm_topk_prob),
-                        i32::from(self.config.use_expert_bias),
+                        i32::from(self.config.norm_topk_prob.unwrap_or(true)),
+                        i32::from(self.config.use_expert_bias.unwrap_or(true)),
                         i32::from(self.config.tie_embedding),
                         i32::from(self.config.conv_bias),
                         max_kv_len,
@@ -4158,8 +4158,8 @@ mod paged_adapter_construction_tests {
             num_experts: None,
             num_experts_per_tok: None,
             num_dense_layers: None,
-            norm_topk_prob: true,
-            use_expert_bias: true,
+            norm_topk_prob: Some(true),
+            use_expert_bias: Some(true),
         }
     }
 
