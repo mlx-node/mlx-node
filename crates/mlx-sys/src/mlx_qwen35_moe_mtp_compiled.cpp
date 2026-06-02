@@ -606,6 +606,13 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
 // MoE main path takes `offset_arr` as an array input, same as us, so the
 // compile cache is stable across decode steps. The dense MTP file makes
 // the same choice (see `compiled_mtp_draft_decode` there).
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `moe_mtp_draft_decode_fn` reads the
+// MoE MTP head weights via `get_weight(...)` inside the trace, so a model
+// reload in the same process leaves this draft graph baked with the
+// previous model's MTP weights. Cannot null a local static; left as a
+// documented gap (the confirmed P1 — MTP-verify — is fixed via
+// `mlx_qwen35_invalidate_compiled_graphs`).
 static auto& compiled_moe_mtp_draft_decode() {
   static auto fn = mlx::core::compile(moe_mtp_draft_decode_fn);
   return fn;

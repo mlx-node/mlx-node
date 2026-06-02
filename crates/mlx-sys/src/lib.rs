@@ -1640,6 +1640,16 @@ unsafe extern "C-unwind" {
     /// Reset compiled state (call on model reset / new conversation).
     pub fn mlx_qwen35_compiled_reset();
 
+    /// PR #65 (mtp-reload P1): invalidate the compiled MTP-verify
+    /// dispatch tables so the next verify re-traces against the CURRENT
+    /// weight registry. MUST be called on every model reload, after
+    /// `mlx_clear_weights()` and inside the `COMPILED_WEIGHTS_RWLOCK`
+    /// write critical section. Unlike `mlx_qwen35_compiled_reset`
+    /// (per-turn; keeps the verify tables for cross-turn reuse), this is
+    /// a per-reload invalidation that prevents a second same-shape model
+    /// from verifying with the first model's baked weights.
+    pub fn mlx_qwen35_invalidate_compiled_graphs();
+
     /// Export compiled caches for PromptCache reuse.
     pub fn mlx_qwen35_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
 

@@ -1367,6 +1367,14 @@ fn register_moe_weights_with_cpp(
     // per-projection quant-info registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
+    // PR #65 (mtp-reload P1) — invalidate the compiled MTP-verify dispatch
+    // tables (shared with the dense Qwen3.5 path) in the SAME write-lock
+    // critical section as the weight clear, so the next verify re-traces
+    // against the weights we store just below instead of reusing the
+    // previous model's baked compile cache. See the dense loader
+    // (`register_weights_with_cpp`) for the full rationale.
+    unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
+
     let store = |name: &str, array: &MxArray| {
         let c_name = CString::new(name).expect("Weight name contains null byte");
         unsafe {

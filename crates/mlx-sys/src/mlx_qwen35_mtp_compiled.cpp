@@ -423,6 +423,13 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
 // Wrapped in mlx::core::compile (modeled on mlx_qwen35.cpp:286-289 /
 // mlx_qwen35_moe.cpp:549). Safe because mtp_draft_decode_fn takes
 // offset_arr as an array input — see comment at line 166-169.
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `mtp_draft_decode_fn` reads the MTP
+// head weights via `get_weight("mtp.*")` inside the trace, so a model
+// reload in the same process leaves this draft graph baked with the
+// previous model's MTP weights. Cannot null a local static; left as a
+// documented gap (the confirmed P1 — MTP-verify — is fixed in
+// mlx_qwen35.cpp via `mlx_qwen35_invalidate_compiled_graphs`).
 static auto& compiled_mtp_draft_decode() {
   static auto fn = mlx::core::compile(mtp_draft_decode_fn);
   return fn;
@@ -577,6 +584,11 @@ static std::vector<array> mtp_commit_fn(const std::vector<array>& inputs) {
 // The unrolled body differs per M, so
 // each gets its own static-function-local compile cache (survives
 // reset).
+// TODO(mtp-reload): function-local compiled static (per template M) not
+// invalidated on weight change — see PR #65 review. `mtp_commit_fn<M>`
+// reads MTP weights via `get_weight("mtp.*")` inside the trace, so a model
+// reload leaves each per-M commit graph baked with the previous model's
+// MTP weights. Cannot null a local static; left as a documented gap.
 template <int M>
 static auto& compiled_mtp_commit() {
   static auto fn = mlx::core::compile(mtp_commit_fn<M>);

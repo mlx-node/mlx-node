@@ -1578,6 +1578,18 @@ fn register_weights_with_cpp(
     // registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
+    // PR #65 (mtp-reload P1) — invalidate the compiled MTP-verify dispatch
+    // tables in the SAME write-lock critical section as the weight clear.
+    // The verify graphs bake their weights into the compile cache (weights
+    // are captured inside the traced closure, not passed as inputs) and
+    // those tables deliberately survive the per-turn compiled reset for
+    // cross-turn reuse. Without this, a second same-shape Qwen3.5/3.6 model
+    // loaded in the same process would verify speculative tokens with the
+    // first model's baked weights. Nulling the slots forces the next
+    // `get_or_compile_verify_*` to re-trace against the weights we store
+    // just below.
+    unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
+
     // Track every quantized prefix we actually stored (i.e. every name that
     // ends in `.scales`). The defensive merge branches below promote split
     // GDN projections (`*.in_proj_qkv*` + `*.in_proj_z*`) into the merged

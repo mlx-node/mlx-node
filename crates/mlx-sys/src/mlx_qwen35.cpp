@@ -952,6 +952,46 @@ static BatchedVerifyFn& get_or_compile_verify_paged(bool with_tape) {
   return slot;
 }
 
+// PR #65 (mtp-reload P1) — null EVERY MTP-verify dispatch slot so the next
+// `get_or_compile_verify_*` re-traces against the CURRENT weight registry.
+//
+// The compiled verify bodies read weights via `get_weight(...)` INSIDE the
+// traced closure (NOT as compile inputs), so `mlx::core::compile(...)` bakes
+// the captured weight arrays into the cached tape and reuses them verbatim
+// on every later call. These tables are PROCESS-WIDE and deliberately
+// survive the per-turn `mlx_qwen35_compiled_reset()` (cross-turn reuse). On
+// a model RELOAD (weights swapped under the same `model_id` gate) the baked
+// weights are stale, so a second same-shape model would verify with the
+// first model's weights — silent corruption.
+//
+// Assigning an empty `std::function{}` destroys the wrapper, frees its
+// `fun_id`, and forces a NEW wrapper (new `fun_id`) to be built on the next
+// call — which re-traces against the live registry on whatever thread next
+// calls `get_or_compile_*`. This is correct regardless of thread because the
+// re-trace is lazy on the inference thread; we do NOT rely on cross-thread
+// `compile_clear_cache()` (MLX's CompilerCache is thread_local).
+//
+// MUST be called under the Rust `COMPILED_WEIGHTS_RWLOCK.write()` so it is
+// serialized against in-flight compiled reads.
+static void invalidate_verify_compiled_tables() {
+  for (auto& by_tape : g_verify_compiled_by_bucket) {
+    by_tape[0] = BatchedVerifyFn{};
+    by_tape[1] = BatchedVerifyFn{};
+  }
+  for (auto& by_tape : g_verify_argmax_compiled_by_bucket) {
+    by_tape[0] = BatchedVerifyFn{};
+    by_tape[1] = BatchedVerifyFn{};
+  }
+  for (auto& by_tape : g_verify_sparse_compiled_by_bucket) {
+    by_tape[0].fn = BatchedVerifyFn{};
+    by_tape[0].spec = SparseTargetSpec{};
+    by_tape[1].fn = BatchedVerifyFn{};
+    by_tape[1].spec = SparseTargetSpec{};
+  }
+  g_verify_compiled_paged[0] = BatchedVerifyFn{};
+  g_verify_compiled_paged[1] = BatchedVerifyFn{};
+}
+
 }  // namespace
 
 // =====================================================================
@@ -1096,6 +1136,12 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
   return result;
 }
 
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `dense_compiled_decode_fn_paged`
+// reads weights via `get_weight(...)` inside the trace, so a model reload
+// in the same process leaves this paged AR-decode graph baked with the
+// previous model's weights. Cannot null a local static; left as a
+// documented gap (the confirmed P1 is MTP-verify, handled above).
 static auto& compiled_dense_decode_paged() {
   static auto fn = mlx::core::compile(dense_compiled_decode_fn_paged);
   return fn;
@@ -2661,6 +2707,26 @@ void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
     fflush(stderr);
   }
   mlx_qwen35_compiled_tape_disarm();
+}
+
+// PR #65 (mtp-reload P1) — invalidate ALL compiled MTP-verify dispatch
+// tables so the next `get_or_compile_verify_*` re-traces against the
+// CURRENT weight registry.
+//
+// Called by the Rust loaders (`register_weights_with_cpp` /
+// `register_moe_weights_with_cpp`) on EVERY model reload, immediately
+// after `mlx_clear_weights()` and INSIDE the `COMPILED_WEIGHTS_RWLOCK`
+// write critical section, so it is serialized against in-flight
+// compiled reads. Unlike `mlx_qwen35_compiled_reset()` (a PER-TURN
+// reset that deliberately keeps the verify tables for cross-turn reuse),
+// this is a PER-RELOAD invalidation: without it a second same-shape
+// Qwen3.5/3.6 model loaded in the same process would verify speculative
+// tokens with the FIRST model's baked weights (silent corruption).
+//
+// See `invalidate_verify_compiled_tables()` for the slot-nulling →
+// lazy-re-trace mechanism and its thread-safety rationale.
+void mlx_qwen35_invalidate_compiled_graphs() {
+  invalidate_verify_compiled_tables();
 }
 
 // Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1

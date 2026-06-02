@@ -586,6 +586,12 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
   return result;
 }
 
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `moe_compiled_decode_fn` reads expert
+// + attention weights via `get_weight(...)` inside the trace, so a model
+// reload in the same process leaves this MoE AR-decode graph baked with the
+// previous model's weights. Cannot null a local static; left as a
+// documented gap (the confirmed P1 is MTP-verify).
 static auto& compiled_moe_decode() {
   static auto fn = mlx::core::compile(moe_compiled_decode_fn);
   return fn;
@@ -847,11 +853,24 @@ static std::vector<array> moe_verify_batched_decode_fn(
   return result;
 }
 
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `moe_verify_batched_decode_fn` reads
+// weights via `get_weight(...)` inside the trace; this is the MoE
+// MTP-verify graph (sibling of the dense bucket tables that ARE invalidated
+// by `mlx_qwen35_invalidate_compiled_graphs`). A model reload leaves it
+// baked with the previous model's weights. Cannot null a local static;
+// left as a documented gap — the MoE verify path needs the same
+// resettable-global treatment as the dense bucket tables in a follow-up.
 static auto& compiled_moe_verify_batched() {
   static auto fn = mlx::core::compile(moe_verify_batched_decode_fn);
   return fn;
 }
 
+// TODO(mtp-reload): function-local compiled static not invalidated on
+// weight change — see PR #65 review. `moe_compiled_decode_fn_paged` reads
+// weights via `get_weight(...)` inside the trace, so a model reload leaves
+// this paged MoE AR-decode graph baked with the previous model's weights.
+// Cannot null a local static; left as a documented gap.
 static auto& compiled_moe_decode_paged() {
   static auto fn = mlx::core::compile(moe_compiled_decode_fn_paged);
   return fn;
