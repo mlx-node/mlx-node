@@ -5,6 +5,7 @@ import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { PermutationInvariance } from '../widgets/PermutationInvariance';
 import { RopeRelativeDial } from '../widgets/RopeRelativeDial';
 
 /**
@@ -215,6 +216,11 @@ export function RopeChapterBody() {
           <em>"the cat sat on the mat"</em> from <em>"mat the on sat cat the"</em>. Something has to inject the order
           back in.
         </p>
+        <p>
+          See it for yourself first. Below is a toy bag of three tokens with no position attached — reorder them and the
+          attention weights never budge:
+        </p>
+        <PermutationInvariance />
 
         <h2>Two earlier ideas</h2>
         <ul>
@@ -246,19 +252,61 @@ export function RopeChapterBody() {
         </p>
         <MathDisplay latex={String.raw`\theta_i = \text{base}^{-2i / d}`} />
         <p>
+          Reading that in words: as the pair index <code>i</code> grows, the exponent <code>−2i/d</code> gets more
+          negative, so <MathDisplay latex={String.raw`\theta_i`} inline /> gets smaller. Low-index pairs spin fast (they
+          track fine, local position); high-index pairs spin slowly (they track coarse, long-range position).
+        </p>
+        <p>
           At token position <code>m</code>, the pair is rotated by an angle of{' '}
           <MathDisplay latex={String.raw`m \cdot \theta_i`} inline />:
+        </p>
+        <p>
+          A <strong>rotation matrix</strong> just spins a 2-D point — think of a clock hand — by an angle{' '}
+          <MathDisplay latex={String.raw`\theta`} inline />; the four trig entries below are simply the recipe for
+          computing where the spun point lands. The clock-hand dials further down show exactly this spin. Angles here
+          are measured in <strong>radians</strong> — a unit where one full turn is{' '}
+          <MathDisplay latex={String.raw`2\pi \approx 6.28`} inline />, so a rate of "1 rad/token" is about a sixth of a
+          turn per step.
         </p>
         <MathDisplay
           latex={String.raw`\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}`}
         />
         <p>
-          <strong>One implementation detail:</strong> the pairs are drawn here as neighbours (<code>x_0</code> with{' '}
-          <code>x_1</code>) for clarity, but Qwen3.5 — like most Llama/HF-style models — uses the mathematically
-          equivalent <em>rotate-half</em> layout: dimension <code>i</code> is paired with its counterpart{' '}
-          <code>i + d/2</code> in the second half of the rotated block. Same angles, same frequencies, same
-          relative-position property; only <em>which</em> two dimensions share a rotation differs.
+          The pairs are drawn here as neighbours (<code>x_0</code> with <code>x_1</code>) for clarity; how Qwen3.5
+          actually lays them out is an implementation detail you can skip on a first read (see <strong>Advanced</strong>{' '}
+          below).
         </p>
+
+        {/* Optional deep-dive: the rotate-half pairing layout is an
+            implementation detail that interrupts the core "rotate, don't add"
+            story for a beginner — the math, angles, and frequencies are
+            identical either way. Collapsed by default and skippable. Native
+            <details> so it stays keyboard-focusable; styled like the project's
+            Glossary disclosure (mirrors 04-multihead-gqa.tsx). */}
+        <details className="group not-prose my-4 rounded-md border border-border bg-muted/30 px-4 py-3 text-sm">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-foreground/90 [&::-webkit-details-marker]:hidden">
+            <span className="font-medium">
+              Advanced: how the pairs are actually laid out (rotate-half){' '}
+              <span className="text-muted-foreground">· optional, for the curious</span>
+            </span>
+            <span
+              aria-hidden="true"
+              className="text-xs text-muted-foreground transition-transform group-open:rotate-90"
+            >
+              ▸
+            </span>
+          </summary>
+          <div className="mt-3 space-y-2 text-[13px] leading-relaxed text-foreground/80">
+            <p>
+              The pairs are drawn here as neighbours (<code>x_0</code> with <code>x_1</code>) for clarity, but Qwen3.5 —
+              like most Llama/HF-style models — uses the mathematically equivalent <em>rotate-half</em> layout:
+              dimension <code>i</code> is paired with its counterpart <code>i + d/2</code> in the second half of the
+              rotated block. Same angles, same frequencies, same relative-position property; only <em>which</em> two
+              dimensions share a rotation differs.
+            </p>
+          </div>
+        </details>
+
         <p>
           Rotation is <strong>unitary</strong> — it preserves vector norms — so RoPE doesn't change how big Q and K are,
           only where they point. The position information rides on the angle, not the magnitude.

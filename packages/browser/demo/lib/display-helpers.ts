@@ -65,6 +65,25 @@ export function formatLoadingText(status: string | null): string {
   return status && status.trim().length > 0 ? status : 'Initializing model…';
 }
 
+export function formatBytes(value: number): string {
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  }
+  if (value >= 1024 * 1024) {
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (value >= 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${Math.round(value)} B`;
+}
+
+export function formatFileName(file: string | undefined): string | null {
+  const trimmed = file?.trim();
+  if (!trimmed) return null;
+  return trimmed.split('/').filter(Boolean).pop() ?? trimmed;
+}
+
 export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
 
 const REASONING_CYCLE: ReasoningEffort[] = ['off', 'low', 'medium', 'high'];

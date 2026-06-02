@@ -47,7 +47,8 @@ export const learning: ChapterLearningData = {
     },
     {
       term: 'logit',
-      definition: 'One unbounded real-valued score per vocab entry. Pre-softmax.',
+      definition:
+        "One unbounded real-valued score per vocab entry — higher means the model favors that token more. They aren't probabilities yet; the sampling chapter turns them into probabilities with softmax.",
     },
     {
       term: 'weight tying',
@@ -185,10 +186,12 @@ export function LmHeadChapterBody() {
           the model uses to read out that geometry.
         </p>
         <p>
-          The inner product unpacks as <code>h · w = |h|·|w|·cos θ</code>: with every token's row at a comparable
-          length, the logit is really just a readout of the <em>angle</em> between the hidden state and that row. Toggle
-          the three cases below — aligned, orthogonal, opposed — and watch the per-dimension products (which sum to the
-          logit) and the cosine move together.
+          The inner product unpacks as <code>h · w = |h|·|w|·cos θ</code>, where <code>cos θ</code> is the{' '}
+          <em>cosine</em> of the angle between the two vectors — it runs from <code>+1</code> when they point the same
+          way, through <code>0</code> at a right angle, to <code>−1</code> when they point opposite ways. With every
+          token's row at a comparable length, the logit is really just a readout of the <em>angle</em> between the
+          hidden state and that row. Toggle the three cases below — aligned, orthogonal, opposed — and watch the
+          per-dimension products (which sum to the logit) and the cosine move together.
         </p>
 
         <InnerProductLogit />
@@ -230,9 +233,10 @@ export function LmHeadChapterBody() {
           chapter 11 will introduce temperature and top-p).
         </p>
         <p className="text-muted-foreground">
-          <em>What to notice:</em> the bars are not yet probabilities — they are <em>logits</em>, untouched by softmax.
-          They can be negative; their absolute magnitudes are not comparable across prompts. Softmax in chapter 11 is
-          what turns this into a probability distribution.
+          <em>What to notice:</em> the panel runs softmax over those logits so the bar <em>heights</em> read as
+          probabilities (each panel's bars sum to 1). But the raw scores the LM head emits are <em>logits</em> —
+          arbitrary real numbers that can be negative and whose magnitudes aren't comparable across prompts. Chapter 11
+          is where temperature and top-p reshape that softmax into the model's actual choice.
         </p>
       </Prose>
     </ChapterFrame>

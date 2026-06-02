@@ -11,6 +11,7 @@ import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { LearnedGainInspector } from '../widgets/LearnedGainInspector';
+import { SaturatedSoftmax } from '../widgets/SaturatedSoftmax';
 
 const DEFAULT_PROMPT = 'The river flows softly through the valley.';
 const DEFAULT_NUM_LAYERS = 24;
@@ -234,6 +235,13 @@ export function RmsNormChapterBody() {
           the brakes on. The chart on the right shows a real prompt: the residual still climbs about 15× over depth
           (visible bottom line), but the input to each sub-block is held flat near √hidden_dim by RMSNorm (pink line).
         </p>
+        <p>
+          Before the formula, feel the problem the brakes solve. &ldquo;Softmaxes saturate&rdquo; sounds abstract — this
+          widget makes it concrete. Push a token's magnitude up and watch a downstream softmax collapse from a
+          spread-out distribution onto a single option, going blind to the rest:
+        </p>
+
+        <SaturatedSoftmax />
 
         <h2>The formula, in two lines</h2>
         <p>
@@ -244,10 +252,24 @@ export function RmsNormChapterBody() {
           latex={String.raw`\begin{aligned} \text{RMS}(x) &= \sqrt{\text{mean}(x^2) + \varepsilon} \\ y_i &= \frac{x_i}{\text{RMS}(x)} \cdot g_i \end{aligned}`}
         />
         <p>
-          The learned gain <code>g</code> is the only parameter the normalizer carries — one scalar per feature, length
-          equal to <code>hidden_dim</code>. Divide by RMS first to make the vector's average squared magnitude land at
-          1; with mean(x²) ≈ 1, the squared entries sum to ≈ hidden_dim, so the vector's length is{' '}
-          <code>L2 = √(Σx²) ≈ √hidden_dim = √1024 = 32</code> — that is where the &ldquo;about 32&rdquo; comes from.
+          Here <code>ε</code> (epsilon) is a tiny constant so we never divide by zero, and the learned gain{' '}
+          <code>g</code> is the only parameter the normalizer carries — one scalar per feature, length equal to{' '}
+          <code>hidden_dim</code>. Divide by RMS first to make the vector's average squared magnitude land at 1. That is
+          what anchors the vector's <strong>L2 norm</strong> — the L2 norm is just the vector's length, the square root
+          of the sum of its squared entries — near √hidden_dim:
+        </p>
+        <ul>
+          <li>after RMSNorm the mean of the squared entries ≈ 1;</li>
+          <li>
+            so the 1024 entries' squares sum to ≈ 1024 (here <code>Σ</code> means &ldquo;sum over all the
+            entries&rdquo;, so <code>Σx²</code> ≈ 1024);
+          </li>
+          <li>
+            so the vector's length <code>L2 = √(Σx²) ≈ √1024 = 32</code> — that is where the &ldquo;about 32&rdquo;
+            comes from.
+          </li>
+        </ul>
+        <p>
           Then let <code>g</code> reweight each feature however the model wants. Initially <code>g = 1</code> for every
           feature, so before training RMSNorm just standardises magnitudes; during training the model learns which
           features matter more than others and bakes that into <code>g</code>.

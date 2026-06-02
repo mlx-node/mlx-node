@@ -1,4 +1,4 @@
-import { formatLoadingText } from '../../lib/display-helpers';
+import { formatBytes, formatFileName, formatLoadingText } from '../../lib/display-helpers';
 
 export type LoadingProgress = {
   pct: number;
@@ -12,25 +12,6 @@ export type LoadingProps = {
   status: string | null;
   progress?: LoadingProgress | null;
 };
-
-function formatBytes(value: number): string {
-  if (value >= 1024 * 1024 * 1024) {
-    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  }
-  if (value >= 1024 * 1024) {
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-  }
-  if (value >= 1024) {
-    return `${(value / 1024).toFixed(1)} KB`;
-  }
-  return `${Math.round(value)} B`;
-}
-
-function formatFileName(file: string | undefined): string | null {
-  const trimmed = file?.trim();
-  if (!trimmed) return null;
-  return trimmed.split('/').filter(Boolean).pop() ?? trimmed;
-}
 
 export function Loading({ status, progress }: LoadingProps) {
   const pct = progress ? Math.round(progress.pct) : null;

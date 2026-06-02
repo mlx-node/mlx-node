@@ -8,7 +8,7 @@
 import { createFileRoute, redirect, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 
-import { Loading } from '../components/loading/Loading';
+import { PanelLoading } from '../components/loading/PanelLoading';
 import { findChapter } from '../learn/chapters';
 import { OverviewChapterBody } from '../learn/chapters/00-overview';
 import { TokenizationChapterBody, TokenizerDemo } from '../learn/chapters/01-tokenization';
@@ -31,17 +31,35 @@ import { triggerLocalPicker } from '../lib/local-model-picker';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
 
-// Chapters that are pure prose + self-contained widgets — no live model/worker
-// demo (their tryItPanel is null, like the architecture chapter). They must stay
-// readable while the model is still downloading or unavailable, so the
-// route-level model gate below is skipped for them.
-const PROSE_ONLY_CHAPTERS = new Set(['overview', 'post-training', 'architecture']);
+// The chapter body always renders immediately (LessonLayout's reading column is
+// model-free). Only the right-hand "Try it now" demo panel is gated, classified
+// by the resource it needs:
+//
+//   model  — needs the full ~1.6 GB model ('ready'); these warm the model in the
+//            background while the learner reads.
+//   device — needs only the WebGPU device + WASM runtime, NOT the model
+//            (Training trains a tiny from-scratch transformer); gates on
+//            `deviceReady` and triggers a device-only init.
+//   none   — pure JS, needs nothing; the demo renders immediately and we do NOT
+//            kick off any download (one exception below: `overview`).
+//
+// Chapters absent from all three sets have no demo panel at all (their inline
+// content/poster lives in the body) and pass `null` for `tryItPanel`.
 
-// Chapters whose live demo needs the WebGPU device + WASM runtime, but NOT the
-// big 1.6 GB model. The Training playground trains a tiny from-scratch
-// transformer on the MLX autograd/optimizer stack, so it gates on the device
-// being up (deviceReady) rather than the full model, and triggers a
-// device-only init so the model is never downloaded for this chapter alone.
+// model-panel chapters — gate the demo on the full model and background-warm it.
+const MODEL_PANEL_CHAPTERS = new Set([
+  'tokenization',
+  'embeddings',
+  'attention',
+  'multi-head-gqa',
+  'rmsnorm',
+  'mlp',
+  'full-block',
+  'lm-head',
+  'sampling',
+]);
+
+// device-panel chapters — gate on the WebGPU device only (no model download).
 const DEVICE_ONLY_CHAPTERS = new Set(['training']);
 
 function ChapterRouteComponent() {
@@ -51,16 +69,32 @@ function ChapterRouteComponent() {
   const { status, loadingText, loadingProgress, hostedModelAvailable, deviceReady, kickoffLoad, kickoffDeviceOnly } =
     useModelLoader();
 
+  const isModelPanelChapter = MODEL_PANEL_CHAPTERS.has(chapter.id);
   const isDeviceOnlyChapter = DEVICE_ONLY_CHAPTERS.has(chapter.id);
 
-  // Auto-kickoff on direct URL landings (bookmark, hard reload of
-  // /chapters/<id>). DEVICE_ONLY chapters (Training) bring up just the WebGPU
-  // device — no model download. Every other live chapter triggers the full
-  // model load. Both kickoffs are idempotent at the App level.
+  // Whether the demo panel's resource is up. `none`-resource panels (rope,
+  // kv-cache, scaling) are pure JS and always ready. model panels wait for the
+  // full model; device panels wait for the WebGPU device (a full 'ready'
+  // implies the device is up too).
+  const panelReady = isModelPanelChapter
+    ? status === 'ready'
+    : isDeviceOnlyChapter
+      ? deviceReady || status === 'ready'
+      : true;
+
+  // Auto-kickoff (background warm-up) on direct URL landings (bookmark, hard
+  // reload of /chapters/<id>) so the panel's resource is loading while the
+  // learner reads. DEVICE_ONLY chapters (Training) bring up just the WebGPU
+  // device — no model download. model-panel chapters trigger the full model
+  // load; we also preload for `overview` (Ch.1) as a deliberate onboarding
+  // cache-warm — the learner will need the model in Ch.2. Pure-JS `none`
+  // chapters (rope, kv-cache, scaling, post-training, architecture) trigger NO
+  // download. All kickoffs are idempotent at the App level.
   //
   // Note: device-only kickoff is intentionally NOT gated on `hostedModelAvailable`
   // — it never fetches the model, so it works even when no hosted model exists
   // (and even on hosts where the user would otherwise pick a local directory).
+  const shouldPreloadModel = isModelPanelChapter || chapter.id === 'overview';
   useEffect(() => {
     if (status === 'ready') return;
     if (isDeviceOnlyChapter) {
@@ -68,21 +102,55 @@ function ChapterRouteComponent() {
       kickoffDeviceOnly();
       return;
     }
+    if (!shouldPreloadModel) return;
     if (hostedModelAvailable === false) return;
     kickoffLoad();
-  }, [status, isDeviceOnlyChapter, deviceReady, hostedModelAvailable, kickoffLoad, kickoffDeviceOnly]);
+  }, [
+    status,
+    isDeviceOnlyChapter,
+    shouldPreloadModel,
+    deviceReady,
+    hostedModelAvailable,
+    kickoffLoad,
+    kickoffDeviceOnly,
+  ]);
 
-  // Gate the live demo behind the resource it needs. DEVICE_ONLY chapters
-  // render once the WebGPU device is up (deviceReady); other live chapters wait
-  // for the full model ('ready'). Prose-only chapters render immediately so
-  // onboarding (Ch.1) isn't blocked behind a 1.6 GB download.
-  if (isDeviceOnlyChapter) {
-    if (!deviceReady && status !== 'ready') {
-      return <Loading status={loadingText || 'Initializing WebGPU device...'} progress={loadingProgress} />;
-    }
-  } else if (status !== 'ready' && !PROSE_ONLY_CHAPTERS.has(chapter.id)) {
-    return <Loading status={loadingText || null} progress={loadingProgress} />;
-  }
+  // The chapter's live demo, or null for panel-less chapters (overview,
+  // post-training, architecture — their inline content/poster lives in the
+  // body). `none`-resource demos (rope, kv-cache, scaling) render here
+  // immediately; model/device demos render here once `panelReady`.
+  const demoPanel =
+    chapter.id === 'attention' ? (
+      <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'multi-head-gqa' ? (
+      <MultiheadGqaDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'tokenization' ? (
+      <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'embeddings' ? (
+      <EmbeddingsDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'rope' ? (
+      <RopeDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'rmsnorm' ? (
+      <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'mlp' ? (
+      <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'full-block' ? (
+      <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'lm-head' ? (
+      <LmHeadDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'sampling' ? (
+      <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'kv-cache' ? (
+      <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'training' ? (
+      <TrainingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : chapter.id === 'scaling' ? (
+      <ScalingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
+    ) : null;
+  // 'architecture', 'overview', 'post-training' render inline in the body and
+  // intentionally have no "Try it now" panel (the column is dropped).
+
+  const hasDemoPanel = demoPanel !== null;
 
   return (
     <LessonLayout
@@ -106,35 +174,19 @@ function ChapterRouteComponent() {
         void navigate({ to: '/chat', search: (prev) => prev });
       }}
       tryItPanel={
-        chapter.id === 'attention' ? (
-          <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'multi-head-gqa' ? (
-          <MultiheadGqaDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'tokenization' ? (
-          <TokenizerDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'embeddings' ? (
-          <EmbeddingsDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'rope' ? (
-          <RopeDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'rmsnorm' ? (
-          <RmsNormDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'mlp' ? (
-          <MlpDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'full-block' ? (
-          <FullBlockDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'lm-head' ? (
-          <LmHeadDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'sampling' ? (
-          <SamplingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'kv-cache' ? (
-          <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'training' ? (
-          <TrainingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : chapter.id === 'scaling' ? (
-          <ScalingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-        ) : null
-        /* 'architecture' renders its interactive poster inline in the body and
-           intentionally has no "Try it now" panel (the column is dropped). */
+        // Gate ONLY the demo panel: render the real demo once its resource is
+        // ready; otherwise show a compact in-column loading affordance so the
+        // 3-col layout (and the reading body) stays put while it warms.
+        hasDemoPanel && !panelReady ? (
+          <PanelLoading
+            status={loadingText || null}
+            progress={loadingProgress}
+            hostedUnavailable={isModelPanelChapter && hostedModelAvailable === false}
+            onLoadLocal={triggerLocalPicker}
+          />
+        ) : (
+          demoPanel
+        )
       }
     >
       {chapter.id === 'attention' ? (

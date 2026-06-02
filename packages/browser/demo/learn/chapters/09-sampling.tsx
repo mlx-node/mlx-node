@@ -73,7 +73,7 @@ export const learning: ChapterLearningData = {
     },
   ],
   takeaways: [
-    'Logits become probabilities only after softmax — comparing raw logits across runs or models is meaningless.',
+    "Logits become probabilities only after softmax. Within one step their order is what matters — the largest logit is the greedy pick — but the absolute values aren't comparable across different runs or models.",
     'Temperature reshapes the distribution; top-p truncates the tail. A common default is T=0.7 with top_p=0.9.',
     "The model's actually-sampled token may not be the bar with the highest probability after you change the sliders — that's how the sliders steer generation.",
   ],
@@ -164,11 +164,12 @@ export function SamplingChapterBody() {
 
         <h2>Why not just pick the maximum?</h2>
         <p>
-          The simplest rule is <strong>greedy decoding</strong>: take <code>argmax(logits)</code> at every step. It's
-          deterministic and reproducible, but it has a famous failure mode — repetition. The instant the model finds a
-          phrase whose continuation it's confident about, it keeps re-entering the same loop, because that loop is
-          always the locally-best choice. Greedy decoding also throws away a lot of information: if two tokens have
-          nearly equal logits, picking one and ignoring the other is a fragile tie-break.
+          The simplest rule is <strong>greedy decoding</strong>: take <code>argmax(logits)</code> at every step —{' '}
+          <code>argmax</code> just means "pick the position with the largest value", i.e. the single highest-scoring
+          token. It's deterministic and reproducible, but it has a famous failure mode — repetition. The instant the
+          model finds a phrase whose continuation it's confident about, it keeps re-entering the same loop, because that
+          loop is always the locally-best choice. Greedy decoding also throws away a lot of information: if two tokens
+          have nearly equal logits, picking one and ignoring the other is a fragile tie-break.
         </p>
 
         <h2>Softmax: logits → probabilities</h2>
@@ -179,8 +180,8 @@ export function SamplingChapterBody() {
         <MathDisplay latex={String.raw`p_i = \frac{\exp(l_i / T)}{\sum_j \exp(l_j / T)}`} />
         <p>
           Two things are happening here. The exponential makes every value positive; the division by the sum makes them
-          sum to 1. The numerator also includes a <strong>temperature</strong> <code>T</code> that scales the raw logits
-          before the exponential. Temperature acts as a sharpness knob:
+          sum to 1. Each logit is also divided by a <strong>temperature</strong> <code>T</code> before the exponential —
+          the same <code>T</code> appears in every term, top and bottom. Temperature acts as a sharpness knob:
         </p>
         <ul>
           <li>

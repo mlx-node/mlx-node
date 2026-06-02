@@ -139,18 +139,20 @@ export function ScalingChapterBody() {
         <p>
           Chapter 13 reduced training to one line of cross-entropy. That description is correct and it is{' '}
           <em>spectacularly insufficient</em> as a recipe. A 24-layer transformer trained on hundreds of billions of
-          tokens with naive SGD will: diverge in the first 100 steps; have its loss spike to <code>NaN</code> from a
-          single bad batch; settle into a local minimum that generalizes poorly. The fix is a small handful of
-          engineering tricks — none of them are part of the model architecture, but every modern training run uses all
-          of them.
+          tokens with naive SGD will: diverge in the first 100 steps; have its loss spike to <code>NaN</code>{' '}
+          (Not-a-Number — the arithmetic blew up past what a float can hold) from a single bad batch; settle into a
+          local minimum that <em>generalizes</em> poorly (does well on the training text but badly on text it never
+          saw). The fix is a small handful of engineering tricks — none of them are part of the model architecture, but
+          every modern training run uses all of them.
         </p>
 
         <h2>The optimizer: AdamW, not SGD</h2>
         <p>
-          Plain stochastic gradient descent (<code>θ := θ - η·g</code>) doesn't work well for transformers. Different
-          parameters need very different step sizes — embedding rows for rare tokens need much larger updates than dense
-          weights, for example. <strong>Adam</strong> tracks per-parameter running averages of <code>g</code> and{' '}
-          <code>g²</code>, then takes a step normalized by <code>√g²</code>. <strong>AdamW</strong> adds{' '}
+          Plain stochastic gradient descent (<code>θ := θ - η·g</code> — nudge each weight <code>θ</code> against its
+          gradient <code>g</code>, scaled by a learning rate <code>η</code>) doesn't work well for transformers.
+          Different parameters need very different step sizes — embedding rows for rare tokens need much larger updates
+          than dense weights, for example. <strong>Adam</strong> tracks per-parameter running averages of <code>g</code>{' '}
+          and <code>g²</code>, then takes a step normalized by <code>√g²</code>. <strong>AdamW</strong> adds{' '}
           <em>decoupled weight decay</em>: instead of penalising <code>||θ||²</code> through the loss, the optimizer
           subtracts a small fraction of <code>θ</code> from itself at every step. This is the standard recipe for every
           modern LLM pretrain.
@@ -212,8 +214,9 @@ export function ScalingChapterBody() {
           </li>
         </ul>
         <p>
-          Fine-tuning is a different story — a small curated dataset <em>can</em> be overfit, and dropout often
-          reappears at non-zero values (typically 0.05-0.1) in the fine-tuning recipe.
+          Fine-tuning is a different story — a small curated dataset <em>can</em> be <em>overfit</em> (the model
+          memorizes those specific examples instead of learning patterns that transfer), and dropout often reappears at
+          non-zero values (typically 0.05-0.1) in the fine-tuning recipe.
         </p>
 
         <h2>Reading a real config</h2>
@@ -230,6 +233,27 @@ batch_size:  4M tokens (gradient accumulation across many devices)
 seq_len:     8192
 total_steps: 500,000`}
         </pre>
+        <p>The less-obvious knobs in that block, in plain terms:</p>
+        <ul>
+          <li>
+            <code>beta1 = 0.9</code>, <code>beta2 = 0.95</code> — how fast AdamW's two running averages forget. beta1
+            smooths the gradient <code>g</code>; beta2 smooths the squared gradient <code>g²</code>. Higher = longer
+            memory.
+          </li>
+          <li>
+            <code>eps = 1e-8</code> — a tiny constant added in the denominator so the step never divides by zero when a
+            parameter's <code>g²</code> average is near zero.
+          </li>
+          <li>
+            <code>weight_decay = 0.1</code> — the strength of the pull-toward-zero described above; 0.1 is a typical
+            pretraining value.
+          </li>
+          <li>
+            <strong>gradient accumulation</strong> — sum the gradients from several small batches before taking one
+            optimizer step, so a handful of GPUs can imitate one enormous 4M-token batch they could never fit in memory
+            at once.
+          </li>
+        </ul>
         <p>
           Every one of those lines is a guardrail against a specific failure mode discovered the hard way during the
           last decade of LLM training. The architecture is the model; this is the recipe that makes the architecture

@@ -62,7 +62,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'SwiGLU',
       definition:
-        'Gated MLP variant: silu(gate_proj(x)) * up_proj(x), then projected back. The * is element-wise multiplication.',
+        'Gated MLP variant: silu(gate_proj(x)) ⊙ up_proj(x), then projected back. The ⊙ is element-wise multiplication.',
     },
     {
       term: 'SiLU',
@@ -99,7 +99,7 @@ export const learning: ChapterLearningData = {
   quiz: [
     {
       id: 'q1-elementwise',
-      prompt: 'In SwiGLU, what kind of multiplication is the * between silu(gate_proj(x)) and up_proj(x)?',
+      prompt: 'In SwiGLU, what kind of multiplication is the ⊙ between silu(gate_proj(x)) and up_proj(x)?',
       options: [
         { id: 'a', label: 'Matrix multiplication.' },
         {
@@ -180,9 +180,10 @@ export function MlpChapterBody() {
         <p>
           The <strong>residual connection</strong> is the <code>x_in +</code> part. It exists for two reasons. First,
           gradients: backprop can flow straight through the identity path, so even a 24-layer stack stays trainable.
-          Second, semantics: think of the residual stream as a<em> highway</em> that runs the full depth of the model.
-          Each block reads from the highway, computes a small contribution, and adds it back. The model's prediction is
-          the accumulation of every block's contribution — not the output of the last block alone.
+          Second, semantics: think of the residual stream as a<em> highway</em> that runs the full depth of the model
+          (you'll see the residual stream drawn in the next chapter, the full transformer block). Each block reads from
+          the highway, computes a small contribution, and adds it back. The model's prediction is the accumulation of
+          every block's contribution — not the output of the last block alone.
         </p>
 
         <h2>What "gated MLP" actually means</h2>
@@ -210,8 +211,9 @@ export function MlpChapterBody() {
           latex={String.raw`\text{MLP}(x) = \text{down\_proj}\!\bigl(\,\text{silu}(\text{gate\_proj}(x)) \,\odot\, \text{up\_proj}(x)\bigr)`}
         />
         <p>
-          Read this expression carefully. The <code>*</code> is <em>element-wise</em>, not matrix multiplication: each
-          of the intermediate_dim features in <code>silu(gate_proj(x))</code> multiplies the corresponding feature in{' '}
+          Read this expression carefully. The <code>⊙</code> is <em>element-wise</em>, not matrix multiplication (
+          <code>⊙</code> means element-wise multiply — multiply matching entries position-by-position): each of the
+          intermediate_dim features in <code>silu(gate_proj(x))</code> multiplies the corresponding feature in{' '}
           <code>up_proj(x)</code>. The gate-projection decides <em>how much</em> of each feature passes through; the
           up-projection supplies the value. The two are entangled per feature, then collapsed back to hidden_dim by{' '}
           <code>down_proj</code>.
@@ -252,8 +254,9 @@ export function MlpChapterBody() {
           Here is the surprising part: the MLP's raw output is <em>much smaller</em> than the residual stream it writes
           into. Because every block <em>adds</em> its output into the stream — it never overwrites — those contributions
           accumulate layer over layer, so the residual stream's per-token L2 grows even though each individual write is
-          small. Each individual MLP's output is a small delta on top — a correction, not a replacement. Watch the chart
-          below: <strong>MLP output</strong> per-token L2 is a fraction of the layer's full output L2. The bulk of the
+          small (the L2 norm is just the vector's length — the square root of the sum of its squared entries). Each
+          individual MLP's output is a small delta on top — a correction, not a replacement. Watch the chart below:{' '}
+          <strong>MLP output</strong> per-token L2 is a fraction of the layer's full output L2. The bulk of the
           magnitude in the residual stream came from the input, not from this layer's MLP.
         </p>
         <p>

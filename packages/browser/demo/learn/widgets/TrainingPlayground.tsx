@@ -548,17 +548,24 @@ export function TrainingPlayground({ workerRef, abortRef }: TrainingPlaygroundPr
           </div>
         </div>
         <LiveLossCurve losses={losses} maxStep={TOTAL_STEPS} />
-        {scatterCheck.kind === 'pass' ? (
-          <div className="text-[11px] text-muted-foreground">
-            <span className="text-primary">✓</span> scatter_add kernel verified — repeated-index gradient accumulates
-            (row 3 = 3.0, not 1.0)
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          <strong className="font-medium text-foreground/80">This is intentional overfitting.</strong> The corpus is
+          tiny and repetitive, so the model <em>memorizes</em> it within a few hundred steps and the loss falls to near
+          zero. Real pretraining does the opposite — it sees each token roughly once across trillions, so it can&apos;t
+          memorize and has to <em>generalize</em> (Chapter 14). The point here is to make learning <em>visible</em> in
+          seconds, not to be realistic.
+        </p>
+        {scatterCheck.kind === 'fail' ? (
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive"
+          >
+            ⚠ This browser computed the training gradient incorrectly, so the loss curve above may be unreliable on this
+            device.{' '}
+            <span className="text-destructive/80">
+              (scatter_add self-test: repeated-index gradient = {scatterCheck.got}, expected 3.0)
+            </span>
           </div>
-        ) : scatterCheck.kind === 'fail' ? (
-          <div className="text-[11px] text-destructive">
-            ⚠ scatter_add kernel check FAILED — repeated-index gradient = {scatterCheck.got} (expected 3.0)
-          </div>
-        ) : scatterCheck.kind === 'pending' ? (
-          <div className="text-[11px] text-muted-foreground">checking kernel…</div>
         ) : null}
       </div>
 

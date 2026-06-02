@@ -195,7 +195,8 @@ export function FullBlockChapterBody() {
           <li>
             <strong>Multi-head &amp; GQA</strong> (chapter 5) — attention is run in parallel by many heads sharing a
             smaller pool of K/V projections, so the model can look at several patterns at once without inflating the KV
-            cache.
+            cache (a KV cache stores each token's keys and values so they aren't recomputed every step — its own chapter
+            comes later).
           </li>
           <li>
             <strong>RoPE</strong> (chapter 6) — the rotation applied to Q and K inside attention. It's how the model
@@ -232,13 +233,14 @@ export function FullBlockChapterBody() {
         <p>
           Two consequences fall out. First, <strong>gradients</strong>: backprop can flow straight through the identity
           path even in a 24-layer stack, which is why deep transformers train at all. Without the residual, the gradient
-          gets repeatedly multiplied by each layer's transformation (its Jacobian), and across a stack this deep it
-          <em> tends to</em> vanish or explode; the residual's identity path is what lets it survive. Second,{' '}
-          <strong>magnitudes</strong>: the residual stream grows in L2 (the vector's length — the √ of the sum of its
-          squared components) with depth, since each layer adds a non-zero contribution, while every <em>individual</em>{' '}
-          sub-block's output stays small. The 3D widget on the right colors each ring by the per-token L2 of the layer
-          output — you can see the magnitude climb as you scan up the tower, exactly mirroring the bar growing in the
-          animation.
+          (the training signal that adjusts the weights — covered in the Training chapter) gets repeatedly multiplied by
+          each layer's transformation (its Jacobian — don't worry about that term here), and across a stack this deep it
+          <em> tends to</em> vanish or explode (it shrinks to almost nothing or blows up as it passes back through many
+          layers); the residual's identity path is what lets it survive. Second, <strong>magnitudes</strong>: the
+          residual stream grows in L2 (the vector's length — the √ of the sum of its squared components) with depth,
+          since each layer adds a non-zero contribution, while every <em>individual</em> sub-block's output stays small.
+          The 3D widget on the right colors each ring by the per-token L2 of the layer output — you can see the
+          magnitude climb as you scan up the tower, exactly mirroring the bar growing in the animation.
         </p>
         <p className="text-muted-foreground">
           <strong>Mental model:</strong> think of the residual stream as a piece of working memory that the network

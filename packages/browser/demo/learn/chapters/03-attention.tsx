@@ -174,6 +174,10 @@ export function AttentionChapterBody() {
 
         <h2>The intuition</h2>
         <p>
+          Intuitively, each token looks over all the earlier tokens and pulls in the information it needs — like
+          re-reading the sentence and focusing on the few words that matter for what comes next.
+        </p>
+        <p>
           Imagine you're the model and someone hands you the prompt <code>"The cat sat on the ___"</code> and asks for
           the next word. To guess well you have to look back at the earlier tokens: <code>cat</code> tells you the
           subject is an animal, <code>sat</code> tells you it's resting on something, <code>on the</code> tells you a
@@ -185,7 +189,8 @@ export function AttentionChapterBody() {
         <h2>Q, K, V — three projections of the same vector</h2>
         <p>
           Each token comes in as a vector <code>x</code> (its embedding, after earlier layers have refined it). The
-          model linearly projects <code>x</code> three different ways:
+          model linearly projects <code>x</code> three different ways (a "projection" here just means multiplying the
+          vector by a learned matrix to get a new vector):
         </p>
         <ul>
           <li>
@@ -225,8 +230,9 @@ export function AttentionChapterBody() {
         <p>
           We divide by <code>√d_head</code> for a numerical reason: as <code>d_head</code> grows, dot products grow on
           average too, and without scaling the softmax would saturate (one cell at 1.0, the rest near 0.0) and gradients
-          would vanish. Dividing by the standard deviation of a random dot product (≈ <code>√d_head</code>) keeps the
-          scores in a regime where softmax is informative.
+          would vanish (a gradient is the training signal that tunes the weights — covered in the Training chapter;
+          don&apos;t worry if it&apos;s fuzzy here). Dividing by the standard deviation of a random dot product (≈{' '}
+          <code>√d_head</code>) keeps the scores in a regime where softmax is informative.
         </p>
         <p>
           The widget below makes that one sentence tangible. Drag the head dimension and watch the same set of key

@@ -151,9 +151,11 @@ export function PostTrainingChapterBody() {
           SFT makes the model follow instructions; <strong>preference tuning</strong> makes it follow them <em>well</em>{' '}
           — more helpful, more honest, less likely to produce harmful or evasive answers. Humans compare candidate
           responses ("A is better than B"), and the model is trained to prefer the responses people preferred.{' '}
-          <strong>RLHF</strong> does this with a separate reward model and reinforcement learning; <strong>DPO</strong>{' '}
-          optimizes the preference directly, skipping the reward model. Either way the objective is no longer plain
-          next-token cross-entropy — this is the one stage that genuinely departs from the loss you've seen.
+          <strong>RLHF</strong> does this with a separate <strong>reward model</strong> — a second model trained on the
+          human comparisons to predict how much people would like a given response, which the main model is then
+          optimized to score well on — and reinforcement learning; <strong>DPO</strong> optimizes the preference
+          directly, skipping the reward model. Either way the objective is no longer plain next-token cross-entropy —
+          this is the one stage that genuinely departs from the loss you've seen.
         </p>
         <p>
           Pick which response a human prefers and apply the update a few times to see what "training on a preference"

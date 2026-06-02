@@ -158,11 +158,20 @@ export function MultiheadGqaChapterBody() {
         <p>
           Chapter 4 introduced attention as a single operation: <code>softmax(QKᵀ/√d)·V</code> (here that{' '}
           <code>√d</code> is <code>√head_dim</code>, the per-head width — <code>√{QWEN_HEAD_DIM} = 16</code> for Qwen3.5
-          — not the full hidden size). In real LLMs, that operation is run <em>many times in parallel</em>, once per{' '}
-          <strong>head</strong>, and the results are concatenated and projected back together. The reason is capacity: a
-          single head can model one type of relationship at a time — say, "look at the previous token." Multiple heads
-          in parallel let the model attend to different patterns simultaneously: one head can chase the previous token,
-          another the matching bracket, another the subject—verb agreement at distance.
+          — not the full hidden size). In words: score how well each token&apos;s query matches every token&apos;s key,
+          divide by <code>√d</code> so the scores don&apos;t blow up as the vectors get longer, softmax turns those
+          scores into weights that sum to 1, and you blend the values by those weights. In real LLMs, that operation is
+          run <em>many times in parallel</em>, once per <strong>head</strong>, and the results are concatenated and
+          projected back together. The reason is capacity: a single head can model one type of relationship at a time —
+          say, "look at the previous token." Multiple heads in parallel let the model attend to different patterns
+          simultaneously: one head can chase the previous token, another the matching bracket, another the subject—verb
+          agreement at distance.
+        </p>
+
+        <p>
+          Think of each head as one &quot;lens&quot; for comparing tokens: it learns to notice one kind of relationship.
+          One head might track which adjective belongs to which noun; another, which earlier word a pronoun refers to.
+          Running several in parallel lets the model watch many relationships at once.
         </p>
 
         <p>
@@ -176,12 +185,14 @@ export function MultiheadGqaChapterBody() {
 
         <h2>Standard multi-head attention (MHA)</h2>
         <p>
-          For hidden size <code>d</code> and <code>H</code> heads, each head gets its own dimension <code>d_head</code>{' '}
-          — classically <code>d_head = d / H</code>, so the heads tile the hidden width exactly (many models, including
-          Qwen3.5, decouple the two — more below). The model projects the token vector to a Q, K and V of shape{' '}
-          <code>[H, seq, d_head]</code> with three weight matrices, then reshapes. Each head runs its own attention over
-          its own Q/K/V slice; the <code>H</code> outputs are concatenated and projected back into a <code>d</code>-wide
-          vector that flows on through the layer.
+          For hidden size <code>d</code> and <code>H</code> heads (<code>H</code> = the number of query heads running in
+          parallel), each head gets its own dimension <code>d_head</code> (<code>d_head</code> = the per-head vector
+          width) — classically <code>d_head = d / H</code>, so the heads tile the hidden width exactly (many models,
+          including Qwen3.5, decouple the two — more below). The model projects the token vector to a Q, K and V of
+          shape <code>[H, seq, d_head]</code> with three weight matrices, then reshapes (read{' '}
+          <code>[H, seq, d_head]</code> as a 3-D array: H heads × seq positions × d_head numbers each). Each head runs
+          its own attention over its own Q/K/V slice; the <code>H</code> outputs are concatenated and projected back
+          into a <code>d</code>-wide vector that flows on through the layer.
         </p>
         <p>
           At inference, K and V for each token are <strong>cached</strong> across generation steps — that's what makes
@@ -204,10 +215,10 @@ export function MultiheadGqaChapterBody() {
         />
         <p>
           The Q projection still has <code>H</code> heads (each with their own weights), but the K and V projections
-          only have <code>G</code> heads. When attention is computed for query head <code>h</code>, it dot-products
-          against the K of group <code>floor(h / group_size)</code> — and reads from the same group's V. KV cache
-          shrinks by a factor of <code>H/G</code> with no change to the Q dimension and minimal accuracy loss in
-          practice.
+          only have <code>G</code> heads (<code>G</code> = the number of key/value groups, one shared K/V per group).
+          When attention is computed for query head <code>h</code>, it dot-products against the K of group{' '}
+          <code>floor(h / group_size)</code> — and reads from the same group's V. KV cache shrinks by a factor of{' '}
+          <code>H/G</code> with no change to the Q dimension and minimal accuracy loss in practice.
         </p>
 
         <h2>Qwen3.5-0.8B specifics</h2>
@@ -230,16 +241,50 @@ export function MultiheadGqaChapterBody() {
             hidden = {QWEN_HIDDEN_DIM} → H · head_dim = {QWEN_NUM_HEADS} · {QWEN_HEAD_DIM} ={' '}
             {QWEN_NUM_HEADS * QWEN_HEAD_DIM}
           </code>
-          , not a square <code>d × d</code> matrix. (In Qwen3.5 the full <code>q_proj</code> weight is actually twice as
-          wide — <code>{2 * QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> outputs — because it also emits a per-head{' '}
-          <em>output gate</em> next to the queries, as the pipeline diagram above shows; the{' '}
-          <code>{QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> above is the query half.)
+          , not a square <code>d × d</code> matrix. (Qwen adds a couple of wrinkles to this projection — see{' '}
+          <strong>Advanced</strong> below.)
         </p>
         <p>
-          Layers in Qwen3.5 alternate: most are <em>linear-attention</em> (a recurrent variant outside this chapter's
-          scope), and every fourth layer is the classic <em>full-attention</em> layer with softmax scores you can
-          inspect. The layer selector below restricts to the latter.
+          Qwen3.5 also alternates two kinds of layer, and the layer selector below restricts to the classic{' '}
+          <em>full-attention</em> layers with softmax scores you can inspect (the other kind is covered in{' '}
+          <strong>Advanced</strong> below).
         </p>
+
+        {/* Optional deep-dive: the Qwen-3.5–specific complications that interrupt
+            the core multi-head → GQA story for a beginner — the per-head output
+            gate folded into q_proj, and the linear-attention layers the chapter
+            doesn't otherwise cover. Collapsed by default and skippable. Native
+            <details> so it stays keyboard-focusable; styled like the project's
+            Glossary disclosure (mirrors 14-architecture.tsx). */}
+        <details className="group not-prose my-4 rounded-md border border-border bg-muted/30 px-4 py-3 text-sm">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-foreground/90 [&::-webkit-details-marker]:hidden">
+            <span className="font-medium">
+              Advanced: Qwen-3.5 specifics (output gate, QK-norm, linear layers){' '}
+              <span className="text-muted-foreground">· optional, for the curious</span>
+            </span>
+            <span
+              aria-hidden="true"
+              className="text-xs text-muted-foreground transition-transform group-open:rotate-90"
+            >
+              ▸
+            </span>
+          </summary>
+          <div className="mt-3 space-y-2 text-[13px] leading-relaxed text-foreground/80">
+            <p>
+              In Qwen3.5 the full <code>q_proj</code> weight is actually twice as wide —{' '}
+              <code>{2 * QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> outputs — because it also emits a per-head{' '}
+              <em>output gate</em> next to the queries, as the pipeline diagram above shows; the{' '}
+              <code>{QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code> above is the query half. (Qwen also applies a per-head
+              RMSNorm to the queries and keys — <code>q_norm</code> / <code>k_norm</code> — before the dot products; the
+              architecture chapter covers both.)
+            </p>
+            <p>
+              Layers in Qwen3.5 alternate: most are <em>linear-attention</em> (a recurrent variant outside this
+              chapter's scope), and every fourth layer is the classic <em>full-attention</em> layer with softmax scores
+              you can inspect. The layer selector below restricts to the latter.
+            </p>
+          </div>
+        </details>
 
         <h2>The trade-off, and where MQA fits</h2>
         <p>

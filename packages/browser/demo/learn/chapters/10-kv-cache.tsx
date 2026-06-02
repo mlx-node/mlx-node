@@ -56,7 +56,9 @@ const LINEAR_HEAD_DIM = 128;
 const LINEAR_STATE_SIZE_BYTES = LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM * BYTES_PER_FLOAT;
 
 const DECODE_PROMPT_TOKENS: ReadonlyArray<string> = ['The', ' cat', ' sat', ' on', ' the'];
-const DECODE_GENERATED_TOKENS: ReadonlyArray<string> = [' mat', '.', ' It'];
+// " floor" is the continuation this course measured for the prompt (matches the
+// LM-head chapter and the token-journey scrubber), not the cliché " mat".
+const DECODE_GENERATED_TOKENS: ReadonlyArray<string> = [' floor', '.', ' It'];
 const DECODE_TOTAL_STEPS = DECODE_PROMPT_TOKENS.length + DECODE_GENERATED_TOKENS.length;
 const DECODE_AUTOPLAY_MS = 1100;
 
@@ -238,9 +240,9 @@ export function KvCacheChapterBody() {
         <h2>Why caching K and V works</h2>
         <p>
           At decode step <code>t</code>, every layer needs the attention output for the new token:{' '}
-          <code>softmax(q_t · K^T / √d) · V</code>. The Q is brand new (it comes from the just-computed hidden state).
-          The K and V for the new token are also new. But the K and V for tokens <code>0..t-1</code> were already
-          computed in earlier steps —{' '}
+          <code>softmax(q_t · K^T / √d) · V</code> — the same attention formula from Chapter 4. The Q is brand new (it
+          comes from the just-computed hidden state). The K and V for the new token are also new. But the K and V for
+          tokens <code>0..t-1</code> were already computed in earlier steps —{' '}
           <em>
             and they don't depend on token <code>t</code>
           </em>
@@ -278,8 +280,10 @@ export function KvCacheChapterBody() {
           (one in every four, at indices {FULL_LAYER_INDICES.join(', ')}) are conventional full-attention layers — the
           ones from Chapter 4, with the linear-in-
           <code>seq_len</code> KV cache. The other {NUM_LINEAR_LAYERS} layers use a{' '}
-          <strong>linear attention variant called GatedDeltaNet</strong>. Instead of caching K and V per token, a
-          GatedDeltaNet layer compresses the entire history into a <em>fixed-size recurrent state</em> of shape{' '}
+          <strong>linear attention variant called GatedDeltaNet</strong> — "linear" because its cost grows in proportion
+          to the sequence length rather than with its square, the way full softmax attention does. Instead of caching K
+          and V per token, a GatedDeltaNet layer compresses the entire history into a{' '}
+          <em>fixed-size recurrent state</em> of shape{' '}
           <code>
             [{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]
           </code>{' '}
@@ -328,8 +332,9 @@ export function KvCacheChapterBody() {
             <code className="rounded bg-background px-1 py-0.5 font-mono text-[11px]">
               [layers, 2, batch, kv_heads, max_seq, head_dim]
             </code>{' '}
-            that each attention layer writes into and reads from, with a position counter telling it how much of the
-            tensor is live. The "key" is the position index, not a hash. It&apos;s a buffer, not a hashmap.
+            (the <code>2</code> is the key/value pair — one slab for K, one for V) that each attention layer writes into
+            and reads from, with a position counter telling it how much of the tensor is live. The "key" is the position
+            index, not a hash. It&apos;s a buffer, not a hashmap.
           </p>
         </div>
 

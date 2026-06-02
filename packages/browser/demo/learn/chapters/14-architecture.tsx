@@ -326,7 +326,9 @@ export function ArchitectureChapterBody() {
                   <strong>The gated delta-rule recurrence</strong> is the heart of it. It carries one fixed-size state
                   and walks the sequence token by token: β controls how much each new token <em>overwrites</em> that
                   state, and g (decay) controls how fast old information is <em>forgotten</em>. That makes it O(n) in
-                  the sequence length — linear, not quadratic — with a state whose size never grows.
+                  the sequence length — linear (cost grows in step with the token count), not quadratic (full
+                  attention's cost grows with the <em>square</em> of it — double the tokens, roughly four times the
+                  work) — with a state whose size never grows.
                 </li>
                 <li>
                   <strong>Memory.</strong> Instead of a KV cache that grows with every token, the layer carries only a
@@ -429,6 +431,11 @@ type RelatedLink = { chapterId: string; label: string };
 type Detail = { title: string; facts?: string; body: string; related?: RelatedLink[] };
 
 const DETAILS: Record<string, Detail> = {
+  'start-here': {
+    title: 'Start here — the whole model in one map',
+    facts: 'text enters at the bottom · next-token scores come out the top',
+    body: `This is all of Qwen3.5-0.8B in one picture. Your text enters at the bottom as token ids, becomes vectors (embeddings), then flows upward through ${NUM_LAYERS} repeating layers — each one mixes information across the sequence (attention) and then transforms every token (the SwiGLU feed-forward) — before a final normalization and the LM head turn the top vector into one score per vocabulary token. Click, hover, or tab any block to read what it does. Most layers use a cheap "linear" mixer and a few use full attention — use the toggle above to compare them.`,
+  },
   // --- central spine ---
   output: {
     title: 'Output logits',
@@ -610,7 +617,7 @@ const DETAILS: Record<string, Detail> = {
   'vision-encoder': {
     title: 'Vision encoder ×12',
     facts: 'hidden 768 · 12 heads',
-    body: 'A 12-layer ViT-style encoder (hidden 768) turns image/video patches into visual tokens.',
+    body: `A 12-layer ViT-style encoder (hidden 768, with its own 12 attention heads — separate from the decoder's ${NUM_HEADS} query heads) turns image/video patches into visual tokens.`,
   },
   'vision-project': {
     title: 'Vision → hidden 1024',
@@ -652,7 +659,7 @@ function sequenceDetailFor(mixer: Mixer): Detail {
 type Mixer = 'gdn' | 'gqa';
 
 export function ArchitecturePoster() {
-  const [selectedId, setSelectedId] = React.useState<string>('decoder');
+  const [selectedId, setSelectedId] = React.useState<string>('start-here');
   const [mixer, setMixer] = React.useState<Mixer>('gdn');
 
   const detail = selectedId === 'sequence' ? sequenceDetailFor(mixer) : (DETAILS[selectedId] ?? DETAILS.decoder!);

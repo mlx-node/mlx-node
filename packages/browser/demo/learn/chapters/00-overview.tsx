@@ -6,6 +6,7 @@ import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { GenerationLoop } from '../widgets/GenerationLoop';
 import { LogitsToSoftmax } from '../widgets/LogitsToSoftmax';
+import { TokenJourney } from '../widgets/TokenJourney';
 
 /**
  * Chapter 1 (overview) — "What is an LLM?". The top-down on-ramp the course was
@@ -122,17 +123,17 @@ export function OverviewChapterBody() {
 
         <h2>One call: tokens in, a score for every next token</h2>
         <p>
-          Concretely, the input is an array of integer token ids (from the{' '}
+          Concretely, the input is just a list of integers — one id per token, produced by the{' '}
           <Link to="/chapters/$chapterId" params={{ chapterId: 'tokenization' }} search={(prev) => prev}>
             tokenizer
-          </Link>
-          ), and the output is one number per vocabulary entry:
+          </Link>{' '}
+          — and the output is a big array of decimals, one score per vocabulary word:
         </p>
         <pre>
-          <code>{`tokens: number[]          // e.g. [791, 9059, 7731, 389, 279]
+          <code>{`tokens: number[]          // a list of integers, one id per token, e.g. [791, 9059, 7731, 389, 279]
    │
    ▼  one forward pass
-logits: Float32Array(${VOCAB.toLocaleString()})   // one raw score per vocab token`}</code>
+logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — one raw score per vocab word`}</code>
         </pre>
         <p>
           Those raw scores are called <strong>logits</strong>. Run them through a softmax and you have a probability
@@ -146,6 +147,15 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // one raw score per vocab tok
           <code>{VOCAB.toLocaleString()}</code>:
         </p>
         <LogitsToSoftmax />
+        <p>
+          The <em>Sharpen ↔ flatten</em> slider scales the raw logits before the softmax: drag it up and the model
+          commits harder to its single top guess (the distribution spikes), drag it down and probability spreads more
+          evenly across the options. That is exactly the knob{' '}
+          <Link to="/chapters/$chapterId" params={{ chapterId: 'sampling' }} search={(prev) => prev}>
+            <strong>temperature</strong>
+          </Link>{' '}
+          tunes when you generate text — here it acts as an inverse temperature (higher = sharper).
+        </p>
 
         <h2>The generation loop</h2>
         <p>
@@ -174,6 +184,11 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // one raw score per vocab tok
           </Link>{' '}
           puts them back on one page.
         </p>
+        <p>
+          Better yet, here is that whole journey as something you can <em>step through</em> — one concrete token, from
+          raw text to the next word, with the shape of the data shown at every step:
+        </p>
+        <TokenJourney />
 
         <h2>Why "predict the next token" is enough</h2>
         <p>

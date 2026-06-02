@@ -545,9 +545,11 @@ export function EmbeddingsChapterBody() {
 
         <h2>Why vectors?</h2>
         <p>
-          A continuous representation lets the model express degrees of similarity. The classic word2vec demo —{' '}
-          <code>king − man + woman ≈ queen</code> — showed that learned embeddings can capture relationships as
-          directions in the vector space. Modern LLM embeddings have <em>much</em> more entangled structure than
+          A continuous representation lets the model express degrees of similarity. The key idea is that a vector is
+          just a <em>direction in space</em>, and words that mean similar things end up pointing in similar directions —
+          so "related" becomes something the model can measure as an angle. The famous (if idealized) word2vec example —{' '}
+          <code>king − man + woman ≈ queen</code> — showed that learned embeddings can even capture relationships as
+          directions you can do arithmetic on. Modern LLM embeddings have <em>much</em> more entangled structure than
           word2vec did (one model serves dozens of tasks across many languages and code styles), so the clean analogy
           arithmetic is weaker — but the underlying idea is the same:{' '}
           <strong>nearby vectors mean related tokens</strong>, and the transformer layers spend their entire forward
@@ -570,10 +572,11 @@ export function EmbeddingsChapterBody() {
         </p>
         <p>
           Modern LLMs (Qwen3.5 included) often <strong>tie</strong> the input embedding to the output unembedding (the{' '}
-          <code>lm_head</code> that turns the final hidden state back into logits over the vocabulary). Tying these two
-          matrices saves parameters, and forces the representations to be useful in both directions: the same vector
-          space that <em>reads</em> the prompt also <em>writes</em> the next token's logit. The widget on the right
-          plots rows from this exact shared matrix.
+          <code>lm_head</code> that turns the final hidden state back into logits over the vocabulary — we cover that in
+          the LM-head chapter; for now just read it as "the layer that scores the next token"). Tying these two matrices
+          saves parameters, and forces the representations to be useful in both directions: the same vector space that{' '}
+          <em>reads</em> the prompt also <em>writes</em> the next token's logit. The widget on the right plots rows from
+          this exact shared matrix.
         </p>
 
         <ShapeProblem
@@ -587,6 +590,11 @@ export function EmbeddingsChapterBody() {
         />
 
         <h2>PCA: a 2D window into a 1024-dim space</h2>
+        <p>
+          Think of photographing a 3-D sculpture: you turn it to the angle that spreads its features out the most so you
+          can see the structure. PCA picks that "best camera angle" for the 1024-dimensional embedding space — and, like
+          a photo, it flattens away depth, so on-screen distance is a rough guide, not an exact ruler.
+        </p>
         <p>
           We can't see 1024 dimensions, so we project. <strong>Principal component analysis</strong> finds the
           directions of greatest variance in the data and projects onto the top two (or three). The result is the best

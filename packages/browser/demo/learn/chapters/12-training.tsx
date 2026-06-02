@@ -224,14 +224,15 @@ export function TrainingChapterBody() {
         <p>
           <strong>RLHF / DPO / direct preference</strong> methods diverge from the simple cross-entropy story — they
           score model outputs against human preferences or a reward model, and the loss is no longer plain next-token
-          CE. Those are out of scope for this chapter; the important point is that the <em>base behavior</em> of every
-          one of these post-training stages still rests on the next-token cross-entropy foundation laid here.
+          cross-entropy. Those are out of scope for this chapter; the important point is that the <em>base behavior</em>{' '}
+          of every one of these post-training stages still rests on the next-token cross-entropy foundation laid here.
         </p>
 
         <h2>What the optimizer actually does</h2>
         <p>
-          The loss is one scalar. Backpropagation computes its gradient with respect to every weight in the model (~800M
-          of them for Qwen3.5-0.8B). An optimizer (almost always AdamW for LLM pretraining) takes a small step in the
+          The loss is one scalar. <strong>Backpropagation</strong> — working the chain rule backward through the forward
+          pass — computes its gradient with respect to every weight in the model (~800M of them for Qwen3.5-0.8B). An
+          optimizer (almost always <strong>AdamW</strong>, broken down in Chapter 14) takes a small step in the
           direction that lowers the loss. Strip it down to a single weight and the rule is easy to see: the gradient
           points uphill, so step the opposite way — and the size of that step (the learning rate) has a sweet spot.
         </p>
