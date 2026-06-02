@@ -1023,7 +1023,11 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // `save_safetensors` drains its argument (drain-on-write, #63); the
         // sidecar is small and is still needed below (`is_empty()` gates the
         // config metadata), so drain a clone and keep the original intact.
-        crate::utils::safetensors::save_safetensors(&mtp_path, &mut mtp_sidecar_tensors.clone(), None)?;
+        crate::utils::safetensors::save_safetensors(
+            &mtp_path,
+            &mut mtp_sidecar_tensors.clone(),
+            None,
+        )?;
         info!("  Wrote mtp.safetensors");
     }
 
@@ -1437,9 +1441,11 @@ fn write_mtp_drafter_dir(
 
     // model.safetensors — single file, format:mlx so mlx-vlm skips re-sanitize.
     let model_path = drafter_dir.join("model.safetensors");
+    // `save_safetensors` drains its argument (drain-on-write, #63); the drafter
+    // is small and borrowed immutably here, so drain a clone.
     crate::utils::safetensors::save_safetensors(
         &model_path,
-        drafter_tensors,
+        &mut drafter_tensors.clone(),
         Some(serde_json::json!({"format": "mlx"})),
     )?;
 

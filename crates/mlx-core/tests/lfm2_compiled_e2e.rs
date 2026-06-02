@@ -291,6 +291,9 @@ fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
         include_reasoning: Some(true),
         report_performance: Some(false),
         reuse_cache: Some(reuse_cache),
+        enable_mtp: None,
+        mtp_depth: None,
+        mtp_adaptive_depth: None,
     }
 }
 

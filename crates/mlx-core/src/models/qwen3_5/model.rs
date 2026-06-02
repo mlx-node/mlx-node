@@ -9226,29 +9226,20 @@ fn forward_pre_norm_inner(
     // showed deltas inside the run-to-run noise band). The CPU/GPU
     // overlap benefit only materializes across the inter-chunk barrier
     // in chunked_prefill, which now uses async_eval_layer_caches.
-    // E37: slice h to last token before final_norm + lm_head. All callers
-    // of forward_inner only consume the last token's logits (chat decode is
-    // already T=1; prefill samples from last token only — see e.g. line
-    // ~5151's `slice_axis(1, seq_len-1, seq_len)`). For prefill with T=860
-    // this skips ~99.9% of the lm_head matmul.
-    // E38: additionally, in the last layer, slice h to last token BEFORE
-    // the MLP. Skips ~120 GFLOPs of wasted MLP work for the discarded T-1
-    // rows. Cache writes still happen on full T inside attention. For
-    // decode (T=1) both slices are no-ops.
-    // Env-toggle MLX_DISABLE_E37_LAST_TOKEN_SLICE=1 reverts both for A/B.
-    let slice_last_token = std::env::var("MLX_DISABLE_E37_LAST_TOKEN_SLICE").is_err();
+    //
+    // This is the SHARED pre-norm primitive: it MUST return the full
+    // per-position hidden. The MTP prompt-hidden path
+    // (`chunked_prefill_with_hidden_with_size`) keeps the result and
+    // re-slices it by chunk length, so a last-token slice here would
+    // corrupt it. The logits-only callers get the equivalent of the
+    // upstream E37 last-token optimization from
+    // `project_last_logits_from_pre_norm_hidden` (which slices before
+    // `final_norm` + `lm_head`), so the slice deliberately does NOT
+    // live in this loop.
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        let is_last_layer = i + 1 == num_layers;
-        h = layers[i].forward_with_optional_last_slice(
-            &h,
-            None,
-            cache,
-            None,
-            true,
-            slice_last_token && is_last_layer,
-        )?;
-        if i == 0 || is_last_layer {
+        h = layers[i].forward(&h, None, cache, None, true)?;
+        if i == 0 || i + 1 == num_layers {
             debug!(
                 "Qwen3.5 forward_inner: post_layer[{}/{}] shape={}",
                 i,
