@@ -225,6 +225,145 @@ inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
 }
 
 // =====================================================================
+// PAGED-cache variant of `lfm2_attn_pure_fn_arr` for the COMPILED-PAGED
+// decode graph (Phase P1).
+//
+// Identical lfm2 attention MATH up through RoPE to the flat array-offset fn
+// above (GQA, per-head Q/K RMSNorm, NO q-gate/bias, neox RoPE over the full
+// head_dim applied AFTER the transpose, out_proj). The ONLY substitution is the
+// KV-cache + SDPA step: instead of `slice_update` into a fixed-shape padded KV
+// cache + masked `scaled_dot_product_attention`, it writes the new K/V into the
+// shared block-paged Metal pool via `mlx::core::fast::paged_kv_write` and gathers
+// + attends over the pool via `mlx::core::fast::paged_attention` — exactly the
+// ops qwen35's `attn_for_compile_paged` uses (the call shapes/flags are copied
+// from there to guarantee parity).
+//
+// PARITY with the EAGER `Lfm2Attention::forward_paged` (attention.rs:177-314,
+// decode arm): that path transposes to [B,H,T,D] THEN ropes (with offset =
+// first_logical_position), then transposes K/V back to [num_tokens,n_kv,D] for
+// `update_keys_values` (which wraps paged_kv_write) and squeezes Q to
+// [1,num_heads,head_dim] for `gather_kv_for_decode` (which wraps paged_attention)
+// with scale=self.scale and softcap=1.0. The eager API's softcap=1.0 means
+// DISABLED and maps to the graph op's softcap=0.0f used here. T=1 for decode, so
+// the lfm2 "transpose-THEN-rope" ordering is preserved here verbatim and is
+// numerically identical to the eager path.
+//
+// Layout contract (block_size=16, x_pack=8, bf16, sliding_window=0):
+//   k_pool: [num_blocks, num_kv_heads, head_dim/x_pack, block_size, x_pack]
+//   v_pool: [num_blocks, num_kv_heads, head_dim, block_size]
+//   k_scale/v_scale: [1] f32 placeholders (1.0; FP8 calibration is future work)
+//   block_table: [1, max_blocks_per_seq] int32; slot_mapping: [num_tokens] int64
+//   seq_lens:   [1] int32 (validity is handled by paged_attention via seq_lens —
+//               NO additive mask is constructed here, unlike the flat fn).
+// Returns Lfm2AttnResult{output, keys=new_k_pool, values=new_v_pool}: keys/values
+// are the POST-WRITE pool tensors so the compile graph's dependency edge flows
+// through paged_kv_write's outputs into paged_attention's inputs, and the caller
+// can stash them back into the global pool slots (mirrors qwen's re-purposing of
+// AttnPureResult.{keys,values}).
+// =====================================================================
+inline Lfm2AttnResult lfm2_attn_pure_fn_arr_paged(
+    const array& x,                     // [B, hidden] — 2D decode
+    int layer_idx,
+    const array& k_pool,                // [num_blocks, n_kv, head_dim/x, block, x]
+    const array& v_pool,                // [num_blocks, n_kv, head_dim, block]
+    const array& k_scale,               // [1] f32 placeholder
+    const array& v_scale,               // [1] f32 placeholder
+    const array& offset_arr,            // [1] int32 RoPE position
+    const array& block_table,           // [1, max_blocks_per_seq] int32
+    const array& slot_mapping,          // [num_tokens] int64
+    const array& seq_lens,              // [1] int32
+    int block_size,
+    const Lfm2MoeConfig& cfg) {
+  using namespace qwen35_common;
+  int B = x.shape(0);
+  std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
+
+  // ---- Q/K/V projections — NO bias, NO 2x gate width (lfm2 specifics). ----
+  auto queries = linear_proj(x, pfx + "q_proj");
+  auto keys = linear_proj(x, pfx + "k_proj");
+  auto values = linear_proj(x, pfx + "v_proj");
+
+  queries = reshape(queries, {B, 1, cfg.num_heads, cfg.head_dim});
+  keys = reshape(keys, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+  values = reshape(values, {B, 1, cfg.num_kv_heads, cfg.head_dim});
+
+  // Per-head Q/K RMSNorm over head_dim (eps = norm_eps). V: none.
+  queries =
+      mlx::core::fast::rms_norm(queries, get_weight(pfx + "q_layernorm.weight"), cfg.norm_eps);
+  keys = mlx::core::fast::rms_norm(keys, get_weight(pfx + "k_layernorm.weight"), cfg.norm_eps);
+
+  // Transpose to [B,H,T,D] FIRST, then RoPE (lfm2 ordering — position axis = T).
+  queries = transpose(queries, {0, 2, 1, 3});
+  keys = transpose(keys, {0, 2, 1, 3});
+  values = transpose(values, {0, 2, 1, 3});
+
+  // neox RoPE over the FULL head_dim, ARRAY offset overload (graph-safe).
+  queries =
+      mlx::core::fast::rope(queries, cfg.head_dim, false, cfg.rope_theta, 1.0f, offset_arr);
+  keys = mlx::core::fast::rope(keys, cfg.head_dim, false, cfg.rope_theta, 1.0f, offset_arr);
+
+  // ---- Convert to the paged layouts the fast ops expect ----
+  //   new_k / new_v: [num_tokens, num_kv_heads, head_dim]
+  //   q_pa:          [num_tokens, num_heads,    head_dim]
+  // For decode B == num_tokens == 1 and the time axis is 1. Mirror the eager
+  // path's [B,H,T,D] -> [B,T,Hkv,D] -> [B*T,Hkv,D] for K/V (attention.rs:227-236)
+  // and squeeze Q (attention.rs:289-293).
+  int num_tokens = B;  // single-token decode
+  auto new_k = reshape(transpose(keys, {0, 2, 1, 3}),
+                       {num_tokens, cfg.num_kv_heads, cfg.head_dim});
+  auto new_v = reshape(transpose(values, {0, 2, 1, 3}),
+                       {num_tokens, cfg.num_kv_heads, cfg.head_dim});
+  auto q_pa = reshape(transpose(queries, {0, 2, 1, 3}),
+                      {num_tokens, cfg.num_heads, cfg.head_dim});
+
+  // Phase P1 hard-coded contract (matches qwen attn_for_compile_paged):
+  // bf16 cache, x_pack=8, sliding=0.
+  constexpr int X_PACK = 8;
+  constexpr int SLIDING_WINDOW = 0;
+  const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
+
+  // 1) Write the new K/V into the paged pool.
+  auto write_pair = mlx::core::fast::paged_kv_write(
+      k_pool, v_pool,
+      new_k, new_v,
+      slot_mapping,
+      k_scale, v_scale,
+      block_size,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      X_PACK,
+      kv_dtype);
+  auto new_k_pool = std::move(write_pair.first);
+  auto new_v_pool = std::move(write_pair.second);
+
+  // 2) Gather + attend via the paged kernel against the just-written pool.
+  //    Using the post-write outputs makes the read-after-write dependency
+  //    edge explicit for the MLX scheduler. scale = head_dim^-0.5, softcap=0
+  //    (== the eager softcap=1.0/disabled), sliding=0.
+  float scale = std::pow(static_cast<float>(cfg.head_dim), -0.5f);
+  auto attn_out = mlx::core::fast::paged_attention(
+      q_pa,
+      new_k_pool, new_v_pool,
+      block_table, seq_lens,
+      k_scale, v_scale,
+      scale,
+      /*softcap=*/0.0f,
+      SLIDING_WINDOW,
+      block_size,
+      cfg.num_heads,
+      cfg.num_kv_heads,
+      cfg.head_dim,
+      kv_dtype);
+
+  // attn_out: [num_tokens, num_heads, head_dim] -> [B, H*D]. lfm2 has NO gate.
+  attn_out = reshape(attn_out, {B, cfg.num_heads * cfg.head_dim});
+  auto output = linear_proj(attn_out, pfx + "out_proj");
+
+  // keys/values re-purposed as the post-write pools (caller stashes them back).
+  return {output, new_k_pool, new_v_pool};
+}
+
+// =====================================================================
 // Dense SwiGLU MLP for an lfm2 layer (mirrors `MLP::forward` / lfm2.py).
 //   down_proj(swiglu(gate_proj(x), up_proj(x))), keys
 //   layers.{i}.feed_forward.{gate,up,down}_proj.

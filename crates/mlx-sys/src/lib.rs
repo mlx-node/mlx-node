@@ -1924,6 +1924,116 @@ unsafe extern "C-unwind" {
     /// mutex, so the closure swap is thread-safe regardless of caller locking.
     pub fn mlx_lfm2_invalidate_compiled();
 
+    // ============================================
+    // Phase P2: compiled-PAGED lfm2 decode forward FFI. Drives the
+    // compiled-paged decode graph (`lfm2_decode_fn_paged` /
+    // `compiled_lfm2_decode_paged`) over the shared block-paged Metal pools.
+    // STRICTLY separate from the flat lifecycle above — the two decode paths
+    // never alias; `mlx_lfm2_paged_reset` wipes ONLY the paged globals.
+    // bf16/f16 only (quantized stays eager); decode-only (prefill stays eager
+    // pure-Rust paged, then seeds this). Covers BOTH dense lfm2 and lfm2_moe.
+    // ============================================
+
+    /// Initialize the compiled-paged lfm2 decode graph from post-prefill state.
+    ///
+    /// `is_attn` is a `num_layers`-long per-layer dispatch map (1 = full
+    /// attention, 0 = conv), built dynamically from `config.is_attention_layer`.
+    /// It is appended BEFORE the per-layer handle arrays and the C++ param order
+    /// (`mlx_lfm2_moe_init_paged` in mlx_lfm2_moe.cpp) MUST match this
+    /// byte-for-byte or the ABI is silently miswired.
+    ///
+    /// Per-layer handle import (length `num_layers` each):
+    /// attn layer i → `k_pool_handles[i]` / `v_pool_handles[i]` /
+    /// `k_scale_handles[i]` / `v_scale_handles[i]` (null on any → bail, returns
+    /// `-1`); conv layer i → `conv_state_handles[i]` (the conv state
+    /// `[B,l_cache-1,hidden]`; null → bail). Conv-layer pool/scale slots and
+    /// attn-layer conv-state slots may be null (placeholders are stored).
+    ///
+    /// `block_size` MUST be 16 (the paged graph hard-codes it, matching qwen's
+    /// `attn_for_compile_paged`); any other value returns `-1`. The init
+    /// force-evals the attn pools to surface a Metal OOM / layout / dtype fault
+    /// HERE rather than inside the first forward.
+    ///
+    /// Returns `0` on success, `-1` on failure. On failure the C++ side clears
+    /// `g_lfm2_paged_inited` and emits a stderr diagnostic; the Rust caller MUST
+    /// inspect the return value and fall back to the pure-Rust paged decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_lfm2_moe_init_paged(
+        num_layers: i32,
+        hidden_size: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        norm_eps: f32,
+        conv_l_cache: i32,
+        num_experts: i32,
+        num_experts_per_tok: i32,
+        num_dense_layers: i32,
+        norm_topk_prob: i32,
+        use_expert_bias: i32,
+        tie_embedding: i32,
+        conv_bias: i32,
+        max_kv_len: i32,
+        batch_size: i32,
+        block_size: i32,
+        is_attn: *const i32,
+        k_pool_handles: *mut *mut mlx_array,
+        v_pool_handles: *mut *mut mlx_array,
+        k_scale_handles: *mut *mut mlx_array,
+        v_scale_handles: *mut *mut mlx_array,
+        conv_state_handles: *mut *mut mlx_array,
+        prefill_offset: i32,
+    ) -> i32;
+
+    /// Run one compiled-paged lfm2 decode step. Inputs (PagedAttentionInputs)
+    /// come from the Rust adapter's `build_paged_attention_inputs`; the per-layer
+    /// pool/scale/conv-state globals come from `mlx_lfm2_moe_init_paged`. Sets
+    /// `*output_logits` to a heap-allocated `mlx_array*` (caller owns) on
+    /// success, or `nullptr` on error / when not initialized. `cache_offset_out`
+    /// receives the post-step offset.
+    ///
+    /// **Decode-only contract.** `input_ids` MUST have exactly one element and
+    /// `slot_mapping` MUST be `[1]`. Violating it returns null logits + a stderr
+    /// diagnostic, leaving global state untouched so the caller can fall back to
+    /// the pure-Rust paged decode. The traced-compiled-paged engagement counter
+    /// (`mlx_lfm2_moe_compiled_paged_call_count`) is bumped ONLY in the compiled
+    /// arm (not under `MLX_NO_COMPILE`).
+    pub fn mlx_lfm2_moe_forward_paged(
+        input_ids: *mut mlx_array,
+        embedding_weight: *mut mlx_array,
+        offset_arr: *mut mlx_array,
+        block_table: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        num_valid_tokens: *mut mlx_array,
+        num_valid_blocks: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        output_logits: *mut *mut mlx_array,
+        cache_offset_out: *mut i32,
+    );
+
+    /// Tear down ONLY the compiled-paged decode state (config, is_attn, per-layer
+    /// pools/scales/conv-state, offset, inited flag). Does NOT touch the flat
+    /// lfm2 globals, the shared model-id atom, or the engagement counter.
+    pub fn mlx_lfm2_paged_reset();
+
+    /// Cumulative count of `mlx_lfm2_moe_forward_paged` calls that took the
+    /// TRACED `compiled_lfm2_decode_paged()` branch — i.e. NOT the eager
+    /// `MLX_NO_COMPILE` arm. Distinct from the flat
+    /// `mlx_lfm2_moe_compiled_decode_call_count`; proves the compiled-paged
+    /// closure actually ran. NOT reset by `mlx_lfm2_paged_reset`.
+    pub fn mlx_lfm2_moe_compiled_paged_call_count() -> u64;
+
+    /// Cumulative count of `mlx_lfm2_moe_forward_paged` calls that ran the C++
+    /// paged decode — BOTH the compiled AND the eager `MLX_NO_COMPILE` arm. The
+    /// paged analogue of the flat `mlx_lfm2_moe_forward_call_count`; it is the
+    /// ONLY engagement signal the EAGER-paged (`MLX_NO_COMPILE=1`) run produces,
+    /// since `mlx_lfm2_moe_compiled_paged_call_count` never bumps in that arm. A
+    /// nonzero before/after delta proves the C++ paged forward engaged rather than
+    /// the Rust caller silently falling back to the pure-Rust paged decode. NOT
+    /// reset by `mlx_lfm2_paged_reset`.
+    pub fn mlx_lfm2_moe_paged_forward_call_count() -> u64;
+
     /// TEST-ONLY component probe: run a sequence of `T` lfm2 attention decode
     /// steps (B=1, `x_seq` is `[T, hidden]`) through the compiled
     /// `lfm2_attn_pure_fn`, threading the KV cache, and return the LAST step's

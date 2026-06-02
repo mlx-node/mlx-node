@@ -81,7 +81,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mlx_core::models::lfm2::model::Lfm2Model;
-use mlx_core::models::qwen3_5::model::{ChatConfig, ChatResult};
+use mlx_core::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk};
 use mlx_core::tokenizer::ChatMessage;
 
 /// New tokens decoded per run for the short-prompt tests. Spec requires N >= 48;
@@ -294,25 +294,35 @@ fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
     }
 }
 
-/// Greedy config with REASONING DISABLED (`reasoning_effort: "none"` →
-/// `enable_thinking=Some(false)`, `include_reasoning=Some(false)`).
+/// Greedy config with MINIMAL reasoning + VERBATIM `raw_text`.
 ///
-/// This is the config that makes a thinking-checkpoint reply round-trip
-/// through re-templating, which is required to reach the warm strict-extend
-/// path via `chat_session_start` (see `lfm2_warm_reuse_offset_fix`). With
-/// thinking enabled, `finalize_chat_result` strips the reasoning span out of
-/// `ChatResult.text`, so echoing `text` back in the next turn's history no
-/// longer reproduces the raw generated tokens that were cached — the prefix
-/// verifier misses and the turn cold-prefills. With thinking disabled,
-/// `parse_thinking_and_tools` passes the decoded text through verbatim
-/// (`text == raw_text`), so `assistant_message(&r1.text)` re-renders to the
-/// exact cached token prefix and `verify_cache_prefix` takes the strict-extend
-/// branch.
+/// `reasoning_effort: "none"` (+ `thinking_token_budget: None`) forces the
+/// thinking budget to `0` via `default_thinking_budget_for_effort`, so the
+/// model emits a degenerate empty `<think></think>` span on the first two
+/// decode steps and then answers — deterministic and short. (LFM2's chat
+/// template IGNORES `enable_thinking`; the runtime hard-codes
+/// `thinking_enabled = true` in `chat_sync_core`, so "none" controls the
+/// reasoning BUDGET, not whether reasoning is parsed.)
+///
+/// `include_reasoning: Some(true)` is LOAD-BEARING for the warm strict-extend
+/// reachability via `chat_session_start` (see `lfm2_warm_reuse_offset_fix`):
+/// `save_cache_state` persists the RAW generated tokens, which BEGIN with the
+/// `<think></think>` markers. `ChatResult.text` always has that reasoning span
+/// stripped (`parse_thinking_and_tools` splits at `</think>` whenever
+/// `thinking_enabled` — always true on LFM2), so echoing `text` back in the
+/// next turn's history drops the `<think></think>` tokens and the re-templated
+/// prompt diverges from the cache at the first generated token (verifier
+/// returns 0, full prefill). With `include_reasoning: Some(true)`,
+/// `ChatResult.raw_text` is the FULL verbatim decode (markers included), which
+/// round-trips token-exact through the tokenizer, so echoing `r.raw_text`
+/// re-renders the exact cached prefix and `verify_cache_prefix` takes the
+/// strict-extend branch. (`text` is unaffected by `include_reasoning`, so the
+/// warm-vs-cold output comparison is identical either way.)
 fn greedy_chat_config_no_thinking(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
     ChatConfig {
         reasoning_effort: Some("none".to_string()),
         thinking_token_budget: None,
-        include_reasoning: Some(false),
+        include_reasoning: Some(true),
         ..greedy_chat_config(max_new_tokens, reuse_cache)
     }
 }
@@ -511,11 +521,18 @@ fn gated() -> bool {
 }
 
 fn no_compile_env() -> bool {
-    // Match the C++ side EXACTLY: `std::getenv("MLX_NO_COMPILE") != nullptr`
-    // selects the eager `lfm2_decode_fn` branch for ANY value (incl. "0").
-    // Using `== Ok("1")` here would desync: `MLX_NO_COMPILE=0` would run the
-    // eager C++ branch while the test still believed the compiled graph ran.
+    // Match the C++ side EXACTLY: the paged forward selects the eager branch when
+    // `std::getenv("MLX_NO_COMPILE") != nullptr || std::getenv("MLX_DISABLE_COMPILE")
+    // != nullptr` — for ANY value (incl. "0"). Using `== Ok("1")` here would
+    // desync: `MLX_NO_COMPILE=0` would run the eager C++ branch while the test
+    // still believed the compiled graph ran.
+    //
+    // MLX_DISABLE_COMPILE makes MLX's `compile()` a no-op, so the compiled-paged
+    // counter never bumps under it; engagement tests that early-skip under
+    // no-compile MUST also skip here, or they'd assert a false-positive
+    // call-delta. (The C++ `no_compile` latch now ORs both env vars too.)
     std::env::var_os("MLX_NO_COMPILE").is_some()
+        || std::env::var_os("MLX_DISABLE_COMPILE").is_some()
 }
 
 /// Workspace-`target/` path for the cross-invocation native-flat artifact. PID
@@ -633,6 +650,70 @@ async fn run_paged_single(src: &Path, suffix: &str, prompt: &str, max_new: i32) 
         .await
         .unwrap_or_else(|e| panic!("paged chat_session_start ({suffix}): {e:?}"));
     let after = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
+    let out = run_outcome(suffix, &r, after.saturating_sub(before));
+    drop(model);
+    out
+}
+
+/// Load a paged (`use_block_paged_cache:true`) model and run a single-turn
+/// greedy decode, capturing the COMPILED-PAGED engagement delta
+/// (`mlx_lfm2_moe_compiled_paged_call_count`) — the per-step counter bumped only
+/// inside the traced `compiled_lfm2_decode_paged()` branch. This is the P4 proof
+/// that the default paged path runs the compiled-paged graph (not the eager
+/// pure-Rust paged decode). `clone_model_dir(.., true)` sets `paged_block_size:
+/// 16`, exactly what `init_lfm2_paged_compiled_session` requires.
+async fn run_paged_compiled(src: &Path, suffix: &str, prompt: &str, max_new: i32) -> RunOutcome {
+    let dir = clone_model_dir(src, suffix, true)
+        .unwrap_or_else(|e| panic!("clone paged-compiled dir ({suffix}): {e}"));
+    let model = Lfm2Model::load_from_dir(&dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load paged-compiled model ({suffix}): {e:?}"));
+    let before = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let r = model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(greedy_chat_config(max_new, true)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("paged-compiled chat_session_start ({suffix}): {e:?}"));
+    let after = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let out = run_outcome(suffix, &r, after.saturating_sub(before));
+    drop(model);
+    out
+}
+
+/// Load a paged (`use_block_paged_cache:true`) model and run a single-turn greedy
+/// decode under the EAGER paged path, capturing the PAGED-FORWARD engagement delta
+/// (`mlx_lfm2_moe_paged_forward_call_count`) — the per-step counter bumped at the
+/// top of `mlx_lfm2_moe_forward_paged` for BOTH the compiled AND the eager
+/// `MLX_NO_COMPILE` arm.
+///
+/// This is the helper the EAGER-paged reference uses (run as a SEPARATE process
+/// with `MLX_NO_COMPILE=1`, since the C++ `static bool no_compile` latches once per
+/// process). Under `MLX_NO_COMPILE=1` the Rust gate `compiled_path_active()` stays
+/// ON (it does NOT read `MLX_NO_COMPILE`, exactly like the flat path), so the
+/// decode loop still routes through `forward_lfm2_cpp_paged` →
+/// `mlx_lfm2_moe_forward_paged`, which runs the EAGER `lfm2_decode_fn_paged` arm
+/// (same paged KV-pool / conv layout / RoPE / offset logic, just not
+/// `mlx::core::compile`d). The compiled-paged counter never bumps in that arm, so
+/// the paged-forward counter is the only "C++ paged forward engaged" proof the
+/// eager run has — a nonzero delta rules out a silent fallback to the pure-Rust
+/// `run_paged_decode_step` (which would never enter the C++ FFI).
+async fn run_paged_eager(src: &Path, suffix: &str, prompt: &str, max_new: i32) -> RunOutcome {
+    let dir = clone_model_dir(src, suffix, true)
+        .unwrap_or_else(|e| panic!("clone paged-eager dir ({suffix}): {e}"));
+    let model = Lfm2Model::load_from_dir(&dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load paged-eager model ({suffix}): {e:?}"));
+    let before = unsafe { mlx_sys::mlx_lfm2_moe_paged_forward_call_count() };
+    let r = model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(greedy_chat_config(max_new, true)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("paged-eager chat_session_start ({suffix}): {e:?}"));
+    let after = unsafe { mlx_sys::mlx_lfm2_moe_paged_forward_call_count() };
     let out = run_outcome(suffix, &r, after.saturating_sub(before));
     drop(model);
     out
@@ -924,6 +1005,351 @@ async fn lfm2_compiled_flat_vs_paged_e2e_parity() {
         "[PASS] compiled-flat engaged ({} calls) and agrees with paged within \
          tail tolerance ({tail}B <= {TAIL_TOLERANCE_BYTES}B)",
         flat.call_delta
+    );
+}
+
+// =============================================================================
+// P4: COMPILED-PAGED engagement + coherence (DENSE 1.2B).
+//
+// The P4 deliverable: the DEFAULT paged decode path now runs the COMPILED-PAGED
+// graph (`lfm2_decode_fn_paged`), not the eager pure-Rust paged decode. This
+// test loads the 1.2B dense checkpoint with `use_block_paged_cache:true`
+// (paged is also the production default), decodes N tokens, and proves:
+//   1. ENGAGEMENT: `mlx_lfm2_moe_compiled_paged_call_count` advanced by ~N-1
+//      (the last sampled token is never fed forward). A delta of 0 means a
+//      silent fallback to the eager paged decode → hard fail.
+//   2. COHERENCE: the compiled-paged text agrees with the compiled-FLAT decode
+//      everywhere except (at most) a short trailing argmax-tie flip — the same
+//      flat-vs-paged-graph tolerance the existing parity test uses. (Both are
+//      now compiled; the residual divergence is pure flat-vs-paged bf16 noise.)
+//
+// Under `MLX_NO_COMPILE=1` the paged path is the EAGER C++ paged graph, so the
+// compiled-paged counter never bumps — skip cleanly so a whole-binary
+// `MLX_NO_COMPILE=1` invocation doesn't spuriously fail here (the dedicated
+// eager-vs-compiled capture tests own that mode).
+// =============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_compiled_paged_engagement_dense() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        eprintln!("[skip] MLX_NO_COMPILE=1 — compiled-paged engagement test is compile-mode-only");
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    eprintln!("[paged-compiled] checkpoint: {}", src.display());
+
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // ---- Compiled-PAGED path (under test) --------------------------------
+    let paged = run_paged_compiled(&src, "paged-compiled", prompt, N_NEW_TOKENS).await;
+
+    // ENGAGEMENT GATE: delta == 0 => silent eager fallback => hard fail.
+    assert!(
+        paged.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "COMPILED-PAGED PATH DID NOT ENGAGE: compiled_paged_call_count delta = {} \
+         (model_id={}, weight_count={}). The paged decode silently fell back to the \
+         eager pure-Rust paged decode.",
+        paged.call_delta,
+        paged.model_id,
+        paged.weight_count
+    );
+    assert_ne!(
+        paged.model_id, 0,
+        "compiled-paged model id was not published"
+    );
+    assert_eq!(
+        paged.weight_count, EXPECTED_WEIGHT_COUNT,
+        "unexpected registered weight count (paged registration must match flat)"
+    );
+
+    // COHERENCE: compiled-paged vs compiled-flat. Both compiled; a late argmax
+    // tie can flip the last token or two — require agreement everywhere else.
+    let flat = run_flat_single(&src, "paged-compiled-flatref", prompt, N_NEW_TOKENS).await;
+    let tail = tail_diff_bytes(&paged.text, &flat.text);
+    eprintln!(
+        "[paged-compiled] vs compiled-flat: tail_diff={tail}B (common_prefix={}B)",
+        common_prefix_len(&paged.text, &flat.text)
+    );
+    assert_tail_only_divergence("paged-compiled-vs-flat", &paged.text, &flat.text);
+    assert_eq!(
+        paged.num_tokens, flat.num_tokens,
+        "num_tokens mismatch: paged-compiled={} flat={}",
+        paged.num_tokens, flat.num_tokens
+    );
+
+    eprintln!(
+        "[PASS] compiled-PAGED engaged ({} compiled-paged calls) and agrees with \
+         compiled-flat within tail tolerance ({tail}B <= {TAIL_TOLERANCE_BYTES}B). \
+         text snippet: {:?}",
+        paged.call_delta,
+        &paged.text.chars().take(80).collect::<String>()
+    );
+}
+
+// =============================================================================
+// P5: COMPILED-PAGED vs EAGER-PAGED parity (DENSE + MoE).
+//
+// The make-or-break P5 gate: the COMPILED-paged decode graph
+// (`lfm2_decode_fn_paged` wrapped in `mlx::core::compile`) must be byte-greedy
+// IDENTICAL to the EAGER-paged decode graph (the SAME `lfm2_decode_fn_paged`, run
+// directly under `MLX_NO_COMPILE=1`). The two share EVERY paged numeric: the same
+// `paged_kv_write` / `paged_attention` ops over the same block-paged Metal pools,
+// the same per-head Q/K RMSNorm + neox RoPE(array offset), the same conv-state
+// threading and FFN dispatch — the ONLY difference is whether the graph is
+// `mlx::core::compile`d. So byte-identity is the verdict that `compile()`
+// faithfully preserves the eager paged graph (an early divergence would be a real
+// compile() topology/offset bug, the only thing that differs between the runs).
+//
+// This is the PAGED twin of the flat `lfm2_eager_flat_vs_compiled_capture`
+// verdict, and it is split the SAME way for the SAME reason: the C++
+// `static bool no_compile` in `mlx_lfm2_moe_forward_paged` latches ONCE per
+// process, so the eager reference MUST be a SEPARATE `cargo test` invocation with
+// `MLX_NO_COMPILE=1`. The two halves communicate through a topology-qualified
+// artifact file in the workspace `target/`, never an in-process env toggle:
+//
+//   * THIS test (`lfm2_compiled_paged_vs_eager_paged`, compiled-mode only): runs
+//     the compiled-paged decode, asserts ENGAGEMENT via the compiled-paged
+//     counter (`mlx_lfm2_moe_compiled_paged_call_count` delta > 0 — a 0 delta is a
+//     silent fallback to the eager pure-Rust paged decode), and writes the
+//     compiled-paged text to `lfm2[_moe]_e2e_compiled_paged.txt`.
+//   * The capture test below (`lfm2_eager_paged_vs_compiled_paged_capture`,
+//     `MLX_NO_COMPILE=1` only): runs the eager-paged decode, asserts the C++ paged
+//     forward ENGAGED (`mlx_lfm2_moe_paged_forward_call_count` delta — the only
+//     signal the eager arm produces), and diffs eager-paged vs the compiled-paged
+//     artifact for BYTE-GREEDY equality across >= N_NEW_TOKENS (48) tokens.
+//
+// Dense is covered by the shared `resolve_source_model` default; MoE is gated on
+// `LFM2_MOE_MODEL_PATH` (the topology-qualified artifact name keeps them from
+// colliding). Skips cleanly under `MLX_NO_COMPILE=1` (the capture test owns that
+// mode) so a whole-binary `MLX_NO_COMPILE=1` invocation doesn't spuriously fail.
+// =============================================================================
+
+/// Artifact name for the compiled-PAGED decode text, topology-qualified so the
+/// dense (`lfm2_e2e_compiled_paged.txt`) and MoE (`lfm2_moe_e2e_compiled_paged.txt`)
+/// runs never diff against each other's stale text.
+fn compiled_paged_artifact_name(is_moe: bool) -> &'static str {
+    if is_moe {
+        "lfm2_moe_e2e_compiled_paged.txt"
+    } else {
+        "lfm2_e2e_compiled_paged.txt"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_compiled_paged_vs_eager_paged() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        eprintln!(
+            "[skip] MLX_NO_COMPILE=1 — compiled-paged writer is compiled-mode-only \
+             (the eager-paged capture test owns MLX_NO_COMPILE=1)"
+        );
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    let comp_is_moe = is_moe_config(&src);
+    eprintln!(
+        "[paged-parity] checkpoint: {} (is_moe={comp_is_moe})",
+        src.display()
+    );
+
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // ---- Compiled-PAGED path (under test) --------------------------------
+    let paged = run_paged_compiled(&src, "paged-parity-compiled", prompt, N_NEW_TOKENS).await;
+
+    // ENGAGEMENT GATE: delta == 0 => silent eager pure-Rust fallback => hard fail.
+    // (delta>0 is the explicit P5 requirement.)
+    assert!(
+        paged.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "COMPILED-PAGED PATH DID NOT ENGAGE: compiled_paged_call_count delta = {} \
+         (model_id={}, weight_count={}). The paged decode silently fell back to the \
+         eager pure-Rust paged decode — the compiled-paged graph never ran, so the \
+         parity comparison would be meaningless.",
+        paged.call_delta,
+        paged.model_id,
+        paged.weight_count
+    );
+    assert_ne!(
+        paged.model_id, 0,
+        "compiled-paged model id was not published"
+    );
+    // FULL-GENERATION: the eager-paged capture diffs the WHOLE text, so the
+    // compiled writer must decode the full N tokens (no early stop) or the eager
+    // side could pass a short prefix while hiding a downstream divergence.
+    assert_eq!(
+        paged.num_tokens, N_NEW_TOKENS as u32,
+        "compiled-paged: generated {} tokens but expected the full {} — an early stop \
+         shrinks the byte-greedy parity window the eager-paged capture diffs against",
+        paged.num_tokens, N_NEW_TOKENS
+    );
+
+    // Persist the compiled-paged decode text so a SEPARATE `MLX_NO_COMPILE=1`
+    // invocation (the eager-paged capture below) can diff against it for the
+    // byte-greedy parity verdict.
+    let art = artifact_path(compiled_paged_artifact_name(comp_is_moe));
+    if let Err(e) = fs::write(&art, &paged.text) {
+        eprintln!("[warn] could not write compiled-paged artifact {art:?}: {e}");
+    } else {
+        eprintln!(
+            "[paged-parity] wrote compiled-paged artifact: {}",
+            art.display()
+        );
+    }
+
+    eprintln!(
+        "[PASS] compiled-PAGED engaged ({} compiled-paged calls, {} tokens); \
+         artifact written for the MLX_NO_COMPILE=1 eager-paged byte-greedy diff. \
+         text snippet: {:?}",
+        paged.call_delta,
+        paged.num_tokens,
+        &paged.text.chars().take(80).collect::<String>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_eager_paged_vs_compiled_paged_capture() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if !no_compile_env() {
+        eprintln!(
+            "[skip] eager-paged capture requires MLX_NO_COMPILE=1 (run as a SEPARATE \
+             cargo test invocation with that env set; the static no_compile flag latches \
+             once per process)"
+        );
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    let eager_is_moe = is_moe_config(&src);
+    eprintln!(
+        "[eager-paged] checkpoint: {} (is_moe={eager_is_moe})",
+        src.display()
+    );
+
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // ---- Eager-PAGED reference (MLX_NO_COMPILE=1) ------------------------
+    let eager = run_paged_eager(&src, "paged-parity-eager", prompt, N_NEW_TOKENS).await;
+
+    // ENGAGEMENT: under MLX_NO_COMPILE=1 the Rust gate still routes through the C++
+    // paged forward (it does NOT read MLX_NO_COMPILE — only the env flag INSIDE
+    // mlx_lfm2_moe_forward_paged swaps compile→eager). So the paged-forward counter
+    // MUST advance ~N-1; a 0 delta means the Rust caller silently fell back to the
+    // pure-Rust paged decode and the eager C++ graph never ran — the comparison
+    // would be meaningless. (The compiled-paged counter never bumps in this arm,
+    // which is exactly WHY a separate paged-forward counter exists.)
+    assert!(
+        eager.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "eager-paged (MLX_NO_COMPILE=1) did not run the C++ paged forward \
+         (paged_forward_call_count delta = {}). Expected ~N-1: MLX_NO_COMPILE only \
+         swaps compile→eager INSIDE mlx_lfm2_moe_forward_paged; it does not disable \
+         the Rust gate. A 0 delta is a silent fallback to the pure-Rust paged decode.",
+        eager.call_delta
+    );
+    assert_eq!(
+        eager.num_tokens, N_NEW_TOKENS as u32,
+        "eager-paged: generated {} tokens but expected the full {} — an early stop \
+         shrinks the byte-greedy parity window below the compiled-paged artifact",
+        eager.num_tokens, N_NEW_TOKENS
+    );
+    eprintln!(
+        "[eager-paged] C++ paged forward ran (call_delta={}, model_id={}, num_tokens={})",
+        eager.call_delta, eager.model_id, eager.num_tokens
+    );
+
+    // Persist for symmetry / debugging.
+    let eager_art = artifact_path(if eager_is_moe {
+        "lfm2_moe_e2e_eager_paged.txt"
+    } else {
+        "lfm2_e2e_eager_paged.txt"
+    });
+    let _ = fs::write(&eager_art, &eager.text);
+
+    // ---- BYTE-GREEDY PARITY VERDICT: eager-paged vs compiled-paged -------
+    // Read the topology-matched compiled-paged artifact written by
+    // `lfm2_compiled_paged_vs_eager_paged` (run the default/compiled suite FIRST).
+    let comp_art = artifact_path(compiled_paged_artifact_name(eager_is_moe));
+    let compiled_text = fs::read_to_string(&comp_art).unwrap_or_else(|e| {
+        panic!(
+            "[eager-paged] compiled-paged artifact not found at {} ({e}); run the \
+             default (compiled) suite FIRST to produce it \
+             (LFM2_COMPILED_E2E=1 ... lfm2_compiled_paged_vs_eager_paged), then re-run \
+             this with MLX_NO_COMPILE=1. eager-paged text captured to {}.",
+            comp_art.display(),
+            eager_art.display()
+        )
+    });
+
+    let lcp = common_prefix_len(&eager.text, &compiled_text);
+    let tail = tail_diff_bytes(&eager.text, &compiled_text);
+    eprintln!(
+        "[VERDICT] eager-paged vs compiled-paged: common_prefix={lcp}B eager_len={}B \
+         compiled_len={}B tail_diff={tail}B",
+        eager.text.len(),
+        compiled_text.len()
+    );
+
+    // The two runs share the SAME paged graph (only compile() differs), so the
+    // expected verdict is BYTE-IDENTICAL — exactly like the flat eager-vs-compiled
+    // case. Assert byte equality as the strict gate; `assert_tail_only_divergence`
+    // is the loud-failure path if compile() introduced any divergence (early =>
+    // a real compile() topology/offset bug; late tail => a benign argmax tie that
+    // we still surface).
+    if eager.text == compiled_text {
+        eprintln!(
+            "[VERDICT] BYTE-IDENTICAL ({} bytes / {} tokens) — `compile()` faithfully \
+             preserves the eager paged decode graph; the compiled-paged port is \
+             numerically exact.",
+            eager.text.len(),
+            eager.num_tokens
+        );
+    } else {
+        eprintln!("[VERDICT] eager and compiled PAGED differ — investigate (see tails below)");
+        eprintln!(
+            "[VERDICT] eager_tail    = {:?}",
+            &eager.text[lcp.min(eager.text.len())..]
+        );
+        eprintln!(
+            "[VERDICT] compiled_tail = {:?}",
+            &compiled_text[lcp.min(compiled_text.len())..]
+        );
+    }
+    assert_tail_only_divergence("eager-paged-vs-compiled-paged", &eager.text, &compiled_text);
+
+    // BYTE-GREEDY across >= 48 tokens (spec): both sides generated N_NEW_TOKENS
+    // (48) and the shared byte prefix must span essentially all of it (allowing
+    // only the late argmax-tie tail). A short shared prefix would already have
+    // failed `assert_tail_only_divergence` above; this asserts the agreed span is
+    // long enough to actually cover the 48-token greedy decode.
+    let min_shared = compiled_text.len().saturating_sub(TAIL_TOLERANCE_BYTES);
+    assert!(
+        lcp >= min_shared,
+        "[eager-paged-vs-compiled-paged] byte-greedy parity over the full {}-token \
+         decode FAILED: shared prefix is only {lcp}B but the compiled-paged text is \
+         {}B (need >= {min_shared}B, i.e. agreement minus the <= {TAIL_TOLERANCE_BYTES}B \
+         argmax-tie tail).",
+        N_NEW_TOKENS,
+        compiled_text.len()
+    );
+
+    eprintln!(
+        "[PASS] eager-paged vs compiled-paged BYTE-GREEDY parity holds over the full \
+         {}-token decode (shared prefix {lcp}B, tail_diff {tail}B <= {TAIL_TOLERANCE_BYTES}B); \
+         compile() is faithful to the eager paged graph.",
+        N_NEW_TOKENS
     );
 }
 
@@ -1270,7 +1696,7 @@ async fn lfm2_long_prompt_offset_fix() {
 //
 // We drive that here with TWO `chat_session_start` calls on ONE live model:
 //   turn 1: [user1]
-//   turn 2: [user1, assistant(reply1), user2]   (a superset prompt)
+//   turn 2: [user1, assistant(raw_reply1), user2]   (a superset prompt)
 // Turn 2's tokenized prompt begins with turn 1's persisted history, so the
 // strict-extend branch fires; the compiled path stays engaged (call_delta ~N-1),
 // and the seed offset comes from the live KV position. Pre-fix this seeded the
@@ -1279,38 +1705,42 @@ async fn lfm2_long_prompt_offset_fix() {
 // coherently.
 //
 // REACHABILITY (verified empirically on this lfm2.5-1.2b-THINKING checkpoint,
-// 2026-05-30) — load-bearing, hence `greedy_chat_config_no_thinking`:
+// 2026-06-02) — load-bearing, hence the `r1.raw_text` echo + the
+// `include_reasoning: Some(true)` in `greedy_chat_config_no_thinking`:
 //
 //   The strict-extend branch only fires when turn 2's tokenized prompt is a
 //   byte-prefix of `cached_token_history` (= turn-1 template tokens + turn-1
-//   RAW generated tokens, see `save_cache_state`). Turn 2 re-templates
-//   `assistant_message(&r1.text)`. The round-trip therefore depends on whether
-//   `r1.text` equals the raw generated tokens that were cached:
+//   RAW generated tokens, see `save_cache_state`). LFM2's chat template IGNORES
+//   `enable_thinking` and `chat_sync_core` hard-codes `thinking_enabled = true`,
+//   so the model ALWAYS emits a `<think>…</think>` span (here `reasoning_effort:
+//   "none"` forces the budget to 0 → a degenerate empty `<think></think>` as
+//   the first two generated tokens) and `parse_thinking_and_tools` ALWAYS splits
+//   the decoded text at `</think>`. Therefore the round-trip turns on WHICH
+//   field turn 2 echoes:
 //
-//     * Reasoning ENABLED (the suite's `greedy_chat_config`, reasoning_effort
-//       unset -> thinking_enabled defaults true): `finalize_chat_result` /
-//       `parse_thinking_and_tools` SPLIT the decoded text at `</think>` and
-//       return only the post-`</think>` content in `ChatResult.text`. The
-//       cached tokens still include the `<think>…</think>` reasoning span, so
-//       echoing the stripped `text` produces a prompt that does NOT prefix the
-//       cache. `verify_cache_prefix` returns 0 -> full prefill ->
-//       `cached_tokens=0`. Observed: turn2 call_delta=23, cached_tokens=0.
-//       (This is what the freshly-hardened `cached_tokens>0` assertion caught.)
+//     * Echoing `ChatResult.text` (reasoning-stripped): the `<think></think>`
+//       markers — the FIRST generated tokens in the cache — are gone, so the
+//       re-templated prompt diverges from the cache at the very first generated
+//       token. `verify_cache_prefix` returns 0 -> full prefill ->
+//       `cached_tokens=0`. (This is what the `cached_tokens>0` assertion caught;
+//       the prior comment's "reasoning-disabled -> verbatim text" claim was
+//       wrong because LFM2 never disables reasoning parsing.)
 //
-//     * Reasoning DISABLED (`reasoning_effort:"none"` -> enable_thinking=false,
-//       include_reasoning=false): `parse_thinking_and_tools` takes the
-//       `!thinking_enabled` branch and passes the decoded text through VERBATIM
-//       (`text == raw_text`, the leading literal `<think>` and all). Echoing
-//       `r1.text` reproduces the exact cached token prefix, the strict-extend
-//       branch fires, and the offset seed runs on a NON-ZERO prefix. Observed:
-//       turn2 call_delta=23, cached_tokens=22.
+//     * Echoing `ChatResult.raw_text` with `include_reasoning: Some(true)`
+//       (the FULL verbatim decode, `<think></think>` markers and all): this
+//       round-trips token-exact through the tokenizer (empirically verified,
+//       including across the max_new mid-word truncation boundary), so the
+//       re-templated prompt reproduces the EXACT cached token prefix, the
+//       strict-extend branch fires, and the offset seed runs on a NON-ZERO
+//       prefix. Observed: turn2 call_delta=23, cached_tokens=45.
 //
 //   So warm strict-extend reuse IS reachable through the public
-//   `chat_session_start` API for this checkpoint — but only with reasoning
-//   disabled, which is why turn 1 and turn 2 both use
-//   `greedy_chat_config_no_thinking`. (`chat_session_continue` is hard-wired
-//   NATIVE at model.rs ~2604 and can never exercise the compiled warm path, so
-//   the resend-superset pattern is the only public route — it works here.)
+//   `chat_session_start` API for this checkpoint — by echoing the VERBATIM
+//   `raw_text` (not the stripped `text`), which is why turn 1 captures
+//   `r1.raw_text` and turn 2 (and the cold oracle) echo it.
+//   (`chat_session_continue` is hard-wired NATIVE at model.rs ~2604 and can
+//   never exercise the compiled warm path, so the resend-superset pattern is the
+//   only public route — it works here.)
 //
 // Oracle: a FRESH-session run of the identical turn-2 prompt (no warm prefix),
 // same reasoning-disabled config. Same compiled flat graph, same full prompt,
@@ -1350,15 +1780,20 @@ async fn lfm2_warm_reuse_offset_fix() {
         // Turn 1: fresh session. Compiled path engages and persists the
         // [user1, assistant(reply1)] history for the next strict-extend hit.
         //
-        // REASONING DISABLED (`greedy_chat_config_no_thinking`) is LOAD-BEARING
-        // for reachability on this THINKING checkpoint. See the strict-extend
-        // reachability note above `lfm2_warm_reuse_offset_fix`: with reasoning
-        // enabled, `finalize_chat_result` strips the `<think>…</think>` span out
-        // of `ChatResult.text`, so echoing `text` in turn 2's history no longer
-        // reproduces the raw cached tokens and `verify_cache_prefix` misses
-        // (cached_tokens=0, full prefill). With reasoning disabled the reply is
-        // verbatim (`text == raw_text`), so `assistant_message(&r1.text)`
-        // re-renders the exact cached prefix and the strict-extend branch fires.
+        // We echo `r1.raw_text` (NOT `r1.text`) into turn 2's history. This is
+        // LOAD-BEARING for reachability on this THINKING checkpoint: LFM2 ALWAYS
+        // parses reasoning (`thinking_enabled` is hard-coded true in
+        // `chat_sync_core`; the chat template ignores `enable_thinking`), so
+        // `ChatResult.text` always has the leading `<think></think>` span
+        // stripped. But `save_cache_state` persists the RAW generated tokens,
+        // which BEGIN with those `<think></think>` markers — so echoing the
+        // stripped `text` drops them and the re-templated turn-2 prompt diverges
+        // from the cache at the first generated token (`verify_cache_prefix`
+        // returns 0 → full prefill → `cached_tokens=0`). `greedy_chat_config_no_thinking`
+        // sets `include_reasoning: Some(true)` so `r1.raw_text` is the FULL
+        // verbatim decode (markers included); it round-trips token-exact through
+        // the tokenizer, so `assistant_message(&r1.raw_text)` re-renders the
+        // EXACT cached prefix and the strict-extend branch fires (cached_tokens>0).
         let before_t1 = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
         let r1 = model
             .chat_session_start(
@@ -1370,21 +1805,24 @@ async fn lfm2_warm_reuse_offset_fix() {
         let after_t1 = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
         let turn1_delta = after_t1.saturating_sub(before_t1);
         eprintln!(
-            "[warm-flat] turn1 call_delta={turn1_delta} text={:?}",
-            r1.text
+            "[warm-flat] turn1 call_delta={turn1_delta} text={:?} raw_text={:?}",
+            r1.text, r1.raw_text
         );
 
         // Turn 2: a NEW session-start whose message list replays the prior turn
-        // (user1 + assistant reply1) and appends user2. The tokenized prompt is
-        // a STRICT EXTENSION of the persisted history, so `chat_sync_core` takes
-        // the strict-extend branch (prefill only the user2 tail) AND keeps the
-        // compiled path engaged — exactly fix #1's warm-reuse seed path.
+        // (user1 + assistant RAW reply1) and appends user2. Echoing the VERBATIM
+        // `r1.raw_text` (markers and all) — not the reasoning-stripped `r1.text` —
+        // makes the tokenized prompt a STRICT EXTENSION of the persisted history
+        // (which `save_cache_state` stored as the raw generated tokens), so
+        // `chat_sync_core` takes the strict-extend branch (prefill only the user2
+        // tail) AND keeps the compiled path engaged — exactly fix #1's warm-reuse
+        // seed path.
         let before_t2 = unsafe { mlx_sys::mlx_lfm2_moe_forward_call_count() };
         let r2 = model
             .chat_session_start(
                 vec![
                     user_message(user1),
-                    assistant_message(&r1.text),
+                    assistant_message(&r1.raw_text),
                     user_message(user2),
                 ],
                 Some(greedy_chat_config_no_thinking(max_new, true)),
@@ -1399,7 +1837,9 @@ async fn lfm2_warm_reuse_offset_fix() {
             r2.text
         );
         drop(model);
-        (turn1_delta, turn2_delta, turn2_cached, r2.text, r1.text)
+        // Return `r1.raw_text` (the VERBATIM reply echoed into turn 2) so the
+        // cold oracle below replays the IDENTICAL turn-2 prompt — apples-to-apples.
+        (turn1_delta, turn2_delta, turn2_cached, r2.text, r1.raw_text)
     };
 
     // Turn 1 (session anchor) MUST engage the compiled path.
@@ -1453,11 +1893,14 @@ async fn lfm2_warm_reuse_offset_fix() {
             .chat_session_start(
                 vec![
                     user_message(user1),
+                    // Echo the SAME verbatim `raw_text` the warm turn 2 echoed so
+                    // the templated turn-2 prompt is byte-identical between the
+                    // warm-reuse run and this cold oracle.
                     assistant_message(&turn1_reply),
                     user_message(user2),
                 ],
-                // Same reasoning-disabled config as the warm run so this is a
-                // like-for-like full-prefill oracle of the identical prompt.
+                // Same config as the warm run so this is a like-for-like
+                // full-prefill oracle of the identical prompt.
                 Some(greedy_chat_config_no_thinking(max_new, true)),
             )
             .await
@@ -1792,5 +2235,199 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
          {lcp}-byte early prefix (>= {GOLDEN_MIN_PREFIX_BYTES_MOE}); compiled path engaged \
          (call_delta={}).",
         flat.call_delta
+    );
+}
+
+// =============================================================================
+// P4 (STREAMING): COMPILED-PAGED engagement + non-stream parity (DENSE 1.2B).
+//
+// The non-streaming paged decode loop (`chat_sync_core_paged_inner`) was already
+// proven to engage the compiled-paged C++ graph by
+// `lfm2_compiled_paged_engagement_dense` / `lfm2_compiled_paged_vs_eager_paged`.
+// The STREAMING paged decode loop (`chat_stream_sync_core_paged_inner`) was JUST
+// wired into the SAME shared compiled-paged helpers
+// (`Lfm2Inner::paged_compiled_decode_setup` + `paged_compiled_decode_step`); this
+// test is its dedicated regression gate. It proves two things on the real 1.2B
+// dense checkpoint with `use_block_paged_cache:true` (the production default):
+//
+//   1. ENGAGEMENT — `mlx_lfm2_moe_compiled_paged_call_count` advances by ~N-1
+//      across a STREAMING decode. Before the streaming loop was wired to the
+//      compiled-paged path this delta was 0 (the stream silently ran the eager
+//      pure-Rust paged decode). A 0 delta here is the exact pre-fix failure and
+//      is a HARD FAIL.
+//   2. PARITY — the text reconstructed from the streaming delta chunks
+//      (`chunk.text`, concatenated) is BYTE-IDENTICAL to the non-streaming
+//      compiled-paged `ChatResult.text` reference. Both run the SAME compiled-
+//      paged graph at temperature 0 over the SAME prompt/config, so the only
+//      tolerated divergence is a late argmax-tie tail (`TAIL_TOLERANCE_BYTES`,
+//      the suite's shared comparison budget) — an early divergence is a real
+//      streaming-seam bug.
+//
+// Each side loads a FRESH model from its OWN cloned checkpoint dir (matching the
+// `run_*` helpers) so there is no cross-run cache state. Under `MLX_NO_COMPILE=1`
+// the paged path is the eager C++ graph and the compiled-paged counter never
+// bumps, so skip cleanly (the eager-paged capture tests own that mode).
+// =============================================================================
+
+/// Drain the LFM2 streaming receiver for one turn, concatenating the delta
+/// `chunk.text` (the SAME reconstruction the proven session test
+/// `lfm2_session_stream_matches_non_stream_byte_for_byte` uses to match
+/// `ChatResult.text`). Returns the reconstructed text, the terminal
+/// `finish_reason`, and the terminal `num_tokens`. Panics if the stream never
+/// reaches `done == true` (a stream that closes without a terminal chunk is a
+/// hard bug, not a benign early stop).
+async fn drain_lfm2_stream_text(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+) -> (String, String, u32) {
+    let mut text = String::new();
+    let mut finish_reason = String::new();
+    let mut num_tokens = 0u32;
+    let mut saw_done = false;
+    while let Some(result) = rx.recv().await {
+        let chunk = result.expect("lfm2 stream chunk error");
+        if chunk.done {
+            saw_done = true;
+            finish_reason = chunk.finish_reason.unwrap_or_default();
+            num_tokens = chunk.num_tokens.unwrap_or(0);
+            break;
+        }
+        text.push_str(&chunk.text);
+    }
+    assert!(saw_done, "lfm2 stream never reached done=true");
+    (text, finish_reason, num_tokens)
+}
+
+/// Strip a LEADING empty `<think></think>` reasoning wrapper (and the single
+/// following newline, if present) from a streamed reconstruction. With
+/// `thinking_token_budget: Some(0)` the template opens then immediately closes
+/// thinking, so the streamed delta chunks carry an empty `<think></think>\n`
+/// that the non-streaming `ChatResult.text` already had stripped by
+/// `finalize_chat_result`. Stripping it here makes the stream-vs-non-stream
+/// comparison content-vs-content. Only an EMPTY leading wrapper is removed; any
+/// non-empty `<think>…content…</think>` is left intact so a real reasoning-span
+/// divergence would still surface. Returns the input unchanged if no empty
+/// wrapper is present (so it is a no-op on the already-stripped reference).
+fn strip_leading_empty_think(s: &str) -> &str {
+    const EMPTY: &str = "<think></think>";
+    if let Some(rest) = s.strip_prefix(EMPTY) {
+        rest.strip_prefix('\n').unwrap_or(rest)
+    } else {
+        s
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_compiled_paged_streaming_engagement_and_parity_dense() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        // The streaming-compiled engagement signal is the compiled-paged counter,
+        // which never bumps under MLX_NO_COMPILE=1 (the paged path is the eager C++
+        // graph there). Skip cleanly so a whole-binary MLX_NO_COMPILE=1 invocation
+        // doesn't spuriously fail (the eager-paged capture tests own that mode).
+        eprintln!(
+            "[skip] MLX_NO_COMPILE=1 — streaming compiled-paged engagement test is compile-mode-only"
+        );
+        return;
+    }
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    eprintln!("[paged-compiled-stream] checkpoint: {}", src.display());
+
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // ---- NON-STREAMING reference (compiled-paged) ------------------------
+    // Reuse the proven non-streaming compiled-paged helper: it loads a fresh paged
+    // model, runs `chat_session_start`, and reports the compiled-paged call delta.
+    let reference =
+        run_paged_compiled(&src, "paged-compiled-stream-ref", prompt, N_NEW_TOKENS).await;
+    assert!(
+        reference.call_delta >= MIN_COMPILED_CALL_DELTA,
+        "REFERENCE non-streaming compiled-paged path did not engage (call_delta={}, \
+         model_id={}, weight_count={}); the parity comparison would be meaningless.",
+        reference.call_delta,
+        reference.model_id,
+        reference.weight_count
+    );
+    eprintln!(
+        "[paged-compiled-stream] non-streaming reference engaged (call_delta={}, num_tokens={}, finish={})",
+        reference.call_delta, reference.num_tokens, reference.finish_reason
+    );
+
+    // ---- STREAMING under test (compiled-paged) --------------------------
+    // Fresh model from its own cloned paged dir to avoid cross-run cache state,
+    // exactly like the `run_*` helpers. `clone_model_dir(.., true)` sets
+    // `paged_block_size: 16`, which `init_lfm2_paged_compiled_session` requires.
+    let stream_dir = clone_model_dir(&src, "paged-compiled-stream", true)
+        .unwrap_or_else(|e| panic!("clone paged-compiled-stream dir: {e}"));
+    let stream_model = Lfm2Model::load_from_dir(&stream_dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load paged-compiled-stream model: {e:?}"));
+
+    let before = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let (handle, rx) = stream_model
+        .chat_stream_session_start_for_test(
+            vec![user_message(prompt)],
+            Some(greedy_chat_config(N_NEW_TOKENS, true)),
+        )
+        .unwrap_or_else(|e| panic!("chat_stream_session_start_for_test dispatch failed: {e:?}"));
+    let (stream_text, stream_finish, stream_tokens) = drain_lfm2_stream_text(rx).await;
+    let after = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let stream_call_delta = after.saturating_sub(before);
+    drop(handle);
+    drop(stream_model);
+
+    eprintln!(
+        "[paged-compiled-stream] STREAMING run: call_delta={stream_call_delta} num_tokens={stream_tokens} finish={stream_finish}"
+    );
+    eprintln!("[paged-compiled-stream] stream_text = {stream_text:?}");
+
+    // ---- ASSERT 1: STREAMING compiled-paged ENGAGEMENT ------------------
+    // This is the whole point: pre-fix the streaming loop ran the eager pure-Rust
+    // paged decode and left this delta at 0.
+    assert!(
+        stream_call_delta >= MIN_COMPILED_CALL_DELTA,
+        "STREAMING compiled-paged path did not engage (call_delta={stream_call_delta}) — \
+         chat_stream_sync_core_paged_inner is not wired to compiled-paged. Expected ~N-1 \
+         compiled-paged forward calls (>= {MIN_COMPILED_CALL_DELTA}); a 0/low delta means the \
+         streaming decode silently fell back to the eager pure-Rust paged decode."
+    );
+
+    // ---- ASSERT 2: STREAMING == NON-STREAMING reference -----------------
+    // Both run the SAME compiled-paged graph at temperature 0, so the GENERATED
+    // CONTENT must be byte-identical save for at most a late argmax-tie tail.
+    //
+    // ONE representation difference must be normalized first: with
+    // `thinking_token_budget: Some(0)` the template opens then immediately forces
+    // a `</think>`, so the run emits an EMPTY `<think></think>\n` reasoning block.
+    // The non-streaming `ChatResult.text` (`reference.text`) has that empty span
+    // stripped by `finalize_chat_result`, but the streaming delta chunks emit it
+    // verbatim, so the raw streamed text carries a leading `<think></think>\n` the
+    // reference does not. That is a FORMATTING difference, not a decode
+    // divergence (the post-wrapper content is what proves parity). Strip a leading
+    // empty-think wrapper from the streamed reconstruction so the comparison is
+    // content-vs-content (the strip is a no-op on the already-stripped reference).
+    let stream_content = strip_leading_empty_think(&stream_text);
+    let tail = tail_diff_bytes(stream_content, &reference.text);
+    eprintln!(
+        "[paged-compiled-stream] stream-vs-nonstream: tail_diff={tail}B (common_prefix={}B) \
+         (streamed had empty-think wrapper stripped: {})",
+        common_prefix_len(stream_content, &reference.text),
+        stream_content.len() != stream_text.len()
+    );
+    assert_tail_only_divergence(
+        "paged-compiled-stream-vs-nonstream",
+        stream_content,
+        &reference.text,
+    );
+
+    eprintln!(
+        "[PASS] STREAMING compiled-PAGED engaged ({stream_call_delta} compiled-paged calls) and \
+         agrees with the non-streaming compiled-paged reference within tail tolerance \
+         ({tail}B <= {TAIL_TOLERANCE_BYTES}B). content snippet: {:?}",
+        &stream_content.chars().take(80).collect::<String>()
     );
 }
