@@ -1360,16 +1360,30 @@ impl Lfm2Inner {
         // which flow through the generic store loop under the same keys
         // `get_weight` reads.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
-        if !is_quantized {
+        // Compiled-PAGED decode is bf16-only (the paged KV pools + static mask
+        // hard-code `KvDtype::Bf16`); compiled-FLAT is dtype-generic. Compute the
+        // whole-model bf16-clean invariant FIRST (read-only dtype scan over the
+        // still-live `params`; `*.expert_bias` F32 on MoE is the one allowed
+        // exception, handled inside the scan) so the registration decision and
+        // the `paged_compiled_decode_setup` gate share one authoritative flag.
+        let all_float_weights_bf16 = if is_quantized {
+            false
+        } else {
+            all_registered_float_weights_are_bf16(&params)?
+        };
+        // Flat is selected iff `use_block_paged_cache == Some(false)`; `None` /
+        // `Some(true)` build the paged adapter at `Lfm2Inner::new` and the decode
+        // dispatch keys on `paged_adapter.is_some()`, so this is an authoritative
+        // load-time predictor of which decode loop this instance will run.
+        let is_flat = inner.config.use_block_paged_cache == Some(false);
+        if should_register_compiled(is_quantized, is_flat, all_float_weights_bf16) {
             register_weights_with_cpp(&params, inner.model_id, &inner.config)?;
-            // Compiled-PAGED decode is bf16-only (the paged KV pools + graph
-            // hard-code `KvDtype::Bf16`). Record (once, over the SAME param map we
-            // just registered) whether every registered float weight is BFloat16
-            // so `paged_compiled_decode_setup` can gate compiled-paged on an
-            // authoritative whole-model invariant rather than a hand-picked tensor
-            // subset. The flat compiled path is unaffected (it does not consult
-            // this flag); a non-bf16 checkpoint still registers and runs flat.
-            inner.all_float_weights_bf16 = all_registered_float_weights_are_bf16(&params)?;
+            // Record the bf16-clean flag (only meaningful once registered) so
+            // `paged_compiled_decode_setup` can gate compiled-paged on this
+            // authoritative whole-model invariant rather than a hand-picked
+            // tensor subset. The flat compiled path does not consult this flag; a
+            // non-bf16 flat checkpoint still registers and runs flat.
+            inner.all_float_weights_bf16 = all_float_weights_bf16;
         }
 
         // NOTE: the cache-limit coordinator registration happens in
@@ -1471,6 +1485,28 @@ fn all_registered_float_weights_are_bf16(params: &HashMap<String, MxArray>) -> R
         }
     }
     Ok(true)
+}
+
+/// Decide whether to register this checkpoint's weights into the shared compiled
+/// registry. Registration is NOT free: it clears `g_weights` and publishes
+/// `model_id` into the single, process-global, cross-family `g_active_model_id`
+/// slot, EVICTING any resident qwen/lfm compiled model (its `compiled_path_active()`
+/// id-equality probe then fails until reload). So register ONLY when this model
+/// will itself take a compiled path:
+///   * quantized → never (the compiled `linear_proj` would mis-dispatch the
+///     quant mode; quantized compiled decode is deferred);
+///   * flat (`use_block_paged_cache == Some(false)`) → always register: the flat
+///     compiled graph is dtype-generic, so bf16 AND f16 flat checkpoints run it;
+///   * paged (default) → register ONLY when bf16-clean: compiled-PAGED is
+///     bf16-only, so a non-bf16 paged checkpoint is forced onto eager paged by
+///     `paged_compiled_decode_setup` (`!all_float_weights_bf16`). Registering it
+///     would evict another model's compiled path for ZERO benefit, so skip it.
+fn should_register_compiled(
+    is_quantized: bool,
+    is_flat: bool,
+    all_float_weights_bf16: bool,
+) -> bool {
+    !is_quantized && (is_flat || all_float_weights_bf16)
 }
 
 fn register_weights_with_cpp(
@@ -1862,6 +1898,41 @@ mod tests {
                 "an f16 `{key}` (q/k/v still bf16) must FAIL the compiled-paged bf16-only gate"
             );
         }
+    }
+
+    /// Registration-gate regression (PR #66 review P2): registering publishes
+    /// `model_id` into the single, cross-family `g_active_model_id` slot and
+    /// EVICTS any resident compiled model. So we must register only when this
+    /// model can itself take a compiled path. The one case the widened gate would
+    /// have gotten wrong is **f16 + paged** (default cache): compiled-PAGED is
+    /// bf16-only, so it can never use the registered path — registering it would
+    /// be a pure-downside eviction. Every other non-quantized case must STILL
+    /// register (flat is dtype-generic; bf16-paged uses compiled-paged).
+    #[test]
+    fn compiled_registration_gate_skips_only_f16_paged() {
+        // flat (use_block_paged_cache==Some(false)) → always register, any dtype.
+        assert!(
+            should_register_compiled(/*quant*/ false, /*flat*/ true, /*bf16*/ true),
+            "bf16 flat must register (compiled-flat)"
+        );
+        assert!(
+            should_register_compiled(false, true, false),
+            "f16 flat must register (compiled-flat is dtype-generic)"
+        );
+        // paged (default) → register only when bf16-clean.
+        assert!(
+            should_register_compiled(false, false, true),
+            "bf16 paged must register (compiled-paged)"
+        );
+        assert!(
+            !should_register_compiled(false, false, false),
+            "f16 paged must NOT register — it can only run eager paged, so \
+             registering would evict another model's compiled path for nothing"
+        );
+        // quantized → never, regardless of flat/dtype.
+        assert!(!should_register_compiled(true, true, false));
+        assert!(!should_register_compiled(true, false, true));
+        assert!(!should_register_compiled(true, true, true));
     }
 
     /// F1 regression: a `use_expert_bias=true` flat bf16 MoE checkpoint that
