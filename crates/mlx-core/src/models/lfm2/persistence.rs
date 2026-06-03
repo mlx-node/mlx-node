@@ -1376,7 +1376,24 @@ impl Lfm2Inner {
         // dispatch keys on `paged_adapter.is_some()`, so this is an authoritative
         // load-time predictor of which decode loop this instance will run.
         let is_flat = inner.config.use_block_paged_cache == Some(false);
-        if should_register_compiled(is_quantized, is_flat, all_float_weights_bf16) {
+        // Compiled-PAGED ALSO hard-requires block_size == CPP_PAGED_REQUIRED_BLOCK_SIZE
+        // (16): `paged_compiled_decode_setup` falls back to eager when
+        // `adapter.block_size() != 16`. The adapter's block size is fixed once at
+        // `Lfm2Inner::new` as `config.paged_block_size.unwrap_or(16)` and is
+        // immutable thereafter, so this load-time value authoritatively predicts
+        // the decode-time gate. `unwrap_or(16)` matches that construction, so a
+        // `None` config still passes (None builds a 16-block adapter that DOES arm
+        // compiled). A bf16 *paged* checkpoint with `paged_block_size` 8/32 can use
+        // no compiled path, so registering it would only evict another model's
+        // compiled slot — same needless eviction the dtype gate closed for f16.
+        let paged_block_size_ok = inner.config.paged_block_size.unwrap_or(16)
+            == crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
+        if should_register_compiled(
+            is_quantized,
+            is_flat,
+            all_float_weights_bf16,
+            paged_block_size_ok,
+        ) {
             register_weights_with_cpp(&params, inner.model_id, &inner.config)?;
             // Record the bf16-clean flag (only meaningful once registered) so
             // `paged_compiled_decode_setup` can gate compiled-paged on this
@@ -1496,17 +1513,27 @@ fn all_registered_float_weights_are_bf16(params: &HashMap<String, MxArray>) -> R
 ///   * quantized → never (the compiled `linear_proj` would mis-dispatch the
 ///     quant mode; quantized compiled decode is deferred);
 ///   * flat (`use_block_paged_cache == Some(false)`) → always register: the flat
-///     compiled graph is dtype-generic, so bf16 AND f16 flat checkpoints run it;
-///   * paged (default) → register ONLY when bf16-clean: compiled-PAGED is
-///     bf16-only, so a non-bf16 paged checkpoint is forced onto eager paged by
-///     `paged_compiled_decode_setup` (`!all_float_weights_bf16`). Registering it
+///     compiled graph is dtype/block-generic (a flat instance has no paged
+///     adapter, so there is no block size to consult), so bf16 AND f16 flat
+///     checkpoints run it — `paged_block_size_ok` is intentionally NOT consulted
+///     for the flat arm;
+///   * paged (default) → register ONLY when BOTH `all_float_weights_bf16` AND
+///     `paged_block_size_ok`: compiled-PAGED is bf16-only AND hard-codes
+///     block_size == 16, so `paged_compiled_decode_setup` forces a non-bf16 OR
+///     non-16-block paged checkpoint onto eager paged. Registering such a model
 ///     would evict another model's compiled path for ZERO benefit, so skip it.
+///
+/// `{not quantized, all-float-bf16, block_size == 16}` is the complete set of
+/// load-time-knowable preconditions for the paged compiled path; every other
+/// decline (model-id eviction race, seed-time pool failures, mid-cycle forward
+/// errors) is runtime-only and handled by the lock-release + RAII reset fallback.
 fn should_register_compiled(
     is_quantized: bool,
     is_flat: bool,
     all_float_weights_bf16: bool,
+    paged_block_size_ok: bool,
 ) -> bool {
-    !is_quantized && (is_flat || all_float_weights_bf16)
+    !is_quantized && (is_flat || (all_float_weights_bf16 && paged_block_size_ok))
 }
 
 fn register_weights_with_cpp(
@@ -1900,39 +1927,61 @@ mod tests {
         }
     }
 
-    /// Registration-gate regression (PR #66 review P2): registering publishes
+    /// Registration-gate regression (PR #66 review): registering publishes
     /// `model_id` into the single, cross-family `g_active_model_id` slot and
-    /// EVICTS any resident compiled model. So we must register only when this
-    /// model can itself take a compiled path. The one case the widened gate would
-    /// have gotten wrong is **f16 + paged** (default cache): compiled-PAGED is
-    /// bf16-only, so it can never use the registered path — registering it would
-    /// be a pure-downside eviction. Every other non-quantized case must STILL
-    /// register (flat is dtype-generic; bf16-paged uses compiled-paged).
+    /// EVICTS any resident compiled model, so we must register only when this
+    /// model can itself take a compiled path. Compiled-PAGED has TWO load-time
+    /// preconditions beyond `!is_quantized`: bf16-clean weights AND block_size ==
+    /// 16. The two cases the widened gate would otherwise get wrong are **f16 +
+    /// paged** (compiled-PAGED is bf16-only) and **bf16 + paged + block != 16**
+    /// (compiled-PAGED hard-codes block 16) — both fall back to eager paged, so
+    /// registering them is a pure-downside eviction. Flat is dtype/block-generic
+    /// (no paged adapter), so it must register regardless of dtype OR block.
+    ///
+    /// Args: `should_register_compiled(is_quantized, is_flat, all_bf16, block16_ok)`.
     #[test]
-    fn compiled_registration_gate_skips_only_f16_paged() {
-        // flat (use_block_paged_cache==Some(false)) → always register, any dtype.
+    fn compiled_registration_gate_skips_f16_or_nonblock16_paged() {
+        // flat (use_block_paged_cache==Some(false)) → always register, any dtype,
+        // any block (a flat instance has no paged adapter → block is irrelevant).
         assert!(
-            should_register_compiled(/*quant*/ false, /*flat*/ true, /*bf16*/ true),
+            should_register_compiled(
+                /*quant*/ false, /*flat*/ true, /*bf16*/ true, /*blk16*/ true
+            ),
             "bf16 flat must register (compiled-flat)"
         );
         assert!(
-            should_register_compiled(false, true, false),
+            should_register_compiled(false, true, false, true),
             "f16 flat must register (compiled-flat is dtype-generic)"
         );
-        // paged (default) → register only when bf16-clean.
         assert!(
-            should_register_compiled(false, false, true),
-            "bf16 paged must register (compiled-paged)"
+            should_register_compiled(false, true, true, false),
+            "flat must register regardless of paged_block_size (flat compiled graph \
+             has no adapter / is block-generic)"
+        );
+        // paged (default) → register only when bf16-clean AND block_size == 16.
+        assert!(
+            should_register_compiled(false, false, true, true),
+            "bf16 paged + block16 must register (compiled-paged)"
         );
         assert!(
-            !should_register_compiled(false, false, false),
+            !should_register_compiled(false, false, false, true),
             "f16 paged must NOT register — it can only run eager paged, so \
              registering would evict another model's compiled path for nothing"
         );
-        // quantized → never, regardless of flat/dtype.
-        assert!(!should_register_compiled(true, true, false));
-        assert!(!should_register_compiled(true, false, true));
-        assert!(!should_register_compiled(true, true, true));
+        assert!(
+            !should_register_compiled(false, false, true, false),
+            "bf16 paged with block_size != 16 must NOT register — compiled-paged \
+             hard-requires block16, so registering would evict for nothing"
+        );
+        assert!(
+            !should_register_compiled(false, false, false, false),
+            "f16 paged + block != 16 must NOT register (neither precondition met)"
+        );
+        // quantized → never, regardless of flat/dtype/block.
+        assert!(!should_register_compiled(true, true, false, true));
+        assert!(!should_register_compiled(true, false, true, true));
+        assert!(!should_register_compiled(true, true, true, true));
+        assert!(!should_register_compiled(true, false, true, false));
     }
 
     /// F1 regression: a `use_expert_bias=true` flat bf16 MoE checkpoint that
