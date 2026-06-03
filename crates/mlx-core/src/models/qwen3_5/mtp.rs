@@ -425,6 +425,127 @@ impl Qwen3_5MTPModule {
 
         Ok(())
     }
+
+    /// Whether the MTP head holds ANY quantized linear (fc, attention
+    /// projection, or MLP).
+    ///
+    /// The model-level `save_model_sync` path is dense/bf16-only: it
+    /// serializes `Linear::get_weight()` (the dense `weight` slot only, NOT
+    /// the packed quantized block) and NaN-validates every emitted tensor via
+    /// `to_float32()`. For a quantized MTP head that dense slot is not a
+    /// faithful bf16 representation of the quantized payload: per-layer
+    /// `QuantizedLinear`s keep their packed uint32 in `weight` (emitting it as
+    /// bf16 is outright garbage), and the top-level `fc` `nn::Linear`
+    /// dequantizes on load (a lossy bf16 copy). Either way the head is not
+    /// round-trippable, and emitting it would masquerade as a valid bf16 head
+    /// on reload — strictly worse than the clean-drop behavior.
+    /// `save_model_sync` calls this to skip MTP serialization (with a warning)
+    /// when any sub-linear is quantized.
+    ///
+    /// `mtp_weights_loaded` alone does NOT distinguish quantized vs bf16, so
+    /// this explicit quant check is required.
+    pub fn has_quantized_weights(&self) -> bool {
+        if self.fc.is_quantized() {
+            return true;
+        }
+        self.layers.iter().any(|layer| {
+            let attn_quantized = match &layer.attn {
+                AttentionType::Full(a) => a.is_quantized(),
+                // MTP layers are full-attention only (enforced in `new`);
+                // treat an unexpected Linear conservatively as "quantized"
+                // so the save path drops rather than emits garbage.
+                AttentionType::Linear(_) => true,
+            };
+            attn_quantized || layer.mlp.is_quantized()
+        })
+    }
+
+    /// Serialize the MTP head's bf16 weights keyed with the on-disk `mtp.`
+    /// prefix.
+    ///
+    /// Returns a SUPERSET of the keys the loader requires
+    /// (`persistence::missing_mtp_required_weights` /
+    /// `mtp_drafter::missing_required_mtp_keys`): every top-level norm + fc
+    /// and, per MTP layer, the four attention projections, q/k/v norms, the
+    /// three dense-MLP projections, and the two layer norms. Mirrors the
+    /// per-layer Full-attention + Standard-MLP serialization branch in
+    /// `Qwen35Inner::save_model_sync`.
+    ///
+    /// DENSE-ONLY: callers MUST gate on `!has_quantized_weights()` first —
+    /// this emits `Linear::get_weight()` (the dense slot), which is only
+    /// faithful for a bf16 head. Attention biases are intentionally omitted
+    /// (the loader does not require them, and the surrounding `save_model_sync`
+    /// likewise never serializes attention biases for the base layers).
+    pub fn get_parameters(&self) -> HashMap<String, MxArray> {
+        let mut params = HashMap::new();
+
+        // Top-level norms + fc projection.
+        params.insert(
+            "mtp.pre_fc_norm_hidden.weight".to_string(),
+            self.pre_fc_norm_hidden.get_weight(),
+        );
+        params.insert(
+            "mtp.pre_fc_norm_embedding.weight".to_string(),
+            self.pre_fc_norm_embedding.get_weight(),
+        );
+        params.insert("mtp.norm.weight".to_string(), self.norm.get_weight());
+        params.insert("mtp.fc.weight".to_string(), self.fc.get_weight());
+
+        // Per-MTP-layer weights. MTP layers are full-attention + dense MLP
+        // (enforced in `new`); the loader's required-key set is exactly
+        // these `.weight` tensors.
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("mtp.layers.{i}");
+            if let AttentionType::Full(attn) = &layer.attn {
+                params.insert(
+                    format!("{prefix}.self_attn.q_proj.weight"),
+                    attn.get_q_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.k_proj.weight"),
+                    attn.get_k_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.v_proj.weight"),
+                    attn.get_v_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.o_proj.weight"),
+                    attn.get_o_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    attn.get_q_norm_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    attn.get_k_norm_weight(),
+                );
+            }
+            params.insert(
+                format!("{prefix}.mlp.gate_proj.weight"),
+                layer.mlp.get_gate_proj_weight(),
+            );
+            params.insert(
+                format!("{prefix}.mlp.up_proj.weight"),
+                layer.mlp.get_up_proj_weight(),
+            );
+            params.insert(
+                format!("{prefix}.mlp.down_proj.weight"),
+                layer.mlp.get_down_proj_weight(),
+            );
+            params.insert(
+                format!("{prefix}.input_layernorm.weight"),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        params
+    }
 }
 
 #[cfg(test)]
@@ -549,6 +670,38 @@ mod tests {
                 "MTP fresh_caches must be FullAttention slots"
             );
         }
+    }
+
+    /// Contract guard: `get_parameters()` must emit a SUPERSET of every key
+    /// the loader requires for a dense MTP head. We compare against the
+    /// shared `mtp_drafter::missing_required_mtp_keys` (the single source of
+    /// truth used by the drafter-merge gate and the MoE post-sanitize gate),
+    /// so the save key set can never silently drift below what load needs —
+    /// the exact bug this fix closes (`save_model_sync` previously emitted
+    /// NO mtp.* keys, disabling speculative decode on reload).
+    #[test]
+    fn get_parameters_is_superset_of_required_keys() {
+        use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};
+
+        let Some((mtp, cfg)) = build_mtp_or_skip("get_parameters_is_superset_of_required_keys")
+        else {
+            return;
+        };
+
+        let params = mtp.get_parameters();
+        let missing =
+            missing_required_mtp_keys(&params, DrafterBodyVariant::Dense, cfg.n_mtp_layers);
+        assert!(
+            missing.is_empty(),
+            "get_parameters() must emit every loader-required dense MTP key; missing: {missing:?}"
+        );
+
+        // Sanity: a freshly-constructed (random-init) module is bf16, so the
+        // dense-only save path is permitted to serialize it.
+        assert!(
+            !mtp.has_quantized_weights(),
+            "a bf16-constructed MTP module must not report quantized weights"
+        );
     }
 
     #[test]

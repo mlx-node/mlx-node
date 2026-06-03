@@ -158,6 +158,19 @@ impl SparseMoeBlock {
         self.shared_expert_gate.get_weight()
     }
 
+    /// Whether any sub-projection (router gate, expert switch_mlp, shared
+    /// expert, or shared-expert gate) holds quantized weights.
+    ///
+    /// Used by the dense/bf16-only MTP save path to refuse serializing a
+    /// quantized MoE MTP layer's stale dense weights (see
+    /// `Qwen3_5MoeMTPModule::has_quantized_weights`).
+    pub fn is_quantized(&self) -> bool {
+        self.gate.is_quantized()
+            || self.switch_mlp.is_quantized()
+            || self.shared_expert.is_quantized()
+            || self.shared_expert_gate.is_quantized()
+    }
+
     // ========== Weight setters ==========
 
     pub fn set_gate_weight(&mut self, w: &MxArray) -> Result<()> {

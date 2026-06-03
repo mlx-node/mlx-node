@@ -572,6 +572,164 @@ impl Qwen3_5MoeMTPModule {
 
         Ok(())
     }
+
+    /// Whether the MoE MTP head holds ANY quantized linear (fc, attention
+    /// projection, dense MLP, or MoE expert/router/shared-expert weights).
+    ///
+    /// `save_model_sync` is dense/bf16-only: it serializes the dense
+    /// `get_weight()` slot and NaN-validates via `to_float32()`. For a
+    /// quantized MTP head that dense slot is not a faithful bf16 copy of the
+    /// quantized payload (packed uint32 for `QuantizedLinear`s, a lossy
+    /// dequant for the `fc` `nn::Linear`), so emitting it would masquerade as
+    /// a valid bf16 head on reload — strictly worse than dropping it. The save
+    /// path calls this to skip MTP serialization (with a warning) when any
+    /// sub-linear is quantized. `mtp_weights_loaded` alone does not
+    /// distinguish quantized vs bf16.
+    pub fn has_quantized_weights(&self) -> bool {
+        if self.fc.is_quantized() {
+            return true;
+        }
+        self.layers.iter().any(|layer| {
+            let attn_quantized = match &layer.attn {
+                AttentionType::Full(a) => a.is_quantized(),
+                // MTP layers are full-attention only (enforced in `new`);
+                // treat an unexpected Linear conservatively as "quantized"
+                // so the save path drops rather than emits garbage.
+                AttentionType::Linear(_) => true,
+            };
+            let mlp_quantized = match &layer.mlp {
+                MLPType::Dense(mlp) => mlp.is_quantized(),
+                MLPType::MoE(moe) => moe.is_quantized(),
+            };
+            attn_quantized || mlp_quantized
+        })
+    }
+
+    /// Serialize the MoE MTP head's bf16 weights keyed with the on-disk
+    /// `mtp.` prefix.
+    ///
+    /// Returns a SUPERSET of the keys the loader requires
+    /// (`mtp_drafter::missing_required_mtp_keys` with
+    /// `DrafterBodyVariant::Moe`): every top-level norm + fc and, per MTP
+    /// layer, the four attention projections, q/k/v norms, the two layer
+    /// norms, and the MLP weights — dense (`mlp.{gate,up,down}_proj`) or MoE
+    /// (`mlp.gate` + `mlp.switch_mlp.{gate,up,down}_proj` + shared expert)
+    /// matching the layer's actual flavor (which mirrors the main model at
+    /// `fa_idx`). Mirrors the per-layer serialization branch in
+    /// `Qwen3_5MoeModel::save_model_sync`.
+    ///
+    /// DENSE-ONLY: callers MUST gate on `!has_quantized_weights()` first.
+    /// Attention biases are intentionally omitted (the loader does not
+    /// require them, matching `save_model_sync` for the base layers).
+    pub fn get_parameters(&self) -> HashMap<String, MxArray> {
+        let mut params = HashMap::new();
+
+        // Top-level norms + fc projection.
+        params.insert(
+            "mtp.pre_fc_norm_hidden.weight".to_string(),
+            self.pre_fc_norm_hidden.get_weight(),
+        );
+        params.insert(
+            "mtp.pre_fc_norm_embedding.weight".to_string(),
+            self.pre_fc_norm_embedding.get_weight(),
+        );
+        params.insert("mtp.norm.weight".to_string(), self.norm.get_weight());
+        params.insert("mtp.fc.weight".to_string(), self.fc.get_weight());
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("mtp.layers.{i}");
+            if let AttentionType::Full(attn) = &layer.attn {
+                params.insert(
+                    format!("{prefix}.self_attn.q_proj.weight"),
+                    attn.get_q_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.k_proj.weight"),
+                    attn.get_k_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.v_proj.weight"),
+                    attn.get_v_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.o_proj.weight"),
+                    attn.get_o_proj_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.q_norm.weight"),
+                    attn.get_q_norm_weight(),
+                );
+                params.insert(
+                    format!("{prefix}.self_attn.k_norm.weight"),
+                    attn.get_k_norm_weight(),
+                );
+            }
+
+            match &layer.mlp {
+                MLPType::Dense(mlp) => {
+                    params.insert(
+                        format!("{prefix}.mlp.gate_proj.weight"),
+                        mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.up_proj.weight"),
+                        mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.down_proj.weight"),
+                        mlp.get_down_proj_weight(),
+                    );
+                }
+                MLPType::MoE(moe) => {
+                    // Router gate.
+                    params.insert(format!("{prefix}.mlp.gate.weight"), moe.get_gate_weight());
+                    // Expert switch_mlp 3D projections.
+                    let switch_mlp = moe.get_switch_mlp();
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.gate_proj.weight"),
+                        switch_mlp.get_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.up_proj.weight"),
+                        switch_mlp.get_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.switch_mlp.down_proj.weight"),
+                        switch_mlp.get_down_proj_weight(),
+                    );
+                    // Shared expert dense MLP.
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                        moe.get_shared_expert_gate_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                        moe.get_shared_expert_up_proj_weight(),
+                    );
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                        moe.get_shared_expert_down_proj_weight(),
+                    );
+                    // Shared expert gate.
+                    params.insert(
+                        format!("{prefix}.mlp.shared_expert_gate.weight"),
+                        moe.get_shared_expert_gate_weight(),
+                    );
+                }
+            }
+
+            params.insert(
+                format!("{prefix}.input_layernorm.weight"),
+                layer.get_input_layernorm_weight(),
+            );
+            params.insert(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                layer.get_post_attention_layernorm_weight(),
+            );
+        }
+
+        params
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +871,37 @@ mod tests {
                 "MTP fresh_caches must be FullAttention slots"
             );
         }
+    }
+
+    /// Contract guard: `get_parameters()` must emit a SUPERSET of every key
+    /// the MoE loader requires for an MTP head. The MoE post-sanitize gate
+    /// (`qwen3_5_moe/persistence.rs`) calls `missing_required_mtp_keys(..,
+    /// DrafterBodyVariant::Moe, ..)`; we assert against that same shared
+    /// source of truth so save can never drift below what load needs. With
+    /// the tiny config (decoder_sparse_step=1) the MTP layer is MoE-flavored,
+    /// so this also locks the `switch_mlp.*` + `mlp.gate` MoE MLP keys.
+    #[test]
+    fn get_parameters_is_superset_of_required_keys() {
+        use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};
+
+        let Some((mtp, cfg)) = build_mtp_or_skip("get_parameters_is_superset_of_required_keys")
+        else {
+            return;
+        };
+
+        let params = mtp.get_parameters();
+        let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, cfg.n_mtp_layers);
+        assert!(
+            missing.is_empty(),
+            "get_parameters() must emit every loader-required MoE MTP key; missing: {missing:?}"
+        );
+
+        // Sanity: a freshly-constructed (random-init) module is bf16, so the
+        // dense-only save path is permitted to serialize it.
+        assert!(
+            !mtp.has_quantized_weights(),
+            "a bf16-constructed MoE MTP module must not report quantized weights"
+        );
     }
 
     #[test]

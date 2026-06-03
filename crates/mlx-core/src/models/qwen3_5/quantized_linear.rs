@@ -82,6 +82,15 @@ impl LinearProj {
             LinearProj::Quantized(ql) => ql.get_weight().clone(),
         }
     }
+
+    /// Whether this projection holds a quantized backend.
+    ///
+    /// Used by the dense/bf16-only `save_model_sync` MTP path to refuse
+    /// emitting a quantized projection's stale dense `weight` as if it were
+    /// a valid bf16 tensor (see `Qwen3_5MTPModule::has_quantized_weights`).
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, LinearProj::Quantized(_))
+    }
 }
 
 /// An MLP that can be either standard or quantized.
@@ -132,6 +141,15 @@ impl MLPVariant {
             MLPVariant::Standard(mlp) => mlp.get_down_proj_weight(),
             MLPVariant::Quantized { down_proj, .. } => down_proj.get_weight().clone(),
         }
+    }
+
+    /// Whether this MLP holds a quantized backend.
+    ///
+    /// Used by the dense/bf16-only `save_model_sync` MTP path to refuse
+    /// emitting a quantized MLP's stale dense weights (see
+    /// `Qwen3_5MTPModule::has_quantized_weights`).
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, MLPVariant::Quantized { .. })
     }
 
     pub fn set_gate_proj_weight(&mut self, w: &MxArray) -> Result<()> {

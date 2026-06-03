@@ -666,4 +666,17 @@ impl Qwen3_5Attention {
     pub fn get_k_norm_weight(&self) -> MxArray {
         self.k_norm.get_weight()
     }
+
+    /// Whether any of the q/k/v/o projections hold quantized weights.
+    ///
+    /// Used by the dense/bf16-only MTP save path to detect a quantized MTP
+    /// head (loaded from a `--q-mtp all`/`cyankiwi` checkpoint) and refuse
+    /// to serialize stale dense weights (see
+    /// `Qwen3_5MTPModule::has_quantized_weights`).
+    pub fn is_quantized(&self) -> bool {
+        self.q_proj.is_quantized()
+            || self.k_proj.is_quantized()
+            || self.v_proj.is_quantized()
+            || self.o_proj.is_quantized()
+    }
 }

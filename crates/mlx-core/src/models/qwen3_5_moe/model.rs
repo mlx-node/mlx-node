@@ -6004,6 +6004,33 @@ impl Qwen35MoeInner {
             params.extend(vision_params);
         }
 
+        // Multi-Token Prediction head. `config.n_mtp_layers` round-trips
+        // through config.json, so a reloaded checkpoint reconstructs the MTP
+        // module from config and expects the `mtp.*` tensors present —
+        // without this block the loader finds them absent, sets
+        // `mtp_weights_loaded = false`, and silently disables speculative
+        // decode. The `mtp_weights_loaded` guard is essential: `mtp.is_some()`
+        // alone would serialize a random-init module (constructed from config
+        // even when no weights were loaded).
+        if self.mtp_weights_loaded
+            && let Some(ref mtp) = self.mtp
+        {
+            // `save_model_sync` is dense/bf16-only. A quantized MTP head's
+            // dense slot is not a faithful bf16 copy of the quantized payload
+            // (packed uint32 for the per-layer linears, a lossy dequant for
+            // `fc`) — emitting it would masquerade as a valid bf16 head on
+            // reload, strictly worse than the clean-drop behavior. Skip + warn.
+            if mtp.has_quantized_weights() {
+                warn!(
+                    "Skipping MTP head serialization: the loaded MTP weights are quantized and \
+                     save_model_sync is dense/bf16-only. The reloaded checkpoint will run \
+                     autoregressive-only (no speculative MTP)."
+                );
+            } else {
+                params.extend(mtp.get_parameters());
+            }
+        }
+
         // Validate all parameters for NaN/Inf before writing to disk
         for (name, param) in params.iter() {
             let data = param.to_float32()?;
