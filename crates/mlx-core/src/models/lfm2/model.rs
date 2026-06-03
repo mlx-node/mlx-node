@@ -1695,6 +1695,23 @@ impl Lfm2Inner {
                         .rollback_last_tokens(1)
                         .map_err(Error::from_reason)?;
                     st.cpp_session_ready = false;
+                    // The rest of this turn runs pure-Rust eager paged decode
+                    // (`run_paged_decode_step` touches none of the C++ compiled
+                    // paged globals), so the seeded compiled-paged session is now
+                    // dead. Tear it down and release the process-wide locks NOW
+                    // instead of pinning them for the whole generation (they
+                    // otherwise block weight registration `.write()` / other
+                    // compiled startups `.lock()`).
+                    //
+                    // ORDER IS LOAD-BEARING (mirrors the struct field drop order,
+                    // see `Lfm2PagedCompiledState`): drop the reset guard FIRST so
+                    // `mlx_lfm2_paged_reset()` runs WHILE the lifecycle mutex +
+                    // weight read lock are STILL held; only THEN release the locks.
+                    // After this all three guards are None, so the struct's
+                    // eventual drop is a no-op (no double reset / double release).
+                    drop(st._paged_reset_guard.take());
+                    st._weight_guard = None;
+                    st._compiled_lock = None;
                     // Re-run this token through the pure-Rust paged decode
                     // (re-records the token on the rolled-back cursor).
                     self.run_paged_decode_step(token_id)?.squeeze(Some(&[1]))
