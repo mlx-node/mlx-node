@@ -38,6 +38,12 @@ import {
   type PageSeo,
 } from '../demo/lib/seo-metadata';
 
+// The real SPA layout shell — rendered statically around each body so the
+// prerendered HTML matches the SPA's chrome (header + sidebar + centered,
+// padded, scrollable reading column) instead of dumping the bare body
+// full-width. It is SSR-safe (only a Button + icons + the chapter registry).
+import { LessonLayout } from '../demo/learn/LessonLayout';
+
 // Mirror of the id->body import block in demo/routes/chapters.$chapterId.tsx.
 import { OverviewChapterBody } from '../demo/learn/chapters/00-overview';
 import { TokenizationChapterBody } from '../demo/learn/chapters/01-tokenization';
@@ -77,6 +83,20 @@ const BODIES: Record<string, React.ComponentType> = {
   'post-training': PostTrainingChapterBody,
   architecture: ArchitectureChapterBody,
 };
+
+// Chapters whose interactive content lives inline in the body — they have no
+// right-hand "Try it now" column. Mirror of demo/routes/chapters.$chapterId.tsx
+// (the route renders no demoPanel for these three).
+const PANEL_LESS = new Set(['overview', 'post-training', 'architecture']);
+const noop = (): void => {};
+// Static stand-in for the live demo panel so panel chapters keep their
+// 3-column grid (hence the same reading-column width) in the pre-JS HTML; the
+// SPA swaps in the real consent layer / demo on boot via createRoot.
+const TRY_IT_PLACEHOLDER = (
+  <div className="rounded-lg border border-border bg-card/40 p-6 text-sm text-muted-foreground">
+    Loading the interactive demo…
+  </div>
+);
 
 /** HTML-attribute / text escape. */
 function esc(s: string): string {
@@ -271,20 +291,35 @@ void (async function main() {
   // 1) Per-chapter pages.
   for (const c of CHAPTERS) {
     const Body = BODIES[c.id];
-    const bodyHtml = renderToString(
+    // Render the body inside the REAL LessonLayout (header + sidebar + centered,
+    // padded, scrollable reading column) so the pre-JS HTML matches the SPA
+    // instead of dumping the bare body full-width. Handlers are no-ops: the SPA
+    // boots with createRoot and REPLACES this subtree, so they back only the
+    // brief pre-JS view + crawlers. Panel chapters get a placeholder so their
+    // 3-column reading-column width matches pre-JS↔post-JS.
+    const rootHtml = renderToString(
       <RouterContextProvider router={router}>
-        <Body />
+        <LessonLayout
+          current={c}
+          wideBody={c.id === 'architecture'}
+          tryItPanel={PANEL_LESS.has(c.id) ? null : TRY_IT_PLACEHOLDER}
+          onOpenChapter={noop}
+          onBackToIndex={noop}
+          onOpenFreeChat={noop}
+        >
+          <Body />
+        </LessonLayout>
       </RouterContextProvider>,
     );
-    if (bodyHtml.trim().length < 50) {
+    if (rootHtml.trim().length < 50) {
       throw new Error(
-        `prerender: chapter "${c.id}" rendered an empty/too-small body (${bodyHtml.length} chars) — refusing to write.`,
+        `prerender: chapter "${c.id}" rendered an empty/too-small body (${rootHtml.length} chars) — refusing to write.`,
       );
     }
 
     const seo = getChapterSeo(c);
     const head = buildHead(seo, chapterJsonLd(c), assetTags);
-    const page = composePage(shellHtml, head, bodyHtml);
+    const page = composePage(shellHtml, head, rootHtml);
 
     const outDir = path.join(distClient, 'chapters', c.id);
     fs.mkdirSync(outDir, { recursive: true });
