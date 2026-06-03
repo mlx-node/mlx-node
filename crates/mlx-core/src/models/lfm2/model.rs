@@ -1513,7 +1513,7 @@ impl Lfm2Inner {
             );
             use_cpp_pre = false;
         }
-        let _compiled_lock = if use_cpp_pre {
+        let mut _compiled_lock = if use_cpp_pre {
             Some(
                 crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
                     .lock()
@@ -1572,6 +1572,19 @@ impl Lfm2Inner {
         } else {
             false
         };
+
+        // When the compiled-paged session did NOT come up (model_id eviction,
+        // block_size mismatch, or seed failure), the decode loop runs the pure-Rust
+        // eager paged path, which touches none of the C++ compiled globals. Holding
+        // the cross-family lifecycle mutex / weight read lock across that whole loop
+        // is needless and blocks weight registration (.write()) and other compiled
+        // startups (.lock()) for the entire generation. Drop them now. Safe because
+        // cpp_session_ready==false here implies _paged_reset_guard is None (no seed
+        // ran), so the reset-while-locks-held drop-order invariant is vacuous.
+        if !cpp_session_ready {
+            _weight_guard = None;
+            _compiled_lock = None;
+        }
 
         // RAII guard: resets the compiled-PAGED C++ globals
         // (`mlx_lfm2_paged_reset`) on EVERY exit path — including a `?`
@@ -2106,17 +2119,7 @@ impl Lfm2Inner {
     /// for full-attention layers (paged_idx counts only those layers in
     /// their original order) and `Conv` for conv layers.
     fn compute_layer_kinds(&self) -> Vec<Lfm2LayerKind> {
-        let mut kinds = Vec::with_capacity(self.layers.len());
-        let mut paged_idx: u32 = 0;
-        for i in 0..self.layers.len() {
-            if self.config.is_attention_layer(i) {
-                kinds.push(Lfm2LayerKind::FullAttention { paged_idx });
-                paged_idx += 1;
-            } else {
-                kinds.push(Lfm2LayerKind::Conv);
-            }
-        }
-        kinds
+        compute_layer_kinds_for(&self.config, self.layers.len())
     }
 
     /// Block-paged streaming variant of [`Self::chat_stream_sync_core`].
