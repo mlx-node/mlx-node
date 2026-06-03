@@ -2363,6 +2363,12 @@ unsafe extern "C-unwind" {
         num_experts_per_tok: i32,
         norm_topk_prob: i32,
         decoder_sparse_step: i32,
+        // Precomputed eager-path MLP flavor for the MTP layer
+        // (`is_moe_layer(fa_idx)` → 1 MoE / 0 dense). Honors
+        // `mlp_only_layers` + the sparse-step modulo, which the FFI side
+        // cannot reconstruct — keeps the compiled `mtp.layers.*.mlp.*`
+        // dispatch in lock-step with the Rust loader.
+        mtp_layer_is_moe: i32,
     ) -> i32;
 
     /// One MoE MTP draft step. `prev_hidden` and `prev_emb` are both

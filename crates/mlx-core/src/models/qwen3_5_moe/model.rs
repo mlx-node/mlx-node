@@ -8425,6 +8425,10 @@ pub(super) fn init_moe_mtp_compiled_from_main(
             config.num_experts_per_tok,
             if config.norm_topk_prob { 1 } else { 0 },
             config.decoder_sparse_step,
+            // Pass the eager-path MLP flavor so the compiled path honors
+            // `mlp_only_layers` + the sparse-step modulo (which never cross
+            // the FFI boundary) and can never disagree with the loader.
+            mtp_compiled_layer_is_moe_flag(config),
         )
     };
 
@@ -8444,6 +8448,113 @@ pub(super) fn init_moe_mtp_compiled_from_main(
     }
 
     Ok(())
+}
+
+/// The `mtp_layer_is_moe` flag passed to the compiled MTP FFI init — the
+/// eager-path flavor decision (`is_moe_layer(fa_idx)` via
+/// [`Qwen3_5MoeMTPModule::mtp_mlp_variant`]), so the compiled dispatch
+/// honors `mlp_only_layers` + the sparse-step modulo identically to the
+/// Rust loader. Returns `1` for a MoE-flavored MTP layer, `0` for dense.
+fn mtp_compiled_layer_is_moe_flag(config: &Qwen3_5MoeConfig) -> i32 {
+    if Qwen3_5MoeMTPModule::mtp_mlp_variant(config)
+        == crate::models::mtp_drafter::DrafterBodyVariant::Moe
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod mtp_compiled_flavor_flag_tests {
+    //! Pure (MLX-free) coverage for the `mtp_layer_is_moe` flag that feeds
+    //! the compiled MoE-MTP FFI init. The flag MUST mirror the eager-path
+    //! `is_moe_layer(fa_idx)` decision so the compiled `mtp.layers.*.mlp.*`
+    //! key dispatch honors `mlp_only_layers` + the sparse-step modulo
+    //! identically — the divergence this fix closes.
+
+    use super::*;
+    use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+
+    /// Tiny MoE config (fa_idx = 3, full-attention, decoder_sparse_step = 1
+    /// → MoE-flavored MTP layer). `n_mtp_layers = 1` so an MTP head exists.
+    fn tiny_moe_mtp_cfg() -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 8,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: Some(64),
+            paged_block_size: Some(16),
+            use_block_paged_cache: None,
+            n_mtp_layers: 1,
+        }
+    }
+
+    #[test]
+    fn flag_is_one_for_moe_flavored_mtp_layer() {
+        let cfg = tiny_moe_mtp_cfg();
+        let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+        // Sanity: the canonical config really resolves to a MoE-flavored
+        // MTP layer (decoder_sparse_step = 1 divides everything).
+        assert!(
+            cfg.is_moe_layer(fa_idx),
+            "tiny config must be MoE-flavored at fa_idx"
+        );
+        assert_eq!(
+            mtp_compiled_layer_is_moe_flag(&cfg),
+            1,
+            "MoE-flavored MTP layer must pass mtp_layer_is_moe = 1 to the FFI"
+        );
+    }
+
+    #[test]
+    fn flag_is_zero_for_dense_flavored_mtp_layer_via_mlp_only_layers() {
+        let mut cfg = tiny_moe_mtp_cfg();
+        let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+        // Force the MTP layer dense by listing fa_idx in mlp_only_layers —
+        // exactly the case the compiled path's old num_experts/sparse-step
+        // check could not see (it stayed MoE → key mismatch).
+        cfg.mlp_only_layers = Some(vec![fa_idx as i32]);
+        assert!(
+            !cfg.is_linear_layer(fa_idx),
+            "fa_idx must stay full-attention so the MTP layer is constructible"
+        );
+        assert!(
+            !cfg.is_moe_layer(fa_idx),
+            "mlp_only_layers override must make fa_idx dense-flavored"
+        );
+        assert_eq!(
+            mtp_compiled_layer_is_moe_flag(&cfg),
+            0,
+            "dense-flavored MTP layer must pass mtp_layer_is_moe = 0 to the FFI"
+        );
+    }
 }
 
 /// One MoE MTP draft step on the compiled path.

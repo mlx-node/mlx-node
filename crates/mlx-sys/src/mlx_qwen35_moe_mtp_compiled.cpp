@@ -133,7 +133,12 @@ struct MoeConfigMtp : BaseConfig {
   bool norm_topk_prob;
   int decoder_sparse_step;
   int n_mtp_layers;
-  int mtp_fa_layer_idx;  // full_attention_interval - 1 (clamped at 0).
+  // full_attention_interval - 1 (clamped at 0). Now write-only — the two
+  // former readers (`is_moe_layer_mtp(fa_idx, cfg)`) were replaced by
+  // `mtp_layer_is_moe` below. Kept for forward compatibility / introspection,
+  // mirroring the dense `mlx_qwen35_mtp_compiled.cpp` sibling field.
+  int mtp_fa_layer_idx;
+  bool mtp_layer_is_moe;  // precomputed by the Rust loader's is_moe_layer(fa_idx) — honors mlp_only_layers + the sparse-step modulo, which the FFI-side cannot see.
 };
 
 // Per-(MTP-layer) quant info — mirrors the structs in `mlx_qwen35_moe.cpp`
@@ -420,20 +425,14 @@ array dense_mlp_fn_pfx(
 }
 
 // =====================================================================
-// is_moe_layer — verbatim copy of the predicate in mlx_qwen35_moe.cpp.
-// `mlp_only_layers` is NOT plumbed through to the MTP path because the
-// dispatch is for a SINGLE fixed layer index (fa_idx) and the Rust loader
-// `Qwen3_5MoeMTPModule::new` already validates that fa_idx is not a
-// linear-attention layer. We honor a `mlp_only` override at init time by
-// flipping the per-MTP-layer quant info accordingly (the main path's set
-// is keyed by main-layer index, not MTP-layer index — they don't overlap).
-// =====================================================================
-bool is_moe_layer_mtp(int layer_idx, const MoeConfigMtp& cfg) {
-  if (cfg.num_experts <= 0) return false;
-  if (cfg.decoder_sparse_step <= 0) return false;
-  return ((layer_idx + 1) % cfg.decoder_sparse_step) == 0;
-}
-
+// MTP MLP flavor (MoE vs dense) is NOT recomputed here. The Rust eager
+// loader is the source of truth: it derives the MTP layer's flavor from
+// `is_moe_layer(fa_idx)`, which honors `mlp_only_layers` + the sparse-step
+// modulo — neither of which crosses the FFI boundary. That precomputed
+// bool is passed through `mlx_qwen35_moe_mtp_compiled_init_from_main` and
+// stored as `MoeConfigMtp.mtp_layer_is_moe`, so the compiled dispatch and
+// the eager path can never disagree on the `mtp.layers.{j}.mlp.*` key
+// schema (dense `mlp.{gate,up,down}_proj` vs MoE `switch_mlp.* + gate`).
 // =====================================================================
 // Per-MTP-layer quant detection.
 //
@@ -454,8 +453,7 @@ void detect_mtp_layer_quants(const MoeConfigMtp& cfg) {
   g_mtp_dense_quant.clear();
   g_mtp_dense_quant.reserve(cfg.n_mtp_layers);
 
-  int fa_idx = cfg.mtp_fa_layer_idx;
-  bool moe = is_moe_layer_mtp(fa_idx, cfg);
+  bool moe = cfg.mtp_layer_is_moe;
 
   for (int j = 0; j < cfg.n_mtp_layers; j++) {
     std::string pfx = "mtp.layers." + std::to_string(j) + ".mlp.";
@@ -559,8 +557,7 @@ static std::vector<array> moe_mtp_draft_decode_fn(const std::vector<array>& inpu
     new_caches.push_back(zeros({}, mlx::core::bfloat16));
   }
 
-  const int fa_idx = cfg.mtp_fa_layer_idx;
-  const bool moe = is_moe_layer_mtp(fa_idx, cfg);
+  const bool moe = cfg.mtp_layer_is_moe;
 
   for (int j = 0; j < cfg.n_mtp_layers; j++) {
     std::string lp = "mtp.layers." + std::to_string(j);
@@ -737,7 +734,8 @@ int32_t mlx_qwen35_moe_mtp_compiled_init_from_main(
     int num_experts,
     int num_experts_per_tok,
     int norm_topk_prob,
-    int decoder_sparse_step
+    int decoder_sparse_step,
+    int mtp_layer_is_moe
 ) {
   try {
     if (n_mtp_layers <= 0) {
@@ -785,6 +783,7 @@ int32_t mlx_qwen35_moe_mtp_compiled_init_from_main(
     g_mtp_config.decoder_sparse_step     = decoder_sparse_step;
     g_mtp_config.n_mtp_layers            = n_mtp_layers;
     g_mtp_config.mtp_fa_layer_idx        = std::max(full_attention_interval - 1, 0);
+    g_mtp_config.mtp_layer_is_moe        = (mtp_layer_is_moe != 0);
 
     g_mtp_compiled_caches.clear();
     g_mtp_compiled_caches.reserve(n_mtp_layers * 2);
