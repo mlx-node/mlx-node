@@ -3526,16 +3526,22 @@ macro_rules! decode_loop_mtp {
                         &mut $ds, $tok.inner(), initial_token_id, &$gen, $slen,
                     );
                     $slen += token_text.len();
-                    $cb.call(
-                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
-                            text: token_text, done: false, finish_reason: None,
-                            tool_calls: None, thinking: None, num_tokens: None,
-                            prompt_tokens: None, reasoning_tokens: None,
-                            raw_text: None, cached_tokens: None, performance: None,
-                            is_reasoning: Some(_is_reasoning),
-                        }),
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    // Suppress reasoning (<think>…</think>) deltas from the stream
+                    // when include_reasoning == false, matching the AR decode loop.
+                    // Detokenize + length-advance stay OUTSIDE this gate so
+                    // DecodeStream sees every token.
+                    if $p.include_reasoning || !_is_reasoning {
+                        $cb.call(
+                            Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                                text: token_text, done: false, finish_reason: None,
+                                tool_calls: None, thinking: None, num_tokens: None,
+                                prompt_tokens: None, reasoning_tokens: None,
+                                raw_text: None, cached_tokens: None, performance: None,
+                                is_reasoning: Some(_is_reasoning),
+                            }),
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
                 }
             )?
             $profiler.step();
@@ -3675,16 +3681,21 @@ macro_rules! decode_loop_mtp {
                         &mut $ds, $tok.inner(), token_id, &$gen, $slen,
                     );
                     $slen += token_text.len();
-                    $cb.call(
-                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
-                            text: token_text, done: false, finish_reason: None,
-                            tool_calls: None, thinking: None, num_tokens: None,
-                            prompt_tokens: None, reasoning_tokens: None,
-                            raw_text: None, cached_tokens: None, performance: None,
-                            is_reasoning: Some(_is_reasoning),
-                        }),
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    // Suppress reasoning deltas when include_reasoning == false,
+                    // matching the AR decode loop (detokenize + length-advance
+                    // above stay outside the gate so DecodeStream sees every token).
+                    if $p.include_reasoning || !_is_reasoning {
+                        $cb.call(
+                            Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                                text: token_text, done: false, finish_reason: None,
+                                tool_calls: None, thinking: None, num_tokens: None,
+                                prompt_tokens: None, reasoning_tokens: None,
+                                raw_text: None, cached_tokens: None, performance: None,
+                                is_reasoning: Some(_is_reasoning),
+                            }),
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
                 )?
 
                 if token_id == $eos {
@@ -3972,16 +3983,21 @@ macro_rules! decode_loop_mtp {
                         &mut $ds, $tok.inner(), tok_id, &$gen, $slen,
                     );
                     $slen += token_text.len();
-                    $cb.call(
-                        Ok($crate::models::qwen3_5::model::ChatStreamChunk {
-                            text: token_text, done: false, finish_reason: None,
-                            tool_calls: None, thinking: None, num_tokens: None,
-                            prompt_tokens: None, reasoning_tokens: None,
-                            raw_text: None, cached_tokens: None, performance: None,
-                            is_reasoning: Some(_is_reasoning),
-                        }),
-                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
-                    );
+                    // Suppress reasoning deltas when include_reasoning == false,
+                    // matching the AR decode loop (detokenize + length-advance
+                    // above stay outside the gate so DecodeStream sees every token).
+                    if $p.include_reasoning || !_is_reasoning {
+                        $cb.call(
+                            Ok($crate::models::qwen3_5::model::ChatStreamChunk {
+                                text: token_text, done: false, finish_reason: None,
+                                tool_calls: None, thinking: None, num_tokens: None,
+                                prompt_tokens: None, reasoning_tokens: None,
+                                raw_text: None, cached_tokens: None, performance: None,
+                                is_reasoning: Some(_is_reasoning),
+                            }),
+                            napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
                 )?
                 if tok_id == $eos {
                     $reason = String::from("stop");
