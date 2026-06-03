@@ -3411,6 +3411,21 @@ macro_rules! decode_loop_mtp {
         // the cache-clear cadence.
         let mut last_clear_at: usize = $gen.len();
 
+        // PARITY-FIX (budget): `$max` is the raw `max_new_tokens: i32`
+        // with no upstream clamp on the chat/MTP path, so it can be `0`
+        // or NEGATIVE (reachable via `ChatConfig.maxNewTokens` and
+        // `/v1/responses` `max_output_tokens`). AR's `decode_loop!` uses
+        // `for step in 0..$max` — an empty range for `$max <= 0` — and
+        // therefore emits 0 tokens. The MTP loop below compares
+        // `$gen.len()` against the budget via `as usize`; a NEGATIVE
+        // `$max` would wrap to a huge `usize` and never trip the length
+        // cap (effectively unbounded). Clamp negatives to 0 ONCE here
+        // and use this value for every budget comparison so MTP matches
+        // AR's "0 new tokens for a nonpositive budget" semantics. For
+        // `$max >= 1` this is numerically identical to `($max as usize)`
+        // ⇒ byte-for-byte identical behavior for valid budgets.
+        let max_as_usize: usize = ($max).max(0) as usize;
+
         // PARITY-FIX: emit the initial `$y` (sampled from the prefill's
         // last logits BEFORE this macro was entered) before Step A's
         // first iteration. AR's `decode_loop!` macro emits its input
@@ -3425,7 +3440,13 @@ macro_rules! decode_loop_mtp {
         // token participates identically. The stop checks (EOS,
         // length, cancel, repetition) run at the top of the loop body
         // below — they read `$gen` so the initial push is visible.
-        {
+        //
+        // Guarded on the budget: at macro entry `$gen` holds only
+        // generated tokens (0 here), so `$gen.len() < max_as_usize` is
+        // `0 < 0 == false` when `$max <= 0` ⇒ NO initial push, matching
+        // AR. For `$max >= 1` the guard is `0 < max` (true) ⇒ the push
+        // runs exactly as before.
+        if $gen.len() < max_as_usize {
             let _stream_ctx = $crate::stream::StreamContext::new($stream);
             $profiler.begin("extract");
             $y.eval();
@@ -3483,7 +3504,7 @@ macro_rules! decode_loop_mtp {
                 $reason = reason.to_string();
                 break;
             }
-            if $gen.len() >= ($max as usize) {
+            if $gen.len() >= max_as_usize {
                 if $reason.is_empty() { $reason = String::from("length"); }
                 break;
             }
@@ -3607,7 +3628,7 @@ macro_rules! decode_loop_mtp {
                     $reason = reason.to_string();
                     break;
                 }
-                if $gen.len() >= ($max as usize) {
+                if $gen.len() >= max_as_usize {
                     if $reason.is_empty() { $reason = String::from("length"); }
                     break;
                 }
@@ -3674,7 +3695,7 @@ macro_rules! decode_loop_mtp {
             // drafts. On full accept per cycle we emit D+1 tokens for
             // D draft steps + 1 verify (one fewer main forward than
             // pre-W6.5).
-            if $gen.len() >= ($max as usize) {
+            if $gen.len() >= max_as_usize {
                 if $reason.is_empty() { $reason = String::from("length"); }
                 break;
             }
@@ -3743,7 +3764,7 @@ macro_rules! decode_loop_mtp {
             // broke the loop otherwise). With `effective_depth =
             // remaining - 1` the verify writes exactly `remaining`
             // slots and the cycle emits at most `remaining` tokens.
-            let remaining: usize = ($max as usize).saturating_sub($gen.len());
+            let remaining: usize = max_as_usize.saturating_sub($gen.len());
             let cycle_depth: usize = cycle_depth.min(remaining.saturating_sub(1));
             if cycle_depth < 1 {
                 // Only 1 token of budget left — an MTP cycle would
@@ -3862,7 +3883,7 @@ macro_rules! decode_loop_mtp {
             let mut cycle_emitted: usize = 0;
             $profiler.begin("mtp_emit_loop");
             for tok_id in outcome.tokens.iter().copied() {
-                if $gen.len() >= ($max as usize) {
+                if $gen.len() >= max_as_usize {
                     if $reason.is_empty() { $reason = String::from("length"); }
                     hit_stop = true;
                     break;

@@ -689,3 +689,109 @@ async fn session_start_accepts_images_for_vlm() {
         result
     );
 }
+
+// ---------------------------------------------------------------------
+// Regression: nonpositive `max_new_tokens` budget → 0 generated tokens
+// on the MTP decode path, matching the AR `decode_loop!` semantics.
+// ---------------------------------------------------------------------
+//
+// The MTP decode macro (`decode_loop_mtp!` in `chat_common.rs`) used to
+// UNCONDITIONALLY push the prefill-seed token before its loop's length
+// check, so `maxNewTokens == 0` emitted ONE token where AR's
+// `for step in 0..max` emits ZERO. A NEGATIVE budget additionally wrapped
+// through `as usize` to an effectively unbounded cap, so only EOS /
+// repetition / cancellation could ever stop generation. The fix clamps
+// the budget (`($max).max(0) as usize`) once and guards the initial emit
+// on it, so MTP now matches AR: 0 new tokens for a nonpositive budget.
+//
+// This test exercises BOTH the MTP-enabled config (the regression) and
+// the AR baseline (the parity target). When `MLX_TEST_MODEL_PATH` points
+// at a checkpoint WITHOUT MTP weights, the MTP gate silently falls back
+// to AR; the assertion (`num_tokens == 0`) still holds, so the test stays
+// green either way. With an MTP-capable checkpoint it directly catches
+// the 1-vs-0 regression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
+async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!(
+            "skipping: MLX_TEST_MODEL_PATH unset (point it at e.g. \
+             ./.cache/models/qwen3.5-0.8b-mlx-bf16 with an MTP head)"
+        );
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // Build a config with an explicit MTP toggle and a given budget.
+    let cfg_with = |max_new_tokens: i32, enable_mtp: bool| ChatConfig {
+        enable_mtp: Some(enable_mtp),
+        ..chat_config_default(max_new_tokens)
+    };
+
+    // 1) AR baseline at budget 0: empty range → 0 tokens (the parity
+    //    target the MTP path must match).
+    let ar_zero = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(0, false)),
+        )
+        .await
+        .expect("AR max_new_tokens=0 chat_session_start failed");
+    println!(
+        "AR budget=0: num_tokens={} finish_reason={:?}",
+        ar_zero.num_tokens, ar_zero.finish_reason
+    );
+    assert_eq!(
+        ar_zero.num_tokens, 0,
+        "AR baseline must emit 0 tokens at max_new_tokens=0, got {}",
+        ar_zero.num_tokens
+    );
+
+    // 2) MTP path at budget 0: this is the regression. Before the fix the
+    //    unconditional prefill-seed push made this 1. It must now be 0.
+    let mtp_zero = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(0, true)),
+        )
+        .await
+        .expect("MTP max_new_tokens=0 chat_session_start failed");
+    println!(
+        "MTP budget=0: num_tokens={} finish_reason={:?}",
+        mtp_zero.num_tokens, mtp_zero.finish_reason
+    );
+    assert_eq!(
+        mtp_zero.num_tokens, 0,
+        "MTP path must emit 0 tokens at max_new_tokens=0 (matching AR), got {}",
+        mtp_zero.num_tokens
+    );
+
+    // 3) Negative budget on the MTP path: previously wrapped via `as
+    //    usize` to a huge cap → effectively unbounded. Must now clamp to
+    //    0 like AR's empty range.
+    let mtp_neg = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(-5, true)),
+        )
+        .await
+        .expect("MTP max_new_tokens=-5 chat_session_start failed");
+    println!(
+        "MTP budget=-5: num_tokens={} finish_reason={:?}",
+        mtp_neg.num_tokens, mtp_neg.finish_reason
+    );
+    assert_eq!(
+        mtp_neg.num_tokens, 0,
+        "MTP path must emit 0 tokens at a negative budget, got {}",
+        mtp_neg.num_tokens
+    );
+}
