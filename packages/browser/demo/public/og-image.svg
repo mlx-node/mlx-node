@@ -84,26 +84,26 @@
   <g transform="translate(104 162)">
     <rect width="452" height="45" rx="22.5" fill="url(#pill)" stroke="#F7CFE0" stroke-opacity="0.28"/>
     <circle cx="28" cy="22.5" r="5.5" fill="#F7CFE0"/>
-    <text x="48" y="29" font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" letter-spacing="4" fill="#F1E7F1" fill-opacity="0.86">MULTIMODAL AI · 100% LOCAL · WEBGPU</text>
+    <text x="48" y="29" font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" letter-spacing="4" fill="#F1E7F1" fill-opacity="0.86">REAL LLM · 100% LOCAL · WEBGPU</text>
   </g>
 
-  <text x="104" y="316" font-family="'Instrument Serif', Georgia, serif" font-size="92" font-style="italic" fill="url(#title)">Qwen 3.5 Vision</text>
-  <text x="108" y="388" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="31" font-weight="600" fill="#F7F2F5">MLX Browser</text>
-  <text x="108" y="434" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="25" fill="#D8D3DB" fill-opacity="0.88">Run a multimodal language model entirely in your browser.</text>
+  <text x="104" y="316" font-family="'Instrument Serif', Georgia, serif" font-size="92" font-style="italic" fill="url(#title)">How LLMs Work</text>
+  <text x="108" y="388" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="31" font-weight="600" fill="#F7F2F5">Interactive in-browser course</text>
+  <text x="108" y="434" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="25" fill="#D8D3DB" fill-opacity="0.88">Run a real 0.8B language model entirely in your browser.</text>
   <text x="108" y="471" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="25" fill="#D8D3DB" fill-opacity="0.72">No server, no API keys — powered by WebGPU.</text>
 
   <g font-family="'DM Mono', ui-monospace, SFMono-Regular, Menlo, monospace">
     <g transform="translate(108 542)">
-      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">VISION + LANGUAGE</text>
-      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">UNIFIED MULTIMODAL</text>
+      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">0.8B PARAMS</text>
+      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">QWEN3.5</text>
     </g>
     <g transform="translate(392 542)">
       <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">WEBGPU</text>
       <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">BROWSER NATIVE</text>
     </g>
     <g transform="translate(612 542)">
-      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">REASONING</text>
-      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">CODE · AGENTS · VISUAL</text>
+      <text font-size="19" font-weight="700" letter-spacing="2" fill="#FFF8EA">16 CHAPTERS</text>
+      <text y="32" font-size="15" letter-spacing="2.6" fill="#B9B0B8">INTERACTIVE COURSE</text>
     </g>
   </g>
 

@@ -42,13 +42,13 @@ export function Landing({
     <div className="overlay-screen">
       <DriftingLibrary />
       <div className="landing-content">
-        <div className="landing-tag">Multimodal AI · 100% Local · WebGPU</div>
+        <div className="landing-tag">Real LLM · 100% Local · WebGPU</div>
         <h1 className="landing-title">
-          Qwen 3.5 <em>Vision</em>
+          How LLMs <em>Work</em>
         </h1>
         <p className="landing-sub">
-          Run a multimodal vision-language model entirely in your browser. No server, no API keys — powered by{' '}
-          <code>@mlx-node/browser</code> and WebGPU.
+          Run a real 0.8B language model (Qwen3.5) entirely in your browser, then learn exactly how it works —
+          layer by layer. No server, no API keys — powered by <code>@mlx-node/browser</code> and WebGPU.
         </p>
 
         <div className="landing-void-ad" aria-label="Hosted on Void Platform">
@@ -59,16 +59,16 @@ export function Landing({
 
         <div className="landing-specs">
           <div className="spec">
-            <div className="spec-value">Vision + Language</div>
-            <div className="spec-label">Unified Multimodal</div>
+            <div className="spec-value">0.8B params</div>
+            <div className="spec-label">Qwen3.5 · runs live</div>
           </div>
           <div className="spec">
-            <div className="spec-value">201 Languages</div>
-            <div className="spec-label">Global Coverage</div>
+            <div className="spec-value">{CHAPTERS.length} chapters</div>
+            <div className="spec-label">Interactive course</div>
           </div>
           <div className="spec">
-            <div className="spec-value">Reasoning</div>
-            <div className="spec-label">Code · Agents · Visual</div>
+            <div className="spec-value">100% local</div>
+            <div className="spec-label">WebGPU · no server</div>
           </div>
         </div>
 
@@ -107,7 +107,7 @@ export function Landing({
         )}
       </div>
 
-      <img className="landing-mascot" src="/capybara.png" alt="Qwen capybara mascot" />
+      <img className="landing-mascot" src="/capybara.png" alt="Capybara mascot" />
 
       <div className="landing-footer">
         Built with <code>@mlx-node/browser</code>
