@@ -28,6 +28,21 @@ use super::config::Lfm2Config;
 use super::decoder_layer::{Lfm2DecoderLayer, Lfm2LayerKind};
 use super::layer_cache::Lfm2LayerCache;
 
+/// Whether the paged-prefill last-token slice optimization is enabled.
+///
+/// When ON (default), the eager paged prefill slices the residual stream to the
+/// final token BEFORE the output norm + `lm_head` projection, so the largest
+/// matmul only runs over the single row whose logits the caller consumes —
+/// byte-identical, since the discarded rows are never read and all cache writes
+/// already happened in the per-layer loop. Set `MLX_LFM2_DISABLE_LAST_TOKEN_SLICE`
+/// (any value) to fall back to the old "project full T, then slice" behavior for
+/// same-binary A/B baselining. The env var is read once on first call and cached;
+/// subsequent reads hit the `OnceLock` fast path.
+fn last_token_slice_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
+}
+
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
@@ -1923,14 +1938,32 @@ impl Lfm2Inner {
 
         // Output norm + lm_head. Tied path → `Embedding::as_linear` (packed
         // quantized matmul or dense `h @ weight^T`).
-        hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        //
+        // OPT (`MLX_LFM2_DISABLE_LAST_TOKEN_SLICE` unset, default ON): only the
+        // FINAL token's logits are ever consumed by the caller, yet the output
+        // norm + lm_head (vocab 65536 × hidden 2048 matmul) would otherwise run
+        // over the full `[1, T, hidden]` residual stream. Slice to the last row
+        // BEFORE the projection so the largest matmul does ~T× less work. This
+        // is byte-identical: every attention / conv cache write already happened
+        // in the per-layer loop above, and the discarded rows are never read.
+        // Setting the toggle reproduces the old "project full T, then slice"
+        // behavior for same-binary A/B baselining.
+        let proj_input = if last_token_slice_enabled() {
+            let seq_len_h = hidden_states.shape_at(1)?;
+            hidden_states.slice_axis(1, seq_len_h - 1, seq_len_h)?
+        } else {
+            hidden_states
+        };
+        let hidden_states = self.embedding_norm.forward(&proj_input)?;
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else {
             self.embed_tokens.as_linear(&hidden_states)?
         };
 
-        // Slice the last token's logits.
+        // Slice the last token's logits. When the opt is ON `logits` already has
+        // T=1, so this is a no-op slice; when OFF it picks the final row as
+        // before. Either way the returned shape is unchanged.
         let seq_len = logits.shape_at(1)?;
         let last = logits
             .slice_axis(1, seq_len - 1, seq_len)?
