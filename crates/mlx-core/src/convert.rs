@@ -1531,16 +1531,21 @@ fn write_mtp_drafter_dir(
         }
     }
 
-    // block_size = mtp_num_hidden_layers + 2. Prefer the config value; otherwise
-    // derive it from the count of distinct `mtp.layers.{N}` (after prefix strip
-    // the drafter keys are `layers.{N}...`).
+    // block_size = mtp_num_hidden_layers + 2. Prefer a VALID (> 0) config value;
+    // otherwise derive it from the count of distinct `mtp.layers.{N}` (after prefix
+    // strip the drafter keys are `layers.{N}...`). An explicit `0` in either config
+    // is treated as missing/stale and falls through to the tensor-derived count —
+    // a drafter always has >= 1 layer, so `0` would otherwise emit `block_size: 2`
+    // despite real `layers.{N}` blocks in the extracted weights.
     let mtp_num_hidden_layers = text_config
         .get("mtp_num_hidden_layers")
         .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
         .or_else(|| {
             source_config
                 .get("mtp_num_hidden_layers")
                 .and_then(|v| v.as_u64())
+                .filter(|&n| n > 0)
         })
         .unwrap_or_else(|| distinct_drafter_layer_count(drafter_tensors) as u64);
     let block_size = mtp_num_hidden_layers + 2;
@@ -6576,6 +6581,50 @@ mod tests {
         assert!(!reloaded.keys().any(|k| k.starts_with("mtp.")));
         let reloaded_fc = f32_vec(reloaded.get("fc.weight").unwrap());
         assert_eq!(reloaded_fc, inline_fc, "round-tripped fc.weight diverged");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An explicit `mtp_num_hidden_layers: 0` in the source config is stale/invalid
+    /// (a drafter always has >= 1 layer) and must NOT win over the tensor-derived
+    /// count: it should fall through and emit `block_size = distinct_layers(1) + 2`,
+    /// not the degenerate `block_size: 2`.
+    #[test]
+    fn split_drafter_block_size_ignores_zero_config() {
+        let mut weights = synthetic_split_weights();
+        let drafter = extract_mtp_drafter_tensors(&mut weights).unwrap();
+
+        // Source config explicitly says ZERO MTP layers (stale/wrong), in both
+        // the wrapper and the nested text_config.
+        let source_config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "mtp_num_hidden_layers": 0,
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 2,
+                "mtp_num_hidden_layers": 0,
+                "tie_word_embeddings": false,
+                "rms_norm_eps": 1e-6
+            }
+        });
+
+        let base = std::env::temp_dir().join(format!("mlx_split_test_zero_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let out_dir = base.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        write_mtp_drafter_dir(&out_dir, &base, &source_config, &drafter, false).unwrap();
+
+        let cfg: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out_dir.join("mtp-drafter/config.json")).unwrap(),
+        )
+        .unwrap();
+        // distinct_drafter_layer_count(synthetic) == 1 → block_size = 1 + 2 = 3.
+        assert_eq!(
+            cfg["block_size"], 3,
+            "explicit mtp_num_hidden_layers:0 must fall through to the tensor count, not emit block_size:2"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
