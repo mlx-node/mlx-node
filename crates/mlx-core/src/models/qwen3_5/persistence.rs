@@ -820,8 +820,9 @@ fn missing_mtp_required_weights(
     config: &Qwen3_5Config,
 ) -> Vec<String> {
     let mut missing = Vec::new();
+    // Norms are never quantized (`convert.rs::mtp_quant_decision` returns
+    // `Skip` for them), so a presence check is sufficient.
     for key in [
-        "mtp.fc.weight",
         "mtp.norm.weight",
         "mtp.pre_fc_norm_hidden.weight",
         "mtp.pre_fc_norm_embedding.weight",
@@ -830,6 +831,14 @@ fn missing_mtp_required_weights(
             missing.push(key.to_string());
         }
     }
+
+    // `mtp.fc` is a linear that `--q-mtp all` affine-quantizes to a packed
+    // `Uint32` weight, so it needs the same dtype-aware check as the
+    // per-layer linears: a `Uint32` `mtp.fc.weight` without `mtp.fc.scales`
+    // would otherwise pass the gate and hit the dense `set_weight` branch in
+    // `Qwen3_5MTPModule::apply_weights` (garbage), instead of cleanly
+    // disabling MTP.
+    require_mtp_linear(params, "mtp.fc", &mut missing);
 
     for layer_idx in 0..config.n_mtp_layers.max(0) {
         let prefix = format!("mtp.layers.{layer_idx}");
@@ -2150,6 +2159,147 @@ mod tests {
 
         assert!(overrides.contains_key("mtp.fc"));
         assert_eq!(overrides.len(), 8);
+    }
+
+    /// Config with `n_mtp_layers = 0` so `missing_mtp_required_weights`
+    /// only exercises the top-level norms + the `mtp.fc` guard (the
+    /// per-layer linear loop is empty), keeping the fixture tiny.
+    fn no_mtp_layer_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// Build the three (never-quantized) MTP norms as bf16. Returns `None`
+    /// if MLX/Metal is unavailable so the test skips cleanly.
+    fn mtp_norms_or_skip(label: &str) -> Option<HashMap<String, MxArray>> {
+        let mut params = HashMap::new();
+        for key in [
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+        ] {
+            match MxArray::zeros(&[64], Some(DType::BFloat16)) {
+                Ok(arr) => {
+                    params.insert(key.to_string(), arr);
+                }
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("Metal") || msg.contains("device") {
+                        eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                        return None;
+                    }
+                    panic!("unexpected MxArray::zeros failure in {label}: {msg}");
+                }
+            }
+        }
+        Some(params)
+    }
+
+    #[test]
+    fn fc_uint32_weight_missing_scales_flags_gate() {
+        let label = "fc_uint32_weight_missing_scales_flags_gate";
+        let cfg = no_mtp_layer_cfg();
+        let Some(mut params) = mtp_norms_or_skip(label) else {
+            return;
+        };
+
+        // Packed (affine-quantized) `mtp.fc.weight` as produced by
+        // `--q-mtp all`, but WITHOUT the required `mtp.fc.scales`.
+        let fc_weight = match MxArray::from_uint32(&[0u32; 8], &[8]) {
+            Ok(arr) => arr,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected MxArray::from_uint32 failure in {label}: {msg}");
+            }
+        };
+        params.insert("mtp.fc.weight".to_string(), fc_weight);
+
+        // Uint32 fc weight with no scales must be flagged (would otherwise
+        // hit the dense `set_weight` branch and corrupt the model).
+        let missing = missing_mtp_required_weights(&params, &cfg);
+        assert!(
+            missing.iter().any(|k| k == "mtp.fc.scales"),
+            "expected mtp.fc.scales to be flagged, got: {missing:?}"
+        );
+
+        // Negative control: adding the scales clears the report.
+        let scales = match MxArray::zeros(&[1], Some(DType::BFloat16)) {
+            Ok(arr) => arr,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected MxArray::zeros failure in {label}: {msg}");
+            }
+        };
+        params.insert("mtp.fc.scales".to_string(), scales);
+        let missing = missing_mtp_required_weights(&params, &cfg);
+        assert!(
+            !missing.iter().any(|k| k == "mtp.fc.scales"),
+            "mtp.fc.scales should not be flagged once present, got: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn fc_bf16_weight_without_scales_is_not_flagged() {
+        let label = "fc_bf16_weight_without_scales_is_not_flagged";
+        let cfg = no_mtp_layer_cfg();
+        let Some(mut params) = mtp_norms_or_skip(label) else {
+            return;
+        };
+
+        // Dense (unquantized) bf16 fc weight: scales are NOT required, so
+        // neither `mtp.fc.weight` nor `mtp.fc.scales` should be reported.
+        let fc_weight = match MxArray::zeros(&[8, 8], Some(DType::BFloat16)) {
+            Ok(arr) => arr,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected MxArray::zeros failure in {label}: {msg}");
+            }
+        };
+        params.insert("mtp.fc.weight".to_string(), fc_weight);
+
+        let missing = missing_mtp_required_weights(&params, &cfg);
+        assert!(
+            missing.is_empty(),
+            "bf16 fc (no scales) must not be flagged, got: {missing:?}"
+        );
     }
 
     #[test]
