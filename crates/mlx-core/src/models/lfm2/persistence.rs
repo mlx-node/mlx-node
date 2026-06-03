@@ -463,6 +463,13 @@ fn parse_config(model_path: &Path) -> Result<Lfm2Config> {
         }
     }
 
+    // NOTE: the `use_block_paged_cache` default is NOT resolved here. Quant-ness
+    // is determined authoritatively from the loaded tensors (`.scales` keys) in
+    // `Lfm2Inner::load_from_dir` — the SAME signal that gates compiled
+    // registration — not from config metadata, which can diverge (e.g. a
+    // checkpoint with only per-layer quantization entries and no top-level
+    // `bits`/`mode`). See the resolution block there, before `Lfm2Inner::new`.
+
     Ok(config)
 }
 
@@ -1257,7 +1264,7 @@ impl Lfm2Inner {
         let path = Path::new(model_path);
 
         // Parse config
-        let config = parse_config(path)?;
+        let mut config = parse_config(path)?;
 
         let num_attn = config.full_attn_idxs().len();
         let num_conv = config.num_hidden_layers as usize - num_attn;
@@ -1302,6 +1309,35 @@ impl Lfm2Inner {
         // Sanitize weights
         let params = sanitize_weights(&mut params, &config)?;
         info!("Sanitized to {} tensors", params.len());
+
+        // Authoritative quant signal: the presence of `.scales` tensors — the
+        // SAME signal that gates compiled registration below. Resolve the
+        // `use_block_paged_cache` default HERE (before `Lfm2Inner::new` consumes
+        // `config` to build the paged adapter), keyed on tensors rather than
+        // config metadata so it can never diverge from the registration gate for
+        // a checkpoint whose `quantization` block lacks top-level `bits`/`mode`.
+        // A quantized checkpoint can never register with the compiled-PAGED C++
+        // path, so its paged route degenerates to the slow eager-PAGED loop
+        // (~12 `synchronize_mlx()`/token, blocking `y.eval()`, no async double-
+        // buffering); default it to FLAT eager decode (~1.84× faster on the
+        // measured mxfp8 LFM2.5-8B-A1B). bf16 (no `.scales`) stays `None` so
+        // `Lfm2Inner::new`'s `unwrap_or(true)` keeps PAGED (PR #66 compiled-PAGED
+        // ~1.5×). Explicit `use_block_paged_cache` in config.json always wins.
+        let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
+        {
+            let resolved = Lfm2Config::resolve_use_block_paged_default(
+                config.use_block_paged_cache,
+                is_quantized,
+            );
+            if config.use_block_paged_cache.is_none() && resolved == Some(false) {
+                info!(
+                    "LFM2: quantized checkpoint (.scales tensors) detected -> defaulting \
+                     use_block_paged_cache=false (flat decode); pin use_block_paged_cache:true \
+                     in config.json to force paged"
+                );
+            }
+            config.use_block_paged_cache = resolved;
+        }
 
         // Create inner model
         let mut inner = Lfm2Inner::new(config)?;
@@ -1359,7 +1395,9 @@ impl Lfm2Inner {
         // biases (`conv.in_proj.bias`, `conv.conv.bias`, `conv.out_proj.bias`)
         // which flow through the generic store loop under the same keys
         // `get_weight` reads.
-        let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
+        // `is_quantized` (`.scales` tensors present) was computed above, before
+        // the `use_block_paged_cache` default resolution, and is reused here as
+        // the single authoritative quant signal for the registration gate.
         // Compiled-PAGED decode is bf16-only (the paged KV pools + static mask
         // hard-code `KvDtype::Bf16`); compiled-FLAT is dtype-generic. Compute the
         // whole-model bf16-clean invariant FIRST (read-only dtype scan over the
@@ -3409,6 +3447,85 @@ mod tests {
         assert!(
             msg.contains("w1") && msg.contains("alias"),
             "error should name the stray w1 alias, got: {msg}"
+        );
+    }
+
+    /// `parse_config` must NOT resolve the `use_block_paged_cache` default — that
+    /// moved to `Lfm2Inner::load_from_dir`, keyed on the authoritative `.scales`
+    /// tensor signal (not config metadata, which can diverge for checkpoints
+    /// whose quantization block lacks top-level `bits`/`mode`). So parse_config
+    /// leaves the field exactly as written: `None` when unset (even with a
+    /// quantization block present) and explicit values pass through unchanged.
+    #[test]
+    fn test_parse_config_does_not_resolve_use_block_paged_default() {
+        // Minimal LFM2 config body; `{extra}` is spliced in per case.
+        fn config_json(extra: &str) -> String {
+            format!(
+                r#"{{
+                    "vocab_size": 100,
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "max_position_embeddings": 128,
+                    "norm_eps": 1e-5,
+                    "conv_bias": false,
+                    "conv_L_cache": 3,
+                    "block_dim": 64,
+                    "block_ff_dim": 64,
+                    "layer_types": ["conv", "full_attention"]{extra}
+                }}"#
+            )
+        }
+
+        // Unique temp dir per case; written + parsed + cleaned up. Uses only
+        // std::fs + std::env::temp_dir (no tempfile dependency).
+        fn parse_with(extra: &str, case: &str) -> Lfm2Config {
+            let dir = std::env::temp_dir().join(format!(
+                "lfm2-parse-config-test-{}-{}-{case}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            fs::write(dir.join("config.json"), config_json(extra)).expect("write config.json");
+            let cfg = parse_config(&dir).expect("parse_config must succeed");
+            let _ = fs::remove_dir_all(&dir);
+            cfg
+        }
+
+        // A quantization block present but the flag UNSET -> parse_config leaves
+        // it None (resolution is deferred to load_from_dir's `.scales` check, so
+        // metadata shape — top-level bits/mode vs per-layer-only — is irrelevant
+        // here and can't diverge from the registration gate).
+        let cfg_q = parse_with(
+            r#", "quantization": {"group_size": 32, "bits": 8, "mode": "mxfp8"}"#,
+            "q",
+        );
+        assert_eq!(
+            cfg_q.use_block_paged_cache, None,
+            "parse_config must NOT resolve the default for a quantized config \
+             (deferred to load_from_dir/.scales)"
+        );
+
+        // bf16 (no quantization block), unset -> None.
+        let cfg_b = parse_with("", "b");
+        assert_eq!(cfg_b.use_block_paged_cache, None, "bf16 + unset stays None");
+
+        // Explicit values pass through parse_config untouched.
+        let cfg_t = parse_with(r#", "use_block_paged_cache": true"#, "t");
+        assert_eq!(
+            cfg_t.use_block_paged_cache,
+            Some(true),
+            "explicit true must pass through parse_config"
+        );
+        let cfg_f = parse_with(r#", "use_block_paged_cache": false"#, "f");
+        assert_eq!(
+            cfg_f.use_block_paged_cache,
+            Some(false),
+            "explicit false must pass through parse_config"
         );
     }
 }

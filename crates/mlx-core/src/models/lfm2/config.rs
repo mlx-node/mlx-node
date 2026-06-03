@@ -192,6 +192,34 @@ impl Lfm2Config {
         self.num_experts.is_some()
     }
 
+    /// Resolve the load-time default for `use_block_paged_cache`.
+    ///
+    /// Policy (pure, no I/O — isolated here for unit testing):
+    /// * An explicit `Some(_)` from config.json always wins (user/converter
+    ///   pinned the storage backend — never override it).
+    /// * When the field is absent (`None`) AND the checkpoint is quantized,
+    ///   default to `Some(false)` (flat eager decode). Quantized checkpoints
+    ///   can never register with the compiled-PAGED C++ path
+    ///   (`should_register_compiled` short-circuits on `is_quantized`), so the
+    ///   paged route degenerates to the slow eager-PAGED loop
+    ///   (~12 `synchronize_mlx()`/token, blocking `y.eval()`, no async
+    ///   double-buffering). The flat path uses an in-graph `KVCache` +
+    ///   `async_eval_arrays` (zero per-layer sync) and is ~1.84× faster on the
+    ///   measured mxfp8 LFM2.5-8B-A1B workload.
+    /// * Otherwise (absent + not quantized, e.g. bf16) leave it `None` so
+    ///   `Lfm2Inner::new`'s `unwrap_or(true)` continues to yield PAGED — which
+    ///   bf16 wants (PR #66 compiled-PAGED ~1.5×).
+    pub fn resolve_use_block_paged_default(
+        explicit: Option<bool>,
+        is_quantized: bool,
+    ) -> Option<bool> {
+        match explicit {
+            Some(_) => explicit,
+            None if is_quantized => Some(false),
+            None => None,
+        }
+    }
+
     /// Whether the layer at `idx` uses a sparse MoE feed-forward block.
     ///
     /// MoE layers are those at or after `num_dense_layers` in a MoE
@@ -429,6 +457,58 @@ mod tests {
         assert!(!cfg.is_moe_layer(1));
         assert!(cfg.is_moe_layer(2));
         assert!(cfg.is_moe_layer(3));
+    }
+
+    /// `resolve_use_block_paged_default` policy: quantized + unset -> flat;
+    /// bf16 + unset -> left None (so `Lfm2Inner::new`'s unwrap_or(true) yields
+    /// paged); explicit Some(_) always honored regardless of quant-ness.
+    #[test]
+    fn test_resolve_use_block_paged_default_quantized_none_goes_flat() {
+        // quantized + unset -> flat eager decode.
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(None, true),
+            Some(false),
+            "quantized checkpoint with use_block_paged_cache unset must default to flat"
+        );
+        // bf16 + unset -> left None so the downstream unwrap_or(true) keeps paged.
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(None, false),
+            None,
+            "bf16 checkpoint with use_block_paged_cache unset must stay None (paged via unwrap_or)"
+        );
+        // Explicit paged honored even on a quantized checkpoint.
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(Some(true), true),
+            Some(true),
+            "explicit use_block_paged_cache:true must win on quantized"
+        );
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(Some(true), false),
+            Some(true),
+            "explicit use_block_paged_cache:true must win on bf16"
+        );
+        // Explicit flat honored on both.
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(Some(false), true),
+            Some(false),
+            "explicit use_block_paged_cache:false must win on quantized"
+        );
+        assert_eq!(
+            Lfm2Config::resolve_use_block_paged_default(Some(false), false),
+            Some(false),
+            "explicit use_block_paged_cache:false must win on bf16"
+        );
+
+        // The resolved values feed Lfm2Inner::new's `unwrap_or(true)`:
+        // bf16/None -> true (paged); quantized/None -> Some(false) -> false (flat).
+        assert!(
+            Lfm2Config::resolve_use_block_paged_default(None, false).unwrap_or(true),
+            "bf16 None must resolve to paged (true) at the unwrap_or(true) site"
+        );
+        assert!(
+            !Lfm2Config::resolve_use_block_paged_default(None, true).unwrap_or(true),
+            "quantized None must resolve to flat (false) at the unwrap_or(true) site"
+        );
     }
 
     /// `norm_topk_prob` / `use_expert_bias` round-trip false through serde.

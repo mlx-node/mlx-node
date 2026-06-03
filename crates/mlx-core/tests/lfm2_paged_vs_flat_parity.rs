@@ -335,3 +335,153 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
         r2_flat.num_tokens, r2_paged.num_tokens,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Telemetry regression: LFM2 paged prefillTokensPerSecond must be full-prompt
+// scale, not attention-suffix scale, on a warm cross-request prefix-cache hit.
+//
+// The paged prefill reprocesses the FULL prompt through the conv layers every
+// turn (run_paged_prefill_chunk Pass 1), so ttft measures full-prompt work.
+// The pre-fix code divided that ttft into the attention SUFFIX
+// (tokens.len()-cached_prefix_len), under-reporting prefill tok/s by the
+// cache-hit ratio (~37 vs ~thousands). This guards the fix that uses the
+// full-prompt count (tokens.len()) as the numerator.
+// ---------------------------------------------------------------------------
+
+/// Like `parity_chat_config` but with `report_performance: true` so the
+/// returned `ChatResult.performance` is populated.
+fn perf_chat_config(max_new_tokens: i32) -> ChatConfig {
+    let mut cfg = parity_chat_config(max_new_tokens);
+    cfg.report_performance = Some(true);
+    cfg
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    // Paged adapter ON (the path with the telemetry bug).
+    let paged_dir = match clone_model_dir(&src, "lfm2-paged-perf", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for paged path: {e}"),
+    };
+    let paged_model = Lfm2Model::load_from_dir(&paged_dir.to_string_lossy())
+        .await
+        .expect("failed to load paged-path LFM2 model");
+
+    // A reasonably long turn-1 prompt so the turn-2 cached prefix dwarfs the
+    // new suffix — that is the regime where suffix-vs-full-prompt diverge.
+    let prompt1 = "Write a short paragraph about the history of the printing press, \
+                   covering Gutenberg, movable type, and the spread of literacy across \
+                   Europe in the fifteenth and sixteenth centuries.";
+    let _r1 = paged_model
+        .chat_session_start(vec![user_message(prompt1)], Some(perf_chat_config(32)))
+        .await
+        .expect("turn 1 paged chat_session_start failed");
+
+    // Turn 2: a FRESH paged session re-submitting the IDENTICAL prompt. On a
+    // paged model the BlockAllocator reuses the content-addressed prefix, so
+    // `cached_tokens` covers ~the whole prompt while the new attention suffix is
+    // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
+    // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
+    // This exercises the `chat_sync_core_paged` START path that the telemetry fix
+    // touches, NOT the `chat_session_continue` delta path (which legitimately
+    // forwards only the delta via `chat_tokens_delta_sync` and is left unchanged).
+    let r2 = paged_model
+        .chat_session_start(vec![user_message(prompt1)], Some(perf_chat_config(32)))
+        .await
+        .expect("turn 2 paged chat_session_start failed");
+
+    let perf = r2
+        .performance
+        .expect("performance must be present when report_performance:true");
+
+    eprintln!(
+        "paged perf regression: prompt_tokens={} cached_tokens={} ttft_ms={:.2} \
+         prefill_tps={:.2}",
+        r2.prompt_tokens, r2.cached_tokens, perf.ttft_ms, perf.prefill_tokens_per_second,
+    );
+
+    // (b) The cache-hit context is still reported (warm reuse actually happened).
+    assert!(
+        r2.cached_tokens > 0,
+        "expected a warm prefix-cache hit on turn 2 (cached_tokens>0), got {}",
+        r2.cached_tokens,
+    );
+
+    // (a) prefill tok/s must be full-prompt scale. Reconstruct the full-prompt
+    // and suffix expectations from the SAME ttft the engine measured, then
+    // assert the reported value tracks the full prompt, not the suffix.
+    //
+    // ttft_ms can be ~0 only on a degenerate empty prefill; guard so the test
+    // fails loudly rather than dividing by zero.
+    assert!(
+        perf.ttft_ms > 0.0,
+        "ttft_ms must be positive for the throughput check, got {}",
+        perf.ttft_ms,
+    );
+    let ttft_s = perf.ttft_ms / 1000.0;
+    let full_prompt_tps = r2.prompt_tokens as f64 / ttft_s;
+    let suffix_len = (r2.prompt_tokens as i64 - r2.cached_tokens as i64).max(0) as f64;
+    let suffix_tps = suffix_len / ttft_s;
+
+    // The reported value must be at least half the full-prompt rate. A
+    // suffix-scale numerator (which is >5x smaller here, since cached_tokens
+    // dominates) would fall far below this bar and fail.
+    assert!(
+        perf.prefill_tokens_per_second >= 0.5 * full_prompt_tps,
+        "prefill_tokens_per_second ({:.2}) must be full-prompt scale (>= 0.5 * {:.2}); \
+         a suffix-scale numerator would report ~{:.2}",
+        perf.prefill_tokens_per_second,
+        full_prompt_tps,
+        suffix_tps,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a quantized LFM2 checkpoint loaded with NO config override must
+// default to the FLAT decode path.
+//
+// The default is resolved in `Lfm2Inner::load_from_dir` from the authoritative
+// `.scales` tensor signal (NOT config metadata), the same signal that gates
+// compiled registration. This proves the wiring end-to-end on real weights and
+// guards against a quantized checkpoint silently landing on the slow eager-PAGED
+// path (the bug this branch removes). Because detection keys on tensors, a
+// checkpoint whose `quantization` block lacks top-level `bits`/`mode` (per-layer
+// only) is handled identically — the metadata shape is never consulted.
+//
+// Gated on its OWN env var so it only runs when the operator explicitly points
+// at a QUANTIZED checkpoint (a bf16 checkpoint would correctly stay paged and
+// fail this assertion).
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_QUANTIZED_MODEL_PATH pointing to a real QUANTIZED LFM2 checkpoint"]
+async fn lfm2_quantized_default_load_takes_flat_path() {
+    let Ok(model_path) = std::env::var("MLX_TEST_QUANTIZED_MODEL_PATH") else {
+        eprintln!(
+            "skipping: MLX_TEST_QUANTIZED_MODEL_PATH unset (point it at a quantized LFM2 \
+             checkpoint, e.g. an mxfp8/affine-4bit convert output)"
+        );
+        return;
+    };
+    if !Path::new(&model_path).exists() {
+        eprintln!("skipping: MLX_TEST_QUANTIZED_MODEL_PATH does not exist: {model_path}");
+        return;
+    }
+
+    // DEFAULT load — no config override, no clone. The on-disk config.json has
+    // `use_block_paged_cache` unset; the loader must flip it to flat because the
+    // weights carry `.scales`.
+    let model = Lfm2Model::load_from_dir(&model_path)
+        .await
+        .expect("failed to load quantized LFM2 model");
+
+    assert!(
+        !model.has_block_paged_cache(),
+        "a quantized LFM2 checkpoint with use_block_paged_cache unset must default to FLAT \
+         (has_block_paged_cache()==false); got paged — the .scales-keyed default did not fire"
+    );
+}

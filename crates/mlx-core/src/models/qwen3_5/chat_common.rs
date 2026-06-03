@@ -6682,3 +6682,56 @@ mod verify_cache_prefix_invariant_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod compute_performance_metrics_tests {
+    //! `compute_performance_metrics` is a faithful numerator / ttft divider:
+    //! `prefill_tokens_per_second = prefill_tokens_len / (ttft_ms/1000)`. This
+    //! documents that the LFM2-paged telemetry fix (using the full-prompt count
+    //! as the numerator) MUST live at the call site — the divider here applies
+    //! whatever numerator it is given, verbatim. Cheap, deterministic, no GPU.
+    use super::compute_performance_metrics;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn compute_performance_metrics_uses_given_numerator_directly() {
+        let t0 = Instant::now();
+        let ttft = Duration::from_millis(150);
+        let first_tok = t0 + ttft;
+
+        // Full-prompt numerator (1000) -> ~6667 tok/s; ttft ~= 150ms.
+        let m = compute_performance_metrics(Some(t0), Some(first_tok), 1000, 8)
+            .expect("metrics present when both instants are Some");
+        assert!(
+            (m.ttft_ms - 150.0).abs() < 5.0,
+            "ttft_ms should reflect first_tok - gen_start (~150ms), got {}",
+            m.ttft_ms
+        );
+        let expected_full = 1000.0 / 0.150;
+        assert!(
+            (m.prefill_tokens_per_second - expected_full).abs() / expected_full < 0.05,
+            "full-prompt numerator must divide directly: expected ~{expected_full:.0}, got {}",
+            m.prefill_tokens_per_second
+        );
+
+        // Suffix-scale numerator (6) -> ~40 tok/s: the exact bogus value the
+        // LFM2-paged bug produced (6 / 0.150). Proves the function is a plain
+        // divider and the numerator is the load-bearing choice.
+        let m_suffix =
+            compute_performance_metrics(Some(t0), Some(first_tok), 6, 8).expect("metrics present");
+        let expected_suffix = 6.0 / 0.150;
+        assert!(
+            (m_suffix.prefill_tokens_per_second - expected_suffix).abs() / expected_suffix < 0.05,
+            "suffix numerator divides directly: expected ~{expected_suffix:.0}, got {}",
+            m_suffix.prefill_tokens_per_second
+        );
+        // And the full-prompt value is >5x the suffix value, i.e. the bug
+        // under-reported by exactly the cached-prefix ratio.
+        assert!(
+            m.prefill_tokens_per_second > 5.0 * m_suffix.prefill_tokens_per_second,
+            "full-prompt tok/s ({}) must be >5x suffix tok/s ({})",
+            m.prefill_tokens_per_second,
+            m_suffix.prefill_tokens_per_second
+        );
+    }
+}

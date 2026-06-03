@@ -1405,12 +1405,19 @@ impl Lfm2Inner {
         let last_token_in_cache = false;
         self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
 
-        // Performance metrics
+        // Performance metrics.
+        // Paged prefill reprocesses the FULL prompt through conv layers
+        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
+        // cached prefix. ttft measures full-prompt work, so the throughput
+        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
+        // (If a future LFM2 paged variant carries conv state across turns and
+        // truly forwards only the delta during prefill, revert this to the
+        // delta count.)
         let performance = if report_perf {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
+                tokens.len(),
                 generated_tokens.len(),
             )
         } else {
@@ -2373,12 +2380,19 @@ impl Lfm2Inner {
             }
         }
 
-        // Performance metrics
+        // Performance metrics.
+        // Paged prefill reprocesses the FULL prompt through conv layers
+        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
+        // cached prefix. ttft measures full-prompt work, so the throughput
+        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
+        // (If a future LFM2 paged variant carries conv state across turns and
+        // truly forwards only the delta during prefill, revert this to the
+        // delta count.)
         let performance = if report_perf {
             compute_performance_metrics(
                 generation_start,
                 first_token_instant,
-                tokens.len() - cached_prefix_len as usize,
+                tokens.len(),
                 generated_tokens.len(),
             )
         } else {
