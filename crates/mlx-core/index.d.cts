@@ -2034,10 +2034,21 @@ export interface ConversionOptions {
    */
   quantMxfp?: boolean;
   /**
-   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", or "all".
-   * cyankiwi keeps mtp.fc dense and quantizes only MTP layer linears as
-   * 4-bit affine group_size=32 in an MTPLX-style mtp.safetensors sidecar;
-   * all also quantizes mtp.fc.
+   * Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", "all",
+   * or "split" (alias "drafter").
+   * "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
+   * 4-bit affine group_size=32. For dense `qwen3_5` the quantized linears are
+   * emitted into an MTPLX-compatible mtp.safetensors sidecar; for MoE
+   * (`qwen3_5_moe`) there is no sidecar — they are quantized in place and stored
+   * inline in the main safetensors shards.
+   * "all" additionally quantizes mtp.fc. For dense `qwen3_5` the quantized MTP
+   * linears land in the mtp.safetensors sidecar; for MoE (`qwen3_5_moe`) there
+   * is no sidecar — they are quantized in place and stored inline in the main
+   * safetensors shards.
+   * "split"/"drafter" emits a body checkpoint with NO mtp.* tensors plus a
+   * separate `mtp-drafter/` directory in mlx-vlm's `qwen3_5_mtp` format
+   * (bare-keyed MTP head, format:mlx). It does NOT require --quantize/--q-recipe;
+   * the body may be bf16 or already-quantized and the MTP head stays bf16.
    */
   quantMtp?: string;
 }

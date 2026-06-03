@@ -132,7 +132,7 @@ mlx convert \
 | `--q-group-size` |       | `64`          | Quantization group size                        |
 | `--q-mode`       |       | `affine`      | Mode: `affine` or `mxfp8`                      |
 | `--q-recipe`     |       |               | Per-layer mixed-bit recipe                     |
-| `--q-mtp`        |       | `off`         | Qwen MTP sidecar policy: `cyankiwi` or `all`   |
+| `--q-mtp`        |       | `off`         | Qwen MTP-quant policy: `cyankiwi`, `all`, or `split` (alias `drafter`) |
 | `--imatrix-path` |       |               | imatrix GGUF for AWQ pre-scaling               |
 | `--mmproj`       |       |               | mmproj GGUF for vision encoder weights         |
 

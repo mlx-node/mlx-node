@@ -47,7 +47,7 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
-### Qwen MTP sidecar conversion
+### Qwen MTP quantization conversion
 
 ```bash
 mlx convert \
@@ -59,9 +59,19 @@ mlx convert \
   --q-mtp cyankiwi
 ```
 
-`--q-mtp cyankiwi` writes MTP tensors to `mtp.safetensors`, keeps `mtp.fc`
-and MTP norms BF16, and packs the 7 MTP layer linears as 4-bit affine
-group-size 32 tensors with MTPLX-compatible metadata.
+`--q-mtp cyankiwi` keeps `mtp.fc` and MTP norms BF16 and packs the MTP layer
+linears as 4-bit affine group-size 32 tensors with MTPLX-compatible metadata.
+Where those quantized tensors land depends on the model family:
+
+- Dense `qwen3_5` — emitted into a separate `mtp.safetensors` sidecar.
+- MoE `qwen3_5_moe` — there is **no sidecar**; the MTP tensors are quantized in
+  place and stored inline in the main safetensors shards.
+
+`--q-mtp all` additionally quantizes `mtp.fc` (same dense-sidecar / MoE-inline
+split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
+`mtp.*` tensors** plus a separate `mtp-drafter/` directory in mlx-vlm's
+`qwen3_5_mtp` format (bare-keyed, BF16 MTP head); it does not require
+`--quantize`/`--q-recipe` and the body may be BF16 or already-quantized.
 
 | Flag               | Purpose                                                                         |
 | ------------------ | ------------------------------------------------------------------------------- |
@@ -71,7 +81,7 @@ group-size 32 tensors with MTPLX-compatible metadata.
 | `-q`, `--quantize` | Enable quantization                                                             |
 | `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth` |
 | `--q-mode`         | `affine` (default) or `mxfp8`                                                   |
-| `--q-mtp`          | Qwen MTP sidecar policy: `off`, `cyankiwi`, or `all`                            |
+| `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)   |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                        |
 | `--mmproj`         | Vision-encoder conversion path                                                  |
 | `-v`, `--verbose`  | Verbose logging                                                                 |

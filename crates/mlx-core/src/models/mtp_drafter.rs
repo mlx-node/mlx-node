@@ -44,7 +44,7 @@ use napi::bindgen_prelude::*;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use crate::utils::safetensors::load_safetensors_lazy;
 
 /// `model_type` value that identifies an mlx-vlm split MTP drafter `config.json`.
@@ -98,12 +98,24 @@ const REQUIRED_PER_LAYER_DENSE_MLP: [&str; 3] = [
     "mlp.down_proj.weight",
 ];
 
-/// MoE-only per-layer expert + router weights.
-const REQUIRED_PER_LAYER_MOE_MLP: [&str; 4] = [
+/// MoE-only per-layer expert + router + shared-expert weights.
+///
+/// The shared expert is UNCONDITIONAL in this codebase: `SparseMoeBlock::new`
+/// / `new_quantized` always build `shared_expert` + `shared_expert_gate`, and
+/// both `forward` and `Qwen3_5MoeMTPModule::apply_weights`/`get_parameters`
+/// always consume/emit them. So a MoE-flavored MTP layer requires the four
+/// expert/router keys AND the four shared-expert keys — a checkpoint missing
+/// only the shared-expert tensors would otherwise pass this gate and load
+/// random shared-expert weights, corrupting speculative decode.
+const REQUIRED_PER_LAYER_MOE_MLP: [&str; 8] = [
     "mlp.switch_mlp.gate_proj.weight",
     "mlp.switch_mlp.up_proj.weight",
     "mlp.switch_mlp.down_proj.weight",
     "mlp.gate.weight",
+    "mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_expert.up_proj.weight",
+    "mlp.shared_expert.down_proj.weight",
+    "mlp.shared_expert_gate.weight",
 ];
 
 /// Top-level MTP head weights required by BOTH variants.
@@ -331,21 +343,46 @@ fn validate_drafter_text_config_variant(
 ///
 /// Shared by the drafter-merge gate ([`load_drafter_tensors`]) and the MoE
 /// loader's post-sanitize completeness gate, so the dense and MoE backbones use
-/// one source of truth for "what a complete MTP head looks like". The dense
-/// loader has its own near-identical `missing_mtp_required_weights` that also
-/// validates quantized `.scales` companions; this map-only variant intentionally
-/// checks `.weight` presence (the packed weight key exists in both bf16 and
-/// quantized form), which is sufficient to catch a missing/wrong-variant head.
+/// one source of truth for "what a complete MTP head looks like".
+///
+/// DTYPE-AWARE for quantized companions: for every required `.weight` key, if
+/// the present array's dtype is `Uint32` (an affine/MXFP/NVFP packed weight),
+/// the sibling `.scales` key is ALSO required — mirroring the dense loader's
+/// `require_mtp_linear` (`qwen3_5/persistence.rs`). A packed `Uint32` `.weight`
+/// without its `.scales` would otherwise load as silent garbage (MoE
+/// `SwitchLinear::set_weight` performs no shape/dtype check). For bf16/f16
+/// `.weight`s no `.scales` is required, so plain dense checkpoints are
+/// unaffected. If a `.weight`'s dtype cannot be read, it is treated
+/// conservatively as non-quantized (no extra `.scales` requirement) rather than
+/// erroring — matching the dense loader's handling.
 pub(crate) fn missing_required_mtp_keys(
     params: &HashMap<String, MxArray>,
     body: DrafterBodyVariant,
     n_mtp_layers: i32,
 ) -> Vec<String> {
     let mut missing = Vec::new();
-    for key in REQUIRED_TOP_LEVEL {
-        if !params.contains_key(key) {
-            missing.push(key.to_string());
+    // For a required `<base>.weight` key: flag the `.weight` if absent;
+    // otherwise, if the present array is a packed `Uint32` quantized weight,
+    // ALSO require its sibling `<base>.scales` (mirrors the dense loader's
+    // `require_mtp_linear`). A dtype that cannot be read is treated as
+    // non-quantized (conservative, no extra requirement).
+    let mut require_weight = |key: String| {
+        let Some(weight) = params.get(&key) else {
+            missing.push(key);
+            return;
+        };
+        if matches!(weight.dtype(), Ok(DType::Uint32))
+            && let Some(base) = key.strip_suffix(".weight")
+        {
+            let scales_key = format!("{base}.scales");
+            if !params.contains_key(&scales_key) {
+                missing.push(scales_key);
+            }
         }
+    };
+
+    for key in REQUIRED_TOP_LEVEL {
+        require_weight(key.to_string());
     }
     let mlp_suffixes: &[&str] = if body.is_moe() {
         &REQUIRED_PER_LAYER_MOE_MLP
@@ -355,10 +392,7 @@ pub(crate) fn missing_required_mtp_keys(
     for layer_idx in 0..n_mtp_layers.max(0) {
         let prefix = format!("mtp.layers.{layer_idx}");
         for suffix in REQUIRED_PER_LAYER_COMMON.iter().chain(mlp_suffixes.iter()) {
-            let key = format!("{prefix}.{suffix}");
-            if !params.contains_key(&key) {
-                missing.push(key);
-            }
+            require_weight(format!("{prefix}.{suffix}"));
         }
     }
     missing
@@ -755,12 +789,74 @@ mod tests {
         assert!(missing.contains(&"mtp.layers.0.mlp.gate.weight".to_string()));
     }
 
+    /// Fix A regression: the shared expert is UNCONDITIONAL, so a MoE checkpoint
+    /// missing ONLY a shared-expert tensor (switch_mlp + router gate all present)
+    /// must still be flagged incomplete — otherwise the head loads random
+    /// shared-expert weights and corrupts speculative decode.
+    #[test]
+    fn partial_moe_drafter_missing_shared_expert_rejected() {
+        // (a) missing a shared_expert projection weight.
+        let mut params = complete_mtp_keys(DrafterBodyVariant::Moe, 1);
+        params.remove("mtp.layers.0.mlp.shared_expert.gate_proj.weight");
+        let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, 1);
+        assert_eq!(missing.len(), 1, "got: {missing:?}");
+        assert!(missing.contains(&"mtp.layers.0.mlp.shared_expert.gate_proj.weight".to_string()));
+
+        // (b) missing the shared_expert_gate weight.
+        let mut params = complete_mtp_keys(DrafterBodyVariant::Moe, 1);
+        params.remove("mtp.layers.0.mlp.shared_expert_gate.weight");
+        let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, 1);
+        assert_eq!(missing.len(), 1, "got: {missing:?}");
+        assert!(missing.contains(&"mtp.layers.0.mlp.shared_expert_gate.weight".to_string()));
+    }
+
     #[test]
     fn missing_top_level_mtp_fc_rejected() {
         let mut params = complete_mtp_keys(DrafterBodyVariant::Dense, 1);
         params.remove("mtp.fc.weight");
         let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Dense, 1);
         assert_eq!(missing, vec!["mtp.fc.weight".to_string()]);
+    }
+
+    /// Fix B regression: a packed `Uint32` required `.weight` with NO sibling
+    /// `.scales` must be flagged (the missing `.scales`), mirroring the dense
+    /// loader's `require_mtp_linear`. The MoE `SwitchLinear::set_weight` performs
+    /// no shape/dtype check, so a quantized `.weight` without scales would load
+    /// as silent garbage. Needs Metal to allocate the Uint32 array — skip when
+    /// MLX/Metal is unavailable (same pattern as the other allocating tests).
+    #[test]
+    fn quantized_weight_missing_scales_rejected() {
+        // A complete bf16 set, then swap one switch_mlp `.weight` for a packed
+        // Uint32 array and omit its `.scales`.
+        let mut params = complete_mtp_keys(DrafterBodyVariant::Moe, 1);
+        let packed = match MxArray::zeros(&[2, 2], Some(DType::Uint32)) {
+            Ok(a) => a,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!(
+                        "skipping quantized_weight_missing_scales_rejected (Metal unavailable): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Uint32 zeros failure: {msg}");
+            }
+        };
+        params.insert(
+            "mtp.layers.0.mlp.switch_mlp.gate_proj.weight".to_string(),
+            packed,
+        );
+        // No `...switch_mlp.gate_proj.scales` inserted.
+        let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, 1);
+        assert!(
+            missing.contains(&"mtp.layers.0.mlp.switch_mlp.gate_proj.scales".to_string()),
+            "a packed Uint32 .weight with no .scales must require the .scales companion; got: {missing:?}"
+        );
+        // The `.weight` itself is present, so it must NOT be flagged.
+        assert!(
+            !missing.contains(&"mtp.layers.0.mlp.switch_mlp.gate_proj.weight".to_string()),
+            "the present Uint32 .weight must not be flagged missing; got: {missing:?}"
+        );
     }
 
     #[test]
@@ -773,8 +869,9 @@ mod tests {
         }
         let missing = missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, 2);
         assert!(missing.iter().all(|k| k.starts_with("mtp.layers.1.")));
-        // 8 common + 4 MoE MLP = 12 per-layer keys for the missing layer.
-        assert_eq!(missing.len(), 12);
+        // 8 common + 8 MoE MLP (switch_mlp.{gate,up,down} + gate + shared_expert.{gate,up,down}
+        // + shared_expert_gate) = 16 per-layer keys for the missing layer.
+        assert_eq!(missing.len(), 16);
     }
 
     fn write_text_config(dir: &Path, top_model_type: &str, text_model_type: &str) {
