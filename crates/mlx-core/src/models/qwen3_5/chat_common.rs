@@ -1199,9 +1199,14 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         // show deeper bf16 MTP-head cycles lose more verify/draft time than
         // they recover from acceptance.
         enable_mtp: config.enable_mtp.unwrap_or(false),
+        // Clamp the SIGNED depth before casting to usize: a negative
+        // `mtpDepth` (reachable via the public `ChatConfig` surface) would
+        // otherwise wrap (`-1 as usize` == usize::MAX) and clamp UP to 5,
+        // forcing the slowest/deepest MTP path. Clamping first preserves the
+        // documented `<1 → 1` behavior.
         mtp_depth: config
             .mtp_depth
-            .map(|d| (d as usize).clamp(1, 5))
+            .map(|d| d.clamp(1, 5) as usize)
             .unwrap_or(1),
         // W6.8 — adaptive depth policy is opt-in by default. An explicit
         // `mtpAdaptiveDepth` always wins. See
@@ -4216,6 +4221,16 @@ mod mtp_params_tests {
             p.mtp_depth, 5,
             "mtp_depth=99 must clamp to verify-FFI max 5"
         );
+
+        // Negative depths are "<1" and must clamp to 1 — NOT wrap to
+        // usize::MAX and clamp up to the slowest depth 5.
+        cfg.mtp_depth = Some(-1);
+        let p = extract_chat_params(&cfg);
+        assert_eq!(p.mtp_depth, 1, "mtp_depth=-1 must clamp to 1, not 5");
+
+        cfg.mtp_depth = Some(i32::MIN);
+        let p = extract_chat_params(&cfg);
+        assert_eq!(p.mtp_depth, 1, "mtp_depth=i32::MIN must clamp to 1");
     }
 
     /// W6.8 — `mtp_adaptive_depth` default resolution.
