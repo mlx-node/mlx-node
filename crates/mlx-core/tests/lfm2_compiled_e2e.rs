@@ -2434,3 +2434,202 @@ async fn lfm2_compiled_paged_streaming_engagement_and_parity_dense() {
         &stream_content.chars().take(80).collect::<String>()
     );
 }
+
+// =============================================================================
+// QUANTIZED compiled-decode parity (mxfp8 / affine-4bit), paged + flat.
+//
+// The Phase-3b lift: quantized checkpoints (`.scales` companions) now register
+// the compiled path with authoritative per-projection quant-info (Rust
+// `register_weights_with_cpp_locked` -> `mlx_store_quant_info`), so the compiled
+// `lfm2_switch_linear` / `linear_proj` dispatch the SAME (mode, bits, group_size)
+// the eager loaders resolve — not the companion-tensor heuristic that conflated
+// MXFP4 / NVFP4 with MXFP8.
+//
+// ORACLE — eviction-based, in-process, NO env toggle: load the SAME quantized
+// checkpoint TWICE. Registration publishes `model_id` into the single, process-
+// global `g_active_model_id` slot, so the SECOND load EVICTS the first. The second
+// instance therefore runs the COMPILED C++ graph; the first (evicted) falls to the
+// PURE-RUST eager decode (its `compiled_path_active()` id-probe now fails — see
+// `chat_sync_core` / `chat_sync_core_paged`). Comparing the two is the decisive
+// MISLABEL oracle: the pure-Rust eager path dispatches quant through the
+// INDEPENDENT Rust `QuantizedLinear` / `QuantizedSwitchLinear` modules, so a C++
+// dispatch mislabel (e.g. affine-as-mxfp8 -> gibberish) diverges EARLY and trips
+// the tail-only tolerance. (A same-graph `MLX_NO_COMPILE` reference shares the C++
+// dispatch and so could agree-while-wrong — it cannot catch a mislabel.) Pure-Rust
+// eager IS the proven oracle: before this change quantized checkpoints NEVER
+// registered, so eager decode was the ONLY (shipping) quantized path.
+//
+// Engagement is proven by the per-step C++ counters: the compiled instance bumps
+// (`mlx_lfm2_moe_compiled_paged_call_count` paged / `mlx_lfm2_moe_forward_call_count`
+// flat); the evicted eager instance bumps NEITHER (it never enters the C++ FFI). A
+// zero compiled delta OR a nonzero eager delta fails the test LOUDLY (so a wrong
+// eviction order under concurrent execution is a loud failure, never a false pass).
+//
+// SERIAL: like every engagement test in this file, the eviction oracle assumes the
+// suite runs with `--test-threads=1` (the load->infer window must not be raced by
+// another test's registration). Gated on `LFM2_QUANT_MODEL_PATH` (fallback
+// `MLX_TEST_QUANTIZED_MODEL_PATH`) + `LFM2_COMPILED_E2E=1`. Run once per recipe
+// (mxfp8 AND affine-4bit) to cover the no-biases (mxfp8) and biases-present
+// (affine) `gather_qmm` arms. Skipped under `MLX_NO_COMPILE=1` (which would make
+// BOTH instances eager -> no compiled engagement -> false oracle).
+// =============================================================================
+
+fn resolve_quant_model() -> Option<PathBuf> {
+    let raw = std::env::var("LFM2_QUANT_MODEL_PATH")
+        .or_else(|_| std::env::var("MLX_TEST_QUANTIZED_MODEL_PATH"));
+    let Ok(model_path) = raw else {
+        eprintln!(
+            "[skip] LFM2_QUANT_MODEL_PATH / MLX_TEST_QUANTIZED_MODEL_PATH unset \
+             (point at a quantized lfm2_moe checkpoint, e.g. .../lfm2-ours-mxfp8)"
+        );
+        return None;
+    };
+    let p = PathBuf::from(&model_path);
+    if !p.exists() {
+        eprintln!("[skip] quant model path does not exist: {model_path}");
+        return None;
+    }
+    Some(p)
+}
+
+/// Eviction-based compiled-vs-eager parity for a quantized checkpoint.
+///
+/// `use_block_paged` picks the decode shape (true=paged, false=flat). Loads the
+/// checkpoint twice (eager-ref FIRST, compiled SECOND -> compiled evicts eager),
+/// runs the compiled instance (asserting per-step compiled engagement), then the
+/// evicted eager instance (asserting NO compiled engagement), and asserts the two
+/// outputs agree within the tail-only argmax-tie tolerance. Both models stay alive
+/// until both runs complete (the evicted instance must not drop before its run).
+async fn quant_compiled_vs_eager_parity(src: &Path, use_block_paged: bool) {
+    let mode = if use_block_paged { "paged" } else { "flat" };
+    let prompt = "What is the capital of France? Answer in one short sentence.";
+
+    // eager-ref FIRST so the compiled load evicts it.
+    let eager_dir = clone_model_dir(src, &format!("quant-{mode}-eager"), use_block_paged)
+        .unwrap_or_else(|e| panic!("clone quant {mode} eager dir: {e}"));
+    let compiled_dir = clone_model_dir(src, &format!("quant-{mode}-compiled"), use_block_paged)
+        .unwrap_or_else(|e| panic!("clone quant {mode} compiled dir: {e}"));
+
+    let eager_model = Lfm2Model::load_from_dir(&eager_dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load quant {mode} eager-ref: {e:?}"));
+    let compiled_model = Lfm2Model::load_from_dir(&compiled_dir.to_string_lossy())
+        .await
+        .unwrap_or_else(|e| panic!("load quant {mode} compiled: {e:?}"));
+
+    // Counter selector: paged compiled bumps the compiled-paged counter; flat
+    // compiled bumps the flat forward counter. The evicted pure-Rust eager run
+    // bumps NEITHER, since it never enters the C++ FFI.
+    let read_counter = || unsafe {
+        if use_block_paged {
+            mlx_sys::mlx_lfm2_moe_compiled_paged_call_count()
+        } else {
+            mlx_sys::mlx_lfm2_moe_forward_call_count()
+        }
+    };
+
+    // --- COMPILED instance (the 2nd load == active model_id) ---
+    let c0 = read_counter();
+    let r_compiled = compiled_model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(greedy_chat_config(N_NEW_TOKENS, true)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("quant {mode} compiled chat: {e:?}"));
+    let compiled_delta = read_counter().saturating_sub(c0);
+    eprintln!(
+        "[quant-{mode}-compiled] num_tokens={} compiled_delta={compiled_delta} text={:?}",
+        r_compiled.num_tokens, r_compiled.text
+    );
+    // Engagement is generation-length-agnostic: the per-step compiled counter must
+    // track the number of decode steps (~num_tokens-1; the last sampled token is
+    // never fed forward). Tying the floor to `num_tokens` rather than a fixed
+    // constant is robust to early EOS (a concise 4-bit answer can stop well short
+    // of `N_NEW_TOKENS`). A shortfall means some steps silently fell back to eager,
+    // or a concurrent load evicted this instance (run with --test-threads=1).
+    assert!(
+        compiled_delta > 0 && compiled_delta + 2 >= u64::from(r_compiled.num_tokens),
+        "QUANT COMPILED-{} DID NOT FULLY ENGAGE: per-step compiled counter delta = {compiled_delta} \
+         for {} generated tokens (expected ~num_tokens-1). The decode silently fell back to eager, \
+         or a concurrent load evicted this instance — run the suite with --test-threads=1.",
+        mode.to_uppercase(),
+        r_compiled.num_tokens
+    );
+
+    // --- EAGER instance (the 1st load, now EVICTED -> pure-Rust eager) ---
+    let e0 = read_counter();
+    let r_eager = eager_model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(greedy_chat_config(N_NEW_TOKENS, true)),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("quant {mode} eager chat: {e:?}"));
+    let eager_delta = read_counter().saturating_sub(e0);
+    eprintln!(
+        "[quant-{mode}-eager] num_tokens={} eager_compiled_delta={eager_delta} text={:?}",
+        r_eager.num_tokens, r_eager.text
+    );
+    assert_eq!(
+        eager_delta, 0,
+        "EVICTION DID NOT TAKE: the 'eager' instance bumped the compiled counter by {eager_delta} \
+         — it ran COMPILED, not pure-Rust eager, so it is NOT an independent oracle. The 2nd load \
+         must own the active model_id (run the suite with --test-threads=1)."
+    );
+
+    // --- PARITY: compiled-C++ vs pure-Rust eager (independent quant dispatch) ---
+    assert_tail_only_divergence(
+        &format!("quant-{mode}-compiled-vs-eager"),
+        &r_compiled.text,
+        &r_eager.text,
+    );
+    assert_eq!(
+        r_compiled.num_tokens, r_eager.num_tokens,
+        "quant {mode} num_tokens mismatch: compiled={} eager={}",
+        r_compiled.num_tokens, r_eager.num_tokens
+    );
+
+    eprintln!(
+        "[PASS] quant compiled-{mode} engaged ({compiled_delta} calls) and agrees with the \
+         pure-Rust eager-{mode} oracle within tail tolerance ({TAIL_TOLERANCE_BYTES}B)."
+    );
+
+    // Keep both alive until here (the evicted instance must outlive its eager run).
+    drop(compiled_model);
+    drop(eager_model);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_quant_compiled_paged_matches_eager_paged() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        eprintln!("[skip] MLX_NO_COMPILE=1 — the eviction oracle needs the compiled path live");
+        return;
+    }
+    let Some(src) = resolve_quant_model() else {
+        return;
+    };
+    eprintln!("[quant-paged] checkpoint: {}", src.display());
+    quant_compiled_vs_eager_parity(&src, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lfm2_quant_compiled_flat_matches_eager_flat() {
+    if !gated() {
+        eprintln!("[skip] LFM2_COMPILED_E2E != 1");
+        return;
+    }
+    if no_compile_env() {
+        eprintln!("[skip] MLX_NO_COMPILE=1 — the eviction oracle needs the compiled path live");
+        return;
+    }
+    let Some(src) = resolve_quant_model() else {
+        return;
+    };
+    eprintln!("[quant-flat] checkpoint: {}", src.display());
+    quant_compiled_vs_eager_parity(&src, false).await;
+}

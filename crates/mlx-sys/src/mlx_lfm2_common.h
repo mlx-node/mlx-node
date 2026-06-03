@@ -50,8 +50,12 @@ struct Lfm2MoeConfig {
   // (conv.in_proj.bias, conv.conv.bias, conv.out_proj.bias). Default false
   // (bias-free checkpoint).
   bool conv_bias = false;
-  // Phase 3b quant fields (default 0 = bf16). Declared NOW so the config ABI is
-  // stable across 3a->3b. quant_mode: 0=bf16, 1=mxfp8, 2=mxfp4, 3=nvfp4.
+  // SUPERSEDED by the per-prefix quant-info registry (`lookup_quant_info`,
+  // populated Rust-side via `mlx_store_quant_info`). These whole-model scalars
+  // cannot express mixed recipes (affine router + fp experts), so quant dispatch
+  // no longer reads them — `lfm2_switch_linear`/`linear_proj` key off `.scales`
+  // presence + the registry. Kept (unused, default 0) for config-ABI stability;
+  // do NOT re-wire them.
   int quant_mode = 0;
   int bits = 0;
   int group_size = 0;
@@ -386,7 +390,7 @@ inline array lfm2_dense_mlp(const array& x, int layer_idx) {
 //   indices: [ne, k]       rhs (expert) indices
 // Returns [ne, k, out]. The bf16 branch swaps the stored [E, out, in] weight to
 // [E, in, out] for gather_mm (matching qwen35 `switch_linear_forward`). The quant
-// branch (cfg.quant_mode != 0) is declared for Phase 3b; 3a only exercises bf16.
+// branch dispatches per-prefix off the shared quant-info registry (Rust-populated).
 // =====================================================================
 inline array lfm2_switch_linear(
     const array& x,
@@ -394,29 +398,53 @@ inline array lfm2_switch_linear(
     const array& indices,
     const Lfm2MoeConfig& cfg) {
   using namespace qwen35_common;
-  if (cfg.quant_mode != 0) {
-    // Quantized experts (Phase 3b). gate/up/down ship stacked .scales (+ optional
-    // .biases for affine recipes). mode string per cfg.quant_mode.
+  // Quantized experts: dispatch per-prefix off the SHARED quant-info registry
+  // (populated Rust-side via `mlx_store_quant_info`), identical in spirit to
+  // qwen35 `switch_linear_fwd`. The presence of a `.scales` companion is the
+  // authoritative quant marker — NOT `cfg.quant_mode` (a single whole-model
+  // scalar cannot express mixed affine-router + fp-expert recipes). Registry
+  // hit → use the (mode, bits, group_size) tuple Rust resolved; miss → legacy
+  // companion heuristic (no biases → mxfp8 gs=32/bits=8; biases → affine,
+  // shape-inferred bits). After Rust registration the miss path is never taken
+  // for a registered checkpoint (every `.scales` prefix gets an entry).
+  if (has_weight(prefix + ".scales")) {
     auto w = get_weight(prefix + ".weight");
     auto scales = get_weight(prefix + ".scales");
     std::optional<array> biases = std::nullopt;
-    if (g_weights().count(prefix + ".biases") > 0) {
+    if (has_weight(prefix + ".biases")) {
       biases = get_weight(prefix + ".biases");
     }
-    const char* mode = "mxfp8";
-    if (cfg.quant_mode == 2) {
-      mode = "mxfp4";
-    } else if (cfg.quant_mode == 3) {
-      mode = "nvfp4";
+
+    int gs;
+    int bits;
+    std::string mode;
+    if (auto info = lookup_quant_info(prefix)) {
+      gs = info->group_size;
+      bits = info->bits;
+      mode = info->mode;
+    } else {
+      // Legacy heuristic. Shape-based bit inference handles mixed-bit affine
+      // recipes; no-biases means MXFP8 by convention.
+      int w_cols = w.shape(-1);
+      int s_cols = scales.shape(-1);
+      gs = 64;
+      int original_cols = s_cols * gs;
+      bits = (w_cols * 32) / original_cols;
+      mode = biases.has_value() ? "affine" : "mxfp8";
+      if (!biases.has_value()) {
+        gs = 32;
+        bits = 8;
+      }
     }
+
     return mlx::core::gather_qmm(
         x, w, scales, biases,
         std::nullopt,  // lhs_indices (not used)
         indices,       // rhs_indices (expert indices)
         true,          // transpose
-        std::optional<int>(cfg.group_size),
-        std::optional<int>(cfg.bits),
-        std::string(mode),
+        std::optional<int>(gs),
+        std::optional<int>(bits),
+        mode,
         /*sorted=*/false);
   }
   // bf16/f16: plain gather_mm over the swapped weight ([E, in, out]).

@@ -44,6 +44,16 @@ fn last_token_slice_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
 }
 
+/// Escape hatch for the quantized compiled decode path (flat + paged). Returns
+/// `true` (enabled) unless `MLX_LFM2_DISABLE_QUANT_COMPILED` is set, which forces
+/// quantized checkpoints back onto the eager decode path (the A/B baseline and a
+/// production escape hatch). Read once via `OnceLock` (process-global, NOT
+/// per-request) matching the `last_token_slice_enabled` house style.
+pub(crate) fn quant_compiled_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_QUANT_COMPILED").is_none())
+}
+
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
@@ -99,6 +109,23 @@ pub(crate) struct Lfm2Inner {
     /// subset. `false` until weights register (defaults safe: a model that
     /// somehow reached decode unregistered falls back to eager paged).
     pub(crate) all_float_weights_bf16: bool,
+    /// True iff this checkpoint is quantized (any `.scales`-suffixed tensor).
+    /// Computed once at load time (`persistence.rs`: `params.keys().any(.scales)`)
+    /// and set unconditionally after construction, so it is authoritative for ALL
+    /// checkpoints (independent of whether the compiled path registered).
+    /// `paged_compiled_decode_setup` consults it to switch the compiled-paged
+    /// bf16-only gate over to the `non_quant_floats_bf16` invariant — quantized
+    /// `.weight` tensors are uint32-packed, not bf16, so the all-float scan is
+    /// meaningless for them.
+    pub(crate) is_quantized: bool,
+    /// True iff every NON-quantized floating weight is BFloat16 — the
+    /// quantized-checkpoint analogue of `all_float_weights_bf16`. The packed
+    /// `.weight` tensors are uint32 (skipped); their float `.scales`/`.biases`
+    /// companions plus the unquantized dense floats (norms, conv biases, untied
+    /// lm_head, the dense bf16 embedding) must all be bf16 so the hidden state
+    /// feeding the bf16-only `paged_kv_write`/`paged_attention` stays bf16.
+    /// `false` until a quantized checkpoint registers; only meaningful then.
+    pub(crate) non_quant_floats_bf16: bool,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -434,6 +461,12 @@ impl Lfm2Inner {
             // registered weights (set in `persistence.rs` alongside the C++
             // weight registration). A non-match keeps compiled-PAGED OFF.
             all_float_weights_bf16: false,
+            // Safe defaults: `Lfm2Inner::new` only sees `config` (no params/scales),
+            // so both are set post-construction in `persistence.rs` — `is_quantized`
+            // unconditionally, `non_quant_floats_bf16` only when a quantized
+            // checkpoint registers. Defaults keep the quantized compiled path OFF.
+            is_quantized: false,
+            non_quant_floats_bf16: false,
         })
     }
 
@@ -447,13 +480,16 @@ impl Lfm2Inner {
     /// atom) equals this model's [`Lfm2Inner::model_id`].
     ///
     /// The id is published ONLY by `register_weights_with_cpp` (load time), which
-    /// P4 invokes for ANY non-quantized bf16/f16 checkpoint — DENSE or
-    /// sparse-MoE, FLAT or PAGED (Phase 3c lifted the MoE exclusion; P4 lifted
-    /// the paged exclusion). The single registered weight map + `model_id` serve
-    /// BOTH the flat (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`)
-    /// compiled graphs; the per-step dispatcher picks the right one. The gate is
-    /// structurally false for quantized checkpoints (those never register), and
-    /// false until an lfm2 model has registered its weights into the shared map.
+    /// is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or PAGED
+    /// (Phase 3c lifted the MoE exclusion; P4 lifted the paged exclusion) — AND
+    /// now for QUANTIZED checkpoints (authoritative per-projection quant-info is
+    /// published, so `linear_proj` / `lfm2_switch_linear` dispatch correctly),
+    /// gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense (non-packed)
+    /// input embedding; see `should_register_compiled`. The single registered
+    /// weight map + `model_id` serve BOTH the flat (`lfm2_decode_fn`) and paged
+    /// (`lfm2_decode_fn_paged`) compiled graphs; the per-step dispatcher picks the
+    /// right one. The gate is false until an lfm2 model has registered its weights
+    /// into the shared map (and false for an instance evicted by a later load).
     pub(crate) fn compiled_path_active(&self) -> bool {
         let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
         active != 0 && active == self.model_id
@@ -1499,25 +1535,38 @@ impl Lfm2Inner {
         // post-loop export step (plan risk #5).
         use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
         let mut use_cpp_pre = self.compiled_path_active();
-        // bf16-only gate (1b): the compiled-PAGED graph + paged KV pools are
-        // bf16-only (KvDtype::Bf16, bf16 static mask). The gate MUST match what
-        // the graph consumes, not a hand-picked subset: `lfm2_decode_fn_paged`
-        // reads operator/FFN/final norms, q/k norms, attention out_proj, conv
-        // weights/biases, dense-MLP or MoE router/expert weights, and the
-        // (untied) lm_head in addition to q/k/v — any non-bf16 float among them
-        // makes the hidden state (hence q/new_k/new_v) non-bf16 before the
-        // bf16-only `paged_kv_write`/`paged_attention` (step-0 trip at best, an
-        // out-of-contract forward at worst). So we gate on the authoritative
-        // load-time `all_float_weights_bf16` flag (computed once over the whole
-        // registered param map). Non-bf16 → pure-Rust eager paged, with no wasted
-        // seed and no lying engagement signal. `*.expert_bias` (intentional F32
-        // on MoE) is the one allowed exception, handled in the load-time scan.
-        // Quantized checkpoints are already excluded by `compiled_path_active()`.
-        if use_cpp_pre && !self.all_float_weights_bf16 {
+        // bf16-activation gate (1b): the compiled-PAGED graph + paged KV pools are
+        // bf16-only (KvDtype::Bf16, bf16 static mask), so the hidden state feeding
+        // `paged_kv_write`/`paged_attention` must be bf16. The gate MUST match what
+        // the graph consumes, not a hand-picked subset: `lfm2_decode_fn_paged` reads
+        // operator/FFN/final norms, q/k norms, attention out_proj, conv
+        // weights/biases, dense-MLP or MoE router/expert weights, and the (untied)
+        // lm_head in addition to q/k/v.
+        //
+        //  - bf16 checkpoint: EVERY float weight must be bf16
+        //    (`all_float_weights_bf16`).
+        //  - QUANTIZED checkpoint: the packed `.weight` tensors are uint32 (NOT part
+        //    of the activation dtype); the invariant is that the NON-quantized floats
+        //    (norms, conv biases, untied lm_head, dense bf16 embedding) plus the quant
+        //    float companions are bf16 (`non_quant_floats_bf16`), AND the
+        //    `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch is not set. Packed-quant
+        //    INPUT embeddings are already barred at registration (the C++ does a dense
+        //    `take` over the embedding), so a registered quantized checkpoint reaching
+        //    here has a usable dense embedding.
+        //
+        // `*.expert_bias` (intentional F32 on MoE) is the one allowed exception,
+        // handled in the load-time scans.
+        let activations_bf16 = if self.is_quantized {
+            quant_compiled_enabled() && self.non_quant_floats_bf16
+        } else {
+            self.all_float_weights_bf16
+        };
+        if use_cpp_pre && !activations_bf16 {
             warn!(
-                "lfm2 compiled paged decode: model has a non-bf16 float weight (embedding, norm, \
-                 projection, conv, FFN/MoE, or lm_head); the compiled-PAGED graph + paged KV pools \
-                 are bf16-only, so using the pure-Rust eager paged decode path for this request."
+                "lfm2 compiled paged decode: activation-dtype invariant unmet (a non-bf16 float \
+                 weight — embedding, norm, projection, conv, FFN/MoE, or lm_head — or quantized \
+                 compiled decode disabled); the compiled-PAGED graph + paged KV pools are \
+                 bf16-only, so using the pure-Rust eager paged decode path for this request."
             );
             use_cpp_pre = false;
         }
