@@ -1196,49 +1196,6 @@ fn apply_vision_weights(
     Ok(())
 }
 
-/// Register all sanitized weights with the C++ compiled forward pass.
-/// Uses the shared g_weights map (same API as Qwen3.5).
-/// Sets model_id AFTER all weights stored.
-fn register_gemma4_weights_with_cpp(
-    params: &HashMap<String, MxArray>,
-    inner: &Gemma4Inner,
-    model_id: u64,
-) {
-    use mlx_sys as sys;
-    use std::ffi::CString;
-
-    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
-        .write()
-        .unwrap();
-
-    unsafe { sys::mlx_clear_weights() };
-
-    let store = |name: &str, array: &MxArray| {
-        let c_name = CString::new(name).expect("Weight name contains null byte");
-        unsafe {
-            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
-        }
-    };
-
-    for (name, array) in params {
-        store(name, array);
-    }
-
-    // Store pre-transposed embedding weight for tied lm_head in C++ path.
-    // Source the dense (dequantized when applicable) table from inner so
-    // quantized checkpoints don't publish a packed uint32 transpose.
-    if let Some(w_t) = inner.embed_weight_t.as_ref() {
-        store("embed_tokens.weight_t", w_t);
-    } else if let Ok(w_t) = inner.embed_tokens.get_weight().transpose(Some(&[1, 0])) {
-        store("embed_tokens.weight_t", &w_t);
-    }
-
-    let count = unsafe { sys::mlx_weight_count() };
-    info!("Registered {} weights with C++ Gemma4 forward pass", count);
-
-    unsafe { sys::mlx_set_model_id(model_id) };
-}
-
 impl Gemma4Inner {
     /// Load a Gemma4Inner from a directory containing safetensors and config.json.
     ///
@@ -1464,8 +1421,22 @@ impl Gemma4Inner {
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
-        // Register weights with C++ compiled forward pass
-        register_gemma4_weights_with_cpp(&params, &inner, inner.model_id);
+        // NO compiled-weight registration for Gemma4. Gemma4 has NO compiled
+        // C++ forward path (there is no `mlx_gemma4*.cpp`, and Gemma4 never reads
+        // `mlx_*_get_model_id()`); its forward uses primitive-op FFI that takes
+        // weight arrays by POINTER (from this Rust `inner`/`params`), never
+        // by-name from the shared C++ `g_weights` map. The previous
+        // `register_gemma4_weights_with_cpp` was therefore vestigial for
+        // Gemma4's own inference AND actively harmful to co-resident families:
+        // it called `mlx_clear_weights()` (evicting a resident qwen3.5/lfm2
+        // compiled model's weights on every Gemma4 load) and published a
+        // Gemma4 id from a PRIVATE 0-based counter into the SHARED
+        // `g_active_model_id` atom, which could collide with a qwen3.5/lfm2 id
+        // (those draw from the shared `QWEN35_MODEL_ID_COUNTER`) and make their
+        // compiled gate false-positive against Gemma4's weights. Removing the
+        // registration closes that cross-family collision at the root and stops
+        // Gemma4 from clobbering the shared compiled registry. `inner.model_id`
+        // remains a purely local NAPI handle (never published).
 
         // NOTE: the cache-limit coordinator registration happens in
         // `Gemma4Model::load_from_dir` after this function returns,
@@ -1585,5 +1556,70 @@ mod tests {
         );
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
+    }
+
+    /// Cross-family compiled-registry collision regression.
+    ///
+    /// Gemma4 has NO compiled C++ forward path (no `mlx_gemma4*.cpp`; its forward
+    /// uses primitive-op FFI that takes weight arrays by POINTER, never by-name
+    /// from the shared C++ `g_weights`). So a Gemma4 load MUST NOT register
+    /// weights into, or publish a model id onto, the SHARED compiled registry
+    /// (`g_active_model_id` + `g_weights`) that qwen3.5 / lfm2 own. A prior
+    /// `register_gemma4_weights_with_cpp` violated that: it `mlx_clear_weights()`
+    /// (evicting a co-resident qwen3.5/lfm2 compiled model on every Gemma4 load)
+    /// then published a Gemma4 id drawn from a PRIVATE 0-based counter onto the
+    /// shared atom — which could collide with a qwen3.5/lfm2 id (those draw from
+    /// the shared 1-based `QWEN35_MODEL_ID_COUNTER`) and make their compiled gate
+    /// false-positive against Gemma4's weights. This pins the fix: loading a
+    /// Gemma4 model leaves the shared `g_active_model_id` atom UNCHANGED.
+    ///
+    /// Race-free: holds `COMPILED_WEIGHTS_RWLOCK.write()` for the whole check, so
+    /// no concurrent registration/decode (all of which take this lock) can touch
+    /// the atom mid-test. Uses a sentinel id instead of a real qwen/lfm2 load, so
+    /// only a Gemma4 checkpoint is needed. (If Gemma4 registration is ever
+    /// re-introduced it would try to take this same write lock and the test would
+    /// block — a deliberately loud regression signal.)
+    #[test]
+    #[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH pointing to a real Gemma4 checkpoint"]
+    fn gemma4_load_does_not_touch_shared_compiled_model_id() {
+        let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
+            eprintln!("skipping: MLX_TEST_GEMMA4_MODEL_PATH unset");
+            return;
+        };
+
+        // Exclusive ownership of the shared compiled registry for the whole
+        // check (poison-recovered, matching the registration/decode lock usage).
+        let _w = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Remember whatever was published before so we leave the shared atom
+        // exactly as we found it (non-destructive to any co-resident model).
+        let original = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
+
+        // Simulate a resident qwen3.5/lfm2 registration by publishing a sentinel
+        // id onto the shared atom (the same atom `mlx_lfm2_get_model_id()` reads).
+        const SENTINEL: u64 = 0x00C0_FFEE;
+        unsafe { mlx_sys::mlx_set_model_id(SENTINEL) };
+        let before = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
+        assert_eq!(before, SENTINEL, "sentinel id publish failed");
+
+        // Load Gemma4 via the sync inner loader — the exact path that used to
+        // register weights / publish a model id.
+        let loaded = Gemma4Inner::load_from_dir(&model_path);
+
+        let after = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
+        // Restore the pre-test atom value before releasing the lock.
+        unsafe { mlx_sys::mlx_set_model_id(original) };
+
+        let (_inner, _bytes) =
+            loaded.unwrap_or_else(|e| panic!("Gemma4Inner::load_from_dir failed: {e:?}"));
+
+        assert_eq!(
+            after, SENTINEL,
+            "Gemma4 load mutated the SHARED compiled model-id atom ({before:#x} -> {after:#x}); \
+             Gemma4 must not register into the qwen3.5/lfm2 compiled registry — cross-family \
+             model-id collision regression."
+        );
     }
 }

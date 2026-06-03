@@ -195,6 +195,99 @@ bool g_lfm2_inited = false;
 uint64_t g_lfm2_forward_calls = 0;
 uint64_t g_lfm2_compiled_decode_calls = 0;
 
+// =====================================================================
+// PAGED decode state (Phase P1 — the compiled-paged graph). Strictly SEPARATE
+// from the flat globals above so the two paths never alias. The flat path threads
+// a fixed-shape padded KV cache + additive mask; the paged path threads the
+// shared block-paged Metal pools (`mlx::core::fast::paged_kv_write` /
+// `paged_attention`) plus per-turn conv state.
+//
+// CONV-STATE THREADING CONTRACT (the [HIGH] finding — design (A)):
+//   Conv state is threaded EXACTLY like qwen's linear caches: as a graph
+//   input/output cache SLOT, NOT via a side global. `lfm2_decode_fn_paged`
+//   reads each conv layer's prior state from its stride-4 INPUT slot
+//   (`inputs[base+0]`) and writes the new state to its stride-2 OUTPUT slot
+//   (`new_caches[i*kPerLayerOut]`). There is NO separate conv-state global —
+//   the per-turn storage that P2's `mlx_lfm2_moe_forward_paged` re-feeds each
+//   step is the per-layer slot vector `g_lfm2_paged_k_pools[i]`, REUSED to hold
+//   the conv state for conv layers (this is qwen's exact convention: qwen
+//   stores attn pools in `g_dense_k_pools[i]` and threads linear/conv caches in
+//   the parallel `g_dense_paged_linear_caches` slots, indexed by the same `i`
+//   with a placeholder in the other vector). Because lfm2's conv state is a
+//   SINGLE tensor per conv layer (no second recurrent-state tensor like qwen's
+//   linear cache), one slot per layer suffices, so we overload the existing
+//   `g_lfm2_paged_k_pools` vector instead of adding a `num_layers*2` cache
+//   vector. A side global would silently desync the conv recurrence (stale
+//   state fed each step), so it does NOT exist.
+//
+//   g_lfm2_paged_config       POD shape for `lfm2_decode_fn_paged`.
+//   g_lfm2_paged_is_attn      per-ABSOLUTE-layer dispatch (1=attn, 0=conv),
+//                             length num_layers (kept OUT of the POD).
+//   g_lfm2_paged_k_pools      per-ABSOLUTE-layer slot, length num_layers. DUAL
+//                             PURPOSE by layer kind (design (A) above):
+//                               * attn layer i: holds the paged K pool;
+//                               * conv layer i: holds the conv state
+//                                 [B, l_cache-1, hidden].
+//                             P2 feeds this into `fn_inputs[base+0]` and writes
+//                             back `outputs[2+i*2]` here every step. Threaded
+//                             WITHIN a turn only (the eager paged path reprefills
+//                             conv each turn, so there is no cross-turn conv
+//                             export — see plan risk #5).
+//   g_lfm2_paged_v_pools /    per-ABSOLUTE-layer paged pools / scales. Meaningful
+//   g_lfm2_paged_k_scales /   for attn layers only; conv layers hold bf16/f32
+//   g_lfm2_paged_v_scales     placeholders so per-layer indexing stays uniform
+//                             (mirrors qwen's per-layer parallel-vector
+//                             convention — lfm2 mixes attn/conv irregularly, so a
+//                             modulo `is_linear` test like qwen's does NOT apply;
+//                             the explicit is_attn vector drives dispatch).
+//   g_lfm2_paged_offset_int   current decode position (RoPE offset for next step).
+//   g_lfm2_paged_inited       gates the (P2) paged forward FFI.
+//   g_lfm2_paged_forward_calls  cumulative count of mlx_lfm2_moe_forward_paged
+//                             calls that ran the C++ paged decode (BOTH the
+//                             compiled AND the eager MLX_NO_COMPILE arm). This is
+//                             the paged analogue of the flat g_lfm2_forward_calls:
+//                             it proves the paged C++ forward engaged (vs the Rust
+//                             caller silently falling back to the pure-Rust paged
+//                             decode), which is the ONLY engagement signal the
+//                             EAGER-paged (MLX_NO_COMPILE=1) run has — the compiled
+//                             counter below never bumps in that arm. NOT reset by
+//                             mlx_lfm2_paged_reset.
+//   g_lfm2_compiled_paged_decode_calls  cumulative count of forwards that took the
+//                             TRACED compiled_lfm2_decode_paged() branch (NOT the
+//                             eager MLX_NO_COMPILE arm). Process-lifetime
+//                             engagement signal; incremented only in the compiled
+//                             arm (P2). Distinct from the flat counter above.
+// =====================================================================
+lfm2_common::Lfm2MoeConfig g_lfm2_paged_config;
+std::vector<int> g_lfm2_paged_is_attn;
+std::vector<array> g_lfm2_paged_k_pools;       // [num_layers]
+std::vector<array> g_lfm2_paged_v_pools;       // [num_layers]
+std::vector<array> g_lfm2_paged_k_scales;      // [num_layers]
+std::vector<array> g_lfm2_paged_v_scales;      // [num_layers]
+int g_lfm2_paged_offset_int = 0;
+bool g_lfm2_paged_inited = false;
+uint64_t g_lfm2_paged_forward_calls = 0;
+uint64_t g_lfm2_compiled_paged_decode_calls = 0;
+
+// Tear down ONLY the compiled-PAGED decode state — config, is_attn dispatch,
+// per-layer pools/scales/conv-state, offset, inited flag. Does NOT touch the
+// flat globals (g_lfm2_caches / g_lfm2_offset_int / g_lfm2_inited), the shared
+// model-id atom (owned by mlx_clear_weights), or the engagement counters
+// (g_lfm2_paged_forward_calls / g_lfm2_compiled_paged_decode_calls are
+// process-lifetime signals). Defined BEFORE `mlx_lfm2_moe_init_paged` so init
+// can reset stale/aborted state from inside its failure paths; also called by
+// the public `extern "C" mlx_lfm2_paged_reset()`.
+static void lfm2_reset_paged_globals() {
+  g_lfm2_paged_config = lfm2_common::Lfm2MoeConfig{};
+  g_lfm2_paged_is_attn.clear();
+  g_lfm2_paged_k_pools.clear();
+  g_lfm2_paged_v_pools.clear();
+  g_lfm2_paged_k_scales.clear();
+  g_lfm2_paged_v_scales.clear();
+  g_lfm2_paged_offset_int = 0;
+  g_lfm2_paged_inited = false;
+}
+
 // ---------------------------------------------------------------------------
 // REBUILDABLE compiled-decode closure (Phase 3c hardening).
 //
@@ -303,6 +396,191 @@ void lfm2_reset_compiled_closure_same_epoch() {
   g_lfm2_compiled.reset();
   g_lfm2_compiled_epoch_built = 0;
 }
+
+// =====================================================================
+// PAGED single-token decode loop over the lfm2 backbone (Phase P1).
+//
+// A fork of `lfm2_decode_fn` that swaps the flat fixed-shape padded KV cache +
+// additive-mask SDPA for the block-paged KV pool (`mlx::core::fast::
+// paged_kv_write` / `paged_attention`). Conv layers and the dense/MoE FFN
+// dispatch are IDENTICAL to the flat fn — only the attention layers differ. NO
+// additive mask is constructed: `paged_attention` handles validity via
+// `seq_lens`. Modeled on qwen35's `dense_compiled_decode_fn_paged` /
+// `moe_compiled_decode_fn_paged` (per-ABSOLUTE-layer stride-4 inputs, stride-2
+// outputs) but driven by the explicit `g_lfm2_paged_is_attn` dispatch (lfm2 mixes
+// conv/attn irregularly, so qwen's modulo `is_linear` test does NOT apply).
+//
+// INPUT vector layout (all arrays — order is the compile-cache key):
+//   [0]                  h:                 [B, hidden] embedded input
+//   [1]                  offset_arr:        [1] int32 (RoPE position)
+//   [2]                  block_table:       [1, max_blocks_per_seq] int32
+//   [3]                  slot_mapping:      [num_tokens] int64
+//   [4]                  num_valid_tokens:  [1] int32 (informational/unused)
+//   [5]                  num_valid_blocks:  [1] int32 (informational/unused)
+//   [6]                  seq_lens:          [1] int32
+//   For each ABSOLUTE layer i in [0, num_layers) (stride 4 = kPerLayer):
+//     If conv layer (g_lfm2_paged_is_attn[i] == 0):
+//       [7 + i*4 + 0]    conv_state:        [B, l_cache-1, hidden]
+//       [7 + i*4 + 1..3] placeholders       (unused — keep stride uniform)
+//     If attn layer (g_lfm2_paged_is_attn[i] == 1):
+//       [7 + i*4 + 0]    k_pool
+//       [7 + i*4 + 1]    v_pool
+//       [7 + i*4 + 2]    k_scale            [1] f32
+//       [7 + i*4 + 3]    v_scale            [1] f32
+//
+// OUTPUT vector layout (stride 2 = kPerLayerOut, matching qwen's paged graph):
+//   [0]                  logits:            [B, vocab]
+//   [1]                  new_offset:        offset_arr + 1
+//   For each ABSOLUTE layer i:
+//     If conv layer:
+//       [2 + i*2 + 0]    new_conv_state
+//       [2 + i*2 + 1]    placeholder        (scalar bf16 zero — unused)
+//     If attn layer:
+//       [2 + i*2 + 0]    new_k_pool         (post-write pool tensor)
+//       [2 + i*2 + 1]    new_v_pool         (post-write pool tensor)
+//
+// The 4-input / 2-output stride is identical to the qwen paged graphs and the
+// flat lfm2 graph's 2-output stride, so P2's `mlx_lfm2_moe_forward_paged` writes
+// the post-step caches back with the SAME indexing the flat forward uses (attn:
+// pools, conv: conv state in slot.a, slot.b left as the seeded scalar zero).
+// =====================================================================
+std::vector<array> lfm2_decode_fn_paged(const std::vector<array>& inputs) {
+  using namespace lfm2_common;
+  using namespace qwen35_common;
+  const auto& cfg = g_lfm2_paged_config;
+  auto h = inputs[0];           // [B, hidden]
+  auto offset_arr = inputs[1];  // [1] int32
+  auto block_table = inputs[2];
+  auto slot_mapping = inputs[3];
+  // inputs[4] num_valid_tokens, inputs[5] num_valid_blocks: informational
+  // (paged_attention uses seq_lens for validity). Kept in the input vector for a
+  // uniform header with qwen's paged graphs; not read here.
+  auto seq_lens = inputs[6];
+
+  // Phase P1 hard-coded contract (matches qwen attn_for_compile_paged).
+  constexpr int BLOCK_SIZE = 16;
+
+  constexpr int kHeader = 7;
+  constexpr int kPerLayer = 4;     // input stride per layer
+  constexpr int kPerLayerOut = 2;  // output stride per layer
+
+  // Pre-seed all output cache slots (conv slot.b / placeholders stay scalar zero).
+  std::vector<array> new_caches;
+  new_caches.reserve(cfg.num_layers * kPerLayerOut);
+  for (int i = 0; i < cfg.num_layers * kPerLayerOut; i++) {
+    new_caches.push_back(zeros({}, mlx::core::bfloat16));
+  }
+
+  for (int i = 0; i < cfg.num_layers; i++) {
+    std::string lp = "layers." + std::to_string(i);
+    int base = kHeader + i * kPerLayer;
+
+    // (1) operator_norm BEFORE the op, residual after.
+    auto normed =
+        mlx::core::fast::rms_norm(h, get_weight(lp + ".operator_norm.weight"), cfg.norm_eps);
+    if (g_lfm2_paged_is_attn[i]) {
+      const auto& k_pool = inputs[base + 0];
+      const auto& v_pool = inputs[base + 1];
+      const auto& k_scale = inputs[base + 2];
+      const auto& v_scale = inputs[base + 3];
+      auto res = lfm2_attn_pure_fn_arr_paged(
+          normed, i, k_pool, v_pool, k_scale, v_scale, offset_arr, block_table,
+          slot_mapping, seq_lens, BLOCK_SIZE, cfg);
+      h = h + res.output;
+      // lfm2_attn_pure_fn_arr_paged stashes new_k_pool/new_v_pool in keys/values.
+      new_caches[i * kPerLayerOut] = res.keys;
+      new_caches[i * kPerLayerOut + 1] = res.values;
+    } else {
+      const auto& cs = inputs[base + 0];
+      auto res = lfm2_conv_pure_fn(normed, i, cs, cfg.conv_l_cache, cfg.hidden_size,
+                                   /*conv_bias=*/cfg.conv_bias);
+      h = h + res.output;
+      new_caches[i * kPerLayerOut] = res.new_state;
+      // slot.b left as the pre-seeded scalar zero (unused for conv layers).
+    }
+
+    // (2) ffn_norm BEFORE the FFN, residual after — IDENTICAL dispatch to the
+    // flat lfm2_decode_fn (dense SwiGLU vs sparse MoE).
+    auto ffn_in =
+        mlx::core::fast::rms_norm(h, get_weight(lp + ".ffn_norm.weight"), cfg.norm_eps);
+    bool is_moe_layer = cfg.num_experts > 0 && i >= cfg.num_dense_layers;
+    if (is_moe_layer) {
+      h = h + lfm2_moe_ffn(ffn_in, i, cfg);
+    } else {
+      h = h + lfm2_dense_mlp(ffn_in, i);
+    }
+  }
+
+  // Final norm + tied/untied LM head (identical to the flat fn).
+  h = mlx::core::fast::rms_norm(h, get_weight("embedding_norm.weight"), cfg.norm_eps);
+  h = cfg.tie_embedding ? linear_proj(h, "embed_tokens") : linear_proj(h, "lm_head");
+
+  auto new_offset = offset_arr + array(1, mlx::core::int32);
+  std::vector<array> out;
+  out.reserve(2 + cfg.num_layers * kPerLayerOut);
+  out.push_back(h);
+  out.push_back(new_offset);
+  for (auto& c : new_caches) {
+    out.push_back(c);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// REBUILDABLE compiled-PAGED-decode closure (Phase P1).
+//
+// A SECOND epoch-keyed closure that mirrors `compiled_lfm2_decode()` exactly but
+// for `lfm2_decode_fn_paged`, with a DISTINCT `fun_id` base so the flat and paged
+// MLX compile caches NEVER collide (re-wrapping `compile()` on two different
+// target functions already keys on distinct addresses, but to be defensive the
+// per-epoch ids are derived from a separate static anchor too).
+//
+// It SHARES `g_lfm2_compile_epoch` for invalidation — so a single
+// `mlx_lfm2_invalidate_compiled()` on (re)registration retraces BOTH the flat and
+// paged closures against the freshly-stored weight constants — but keeps its OWN
+// non-atomic optional / epoch_built / fun_id_built state guarded by its OWN mutex
+// `g_lfm2_compiled_paged_mu` (a concurrent flat rebuild and paged rebuild touch
+// disjoint state, so two mutexes avoid needless contention; both observe the same
+// shared atomic epoch).
+// ---------------------------------------------------------------------------
+std::mutex g_lfm2_compiled_paged_mu;
+std::optional<std::function<std::vector<array>(const std::vector<array>&)>>
+    g_lfm2_compiled_paged;
+uint64_t g_lfm2_compiled_paged_epoch_built = 0;
+std::uintptr_t g_lfm2_compiled_paged_fun_id_built = 0;  // 0 == none installed
+bool g_lfm2_has_compiled_paged_fun_id = false;
+
+// lfm2 PAGED-LOCAL fun_id base: a SEPARATE static anchor address, distinct from
+// `lfm2_fun_id_base()` (the flat path's anchor), so the flat and paged per-epoch
+// ids can never collide even at the same epoch.
+inline std::uintptr_t lfm2_paged_fun_id_base() {
+  static char anchor = 0;
+  return reinterpret_cast<std::uintptr_t>(&anchor);
+}
+
+// Returns a stable, owned COPY of the compiled-paged decode closure, re-tracing
+// it under a fresh per-epoch `fun_id` if the shared registration epoch advanced
+// since it was last built. Same lower-level `detail::compile` + `compile_erase`
+// scheme and same by-value return contract as `compiled_lfm2_decode()` (see that
+// function's thread-safety notes); only the target fn, mutex, and fun_id base
+// differ. fun_id scheme: `lfm2_paged_fun_id_base() ^ ((epoch << 1) | 1)`.
+std::function<std::vector<array>(const std::vector<array>&)> compiled_lfm2_decode_paged() {
+  std::lock_guard<std::mutex> lk(g_lfm2_compiled_paged_mu);
+  uint64_t cur = g_lfm2_compile_epoch.load(std::memory_order_acquire);
+  if (!g_lfm2_compiled_paged.has_value() || g_lfm2_compiled_paged_epoch_built != cur) {
+    if (g_lfm2_has_compiled_paged_fun_id) {
+      mlx::core::detail::compile_erase(g_lfm2_compiled_paged_fun_id_built);
+    }
+    std::uintptr_t fun_id =
+        lfm2_paged_fun_id_base() ^ static_cast<std::uintptr_t>((cur << 1) | 1ull);
+    g_lfm2_compiled_paged = mlx::core::detail::compile(lfm2_decode_fn_paged, fun_id);
+    g_lfm2_compiled_paged_epoch_built = cur;
+    g_lfm2_compiled_paged_fun_id_built = fun_id;
+    g_lfm2_has_compiled_paged_fun_id = true;
+  }
+  return *g_lfm2_compiled_paged;
+}
+
 // =============================================================================
 // TEST-ONLY shared synthetic-MoE helpers (used by the compiled-vs-eager probe
 // AND the no-bump warm probe). Extracted from `mlx_lfm2_probe_moe_compiled_vs_eager`
@@ -797,6 +1075,415 @@ void mlx_lfm2_moe_reset() {
 // re-capture B's weights instead of reusing A's frozen graph.
 void mlx_lfm2_invalidate_compiled() {
   g_lfm2_compile_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// =============================================================================
+// PAGED forward FFI (Phase P2). Mirrors qwen35's
+// `mlx_qwen35_init_paged` / `mlx_qwen35_forward_paged` /
+// `mlx_qwen35_compiled_reset` (paged half) and the flat lfm2
+// `mlx_lfm2_moe_init_from_prefill` / `mlx_lfm2_moe_forward` style. Drives the
+// compiled-PAGED decode graph (`lfm2_decode_fn_paged` / `compiled_lfm2_decode_paged`)
+// over the shared block-paged Metal pools. STRICTLY separate from the flat
+// globals/lifecycle above — the two decode paths never alias.
+//
+// bf16/f16 ONLY (quantized stays eager). Decode-only: prefill stays eager
+// pure-Rust paged; this is SEEDED from the post-prefill adapter pools + conv
+// state. Covers BOTH dense lfm2 and lfm2_moe in ONE decode fn (the FFN dispatch
+// is reused unchanged via g_lfm2_paged_config.num_experts / num_dense_layers).
+// =============================================================================
+
+// Initialize the compiled-paged lfm2 decode graph from post-prefill state.
+//
+// `is_attn` (length num_layers, 1=attn/0=conv) drives the per-layer dispatch
+// and is built dynamically Rust-side from config.is_attention_layer; it is NEVER
+// a modulo/hardcoded pattern (lfm2 mixes conv/attn irregularly).
+//
+// Per-layer handle import (design (A) — see the g_lfm2_paged_* contract above):
+//   attn layer i: k_pool_handles[i] -> g_lfm2_paged_k_pools[i]
+//                 v_pool_handles[i] -> g_lfm2_paged_v_pools[i]
+//                 k_scale_handles[i] -> g_lfm2_paged_k_scales[i]
+//                 v_scale_handles[i] -> g_lfm2_paged_v_scales[i]
+//                 (null on any -> bail, g_lfm2_paged_inited=false, return -1).
+//   conv layer i: conv_state_handles[i] -> g_lfm2_paged_k_pools[i]
+//                 (the k_pools vector is REUSED to hold conv state for conv
+//                 layers — one tensor per conv layer suffices). The v_pool /
+//                 k_scale / v_scale slots get bf16/f32 placeholders so per-layer
+//                 indexing stays uniform; they are never read for conv layers.
+//                 (null conv_state -> bail.)
+//
+// max_kv_len / block_size are accepted for ABI symmetry with the flat init and
+// qwen's paged init; the paged graph hard-codes block_size=16 internally
+// (matches qwen attn_for_compile_paged), so block_size MUST be 16 here.
+//
+// Force-evals the attn pools at init to surface a Metal OOM / layout / dtype
+// fault HERE rather than inside the first forward (where the Rust caller's
+// record_tokens has already mutated adapter state). Returns 0 on success, -1 on
+// failure; on failure g_lfm2_paged_inited is cleared and a stderr diagnostic is
+// emitted, so the Rust caller MUST inspect the return value and fall back to the
+// pure-Rust paged decode.
+int32_t mlx_lfm2_moe_init_paged(
+    int num_layers,
+    int hidden_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    float rope_theta,
+    float norm_eps,
+    int conv_l_cache,
+    int num_experts,
+    int num_experts_per_tok,
+    int num_dense_layers,
+    int norm_topk_prob,
+    int use_expert_bias,
+    int tie_embedding,
+    int conv_bias,
+    int max_kv_len,
+    int batch_size,
+    int block_size,
+    const int32_t* is_attn,
+    // Per-layer paged storage (length num_layers). Conv-layer pool/scale slots
+    // may be null (placeholders are stored).
+    mlx_array** k_pool_handles,
+    mlx_array** v_pool_handles,
+    mlx_array** k_scale_handles,
+    mlx_array** v_scale_handles,
+    // Per-layer conv state (length num_layers). Attn-layer slots may be null.
+    mlx_array** conv_state_handles,
+    int prefill_offset) {
+  // Clear any stale state from a prior aborted init (a previous failure could
+  // have left partially-populated pool/scale vectors + imported array handles
+  // resident — GPU-backed leak). Every failure path below + the catch blocks
+  // also reset, so init never leaves mutated globals behind on failure.
+  lfm2_reset_paged_globals();
+  try {
+    // The paged graph hard-codes block_size=16 (matches qwen
+    // attn_for_compile_paged); reject any other value loudly rather than
+    // silently miswiring the pool layout.
+    if (block_size != 16) {
+      std::cerr << "[MLX] mlx_lfm2_moe_init_paged: block_size must be 16, got "
+                << block_size << std::endl;
+      lfm2_reset_paged_globals();
+      return -1;
+    }
+
+    g_lfm2_paged_config = Lfm2MoeConfig{};
+    g_lfm2_paged_config.num_layers = num_layers;
+    g_lfm2_paged_config.hidden_size = hidden_size;
+    g_lfm2_paged_config.num_heads = num_heads;
+    g_lfm2_paged_config.num_kv_heads = num_kv_heads;
+    g_lfm2_paged_config.head_dim = head_dim;
+    g_lfm2_paged_config.rope_theta = rope_theta;
+    g_lfm2_paged_config.norm_eps = norm_eps;
+    g_lfm2_paged_config.conv_l_cache = conv_l_cache;
+    g_lfm2_paged_config.num_experts = num_experts;
+    g_lfm2_paged_config.num_experts_per_tok = num_experts_per_tok;
+    g_lfm2_paged_config.num_dense_layers = num_dense_layers;
+    g_lfm2_paged_config.norm_topk_prob = norm_topk_prob != 0;
+    g_lfm2_paged_config.use_expert_bias = use_expert_bias != 0;
+    g_lfm2_paged_config.tie_embedding = tie_embedding != 0;
+    g_lfm2_paged_config.conv_bias = conv_bias != 0;
+    g_lfm2_paged_config.max_kv_len = max_kv_len;
+    g_lfm2_paged_config.batch_size = batch_size;
+    // NOTE: Lfm2MoeConfig has NO rope_dims — RoPE is over the full head_dim.
+
+    g_lfm2_paged_is_attn.assign(is_attn, is_attn + num_layers);
+
+    g_lfm2_paged_k_pools.clear();
+    g_lfm2_paged_v_pools.clear();
+    g_lfm2_paged_k_scales.clear();
+    g_lfm2_paged_v_scales.clear();
+    g_lfm2_paged_k_pools.reserve(num_layers);
+    g_lfm2_paged_v_pools.reserve(num_layers);
+    g_lfm2_paged_k_scales.reserve(num_layers);
+    g_lfm2_paged_v_scales.reserve(num_layers);
+    g_lfm2_paged_inited = false;
+
+    auto bf16_placeholder = []() { return zeros({}, mlx::core::bfloat16); };
+    auto f32_placeholder = []() { return array(1.0f, mlx::core::float32); };
+
+    for (int i = 0; i < num_layers; i++) {
+      if (is_attn[i]) {
+        if (!k_pool_handles || !v_pool_handles || !k_scale_handles ||
+            !v_scale_handles || !k_pool_handles[i] || !v_pool_handles[i] ||
+            !k_scale_handles[i] || !v_scale_handles[i]) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: missing pool/scale handle "
+                       "for attn layer "
+                    << i << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        g_lfm2_paged_k_pools.push_back(*reinterpret_cast<array*>(k_pool_handles[i]));
+        g_lfm2_paged_v_pools.push_back(*reinterpret_cast<array*>(v_pool_handles[i]));
+        g_lfm2_paged_k_scales.push_back(*reinterpret_cast<array*>(k_scale_handles[i]));
+        g_lfm2_paged_v_scales.push_back(*reinterpret_cast<array*>(v_scale_handles[i]));
+      } else {
+        // Conv layer: g_lfm2_paged_k_pools[i] holds the conv state (design (A)).
+        // v_pool / k_scale / v_scale are unread placeholders for stride symmetry.
+        if (!conv_state_handles || !conv_state_handles[i]) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: missing conv-state handle "
+                       "for conv layer "
+                    << i << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        g_lfm2_paged_k_pools.push_back(*reinterpret_cast<array*>(conv_state_handles[i]));
+        g_lfm2_paged_v_pools.push_back(bf16_placeholder());
+        g_lfm2_paged_k_scales.push_back(f32_placeholder());
+        g_lfm2_paged_v_scales.push_back(f32_placeholder());
+      }
+    }
+
+    g_lfm2_paged_offset_int = prefill_offset;
+
+    // Defense-in-depth: validate the attn pool/scale dtype contract and
+    // force-eval them so a Metal-allocation or layout fault throws HERE (init),
+    // not inside the first forward.
+    {
+      std::vector<array> probe;
+      probe.reserve(num_layers * 4 + 1);
+      for (int i = 0; i < num_layers; i++) {
+        if (!is_attn[i]) continue;
+        if (g_lfm2_paged_k_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: layer " << i
+                    << " k_pool dtype != bf16" << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        if (g_lfm2_paged_v_pools[i].dtype() != mlx::core::bfloat16) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: layer " << i
+                    << " v_pool dtype != bf16" << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        if (g_lfm2_paged_k_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: layer " << i
+                    << " k_scale dtype != f32" << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        if (g_lfm2_paged_v_scales[i].dtype() != mlx::core::float32) {
+          std::cerr << "[MLX] mlx_lfm2_moe_init_paged: layer " << i
+                    << " v_scale dtype != f32" << std::endl;
+          lfm2_reset_paged_globals();
+          return -1;
+        }
+        probe.push_back(g_lfm2_paged_k_pools[i]);
+        probe.push_back(g_lfm2_paged_v_pools[i]);
+        probe.push_back(g_lfm2_paged_k_scales[i]);
+        probe.push_back(g_lfm2_paged_v_scales[i]);
+      }
+      // Break the lazy RNG split chain from model init, and force-eval the pool /
+      // scale layout in the same batch so any Metal/layout error throws here.
+      auto rng_key = mlx::core::random::KeySequence::default_().next();
+      probe.push_back(rng_key);
+      mlx::core::eval(std::move(probe));
+    }
+
+    g_lfm2_paged_inited = true;
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_lfm2_moe_init_paged: " << e.what() << std::endl;
+    // Reset BEFORE returning so a partially-populated init (imported handles /
+    // pool vectors mutated before the throw) leaves no stale GPU-backed state.
+    lfm2_reset_paged_globals();
+    return -1;
+  } catch (...) {
+    std::cerr << "[MLX] mlx_lfm2_moe_init_paged: unknown exception" << std::endl;
+    lfm2_reset_paged_globals();
+    return -1;
+  }
+}
+
+// Single-token compiled-paged decode step. Inputs (PagedAttentionInputs) come
+// from the Rust adapter's `build_paged_attention_inputs`; the per-layer pool /
+// scale / conv-state globals come from `mlx_lfm2_moe_init_paged`. Writes a null
+// *output_logits when the graph is not initialized (or on error) so the caller
+// falls back to the pure-Rust paged decode.
+//
+// DECODE-ONLY contract (mirrors qwen): `input_ids` MUST have exactly one element
+// and `slot_mapping` MUST be `[1]`. The compiled-paged branch increments
+// g_lfm2_compiled_paged_decode_calls ONLY in the compiled arm (NOT the eager
+// MLX_NO_COMPILE arm) — the engagement signal that the traced closure ran.
+void mlx_lfm2_moe_forward_paged(
+    mlx_array* input_ids_ptr,
+    mlx_array* embedding_weight_ptr,
+    mlx_array* offset_arr_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* num_valid_tokens_ptr,
+    mlx_array* num_valid_blocks_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array** output_logits,
+    int* cache_offset_out) {
+  if (!g_lfm2_paged_inited) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  if (!input_ids_ptr || !embedding_weight_ptr || !output_logits ||
+      !offset_arr_ptr || !block_table_ptr || !slot_mapping_ptr ||
+      !num_valid_tokens_ptr || !num_valid_blocks_ptr || !seq_lens_ptr) {
+    if (output_logits) *output_logits = nullptr;
+    return;
+  }
+  const auto& cfg = g_lfm2_paged_config;
+
+  try {
+    auto& input_ids = *reinterpret_cast<array*>(input_ids_ptr);
+    auto& embedding = *reinterpret_cast<array*>(embedding_weight_ptr);
+    auto& offset_arr = *reinterpret_cast<array*>(offset_arr_ptr);
+    auto& block_table = *reinterpret_cast<array*>(block_table_ptr);
+    auto& slot_mapping = *reinterpret_cast<array*>(slot_mapping_ptr);
+    auto& num_valid_tokens = *reinterpret_cast<array*>(num_valid_tokens_ptr);
+    auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
+    auto& seq_lens = *reinterpret_cast<array*>(seq_lens_ptr);
+
+    // Decode-only contract: single-token. `paged_kv_write` requires
+    // slot_mapping.shape(0) == new_k.shape(0) (== num_tokens == 1).
+    if (input_ids.size() != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_lfm2_moe_forward_paged: decode-only contract violated — "
+              "input_ids.size() = %lld, expected 1\n",
+              static_cast<long long>(input_ids.size()));
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
+    if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != 1) {
+      fprintf(stderr,
+              "[MLX] mlx_lfm2_moe_forward_paged: decode-only contract violated — "
+              "slot_mapping shape must be [1], got ndim=%d, shape[0]=%lld\n",
+              slot_mapping.ndim(),
+              slot_mapping.ndim() >= 1 ? static_cast<long long>(slot_mapping.shape(0))
+                                       : -1LL);
+      fflush(stderr);
+      *output_logits = nullptr;
+      return;
+    }
+
+    // Engagement counter: this forward is past the inited + decode-only contract
+    // checks, so the C++ paged decode WILL run (compiled or eager). Bump BEFORE
+    // the compiled/eager branch — this is the paged analogue of the flat
+    // g_lfm2_forward_calls and is the only "paged C++ forward engaged" signal the
+    // EAGER (MLX_NO_COMPILE=1) arm produces (the compiled counter never bumps
+    // there). A Rust caller that fell back to the pure-Rust paged decode would
+    // never reach here, so a nonzero delta proves the C++ paged path ran.
+    g_lfm2_paged_forward_calls++;
+
+    // Embedding lookup: [B,1] -> [B, hidden] (2D, matching lfm2_decode_fn_paged h).
+    auto flat_ids = reshape(input_ids, {-1});
+    auto h = take(embedding, flat_ids, 0);
+
+    // Assemble fn_inputs in the P1 stride-4 order (see lfm2_decode_fn_paged):
+    //   [0..6] header, then per ABSOLUTE layer i (stride 4):
+    //     attn: k_pool, v_pool, k_scale, v_scale
+    //     conv: conv_state, placeholder*3
+    std::vector<array> fn_inputs;
+    fn_inputs.reserve(7 + cfg.num_layers * 4);
+    fn_inputs.push_back(std::move(h));
+    fn_inputs.push_back(offset_arr);
+    fn_inputs.push_back(block_table);
+    fn_inputs.push_back(slot_mapping);
+    fn_inputs.push_back(num_valid_tokens);
+    fn_inputs.push_back(num_valid_blocks);
+    fn_inputs.push_back(seq_lens);
+    for (int i = 0; i < cfg.num_layers; i++) {
+      if (g_lfm2_paged_is_attn[i]) {
+        fn_inputs.push_back(g_lfm2_paged_k_pools[i]);
+        fn_inputs.push_back(g_lfm2_paged_v_pools[i]);
+        fn_inputs.push_back(g_lfm2_paged_k_scales[i]);
+        fn_inputs.push_back(g_lfm2_paged_v_scales[i]);
+      } else {
+        // Conv layer: slot 0 is the conv state (held in g_lfm2_paged_k_pools[i]);
+        // the other 3 are unused placeholders (held in the parallel vectors).
+        fn_inputs.push_back(g_lfm2_paged_k_pools[i]);
+        fn_inputs.push_back(g_lfm2_paged_v_pools[i]);
+        fn_inputs.push_back(g_lfm2_paged_k_scales[i]);
+        fn_inputs.push_back(g_lfm2_paged_v_scales[i]);
+      }
+    }
+
+    // MLX_NO_COMPILE=1 disables compilation for A/B testing — EXACTLY like the
+    // flat mlx_lfm2_moe_forward. Take an OWNED copy of the compiled closure into
+    // a local before invoking it (compiled_lfm2_decode_paged() returns by value;
+    // a concurrent invalidate+recompile cannot dangle this handle mid-call).
+    //
+    // ALSO honor MLX_DISABLE_COMPILE: MLX's own `compile()` becomes a no-op under
+    // MLX_DISABLE_COMPILE (it returns the eager fn unchanged). If we only checked
+    // MLX_NO_COMPILE we would still take the `else` arm and bump
+    // g_lfm2_compiled_paged_decode_calls even though NO traced/compiled graph
+    // actually ran — the engagement counter would lie. Treat either env var as
+    // "no compiled graph" so the compiled counter only bumps when a real compiled
+    // closure executes.
+    static bool no_compile = std::getenv("MLX_NO_COMPILE") != nullptr ||
+                             std::getenv("MLX_DISABLE_COMPILE") != nullptr;
+    std::vector<array> outputs;
+    if (no_compile) {
+      outputs = lfm2_decode_fn_paged(fn_inputs);
+    } else {
+      auto compiled = compiled_lfm2_decode_paged();
+      // Bump the TRACED-branch counter ONLY here (never in the no_compile arm).
+      g_lfm2_compiled_paged_decode_calls++;
+      outputs = compiled(fn_inputs);
+    }
+
+    if (output_logits) {
+      *output_logits = reinterpret_cast<mlx_array*>(new array(outputs[0]));
+    }
+    g_lfm2_paged_offset_int++;
+    // Stash post-step caches back into the per-layer slots (stride 2 output):
+    //   attn: outputs[2+i*2] = new_k_pool, outputs[2+i*2+1] = new_v_pool
+    //   conv: outputs[2+i*2] = new_conv_state (-> k_pools[i]); slot.b unused.
+    for (int i = 0; i < cfg.num_layers; i++) {
+      auto& a = outputs[2 + i * 2];
+      auto& b = outputs[2 + i * 2 + 1];
+      if (g_lfm2_paged_is_attn[i]) {
+        g_lfm2_paged_k_pools[i] = a;
+        g_lfm2_paged_v_pools[i] = b;
+      } else {
+        // Conv state threaded WITHIN the turn via the k_pools slot. slot.b is the
+        // unused scalar placeholder — leave the placeholder in place.
+        g_lfm2_paged_k_pools[i] = a;
+      }
+    }
+
+    if (cache_offset_out) {
+      *cache_offset_out = g_lfm2_paged_offset_int;
+    }
+  } catch (const std::exception& e) {
+    fprintf(stderr, "[MLX] Exception in mlx_lfm2_moe_forward_paged: %s\n", e.what());
+    fflush(stderr);
+    if (output_logits) *output_logits = nullptr;
+  } catch (...) {
+    fprintf(stderr, "[MLX] Unknown exception in mlx_lfm2_moe_forward_paged\n");
+    fflush(stderr);
+    if (output_logits) *output_logits = nullptr;
+  }
+}
+
+// Tear down ONLY the compiled-paged decode state — config, is_attn dispatch,
+// per-layer pools/scales/conv-state, offset, inited flag. Does NOT touch the
+// flat globals (g_lfm2_caches / g_lfm2_offset_int / g_lfm2_inited), the shared
+// model-id atom (owned by mlx_clear_weights), or the engagement counter (a
+// process-lifetime signal). Mirrors the paged half of mlx_qwen35_compiled_reset.
+// Delegates to the file-static `lfm2_reset_paged_globals()` so init failure
+// paths and the public reset share one source of truth for the global set.
+void mlx_lfm2_paged_reset() { lfm2_reset_paged_globals(); }
+
+// Cumulative count of forwards that took the TRACED compiled_lfm2_decode_paged()
+// branch (NOT the eager MLX_NO_COMPILE arm). Distinct from the flat counter
+// (mlx_lfm2_moe_compiled_decode_call_count). Process-lifetime engagement signal;
+// intentionally NOT reset by mlx_lfm2_paged_reset.
+uint64_t mlx_lfm2_moe_compiled_paged_call_count() {
+  return g_lfm2_compiled_paged_decode_calls;
+}
+
+// Cumulative count of mlx_lfm2_moe_forward_paged calls that ran the C++ paged
+// decode (BOTH the compiled AND the eager MLX_NO_COMPILE arm). The paged analogue
+// of the flat mlx_lfm2_moe_forward_call_count; the ONLY engagement signal the
+// EAGER-paged (MLX_NO_COMPILE=1) run has, since the compiled-paged counter above
+// never bumps in that arm. Process-lifetime; NOT reset by mlx_lfm2_paged_reset.
+uint64_t mlx_lfm2_moe_paged_forward_call_count() {
+  return g_lfm2_paged_forward_calls;
 }
 
 // =============================================================================
