@@ -521,6 +521,38 @@ fn augment_mtplx_mtp_quantization(
     n_mtp_layers: i32,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
 ) {
+    // Dense (and dense-flavored) MTP: walk the dense per-layer linear set.
+    augment_mtplx_mtp_quantization_with_suffixes(
+        raw,
+        n_mtp_layers,
+        &MTP_LAYER_LINEAR_SUFFIXES,
+        per_layer_quant,
+    );
+}
+
+/// Augment `per_layer_quant` with the MTP head's per-layer-quant metadata
+/// derived from the `mtplx_mtp_quantization` config block, recording one PLQ
+/// entry per `mtp.layers.{i}.<suffix>` for every `suffix` in `linear_suffixes`
+/// (plus `mtp.fc` under policy `"all"`).
+///
+/// Parameterized by `linear_suffixes` so the dense loader passes the dense
+/// per-layer linear set ([`MTP_LAYER_LINEAR_SUFFIXES`], unchanged behavior) and
+/// the MoE loader passes the flavor-correct set
+/// ([`crate::models::mtp_drafter::MTP_MOE_LAYER_LINEAR_SUFFIXES`] for a
+/// MoE-flavored MTP layer, or the dense set for a dense-flavored MoE MTP layer).
+/// The single-PLQ `mtplx_mtp_quantization` block (uniform bits/group_size/mode)
+/// is sufficient for both because convert quantizes every matched MTP linear at
+/// the SAME uniform PLQ (Option A); see `convert::is_mtp_layer_quantizable_prefix`.
+///
+/// `.entry().or_insert()` is non-clobbering: a per-key override already parsed
+/// from the main `quantization` block (which excludes `mtp.*`, so this is rare)
+/// takes precedence.
+pub(crate) fn augment_mtplx_mtp_quantization_with_suffixes(
+    raw: &Value,
+    n_mtp_layers: i32,
+    linear_suffixes: &[&str],
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+) {
     let Some((policy, plq)) = mtplx_mtp_quant(raw) else {
         return;
     };
@@ -535,7 +567,7 @@ fn augment_mtplx_mtp_quantization(
     }
 
     for layer_idx in 0..n_mtp_layers.max(0) {
-        for suffix in MTP_LAYER_LINEAR_SUFFIXES {
+        for suffix in linear_suffixes {
             per_layer_quant
                 .entry(format!("mtp.layers.{layer_idx}.{suffix}"))
                 .or_insert(plq);
@@ -2158,6 +2190,94 @@ mod tests {
         augment_mtplx_mtp_quantization(&raw, 1, &mut overrides);
 
         assert!(overrides.contains_key("mtp.fc"));
+        assert_eq!(overrides.len(), 8);
+    }
+
+    /// Fix 3 (Task 36): a MoE-flavored MTP layer augments the per-layer-quant
+    /// table with the MoE MLP linear set (experts, router gate, shared expert +
+    /// gate) in addition to the shared attention projections — all at the
+    /// uniform PLQ from the `mtplx_mtp_quantization` block (Option A).
+    #[test]
+    fn mtplx_all_quant_metadata_moe_flavor_includes_expert_and_gate_linears() {
+        use crate::models::mtp_drafter::MTP_MOE_LAYER_LINEAR_SUFFIXES;
+        let raw = json!({
+            "mtplx_mtp_quantization": {
+                "prequantized": true,
+                "policy": "all",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine"
+            }
+        });
+        let mut overrides = HashMap::new();
+        augment_mtplx_mtp_quantization_with_suffixes(
+            &raw,
+            1,
+            &MTP_MOE_LAYER_LINEAR_SUFFIXES,
+            &mut overrides,
+        );
+
+        let expect_plq = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+        };
+        for key in [
+            "mtp.layers.0.self_attn.o_proj",
+            "mtp.layers.0.mlp.switch_mlp.gate_proj",
+            "mtp.layers.0.mlp.switch_mlp.up_proj",
+            "mtp.layers.0.mlp.switch_mlp.down_proj",
+            "mtp.layers.0.mlp.gate",
+            "mtp.layers.0.mlp.shared_expert.gate_proj",
+            "mtp.layers.0.mlp.shared_expert.up_proj",
+            "mtp.layers.0.mlp.shared_expert.down_proj",
+            "mtp.layers.0.mlp.shared_expert_gate",
+        ] {
+            assert_eq!(
+                overrides.get(key).copied(),
+                Some(expect_plq),
+                "missing/incorrect PLQ for MoE MTP linear {key}",
+            );
+        }
+        // `mtp.fc` under policy "all".
+        assert_eq!(overrides.get("mtp.fc").copied(), Some(expect_plq));
+        // 12 per-layer linears (4 attn + 8 MoE MLP) + mtp.fc = 13.
+        assert_eq!(overrides.len(), 13);
+        // The router gate is recorded at the uniform 4-bit PLQ (Option A), NOT a
+        // separate 8-bit gate gate-default — this is what makes the single-PLQ
+        // sidecar block sufficient for produce + reload.
+        assert_eq!(overrides.get("mtp.layers.0.mlp.gate").unwrap().bits, 4);
+    }
+
+    /// A DENSE-flavored MoE MTP layer (sparse step / mlp_only_layers makes the
+    /// pinned fa_idx a dense layer) must use the DENSE suffix list: no
+    /// `switch_mlp.*`/`mlp.gate`/`shared_expert.*` entries, just attention +
+    /// dense MLP — matching what its `apply_weights`/`get_parameters` emit.
+    #[test]
+    fn mtplx_quant_metadata_dense_flavored_moe_uses_dense_suffixes() {
+        let raw = json!({
+            "mtplx_mtp_quantization": {
+                "prequantized": true,
+                "policy": "all",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine"
+            }
+        });
+        let mut overrides = HashMap::new();
+        // Dense-flavored MoE MTP passes the dense suffix list.
+        augment_mtplx_mtp_quantization_with_suffixes(
+            &raw,
+            1,
+            &MTP_LAYER_LINEAR_SUFFIXES,
+            &mut overrides,
+        );
+        assert!(overrides.contains_key("mtp.layers.0.mlp.gate_proj"));
+        assert!(overrides.contains_key("mtp.layers.0.mlp.down_proj"));
+        assert!(!overrides.contains_key("mtp.layers.0.mlp.switch_mlp.gate_proj"));
+        assert!(!overrides.contains_key("mtp.layers.0.mlp.gate"));
+        assert!(!overrides.contains_key("mtp.layers.0.mlp.shared_expert.gate_proj"));
+        // 7 dense per-layer linears + mtp.fc.
         assert_eq!(overrides.len(), 8);
     }
 

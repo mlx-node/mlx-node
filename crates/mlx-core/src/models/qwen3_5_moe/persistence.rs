@@ -9,10 +9,14 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, parse_quant_block, resolve_default_mode,
 };
-use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
+use crate::models::qwen3_5::persistence::{
+    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
+    parse_vision_config,
+};
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
@@ -1130,8 +1134,37 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         .and_then(|q| q["group_size"].as_i64())
                         .unwrap_or(DEFAULT_QUANT_GROUP_SIZE as i64)
                         as i32;
-                    let (top_level_mode, per_layer_quant) =
+                    let (top_level_mode, mut per_layer_quant) =
                         parse_quant_block(quant_cfg, quant_group_size);
+
+                    // PR #65 (Task 36) — augment the per-layer-quant table with
+                    // the MTP head's quantization metadata derived from the
+                    // `mtplx_mtp_quantization` config block, mirroring the dense
+                    // loader (`qwen3_5/persistence.rs`). Without this, a
+                    // `--q-mtp {cyankiwi,all}` MoE checkpoint reloads its
+                    // quantized MTP linears (router gate, switch_mlp experts,
+                    // shared expert + gate, attention) with the WRONG PLQ — the
+                    // gate-prefix would fall back to the 8-bit `default_gate_plq`
+                    // while convert packed them at the uniform 4-bit/gs32 affine
+                    // PLQ (Option A), corrupting the head. The suffix set is
+                    // flavor-derived from the SAME `mtp_mlp_variant` decision the
+                    // load-completeness gate uses (a dense-flavored MoE MTP layer
+                    // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
+                    // the dense suffix list). Injected BEFORE both
+                    // `apply_weights_moe_inner` (eager) and
+                    // `register_moe_weights_with_cpp` (compiled) so both MoE MTP
+                    // paths resolve the correct PLQ.
+                    let mtp_linear_suffixes: &[&str] =
+                        match super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config) {
+                            DrafterBodyVariant::Moe => &MTP_MOE_LAYER_LINEAR_SUFFIXES,
+                            DrafterBodyVariant::Dense => &MTP_LAYER_LINEAR_SUFFIXES,
+                        };
+                    augment_mtplx_mtp_quantization_with_suffixes(
+                        &raw,
+                        config.n_mtp_layers,
+                        mtp_linear_suffixes,
+                        &mut per_layer_quant,
+                    );
 
                     if quant_cfg.is_some() {
                         info!(

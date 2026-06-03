@@ -310,16 +310,23 @@ impl Qwen3_5MoeMTPModule {
 
         // Per-projection PLQ resolution delegates to `effective_plq_for`
         // in `quant_dispatch.rs` — the same helper the main MoE loader
-        // uses in `apply_weights_moe_inner`. This is critical for the
-        // canonical recipes (`mixed_2_6`, `mixed_3_4`, `qwen3_5`) where
-        // the global default is 4-bit affine but the router gates
-        // (`*.mlp.gate`, `*.mlp.shared_expert_gate`) are 8-bit affine;
-        // `effective_plq_for` routes the gate prefixes to
-        // `default_gate_plq` when no per-layer override is recorded.
-        // MTP keys are skipped in the per-layer override table so the
-        // gate-default fallback is the only path that produces correct
-        // bits/group_size for `mtp.layers.{i}.mlp.gate` and
-        // `mtp.layers.{i}.mlp.shared_expert_gate`.
+        // uses in `apply_weights_moe_inner`.
+        //
+        // Two cases, both correct:
+        //  * BODY-quantized-only checkpoint (no `mtplx_mtp_quantization` block):
+        //    MTP keys are absent from `per_layer_quant`, so the router gate
+        //    prefixes (`*.mlp.gate`, `*.mlp.shared_expert_gate`) fall back to
+        //    `default_gate_plq` — 8-bit affine for the canonical recipes
+        //    (`mixed_2_6`, `mixed_3_4`, `qwen3_5`) where the body default is
+        //    4-bit affine. (This is what `apply_weights_routes_gate_to_default_gate_plq`
+        //    locks in.)
+        //  * MTP-quantized checkpoint (`--q-mtp {cyankiwi,all}`): the MoE loader
+        //    (`qwen3_5_moe/persistence.rs::load_with_thread`, Task 36) augments
+        //    `per_layer_quant` with one entry per `mtp.layers.{i}.<suffix>` at
+        //    the UNIFORM PLQ from the `mtplx_mtp_quantization` block (Option A —
+        //    4-bit/gs32 affine, including the router gate). That direct override
+        //    takes precedence over `default_gate_plq` in `effective_plq_for`, so
+        //    the gate is read back at the exact PLQ convert packed it with.
         let plq_for = |prefix: &str| -> PerLayerQuant {
             effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq))
         };
@@ -942,6 +949,169 @@ mod tests {
             !mtp.has_quantized_weights(),
             "a bf16-constructed MoE MTP module must not report quantized weights"
         );
+    }
+
+    /// Affine-quantize a floating-point weight via `mlx_quantize`, returning
+    /// `(packed_weight, scales, biases)`. Works for 2D Linear weights and 3D
+    /// SwitchLinear expert stacks alike (MLX groups along the last axis). Used
+    /// only by the quantized-apply test below. Returns `None` if MLX/Metal is
+    /// unavailable so the caller can skip.
+    fn quantize_affine_or_skip(
+        weight: &MxArray,
+        group_size: i32,
+        bits: i32,
+    ) -> Option<(MxArray, MxArray, MxArray)> {
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        if !ok || out_q.is_null() || out_s.is_null() || out_b.is_null() {
+            return None;
+        }
+        Some((
+            MxArray::from_handle(out_q, "q").ok()?,
+            MxArray::from_handle(out_s, "s").ok()?,
+            MxArray::from_handle(out_b, "b").ok()?,
+        ))
+    }
+
+    /// Fix 3 (Task 36) load-side proof: a quantized MoE-flavored MTP weight set
+    /// (packed `Uint32` `.weight` + `.scales`/`.biases`) loaded via
+    /// `apply_weights` with the AUGMENTED `per_layer_quant` (mirroring what
+    /// `load_with_thread` now injects from `mtplx_mtp_quantization`) installs
+    /// quantized backends for the router gate, switch_mlp experts, shared
+    /// expert + gate, and attention — proving produce (Fix 2) + reload (Fix 3)
+    /// agree on the uniform 4-bit/gs32 affine PLQ.
+    #[test]
+    fn quantized_moe_mtp_apply_weights_installs_quantized_sublayers() {
+        use crate::models::mtp_drafter::MTP_MOE_LAYER_LINEAR_SUFFIXES;
+        use crate::models::quant_dispatch::{PerLayerMode, default_per_layer_quant};
+        use crate::models::qwen3_5::persistence::augment_mtplx_mtp_quantization_with_suffixes;
+        use serde_json::json;
+
+        let label = "quantized_moe_mtp_apply_weights_installs_quantized_sublayers";
+
+        // Source bf16 params from a freshly constructed MoE-flavored MTP module.
+        let Some((bf16_mtp, cfg)) = build_mtp_or_skip(label) else {
+            return;
+        };
+        // tiny_mtp_cfg (decoder_sparse_step=1) → MoE-flavored MTP layer.
+        assert!(matches!(bf16_mtp.layers[0].mlp, MLPType::MoE(_)));
+        let bf16_params = bf16_mtp.get_parameters();
+
+        // The exact set of quantizable linear prefixes for a MoE MTP layer.
+        let quantizable_prefixes: Vec<String> = (0..cfg.n_mtp_layers as usize)
+            .flat_map(|l| {
+                MTP_MOE_LAYER_LINEAR_SUFFIXES
+                    .iter()
+                    .map(move |s| format!("mtp.layers.{l}.{s}"))
+            })
+            .collect();
+        let quantizable: std::collections::HashSet<&str> =
+            quantizable_prefixes.iter().map(String::as_str).collect();
+
+        // Build the quantized param set: replace each quantizable `<prefix>.weight`
+        // with packed weight + scales + biases; copy every other tensor verbatim.
+        let mut q_params: HashMap<String, MxArray> = HashMap::new();
+        for (name, arr) in &bf16_params {
+            let Some(prefix) = name.strip_suffix(".weight") else {
+                q_params.insert(name.clone(), arr.clone());
+                continue;
+            };
+            if !quantizable.contains(prefix) {
+                q_params.insert(name.clone(), arr.clone());
+                continue;
+            }
+            let Some((packed, scales, biases)) = quantize_affine_or_skip(arr, 32, 4) else {
+                eprintln!("skipping {label} (MLX/Metal unavailable during quantize)");
+                return;
+            };
+            q_params.insert(format!("{prefix}.weight"), packed);
+            q_params.insert(format!("{prefix}.scales"), scales);
+            q_params.insert(format!("{prefix}.biases"), biases);
+        }
+
+        // Augment the per-layer-quant table exactly as `load_with_thread` does
+        // for a MoE-flavored MTP layer.
+        let raw = json!({
+            "mtplx_mtp_quantization": {
+                "prequantized": true,
+                "policy": "all",
+                "bits": 4,
+                "group_size": 32,
+                "mode": "affine"
+            }
+        });
+        let mut per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        augment_mtplx_mtp_quantization_with_suffixes(
+            &raw,
+            cfg.n_mtp_layers,
+            &MTP_MOE_LAYER_LINEAR_SUFFIXES,
+            &mut per_layer_quant,
+        );
+
+        // Fresh module to load the quantized weights into.
+        let Some((mut mtp, _cfg2)) = build_mtp_or_skip(label) else {
+            return;
+        };
+        let default_plq = default_per_layer_quant(4, 32, PerLayerMode::Affine);
+        // 8-bit affine gate default (canonical recipe), to PROVE the augmented
+        // 4-bit override wins over it for the router gate (Option A).
+        let default_gate_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 64,
+            mode: PerLayerMode::Affine,
+        };
+        if let Err(err) =
+            mtp.apply_weights(&q_params, default_plq, default_gate_plq, &per_layer_quant)
+        {
+            let msg = err.reason.to_string();
+            if msg.contains("Metal") || msg.contains("device") {
+                eprintln!("skipping {label} (MLX/Metal unavailable during apply): {msg}");
+                return;
+            }
+            panic!("unexpected apply_weights failure in {label}: {msg}");
+        }
+
+        // Top-level aggregate: SOMETHING quantized.
+        assert!(
+            mtp.has_quantized_weights(),
+            "MoE MTP head must report quantized weights after quantized apply"
+        );
+
+        // Per-layer granular assertions.
+        for layer in &mtp.layers {
+            match &layer.attn {
+                AttentionType::Full(a) => assert!(
+                    a.is_quantized(),
+                    "MTP attention must be quantized (q/k/v/o_proj packed)"
+                ),
+                AttentionType::Linear(_) => panic!("MTP layer must be full-attention"),
+            }
+            match &layer.mlp {
+                MLPType::MoE(moe) => {
+                    assert!(
+                        moe.is_quantized(),
+                        "MoE block must report quantized (gate/switch_mlp/shared_expert/gate)"
+                    );
+                    assert!(
+                        moe.get_switch_mlp().is_quantized(),
+                        "switch_mlp experts must be quantized"
+                    );
+                }
+                MLPType::Dense(_) => panic!("tiny_mtp_cfg MTP layer must be MoE-flavored"),
+            }
+        }
     }
 
     /// Regression for the Codex [high] dense-flavored-MoE-MTP load gate.

@@ -118,6 +118,40 @@ const REQUIRED_PER_LAYER_MOE_MLP: [&str; 8] = [
     "mlp.shared_expert_gate.weight",
 ];
 
+/// Per-MTP-layer QUANTIZABLE linear projections for a **MoE-flavored** MTP
+/// layer (bare `<suffix>`, NO `.weight`). This is the single source of truth
+/// for "which MoE MTP linears participate in quantization" shared by:
+///   * the convert-side quant policy
+///     ([`crate::convert::is_mtp_layer_quantizable_prefix`]), which decides
+///     WHICH `mtp.layers.{i}.<suffix>.weight` tensors get packed to INT4, and
+///   * the MoE load-side quant-metadata augmentation
+///     (`qwen3_5_moe/persistence.rs::augment_mtplx_mtp_quantization_moe`), which
+///     records the matching per-layer-quant `(bits, group_size, mode)` so the
+///     reload resolves the exact same PLQ the convert chose.
+///
+/// Keeping produce + reload off ONE list means adding/removing a quantizable
+/// MoE MTP linear updates both paths atomically (the drift-guard test below
+/// ties the MLP entries to [`REQUIRED_PER_LAYER_MOE_MLP`]). The four attention
+/// projections are shared verbatim with the dense set
+/// ([`crate::models::qwen3_5::persistence::MTP_LAYER_LINEAR_SUFFIXES`]); the MLP
+/// entries are the MoE expert/router/shared-expert linears.
+pub(crate) const MTP_MOE_LAYER_LINEAR_SUFFIXES: [&str; 12] = [
+    // Attention (same as dense MTP).
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    // MoE MLP: experts, router gate, shared expert + its gate.
+    "mlp.switch_mlp.gate_proj",
+    "mlp.switch_mlp.up_proj",
+    "mlp.switch_mlp.down_proj",
+    "mlp.gate",
+    "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj",
+    "mlp.shared_expert.down_proj",
+    "mlp.shared_expert_gate",
+];
+
 /// Top-level MTP head weights required by BOTH variants.
 const REQUIRED_TOP_LEVEL: [&str; 4] = [
     "mtp.fc.weight",
@@ -491,6 +525,75 @@ pub fn load_drafter_tensors(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// DRIFT GUARD: the convert-side quant-policy predicate
+    /// ([`crate::convert::is_mtp_layer_quantizable_prefix`]) and the MoE
+    /// load-side augmentation both walk [`MTP_MOE_LAYER_LINEAR_SUFFIXES`], while
+    /// the load-completeness gate ([`missing_required_mtp_keys`]) walks
+    /// [`REQUIRED_PER_LAYER_MOE_MLP`]. If the two lists drift, a convert could
+    /// quantize a MoE MTP linear the loader never augments PLQ for (reload reads
+    /// the wrong bits/group_size → corrupt head) — or the gate could require a
+    /// `.scales` the convert never produced. Tie them at test time:
+    ///   * every MoE-MLP suffix in `MTP_MOE_LAYER_LINEAR_SUFFIXES` (i.e. NOT a
+    ///     shared `self_attn.*` projection), with `.weight` appended, is a member
+    ///     of `REQUIRED_PER_LAYER_MOE_MLP`; and
+    ///   * conversely every `REQUIRED_PER_LAYER_MOE_MLP` entry (minus `.weight`)
+    ///     is present in `MTP_MOE_LAYER_LINEAR_SUFFIXES`.
+    ///
+    /// Adding a quantizable MoE MTP linear in one place therefore forces it in
+    /// the other or this test fails.
+    #[test]
+    fn moe_mtp_linear_suffixes_match_required_moe_mlp() {
+        // The four attention projections are shared with the dense set and are
+        // NOT part of the MoE-MLP required set — strip them out.
+        let moe_mlp_suffixes: Vec<&&str> = MTP_MOE_LAYER_LINEAR_SUFFIXES
+            .iter()
+            .filter(|s| !s.starts_with("self_attn."))
+            .collect();
+
+        // Forward direction: every MoE-MLP linear we QUANTIZE is REQUIRED at load.
+        for suffix in &moe_mlp_suffixes {
+            let weight_key = format!("{suffix}.weight");
+            assert!(
+                REQUIRED_PER_LAYER_MOE_MLP.contains(&weight_key.as_str()),
+                "MoE MTP linear `{suffix}` (quantized by convert) is missing from \
+                 REQUIRED_PER_LAYER_MOE_MLP — the load gate would not require its \
+                 .scales, allowing a silently-garbage quantized reload",
+            );
+        }
+
+        // Reverse direction: every REQUIRED MoE-MLP linear is QUANTIZED.
+        for required in REQUIRED_PER_LAYER_MOE_MLP {
+            let bare = required
+                .strip_suffix(".weight")
+                .expect("REQUIRED_PER_LAYER_MOE_MLP entries are `.weight` keys");
+            assert!(
+                MTP_MOE_LAYER_LINEAR_SUFFIXES.contains(&bare),
+                "REQUIRED MoE MTP linear `{bare}` is absent from \
+                 MTP_MOE_LAYER_LINEAR_SUFFIXES — convert would leave it bf16 while \
+                 the load gate demands its .scales",
+            );
+        }
+
+        // The attention prefixes must stay byte-identical to the dense set so a
+        // dense-flavored MoE MTP layer (which uses the dense suffix list) and a
+        // MoE-flavored one agree on attention quant.
+        for attn in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+        ] {
+            assert!(
+                MTP_MOE_LAYER_LINEAR_SUFFIXES.contains(&attn),
+                "MoE MTP suffix set must include attention projection `{attn}`",
+            );
+            assert!(
+                crate::models::qwen3_5::persistence::MTP_LAYER_LINEAR_SUFFIXES.contains(&attn),
+                "dense MTP suffix set must include attention projection `{attn}`",
+            );
+        }
+    }
 
     #[test]
     fn reprefix_bare_keys() {
