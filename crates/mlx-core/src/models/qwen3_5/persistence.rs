@@ -1330,6 +1330,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     crate::models::mtp_drafter::detect_drafter_safetensors(path)
                     && let Some(drafter_params) = crate::models::mtp_drafter::load_drafter_tensors(
                         &drafter_path,
+                        // Dense backbone: there are no experts, so the MTP
+                        // layer is always dense-flavored. Backbone and MLP
+                        // flavor coincide (both `Dense`).
+                        crate::models::mtp_drafter::DrafterBodyVariant::Dense,
                         crate::models::mtp_drafter::DrafterBodyVariant::Dense,
                         config.n_mtp_layers,
                     )?

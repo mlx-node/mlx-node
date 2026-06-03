@@ -368,12 +368,29 @@ pub(crate) fn missing_required_mtp_keys(
 /// prefix so the returned map slots directly into the loader's raw-params map
 /// before `sanitize_weights`.
 ///
+/// Two variants are taken because the BACKBONE flavor and the per-layer MLP
+/// flavor can differ:
+///   * `backbone` is the model family (`Dense` for a `qwen3_5` body, `Moe` for a
+///     `qwen3_5_moe` body). It gates the drafter's sibling `config.json`
+///     `text_config.model_type` (which encodes the body family the drafter was
+///     emitted for: `...moe...` ⇔ MoE), so a dense drafter dropped beside a MoE
+///     body (or vice-versa) is rejected.
+///   * `mlp_flavor` is the MLP-key schema the MTP layer actually emits — derived
+///     by the caller from `is_moe_layer(fa_idx)` (see
+///     `Qwen3_5MoeMTPModule::mtp_mlp_variant`). A MoE backbone whose MTP layer
+///     resolves to a DENSE-flavored layer (sparse step not dividing the
+///     attention interval, or `fa_idx ∈ mlp_only_layers`) ships dense
+///     `mlp.{gate,up,down}_proj` keys, NOT `switch_mlp.* + mlp.gate`. The
+///     structural completeness gate MUST use `mlp_flavor`, not `backbone`, so it
+///     mirrors what `get_parameters`/`apply_weights` produce. For a dense
+///     backbone the two are always identical (`Dense`).
+///
 /// VALIDATION (both checks reject the merge with a hard error so a broken drafter
 /// can never silently activate as a valid head):
 ///   1. the drafter's sibling `config.json` `text_config.model_type` must match
-///      the `body` backbone (dense ⇔ no `moe`, MoE ⇔ contains `moe`);
+///      the `backbone` family (dense ⇔ no `moe`, MoE ⇔ contains `moe`);
 ///   2. the re-prefixed key set must be COMPLETE for `n_mtp_layers` (top-level
-///      `mtp.fc`/norms + every per-layer attn/norm/MLP weight for the variant).
+///      `mtp.fc`/norms + every per-layer attn/norm/MLP weight for `mlp_flavor`).
 ///
 /// Returns `Ok(None)` when the file yields no tensors (so the caller can warn +
 /// fall through rather than silently merging an empty drafter). Bare keys (the
@@ -381,7 +398,8 @@ pub(crate) fn missing_required_mtp_keys(
 /// normalize to the canonical `mtp.<bare>` form.
 pub fn load_drafter_tensors(
     safetensors_path: &Path,
-    body: DrafterBodyVariant,
+    backbone: DrafterBodyVariant,
+    mlp_flavor: DrafterBodyVariant,
     n_mtp_layers: i32,
 ) -> Result<Option<HashMap<String, MxArray>>> {
     info!(
@@ -389,7 +407,9 @@ pub fn load_drafter_tensors(
         safetensors_path.display()
     );
     // Variant gate first — fail fast on an obviously-wrong drafter before mmap'ing.
-    validate_drafter_text_config_variant(safetensors_path, body)?;
+    // This keys off the BACKBONE family (what the drafter's text_config records),
+    // not the per-layer MLP flavor.
+    validate_drafter_text_config_variant(safetensors_path, backbone)?;
 
     let raw = load_safetensors_lazy(safetensors_path)?;
     let source_count = raw.len();
@@ -407,16 +427,18 @@ pub fn load_drafter_tensors(
     }
 
     // Structural completeness gate — reject a partial / wrong-variant drafter so
-    // the head never loads with default-initialized weights.
-    let missing = missing_required_mtp_keys(&normalized, body, n_mtp_layers);
+    // the head never loads with default-initialized weights. Keys off the
+    // per-layer MLP flavor (which may be Dense even for a MoE backbone).
+    let missing = missing_required_mtp_keys(&normalized, mlp_flavor, n_mtp_layers);
     if !missing.is_empty() {
         let shown = &missing[..missing.len().min(12)];
         return Err(Error::from_reason(format!(
-            "MTP drafter {} is incomplete for a {} backbone with {} MTP layer(s): missing {} \
-             required weight(s); first: {:?}. Refusing to load a partial MTP head. Re-run \
-             `mlx convert --q-mtp split` against the matching base model.",
+            "MTP drafter {} is incomplete for a {} backbone ({}-flavored MTP MLP) with {} MTP \
+             layer(s): missing {} required weight(s); first: {:?}. Refusing to load a partial MTP \
+             head. Re-run `mlx convert --q-mtp split` against the matching base model.",
             safetensors_path.display(),
-            if body.is_moe() { "MoE" } else { "dense" },
+            if backbone.is_moe() { "MoE" } else { "dense" },
+            if mlp_flavor.is_moe() { "MoE" } else { "dense" },
             n_mtp_layers.max(0),
             missing.len(),
             shown,

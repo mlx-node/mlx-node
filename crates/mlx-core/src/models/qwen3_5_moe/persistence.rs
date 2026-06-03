@@ -872,9 +872,20 @@ fn apply_weights_moe_inner(
     // decode. On an incomplete set, warn + disable MTP (leave
     // `mtp_weights_loaded = false`) rather than feeding garbage to the head.
     if inner.mtp.is_some() {
+        // Derive the expected MLP-key schema from the SAME flavor decision
+        // `Qwen3_5MoeMTPModule::new` uses (`is_moe_layer(fa_idx)`), NOT a
+        // hardcoded `Moe`. The MTP layer mirrors the main decoder at
+        // `fa_idx = full_attention_interval - 1`, so a dense-flavored MoE-MTP
+        // layer (sparse step not dividing the interval, or `fa_idx ∈
+        // mlp_only_layers`) emits dense `mlp.{gate,up,down}_proj` keys via
+        // `get_parameters`/`apply_weights`. Hardcoding `Moe` would demand
+        // `switch_mlp.* + mlp.gate`, flag the complete dense-flavored
+        // checkpoint as incomplete, and silently disable speculative MTP even
+        // though the flavor-aware `apply_weights` would have loaded it fine.
+        let body = super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(config);
         let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
             params,
-            crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+            body,
             config.n_mtp_layers,
         );
         if missing.is_empty() {
@@ -1045,7 +1056,17 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         && let Some(drafter_params) =
                             crate::models::mtp_drafter::load_drafter_tensors(
                                 &drafter_path,
+                                // Backbone is MoE (gates the drafter's
+                                // text_config), but the structural key gate
+                                // must use the per-layer MLP flavor: a
+                                // dense-flavored MoE-MTP layer ships dense
+                                // `mlp.*_proj` keys, not `switch_mlp.* +
+                                // mlp.gate`. Mirror `Qwen3_5MoeMTPModule::new`'s
+                                // `is_moe_layer(fa_idx)` so this drafter-merge
+                                // gate agrees with the inline gate + the head's
+                                // own flavor-aware apply_weights.
                                 crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                                super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config),
                                 config.n_mtp_layers,
                             )?
                     {

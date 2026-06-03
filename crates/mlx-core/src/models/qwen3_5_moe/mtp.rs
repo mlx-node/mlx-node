@@ -60,6 +60,7 @@ use std::collections::HashMap;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::models::mtp_drafter::DrafterBodyVariant;
 use crate::models::quant_dispatch::effective_plq_for;
 use crate::nn::{Linear, RMSNorm};
 
@@ -137,7 +138,7 @@ impl Qwen3_5MoeMTPModule {
             )));
         }
 
-        let fa_idx = (config.full_attention_interval - 1).max(0) as usize;
+        let fa_idx = Self::mtp_fa_idx(config);
         if config.is_linear_layer(fa_idx) {
             return Err(Error::from_reason(format!(
                 "Qwen3_5MoeMTPModule::new: refusing to build GDN (linear-attention) MTP layers. \
@@ -165,6 +166,45 @@ impl Qwen3_5MoeMTPModule {
             layers,
             norm,
         })
+    }
+
+    /// The full-attention layer index the MTP `DecoderLayer`s are pinned to.
+    ///
+    /// Single source of the `fa_idx` formula shared by [`new`](Self::new)
+    /// (which builds the layers at this index) and
+    /// [`mtp_mlp_variant`](Self::mtp_mlp_variant) (which derives the loader
+    /// gate's expected MLP flavor from it), so the two can never drift. Clamps
+    /// before the `as usize` cast so a non-positive `full_attention_interval`
+    /// cannot wrap.
+    fn mtp_fa_idx(config: &Qwen3_5MoeConfig) -> usize {
+        (config.full_attention_interval - 1).max(0) as usize
+    }
+
+    /// The MLP flavor (dense vs MoE) of the MTP layer(s) for `config`,
+    /// expressed as the [`DrafterBodyVariant`] the loader's completeness
+    /// gates key off.
+    ///
+    /// MUST mirror the flavor decision in [`new`](Self::new): the MTP
+    /// `DecoderLayer`s are built at `fa_idx = max(full_attention_interval -
+    /// 1, 0)`, and `DecoderLayer::new` selects `MLPType::MoE` vs
+    /// `MLPType::Dense` via `config.is_moe_layer(fa_idx)`. The
+    /// `get_parameters` / `apply_weights` key schema (dense
+    /// `mlp.{gate,up,down}_proj` vs MoE `mlp.switch_mlp.* + mlp.gate`)
+    /// follows the SAME branch, so the load-completeness gate MUST derive
+    /// its expected variant from here rather than hardcoding `Moe` —
+    /// otherwise a dense-flavored MoE-MTP layer (reachable when
+    /// `decoder_sparse_step` does not divide `full_attention_interval`, or
+    /// when `fa_idx ∈ mlp_only_layers`) would emit dense MLP keys while the
+    /// hardcoded-`Moe` gate demanded `switch_mlp.* + mlp.gate`, wrongly
+    /// flagging a complete checkpoint as incomplete and silently disabling
+    /// speculative MTP.
+    pub fn mtp_mlp_variant(config: &Qwen3_5MoeConfig) -> DrafterBodyVariant {
+        let fa_idx = Self::mtp_fa_idx(config);
+        if config.is_moe_layer(fa_idx) {
+            DrafterBodyVariant::Moe
+        } else {
+            DrafterBodyVariant::Dense
+        }
     }
 
     /// Number of MTP DecoderLayers.
@@ -901,6 +941,106 @@ mod tests {
         assert!(
             !mtp.has_quantized_weights(),
             "a bf16-constructed MoE MTP module must not report quantized weights"
+        );
+    }
+
+    /// Regression for the Codex [high] dense-flavored-MoE-MTP load gate.
+    ///
+    /// A MoE backbone whose MTP layer resolves to a DENSE-flavored layer
+    /// (here: `fa_idx ∈ mlp_only_layers`) emits dense
+    /// `mtp.layers.{i}.mlp.{gate,up,down}_proj.weight`, NOT the MoE
+    /// `switch_mlp.* + mlp.gate` schema. The completeness gate MUST derive
+    /// its expected variant from `Qwen3_5MoeMTPModule::mtp_mlp_variant`
+    /// (`is_moe_layer(fa_idx)`); the previous hardcoded `Moe` would have
+    /// rejected this complete checkpoint and silently disabled MTP. We:
+    ///   1. confirm the chosen config really is dense-flavored
+    ///      (`is_linear_layer(fa_idx) == false` so construction succeeds, and
+    ///      `is_moe_layer(fa_idx) == false` so the MLP is dense);
+    ///   2. assert `get_parameters()` is COMPLETE under the derived (Dense)
+    ///      variant (save/load agree); and
+    ///   3. assert the OLD hardcoded `Moe` variant would have flagged it
+    ///      incomplete — locking in that the flavor-derivation is the
+    ///      load-bearing fix, not a no-op.
+    #[test]
+    fn dense_flavored_moe_mtp_load_gate_uses_derived_variant() {
+        use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};
+
+        // Start from the tiny MoE config (fa_idx = 3, full-attention) but force
+        // layer 3 dense via mlp_only_layers — the canonical decoder_sparse_step=1
+        // tests can't reach a dense-flavored MTP layer.
+        let mut cfg = tiny_mtp_cfg();
+        let fa_idx = (cfg.full_attention_interval - 1).max(0) as usize;
+        cfg.mlp_only_layers = Some(vec![fa_idx as i32]);
+
+        // The MTP layer must still be full-attention (construction precondition)
+        // AND dense-flavored (the gap this test guards).
+        assert!(
+            !cfg.is_linear_layer(fa_idx),
+            "fa_idx must be a full-attention layer so the MTP ctor succeeds"
+        );
+        assert!(
+            !cfg.is_moe_layer(fa_idx),
+            "mlp_only_layers override must make fa_idx dense-flavored"
+        );
+        assert_eq!(
+            Qwen3_5MoeMTPModule::mtp_mlp_variant(&cfg),
+            DrafterBodyVariant::Dense,
+            "derived MTP MLP variant must be Dense for a dense-flavored MoE-MTP layer"
+        );
+
+        let mtp = match Qwen3_5MoeMTPModule::new(&cfg) {
+            Ok(m) => m,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!(
+                        "skipping dense_flavored_moe_mtp_load_gate_uses_derived_variant \
+                         (MLX/Metal unavailable): {msg}"
+                    );
+                    return;
+                }
+                panic!("unexpected Qwen3_5MoeMTPModule::new failure: {msg}");
+            }
+        };
+
+        // The constructed layer must really be dense-flavored.
+        assert!(
+            matches!(mtp.layers[0].mlp, MLPType::Dense(_)),
+            "MTP DecoderLayer must be dense-flavored when is_moe_layer(fa_idx) is false"
+        );
+
+        let params = mtp.get_parameters();
+
+        // (1) save/load agree under the DERIVED variant (the fix).
+        let derived = Qwen3_5MoeMTPModule::mtp_mlp_variant(&cfg);
+        let missing_derived = missing_required_mtp_keys(&params, derived, cfg.n_mtp_layers);
+        assert!(
+            missing_derived.is_empty(),
+            "dense-flavored get_parameters() must be complete under the derived Dense variant; \
+             missing: {missing_derived:?}"
+        );
+
+        // (2) CONTRAST: the OLD hardcoded `Moe` gate would WRONGLY reject this
+        // complete dense-flavored checkpoint (demands switch_mlp.* + mlp.gate
+        // that a dense MLP never emits). This is what locks the fix in.
+        let missing_hardcoded_moe =
+            missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, cfg.n_mtp_layers);
+        assert!(
+            !missing_hardcoded_moe.is_empty(),
+            "hardcoded-Moe gate MUST flag a dense-flavored MoE-MTP checkpoint incomplete \
+             (proves the flavor-derivation is load-bearing)"
+        );
+        assert!(
+            missing_hardcoded_moe
+                .iter()
+                .any(|k| k == "mtp.layers.0.mlp.switch_mlp.gate_proj.weight"),
+            "hardcoded-Moe gate must miss switch_mlp.*; got: {missing_hardcoded_moe:?}"
+        );
+        assert!(
+            missing_hardcoded_moe
+                .iter()
+                .any(|k| k == "mtp.layers.0.mlp.gate.weight"),
+            "hardcoded-Moe gate must miss the router mlp.gate; got: {missing_hardcoded_moe:?}"
         );
     }
 
