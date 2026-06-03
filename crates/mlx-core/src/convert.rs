@@ -148,8 +148,14 @@ pub struct ConversionOptions {
     /// Optional Qwen MTP quantization policy: "off" (default), "cyankiwi", "all",
     /// or "split" (alias "drafter").
     /// "cyankiwi" keeps mtp.fc dense and quantizes only the MTP layer linears as
-    /// 4-bit affine group_size=32 in an MTPLX-compatible mtp.safetensors sidecar.
-    /// "all" additionally quantizes mtp.fc.
+    /// 4-bit affine group_size=32. For dense `qwen3_5` the quantized linears are
+    /// emitted into an MTPLX-compatible mtp.safetensors sidecar; for MoE
+    /// (`qwen3_5_moe`) there is no sidecar — they are quantized in place and stored
+    /// inline in the main safetensors shards.
+    /// "all" additionally quantizes mtp.fc. For dense `qwen3_5` the quantized MTP
+    /// linears land in the mtp.safetensors sidecar; for MoE (`qwen3_5_moe`) there
+    /// is no sidecar — they are quantized in place and stored inline in the main
+    /// safetensors shards.
     /// "split"/"drafter" emits a body checkpoint with NO mtp.* tensors plus a
     /// separate `mtp-drafter/` directory in mlx-vlm's `qwen3_5_mtp` format
     /// (bare-keyed MTP head, format:mlx). It does NOT require --quantize/--q-recipe;
@@ -1057,9 +1063,20 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // `mtplx_mtp_quantization` sidecar contract.
     if do_quantize && quant_mtp != "off" && !is_split {
         let description = if quant_mtp == "cyankiwi" {
+            // cyankiwi quantizes only the MTP layer linears (keeping mtp.fc + norms
+            // BF16) — `apply_mtp_quant_policy` applies this uniformly regardless of
+            // model type. This string is storage-agnostic, so it stays accurate for
+            // both dense `qwen3_5` (the quantized linears are extracted into the
+            // `mtp.safetensors` sidecar) and MoE `qwen3_5_moe` (no sidecar; they are
+            // quantized in place, inline in the main shards).
             "Load calibrated CyanKiwi MTP layer linears as packed MLX INT4; keep mtp.fc and MTP norms BF16."
-        } else {
+        } else if emit_mtp_sidecar {
+            // Dense `all`: quantized MTP linears live in the `mtp.safetensors` sidecar.
             "Load packed MLX INT4 MTP linears from mtp.safetensors."
+        } else {
+            // MoE `all`: no sidecar is emitted; the MTP linears are quantized in
+            // place and stored inline in the main sharded safetensors.
+            "Load packed MLX INT4 MTP linears stored inline in the main safetensors shards."
         };
         output_config["mtplx_mtp_quantization"] = serde_json::json!({
             "prequantized": true,

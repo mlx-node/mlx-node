@@ -67,10 +67,11 @@ Quantization Arguments:
                         "unsloth" requires --imatrix-path for quality
   --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi,
                         all, or split (alias drafter).
-                        cyankiwi/all write MTP tensors to an MTPLX-style
-                        mtp.safetensors sidecar. cyankiwi keeps mtp.fc dense and
-                        quantizes MTP layer linears as 4-bit affine
-                        group_size=32; all also quantizes mtp.fc.
+                        cyankiwi/all quantize MTP linears as 4-bit affine
+                        group_size=32: dense qwen3_5 into an MTPLX-style
+                        mtp.safetensors sidecar, MoE (qwen3_5_moe) inline in the
+                        main shards (no sidecar). cyankiwi keeps mtp.fc dense;
+                        all also quantizes mtp.fc.
                         split/drafter emit a body checkpoint with NO mtp.*
                         tensors plus a separate mtp-drafter/ directory in
                         mlx-vlm's qwen3_5_mtp format (bf16 head). split does NOT
@@ -460,7 +461,7 @@ export async function run(argv: string[]) {
     const qGs = quantGroupSize || defaultGs;
     const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
     console.log(
-      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp} sidecar` : ''}`,
+      `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
     );
   }
   if (imatrixPath) {
