@@ -23,6 +23,13 @@ export type ChapterIndexProps = {
   onOpenFreeChat: () => void;
   workerRef: React.RefObject<Worker | null>;
   abortRef: React.RefObject<AbortController | null>;
+  /** True once the full model is loaded and the worker is ready to infer. The
+   *  hero forward-pass demo only auto-runs when this is true; otherwise it
+   *  shows a "load the model" affordance instead of auto-erroring. */
+  modelReady: boolean;
+  /** Explicit user request to load the model (or open the local-model picker
+   *  when no hosted model is available). Wired to the forward-pass demo's CTA. */
+  onLoadModel: () => void;
 };
 
 // (Previous "curriculum phase" colour bands lived here. They drove the
@@ -35,6 +42,8 @@ export function ChapterIndex({
   onOpenFreeChat,
   workerRef,
   abortRef,
+  modelReady,
+  onLoadModel,
 }: ChapterIndexProps) {
   return (
     <div className="absolute inset-0 z-10 overflow-y-auto bg-background">
@@ -71,7 +80,13 @@ export function ChapterIndex({
             data, and replays it through an Apple-Wallet-style card stack
             that shuffles between layers, with full vs linear-attention
             cards getting distinct treatments. */}
-        <ForwardPassFlow onOpenChapter={onOpenChapter} workerRef={workerRef} abortRef={abortRef} />
+        <ForwardPassFlow
+          onOpenChapter={onOpenChapter}
+          workerRef={workerRef}
+          abortRef={abortRef}
+          modelReady={modelReady}
+          onLoadModel={onLoadModel}
+        />
 
         {/* Grid of chapter cards */}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -254,9 +269,15 @@ type ForwardPassFlowProps = {
   onOpenChapter: (chapterId: string) => void;
   workerRef: React.RefObject<Worker | null>;
   abortRef: React.RefObject<AbortController | null>;
+  /** Only auto-run the live forward pass once the model is ready. Before that
+   *  we show a consent affordance rather than auto-firing inference against a
+   *  null worker (which would surface an error). */
+  modelReady: boolean;
+  /** Explicit user request to load the model, wired to the consent CTA. */
+  onLoadModel: () => void;
 };
 
-function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlowProps) {
+function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoadModel }: ForwardPassFlowProps) {
   const [prompt, setPrompt] = React.useState<string>(DEFAULT_PROMPT);
   const [status, setStatus] = React.useState<RunStatus>({ kind: 'idle' });
   const [run, setRun] = React.useState<AttentionRun | null>(null);
@@ -410,14 +431,18 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
     }
   }, [prompt, workerRef, abortRef, reducedMotion]);
 
-  // Auto-fire one run on mount — the route gates rendering on
-  // status === 'ready' so the worker is already alive here.
+  // Auto-fire one run once the model is ready. The chapter list renders
+  // without the model, so on first paint the worker may be null; auto-running
+  // then would surface a "worker unavailable" error. Instead we wait for
+  // `modelReady` (set when the user has loaded the model via the consent CTA
+  // or the global header) and fire exactly once.
   React.useEffect(() => {
+    if (!modelReady) return;
     if (didAutoRunRef.current) return;
     didAutoRunRef.current = true;
     void handleRun();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [modelReady]);
 
   // Cleanup on unmount.
   React.useEffect(
@@ -563,6 +588,39 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef }: ForwardPassFlow
   // "rest" of the deduped reply in the bottom reveal.
   const firstNewTokenTextFull = firstNewTokenInfo ? cleanupTokenText(firstNewTokenInfo.text) : '';
   const showTokenReveal = (status.kind === 'replaying' && activeStage === 'sampling') || status.kind === 'done';
+
+  // Consent gate: this hero demo runs the real model in the browser. The
+  // chapter list above renders without the model, so until the user has loaded
+  // it (and no run has happened yet) we show a frozen consent panel rather than
+  // an inert prompt/Run UI that would only error against a null worker. Once a
+  // run has captured a trace (`run != null`) we keep the full interactive view
+  // even if the worker is later torn down.
+  if (!modelReady && run == null) {
+    return (
+      <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+            One forward pass, end to end — real model run
+          </div>
+        </div>
+        <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
+          <p className="text-sm font-medium text-foreground">Watch the model think — live, in your browser</p>
+          <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
+            Loads the real Qwen3.5-0.8B (~1.6 GB) and runs one forward pass, replaying every layer through a card stack.
+            Runs entirely on your device — nothing leaves your browser. The chapters below are fully readable without
+            it.
+          </p>
+          <button
+            type="button"
+            onClick={onLoadModel}
+            className="rounded-lg border border-primary/50 bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
+          >
+            Load model
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">

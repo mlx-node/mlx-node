@@ -8,7 +8,7 @@
 import { createFileRoute, redirect, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 
-import { PanelLoading } from '../components/loading/PanelLoading';
+import { ModelConsentLayer } from '../components/loading/ModelConsentLayer';
 import { findChapter } from '../learn/chapters';
 import { OverviewChapterBody } from '../learn/chapters/00-overview';
 import { TokenizationChapterBody, TokenizerDemo } from '../learn/chapters/01-tokenization';
@@ -35,18 +35,20 @@ import { useModelLoader } from '../providers/model-loader';
 // model-free). Only the right-hand "Try it now" demo panel is gated, classified
 // by the resource it needs:
 //
-//   model  — needs the full ~1.6 GB model ('ready'); these warm the model in the
-//            background while the learner reads.
+//   model  — needs the full ~1.6 GB model ('ready'); wrapped in a
+//            <ModelConsentLayer mode="model">, which shows a consent CTA until
+//            the user explicitly loads the model. NOTHING auto-downloads.
 //   device — needs only the WebGPU device + WASM runtime, NOT the model
-//            (Training trains a tiny from-scratch transformer); gates on
-//            `deviceReady` and triggers a device-only init.
-//   none   — pure JS, needs nothing; the demo renders immediately and we do NOT
-//            kick off any download (one exception below: `overview`).
+//            (Training trains a tiny from-scratch transformer); wrapped in a
+//            <ModelConsentLayer mode="device">, whose CTA brings up WebGPU with
+//            no download.
+//   none   — pure JS, needs nothing; the demo renders immediately with no
+//            consent gate and triggers NO load.
 //
 // Chapters absent from all three sets have no demo panel at all (their inline
 // content/poster lives in the body) and pass `null` for `tryItPanel`.
 
-// model-panel chapters — gate the demo on the full model and background-warm it.
+// model-panel chapters — gate the demo on the full model behind a consent CTA.
 const MODEL_PANEL_CHAPTERS = new Set([
   'tokenization',
   'embeddings',
@@ -66,59 +68,36 @@ function ChapterRouteComponent() {
   const { chapter } = Route.useRouteContext();
   const navigate = useNavigate();
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
-  const { status, loadingText, loadingProgress, hostedModelAvailable, deviceReady, kickoffLoad, kickoffDeviceOnly } =
-    useModelLoader();
+  const { status, hostedModelAvailable, kickoffLoad, clearLoadError } = useModelLoader();
 
   const isModelPanelChapter = MODEL_PANEL_CHAPTERS.has(chapter.id);
   const isDeviceOnlyChapter = DEVICE_ONLY_CHAPTERS.has(chapter.id);
 
-  // Whether the demo panel's resource is up. `none`-resource panels (rope,
-  // kv-cache, scaling) are pure JS and always ready. model panels wait for the
-  // full model; device panels wait for the WebGPU device (a full 'ready'
-  // implies the device is up too).
-  const panelReady = isModelPanelChapter
-    ? status === 'ready'
-    : isDeviceOnlyChapter
-      ? deviceReady || status === 'ready'
-      : true;
+  // No auto-kickoff: opening a chapter NEVER starts the ~1.6 GB download or a
+  // WebGPU bring-up. The model/device demos are wrapped in <ModelConsentLayer>
+  // (below), which surfaces an explicit consent CTA. Loading happens only on a
+  // user click (that CTA or the global header Load button). Pure-JS `none`
+  // demos (rope, kv-cache, scaling) render immediately and need nothing.
 
-  // Auto-kickoff (background warm-up) on direct URL landings (bookmark, hard
-  // reload of /chapters/<id>) so the panel's resource is loading while the
-  // learner reads. DEVICE_ONLY chapters (Training) bring up just the WebGPU
-  // device — no model download. model-panel chapters trigger the full model
-  // load; we also preload for `overview` (Ch.1) as a deliberate onboarding
-  // cache-warm — the learner will need the model in Ch.2. Pure-JS `none`
-  // chapters (rope, kv-cache, scaling, post-training, architecture) trigger NO
-  // download. All kickoffs are idempotent at the App level.
-  //
-  // Note: device-only kickoff is intentionally NOT gated on `hostedModelAvailable`
-  // — it never fetches the model, so it works even when no hosted model exists
-  // (and even on hosts where the user would otherwise pick a local directory).
-  const shouldPreloadModel = isModelPanelChapter || chapter.id === 'overview';
+  // errorBanner is a single GLOBAL loader state. A failed load on a prior
+  // chapter would otherwise carry its error message into THIS freshly-opened
+  // chapter's consent layer (and the chat overlay) even though the user has
+  // taken no action here. Clear a stale error on chapter change so the user
+  // sees the neutral consent prompt. clearLoadError is guarded to the error
+  // state only — it never aborts an in-flight load or drops a ready model — so
+  // this does NOT start (or restart) any download.
   useEffect(() => {
-    if (status === 'ready') return;
-    if (isDeviceOnlyChapter) {
-      if (deviceReady) return;
-      kickoffDeviceOnly();
-      return;
-    }
-    if (!shouldPreloadModel) return;
-    if (hostedModelAvailable === false) return;
-    kickoffLoad();
-  }, [
-    status,
-    isDeviceOnlyChapter,
-    shouldPreloadModel,
-    deviceReady,
-    hostedModelAvailable,
-    kickoffLoad,
-    kickoffDeviceOnly,
-  ]);
+    clearLoadError();
+  }, [chapter.id, clearLoadError]);
+
+  // The chapter's SEO <head> (title/canonical/OG/JSON-LD) is synced centrally by
+  // the root route's head manager (routes/__root.tsx) on pathname change.
 
   // The chapter's live demo, or null for panel-less chapters (overview,
   // post-training, architecture — their inline content/poster lives in the
   // body). `none`-resource demos (rope, kv-cache, scaling) render here
-  // immediately; model/device demos render here once `panelReady`.
+  // immediately; model/device demos are gated by <ModelConsentLayer> at the
+  // wire-in below, so they only mount once their resource is ready.
   const demoPanel =
     chapter.id === 'attention' ? (
       <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
@@ -159,6 +138,14 @@ function ChapterRouteComponent() {
       // panel-less chapters (overview, post-training) are pure reading and
       // center at a comfortable article width.
       wideBody={chapter.id === 'architecture'}
+      modelReady={status === 'ready'}
+      onLoadModel={() => {
+        if (hostedModelAvailable === false) {
+          triggerLocalPicker();
+          return;
+        }
+        kickoffLoad();
+      }}
       onOpenChapter={(chapterId) => {
         void navigate({ to: '/chapters/$chapterId', params: { chapterId }, search: (prev) => prev });
       }}
@@ -166,24 +153,21 @@ function ChapterRouteComponent() {
         void navigate({ to: '/chapters', search: (prev) => prev });
       }}
       onOpenFreeChat={() => {
-        if (hostedModelAvailable === false) {
-          triggerLocalPicker();
-          return;
-        }
-        kickoffLoad();
+        // Just open the chat surface — do NOT kick off a load here. The chat
+        // overlay (<ChatLayerOverlay>) is the single consent gate for chat: it
+        // surfaces its own "Load the model to chat" CTA (and the local-model
+        // picker when no hosted model is available) when the model isn't ready.
+        // This keeps the ~1.6 GB download behind that explicit chat consent.
         void navigate({ to: '/chat', search: (prev) => prev });
       }}
       tryItPanel={
-        // Gate ONLY the demo panel: render the real demo once its resource is
-        // ready; otherwise show a compact in-column loading affordance so the
-        // 3-col layout (and the reading body) stays put while it warms.
-        hasDemoPanel && !panelReady ? (
-          <PanelLoading
-            status={loadingText || null}
-            progress={loadingProgress}
-            hostedUnavailable={isModelPanelChapter && hostedModelAvailable === false}
-            onLoadLocal={triggerLocalPicker}
-          />
+        // Gate ONLY the demo panel; the reading body always renders. model and
+        // device demos are wrapped in <ModelConsentLayer>, which shows a
+        // consent CTA (no auto-download) and mounts the live demo only once its
+        // resource is ready. Pure-JS `none` demos (rope, kv-cache, scaling)
+        // need nothing and render directly.
+        hasDemoPanel && (isModelPanelChapter || isDeviceOnlyChapter) ? (
+          <ModelConsentLayer mode={isDeviceOnlyChapter ? 'device' : 'model'}>{demoPanel}</ModelConsentLayer>
         ) : (
           demoPanel
         )

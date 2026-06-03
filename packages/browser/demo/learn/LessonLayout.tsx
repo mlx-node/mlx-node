@@ -1,4 +1,4 @@
-import { ArrowLeftIcon, CheckIcon, MessageSquareIcon, PlayIcon } from 'lucide-react';
+import { ArrowLeftIcon, CheckIcon, DownloadIcon, MessageSquareIcon, PlayIcon } from 'lucide-react';
 import * as React from 'react';
 
 import { Button } from '../components/ui/button';
@@ -26,6 +26,15 @@ export type LessonLayoutProps = {
   onOpenChapter: (chapterId: string) => void;
   onBackToIndex: () => void;
   onOpenFreeChat: () => void;
+  /**
+   * Global "Load model" affordance shown in the header so a learner can
+   * pre-load from any chapter. Passed in by the route (which owns the model
+   * loader) so this layout stays presentational and model-free. When the model
+   * is already loaded (`modelReady`), the control is hidden. Omit `onLoadModel`
+   * to drop the control entirely.
+   */
+  modelReady?: boolean;
+  onLoadModel?: () => void;
 };
 
 export function LessonLayout({
@@ -36,6 +45,8 @@ export function LessonLayout({
   onOpenChapter,
   onBackToIndex,
   onOpenFreeChat,
+  modelReady = false,
+  onLoadModel,
 }: LessonLayoutProps) {
   // Per-chapter scroll reset.
   //
@@ -71,10 +82,20 @@ export function LessonLayout({
         <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
           Chapter {current.number} · {current.title}
         </div>
-        <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
-          <MessageSquareIcon className="size-4" />
-          Free chat
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* Global pre-load affordance. Hidden once the model is ready (there
+              is nothing left to load); omit `onLoadModel` to drop it entirely. */}
+          {onLoadModel && !modelReady ? (
+            <Button variant="outline" size="sm" onClick={onLoadModel} className="gap-2">
+              <DownloadIcon className="size-4" />
+              Load model
+            </Button>
+          ) : null}
+          <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
+            <MessageSquareIcon className="size-4" />
+            Free chat
+          </Button>
+        </div>
       </div>
 
       {/* Body: sidebar | prose | (optional) try-it-now. When the chapter has no

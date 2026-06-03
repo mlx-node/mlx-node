@@ -14,6 +14,9 @@ function LandingRouteComponent() {
   const navigate = useNavigate();
   const { hostedModelAvailable, errorBanner, kickoffLoad, status } = useModelLoader();
 
+  // SEO <head> (title/canonical/OG/JSON-LD) is synced centrally by the root
+  // route's head manager (routes/__root.tsx) on pathname change — including "/".
+
   return (
     <Landing
       onLoad={() => {
@@ -35,16 +38,11 @@ function LandingRouteComponent() {
       }}
       onLocalModel={triggerLocalPicker}
       onStartLearning={() => {
-        // Kick off the model load alongside the screen transition. The
-        // chapter routes also auto-kickoff on direct URL landings; this
-        // handler covers the explicit "Start learning" click. Skipped when
-        // no hosted model is available — those users go through the local
-        // model picker, which we deliberately do NOT auto-open from a
-        // learning click. kickoffLoad is idempotent so the chapters route
-        // calling it again post-navigate is a safe no-op.
-        if (status !== 'ready' && hostedModelAvailable !== false) {
-          kickoffLoad();
-        }
+        // Entering the course must NOT download the model — that would re-couple
+        // model loading to navigation, which this refactor exists to remove. The
+        // ~1.6 GB load is gated behind an explicit click on a chapter's live-demo
+        // consent layer (or the global header "Load model" button / the chat
+        // overlay). So this only navigates into the chapter index.
         void navigate({ to: '/chapters', search: (prev) => prev });
       }}
       errorBanner={errorBanner}

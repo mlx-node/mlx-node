@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vp exec vite dev",
     "test": "vp test --config vitest.config.ts",
-    "build": "vp exec vite build",
+    "build": "vp exec vite build && node scripts/prerender.mjs",
     "preview": "vp exec vite preview --host 127.0.0.1",
     "deploy:void": "VITE_MLX_MODEL_URL=/api/model yarn build && vp exec void deploy --project mlx --skip-build",
     "upload:void-model": "node scripts/upload-void-model.mjs"
@@ -40,6 +40,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/three": "^0.184.0",
     "@vitejs/plugin-react": "^6.0.1",
+    "esbuild": "^0.18.20",
     "tailwindcss": "^4.2.4",
     "typescript": "^5.7.0",
     "vite": "^6.3.0",

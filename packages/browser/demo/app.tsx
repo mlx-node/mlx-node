@@ -21,6 +21,7 @@ import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
 import { type ProfileLikeStats, type ReasoningEffort, cycleReasoningEffort } from './lib/display-helpers';
+import { deriveModelLoaderStatus, isClearableLoadError } from './lib/model-loader-state';
 import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
 import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/model-loader';
 import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
@@ -277,6 +278,12 @@ function App() {
   // subsequent setStatus(...) calls (e.g. "Generating...") so the banner
   // doesn't reappear while the user is reading prose.
   const [modelReady, setModelReady] = useState(false);
+  // Synchronous mirror of modelReady, kept in lockstep via the effect further
+  // below and reset synchronously at every load-kickoff site. Declared here,
+  // beside the state, so it is in scope for the load handlers (e.g.
+  // handleLocalModelInputChange, resetForModelLoad) that appear earlier in the
+  // component body than the kickoff callbacks.
+  const modelReadyRef = useRef(false);
   // Flips to `true` once the worker reports `deviceReady` — the WASM runtime +
   // WebGPU device are up but the big model may NOT be loaded. The Training
   // chapter gates on this instead of `modelReady` so it can run its tiny
@@ -292,6 +299,12 @@ function App() {
   // kickoffLoad to detect the device-only -> full-model upgrade and force a
   // re-init.
   const deviceOnlyActiveRef = useRef(false);
+  // Reactive mirror of deviceOnlyRef for the (memoized) status derivation. The
+  // ref is read synchronously inside the load effect / kickoff guards; this
+  // state lets deriveModelLoaderStatus react so a device-only bring-up doesn't
+  // strand model surfaces in `loading` (see deriveModelLoaderStatus). Kept in
+  // lockstep with deviceOnlyRef at every assignment site.
+  const [deviceOnly, setDeviceOnly] = useState(false);
   const [errorBanner, setErrorBannerState] = useState<string | null>(null);
   const [telemetryStats, setTelemetryStats] = useState<ProfileLikeStats | null>(null);
   const [prefillTokensPerSec, setPrefillTokensPerSec] = useState<number | null>(null);
@@ -369,6 +382,12 @@ function App() {
     // instead of hitting the device-up early-return. Only kickoffDeviceOnly
     // sets this ref to true.
     deviceOnlyRef.current = false;
+    setDeviceOnly(false);
+    // A fresh local-model load replaces any current model: reset readiness
+    // synchronously (state + ref) so we publish 'loading', never a stale
+    // 'ready', if a model was already up when the picker fired.
+    setModelReady(false);
+    modelReadyRef.current = false;
     setPendingModelSource(source);
     setErrorBannerState(null);
     setLoadingProgress(null);
@@ -1757,8 +1776,12 @@ function App() {
     function resetForModelLoad(label?: string) {
       activeModelLabel = label ?? configuredModelLabel;
       setModelLine(activeModelLabel);
-      // A fresh bring-up starts: the device is not up until the worker reports
-      // back (either 'ready' for a full model or 'deviceReady' for device-only).
+      // A fresh bring-up starts: neither the model nor the device is up until the
+      // worker reports back ('ready' for a full model, 'deviceReady' for
+      // device-only). Reset BOTH (and modelReadyRef) so a (re)load can never
+      // publish a stale 'ready' against the worker now being torn down.
+      setModelReady(false);
+      modelReadyRef.current = false;
       setDeviceReady(false);
       deviceOnlyActiveRef.current = false;
       setTelemetryStats(null);
@@ -2025,7 +2048,7 @@ function App() {
   useEffect(() => {
     errorBannerRef.current = errorBanner;
   }, [errorBanner]);
-  const modelReadyRef = useRef(false);
+  // modelReadyRef is declared up beside the modelReady state; keep it in sync.
   useEffect(() => {
     modelReadyRef.current = modelReady;
   }, [modelReady]);
@@ -2058,6 +2081,16 @@ function App() {
     if (currentStatus === 'loading' && !deviceOnlyActive) return;
     // Upgrade (or first load): the next bring-up loads the full model.
     deviceOnlyRef.current = false;
+    setDeviceOnly(false);
+    // Clear a stale post-ready modelReady SYNCHRONOUSLY (state + ref), in the
+    // same batch that clears errorBanner and bumps loadKickoff. Otherwise a
+    // Retry from a post-ready error would render one frame with errorBanner null
+    // + modelReady still true -> deriveModelLoaderStatus reports 'ready' (it
+    // gives modelReady precedence) while the old worker is being torn down and
+    // the replacement hasn't posted 'ready' -> a demo could mount against a
+    // dying worker. Resetting here makes the retry publish 'loading' instead.
+    setModelReady(false);
+    modelReadyRef.current = false;
     setPendingModelSource(null);
     setErrorBannerState(null);
     setLoadingProgress(null);
@@ -2068,15 +2101,68 @@ function App() {
   // DEVICE_ONLY chapters (Training). Idempotent: a no-op if a full-model load
   // is already in-flight or done (the device is up as part of that), or if a
   // device-only bring-up is already in-flight/complete.
+  //
+  // Retry semantics: when a prior device bring-up surfaced an error, an explicit
+  // call here is treated as a RETRY — it clears the error and re-inits the
+  // device (keeping deviceOnlyRef true), rather than returning early. This is
+  // the device-mode analogue of kickoffLoad's error->retry path; routing a
+  // device-only Retry through kickoffLoad would instead trigger a full ~1.6 GB
+  // model download, which is wrong for a DEVICE_ONLY chapter.
   const kickoffDeviceOnly = useCallback(() => {
-    if (errorBannerRef.current != null) return; // surfaced error; let retry go through kickoffLoad
     if (modelReadyRef.current) return; // full model up -> device already up
-    if (loadKickoffRef.current > 0) return; // a bring-up (full or device-only) is already in-flight/done
+    const hasError = errorBannerRef.current != null;
+    // No error and a bring-up already happened (in-flight or complete) -> no-op.
+    // When there IS a surfaced error we fall through to re-init (retry) even
+    // though loadKickoff > 0.
+    if (!hasError && loadKickoffRef.current > 0) return;
     deviceOnlyRef.current = true;
+    setDeviceOnly(true);
     setPendingModelSource(null);
     setErrorBannerState(null);
     setLoadingProgress(null);
     setLoadKickoff((k) => k + 1);
+  }, []);
+
+  // Clear a stale GLOBAL errorBanner from a FAILED LOAD when navigating to a
+  // fresh surface (e.g. a chapter the user hasn't acted on) so it doesn't carry
+  // over into the new chapter's consent layer / chat overlay. Guarded so it ONLY
+  // ever clears a failed-load error:
+  //
+  //   - errorBanner == null  -> nothing to clear (no-op); never aborts an
+  //                             in-flight load or drops a ready model.
+  //   - modelReady == true   -> the error is a POST-READY runtime failure on an
+  //                             already-loaded model: a poisoned GPU bridge
+  //                             ("reload required"), a worker crash, or a session
+  //                             error. We must NOT silently clear these on
+  //                             navigation — doing so would both hide the failure
+  //                             AND let deriveModelLoaderStatus report 'ready',
+  //                             mounting live demos / dropping the chat gate
+  //                             against a dead-or-poisoned worker. Leave status
+  //                             'error' so the consent layer / chat keep their
+  //                             Retry affordance (Retry -> kickoffLoad re-inits
+  //                             the worker and recovers). No-op here.
+  //   - modelReady == false  -> a genuine FAILED LOAD (model never came up).
+  //                             Clear the banner and reset loadKickoff to 0 — this
+  //                             re-runs the load effect's cleanup (terminating the
+  //                             dead worker) AND flips the derived status to 'idle'
+  //                             rather than a stuck 'loading' spinner; invalidate
+  //                             deviceReady/deviceOnly so nothing mounts against
+  //                             the torn-down worker.
+  const clearLoadError = useCallback(() => {
+    // Only a failed-load error is clearable; a post-ready error stays surfaced
+    // (see isClearableLoadError) so we never report 'ready' against a dead or
+    // poisoned worker.
+    if (!isClearableLoadError({ errorBanner: errorBannerRef.current, modelReady: modelReadyRef.current })) {
+      return;
+    }
+    deviceOnlyRef.current = false;
+    deviceOnlyActiveRef.current = false;
+    setDeviceOnly(false);
+    setPendingModelSource(null);
+    setErrorBannerState(null);
+    setLoadingProgress(null);
+    setDeviceReady(false);
+    setLoadKickoff(0);
   }, []);
 
   // resetForModelLoad is defined inside the useEffect above, but the providers
@@ -2091,14 +2177,13 @@ function App() {
   }, []);
 
   const modelLoaderValue = useMemo<ModelLoaderContextValue>(() => {
-    const status =
-      errorBanner != null
-        ? 'error'
-        : modelReady
-          ? 'ready'
-          : loadKickoff > 0 || hostedModelAvailable === true
-            ? 'loading'
-            : 'idle';
+    // Status is `idle` until a load actually STARTS (loadKickoff > 0). Merely
+    // detecting a hosted model (hostedModelAvailable === true) must NOT read as
+    // `loading` — nothing has been downloaded yet, and the consent layer / UI
+    // stay in their pre-download state until the user explicitly kicks off a
+    // load. See deriveModelLoaderStatus for the precedence (error > ready >
+    // loading > idle).
+    const status = deriveModelLoaderStatus({ errorBanner, modelReady, loadKickoff, deviceOnly });
     return {
       status,
       loadingText: loadingText ?? '',
@@ -2107,17 +2192,21 @@ function App() {
       errorBanner,
       hostedModelAvailable,
       deviceReady,
+      loadKickoff,
       kickoffLoad,
       kickoffDeviceOnly,
+      clearLoadError,
       resetForModelLoad: resetForModelLoadCallback,
     };
   }, [
     errorBanner,
     modelReady,
     loadKickoff,
+    deviceOnly,
     hostedModelAvailable,
     deviceReady,
     kickoffDeviceOnly,
+    clearLoadError,
     loadingText,
     loadingProgress,
     modelLine,

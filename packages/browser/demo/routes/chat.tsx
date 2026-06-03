@@ -6,29 +6,19 @@
 // directly into the chat DOM via refs (chatRef/promptRef). Unmounting it
 // would break those refs. Visibility is driven by the pathname (=== '/chat').
 //
-// The route itself just kicks off model loading on mount if needed and
-// renders an empty layer-marker div.
+// The route component itself renders nothing — the always-mounted overlay
+// owns the surface. Crucially, opening /chat does NOT auto-download the model:
+// loading happens only via an explicit user action (the consent affordance the
+// overlay shows when the model isn't ready, or the global header Load button).
 
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect } from 'react';
-
-import { useModelLoader } from '../providers/model-loader';
 
 function ChatRouteComponent() {
-  const { status, hostedModelAvailable, kickoffLoad } = useModelLoader();
-
-  // Direct landings on /chat (bookmark, deep link, hard reload) need the
-  // model to come up. kickoffLoad is idempotent at the App level — if a
-  // kickoff has already fired (e.g. we got here from a chapter that
-  // triggered the load) the second call is a no-op.
-  useEffect(() => {
-    if (status === 'ready') return;
-    if (hostedModelAvailable === false) return; // local-picker flow
-    kickoffLoad();
-  }, [status, hostedModelAvailable, kickoffLoad]);
-
   // ChatLayerOverlay (in __root.tsx) covers the full viewport when visible;
-  // this route component has nothing else to render.
+  // this route component has nothing else to render. We deliberately do NOT
+  // kick off a model load here — the overlay surfaces a "Load model to chat"
+  // affordance instead (see ChatLayerOverlay), keeping the ~1.6 GB download
+  // gated behind explicit user consent.
   return null;
 }
 

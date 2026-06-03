@@ -18,10 +18,20 @@
 // equivalent TanStack Router path, preserving model-config search params.
 
 import { createRootRoute, Outlet, redirect, useRouterState } from '@tanstack/react-router';
+import { useEffect } from 'react';
 import { z } from 'zod';
 
 import { ChatLayerOverlay } from '../components/ChatLayerOverlay';
-import { findChapter } from '../learn/chapters';
+import { CHAPTERS, findChapter } from '../learn/chapters';
+import { applySeoHead } from '../lib/seo-head';
+import {
+  chapterJsonLd,
+  courseJsonLd,
+  getChapterSeo,
+  getChaptersHubSeo,
+  getChatSeo,
+  getLandingSeo,
+} from '../lib/seo-metadata';
 
 export const searchSchema = z.object({
   // Model URL — legacy aliases: model_url, modelUrl, model
@@ -66,6 +76,38 @@ export type RootSearch = z.infer<typeof searchSchema>;
 function RootComponent() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const isChatRoute = pathname === '/chat';
+
+  // Centralized per-route <head> sync. The prerendered pages already carry the
+  // correct head on DIRECT entry (what crawlers/unfurlers fetch); this keeps the
+  // title, canonical, description, OG/Twitter, and JSON-LD consistent with the
+  // active route after CLIENT-SIDE navigation — so a JS-executing crawler or an
+  // in-session transition never shows one route's title against another route's
+  // canonical/structured data. One place covers every route (no per-route omission).
+  useEffect(() => {
+    if (pathname === '/') {
+      applySeoHead(getLandingSeo(), courseJsonLd(CHAPTERS));
+      return;
+    }
+    if (pathname === '/chapters' || pathname === '/chapters/') {
+      applySeoHead(getChaptersHubSeo(), courseJsonLd(CHAPTERS));
+      return;
+    }
+    const chapterMatch = pathname.match(/^\/chapters\/([^/]+)\/?$/);
+    if (chapterMatch) {
+      const chapter = findChapter(decodeURIComponent(chapterMatch[1]));
+      if (chapter) {
+        applySeoHead(getChapterSeo(chapter), chapterJsonLd(chapter));
+        return;
+      }
+    }
+    if (pathname === '/chat') {
+      applySeoHead(getChatSeo(), null);
+      return;
+    }
+    // Unknown path — fall back to the site-level landing identity.
+    applySeoHead(getLandingSeo(), courseJsonLd(CHAPTERS));
+  }, [pathname]);
+
   return (
     <>
       <Outlet />
