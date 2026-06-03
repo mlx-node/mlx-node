@@ -1168,7 +1168,12 @@ pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
 /// Extract ChatConfig fields into flat variables with defaults.
 pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
     ChatParams {
-        max_new_tokens: config.max_new_tokens.unwrap_or(2048),
+        // Nonpositive budgets clamp to 0 (AR-equivalent empty completion)
+        // so downstream max_kv_len / cache sizing / the decode macro never
+        // see a negative budget. This single point feeds qwen3_5
+        // dense/paged + qwen3_5_moe (incl. MTP); it is the core backstop
+        // behind the server-side reject in `/v1/responses`.
+        max_new_tokens: config.max_new_tokens.unwrap_or(2048).max(0),
         repetition_penalty: config.repetition_penalty.unwrap_or(1.0),
         repetition_context_size: config.repetition_context_size.unwrap_or(256),
         presence_penalty: config.presence_penalty.unwrap_or(0.0),
@@ -1203,6 +1208,56 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         // `ChatParams::mtp_adaptive_depth` docs.
         mtp_adaptive_depth: config.mtp_adaptive_depth.unwrap_or(false),
     }
+}
+
+/// Round a `(prefill_len + max_new_tokens)` token budget up to the next multiple of 256
+/// for KV-cache capacity sizing. Computed in i64 so a hostile or absurd `max_new_tokens`
+/// near `i32::MAX` cannot overflow the i32 sum (which would panic in debug / silently wrap
+/// in release) before cache initialization. Inputs are floored at 0 (callers already clamp
+/// budgets to >= 0 via `extract_chat_params`; this is defense in depth — for any
+/// non-negative input the result is byte-identical to the legacy
+/// `((prefill_len + max_new_tokens + 255) / 256) * 256`).
+///
+/// Returns `Err` when the rounded capacity would exceed `i32::MAX`, since the native
+/// cache/FFI APIs are i32-typed; the caller surfaces this as a normal request error
+/// instead of overflowing.
+pub fn kv_capacity_round_up(prefill_len: i32, max_new_tokens: i32) -> Result<i32> {
+    let total = (prefill_len.max(0) as i64) + (max_new_tokens.max(0) as i64) + 255;
+    let rounded = (total / 256) * 256;
+    if rounded > i32::MAX as i64 {
+        return Err(Error::from_reason(format!(
+            "requested KV-cache capacity {rounded} (prefill_len={prefill_len} + \
+             max_new_tokens={max_new_tokens}, rounded up to a multiple of 256) exceeds the \
+             maximum supported size of {}",
+            i32::MAX
+        )));
+    }
+    Ok(rounded as i32)
+}
+
+/// Saturating variant for DISPLAY/TRACE only — never errors. Clamps to the largest
+/// multiple of 256 representable in i32. MUST NOT be used to size a real allocation.
+pub fn kv_capacity_round_up_saturating(prefill_len: i32, max_new_tokens: i32) -> i32 {
+    kv_capacity_round_up(prefill_len, max_new_tokens).unwrap_or((i32::MAX / 256) * 256)
+}
+
+/// Eager-allocation cap for generated-output `Vec::with_capacity` hints. A
+/// `Vec::with_capacity` reserves memory immediately, so a hostile-but-accepted
+/// token budget near `i32::MAX` would otherwise reserve gigabytes up front
+/// (~8 GiB for a `Vec<u32>`). Real budgets up to this cap pre-allocate exactly;
+/// larger budgets pre-allocate this much then grow via amortized doubling (a few
+/// reallocs of a few KiB — negligible next to multi-second decode). Bounding the
+/// HINT changes no observable behavior because the Vec still grows to hold every
+/// generated token.
+pub const GENERATED_CAPACITY_HINT_CAP: usize = 8192;
+
+/// Bounded `Vec::with_capacity` hint for a generated-output buffer (tokens or
+/// logprobs) sized from an untrusted `max_new_tokens` budget. Floors negatives at
+/// 0 (so a negative budget can never produce a `usize::MAX` capacity that aborts)
+/// and caps the eager reservation at [`GENERATED_CAPACITY_HINT_CAP`]; the buffer
+/// still grows as needed during decode.
+pub fn generated_capacity_hint(max_new_tokens: i32) -> usize {
+    (max_new_tokens.max(0) as usize).min(GENERATED_CAPACITY_HINT_CAP)
 }
 
 /// Apply repetition + presence + frequency penalties to logits.
@@ -3482,6 +3537,15 @@ macro_rules! decode_loop_mtp {
         }
 
         loop {
+            // Zero budget (nonpositive clamped to 0): AR's `for step in 0..$max`
+            // never iterates and never observes cancel/EOS/repetition, so its
+            // finish_reason stays "length". `max_as_usize` is loop-invariant, so
+            // for any budget >= 1 this is a dead branch (no behavior change);
+            // only a 0 budget short-circuits here, before the cancelled check.
+            if max_as_usize == 0 {
+                if $reason.is_empty() { $reason = String::from("length"); }
+                break;
+            }
             // PARITY-FIX: re-check the same stop conditions Step A
             // uses, BEFORE the forward, so the initial push (above)
             // and any prior-iteration push that landed us on a stop
@@ -5489,6 +5553,114 @@ mod tests {
     use super::*;
 
     const THINK_END_ID: u32 = 151668; // example </think> token ID
+
+    /// Legacy formula the helper must reproduce byte-for-byte on the valid
+    /// (non-overflowing, non-negative) range.
+    fn legacy_round_up(prefill_len: i32, max_new_tokens: i32) -> i32 {
+        ((prefill_len + max_new_tokens + 255) / 256) * 256
+    }
+
+    #[test]
+    fn kv_capacity_round_up_matches_legacy_formula() {
+        // Spread of normal (prefill_len, max_new_tokens) pairs that cannot
+        // overflow i32. For every non-negative non-overflowing input the
+        // helper is byte-identical to the legacy idiom.
+        let cases = [
+            (0, 0),
+            (1, 1),
+            (255, 1),
+            (256, 1),
+            (1000, 2048),
+            (10, 2038),
+            (4096, 0),
+            (0, 4096),
+            (8192, 8192),
+            (123_456, 654_321),
+        ];
+        for (p, m) in cases {
+            let expected = legacy_round_up(p, m);
+            assert_eq!(
+                kv_capacity_round_up(p, m).unwrap(),
+                expected,
+                "kv_capacity_round_up({p}, {m}) must match legacy formula"
+            );
+        }
+        // Spot-check a couple of the trickier ones by hand.
+        assert_eq!(kv_capacity_round_up(0, 0).unwrap(), 0);
+        assert_eq!(kv_capacity_round_up(1, 1).unwrap(), 256);
+        assert_eq!(kv_capacity_round_up(255, 1).unwrap(), 256);
+        assert_eq!(kv_capacity_round_up(256, 1).unwrap(), 512);
+        // 10 + 2038 + 255 = 2303; 2303 / 256 = 8; 8 * 256 = 2048.
+        assert_eq!(kv_capacity_round_up(10, 2038).unwrap(), 2048);
+    }
+
+    #[test]
+    fn kv_capacity_round_up_boundary_exact() {
+        // Largest representable multiple of 256 in i32.
+        assert_eq!((i32::MAX / 256) * 256, 2_147_483_392);
+
+        // Already a multiple of 256 (after +255 it lands exactly on i32::MAX,
+        // which floors back to 2_147_483_392) — no overflow.
+        assert_eq!(
+            kv_capacity_round_up(0, 2_147_483_392).unwrap(),
+            2_147_483_392
+        );
+
+        // One more token rounds up to 2_147_483_648 (> i32::MAX) -> Err.
+        assert!(kv_capacity_round_up(0, 2_147_483_393).is_err());
+
+        // The exact review finding: any non-empty prompt + an i32::MAX budget
+        // would overflow the i32 sum in the legacy formula. Now a clean Err.
+        assert!(kv_capacity_round_up(1, i32::MAX).is_err());
+
+        // i32::MAX budget alone already rounds up past i32::MAX -> Err.
+        assert!(kv_capacity_round_up(0, i32::MAX).is_err());
+    }
+
+    #[test]
+    fn kv_capacity_round_up_saturating_never_panics() {
+        // Saturating variant clamps to the largest in-range multiple of 256
+        // instead of erroring — for display/trace only.
+        assert_eq!(kv_capacity_round_up_saturating(1, i32::MAX), 2_147_483_392);
+        // Valid inputs pass through unchanged.
+        assert_eq!(kv_capacity_round_up_saturating(1, 1), 256);
+    }
+
+    #[test]
+    fn kv_capacity_round_up_floors_negative_inputs() {
+        // Defense in depth: negative inputs are floored at 0 (callers already
+        // clamp, but the helper must never produce a negative or wrapped size).
+        assert_eq!(kv_capacity_round_up(-5, -5).unwrap(), 0);
+        assert_eq!(kv_capacity_round_up(-1, 1).unwrap(), 256);
+        // (256, -1000) floors to (256, 0): 256 + 0 + 255 = 511; 511/256 = 1; *256 = 256.
+        assert_eq!(kv_capacity_round_up(256, -1000).unwrap(), 256);
+        // Negative input must produce the SAME result as the floored positive input.
+        assert_eq!(
+            kv_capacity_round_up(256, -1000).unwrap(),
+            kv_capacity_round_up(256, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_capacity_hint_caps_and_floors() {
+        // [high] scenario: a hostile-but-accepted budget near i32::MAX must NOT
+        // trigger a multi-GiB eager reservation — the hint is capped.
+        assert_eq!(generated_capacity_hint(i32::MAX), 8192);
+        assert_eq!(
+            generated_capacity_hint(i32::MAX),
+            GENERATED_CAPACITY_HINT_CAP
+        );
+        // Negative budgets floor at 0 (never wrap to usize::MAX → abort).
+        assert_eq!(generated_capacity_hint(-5), 0);
+        assert_eq!(generated_capacity_hint(i32::MIN), 0);
+        // Below-cap budgets pass through exactly (behavior-neutral pre-alloc).
+        assert_eq!(generated_capacity_hint(0), 0);
+        assert_eq!(generated_capacity_hint(100), 100);
+        assert_eq!(generated_capacity_hint(2048), 2048);
+        // Exact cap boundary.
+        assert_eq!(generated_capacity_hint(8192), 8192);
+        assert_eq!(generated_capacity_hint(8193), 8192);
+    }
 
     #[test]
     fn test_tracker_starts_in_thinking() {

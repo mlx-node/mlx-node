@@ -1576,7 +1576,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -2397,7 +2397,8 @@ impl Qwen35MoeInner {
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         // Compile-cached `max_blocks_per_seq` shape — picking the
@@ -3120,7 +3121,8 @@ impl Qwen35MoeInner {
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
         let decode_progress_interval = if trace_enabled {
@@ -3758,7 +3760,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -4459,7 +4461,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -5288,7 +5290,7 @@ impl Qwen35MoeInner {
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -6321,9 +6323,17 @@ impl Qwen35MoeInner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        // Bounded, floored capacity hint (see `generated_capacity_hint`): this
+        // training-only path takes `max_new_tokens` from training config
+        // (SFT/GRPO) where panics are banned. The helper prevents both the
+        // negative-budget `.. as usize` wrap to `usize::MAX` (which would abort)
+        // and a multi-GiB eager reservation for an absurd budget, without
+        // changing behavior for valid budgets — the buffer still grows to hold
+        // every generated token.
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };

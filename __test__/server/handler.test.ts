@@ -513,6 +513,142 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('tool_call_id');
     });
 
+    it('returns 400 when max_output_tokens is zero', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: 0,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('max_output_tokens');
+    });
+
+    it('returns 400 when max_output_tokens is negative', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: -5,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('max_output_tokens');
+    });
+
+    it('returns 400 when max_output_tokens is not an integer', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: 1.5,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('max_output_tokens');
+    });
+
+    it('returns 400 when max_output_tokens exceeds i32::MAX (2^31)', async () => {
+      // NAPI truncates a JS integer above i32::MAX to a NEGATIVE i32, which
+      // the core clamp turns into 0 (silent empty completion). Reject at the
+      // edge instead.
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: 2147483648,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('max_output_tokens');
+    });
+
+    it('returns 400 when max_output_tokens is Number.MAX_SAFE_INTEGER', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: Number.MAX_SAFE_INTEGER,
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.message).toContain('max_output_tokens');
+    });
+
+    it('does not 400 when max_output_tokens is a valid positive integer', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        max_output_tokens: 16,
+      });
+      const { res, getStatus, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+    });
+
+    it('does not 400 when max_output_tokens is omitted', async () => {
+      const registry = new ModelRegistry();
+      registry.register('test-model', createMockModel());
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+      });
+      const { res, getStatus, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+    });
+
     it('returns 404 when model is not found', async () => {
       const registry = new ModelRegistry();
       const handler = createHandler(registry);

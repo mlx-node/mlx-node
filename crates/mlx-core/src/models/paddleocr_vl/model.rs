@@ -287,7 +287,10 @@ impl VLModelInner {
         let model_config = self.config.clone();
 
         // Extract config with defaults
-        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
+        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
+        // usize)` below never sees a negative `i32` (`-1 as usize` would
+        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256).max(0);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -476,9 +479,13 @@ impl VLModelInner {
         token.eval();
 
         // Track generated tokens
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
+            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+        );
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(
+                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+            )
         } else {
             Vec::new()
         };
@@ -812,7 +819,10 @@ impl VLModelInner {
         }
 
         let batch_size = all_input_ids.len();
-        let max_new_tokens = config.max_new_tokens.unwrap_or(256);
+        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
+        // usize)` below never sees a negative `i32` (`-1 as usize` would
+        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = config.max_new_tokens.unwrap_or(256).max(0);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1027,8 +1037,12 @@ impl VLModelInner {
         clear_cache();
 
         // === STEP 3: Batched decode loop ===
-        let mut generated_tokens: Vec<Vec<u32>> =
-            vec![Vec::with_capacity(max_new_tokens as usize); batch_size];
+        let mut generated_tokens: Vec<Vec<u32>> = vec![
+            Vec::with_capacity(
+                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens)
+            );
+            batch_size
+        ];
         let mut generated_logprobs: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
         let mut finish_reasons: Vec<Option<String>> = vec![None; batch_size];
 

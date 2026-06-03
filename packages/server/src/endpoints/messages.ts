@@ -101,7 +101,7 @@ import {
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
-import { validateAndCanonicalizeHistoryToolOrder } from './responses.js';
+import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from './responses.js';
 
 /**
  * Sentinel response id used to adopt and drop the per-model warm slot
@@ -954,6 +954,15 @@ export async function handleCreateMessage(
   }
   if (body.max_tokens == null || !Number.isInteger(body.max_tokens) || body.max_tokens <= 0) {
     sendAnthropicBadRequest(res, 'Missing required field: max_tokens');
+    return;
+  }
+  if (body.max_tokens > MAX_OUTPUT_TOKENS) {
+    // The field is present and a positive integer but too large: the native
+    // `ChatConfig.max_new_tokens` is `i32`, and NAPI truncates a JS integer
+    // above `i32::MAX` to a NEGATIVE value (then clamped to 0 → a silent empty
+    // completion), so an over-large budget must 400 with a clear message
+    // rather than be reported as "missing" or silently no-op.
+    sendAnthropicBadRequest(res, `Field "max_tokens" must be an integer between 1 and ${MAX_OUTPUT_TOKENS}`);
     return;
   }
 

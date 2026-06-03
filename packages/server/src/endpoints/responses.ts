@@ -58,6 +58,17 @@ import type {
  */
 const RESPONSE_TTL_SECONDS = 1800;
 
+/**
+ * Upper bound for a client-supplied output-token budget. The native
+ * `ChatConfig.max_new_tokens` is `Option<i32>`, and NAPI's
+ * `napi_get_value_int32` silently truncates a JS integer above `i32::MAX`
+ * to a NEGATIVE value — which the core clamp then turns into 0 (a silent
+ * empty completion). Reject anything above this bound at the edge so an
+ * over-large budget 400s instead of producing nothing. Shared with
+ * `/v1/messages` (`messages.ts`).
+ */
+export const MAX_OUTPUT_TOKENS = 2147483647; // i32::MAX — native ChatConfig.max_new_tokens is i32
+
 function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
@@ -1669,6 +1680,28 @@ export async function handleCreateResponse(
   }
   if (typeof body.input !== 'string' && !Array.isArray(body.input)) {
     sendBadRequest(res, 'Field "input" must be a string or an array', 'input');
+    return;
+  }
+  // A present `max_output_tokens` must be an integer in `[1, i32::MAX]`.
+  // `null` / missing means "no explicit limit" and is fine. Mirrors the
+  // Anthropic `/v1/messages` guard on `max_tokens`. Rejecting here (rather
+  // than forwarding through the mapper) keeps a nonpositive budget from
+  // reaching native chat, where a negative `i32` would size a cache /
+  // allocation as a huge `usize`; core still clamps nonpositive to 0 as
+  // a backstop. The upper bound matters because NAPI truncates a JS
+  // integer above `i32::MAX` to a NEGATIVE `i32` (then clamped to 0 → a
+  // silent empty completion) — reject it as a 400 instead.
+  if (
+    body.max_output_tokens != null &&
+    (!Number.isInteger(body.max_output_tokens) ||
+      body.max_output_tokens <= 0 ||
+      body.max_output_tokens > MAX_OUTPUT_TOKENS)
+  ) {
+    sendBadRequest(
+      res,
+      `Field "max_output_tokens" must be an integer between 1 and ${MAX_OUTPUT_TOKENS}`,
+      'max_output_tokens',
+    );
     return;
   }
 

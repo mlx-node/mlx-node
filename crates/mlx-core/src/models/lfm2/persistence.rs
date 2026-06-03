@@ -2158,7 +2158,9 @@ mod tests {
             prefill_len, prefill_p as i32,
             "prefill KV offset must equal the prefill token count"
         );
-        let max_kv_len = ((prefill_len + (total_t as i32) + 255) / 256) * 256;
+        let max_kv_len =
+            crate::models::qwen3_5::chat_common::kv_capacity_round_up(prefill_len, total_t as i32)
+                .expect("kv capacity round-up in test");
 
         let is_attn: Vec<i32> = (0..num_layers)
             .map(|i| i32::from(config.is_attention_layer(i)))

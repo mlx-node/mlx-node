@@ -13,8 +13,9 @@ use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
     default_thinking_budget_for_effort, extract_chat_params, finalize_chat_result,
-    parse_thinking_and_tools, raw_text_with_reasoning_suppressed, resolve_enable_thinking,
-    resolve_include_reasoning, send_stream_error,
+    generated_capacity_hint, kv_capacity_round_up, parse_thinking_and_tools,
+    raw_text_with_reasoning_suppressed, resolve_enable_thinking, resolve_include_reasoning,
+    send_stream_error,
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -894,7 +895,7 @@ impl Lfm2Inner {
             }
             // Budget the fixed padded cache from the TRUE position so decode
             // can never exceed it (slice_update OOB / silent corruption).
-            let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = kv_capacity_round_up(prefill_len, max_new_tokens)?;
 
             // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
             // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
@@ -1420,7 +1421,8 @@ impl Lfm2Inner {
 
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {
@@ -2109,7 +2111,8 @@ impl Lfm2Inner {
 
         // === STREAMING DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {

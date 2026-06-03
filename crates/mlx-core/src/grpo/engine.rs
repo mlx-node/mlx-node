@@ -212,6 +212,32 @@ impl Default for GRPOEngineConfig {
     }
 }
 
+impl GRPOEngineConfig {
+    /// Validate the config once, before any generation/training begins.
+    ///
+    /// Called from every engine constructor (which all run exactly once,
+    /// BEFORE the train loop / `train_step` / `compute_grads`), so it never
+    /// fires per-step and never panics on a training control-flow path — it
+    /// returns a `Result` Err that the constructor propagates with `?`.
+    ///
+    /// A nonpositive `max_completion_length` would otherwise flow into
+    /// `GenerationConfig.max_new_tokens`, where the (post-clamp) generation
+    /// emits empty "length"-capped completions; the GRPO completion filter
+    /// then treats every completion as length-capped and the engine takes
+    /// the all-filtered SKIP path — advancing training bookkeeping WITHOUT
+    /// applying gradients (a silent no-op). Reject it up front instead.
+    fn validate(&self) -> Result<()> {
+        if let Some(n) = self.max_completion_length
+            && n <= 0
+        {
+            return Err(Error::from_reason(format!(
+                "max_completion_length must be > 0, got {n}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Metrics from a single training step
 #[napi(object)]
 #[derive(Clone)]
@@ -406,6 +432,7 @@ impl GRPOTrainingEngine {
     /// * `config` - Engine configuration
     #[napi(constructor)]
     pub fn new(model: &Qwen3Model, config: GRPOEngineConfig) -> Result<Self> {
+        config.validate()?;
         let model_type = ModelType::Qwen3(model.get_config());
 
         info!(
@@ -447,6 +474,7 @@ impl GRPOTrainingEngine {
     /// Create a new training engine from a Qwen3.5 dense model
     #[napi(factory)]
     pub fn from_qwen35(model: &Qwen3_5Model, config: GRPOEngineConfig) -> Result<Self> {
+        config.validate()?;
         let model_type = ModelType::Qwen35Dense(model.config.clone());
 
         info!(
@@ -484,6 +512,7 @@ impl GRPOTrainingEngine {
     /// Create a new training engine from a Qwen3.5 MoE model
     #[napi(factory)]
     pub fn from_qwen35_moe(model: &Qwen3_5MoeModel, config: GRPOEngineConfig) -> Result<Self> {
+        config.validate()?;
         let model_type = ModelType::Qwen35Moe(model.config.clone());
 
         info!(
@@ -2023,5 +2052,57 @@ mod tests {
         assert_eq!(eff, 0);
         assert!(valid.is_empty());
         assert!(counts.is_empty());
+    }
+
+    // --- GRPOEngineConfig::validate (model-free; runs once before the train
+    //     loop via each engine constructor) -----------------------------------
+
+    #[test]
+    fn validate_rejects_zero_max_completion_length() {
+        // A 0 budget would make every completion an empty "length"-capped
+        // sample → all-filtered SKIP → silent no-op training. Reject up front.
+        let cfg = GRPOEngineConfig {
+            max_completion_length: Some(0),
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("zero budget must be rejected");
+        assert!(
+            err.reason.contains("max_completion_length must be > 0"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_max_completion_length() {
+        let cfg = GRPOEngineConfig {
+            max_completion_length: Some(-1),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("negative budget must be rejected");
+        assert!(
+            err.reason.contains("max_completion_length must be > 0"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn validate_accepts_positive_and_absent_max_completion_length() {
+        // Default (Some(256)) and an explicit positive both pass.
+        assert!(GRPOEngineConfig::default().validate().is_ok());
+        let cfg = GRPOEngineConfig {
+            max_completion_length: Some(1),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        // Absent (None) means "no explicit limit" and is allowed.
+        let cfg_none = GRPOEngineConfig {
+            max_completion_length: None,
+            ..Default::default()
+        };
+        assert!(cfg_none.validate().is_ok());
     }
 }

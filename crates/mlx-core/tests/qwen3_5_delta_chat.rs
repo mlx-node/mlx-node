@@ -705,11 +705,31 @@ async fn session_start_accepts_images_for_vlm() {
 // on it, so MTP now matches AR: 0 new tokens for a nonpositive budget.
 //
 // This test exercises BOTH the MTP-enabled config (the regression) and
-// the AR baseline (the parity target). When `MLX_TEST_MODEL_PATH` points
-// at a checkpoint WITHOUT MTP weights, the MTP gate silently falls back
-// to AR; the assertion (`num_tokens == 0`) still holds, so the test stays
-// green either way. With an MTP-capable checkpoint it directly catches
-// the 1-vs-0 regression.
+// the AR baseline (the parity target).
+//
+// CAVEAT (and why we no longer "stay green either way"): when
+// `enable_mtp = true` but the loaded checkpoint has NO MTP head, the
+// engine's gate (`enable_mtp && has_mtp_weights()`) silently falls back
+// to the AR `decode_loop!`. In that case the "MTP" assertions below would
+// actually re-test the AR path and pass WITHOUT ever entering
+// `decode_loop_mtp!` — a false positive. To prevent that, we first probe
+// the load-time `has_mtp_weights()` signal AND run a small positive-budget
+// MTP generation, confirming via the performance stat
+// (`mtp_mean_accepted_tokens`) that the MTP decode path genuinely ran. If
+// MTP is NOT active (no MTP head in the checkpoint), we print a skip
+// message and `return` rather than running the MTP assertions as if they
+// passed.
+//
+// COVERAGE HONESTY: with an MTP-capable checkpoint this directly catches
+// the 1-vs-0 budget regression in `decode_loop_mtp!`. NOT covered here:
+// (1) the deterministic pre-cancel-flag sub-case (the non-streaming
+//     `chat_session_start` harness can't pre-set a `CancelHandle` before
+//     loop entry — see the note further down; the `max_as_usize == 0`
+//     short-circuit is placed as the loop's first statement, so the
+//     pre-cancelled path is covered by reasoning + statement placement,
+//     not a runtime pre-set); and
+// (2) the MoE call-site (`decode_loop_mtp!` is also expanded for the MoE
+//     model, exercised only by a separate MoE checkpoint).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
 async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
@@ -755,6 +775,67 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         "AR baseline must emit 0 tokens at max_new_tokens=0, got {}",
         ar_zero.num_tokens
     );
+    // Pin the AR parity target: AR's empty `0..0` range never observes
+    // cancel/EOS/repetition, so finish_reason stays at its "length" init.
+    // The MTP assertions below compare against THIS captured baseline
+    // (not a hardcoded literal) so the "MTP matches AR" claim is airtight.
+    assert_eq!(
+        ar_zero.finish_reason, "length",
+        "AR baseline must report finish_reason=\"length\" at max_new_tokens=0, got {:?}",
+        ar_zero.finish_reason
+    );
+
+    // MTP-active gate: confirm the loaded checkpoint actually has an MTP
+    // head AND that the MTP decode path genuinely runs before asserting
+    // anything about it. Without this, a non-MTP checkpoint would make the
+    // budget-0 / negative assertions below silently re-test the AR path
+    // (the engine falls back to `decode_loop!` when `has_mtp_weights()` is
+    // false) and pass as a FALSE POSITIVE.
+    //
+    // `has_mtp_weights()` is the load-time snapshot the engine itself uses
+    // in its gate (`enable_mtp && has_mtp_weights()`). At a 0 budget no
+    // tokens are generated so MTP acceptance is NOT observable; therefore we
+    // run a SMALL POSITIVE-budget MTP generation and require the runtime
+    // performance stat `mtp_mean_accepted_tokens` to be present — proof the
+    // `decode_loop_mtp!` path executed at least one cycle.
+    if !model.has_mtp_weights() {
+        eprintln!(
+            "skipping MTP assertions: checkpoint at {} has no MTP head \
+             (has_mtp_weights() == false); the budget-0 assertions would \
+             otherwise re-test the AR fallback as a false positive",
+            model_path
+        );
+        return;
+    }
+    let mtp_probe = model
+        .chat_session_start(
+            vec![user_message("Say hi in one short word.")],
+            Some(cfg_with(8, true)),
+        )
+        .await
+        .expect("MTP positive-budget probe chat_session_start failed");
+    let mtp_ran = mtp_probe
+        .performance
+        .as_ref()
+        .and_then(|p| p.mtp_mean_accepted_tokens)
+        .is_some();
+    println!(
+        "MTP probe (budget=8): num_tokens={} mtp_mean_accepted_tokens={:?}",
+        mtp_probe.num_tokens,
+        mtp_probe
+            .performance
+            .as_ref()
+            .and_then(|p| p.mtp_mean_accepted_tokens)
+    );
+    if !mtp_ran {
+        eprintln!(
+            "skipping MTP assertions: has_mtp_weights() is true but a \
+             positive-budget MTP run reported no mtp_mean_accepted_tokens \
+             (MTP decode path did not execute — e.g. compiled-path / paged \
+             gate off); not running the MTP assertions as if they passed"
+        );
+        return;
+    }
 
     // 2) MTP path at budget 0: this is the regression. Before the fix the
     //    unconditional prefill-seed push made this 1. It must now be 0.
@@ -774,6 +855,35 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         "MTP path must emit 0 tokens at max_new_tokens=0 (matching AR), got {}",
         mtp_zero.num_tokens
     );
+    // #3 fix: at a 0 budget the MTP loop must short-circuit to "length"
+    // (AR's empty `0..0` range never observes cancel/EOS/repetition, so its
+    // finish_reason stays at the "length" init). Before this fix the loop
+    // was still entered and the cancelled/EOS checks could run first; with
+    // a pre-set cancel flag that produced "cancelled" where AR reports
+    // "length". The non-streaming harness here can't pre-set the cancel
+    // flag (see the note below), but the non-cancelled finish_reason must
+    // still be "length" — and the new `max_as_usize == 0` short-circuit is
+    // the same code path that the pre-cancelled case takes.
+    assert_eq!(
+        mtp_zero.finish_reason, ar_zero.finish_reason,
+        "MTP finish_reason at max_new_tokens=0 must match the AR baseline \
+         ({:?}), got {:?}",
+        ar_zero.finish_reason, mtp_zero.finish_reason
+    );
+    // Pre-cancelled streaming sub-case (#3): the regression was that a
+    // request whose cancel flag is ALREADY set at loop entry, with a 0
+    // budget under MTP, reported "cancelled" while AR reports "length".
+    // This non-streaming `chat_session_start` harness has no `CancelHandle`
+    // wired before the macro is entered (the streaming path sets the flag
+    // via `handle.cancel()` AFTER dispatch, which races the decode and
+    // cannot be made to land before loop entry deterministically here), so
+    // we cannot pre-set the flag in-test. The `max_as_usize == 0`
+    // short-circuit is placed as the VERY FIRST statement inside `loop {}`,
+    // BEFORE the cancelled check, so a pre-cancelled 0-budget request takes
+    // exactly the branch asserted above and yields "length" too. The
+    // assertion on `mtp_zero.finish_reason` therefore covers the same code
+    // path; the cancel-flag ordering is verified by reasoning + the
+    // statement placement rather than a runtime pre-set.
 
     // 3) Negative budget on the MTP path: previously wrapped via `as
     //    usize` to a huge cap → effectively unbounded. Must now clamp to
@@ -793,5 +903,13 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         mtp_neg.num_tokens, 0,
         "MTP path must emit 0 tokens at a negative budget, got {}",
         mtp_neg.num_tokens
+    );
+    // A negative budget clamps to 0, so it takes the same short-circuit as
+    // the 0 case (#3 fix) and must match the same AR baseline.
+    assert_eq!(
+        mtp_neg.finish_reason, ar_zero.finish_reason,
+        "MTP finish_reason at a negative budget (clamped to 0) must match the \
+         AR baseline ({:?}), got {:?}",
+        ar_zero.finish_reason, mtp_neg.finish_reason
     );
 }

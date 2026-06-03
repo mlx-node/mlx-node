@@ -61,5 +61,25 @@ describe.sequential('Qwen3 Model', () => {
       expect(result.numTokens).toBeGreaterThanOrEqual(0);
       expect(result.numTokens).toBeLessThanOrEqual(20);
     });
+
+    it('should reject a nonpositive maxNewTokens budget (parity with Qwen3.5)', async () => {
+      // The public generate() API rejects a nonpositive budget (Err)
+      // instead of panicking the model thread on Vec::with_capacity(-1 as
+      // usize) == usize::MAX. Requires a real model since the guard runs
+      // inside generate_sync on the model thread (post-load).
+      const modelPath = process.env.QWEN3_MODEL_PATH;
+
+      if (!modelPath) {
+        console.log('  ⏭️  Skipping nonpositive-budget reject test (set QWEN3_MODEL_PATH to enable)');
+        return;
+      }
+
+      const model = await Qwen3Model.load(modelPath);
+      const messages = [{ role: 'user', content: 'Hello' }];
+
+      // Both 0 and a negative budget must reject (not panic, not resolve).
+      await expect(model.generate(messages, { maxNewTokens: 0 })).rejects.toThrow(/max_new_tokens must be > 0/);
+      await expect(model.generate(messages, { maxNewTokens: -1 })).rejects.toThrow(/max_new_tokens must be > 0/);
+    });
   });
 });

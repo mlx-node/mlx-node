@@ -372,7 +372,10 @@ impl QianfanOCRInner {
         config: ChatConfig,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
+        // usize)` below never sees a negative `i32` (`-1 as usize` would
+        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -575,7 +578,9 @@ impl QianfanOCRInner {
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
         let prefill_token_count = token_ids.len();
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
+            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+        );
         let mut finish_reason = "length".to_string();
 
         // --- Step 8: Decode loop ---
@@ -766,7 +771,11 @@ impl QianfanOCRInner {
         };
 
         let result: Result<()> = (|| {
-            let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+            // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(..
+            // as usize)` below never sees a negative `i32` (`-1 as usize`
+            // would request `usize::MAX`); the `0..max_new_tokens` loop then
+            // emits 0.
+            let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
             let temperature = config.temperature.unwrap_or(0.0);
             let top_k = config.top_k.unwrap_or(0);
             let top_p = config.top_p.unwrap_or(1.0);
@@ -946,7 +955,9 @@ impl QianfanOCRInner {
             let first_token_instant = generation_start.map(|_| std::time::Instant::now());
             let prefill_token_count = all_tokens.len();
 
-            let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+            let mut generated_tokens: Vec<u32> = Vec::with_capacity(
+                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+            );
             let mut finish_reason = "length".to_string();
 
             // Stateful decoder for correct multi-byte/CJK streaming
@@ -1350,7 +1361,10 @@ impl QianfanOCRInner {
         // boundary for the next `chat_session_continue*` call.
         let eos_token_id = self.im_end_id()?;
 
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
+        // usize)` below never sees a negative `i32` (`-1 as usize` would
+        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1455,7 +1469,9 @@ impl QianfanOCRInner {
 
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
+            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+        );
         let mut finish_reason = "length".to_string();
 
         for step in 0..max_new_tokens {
@@ -1826,7 +1842,10 @@ impl QianfanOCRInner {
 
         let eos_token_id = self.im_end_id()?;
 
-        let max_new_tokens = config.max_new_tokens.unwrap_or(512);
+        // Clamp a nonpositive budget to 0 so the `Vec::with_capacity(.. as
+        // usize)` below never sees a negative `i32` (`-1 as usize` would
+        // request `usize::MAX`); the `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = config.max_new_tokens.unwrap_or(512).max(0);
         let temperature = config.temperature.unwrap_or(0.0);
         let top_k = config.top_k.unwrap_or(0);
         let top_p = config.top_p.unwrap_or(1.0);
@@ -1923,7 +1942,9 @@ impl QianfanOCRInner {
 
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
+            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+        );
         let mut finish_reason = "length".to_string();
 
         // Stateful decoder for correct multi-byte/CJK streaming.
@@ -2155,7 +2176,9 @@ impl QianfanOCRInner {
         let mut token = sample(&last_logits, Some(sampling_config))?;
 
         let eos_token_id = self.config.eos_token_id;
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        let mut generated: Vec<u32> = Vec::with_capacity(
+            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
+        );
 
         for step in 0..max_new_tokens {
             token.eval();
@@ -2277,7 +2300,10 @@ impl QianfanOCRModel {
             Error::from_reason("Model not initialized. Call QianfanOCRModel.load() first.")
         })?;
 
-        let max_new_tokens = max_new_tokens.unwrap_or(256);
+        // Clamp a nonpositive budget to 0 before it reaches `generate_sync`
+        // (which sizes `Vec::with_capacity(.. as usize)`); the
+        // `0..max_new_tokens` loop then emits 0.
+        let max_new_tokens = max_new_tokens.unwrap_or(256).max(0);
         let temperature = temperature.unwrap_or(0.0);
         let input_ids = input_ids.clone();
 

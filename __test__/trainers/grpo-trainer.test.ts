@@ -281,6 +281,20 @@ describe.sequential('GRPOTrainer - Constructor', () => {
   it('should throw error for missing model path', async () => {
     await expect(GRPOTrainer.create({ modelName: 'qwen3-0.6b' })).rejects.toThrow('modelPath is required');
   });
+
+  it('should throw error for nonpositive maxCompletionLength (fail fast, no model load)', async () => {
+    // A 0/negative budget makes every completion an empty "length"-capped
+    // sample → the GRPO filter drops them all → training advances bookkeeping
+    // without applying gradients (a silent no-op). Reject up front, before the
+    // (slow) model load. The `modelPath` is present-but-irrelevant: the
+    // maxCompletionLength check throws before any disk access.
+    await expect(
+      GRPOTrainer.create({ modelPath: '/nonexistent', modelName: 'qwen3-0.6b', maxCompletionLength: 0 }),
+    ).rejects.toThrow('maxCompletionLength must be a positive integer');
+    await expect(
+      GRPOTrainer.create({ modelPath: '/nonexistent', modelName: 'qwen3-0.6b', maxCompletionLength: -1 }),
+    ).rejects.toThrow('maxCompletionLength must be a positive integer');
+  });
 });
 
 describe.sequential('GRPOTrainer - scoreGenerations()', () => {

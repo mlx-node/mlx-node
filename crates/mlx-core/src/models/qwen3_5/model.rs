@@ -2403,7 +2403,8 @@ impl Qwen35Inner {
         // needed to reconstruct a turn's control flow.
         {
             let prefill_len = seq_len as i32;
-            let max_kv_len_estimate = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+            let max_kv_len_estimate =
+                chat_common::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
             let has_mtp = self.has_mtp_weights();
             let branch = if p.enable_mtp && has_mtp && use_compiled {
                 "MTP (will attempt init)"
@@ -2456,7 +2457,7 @@ impl Qwen35Inner {
             } else {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
+                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
                 let num_layers = self.config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -2533,16 +2534,30 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
-                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => {
-                        cond_init_ok = Some(true);
-                        true
-                    }
+                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
+                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                        Ok(()) => {
+                            cond_init_ok = Some(true);
+                            true
+                        }
+                        Err(e) => {
+                            cond_init_ok = Some(false);
+                            warn!(
+                                "W6 MTP init failed; falling back to single-token decode: {}",
+                                e.reason
+                            );
+                            false
+                        }
+                    },
                     Err(e) => {
+                        // KV capacity would overflow i32 — disable MTP, fall back to AR.
+                        // The non-MTP compiled cache is sized by the AR primary site
+                        // above (the `if use_compiled` else-branch / VLM prefill), which
+                        // already surfaced the same Err via `?` before reaching here, so
+                        // this arm is belt-and-suspenders.
                         cond_init_ok = Some(false);
                         warn!(
-                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
                             e.reason
                         );
                         false
@@ -3545,7 +3560,8 @@ impl Qwen35Inner {
 
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         // Compile-cached `max_blocks_per_seq` shape — picking the
@@ -3574,12 +3590,23 @@ impl Qwen35Inner {
             && cpp_session_ready
             && {
                 let prefill_len = token_history.len() as i32;
-                let max_kv_len = ((prefill_len + max_new_tokens + 255) / 256) * 256;
-                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => true,
+                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
+                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(
+                                "Qwen3.5 MTP-paged init failed; falling back to AR paged decode: {}",
+                                e.reason
+                            );
+                            false
+                        }
+                    },
                     Err(e) => {
+                        // KV capacity would overflow i32 — disable MTP and fall back to
+                        // AR paged decode, whose block-paged KV cache grows dynamically
+                        // (no fixed i32 capacity), so it has nothing to overflow.
                         warn!(
-                            "Qwen3.5 MTP-paged init failed; falling back to AR paged decode: {}",
+                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
                             e.reason
                         );
                         false
@@ -4582,7 +4609,8 @@ impl Qwen35Inner {
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         let max_blocks_per_seq: u32 = {
@@ -5291,7 +5319,7 @@ impl Qwen35Inner {
             // VLM adjustments.
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -5351,16 +5379,27 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
-                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => {
-                        cond_init_ok = Some(true);
-                        true
-                    }
+                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
+                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                        Ok(()) => {
+                            cond_init_ok = Some(true);
+                            true
+                        }
+                        Err(e) => {
+                            cond_init_ok = Some(false);
+                            warn!(
+                                "W6 MTP init failed; falling back to single-token decode: {}",
+                                e.reason
+                            );
+                            false
+                        }
+                    },
                     Err(e) => {
+                        // KV capacity would overflow i32 — disable MTP, fall back to AR
+                        // (the AR primary site above surfaces the same Err via `?`).
                         cond_init_ok = Some(false);
                         warn!(
-                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
                             e.reason
                         );
                         false
@@ -6261,7 +6300,7 @@ impl Qwen35Inner {
             } else {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
+                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
                 let num_layers = self.config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -6321,16 +6360,27 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                let max_kv_len = ((prefill_len + p.max_new_tokens + 255) / 256) * 256;
-                match init_mtp_compiled_from_main(&self.config, max_kv_len) {
-                    Ok(()) => {
-                        cond_init_ok = Some(true);
-                        true
-                    }
+                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
+                    Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
+                        Ok(()) => {
+                            cond_init_ok = Some(true);
+                            true
+                        }
+                        Err(e) => {
+                            cond_init_ok = Some(false);
+                            warn!(
+                                "W6 MTP init failed; falling back to single-token decode: {}",
+                                e.reason
+                            );
+                            false
+                        }
+                    },
                     Err(e) => {
+                        // KV capacity would overflow i32 — disable MTP, fall back to AR
+                        // (the AR primary site above surfaces the same Err via `?`).
                         cond_init_ok = Some(false);
                         warn!(
-                            "W6 MTP init failed; falling back to single-token decode: {}",
+                            "Qwen3.5 MTP init skipped; KV capacity overflow: {}",
                             e.reason
                         );
                         false
@@ -7175,9 +7225,17 @@ impl Qwen35Inner {
 
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens as usize);
+        // Bounded, floored capacity hint (see `generated_capacity_hint`): this
+        // training-only path takes `max_new_tokens` from training config
+        // (SFT/GRPO) where panics are banned. The helper prevents both the
+        // negative-budget `.. as usize` wrap to `usize::MAX` (which would abort)
+        // and a multi-GiB eager reservation for an absurd budget, without
+        // changing behavior for valid budgets — the buffer still grows to hold
+        // every generated token.
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(max_new_tokens as usize)
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -11252,7 +11310,7 @@ fn vlm_prefill(
         use mlx_sys as sys;
 
         let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
-        let max_kv_len = ((seq_len_i32 + max_new_tokens + 255) / 256) * 256;
+        let max_kv_len = chat_common::kv_capacity_round_up(seq_len_i32, max_new_tokens)?;
         let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
 
         let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();

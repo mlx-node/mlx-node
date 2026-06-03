@@ -272,6 +272,47 @@ describe('handleCreateMessage', () => {
       expect(parsed.error.message).toContain('max_tokens');
     });
 
+    it('returns 400 when max_tokens exceeds i32::MAX (2^31)', async () => {
+      // NAPI truncates a JS integer above i32::MAX to a NEGATIVE i32, which
+      // the core clamp turns into 0 (silent empty completion). Reject at the
+      // edge instead.
+      const registry = new ModelRegistry();
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 2147483648,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.message).toContain('max_tokens');
+    });
+
+    it('returns 400 when max_tokens is Number.MAX_SAFE_INTEGER', async () => {
+      const registry = new ModelRegistry();
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: Number.MAX_SAFE_INTEGER,
+        } as any,
+        registry,
+      );
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.message).toContain('max_tokens');
+    });
+
     it('returns 400 for null message items', async () => {
       const registry = new ModelRegistry();
       registry.register('test', createMockModel());

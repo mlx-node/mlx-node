@@ -959,6 +959,16 @@ export class GRPOTrainer<T = unknown> {
         `device="${config.device}" is not supported. MLX only supports Metal GPU. Remove device from config.`,
       );
     }
+    // A nonpositive maxCompletionLength would size every completion to an empty
+    // "length"-capped sample, so the GRPO completion filter drops them all and
+    // training advances bookkeeping without applying gradients (a silent
+    // no-op). The native engine rejects this too; fail fast in JS first.
+    if (
+      config.maxCompletionLength != null &&
+      (!Number.isInteger(config.maxCompletionLength) || config.maxCompletionLength <= 0)
+    ) {
+      throw new Error(`maxCompletionLength must be a positive integer, got ${config.maxCompletionLength}`);
+    }
 
     // Create logger early (before model loading)
     // TUI mode is auto-detected from MLX_TUI_MODE env var (set by mlx-tui)

@@ -3061,7 +3061,8 @@ impl Gemma4Inner {
         let first_token_instant = Some(std::time::Instant::now());
 
         // === DECODE LOOP ===
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {
@@ -3387,7 +3388,8 @@ impl Gemma4Inner {
         let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
         let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_new_tokens.max(0) as usize);
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
 
