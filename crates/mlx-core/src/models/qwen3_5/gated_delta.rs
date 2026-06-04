@@ -3,22 +3,83 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-/// Minimum sequence length to use the chunked prefill kernel.
-/// The chunked Metal kernel (`gated_delta_chunked.metal.inc`) is pure scalar-FMA +
-/// `simd_sum` reductions — it contains ZERO `simdgroup_matrix` / NAX matmul instructions.
-/// Its M5+ win therefore comes from M5's higher memory bandwidth plus better Metal
-/// launch-overhead amortization across the chunked tiles, NOT from tensor cores.
-/// On M1–M4 the chunked kernel's O(BT^2) overhead outweighs those bandwidth savings, so
-/// the per-step kernel wins; on M5+ (gen >= 17) chunked wins.
-/// (Future, unclaimed: converting the kernel's Phase-2/Phase-4 GEMMs to
-/// `simdgroup_matrix`/NAX `matmul2d` could speed up prefill further — not done today.)
+/// Minimum sequence length for the chunked prefill kernel to even be *eligible*.
+/// Below this the per-step recurrence always wins, so chunked is never considered.
+/// (Chunked is opt-in only — see [`GdnKernel`] / [`should_use_chunked`].)
 const CHUNK_THRESHOLD: i64 = 64;
 
-/// Minimum GPU architecture generation for the chunked kernel.
-/// On M5 (gen 17) the chunked tiling becomes a net win thanks to higher memory bandwidth
-/// and amortized Metal launch overhead (the kernel uses no tensor-core ops, so this is
-/// NOT a Neural Accelerator effect). On M1–M4 (gen 13–16), the per-step kernel is faster.
-const CHUNK_MIN_GPU_GEN: i32 = 17;
+/// GDN recurrence kernel selection. **Per-step is the default on EVERY GPU generation.**
+///
+/// History (corrected 2026-06-04): a `gen >= 17` (M5) gate once routed long prefills to the
+/// chunked kernel on the unvalidated theory that M5's memory bandwidth made its `O(BT^2)`
+/// tiling a net win. Measured on an M5 Max (gen 17, isolated worktree): the chunked kernel is
+/// **2.8–3.5× SLOWER** end-to-end prefill TTFT than per-step (24–31× slower per isolated GDN
+/// call) at `Hv=32, B=1` across 580–5384 prompt tokens — and it is ~2× slower on M3 too. The
+/// chunked Metal kernel (`gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum`
+/// reductions with ZERO `simdgroup_matrix` / NAX matmul, so it never had a tensor-core
+/// advantage. The gen gate was a stale inversion of an old M3 result that was never A/B'd on
+/// M5; it is removed. Per-step is already the canonical path on M1–M4, for all `seq < 64`, all
+/// masked GDN calls, and every compiled-C++ prefill path — so per-step is the de-facto
+/// reference everywhere.
+///
+/// Chunked is retained behind `MLX_GDN_KERNEL=chunked` for A/B and bring-up only. NOTE: the two
+/// kernels are NOT token-identical — they differ by 1–2 bf16 ULP (two valid reduction
+/// orderings), which can flip a greedy argmax and change the continuation on some long prompts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GdnKernel {
+    /// Measured-best default: per-step on every arch.
+    Auto,
+    /// Force the per-step recurrence (also the `MLX_GDN_FORCE_PERSTEP=1` legacy toggle).
+    ForcePerStep,
+    /// Force the chunked prefill kernel (A/B only — changes output by 1–2 bf16 ULP).
+    ForceChunked,
+}
+
+/// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked`); also honors the
+/// legacy `MLX_GDN_FORCE_PERSTEP=1`. Anything else (incl. unset) → [`GdnKernel::Auto`].
+fn gdn_kernel_override() -> GdnKernel {
+    parse_gdn_kernel(
+        std::env::var("MLX_GDN_KERNEL").ok().as_deref(),
+        std::env::var("MLX_GDN_FORCE_PERSTEP").ok().as_deref(),
+    )
+}
+
+/// Pure parse of the GDN-kernel env overrides (kept env-free for race-free testing).
+/// `MLX_GDN_KERNEL` takes precedence; the legacy `MLX_GDN_FORCE_PERSTEP=1/true/on` is a
+/// per-step-only fallback. Unrecognized / both-unset → [`GdnKernel::Auto`].
+fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>, legacy_force_perstep: Option<&str>) -> GdnKernel {
+    if let Some(v) = mlx_gdn_kernel {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "perstep" | "per_step" | "per-step" | "step" => return GdnKernel::ForcePerStep,
+            "chunked" | "chunk" => return GdnKernel::ForceChunked,
+            _ => {}
+        }
+    }
+    if matches!(
+        legacy_force_perstep.map(str::trim),
+        Some("1") | Some("true") | Some("on")
+    ) {
+        return GdnKernel::ForcePerStep;
+    }
+    GdnKernel::Auto
+}
+
+/// Pure routing predicate: should this GDN call take the chunked prefill kernel?
+///
+/// `Auto` is ALWAYS false — per-step is faster on every measured arch, so chunked only runs
+/// when explicitly forced AND the call is a long (`seq >= CHUNK_THRESHOLD`), unmasked prefill
+/// the chunked kernel can actually handle. `_gpu_gen` is retained for documentation and to make
+/// any future arch-gating a localized one-line change; `Auto` ignores it today (M5 included).
+fn should_use_chunked(seq_len: i64, mask_is_none: bool, _gpu_gen: i32, choice: GdnKernel) -> bool {
+    // Chunked has no masked variant and loses on short sequences — never eligible there.
+    if !mask_is_none || seq_len < CHUNK_THRESHOLD {
+        return false;
+    }
+    match choice {
+        GdnKernel::ForceChunked => true,
+        GdnKernel::Auto | GdnKernel::ForcePerStep => false,
+    }
+}
 
 /// Returns the GPU architecture generation, cached after first call.
 fn gpu_architecture_gen() -> i32 {
@@ -436,18 +497,31 @@ pub fn gated_delta_update(
 
     // Use Metal kernel for recurrence (requires Dk divisible by 32 for SIMD register blocking)
     if k_dim % 32 == 0 {
-        // Chunked kernel for long sequences on M5+ — wins via M5's memory bandwidth +
-        // amortized Metal launch overhead, NOT tensor cores (the kernel is all scalar-FMA
-        // + simd_sum, no simdgroup_matrix). On M1–M4 the per-step kernel is faster.
-        // Chunked kernel needs g in log-space directly (no exp/log roundtrip).
-        if seq_len >= CHUNK_THRESHOLD
-            && mask.is_none()
-            && gpu_architecture_gen() >= CHUNK_MIN_GPU_GEN
-        {
-            match gated_delta_chunked(&q, &k, v, &g_log, &beta, &initial_state) {
-                Ok(result) => return Ok(result),
-                Err(_) => {
-                    // Fall through to per-step kernel
+        // GDN recurrence kernel selection. Per-step is the default on EVERY GPU generation:
+        // chunked is 2.8–3.5× slower prefill on M5 and ~2× slower on M3 (see `GdnKernel`).
+        // Chunked is opt-in only via `MLX_GDN_KERNEL=chunked` (A/B / bring-up), and needs g in
+        // log-space directly (no exp/log roundtrip).
+        //
+        // Cheap eligibility first — mirrors `should_use_chunked`'s early-out (same
+        // `CHUNK_THRESHOLD` / `mask` terms) so short or masked calls (every per-token decode
+        // step) never pay the env + GPU-gen lookups below. The pure `should_use_chunked` still
+        // owns the full contract and is unit-tested; this is just lazy argument evaluation.
+        if seq_len >= CHUNK_THRESHOLD && mask.is_none() {
+            let choice = gdn_kernel_override();
+            if should_use_chunked(seq_len, mask.is_none(), gpu_architecture_gen(), choice) {
+                match gated_delta_chunked(&q, &k, v, &g_log, &beta, &initial_state) {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        // An explicit `MLX_GDN_KERNEL=chunked` force must be observable when it
+                        // fails — otherwise an A/B run silently measures per-step while reporting
+                        // "chunked". (Auto never reaches here: it returns per-step above.)
+                        if choice == GdnKernel::ForceChunked {
+                            eprintln!(
+                                "[mlx-gdn] MLX_GDN_KERNEL=chunked forced but the chunked kernel failed ({e}); falling back to per-step"
+                            );
+                        }
+                        // Fall through to per-step kernel.
+                    }
                 }
             }
         }
@@ -462,4 +536,107 @@ pub fn gated_delta_update(
     // Ops-based sequential loop fallback (also needs exp(g_log))
     let g = g_log.exp()?;
     gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All GPU generations this engine targets (M1=13 … M5=17). The shipped contract is
+    // arch-independent: `Auto` is per-step on every one of these — including M5 (gen 17),
+    // whose old `>= 17` chunked gate was a measured-2.8–3.5×-slower stale inversion.
+    const ALL_GENS: [i32; 5] = [13, 14, 15, 16, 17];
+
+    /// Locks the SHIPPED routing intent so a future edit that re-inverts the M5 default
+    /// (or makes chunked the default on any arch) trips a failing assert. See [`GdnKernel`].
+    #[test]
+    fn chunked_is_never_the_default_on_any_arch() {
+        for gpu_gen in ALL_GENS {
+            // A long, unmasked prefill — the only shape chunked is even eligible for —
+            // still routes to per-step under `Auto`, on EVERY arch (M5 included).
+            assert!(
+                !should_use_chunked(4096, true, gpu_gen, GdnKernel::Auto),
+                "Auto must route to per-step on gen {gpu_gen} (chunked is 2.8–3.5× slower on M5)",
+            );
+            assert!(
+                !should_use_chunked(4096, true, gpu_gen, GdnKernel::ForcePerStep),
+                "ForcePerStep must never select chunked (gen {gpu_gen})",
+            );
+            // Chunked is reachable ONLY by explicit force, and on every arch (so a future
+            // default-flip can be A/B'd in both directions without a rebuild).
+            assert!(
+                should_use_chunked(4096, true, gpu_gen, GdnKernel::ForceChunked),
+                "ForceChunked must select chunked for a long unmasked prefill (gen {gpu_gen})",
+            );
+        }
+    }
+
+    /// Chunked is ineligible for short or masked calls regardless of the override.
+    #[test]
+    fn chunked_eligibility_requires_long_unmasked_prefill() {
+        for choice in [
+            GdnKernel::Auto,
+            GdnKernel::ForcePerStep,
+            GdnKernel::ForceChunked,
+        ] {
+            // Below CHUNK_THRESHOLD → never chunked, even when forced.
+            assert!(!should_use_chunked(CHUNK_THRESHOLD - 1, true, 17, choice));
+            // Masked (decode / banded) → never chunked, even when forced (no masked variant).
+            assert!(!should_use_chunked(4096, false, 17, choice));
+        }
+        // Exactly at the threshold, forced, unmasked → eligible.
+        assert!(should_use_chunked(
+            CHUNK_THRESHOLD,
+            true,
+            17,
+            GdnKernel::ForceChunked
+        ));
+    }
+
+    /// The env-override parser maps strings → [`GdnKernel`] (tested env-free, race-free).
+    #[test]
+    fn parse_gdn_kernel_override_semantics() {
+        // Default: nothing set.
+        assert_eq!(parse_gdn_kernel(None, None), GdnKernel::Auto);
+        // MLX_GDN_KERNEL=chunked / perstep (case-insensitive, trimmed, aliases).
+        assert_eq!(
+            parse_gdn_kernel(Some("chunked"), None),
+            GdnKernel::ForceChunked
+        );
+        assert_eq!(
+            parse_gdn_kernel(Some("  CHUNK "), None),
+            GdnKernel::ForceChunked
+        );
+        assert_eq!(
+            parse_gdn_kernel(Some("perstep"), None),
+            GdnKernel::ForcePerStep
+        );
+        assert_eq!(
+            parse_gdn_kernel(Some("per-step"), None),
+            GdnKernel::ForcePerStep
+        );
+        assert_eq!(
+            parse_gdn_kernel(Some("Step"), None),
+            GdnKernel::ForcePerStep
+        );
+        // MLX_GDN_KERNEL wins over the legacy toggle when it is a known value.
+        assert_eq!(
+            parse_gdn_kernel(Some("chunked"), Some("1")),
+            GdnKernel::ForceChunked
+        );
+        // Unknown MLX_GDN_KERNEL falls through to the legacy toggle, then to Auto.
+        assert_eq!(
+            parse_gdn_kernel(Some("garbage"), Some("1")),
+            GdnKernel::ForcePerStep
+        );
+        assert_eq!(parse_gdn_kernel(Some("garbage"), None), GdnKernel::Auto);
+        // Legacy MLX_GDN_FORCE_PERSTEP truthy values only.
+        assert_eq!(
+            parse_gdn_kernel(None, Some("true")),
+            GdnKernel::ForcePerStep
+        );
+        assert_eq!(parse_gdn_kernel(None, Some("on")), GdnKernel::ForcePerStep);
+        assert_eq!(parse_gdn_kernel(None, Some("0")), GdnKernel::Auto);
+        assert_eq!(parse_gdn_kernel(None, Some("")), GdnKernel::Auto);
+    }
 }

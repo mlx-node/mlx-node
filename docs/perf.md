@@ -41,6 +41,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_EVAL_ALL_CACHES=1`                              | Revert to eval-all-caches (default is token-only)        |
 | `MLX_QWEN35_NATIVE_KV_WRITE` / `MLX_NATIVE_KV_WRITE` | Toggle native KV-write optimization on Qwen3.5 attention |
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`                    | Weight-loading chunk size                                |
+| `MLX_GDN_KERNEL=perstep\|chunked`                    | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts) |
 
 ### Paged-attention
 
@@ -408,7 +409,7 @@ Cross-references:
 | M4   | 16  |
 | M5   | 17  |
 
-The Qwen3.5 chunked GDN prefill kernel is gated on M5+ (`CHUNK_MIN_GPU_GEN = 17`) with a 64-token minimum sequence length. The chunked Metal kernel (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum` reductions — it contains **zero** `simdgroup_matrix` / NAX matmul instructions, so its M5 win is **not** a tensor-core effect. It wins on M5 because of M5's higher memory bandwidth plus better Metal launch-overhead amortization across the chunked tiles; on M1–M4 the chunked tiling's O(BT²) overhead outweighs those savings and the per-step kernel wins. (Future, unclaimed: porting the kernel's Phase-2/Phase-4 GEMMs to `simdgroup_matrix`/NAX `matmul2d` is a prefill-only opportunity that has **not** been done — it is not the reason for the current M5 gate.)
+The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** GPU generation. The alternative chunked prefill kernel (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum` reductions — it contains **zero** `simdgroup_matrix` / NAX matmul instructions, so it never had a tensor-core advantage. It was once gated ON for M5+ (`gen >= 17`) on the theory that M5's memory bandwidth made its `O(BT²)` tiling a net win, but that was never A/B'd on M5. Measured 2026-06-04 on an M5 Max (gen 17, isolated worktree): the chunked kernel is **2.8–3.5× slower** end-to-end prefill TTFT than per-step (24–31× slower per isolated GDN call) across 580–5384 prompt tokens — and ~2× slower on M3. The gen gate was a stale inversion of an old M3 result and has been removed. Chunked is retained behind `MLX_GDN_KERNEL=chunked` for A/B only. **The two kernels are NOT token-identical**: they differ by 1–2 bf16 ULP (two valid reduction orderings), which can flip a greedy argmax and change the continuation on some long prompts. (Future, unclaimed: porting the chunked kernel's Phase-2/Phase-4 GEMMs to `simdgroup_matrix`/NAX `matmul2d` is a prefill-only opportunity that has **not** been done — and is moot while per-step is the hot path.)
 
 ## Quantization
 
