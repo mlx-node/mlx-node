@@ -79,13 +79,20 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         }
     }
 
+    // Always write `use_block_paged_cache` explicitly (in BOTH branches),
+    // mirroring `lfm2_compiled_e2e.rs`. Without this the flat clone
+    // (`use_block_paged == false`) would leave the bf16 source config — which
+    // OMITS the key — untouched, and `Lfm2Inner::new`'s `unwrap_or(true)`
+    // would silently load the PAGED path. That made the parity tests compare
+    // paged-vs-paged and miss flat-path regressions. Pinning the flag forces
+    // the flat clone onto the genuine flat path (`Some(false)`).
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path)
+        .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(use_block_paged);
     if use_block_paged {
-        let cfg_path = dst.join("config.json");
-        let raw = fs::read_to_string(&cfg_path)
-            .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
-        let mut cfg: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-        cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
         // 256 MB pool + 16-token blocks: enough to hold the test's tiny
         // prompts × all attention layers in LFM2-1.2B (head_dim=128,
         // kv_heads varies by layer kind). The adapter only allocates
@@ -93,11 +100,11 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         // than Qwen3's at the same MB.
         cfg["paged_cache_memory_mb"] = serde_json::Value::from(256u32);
         cfg["paged_block_size"] = serde_json::Value::from(16u32);
-        let pretty = serde_json::to_string_pretty(&cfg)
-            .map_err(|e| format!("serialize config.json: {e}"))?;
-        fs::write(&cfg_path, pretty)
-            .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
     }
+    let pretty =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
+    fs::write(&cfg_path, pretty)
+        .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
 
     Ok(dst)
 }
