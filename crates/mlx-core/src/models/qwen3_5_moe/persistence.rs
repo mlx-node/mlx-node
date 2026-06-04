@@ -175,7 +175,7 @@ fn sanitize_weights(
 
         // MTP *non-expert* weights bypass the +1.0 norm shift and stay in final
         // MTPLX form (norms, fc, attn, shared-expert, router gate are consumed
-        // as-is by both the W2 MTP module and the compiled MTP graph). MTP
+        // as-is by both the MTP module and the compiled MTP graph). MTP
         // *expert* weights (`mtp.*.mlp.experts.*`), however, must be normalized
         // identically to the main namespace — fused gate_up split, experts ->
         // switch_mlp rename, per-expert stacking — so the compiled MoE-MTP path's
@@ -1042,7 +1042,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // MTP head discovery precedence (backward-compat mandatory):
                     //   1. inline `mtp.*` tensors in the body shards (existing
                     //      MoE-MTP checkpoints — kept as-is by sanitize);
-                    //   2. mlx-vlm split `mtp-drafter/` directory (Phase 1 convert).
+                    //   2. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
                     // MoE has no legacy `mtp.safetensors` sidecar path; the
                     // drafter merge only fires when the body carries NO inline
                     // `mtp.*` tensors so inline always wins. The re-prefixed
@@ -1137,8 +1137,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     let (top_level_mode, mut per_layer_quant) =
                         parse_quant_block(quant_cfg, quant_group_size);
 
-                    // PR #65 (Task 36) — augment the per-layer-quant table with
-                    // the MTP head's quantization metadata derived from the
+                    // Augment the per-layer-quant table with the MTP head's
+                    // quantization metadata derived from the
                     // `mtplx_mtp_quantization` config block, mirroring the dense
                     // loader (`qwen3_5/persistence.rs`). Without this, a
                     // `--q-mtp {cyankiwi,all}` MoE checkpoint reloads its
@@ -1146,7 +1146,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // shared expert + gate, attention) with the WRONG PLQ — the
                     // gate-prefix would fall back to the 8-bit `default_gate_plq`
                     // while convert packed them at the uniform 4-bit/gs32 affine
-                    // PLQ (Option A), corrupting the head. The suffix set is
+                    // PLQ, corrupting the head. The suffix set is
                     // flavor-derived from the SAME `mtp_mlp_variant` decision the
                     // load-completeness gate uses (a dense-flavored MoE MTP layer
                     // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
@@ -1477,15 +1477,14 @@ fn register_moe_weights_with_cpp(
     // per-projection quant-info registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
-    // PR #65 (mtp-reload P1) — invalidate the compiled MTP-verify dispatch
-    // tables (shared with the dense Qwen3.5 path) in the SAME write-lock
-    // critical section as the weight clear, so the next verify re-traces
-    // against the weights we store just below instead of reusing the
-    // previous model's baked compile cache. See the dense loader
-    // (`register_weights_with_cpp`) for the full rationale.
+    // Invalidate the compiled MTP-verify dispatch tables (shared with the
+    // dense Qwen3.5 path) in the SAME write-lock critical section as the
+    // weight clear, so the next verify re-traces against the weights we store
+    // just below instead of reusing the previous model's baked compile cache.
+    // See the dense loader (`register_weights_with_cpp`) for the full rationale.
     unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
 
-    // PR #65 (mtp-reload P1) — also invalidate the MoE-specific compiled
+    // Also invalidate the MoE-specific compiled
     // graphs (the MTP-verify graph plus the flat + paged AR-decode graphs
     // in `mlx_qwen35_moe.cpp`), which bake expert/attention weights inside
     // their traced closures and are NOT touched by the dense invalidation

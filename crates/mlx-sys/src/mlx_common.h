@@ -42,12 +42,6 @@ namespace mlx::core::fast::paged {
 // contents change per request — that's what keeps the compile cache hitting
 // across calls instead of re-tracing on every shape change.
 //
-// Phase 3 deliverable: Phases 4-9 (one per model migration) will accept a
-// `PagedAttentionInputs` parameter group from the model wrapper and route
-// every input through the same struct, so the compile-cache key stays
-// uniform across models and the metadata flow can be reasoned about in
-// one place.
-//
 // The struct is a thin POD-style aggregator — it does NOT own the arrays.
 // Callers (the Rust adapter) materialize the arrays once per request,
 // hand the struct into the compiled graph, and the arrays die with the

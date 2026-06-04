@@ -3,21 +3,13 @@
 using namespace qwen35_common;
 
 // =============================================================================
-// Qwen3.5 Dense TEXT Prefill — E53 scaffolding
+// Qwen3.5 Dense TEXT Prefill
 //
 // Text-only sibling of mlx_qwen35_vlm_prefill: takes pre-embedded inputs
-// (Rust caller does the embedding lookup), runs the full 32-layer forward
-// in one FFI call using gdn_prefill_fn + attn_prefill_fn_scalar, returns
-// the last-token logits.
-//
-// First-cut scaffolding only: no cache write-back, no compiled-decode
-// init. The Rust dispatch wiring + parity test + actual cache transfer
-// land in the follow-on session (see experiments/E53-text-prefill-compile-scope.md
-// for the broader plan).
-//
-// Caches per layer are stored in g_text_caches so a future session can
-// transfer them to the compiled decode path via the same
-// mlx_qwen35_compiled_init_from_prefill helper used by the VLM path.
+// (Rust caller does the embedding lookup), runs the full forward in one FFI
+// call using gdn_prefill_fn + attn_prefill_fn_scalar, returns the last-token
+// logits. Per-layer caches are stored in g_text_caches for transfer to the
+// compiled decode path via mlx_qwen35_compiled_init_from_prefill.
 // =============================================================================
 
 namespace {
@@ -46,8 +38,7 @@ extern "C" {
 //   output_logits: [B, vocab] containing the last-token logits.
 //                  Caller takes ownership of the returned pointer.
 //
-// Cache state is held in g_text_caches; a follow-on session will wire
-// the transfer to the compiled decode path.
+// Cache state is held in g_text_caches for transfer to the compiled decode path.
 void mlx_qwen35_text_prefill(
     mlx_array* inputs_embeds_ptr,
     int num_layers,
@@ -173,9 +164,9 @@ void mlx_qwen35_text_prefill(
     g_text_offset = T;
     g_text_inited = true;
 
-    // Eval logits + all caches so subsequent FFI calls (e.g. cache transfer
-    // in a future iteration) see materialized arrays, not a dangling lazy
-    // graph rooted in the (now-released) inputs.
+    // Eval logits + all caches so subsequent FFI calls (e.g. cache transfer)
+    // see materialized arrays, not a dangling lazy graph rooted in the
+    // (now-released) inputs.
     {
       std::vector<array> to_eval;
       to_eval.reserve(g_text_caches.size() + 1);

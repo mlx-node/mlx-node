@@ -1,16 +1,13 @@
-// Phase 2 of the paged-attention compile integration.
-//
 // C++ implementation of the paged-attention kernel dispatch. Encodes
 // kernels onto MLX's `metal::CommandEncoder` so dependency tracking is
-// correct and no `wait_until_completed` synchronization band-aid is
-// needed (see Phase 1 limitation in `mlx_paged_ops.h`).
+// correct without manual synchronization.
 //
 // Mirrors the Rust dispatcher in
 // `crates/mlx-paged-attn/src/metal/{state,reshape_and_cache,paged_attention}.rs`
 // kernel-name format, threadgroup-memory math, V1/V2 selection, V2
-// auxiliary-buffer allocation. Any divergence between the Rust and
-// C++ paths is a bug — both sides ultimately invoke the same Metal
-// kernels, just dispatched against different command queues.
+// auxiliary-buffer allocation. Any divergence between the Rust and C++
+// paths is a bug — both sides invoke the same Metal kernels, just
+// dispatched against different command queues.
 
 #include "mlx_paged_dispatch.h"
 
@@ -141,8 +138,8 @@ const char* dtype_string(KvDtype d) {
   return "half";
 }
 
-// Map io dtype paired with cache dtype. Phase 2 follows the Phase 1
-// contract: io == cache for non-FP8, io = bfloat16 for FP8.
+// Map io dtype paired with cache dtype: io == cache for non-FP8,
+// io = bfloat16 for FP8.
 KvDtype io_dtype_for(KvDtype cache) {
   return cache == KvDtype::Fp8 ? KvDtype::Bf16 : cache;
 }
@@ -156,7 +153,7 @@ mlx::core::Dtype mlx_dtype_for(KvDtype d) {
     case KvDtype::Fp8:
       // FP8 is stored opaquely as bytes; the cache buffer is uint8 in
       // MLX. The kernel reinterprets via `to_cache<KV_T, uchar>`. For
-      // io we never see Fp8 (io is bf16 by Phase 1 contract).
+      // io we never see Fp8 (io is bf16).
       return mlx::core::uint8;
   }
   return mlx::core::bfloat16;
@@ -314,9 +311,9 @@ void dispatch_reshape_and_cache(
     return;
   }
 
-  // Phase 1 contract: io dtype == cache dtype for non-FP8, BF16 for
-  // FP8. The Rust dispatcher derives this; we mirror so the kernel
-  // name matches what the metallib instantiated.
+  // io dtype == cache dtype for non-FP8, BF16 for FP8. The Rust
+  // dispatcher derives this; we mirror so the kernel name matches what
+  // the metallib instantiated.
   const KvDtype cache_dtype = kv_dtype;
   const KvDtype input_dtype =
       cache_dtype == KvDtype::Fp8 ? KvDtype::Bf16 : cache_dtype;
@@ -451,13 +448,13 @@ void dispatch_paged_attention_v1_inner(
   encoder.set_bytes<int32_t>(kv_block_stride, 16);
   encoder.set_bytes<int32_t>(kv_head_stride, 17);
 
-  // Phase 7: sliding-window mask. 0 = full context (default).
+  // Sliding-window mask. 0 = full context (default).
   encoder.set_bytes<int32_t>(sliding_window, 18);
 
-  // Threadgroup memory math: same dual-purpose layout as Rust V1.
-  // Phase 1: logits[max_seq_len] f32 + red_smem[2*NUM_WARPS] f32.
-  // Phase 2: out_smem[(NUM_WARPS/2) * head_size] f32 + same red_smem.
-  // Take the max of the two phases.
+  // Threadgroup memory math: same dual-purpose layout as Rust V1. The
+  // buffer serves two kernel stages and is sized to the max:
+  //   logits stage: logits[max_seq_len] f32 + red_smem[2*NUM_WARPS] f32
+  //   v-reduce stage: out_smem[(NUM_WARPS/2)*head_size] f32 + same red_smem
   const size_t logits_bytes =
       static_cast<size_t>(max_context_len) * sizeof(float);
   const size_t v_reduce_bytes =
@@ -561,7 +558,7 @@ void dispatch_paged_attention_v2_inner(
       {});
   tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
 
-  // Phase 1: partitioned attention.
+  // Stage 1: partitioned attention.
   {
     std::string kernel_name = paged_attention_v2_kernel_name(
         io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
@@ -593,7 +590,7 @@ void dispatch_paged_attention_v2_inner(
     encoder.set_bytes<int32_t>(kv_block_stride, 16);
     encoder.set_bytes<int32_t>(kv_head_stride, 17);
 
-    // Phase 7: sliding-window mask. 0 = full context (default).
+    // Sliding-window mask. 0 = full context (default).
     encoder.set_bytes<int32_t>(sliding_window, 18);
 
     // Threadgroup memory: V2 partitions context into PARTITION_SIZE
@@ -618,15 +615,11 @@ void dispatch_paged_attention_v2_inner(
     encoder.dispatch_threadgroups(grid, group);
   }
 
-  // Phase 2: reduce partitions into final output.
-  // We need a barrier here because phase 2 reads the auxiliary
-  // buffers phase 1 wrote. MLX's encoder tracks output→input
-  // dependencies: because `exp_sums`/`max_logits`/`tmp_out` were
-  // registered via `set_output_array` in phase 1 and are about to be
-  // re-set as `set_input_array` in phase 2, MLX's `set_input_array`
-  // path triggers the appropriate fence (via `prev_outputs_`
-  // matching). No manual `barrier()` call needed — MLX handles it
-  // through its own dependency tracking.
+  // Stage 2: reduce partitions into final output.
+  // This stage reads the auxiliary buffers stage 1 wrote. No manual
+  // barrier needed: `exp_sums`/`max_logits`/`tmp_out` were registered
+  // via `set_output_array` in stage 1 and re-set as `set_input_array`
+  // here, so MLX's dependency tracking fences via `prev_outputs_`.
   {
     std::string kernel_name =
         paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
@@ -693,10 +686,9 @@ void dispatch_paged_attention_auto(
     float softcap,
     int sliding_window,
     KvDtype kv_dtype) {
-  // Phase 7 lifts the Phase 1/2 sliding_window=0 restriction: the Metal
-  // kernel now masks K positions older than `context_len - sliding_window`
-  // when sliding_window > 0. Negative values remain illegal (only 0 is
-  // a valid "no mask" sentinel).
+  // The Metal kernel masks K positions older than
+  // `context_len - sliding_window` when sliding_window > 0. Negative
+  // values are illegal (only 0 is a valid "no mask" sentinel).
   if (sliding_window < 0) {
     std::ostringstream msg;
     msg << "[mlx_paged_dispatch] sliding_window=" << sliding_window
@@ -714,7 +706,7 @@ void dispatch_paged_attention_auto(
     throw std::runtime_error(msg.str());
   }
 
-  // Phase 1 contract: io = bf16 for FP8, else io = cache dtype.
+  // io = bf16 for FP8, else io = cache dtype.
   const KvDtype io_dtype = io_dtype_for(kv_dtype);
   const KvDtype cache_dtype = kv_dtype;
 
@@ -927,7 +919,7 @@ void dispatch_paged_attention_varlen_v2_inner(
       {});
   tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
 
-  // Phase 1: partitioned varlen attention.
+  // Stage 1: partitioned varlen attention.
   {
     std::string kernel_name = paged_attention_varlen_v2_kernel_name(
         io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
@@ -982,7 +974,7 @@ void dispatch_paged_attention_varlen_v2_inner(
     encoder.dispatch_threadgroups(grid, group);
   }
 
-  // Phase 2: reduce partitions.
+  // Stage 2: reduce partitions.
   {
     std::string kernel_name =
         paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);

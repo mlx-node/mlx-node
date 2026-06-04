@@ -1,19 +1,11 @@
-// Phase 1 of the paged-attention compile integration.
+// MLX `Custom` primitives for block-paged KV cache write + attention.
 //
-// This header declares two MLX `Custom` primitive subclasses
-// (`PagedKVWrite`, `PagedAttention`) and the matching public free
-// functions that emit them. Their `eval_gpu` implementations call into
-// a temporary `extern "C"` shim exposed by the `mlx-paged-attn` Rust
-// crate (see `crates/mlx-paged-attn/src/extern_c.rs`).
-//
-// PHASE 1 LIMITATION: this shim dispatches to mlx_paged_attn's separate
-// Metal command queue. Phase 2 ports dispatch to MLX's queue (the one
-// used by `inputs[0].primitive_ptr()->stream()`) so dependency tracking
-// is correct. Until then, `eval_gpu` synchronizes MLX before the call
-// and the dispatcher's own `wait_until_completed` covers the read-back.
-// In particular, callers MUST `eval()` any prior dependencies before
-// invoking `paged_kv_write`/`paged_attention`, and `eval()` the outputs
-// before reading them outside an MLX graph.
+// Declares two MLX `Custom` primitive subclasses (`PagedKVWrite`,
+// `PagedAttention`) and the matching public free functions that emit
+// them. Their `eval_gpu` paths dispatch onto MLX's own command encoder,
+// so MLX's dependency tracking is correct: callers do not need to
+// `eval()` ancestors before invoking the primitives nor `eval()` the
+// outputs before reading them inside an MLX graph.
 
 #pragma once
 
@@ -78,10 +70,9 @@ class PagedKVWrite : public Custom {
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
 
-  // PagedKVWrite is inference-only. Override vjp so the diagnostic
-  // points at this primitive rather than falling through to the
-  // generic `Custom::vjp` (which would silently re-run the fallback
-  // for gradient computation).
+  // Inference-only. Override vjp so the diagnostic points at this
+  // primitive rather than falling through to the generic `Custom::vjp`
+  // (which would silently re-run the fallback for gradient computation).
   std::vector<array> vjp(
       const std::vector<array>& primals,
       const std::vector<array>& cotangents,
@@ -115,7 +106,7 @@ class PagedKVWrite : public Custom {
 /// `PagedAttention` computes attention with K/V gathered from
 /// block-paged storage via `block_table` + `seq_lens`. Auto-picks
 /// V1/V2 kernels based on the runtime `max_context_len` (see
-/// `dispatch_paged_attention_auto` in the Rust shim).
+/// `dispatch_paged_attention_auto`).
 ///
 /// Inputs (in order):
 ///   0: `q`          — `[num_seqs, num_q_heads, head_size]`
@@ -223,8 +214,7 @@ class PagedAttention : public Custom {
 ///     `block_idx = slot_idx / block_size`; a mismatch reads/writes
 ///     past the K/V allocation.
 ///   - `slot_mapping`'s max value MUST be `< num_blocks * block_size`.
-///     The factory eval-checks this for Phase 1 safety (skipped during
-///     MLX tracing); Phase 2 will move it kernel-side.
+///     The factory eval-checks this (skipped during MLX tracing).
 ///   - `k_scale`/`v_scale` rank 0/1 of size 1, dtype `float32`.
 std::pair<array, array> paged_kv_write(
     const array& k_pool,
@@ -242,11 +232,11 @@ std::pair<array, array> paged_kv_write(
     StreamOrDevice s = {});
 
 /// Emit a `PagedAttention` primitive. Returns the attention output.
-/// `softcap = 0.0` disables soft-capping (the Rust shim translates to
-/// the kernel's `softcapping = 1.0` "disabled" sentinel).
-/// `sliding_window`: 0 = disabled (only supported value in Phase 1;
-/// Phase 7 adds support for nonzero values for Gemma4). The factory
-/// throws `std::invalid_argument` if a nonzero value is passed.
+/// `softcap = 0.0` disables soft-capping (translated to the kernel's
+/// `softcapping = 1.0` "disabled" sentinel).
+/// `sliding_window`: 0 = disabled; nonzero masks K positions older than
+/// `context_len - sliding_window`. The factory throws
+/// `std::invalid_argument` for negative values.
 ///
 /// Strict input contract — every dimension and dtype is validated at
 /// the factory and a mismatch throws `std::invalid_argument`:
@@ -292,10 +282,10 @@ array paged_attention(
 /// which is what the MTP verify path needs: draft token `t` sees the
 /// committed prefix plus `t` ancestors but NOT the speculative tail.
 ///
-/// Used by the compile-traceable MTP verify forward in Phase 4b. The
-/// kernel name selection mirrors the single-row `PagedAttention`
-/// primitive but routes to the `paged_attention_varlen[_v2_reduce]`
-/// kernels in `paged_attn.metallib`.
+/// Used by the compile-traceable MTP verify forward. Kernel-name
+/// selection mirrors the single-row `PagedAttention` primitive but
+/// routes to the `paged_attention_varlen[_v2_reduce]` kernels in
+/// `paged_attn.metallib`.
 class PagedAttentionVarlen : public Custom {
  public:
   PagedAttentionVarlen(

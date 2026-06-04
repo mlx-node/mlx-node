@@ -37,90 +37,72 @@ use super::model::{ChatConfig, ChatResult, ChatStreamChunk};
 /// Because TS matches on the literal prefix, this constant MUST NOT
 /// change without a coordinated update on both sides of the NAPI
 /// boundary.
-///
-/// Introduced as part of the chat_common helper promotion.
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
 
 // ---------------------------------------------------------------------------
 // MTP runtime flag inventory
 // ---------------------------------------------------------------------------
 //
-// The W6.5+ perf chain added runtime knobs gating individual optimizations.
-// Boolean env flags are read at most once per process and cached. The truthy
-// vocabulary is uniform: trim() + `1` / `true` / `on` (case-insensitive).
-// The primary adaptive depth knob is surfaced through the TypeScript
-// `ChatConfig.mtpAdaptiveDepth` field because it interacts with the user-set
-// `mtpDepth` and needs per-session resolution.
+// Runtime knobs gating individual MTP optimizations. Boolean env flags are
+// read at most once per process and cached. The truthy vocabulary is uniform:
+// trim() + `1` / `true` / `on` (case-insensitive). The primary adaptive depth
+// knob is surfaced through the TypeScript `ChatConfig.mtpAdaptiveDepth` field
+// because it interacts with the user-set `mtpDepth` and needs per-session
+// resolution.
 //
-// | Knob                          | Default | Workstream | Opt direction |
-// |-------------------------------|---------|------------|---------------|
-// | `MLX_MTP_USE_TAPE_REPLAY`     | ON      | W6.6       | opt-OUT       |
-// | (eager verify prewarm)        | ON      | W6.7       | n/a (always)  |
-// | `mtpAdaptiveDepth` (TS field) | OFF*    | W6.8       | per-session   |
-// | `MLX_MTP_ADAPTIVE_DEPTH_MODE` | throughput | W6.23    | opt-IN EV     |
-// | `MLX_MTP_CHAINED_CYCLES`      | M5+ ON, M1–M4 OFF | W6.5 | gen-gated  |
-// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | W6.9       | opt-OUT       |
-// | `MLX_MTP_DEFER_VERIFY_HIDDEN` | ON      | W6.21      | opt-OUT       |
-// | `MLX_MTP_HISTORY_POLICY`      | committed | W6.24    | opt-IN window |
-// | `MLX_MTP_SPARSE_ACCEPT`       | ON      | W6.19      | opt-OUT       |
-// | `MLX_MTP_BATCH_TARGET_ARRAYS` | ON      | W6.22      | opt-OUT       |
-// | `MLX_MTP_TRACE_ACCEPTANCE`    | OFF     | diagnostics| opt-IN        |
+// | Knob                          | Default | Opt direction |
+// |-------------------------------|---------|---------------|
+// | `MLX_MTP_USE_TAPE_REPLAY`     | ON      | opt-OUT       |
+// | `mtpAdaptiveDepth` (TS field) | OFF*    | per-session   |
+// | `MLX_MTP_ADAPTIVE_DEPTH_MODE` | throughput | opt-IN EV  |
+// | `MLX_MTP_CHAINED_CYCLES`      | M5+ ON, M1–M4 OFF | gen-gated |
+// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | opt-OUT       |
+// | `MLX_MTP_DEFER_VERIFY_HIDDEN` | ON      | opt-OUT       |
+// | `MLX_MTP_HISTORY_POLICY`      | committed | opt-IN window |
+// | `MLX_MTP_SPARSE_ACCEPT`       | ON      | opt-OUT       |
+// | `MLX_MTP_BATCH_TARGET_ARRAYS` | ON      | opt-OUT       |
+// | `MLX_MTP_TRACE_ACCEPTANCE`    | OFF     | opt-IN        |
 //
 // * adaptive depth is opt-in. When unset, MTP pins depth 1 because current
 //   Apple Silicon measurements show depth-1 has the best deterministic
 //   throughput on the bf16 MTP-head lane. If `mtpAdaptiveDepth=true`,
-//   `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` switches from the W6.8
-//   throughput state machine to the W6.23 MTPLX-style intra-cycle
-//   expected-value gate. The EV gate starts at `MLX_MTP_EV_BASE_DEPTH` and
-//   deepens toward `mtpDepth` per the EV cost model by default (passed the
-//   temperature-0 byte-parity safety gate on a model-backed smoke); set
+//   `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` switches from the throughput
+//   state machine to the MTPLX-style intra-cycle expected-value gate. The EV
+//   gate starts at `MLX_MTP_EV_BASE_DEPTH` and deepens toward `mtpDepth` per
+//   the EV cost model by default (temperature-0 byte-parity safe); set
 //   `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
 //
-// Naming disambiguation:
-//   - `MLX_MTP_CHAINED_CYCLES` (W6.5) — CROSS-CYCLE hidden-state export.
-//     Each cycle's `verify_hidden[K]` slice seeds the next cycle's first
-//     MTP draft; see `eval_step_with_chained_hidden` below.
-//
 // Interaction notes:
-//   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the W6 Bug #4 K+1 replay
-//     path; safe to combine with all other flags.
+//   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the K+1 replay path; safe to
+//     combine with all other flags.
 //   - `MLX_MTP_CHAINED_CYCLES` is GPU-generation-gated: default ON on M5+
 //     (arch gen >= 17), default OFF on M1–M4 (gen 13–16). Force OFF with
 //     `MLX_MTP_CHAINED_CYCLES=0` (even on M5+) or ON with `=1` (even on
-//     M1–M4) — see `mtp_chained_cycles_enabled()`. The `verify_hidden[K]`
-//     slice is batched into the next-cycle `async_eval` (see
-//     `eval_step_with_chained_hidden` below), and the W6.5-resume
-//     `async_eval` fix removed the slice-DMA stall the original plan
-//     blamed. Rationale: the chained 1-forward-per-cycle shape is the
-//     canonical MTPLX/vLLM design and is T=0 correctness-safe (the verify
-//     forward is ground truth; the chained seed only changes acceptance
-//     RATE, never the committed tokens). On M5+ it is measured net-positive
-//     (affine +16%, nvfp4 byte-identical to AR). On M1–M4 a same-binary A/B
-//     (qwen3.6-27b-nvfp4-mtp / M3 Max / T=0, 200 tokens) showed it helps
-//     only at depth 1 and REGRESSES depth-3 acceptance (a lazy-slice
-//     eval-scheduling stall): depth 1 MTP/AR 1.19× ON vs 1.07× OFF
-//     (meanAccepted 0.76 vs 0.77); depth 3 0.93× ON vs 0.93× OFF with
-//     acceptance dropping (meanAccepted 1.30 ON vs 1.41 OFF, per-position
-//     `[0.674, 0.435, 0.200]` ON vs `[0.724, 0.448, 0.246]` OFF). So it
-//     stays OFF on M1–M4 pending that scheduling fix.
+//     M1–M4) — see `mtp_chained_cycles_enabled()`. It is CROSS-CYCLE
+//     hidden-state export: each cycle's `verify_hidden[K]` slice seeds the
+//     next cycle's first MTP draft (batched into the next-cycle `async_eval`;
+//     see `eval_step_with_chained_hidden` below). The chained 1-forward-per-
+//     cycle shape is the canonical MTPLX/vLLM design and is T=0 correctness-
+//     safe (the verify forward is ground truth; the chained seed only changes
+//     acceptance RATE, never the committed tokens). On M5+ it is net-positive
+//     (affine +16%, nvfp4 byte-identical to AR). On M1–M4 it helps only at
+//     depth 1 and REGRESSES depth-3 acceptance (a lazy-slice eval-scheduling
+//     stall), so it stays OFF there pending that fix.
 //   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
 //     accept loop's CPU-side graph construction; composes cleanly with
 //     all other flags.
 
-// W6.6 — Tape-replay rollback for GDN linear-attention.
+// Tape-replay rollback for GDN linear-attention.
 //
-// Replaces the K+1 main-model forwards the W6 Bug #4 fix ran on every
-// partial-accept verify cycle. When ON (default), the cycle arms tape
-// recording on the dense compiled path BEFORE verify; the per-step
-// `(tape, k, g, qkv)` tensors are accumulated during the D+1 verify
-// forwards; on rejection a single Metal kernel replays only the
-// accepted prefix into the pre-verify snapshot state and the conv state
-// is rebuilt by slicing the recorded qkv. Saves ~30% of cycle wall-time
-// (the W6 plan's rollback budget).
+// Replaces the K+1 main-model forwards on every partial-accept verify cycle.
+// When ON (default), the cycle arms tape recording on the dense compiled path
+// BEFORE verify; the per-step `(tape, k, g, qkv)` tensors are accumulated
+// during the D+1 verify forwards; on rejection a single Metal kernel replays
+// only the accepted prefix into the pre-verify snapshot state and the conv
+// state is rebuilt by slicing the recorded qkv. Saves ~30% of cycle wall-time.
 //
-// Opt-out: `MLX_MTP_USE_TAPE_REPLAY=0` (or `false`) falls back to the
-// K+1 replay path for a release while we shake out kernel bugs. The
-// env var is read once per process and cached.
+// Opt-out: `MLX_MTP_USE_TAPE_REPLAY=0` (or `false`) falls back to the K+1
+// replay path. The env var is read once per process and cached.
 pub(crate) fn mtp_use_tape_replay() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_USE_TAPE_REPLAY") {
@@ -132,7 +114,7 @@ pub(crate) fn mtp_use_tape_replay() -> bool {
     })
 }
 
-// W6.9 — Async-prefetch pipeline.
+// Async verify-eval pipeline.
 //
 // Replaces the synchronous `verify_logits.eval()` at the end of
 // `run_mtp_cycle_inner`'s verify step with a single batched
@@ -141,38 +123,13 @@ pub(crate) fn mtp_use_tape_replay() -> bool {
 // accept loop's penalty / softmax / slice graph construction while the
 // GPU is still running the verify command buffer. The first downstream
 // `eval()` (the accept loop's `p_target.eval()`) then implicitly
-// synchronizes — the same overlap pattern DFlash uses with
-// `mx.async_eval(posterior)` at `spec_epoch.py:2069`.
-//
-// This is the scheduler-level realisation of the W6.9 plan's "stash
-// next-cycle draft handle, drain at cycle start" idea. The literal
-// stash-and-drain refactor would require plumbing a pre-built draft
-// graph handle through `run_mtp_cycle_inner` AND mutating
-// `g_mtp_compiled_caches` BEFORE the accept loop knows K — both
-// architecturally invasive AND only safe in the opt-in
-// `MLX_MTP_CHAINED_CYCLES` path (default off). The async_eval pipeline
-// captures the same overlap-with-CPU-graph-construction win without
-// touching the FFI surface, the `MtpOps` closures, or the cycle
-// state machine.
+// synchronizes. Semantic equivalent of MTPLX's `LAZY_VERIFY_LOGITS`
+// (`MTPLX/mtplx/generation.py:49, 3894`) — both defer the verify-logits
+// sync until the accept loop's first downstream `.eval()`.
 //
 // Opt-out: `MLX_MTP_VERIFY_ASYNC_EVAL=0` (or `false` / `off`) reverts
-// to the synchronous `verify_logits.eval()` barrier. Default ON
-// (Phase 3, 2026-05-26): tape-replay (W6.6) has been stable for
-// multiple releases and the M5 Max controller bench on
-// `qwen3.6-27b-nvfp4-mtp-oproj8` measured the flag lifting the
-// depth-3 ratio from ~1.07× → ~1.13× with byte-identical acceptance.
-// This is the semantic equivalent of MTPLX's `LAZY_VERIFY_LOGITS`
-// (`MTPLX/mtplx/generation.py:49, 3894`) — both defer the
-// verify-logits sync until the accept loop's first downstream
-// `.eval()`. The env var is read once per process and cached.
-//
-// Naming note: an earlier draft of this flag was called
-// `MLX_MTP_PREFETCH`, but the change is overlap-with-CPU-graph-
-// construction (intra-cycle) — NOT cross-cycle draft staging. The
-// literal "stash next-cycle draft handle, drain at cycle start"
-// prefetch from the W6.9 plan lives in a follow-up task scoped to
-// `MLX_MTP_CHAINED_CYCLES=1`. The current flag's name reflects the
-// actual mechanism so users don't expect cross-cycle behaviour.
+// to the synchronous `verify_logits.eval()` barrier (byte-identical
+// acceptance). Default ON. The env var is read once per process and cached.
 pub(crate) fn mtp_verify_async_eval() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_ASYNC_EVAL") {
@@ -184,7 +141,7 @@ pub(crate) fn mtp_verify_async_eval() -> bool {
     })
 }
 
-// W6.21 — Defer verify hidden materialization.
+// Defer verify hidden materialization.
 //
 // The T=0 sparse-accept path needs verifier logits for one batched
 // argmax, but it does not need the full `[1, D+1, hidden]` tensor
@@ -203,7 +160,7 @@ pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
     })
 }
 
-// W6.23 — MTPLX-style stochastic verify scheduling.
+// MTPLX-style stochastic verify scheduling.
 //
 // In the T>0 sparse-accept path, target top-k distributions are the first
 // consumer of verifier logits. Evaluating the full `[D+1, vocab]` logits tensor
@@ -228,13 +185,12 @@ pub(crate) fn mtp_target_distribution_first_enabled() -> bool {
     )
 }
 
-// Phase 4b — opt-OUT gate for the paged-pool MTP verify graph. Default
-// ON since Phase 4b/B4. Set `MLX_MTP_VERIFY_PAGED_ATTN` to `0` /
-// `false` / `off` (case-insensitive, surrounding whitespace ignored)
-// to fall back to the dense BHTD verify path. The Rust gate mirrors
-// the C++ `mtp_verify_paged_attn_enabled()` reader in `mlx_qwen35.cpp`;
-// both must agree per process for the dispatcher to route through the
-// new graph.
+// Opt-OUT gate for the paged-pool MTP verify graph. Default ON. Set
+// `MLX_MTP_VERIFY_PAGED_ATTN` to `0` / `false` / `off` (case-insensitive,
+// surrounding whitespace ignored) to fall back to the dense BHTD verify
+// path. The Rust gate mirrors the C++ `mtp_verify_paged_attn_enabled()`
+// reader in `mlx_qwen35.cpp`; both must agree per process for the
+// dispatcher to route through the new graph.
 pub(crate) fn mtp_verify_paged_attn_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_PAGED_ATTN") {
@@ -253,15 +209,15 @@ pub(crate) fn mtp_verify_paged_attn_enabled() -> bool {
 /// Override either way with MLX_MTP_CHAINED_CYCLES=0/1.
 const CHAINED_CYCLES_MIN_GPU_GEN: i32 = 17;
 
-// W6.5 — Chained cycles via verify-hidden export.
+// Chained cycles via verify-hidden export.
 //
 // Once MTP caches use committed-history and the verifier exports
 // `verify_hidden[K]`, chaining avoids paying the Step-A target forward at the
-// start of every speculative cycle. The W6.5-resume follow-up fused that
-// hidden slice into the same `async_eval` batch as `(token, g_compiled_caches)`
-// at end-of-iteration (see `eval_step_with_chained_hidden` in `MtpOps`) so
-// the slice becomes a sibling of the next-cycle draft's first inputs rather
-// than a late dependency materialized inside the draft graph build.
+// start of every speculative cycle. That hidden slice is fused into the same
+// `async_eval` batch as `(token, g_compiled_caches)` at end-of-iteration (see
+// `eval_step_with_chained_hidden` in `MtpOps`) so the slice becomes a sibling
+// of the next-cycle draft's first inputs rather than a late dependency
+// materialized inside the draft graph build.
 //
 // Default ON on M5+ (GPU arch gen >= 17), where chaining is measured
 // net-positive (affine +16%, nvfp4 byte-identical to AR). Default OFF on M1–M4
@@ -287,7 +243,7 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
     })
 }
 
-// Phase C — prompt-prefix MTP prefill opt-OUT.
+// Prompt-prefix MTP prefill opt-OUT.
 //
 // `MLX_MTP_NO_PROMPT_PREFILL=1` (or `true` / `on`) disables committing
 // the prompt prefix into the MTP committed-history cache: the prefill
@@ -420,8 +376,8 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
     resolve_mtp_prompt_history_selection(policy, prompt_len, window, threshold)
 }
 
-// W6.19 — Accept-loop sync collapse via on-device sparse top-K /
-// batched argmax (MTPLX-style).
+// Accept-loop sync collapse via on-device sparse top-K / batched
+// argmax (MTPLX-style).
 //
 // Replaces the legacy per-position accept loop's D forced GPU syncs
 // (each materializing a full-vocab softmax of ~151k floats) with ONE
@@ -433,7 +389,7 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
 //
 // Eligibility (T=0 fast path):
 //   - `temperature <= 1e-6` (matches `accept_with_residual`'s argmax
-//     shortcut — Bug #3 invariant).
+//     shortcut).
 //   - All penalties at defaults (repetition=1.0, presence=0.0,
 //     frequency=0.0). When any penalty is active, the per-position
 //     `apply_all_penalties` call depends on `hist_extended` which
@@ -508,7 +464,7 @@ impl Drop for ForceSparseAcceptGuard {
     }
 }
 
-// W6.22 — MTPLX-style stochastic accept fast path.
+// MTPLX-style stochastic accept fast path.
 //
 // At T>0 with default penalties and a bounded top-k sampler, exact
 // probability-ratio acceptance does not need dense `[vocab]` CPU copies. We
@@ -528,7 +484,7 @@ pub(crate) fn mtp_batch_target_arrays_enabled() -> bool {
     })
 }
 
-// W6.37 — Native stochastic verifier sparse-target output.
+// Native stochastic verifier sparse-target output.
 //
 // This is an opt-out gate for the dense Qwen compiled path. When the sampler is
 // in MTPLX parity mode, the verifier can return compact
@@ -546,7 +502,7 @@ pub(crate) fn mtp_native_sparse_verify_enabled() -> bool {
     })
 }
 
-// W6.38 — Greedy verifier output fast path.
+// Greedy verifier output fast path.
 //
 // At T=0 with default penalties, accept/reject only needs target top-1 ids.
 // This opt-in gate allows the dense verifier to return `[1, depth+1]` argmax
@@ -916,9 +872,9 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 
 /// Build per-block extra_keys for the paged adapter's prefix-cache walk.
 ///
-/// Phase 6 multimodal cache isolation: when the prompt contains image
-/// tokens, the per-block extra_keys ensure that "same prompt + different
-/// image" produces a cache miss (preventing stale-image KV reuse). For
+/// Multimodal cache isolation: when the prompt contains image tokens,
+/// the per-block extra_keys ensure that "same prompt + different image"
+/// produces a cache miss (preventing stale-image KV reuse). For
 /// text-only prompts (`token_image_positions` is empty), every block gets
 /// an empty extra_keys vec — bit-equal to passing `&[]` uniformly to the
 /// uniform `find_cached_prefix` / `finalize_turn_keep_live` API.
@@ -1105,25 +1061,24 @@ pub(crate) struct ChatParams {
     pub reuse_cache: bool,
     pub thinking_token_budget: Option<i32>,
     pub include_reasoning: bool,
-    /// W6 (MTP): opt-in flag enabling the Multi-Token Prediction
-    /// speculative decode loop. Effective only on the dense compiled
-    /// path AND when the model checkpoint carries an MTP head
+    /// MTP: opt-in flag enabling the Multi-Token Prediction speculative
+    /// decode loop. Effective only on the dense compiled path AND when
+    /// the model checkpoint carries an MTP head
     /// (`Qwen35Inner::has_mtp_weights`). The eager Rust forward, the
     /// paged path, MoE, and VLM decode loops all continue to use the
     /// single-token `decode_loop!` macro regardless. Default: `false`.
     pub enable_mtp: bool,
-    /// W6 (MTP): number of draft tokens per speculative cycle, fed to
-    /// the W5 `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled`
-    /// FFI. Must be in `[1, 5]` to satisfy the verify-FFI contract.
-    /// Default: 1 on the current bf16 MTP-head lane. When
+    /// MTP: number of draft tokens per speculative cycle, fed to the
+    /// `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled` FFI.
+    /// Must be in `[1, 5]` to satisfy the verify-FFI contract. Default:
+    /// 1 on the current bf16 MTP-head lane. When
     /// `mtp_adaptive_depth = true`, this value is only used as the
-    /// initial depth — the W6.8 `AdaptiveDepthPolicy` picks per-cycle.
+    /// initial depth — the `AdaptiveDepthPolicy` picks per-cycle.
     pub mtp_depth: usize,
-    /// W6.8 (MTP): when true, the decode loop runs an
-    /// `AdaptiveDepthPolicy` (`adaptive_depth.rs`) that picks the draft
-    /// depth per cycle by maximising per-depth EMA of
-    /// `accepted_tokens / cycle_wall_ns`. When false, the loop pins
-    /// `mtp_depth` for every cycle (legacy pre-W6.8 behaviour).
+    /// MTP: when true, the decode loop runs an `AdaptiveDepthPolicy`
+    /// (`adaptive_depth.rs`) that picks the draft depth per cycle by
+    /// maximising per-depth EMA of `accepted_tokens / cycle_wall_ns`.
+    /// When false, the loop pins `mtp_depth` for every cycle.
     ///
     /// Default resolution (`extract_chat_params`):
     ///   * User set `mtpAdaptiveDepth` explicitly → use that.
@@ -1193,10 +1148,9 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         reuse_cache: config.reuse_cache.unwrap_or(true),
         thinking_token_budget: config.thinking_token_budget,
         include_reasoning: resolve_include_reasoning(config),
-        // W6 (MTP) — defaults keep MTP OFF until the per-request opt-in
-        // lands in the TS surface (W7). When MTP is enabled and the caller
-        // does not choose a depth, pin depth 1: current M5 Max measurements
-        // show deeper bf16 MTP-head cycles lose more verify/draft time than
+        // MTP defaults OFF. When MTP is enabled and the caller does not
+        // choose a depth, pin depth 1: current M5 Max measurements show
+        // deeper bf16 MTP-head cycles lose more verify/draft time than
         // they recover from acceptance.
         enable_mtp: config.enable_mtp.unwrap_or(false),
         // Clamp the SIGNED depth before casting to usize: a negative
@@ -1208,7 +1162,7 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
             .mtp_depth
             .map(|d| d.clamp(1, 5) as usize)
             .unwrap_or(1),
-        // W6.8 — adaptive depth policy is opt-in by default. An explicit
+        // Adaptive depth policy is opt-in by default. An explicit
         // `mtpAdaptiveDepth` always wins. See
         // `ChatParams::mtp_adaptive_depth` docs.
         mtp_adaptive_depth: config.mtp_adaptive_depth.unwrap_or(false),
@@ -2051,13 +2005,13 @@ macro_rules! decode_loop {
 pub(crate) use decode_loop;
 
 // =============================================================================
-// W6 — MTP speculative decode loop (dense compiled path only).
+// MTP speculative decode loop (dense compiled path only).
 //
 // Sister to `decode_loop!` above; preserves every behavior of the
 // single-token loop (penalties, ReasoningTracker / budget, EOS,
 // repetition cutoff, every-256-step cache clear, streaming +
 // cancellation) while emitting up to `mtp_depth + 1` tokens per
-// outer iteration via the W5 draft + verify FFI plus the W4
+// outer iteration via the draft + verify FFI plus the
 // `accept_with_residual` sampler.
 //
 // Cache-rollback strategy (compiled path):
@@ -2071,7 +2025,7 @@ pub(crate) use decode_loop;
 //     step. On any rejection we rewind by `accepted_count - depth`
 //     via `mlx_qwen35_mtp_compiled_adjust_offset`. The MTP path is
 //     by design 1-token behind the main path's accepted prefix.
-//   - W3's `Qwen3_5LayerCache::snapshot_all` / `restore_all` is the
+//   - `Qwen3_5LayerCache::snapshot_all` / `restore_all` is the
 //     EAGER-PATH rollback primitive. On the compiled path the live
 //     K/V lives in `g_compiled_caches` (C++), not `self.caches`, so
 //     the snapshot/restore is intentionally NOT used here.
@@ -2114,8 +2068,8 @@ pub(crate) use decode_loop;
 ///        `mlx_qwen35_get_cache_offset` / `mlx_qwen35_moe_get_cache_offset`)
 ///        and calls the corresponding `*_begin_cycle(main_offset)` FFI
 ///        to zero the MTP K/V caches and re-anchor the MTP offset.
-///        This fixes W6 Bug #2 (mid-stream divergence): without the
-///        reset the MTP offset lags the main offset by 2 per cycle.
+///        Required for correctness: without the reset the MTP offset
+///        lags the main offset by 2 per cycle (mid-stream divergence).
 /// `S`  : snapshot hook for the main path's GDN linear-attention caches
 ///        plus the main decode offset. Called once per cycle AFTER
 ///        Step A and BEFORE verify. Implementor calls
@@ -2123,8 +2077,7 @@ pub(crate) use decode_loop;
 ///        equivalent). The snapshot is consumed by
 ///        `restore_and_replay_main` on rejection — without it the
 ///        GDN recurrent state stays polluted with rejected draft
-///        positions and the next Step A produces wrong logits (W6 Bug
-///        #4).
+///        positions and the next Step A produces wrong logits.
 /// `RR` : restore + replay hook called on rejection (any
 ///        `accepted_drafts < depth`) AFTER `rollback`. Receives the
 ///        list of accepted draft token IDs (NOT including the residual
@@ -2145,9 +2098,9 @@ pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
-    // W6.5/W6.36/W6.38 — verify returns logits, verify_hiddens, and optionally
-    // precomputed greedy target ids. Logits shape is `[1, depth+1, vocab]`;
-    // hiddens shape is `[1, depth+1, hidden]`; target_argmax shape is
+    // verify returns logits, verify_hiddens, and optionally precomputed
+    // greedy target ids. Logits shape is `[1, depth+1, vocab]`; hiddens
+    // shape is `[1, depth+1, hidden]`; target_argmax shape is
     // `[1, depth+1]` int32 when the backend can return it from the compiled
     // verify graph. In the greedy argmax-only and stochastic native sparse-target
     // paths, logits may be absent; those paths carry `target_argmax` or
@@ -2161,24 +2114,23 @@ where
     // the MTP head's training contract.
     V: FnMut(&MxArray, &MxArray, usize) -> Result<MtpVerifyOutput>,
     R: FnMut(usize, usize),
-    // Phase 4b B4 — invoked from `decode_loop_mtp!` ONLY when a
-    // mid-cycle stop (EOS / cancel / length / repetition cutoff) ends
-    // the emit loop after some but not all of `outcome.tokens` have
-    // been emitted. Receives the count of accepted-but-unemitted
-    // tokens. The paged path uses this to truncate the live paged
-    // adapter so future turns don't reuse KV for tokens the user
-    // never received. Dense / MoE / tests pass a no-op closure (the
-    // dense compiled cursor is driven by `commit_mtp`, which already
-    // ran for the full cycle — no extra rollback is required at this
-    // boundary for dense KV consistency).
+    // Invoked from `decode_loop_mtp!` ONLY when a mid-cycle stop (EOS /
+    // cancel / length / repetition cutoff) ends the emit loop after some
+    // but not all of `outcome.tokens` have been emitted. Receives the
+    // count of accepted-but-unemitted tokens. The paged path uses this to
+    // truncate the live paged adapter so future turns don't reuse KV for
+    // tokens the user never received. Dense / MoE / tests pass a no-op
+    // closure (the dense compiled cursor is driven by `commit_mtp`, which
+    // already ran for the full cycle — no extra rollback is required at
+    // this boundary for dense KV consistency).
     RU: FnMut(usize),
     E: Fn(&MxArray, &MxArray, bool),
-    // W6.5-resume — same shape as `eval_step` but folds the chained
-    // `verify_hidden[K]` slice into the SAME `async_eval` batch as
-    // `(token, g_compiled_caches)`. Used by the chained-cycles macro
-    // path at end-of-iteration so the slice is co-materialized with
-    // the next cycle's first-draft input sources, eliminating the
-    // mid-cycle Metal command-buffer roundtrip the lazy path forces.
+    // Same shape as `eval_step` but folds the chained `verify_hidden[K]`
+    // slice into the SAME `async_eval` batch as `(token, g_compiled_caches)`.
+    // Used by the chained-cycles macro path at end-of-iteration so the
+    // slice is co-materialized with the next cycle's first-draft input
+    // sources, eliminating the mid-cycle Metal command-buffer roundtrip
+    // the lazy path forces.
     //
     // Contract: `token` is the just-set `$y` (CPU-only integer array
     // of the last accepted token); `chained_hidden` is the lazy
@@ -2191,9 +2143,9 @@ where
     B: FnMut(bool),
     S: FnMut(),
     RR: FnMut(&[u32], &MxArray) -> Result<()>,
-    // Phase C — committed-history commit hook. Called once per cycle
-    // AFTER the accept loop computes `accepted_drafts` (K) and BEFORE
-    // `rollback`, on BOTH the full-accept and reject paths. Receives
+    // Committed-history commit hook. Called once per cycle AFTER the
+    // accept loop computes `accepted_drafts` (K) and BEFORE `rollback`,
+    // on BOTH the full-accept and reject paths. Receives
     // `(prev_hidden_in [1,1,hidden], verify_hiddens [1,D+1,hidden],
     // committed_ids [K+2], k_accepted, embedding_weight)`.
     //
@@ -2228,12 +2180,12 @@ where
     pub begin_cycle: B,
     pub snapshot_main_linear: S,
     pub restore_and_replay_main: RR,
-    /// Phase C — committed-history commit hook. See the `CM` bound
-    /// above for the contract. Pass a no-op closure to keep the
-    /// cycle-history policy (MoE path, tests).
+    /// Committed-history commit hook. See the `CM` bound above for the
+    /// contract. Pass a no-op closure to keep the cycle-history policy
+    /// (MoE path, tests).
     pub commit_mtp: CM,
-    /// Phase C — set `true` on the dense path where `commit_mtp` runs
-    /// the real committed-history commit. When `true`,
+    /// Set `true` on the dense path where `commit_mtp` runs the real
+    /// committed-history commit. When `true`,
     /// `run_mtp_cycle_inner` uses the per-step `draft_step` path whose
     /// attention mask is `chain_start <= pos <= offset` with
     /// `chain_start = 0` — correct under committed-history. MoE / tests
@@ -2377,9 +2329,9 @@ where
 
     debug_assert!(depth >= 1, "run_mtp_cycle_inner: depth must be >= 1");
 
-    // Phase C — keep the ORIGINAL cycle-seed hidden alive for the
-    // committed-history commit. `prev_hidden_in` is h(token before
-    // `last_committed_id`) — the correct hidden to pair with the
+    // Keep the ORIGINAL cycle-seed hidden alive for the committed-history
+    // commit. `prev_hidden_in` is h(token before `last_committed_id`) —
+    // the correct hidden to pair with the
     // embedding of `last_committed_id` for that token's MTP slot. The
     // draft loop below moves `prev_hidden_in` into the mutable
     // `prev_hidden` local and overwrites it step by step, so clone the
@@ -2394,9 +2346,9 @@ where
         .unwrap_or(1.0);
     let sampling_cfg = params.sampling_config.unwrap_or_default();
     let draft_sampling_cfg = mtp_draft_sampling_config(sampling_cfg);
-    // W6.19 — Fast-path eligibility: at T=0 with all penalties at
-    // defaults, the per-position accept decision collapses to
-    // `argmax(verify_logits[i]) == draft_id[i]` (Bug #3 invariant in
+    // Fast-path eligibility: at T=0 with all penalties at defaults, the
+    // per-position accept decision collapses to
+    // `argmax(verify_logits[i]) == draft_id[i]` (the argmax shortcut in
     // `accept_with_residual`). Compute this before draft construction so
     // the deterministic path can avoid building unused draft probability
     // tensors.
@@ -2441,10 +2393,10 @@ where
         let probs = if use_sparse_accept || use_sparse_stochastic_accept {
             None
         } else {
-            // PR #65 mtp-reload P2 (codex): the legacy stochastic accept
-            // path consumes this `probs` as the proposal density `q` inside
-            // `accept_with_residual` (`min(1, p/q)` + `(p - q)+` residual).
-            // For Leviathan-Chen exactness `q` MUST be the distribution the
+            // The legacy stochastic accept path consumes this `probs` as
+            // the proposal density `q` inside `accept_with_residual`
+            // (`min(1, p/q)` + `(p - q)+` residual). For Leviathan-Chen
+            // exactness `q` MUST be the distribution the
             // draft token was actually drawn from. The draft id below (T>0
             // branch) is drawn via `sampling::sample(&draft_logits, ..)`
             // → `mlx_compiled_sample_full`, which converts logits→logprobs,
@@ -2590,13 +2542,12 @@ where
         verify_ids = ?verify_ids,
         "MTP verify input built"
     );
-    // W6 Bug #4 — snapshot the main path's GDN linear caches + offset
-    // BEFORE verify runs its D+1 sequential forwards. Verify mutates
-    // `g_compiled_caches` in place; on rejection we restore from this
-    // snapshot and replay only the K accepted drafts so the linear
-    // recurrent state matches the committed token stream. On full
-    // accept the snapshot is discarded — verify already left the
-    // linear state correctly advanced.
+    // Snapshot the main path's GDN linear caches + offset BEFORE verify
+    // runs its D+1 sequential forwards. Verify mutates `g_compiled_caches`
+    // in place; on rejection we restore from this snapshot and replay only
+    // the K accepted drafts so the linear recurrent state matches the
+    // committed token stream. On full accept the snapshot is discarded —
+    // verify already left the linear state correctly advanced.
     profiler.begin("mtp_tape_snapshot");
     (ops.snapshot_main_linear)();
     profiler.end();
@@ -2605,14 +2556,14 @@ where
         depth,
         "MTP main-linear caches + offset snapshot taken (pre-verify)"
     );
-    // W6.5 — verify returns BOTH logits and per-position hiddens.
+    // Verify returns BOTH logits and per-position hiddens.
     // Logits: `[1, depth+1, vocab]`; hiddens: `[1, depth+1, hidden]`.
     // We hold off on slicing the hidden until after the accept loop
     // computes K (= number of accepted drafts) so we can pick
     // `verify_hiddens[:, K, :]` — the correct prediction context for
     // the next cycle's first MTP draft.
-    // Phase 1 instrumentation: the gap between `mtp_cycle` and this
-    // floor is the headroom available to algorithmic work.
+    // The gap between `mtp_cycle` and this floor is the headroom
+    // available to algorithmic work.
     let verify_only_t0 = std::time::Instant::now();
     profiler.begin("mtp_verify_dispatch");
     let trace_logits = mtp_trace_logits();
@@ -2654,17 +2605,14 @@ where
         verify_tokens = effective_depth + 1,
         "MTP verify dispatched (batched target forward over depth+1 tokens)"
     );
-    // W6.9 — Async-eval over verify outputs. By default (Phase 3
-    // flip, 2026-05-26), we dispatch verify (logits + hiddens) via
-    // `async_eval` instead of the synchronous `eval()` below. The
-    // kernel launch returns immediately, letting the CPU construct
-    // the accept loop's penalty / softmax / slice graph while the
-    // verify command buffer is still executing on the GPU. The first
-    // downstream `eval()` (the accept loop's `p_target.eval()` at
-    // the per-position softmax) syncs on completion — the same
-    // overlap pattern DFlash applies in `spec_epoch.py:2069`'s
-    // `mx.async_eval(posterior)` and the semantic equivalent of
-    // MTPLX's `LAZY_VERIFY_LOGITS` (`MTPLX/mtplx/generation.py:49,
+    // Async-eval over verify outputs. By default we dispatch verify
+    // (logits + hiddens) via `async_eval` instead of the synchronous
+    // `eval()` below. The kernel launch returns immediately, letting the
+    // CPU construct the accept loop's penalty / softmax / slice graph
+    // while the verify command buffer is still executing on the GPU. The
+    // first downstream `eval()` (the accept loop's `p_target.eval()` at
+    // the per-position softmax) syncs on completion. Semantic equivalent
+    // of MTPLX's `LAZY_VERIFY_LOGITS` (`MTPLX/mtplx/generation.py:49,
     // 3894`).
     //
     // We batch `verify_hiddens` into the same async_eval call so MLX's
@@ -2675,11 +2623,10 @@ where
     // batch eval is still cheap (one extra command-buffer entry).
     //
     // `MLX_MTP_VERIFY_ASYNC_EVAL=0` reverts to the synchronous
-    // `verify_logits.eval()` barrier — byte-identical to pre-W6.9
-    // behaviour for parity-debugging or hardware where the overlap
-    // budget is negligible.
-    // W6.19 — Fast-path acceptance. When eligible, collapse the D+1
-    // per-position softmax materializations into ONE batched
+    // `verify_logits.eval()` barrier — byte-identical for
+    // parity-debugging or hardware where the overlap budget is negligible.
+    // Fast-path acceptance. When eligible, collapse the D+1 per-position
+    // softmax materializations into ONE batched
     // `argmax(verify_logits, axis=-1)` op + one `.eval()` reading
     // D+1 int32 values.
     //
@@ -2751,13 +2698,12 @@ where
         // hiddens ride on the same compiled graph; we only eval the
         // K-th slice below.
         //
-        // W6.19 note: the sparse-accept path also benefits from this
-        // eager eval — folding verify materialization into the
-        // accept-loop argmax op (one combined sync) measured ~10%
-        // slower than two separate syncs on the qwen3.6-27b smoke.
-        // The eager eval here lets MLX's scheduler pipeline the
-        // verify command buffer with the subsequent argmax dispatch
-        // build, which the combined-eval variant defeats. Kept
+        // Note: the sparse-accept path also benefits from this eager
+        // eval — folding verify materialization into the accept-loop
+        // argmax op (one combined sync) measured ~10% slower than two
+        // separate syncs. The eager eval here lets MLX's scheduler
+        // pipeline the verify command buffer with the subsequent argmax
+        // dispatch build, which the combined-eval variant defeats. Kept
         // unconditional.
         if let Some(argmax_arr) = sparse_verify_argmax {
             argmax_arr.eval();
@@ -2795,9 +2741,9 @@ where
 
     if use_sparse_accept {
         // ONE batched argmax over all D+1 verify positions. Shape
-        // `[1, D+1, vocab]` → `[1, D+1]` int32. Bug #3: at T=0 we
-        // care only about per-position argmax — no full-vocab
-        // softmax materialization needed.
+        // `[1, D+1, vocab]` → `[1, D+1]` int32. At T=0 we care only
+        // about per-position argmax — no full-vocab softmax
+        // materialization needed.
         //
         // `verify_logits` may still be lazy from the verify dispatch
         // (especially under `MLX_MTP_VERIFY_ASYNC_EVAL=1`). The
@@ -3005,9 +2951,9 @@ where
             let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
             let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
             let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-            // PR #65 mtp-reload P2 (codex): the target density `p` consumed by
-            // `accept_with_residual` (`min(1, p/q)` + `(p - q)+` residual) MUST
-            // match the distribution the verify/bonus token is drawn from. The
+            // The target density `p` consumed by `accept_with_residual`
+            // (`min(1, p/q)` + `(p - q)+` residual) MUST match the
+            // distribution the verify/bonus token is drawn from. The
             // bonus on full-accept (and the residual draw on rejection) is
             // sampled via `sampling::sample(&penalized, ..)` →
             // `mlx_compiled_sample_full`, which filters logprobs then applies
@@ -3198,8 +3144,8 @@ where
     if let Some(policy) = ev_depth_policy.as_mut() {
         policy.observe(effective_depth, accepted_drafts);
     }
-    // W6.33 — per-cycle acceptance: feeds the profiler's acceptance
-    // summary (surfaced on `PerformanceMetrics` + the stderr report).
+    // Per-cycle acceptance: feeds the profiler's acceptance summary
+    // (surfaced on `PerformanceMetrics` + the stderr report).
     profiler.record_mtp_cycle(effective_depth, accepted_drafts);
     tracing::debug!(
         target: "mlx_core::mtp",
@@ -3211,7 +3157,7 @@ where
         "MTP cycle accept result"
     );
 
-    // Phase C — committed-history commit.
+    // Committed-history commit.
     //
     // Step-A cycles commit the full newly emitted sequence
     // `[last_committed_id] ++ accepted_tokens`: Step A sampled
@@ -3256,11 +3202,10 @@ where
         "MTP rollback applied"
     );
 
-    // W6 Bug #4 fix — on rejection, restore the main path's GDN
-    // linear caches (back to "after Step A": Step A processed `y_N`
-    // and the snapshot was taken right after) and replay the
-    // K + 1 committed tokens that verify processed but the restore
-    // discarded:
+    // On rejection, restore the main path's GDN linear caches (back to
+    // "after Step A": Step A processed `y_N` and the snapshot was taken
+    // right after) and replay the K + 1 committed tokens that verify
+    // processed but the restore discarded:
     //   * `last_committed_id` (= y_{N+1}, the token Step A sampled
     //     and the cycle treated as the verify-position-0 anchor),
     //   * `d_0..d_{K-1}` (the K accepted drafts).
@@ -3303,11 +3248,10 @@ where
     // the rest of the locals; the underlying lazy MLX arrays stay
     // alive as long as any other handle still holds them.
 
-    // W6.5 — pick the position-K slice of `verify_hiddens` and return
-    // it so the caller (the `decode_loop_mtp!` macro) can chain cycles:
-    // the NEXT cycle's first MTP draft uses this hidden as
-    // `prev_hidden`, eliminating the per-cycle main-model "Step A"
-    // forward.
+    // Pick the position-K slice of `verify_hiddens` and return it so the
+    // caller (the `decode_loop_mtp!` macro) can chain cycles: the NEXT
+    // cycle's first MTP draft uses this hidden as `prev_hidden`,
+    // eliminating the per-cycle main-model "Step A" forward.
     //
     // Semantics: `verify_hiddens[K]` is the post-final-norm hidden at
     // verify position K — the prediction context for the committed
@@ -3320,12 +3264,11 @@ where
     // contract of the MTP head: `MTP(h_t, embed(t+1)) -> logits at
     // t+2`.
     //
-    // Why K (not D, not D+1): the prior W6.5 scaffolding shipped
-    // position D unconditionally, which only matches when ALL drafts
-    // are accepted (K==D). Partial-accept cycles chained from
+    // Why K (not D, not D+1): position D only matches when ALL drafts
+    // are accepted (K==D). Chaining a partial-accept cycle from
     // position D's hidden — the prediction context for the rejected
-    // draft — and the MTP head's drafts diverged from main, dropping
-    // mean acceptance from ~1.5 to ~0.8 tokens/cycle.
+    // draft — diverges the MTP head's drafts from main, dropping mean
+    // acceptance from ~1.5 to ~0.8 tokens/cycle.
     let hidden_dim = verify_hiddens.shape_at(2)?;
     let verify_hidden_k = verify_hiddens.slice(
         &[0, accepted_drafts as i64, 0],
@@ -3347,7 +3290,7 @@ where
 /// Required arguments mirror `decode_loop!`. Adds:
 ///   - `mtp_ops`: an [`MtpOps`] struct.
 ///   - `mtp_depth`: initial / fixed number of draft tokens per cycle
-///     (`>= 1`, `<= 5`). When the W6.8 adaptive policy is ON (see
+///     (`>= 1`, `<= 5`). When the adaptive policy is ON (see
 ///     `params.mtp_adaptive_depth`), this value seeds
 ///     `AdaptiveDepthPolicy::new(...)` and the per-cycle depth is then
 ///     chosen by `pick_depth()`. When adaptive is OFF, this value is
@@ -3395,7 +3338,7 @@ macro_rules! decode_loop_mtp {
         let mut prev_emb_opt: Option<$crate::array::MxArray>;
         let mut last_committed_id_opt: Option<u32>;
 
-        // W6.5 — chained-cycle state. `run_mtp_cycle_inner` slices
+        // Chained-cycle state. `run_mtp_cycle_inner` slices
         // `verify_hiddens[:, K, :]` and returns it; we stash that
         // `[1, 1, hidden]` here so the NEXT outer iteration can skip
         // Step A's ~150 ms main-model forward and feed the chained
@@ -3409,19 +3352,9 @@ macro_rules! decode_loop_mtp {
         // `MTP(prev_hidden=verify_hiddens[K], prev_emb=embed($y)) ->
         // next-next logits`, matching the head's training contract.
         //
-        // Default policy (W6.5 follow-up; preserved post-W6.7): chaining
-        // DISABLED. The position-K slice (commit 2322841) makes chaining
-        // SEMANTICALLY correct — byte-exact parity at T=0 holds in both
-        // modes — but at depth=3 it still measures slower than the
-        // Step-A path even with W6.7's batched verify (0.60× vs 0.74×
-        // on M3 Max bf16, 200-token smoke). The likely cause is the
-        // per-cycle `verify_hiddens[K]` slice + eval pulling an extra
-        // dependency through the compiled-graph cache that the Step-A
-        // path doesn't pay. Re-measure when the chained-hidden eval is
-        // folded into the next cycle's draft trace (W6.8 candidate).
-        //
-        // Set `MLX_MTP_CHAINED_CYCLES=1` to opt INTO chaining for
-        // testing / measurement against the Step-A baseline.
+        // Chaining is GPU-gen-gated (default ON M5+, OFF M1–M4); override
+        // with `MLX_MTP_CHAINED_CYCLES=0/1`. The position-K slice makes it
+        // SEMANTICALLY correct — byte-exact T=0 parity holds in both modes.
         //
         // Invariants:
         //   - `None` on the FIRST iteration (no prior verify) — Step A
@@ -3442,18 +3375,18 @@ macro_rules! decode_loop_mtp {
             $crate::models::qwen3_5::chat_common::mtp_chained_cycles_enabled();
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
 
-        // W6.8 — Adaptive MTP depth policy. When `mtp_adaptive_depth`
-        // is true (explicit opt-in from ChatConfig), the
-        // policy picks the per-cycle draft depth from a per-depth EMA
-        // of `accepted_tokens / cycle_wall_ns` plus a DFlash-style
-        // 3-state machine (`full | reduced | probe`). When false, the
-        // policy is constructed but `pick_depth()` returns
-        // `$p.mtp_depth` on every call (no transitions ever fire
-        // because `record_cycle` is gated below).
+        // Adaptive MTP depth policy. When `mtp_adaptive_depth` is true
+        // (explicit opt-in from ChatConfig), the policy picks the
+        // per-cycle draft depth from a per-depth EMA of
+        // `accepted_tokens / cycle_wall_ns` plus a DFlash-style 3-state
+        // machine (`full | reduced | probe`). When false, the policy is
+        // constructed but `pick_depth()` returns `$p.mtp_depth` on every
+        // call (no transitions ever fire because `record_cycle` is gated
+        // below).
         //
         // The compiled MTP verify graphs are pre-warmed at model load
-        // for every depth `D ∈ {1..=5}` (W6.7), so swinging the depth
-        // freely between cycles is zero-cost from the compile side.
+        // for every depth `D ∈ {1..=5}`, so swinging the depth freely
+        // between cycles is zero-cost from the compile side.
         let mut mtp_depth_policy =
             $crate::models::qwen3_5::adaptive_depth::AdaptiveDepthPolicy::new(
                 $depth.min(u8::MAX as usize) as u8,
@@ -3493,9 +3426,8 @@ macro_rules! decode_loop_mtp {
         // the SAMPLED next token, which means the very first token of
         // the generation (the prefill's seed sample) never reached
         // `$gen`. Without this push MTP's output is the AR output
-        // shifted left by one token — the source of the W6 parity
-        // mismatch reported in `examples/qwen35-mtp-smoke.ts`. We
-        // mirror the per-token bookkeeping Step A does (eval, stream
+        // shifted left by one token. We mirror the per-token bookkeeping
+        // Step A does (eval, stream
         // callback, tracker.observe_token, profiler) so the initial
         // token participates identically. The stop checks (EOS,
         // length, cancel, repetition) run at the top of the loop body
@@ -3584,7 +3516,7 @@ macro_rules! decode_loop_mtp {
                 break;
             }
 
-            // ---- Step A vs. chained-hidden decision (W6.5). -----------
+            // ---- Step A vs. chained-hidden decision. ------------------
             // When chained cycles are enabled (`chained_cycles_enabled`,
             // GPU-generation-gated: default ON on M5+/gen>=17, OFF on
             // M1–M4; override via `MLX_MTP_CHAINED_CYCLES=0/1`): skip
@@ -3597,11 +3529,11 @@ macro_rules! decode_loop_mtp {
             // pending flag survives into Step A's single consume below.
             //
             // When chained cycles are disabled (M1–M4 default, or
-            // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, matching
-            // pre-W6.5 behaviour byte-exact. On M1–M4 the chained path
-            // still regresses depth-3 acceptance (a lazy-slice
-            // eval-scheduling stall), see the comment block at the top
-            // of `decode_loop_mtp!` for details.
+            // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, byte-exact with
+            // the non-chained path. On M1–M4 the chained path still
+            // regresses depth-3 acceptance (a lazy-slice eval-scheduling
+            // stall), see the comment block at the top of
+            // `decode_loop_mtp!` for details.
             //
             // On the chained path the prior cycle's verify already
             // committed all accepted tokens' K/V, and the next cycle's
@@ -3727,7 +3659,7 @@ macro_rules! decode_loop_mtp {
                 last_committed_id_opt = Some(token_id);
                 $y = next_token;
             } else {
-                // ---- Chained path: skip Step A entirely (W6.5). -------
+                // ---- Chained path: skip Step A entirely. --------------
                 // `$y` already holds the prior cycle's last accepted
                 // token (set by that cycle's tail update). That token
                 // has already been pushed to `$gen` / `$hist` /
@@ -3773,14 +3705,14 @@ macro_rules! decode_loop_mtp {
             // bonus/residual; this cycle's verify writes the chained
             // `$y`'s K/V at position 0 and extends the prefix by D more
             // drafts. On full accept per cycle we emit D+1 tokens for
-            // D draft steps + 1 verify (one fewer main forward than
-            // pre-W6.5).
+            // D draft steps + 1 verify (one fewer main forward when
+            // chaining).
             if $gen.len() >= max_as_usize {
                 if $reason.is_empty() { $reason = String::from("length"); }
                 break;
             }
             if $tracker.force_think_end_pending() {
-                // Budget tripped during Step A's observe (after the 3416
+                // Budget tripped during Step A's observe (after Step A's
                 // consume) — defer the forced token to the NEXT cycle's
                 // Step A. This is a NON-consuming peek: the flag stays set,
                 // so next cycle's routing peek (`do_step_a`) forces Step A
@@ -3801,9 +3733,9 @@ macro_rules! decode_loop_mtp {
             let last_id = last_committed_id_opt.ok_or_else(|| {
                 napi::Error::from_reason("last_committed seeded by Step A or chained path")
             })?;
-            // W6 Bug #2 fix (Option Reset): re-anchor the MTP cache to
-            // the main path's CURRENT offset before launching this
-            // cycle's drafts. On the Step-A path the main offset has
+            // Re-anchor the MTP cache to the main path's CURRENT offset
+            // before launching this cycle's drafts. On the Step-A path
+            // the main offset has
             // advanced by 1 (Step A's forward) + the prior cycle's
             // verify advancement. On the chained path the main offset
             // has only advanced by the prior cycle's verify (Step A
@@ -3816,7 +3748,7 @@ macro_rules! decode_loop_mtp {
             // `mlx_core::mtp` trace (old/new MTP offset) — it is the
             // only site that knows the dense-vs-MoE offset getters.
             ($mtp.begin_cycle)(cycle_seed_was_chained && $mtp.committed_history_active);
-            // W6.8 — per-cycle depth selection. When adaptive is OFF,
+            // Per-cycle depth selection. When adaptive is OFF,
             // `pick_depth()` returns the seed depth unchanged
             // (`record_cycle` is gated below). When adaptive is ON, the
             // policy hill-climbs across depth-EMA + manages the
@@ -3894,11 +3826,10 @@ macro_rules! decode_loop_mtp {
                     commit_anchor,
                 );
             $profiler.end();
-            // W6.5 — `run_mtp_cycle_inner` returns the verify-final
-            // hidden so the NEXT outer iteration can skip Step A's
-            // ~150 ms main-model forward. We stash it into
-            // `chained_hidden_opt`; the iteration boundary's `do_step_a`
-            // check will drain it.
+            // `run_mtp_cycle_inner` returns the verify-final hidden so
+            // the NEXT outer iteration can skip Step A's ~150 ms
+            // main-model forward. We stash it into `chained_hidden_opt`;
+            // the iteration boundary's `do_step_a` check will drain it.
             let (outcome, verify_last_hidden) = cycle_res?;
             chained_hidden_opt = Some(verify_last_hidden);
 
@@ -3921,10 +3852,10 @@ macro_rules! decode_loop_mtp {
                     cache_offset,
                 );
             }
-            // W6.8 — feed observation to the policy AFTER the cycle's
-            // tokens have been counted but BEFORE the emit loop's stop
-            // checks (so the record always runs even on partial-emit
-            // due to EOS / length / cancel). `committed` is the number
+            // Feed observation to the policy AFTER the cycle's tokens
+            // have been counted but BEFORE the emit loop's stop checks
+            // (so the record always runs even on partial-emit due to
+            // EOS / length / cancel). `committed` is the number
             // of tokens the cycle actually produced (drafts accepted +
             // residual/bonus); range `[1, depth+1]`.
             let cycle_wall_ns: u64 = cycle_started_at
@@ -4048,31 +3979,28 @@ macro_rules! decode_loop_mtp {
                 as i32;
             $y = $crate::array::MxArray::from_int32(&[last], &[1])?;
 
-            // W6.5-resume — when chaining IS enabled, flush the main
-            // path's KV-cache lazy graph BEFORE the next cycle starts
-            // AND fuse the chained `verify_hidden[K]` slice into the
-            // SAME `async_eval` batch as `(token, g_compiled_caches)`.
+            // When chaining IS enabled, flush the main path's KV-cache
+            // lazy graph BEFORE the next cycle starts AND fuse the
+            // chained `verify_hidden[K]` slice into the SAME `async_eval`
+            // batch as `(token, g_compiled_caches)`.
             //
-            // PRIOR (post-W6.5, pre-resume): we called the plain
-            // `eval_step($y, h, false)` here. That helper does
-            // `async_eval({$y} ++ g_compiled_caches)` and IGNORES `h`
-            // (it only evals the logits arg when `budget_forced=true`).
-            // So the chained hidden stayed LAZY across the iteration
-            // boundary — when the next cycle's `(ops.draft_step)(...)`
-            // built its graph against `prev_hidden = chained_hidden`,
-            // materializing the slice forced a mid-cycle Metal
-            // command-buffer roundtrip that the Step-A bypass doesn't
-            // pay (because Step A's `forward_with_hidden` returns
-            // `(logits, hidden)` as siblings of the same compiled
-            // forward and the macro's `eval_step` co-schedules them
-            // via `next_token → logits → hidden` dependency).
+            // A plain `eval_step($y, h, false)` here would leave the
+            // chained hidden LAZY across the iteration boundary (that
+            // helper ignores `h` unless `budget_forced`), so when the
+            // next cycle's `(ops.draft_step)(...)` built its graph against
+            // `prev_hidden = chained_hidden`, materializing the slice
+            // forced a mid-cycle Metal command-buffer roundtrip that the
+            // Step-A bypass doesn't pay (Step A's `forward_with_hidden`
+            // returns `(logits, hidden)` as siblings of the same compiled
+            // forward and `eval_step` co-schedules them via
+            // `next_token → logits → hidden`).
             //
-            // The new helper `eval_step_with_chained_hidden` extends
-            // the same dispatch to include the slice — so it becomes a
-            // sibling of `(token, caches)`, the kernel scheduler can
-            // overlap its materialization with the next cycle's draft
-            // graph construction, and the chained path stops paying
-            // the per-cycle roundtrip.
+            // `eval_step_with_chained_hidden` extends the same dispatch
+            // to include the slice — so it becomes a sibling of
+            // `(token, caches)`, the kernel scheduler can overlap its
+            // materialization with the next cycle's draft graph
+            // construction, and the chained path stops paying the
+            // per-cycle roundtrip.
             //
             // On the Step-A path this whole branch is dead anyway:
             // Step A's `eval_step` call at the top of the NEXT
@@ -4168,9 +4096,8 @@ mod mtp_history_policy_tests {
 
 #[cfg(test)]
 mod mtp_params_tests {
-    //! W6 (MTP) — defaults + override plumbing for `ChatParams`.
-    //! No Metal required; purely tests the `ChatConfig → ChatParams`
-    //! extraction.
+    //! MTP defaults + override plumbing for `ChatParams`. No Metal
+    //! required; purely tests the `ChatConfig → ChatParams` extraction.
 
     use super::extract_chat_params;
     use crate::models::qwen3_5::model::ChatConfig;
@@ -4249,7 +4176,7 @@ mod mtp_params_tests {
         assert_eq!(p.mtp_depth, 1, "mtp_depth=i32::MIN must clamp to 1");
     }
 
-    /// W6.8 — `mtp_adaptive_depth` default resolution.
+    /// `mtp_adaptive_depth` default resolution.
     ///
     ///   * Neither `mtpAdaptiveDepth` nor `mtpDepth` set → adaptive OFF.
     ///   * `mtpDepth` set, `mtpAdaptiveDepth` unset → adaptive OFF
@@ -4296,12 +4223,12 @@ mod mtp_params_tests {
 
 #[cfg(test)]
 mod mtp_cycle_tests {
-    //! W6 (MTP) — `run_mtp_cycle_inner` smoke tests with mock
-    //! draft / verify closures. Each test invokes the helper with a
-    //! tiny synthetic vocab and validates: emitted token count,
-    //! rollback callback receives the expected
-    //! `(accepted_drafts, depth)` pair. Drafter and verifier closures
-    //! track call counts so the tests double as wiring assertions.
+    //! `run_mtp_cycle_inner` smoke tests with mock draft / verify
+    //! closures. Each test invokes the helper with a tiny synthetic
+    //! vocab and validates: emitted token count, rollback callback
+    //! receives the expected `(accepted_drafts, depth)` pair. Drafter
+    //! and verifier closures track call counts so the tests double as
+    //! wiring assertions.
     //!
     //! The rollback contract: `accepted_drafts` is the number of
     //! draft positions whose K/V we keep (range `0..=depth`). The
@@ -4315,8 +4242,8 @@ mod mtp_cycle_tests {
     //! `mtp.rs`).
     //!
     //! Full token-for-token parity vs the eager Rust MTP forward is
-    //! intentionally out of scope here — see task #8 of the W6 plan
-    //! for the integration smoke that exercises real weights.
+    //! intentionally out of scope here — covered by the integration
+    //! smoke that exercises real weights.
 
     use std::cell::RefCell;
 
@@ -4404,12 +4331,12 @@ mod mtp_cycle_tests {
     /// Construct a verify-step closure that returns logits peaked at
     /// `verify_id_per_position[i]` for each verify position, plus a
     /// zero `[1, depth+1, hidden]` stand-in for the per-position
-    /// verify hiddens (W6.5 fix — the production closure exports the
-    /// post-final-norm hidden at EVERY verify position so the caller
-    /// can slice `verify_hiddens[:, K, :]` for chaining). For the
-    /// mock tests below we don't care about contents, only shape, so
-    /// a fresh zeros tensor matches the `[1, depth+1, hidden_size]`
-    /// contract `run_mtp_cycle_inner` slices from.
+    /// verify hiddens (the production closure exports the post-final-norm
+    /// hidden at EVERY verify position so the caller can slice
+    /// `verify_hiddens[:, K, :]` for chaining). For the mock tests below
+    /// we don't care about contents, only shape, so a fresh zeros tensor
+    /// matches the `[1, depth+1, hidden_size]` contract
+    /// `run_mtp_cycle_inner` slices from.
     fn make_verify<'a>(
         verify_id_per_position: &'a [i32],
         counter: &'a RefCell<usize>,
@@ -4584,8 +4511,8 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Phase C — cycle-level acceptance tests use the legacy
-            // cycle-history policy, so committed-history is inactive.
+            // Cycle-level acceptance tests use the legacy cycle-history
+            // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
         };
@@ -4766,8 +4693,8 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Phase C — cycle-level acceptance tests use the legacy
-            // cycle-history policy, so committed-history is inactive.
+            // Cycle-level acceptance tests use the legacy cycle-history
+            // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
         };
@@ -4937,8 +4864,8 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Phase C — cycle-level acceptance tests use the legacy
-            // cycle-history policy, so committed-history is inactive.
+            // Cycle-level acceptance tests use the legacy cycle-history
+            // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
         };
@@ -5038,8 +4965,8 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Phase C — cycle-level acceptance tests use the legacy
-            // cycle-history policy, so committed-history is inactive.
+            // Cycle-level acceptance tests use the legacy cycle-history
+            // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
         };
@@ -5160,14 +5087,13 @@ mod mtp_cycle_tests {
         );
     }
 
-    // ---- C2: EV intra-cycle deepen — T=0 byte-equivalence gate ----
+    // ---- EV intra-cycle deepen — T=0 byte-equivalence gate ----
 
     /// T=0 (greedy / `use_sparse_accept`) params. Penalties stay at
     /// their no-op defaults so `penalties_no_op == true`, and
-    /// `temperature == 0.0` drives the sparse-accept argmax commit path
-    /// (chat_common.rs:2308). This is the production path that decides
-    /// committed tokens at T=0, and the exact path the EV deepen gate
-    /// (allow_deepen) controls.
+    /// `temperature == 0.0` drives the sparse-accept argmax commit path.
+    /// This is the production path that decides committed tokens at T=0,
+    /// and the exact path the EV deepen gate (allow_deepen) controls.
     fn t0_params() -> super::ChatParams {
         extract_chat_params(&ChatConfig {
             max_new_tokens: None,
@@ -5304,7 +5230,7 @@ mod mtp_cycle_tests {
             };
             let params = t0_params();
             // Fixed seed is belt-and-suspenders: at T=0 the sparse-accept
-            // commit path consumes ZERO RNG (chat_common.rs:2784-2786).
+            // commit path consumes ZERO RNG.
             let mut rng = StdRng::seed_from_u64(0x7E50);
             run_mtp_cycle_inner(
                 &mut ops,
@@ -5340,10 +5266,10 @@ mod mtp_cycle_tests {
         Some((outcome.effective_depth, outcome.tokens, commit))
     }
 
-    /// C2 — the T=0 safety gate that graduates `MLX_MTP_EV_ALLOW_DEEPEN`.
+    /// The T=0 safety gate that graduates `MLX_MTP_EV_ALLOW_DEEPEN`.
     ///
-    /// Reconciles the empirical claim at adaptive_depth.rs:258-262
-    /// ("real M5 Max traces showed intra-cycle deepening can violate the
+    /// Reconciles the empirical claim in `adaptive_depth.rs` ("real M5
+    /// Max traces showed intra-cycle deepening can violate the
     /// temperature-0 byte-equivalence safety contract") against the
     /// static analysis (every committed slot `i` is `target_argmax[i]`,
     /// causally INDEPENDENT of effective_depth; at T=0 the drafter is a
@@ -5453,11 +5379,10 @@ mod mtp_cycle_tests {
 mod compiled_paged_fallback_policy_tests {
     use super::should_propagate_compiled_paged_error;
 
-    /// Regression test for review Finding 1 (HIGH): mid-turn fallback
-    /// after a successful compiled step would corrupt the GDN linear
-    /// cache state. The policy must propagate the error as fatal once
-    /// any compiled step has completed; only the first-step failure is
-    /// safe to fall back to pure-Rust decode.
+    /// Regression test: mid-turn fallback after a successful compiled
+    /// step would corrupt the GDN linear cache state. The policy must
+    /// propagate the error as fatal once any compiled step has completed;
+    /// only the first-step failure is safe to fall back to pure-Rust decode.
     #[test]
     fn no_compiled_step_yet_allows_fallback() {
         assert!(
@@ -6089,8 +6014,8 @@ mod tests {
 
     #[test]
     fn test_fallback_straddling_tool_call_does_not_leak() {
-        // Adversarial (Codex No-ship): a `<tool_call>` opens inside `<think>` but its
-        // `</tool_call>` lands after `</think>`, so the span straddles the reasoning
+        // A `<tool_call>` opens inside `<think>` but its `</tool_call>`
+        // lands after `</think>`, so the span straddles the reasoning
         // boundary. On the no-think_end_id fallback, neither `tool_calls` nor the `text`
         // field may surface a call that began in reasoning, and the reasoning prefix must
         // not leak into `text`.

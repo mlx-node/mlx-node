@@ -14,14 +14,13 @@ using namespace qwen35_common;
 // in one FFI call. Weight storage, helpers, GDN and attention functions are
 // shared with the MoE path via mlx_qwen35_common.h.
 //
-// Phase 5 piece 1 adds a parallel paged-decode graph
-// (`dense_compiled_decode_fn_paged`) that routes full-attention layers
-// through the paged-attention kernels while keeping linear-attention
-// (GDN) layers on the same `gdn_pure_fn` helper as the flat path. The
-// paged-path globals (`g_dense_paged_*`) are independent from the flat
-// path globals (`g_compiled_*`) so both graphs can coexist; the
-// dispatcher chooses one or the other per turn but never mixes them
-// within a single decode step.
+// A parallel paged-decode graph (`dense_compiled_decode_fn_paged`) routes
+// full-attention layers through the paged-attention kernels while keeping
+// linear-attention (GDN) layers on the same `gdn_pure_fn` helper as the flat
+// path. The paged-path globals (`g_dense_paged_*`) are independent from the
+// flat-path globals (`g_compiled_*`) so both graphs can coexist; the
+// dispatcher chooses one or the other per turn but never mixes them within a
+// single decode step.
 // =============================================================================
 
 namespace {
@@ -35,66 +34,59 @@ static std::optional<array> g_compiled_offset;       // scalar int32 (current de
 static int g_offset_int = 0;                         // C++ int mirror of g_compiled_offset
 static bool g_compile_inited = false;
 
-// W6 (MTP) — last post-final-norm hidden of the LAST committed token,
-// stashed at the LM-head boundary inside `qwen35_decode_fn` BEFORE the
-// `lm_head` linear runs. Shape is `[B, hidden_size]` after the
-// implicit reshape that `take` + the per-row final_norm produce
-// (decode batch is `[1, 1]` → reshape({-1}) → `[1]` → `take` →
-// `[1, hidden]`). The W6 MTP seeding path consumes this via
-// `mlx_qwen35_export_last_hidden` to get the first draft step's
-// `prev_hidden` without re-running the main forward.
+// MTP — last post-final-norm hidden of the LAST committed token, stashed at
+// the LM-head boundary inside `qwen35_decode_fn` BEFORE the `lm_head` linear
+// runs. Shape is `[B, hidden_size]` after the implicit reshape that `take` +
+// the per-row final_norm produce (decode batch is `[1, 1]` → reshape({-1}) →
+// `[1]` → `take` → `[1, hidden]`). The MTP seeding path consumes this via
+// `mlx_qwen35_export_last_hidden` to get the first draft step's `prev_hidden`
+// without re-running the main forward.
 //
-// Cleared on `mlx_qwen35_compiled_reset` so cross-turn stale handles
-// never leak. The C++ side keeps a `std::optional<array>` so we can
-// distinguish "never populated" from "populated with zeros".
+// Cleared on `mlx_qwen35_compiled_reset` so cross-turn stale handles never
+// leak. `std::optional<array>` distinguishes "never populated" from
+// "populated with zeros".
 static std::optional<array> g_last_hidden;
 
-// Phase 4b — paged-path sibling of `g_last_hidden`. Stashed at the
-// LM-head boundary inside `dense_compiled_decode_fn_paged` BEFORE the
-// `lm_head` linear runs. Shape is `[B, hidden_size]` after the implicit
-// reshape (paged decode batch is `[1, 1]` → `take` → `[1, hidden]`).
-// Consumed by the paged-MTP gate via `mlx_qwen35_export_last_hidden_paged`
-// to seed the next MTP draft cycle without re-running the main forward.
-// Cleared on `mlx_qwen35_compiled_reset`.
+// Paged-path sibling of `g_last_hidden`. Stashed at the LM-head boundary
+// inside `dense_compiled_decode_fn_paged` BEFORE the `lm_head` linear runs.
+// Shape is `[B, hidden_size]` after the implicit reshape (paged decode batch
+// is `[1, 1]` → `take` → `[1, hidden]`). Consumed by the paged-MTP gate via
+// `mlx_qwen35_export_last_hidden_paged` to seed the next MTP draft cycle
+// without re-running the main forward. Cleared on `mlx_qwen35_compiled_reset`.
 static std::optional<array> g_last_hidden_paged;
 
-// W6 (MTP) Bug #4 fix — snapshot of the GDN linear-attention caches
-// (conv_state + recurrent_state) plus the decode offset taken BEFORE
-// the verify FFI runs its D+1 sequential forward passes. The verify
-// loop mutates `g_compiled_caches` in place for every layer; for
-// linear-attention layers the recurrent / conv state advances through
-// D+1 tokens that may or may not be accepted. On rejection (any
-// `accepted_drafts < depth`) we restore this snapshot so the linear
-// state matches the pre-verify "after Step A" state; the caller then
-// replays exactly K accepted drafts via `forward_compiled` to bring
-// the linear state forward through the committed drafts only.
+// MTP partial-accept snapshot of the GDN linear-attention caches (conv_state +
+// recurrent_state) plus the decode offset, taken BEFORE the verify FFI runs
+// its D+1 sequential forward passes. The verify loop mutates `g_compiled_caches`
+// in place for every layer; for linear-attention layers the recurrent / conv
+// state advances through D+1 tokens that may or may not be accepted. On
+// rejection (any `accepted_drafts < depth`) we restore this snapshot so the
+// linear state matches the pre-verify "after Step A" state; the caller then
+// replays exactly K accepted drafts via `forward_compiled` to bring the linear
+// state forward through the committed drafts only.
 //
-// Only LINEAR-attention layers are snapshotted — full-attention K/V
-// slots are correctly handled by the existing offset-rewind path
-// (later writes overwrite the stale slots, and attention masking
-// hides them via `offset`).
+// Only LINEAR-attention layers are snapshotted — full-attention K/V slots are
+// correctly handled by the existing offset-rewind path (later writes overwrite
+// the stale slots, and attention masking hides them via `offset`).
 //
-// `g_linear_snapshot_offset` records the offset at snapshot time so
-// restore can rewind the offset in lockstep. `g_linear_snapshot_taken`
-// guards against an out-of-order restore that would silently install
-// garbage state.
+// `g_linear_snapshot_offset` records the offset at snapshot time so restore can
+// rewind the offset in lockstep. `g_linear_snapshot_taken` guards against an
+// out-of-order restore that would silently install garbage state.
 //
 // Cleared by `mlx_qwen35_compiled_reset`.
 static std::vector<array> g_compiled_linear_snapshot;
 static int g_linear_snapshot_offset = 0;
 static bool g_linear_snapshot_taken = false;
 
-// W6.6 — Tape-replay rollback infrastructure.
+// Tape-replay rollback infrastructure.
 //
 // When `g_tape_recording_armed == true`, `qwen35_decode_fn` routes
-// linear-attention layers through `gdn_pure_fn_with_tape` (which calls
-// the tape-emitting Metal kernel) and appends the per-step
-// `(tape, k, g, qkv)` tensors into the per-layer accumulators below.
-// After the MTP verify loop's D+1 forwards, each accumulator holds a
-// `[B, D+1, ...]` tensor recording every per-step innovation. On
-// rollback the replay kernel applies the first `accepted_steps` of
-// those innovations to the pre-verify snapshot state — replacing the
-// K+1 main-model forwards the old Bug #4 rollback ran.
+// linear-attention layers through `gdn_pure_fn_with_tape` (which calls the
+// tape-emitting Metal kernel) and appends the per-step `(tape, k, g, qkv)`
+// tensors into the per-layer accumulators below. After the MTP verify loop's
+// D+1 forwards, each accumulator holds a `[B, D+1, ...]` tensor recording every
+// per-step innovation. On rollback the replay kernel applies the first
+// `accepted_steps` of those innovations to the pre-verify snapshot state.
 //
 // Layout (each vector has `num_layers` slots; full-attention slots hold
 // placeholders so per-layer indexing stays uniform):
@@ -104,18 +96,18 @@ static bool g_linear_snapshot_taken = false;
 //   - g_gdn_qkv_tape_acc[i]:    [B, accumulated_steps, conv_dim] model dtype
 //
 // Lifecycle:
-//   - `mlx_qwen35_compiled_tape_arm()` clears the accumulators and sets
-//     the recording flag. Called by `decode_loop_mtp!` right BEFORE the
-//     verify FFI runs its D+1 sequential forwards (when tape-replay is
-//     ENABLED — env var `MLX_MTP_USE_TAPE_REPLAY != "0"`).
+//   - `mlx_qwen35_compiled_tape_arm()` clears the accumulators and sets the
+//     recording flag. Called right BEFORE the verify FFI runs its D+1
+//     sequential forwards (when tape-replay is ENABLED — env var
+//     `MLX_MTP_USE_TAPE_REPLAY != "0"`).
 //   - Each `qwen35_decode_fn` step appends one slice to each layer's
 //     accumulator via `concatenate` along axis 1.
-//   - `mlx_qwen35_compiled_tape_replay(accepted_steps)` consumes the
-//     first `accepted_steps` slices to restore the snapshot state, then
-//     clears the accumulators.
+//   - `mlx_qwen35_compiled_tape_replay(accepted_steps)` consumes the first
+//     `accepted_steps` slices to restore the snapshot state, then clears the
+//     accumulators.
 //   - `mlx_qwen35_compiled_tape_disarm()` is idempotent. Rejection and
-//     full-accept paths normally consume the tape via `_tape_replay`,
-//     which disarms internally; explicit disarm is only for cleanup.
+//     full-accept paths normally consume the tape via `_tape_replay`, which
+//     disarms internally; explicit disarm is only for cleanup.
 //
 // Cleared by `mlx_qwen35_compiled_reset`.
 static bool g_tape_recording_armed = false;
@@ -125,25 +117,24 @@ static std::vector<std::optional<array>> g_gdn_g_tape_acc;  // [num_layers]
 static std::vector<std::optional<array>> g_gdn_qkv_tape_acc;// [num_layers]
 
 // =====================================================================
-// Phase 5 piece 1: paged-decode globals.
+// Paged-decode globals.
 //
-// Independent from the flat-path globals above so both compile graphs
-// can coexist while the Rust dispatcher decides per-turn whether to
-// take the compiled paged path or fall back to the legacy flat path.
+// Independent from the flat-path globals above so both compile graphs can
+// coexist while the Rust dispatcher decides per-turn whether to take the
+// compiled paged path or fall back to the flat path.
 //
 // Layout (size = num_layers; one entry per layer indexed by `layer_idx`):
 //   - g_dense_k_pools / g_dense_v_pools / g_dense_k_scales /
 //     g_dense_v_scales: meaningful only for full-attention layers.
-//     Linear-layer slots hold a small placeholder array — they're never
-//     read by the paged graph.
+//     Linear-layer slots hold a small placeholder array — never read by the
+//     paged graph.
 //   - g_dense_paged_linear_caches: size = num_layers * 2. Slot `2i` and
-//     `2i+1` hold conv_state and recurrent_state for layer `i` when
-//     that layer is linear-attention. Full-attn slots hold placeholders.
+//     `2i+1` hold conv_state and recurrent_state for layer `i` when that layer
+//     is linear-attention. Full-attn slots hold placeholders.
 //
-// `g_dense_paged_inited` gates the new `mlx_qwen35_forward_paged` FFI.
-// `mlx_qwen35_init_paged` is the only way to flip it true; clearing
-// happens in `mlx_qwen35_compiled_reset` so a single reset wipes BOTH
-// graphs' state.
+// `g_dense_paged_inited` gates the `mlx_qwen35_forward_paged` FFI.
+// `mlx_qwen35_init_paged` is the only way to flip it true; clearing happens in
+// `mlx_qwen35_compiled_reset` so a single reset wipes BOTH graphs' state.
 // =====================================================================
 static CompileConfig g_dense_paged_config{};
 static std::vector<array> g_dense_k_pools;          // [num_layers]
@@ -154,17 +145,15 @@ static std::vector<array> g_dense_paged_linear_caches;  // [num_layers * 2]
 static int g_dense_paged_offset_int = 0;
 static bool g_dense_paged_inited = false;
 
-// Phase 4b — paged-pool MTP partial-accept snapshot/restore for the GDN
-// linear-attention recurrent + conv state. Sibling of the BHTD
-// `g_compiled_linear_snapshot` triple (mlx_qwen35.cpp:72-74). Paged
-// verify mutates `g_dense_paged_linear_caches` after processing all D+1
-// verify tokens; on partial-accept (accepted_drafts < depth) the
-// committed state corresponds to fewer steps than the recorded ones, so
-// the next forward must start from a state matching the accepted prefix.
-// Full-attention slots are intentionally NOT snapshotted — the paged
-// pool's `record_tokens` / `rollback_last_tokens` cursor on the Rust
-// side handles K/V slot bookkeeping; later writes overwrite the stale
-// trailing slots.
+// Paged-pool MTP partial-accept snapshot/restore for the GDN linear-attention
+// recurrent + conv state. Sibling of the BHTD `g_compiled_linear_snapshot`.
+// Paged verify mutates `g_dense_paged_linear_caches` after processing all D+1
+// verify tokens; on partial-accept (accepted_drafts < depth) the committed
+// state corresponds to fewer steps than the recorded ones, so the next forward
+// must start from a state matching the accepted prefix. Full-attention slots
+// are intentionally NOT snapshotted — the paged pool's `record_tokens` /
+// `rollback_last_tokens` cursor on the Rust side handles K/V slot bookkeeping;
+// later writes overwrite the stale trailing slots.
 //
 // Cleared by `mlx_qwen35_compiled_reset`.
 static std::vector<array> g_dense_paged_linear_snapshot;
@@ -185,21 +174,19 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
   auto h = inputs[0];
   int offset = g_offset_int;
 
-  // W6.21 — T=1 decode: skip the per-step `[1,1,1,max_kv_len]` attention
-  // mask. `attn_pure_fn(dynamic_kv=true)` slices the KV cache down to the
-  // valid range `[0..offset+1]` and passes NO mask to SDPA. This mirrors
-  // upstream mlx-lm's `create_attention_mask(N=1) → None` + `cache.state`
-  // (keys[..., :offset, :]) pattern. Faster SDPA kernel; byte-exact at
-  // T=0 because the masked-out columns can never affect the per-row
-  // softmax (the mask is `-inf` exactly where the sliced version has no
-  // entry at all).
+  // T=1 decode: skip the per-step `[1,1,1,max_kv_len]` attention mask.
+  // `attn_pure_fn(dynamic_kv=true)` slices the KV cache down to the valid range
+  // `[0..offset+1]` and passes NO mask to SDPA. Mirrors upstream mlx-lm's
+  // `create_attention_mask(N=1) → None` + `cache.state` (keys[..., :offset, :])
+  // pattern. Faster SDPA kernel; byte-exact at T=0 because the masked-out
+  // columns can never affect the per-row softmax (the mask is `-inf` exactly
+  // where the sliced version has no entry at all).
   //
-  // Note: `qwen35_decode_fn` is NOT wrapped in `mlx::core::compile`, so
-  // using a C++-int slice bound (`valid_len = offset+1`) here is safe;
-  // the graph topology evolves with offset but is re-traced every call
-  // anyway. Compiled paths (MoE flat / paged / batched verify / MTP
-  // draft) keep the static-mask path because they need fixed shapes
-  // for the `mlx::core::compile` cache.
+  // `qwen35_decode_fn` is NOT wrapped in `mlx::core::compile`, so using a
+  // C++-int slice bound (`valid_len = offset+1`) here is safe; the graph
+  // topology evolves with offset but is re-traced every call anyway. Compiled
+  // paths (MoE flat / paged / batched verify / MTP draft) keep the static-mask
+  // path because they need fixed shapes for the `mlx::core::compile` cache.
 
   std::vector<array> new_caches;
   new_caches.reserve(cfg.num_layers * 2);
@@ -218,12 +205,12 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
       const auto& cs = inputs[2 + i * 2];
       const auto& rs = inputs[2 + i * 2 + 1];
       if (g_tape_recording_armed) {
-        // W6.6 — emit tape during MTP verify forwards so the rollback
-        // path can replay only the accepted prefix instead of re-running
-        // the main model. The math is identical to `gdn_pure_fn`; the
-        // extra outputs are appended into per-layer accumulators along
-        // the time axis so after the D+1 verify-loop iterations each
-        // accumulator holds the full per-step record.
+        // Emit tape during MTP verify forwards so the rollback path can replay
+        // only the accepted prefix instead of re-running the main model. The
+        // math is identical to `gdn_pure_fn`; the extra outputs are appended
+        // into per-layer accumulators along the time axis so after the D+1
+        // verify-loop iterations each accumulator holds the full per-step
+        // record.
         auto res = gdn_pure_fn_with_tape(normed, i, cs, rs, cfg);
         layer_out = std::move(res.output);
         new_caches[i * 2]     = std::move(res.conv_state);
@@ -249,9 +236,9 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
     } else {
       const auto& kk = inputs[2 + i * 2];
       const auto& kv = inputs[2 + i * 2 + 1];
-      // W6.21 — `dynamic_kv=true`: helper slices KV down to `[0..offset+1]`
-      // and skips the mask entirely. The `attn_mask` slot is unused under
-      // this branch; pass a zero-element placeholder.
+      // `dynamic_kv=true`: helper slices KV down to `[0..offset+1]` and skips
+      // the mask entirely. The `attn_mask` slot is unused under this branch;
+      // pass a zero-element placeholder.
       auto dummy_mask = zeros({}, mlx::core::bfloat16);
       auto res = attn_pure_fn(normed, i, kk, kv, dummy_mask, offset, cfg,
                               /*dynamic_kv=*/true);
@@ -272,10 +259,9 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
-  // W6 (MTP) — stash the post-final-norm hidden of the last decoded
-  // token BEFORE lm_head. The shape is `[1, hidden_size]` for the
-  // flat-path decode (batch=1, single token). The optional is
-  // overwritten on every call so it always reflects the last
+  // MTP — stash the post-final-norm hidden of the last decoded token BEFORE
+  // lm_head. Shape is `[1, hidden_size]` for the flat-path decode (batch=1,
+  // single token). Overwritten every call so it always reflects the last
   // committed token's hidden state.
   g_last_hidden = h;
   if (cfg.tie_word_embeddings) {
@@ -301,14 +287,12 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 // etc.) for kernel fusion.
 
 // =====================================================================
-// W6.7 — Batched verify decode graph.
+// Batched verify decode graph.
 //
-// One forward over `T = depth + 1` tokens (vs the prior D+1 sequential
-// `qwen35_decode_fn` calls). Replaces the per-step `g_verify_*` closure
-// loop in `mlx_qwen35_mtp_compiled.cpp`. Eliminates the per-position
-// `g_last_hidden` capture + `concatenate` accumulator append that the
-// W6.5 chained-cycles path needed (the batched graph emits
-// `[1, D+1, hidden]` natively in one dispatch).
+// One forward over `T = depth + 1` tokens (vs D+1 sequential
+// `qwen35_decode_fn` calls). The batched graph emits `[1, D+1, hidden]`
+// natively in one dispatch, avoiding the per-position `g_last_hidden` capture
+// + `concatenate` accumulator append.
 //
 // Input vector layout:
 //   [0]                      h_3d        [B, T, hidden]  bf16
@@ -330,32 +314,30 @@ static std::vector<array> qwen35_decode_fn(const std::vector<array>& inputs) {
 //     [extra_base + i*4 + 3] qkv_tape    [B, T, conv_dim]
 //
 // The graph is parameterised by `T` only (depth at trace time); the offset
-// arrives as an array so the same compiled graph reuses across all
-// decode positions for a given D. One graph per (depth, with_tape) is
-// cached in `g_compiled_verify_batched` / `g_compiled_verify_batched_tape`.
+// arrives as an array so the same compiled graph reuses across all decode
+// positions for a given D. One graph per (depth, with_tape) is cached.
 // =====================================================================
 
 namespace {
 
-// W6.29 — Bucketed verify graph.
+// Bucketed verify graph.
 //
-// `bucket_kv_len` is the static SDPA key-column count baked into the
-// compile trace for THIS entry of the per-bucket cache. The graph
-// processes the same `[B, T, hidden]` input and emits the same outputs
-// as the prior single-trace version, but SDPA now reads only the first
-// `bucket_kv_len` columns of each full-attn layer's KV cache.
+// `bucket_kv_len` is the static SDPA key-column count baked into the compile
+// trace for THIS entry of the per-bucket cache. The graph processes the same
+// `[B, T, hidden]` input and emits the same outputs as the single-trace
+// version, but SDPA reads only the first `bucket_kv_len` columns of each
+// full-attn layer's KV cache.
 //
-// Invariant the caller MUST uphold: `bucket_kv_len >= g_offset_int + T`,
-// so every valid key column at every row is inside the bucket prefix.
-// The mask's `valid_2d` predicate is computed against `arange(0, bucket)`,
-// which is exactly the K range SDPA sees. Tokens past
-// `g_offset_int + T - 1` inside the bucket prefix are zero-initialised
-// in the KV pool and `-inf`-masked, identical to the prior unbucketed
-// trace's tail behavior.
+// Invariant the caller MUST uphold: `bucket_kv_len >= g_offset_int + T`, so
+// every valid key column at every row is inside the bucket prefix. The mask's
+// `valid_2d` predicate is computed against `arange(0, bucket)`, which is
+// exactly the K range SDPA sees. Tokens past `g_offset_int + T - 1` inside the
+// bucket prefix are zero-initialised in the KV pool and `-inf`-masked,
+// identical to the unbucketed trace's tail behavior.
 //
-// `bucket_kv_len == 0` selects the legacy full-length path (SDPA sees
-// the full `max_kv_len` cache). Used for prompts that exceed the largest
-// bucket and as a safety fallback when bucketing is disabled.
+// `bucket_kv_len == 0` selects the full-length path (SDPA sees the full
+// `max_kv_len` cache). Used for prompts that exceed the largest bucket and as
+// a fallback when bucketing is disabled.
 struct SparseTargetSpec {
   bool enabled = false;
   int top_k = 0;
@@ -509,9 +491,9 @@ static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
   auto h_flat = reshape(h, {B * T, hidden});
   h_flat = fast::rms_norm(h_flat, get_weight("final_norm.weight"), cfg.rms_norm_eps);
   // Capture pre-lm_head hidden (post-final-norm). Same point as
-  // `g_last_hidden` in `qwen35_decode_fn`. Shape is `[B*T, hidden]`;
-  // reshape to `[B, T, hidden]` so the FFI hands it to the Rust caller
-  // in the contract documented at `mlx_qwen35_mtp_verify_compiled_with_hidden`.
+  // `g_last_hidden` in `qwen35_decode_fn`. Shape is `[B*T, hidden]`; reshape to
+  // `[B, T, hidden]` so the FFI hands it to the Rust caller in the contract
+  // documented at `mlx_qwen35_mtp_verify_compiled_with_hidden`.
   auto hidden_out = reshape(h_flat, {B, T, hidden});
 
   auto logits_flat = cfg.tie_word_embeddings
@@ -560,28 +542,24 @@ static std::vector<array> qwen35_verify_batched_decode_fn_bucketed(
   return result;
 }
 
-// W6.29 — Per-bucket compiled-graph cache for the batched verify forward.
+// Per-bucket compiled-graph cache for the batched verify forward.
 //
-// PRIOR (W6.7): `mlx::core::compile` keyed its internal trace cache on
-// input shapes/dtypes. Because `max_kv_len` is baked into the KV cache
-// shape, ONE compile per (with_tape) variant covered all 5 depths — but
-// every depth's verify SDPA processed the FULL padded `max_kv_len`
-// key tensor with a tail `-inf` mask, even when `offset + T << max_kv_len`.
+// One compile per (bucket, with_tape) pair, where `bucket` is the static SDPA
+// key-column count baked into the trace. The dispatcher (`bucket_index_for`)
+// picks the smallest bucket >= `g_offset_int + T`, so SDPA reads only that
+// prefix and the mask matches its column count. Speedup is proportional to
+// `bucket / max_kv_len` per SDPA call — dominant at early decode positions on
+// long-context models. (Without bucketing, one trace per with_tape variant
+// processes the full padded `max_kv_len` key tensor even when
+// `offset + T << max_kv_len`.)
 //
-// NOW: one compile per (bucket, with_tape) pair, where `bucket` is the
-// static SDPA key-column count baked into the trace. The dispatcher
-// (`bucket_index_for`) picks the smallest bucket >= `g_offset_int + T`,
-// so SDPA reads only that prefix and the mask matches its column count.
-// Speedup is proportional to `bucket / max_kv_len` per SDPA call —
-// dominant at early decode positions on long-context models.
-//
-// Populated lazily on first use; thread-safety mirrors the other
-// `compiled_*()` helpers in this file (single-mutex per turn from
-// `DENSE_COMPILED_MUTEX` on the Rust side).
+// Populated lazily on first use; thread-safety mirrors the other `compiled_*()`
+// helpers in this file (single-mutex per turn from `DENSE_COMPILED_MUTEX` on
+// the Rust side).
 using BatchedVerifyFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-// W6.35 — Bucket sizes. The SDPA kernel-selection boundary, NOT a power
-// of two, drives this set. MLX's Metal SDPA `eval_gpu` routes the
+// Bucket sizes. The SDPA kernel-selection boundary, NOT a power of two, drives
+// this set. MLX's Metal SDPA `eval_gpu` routes the
 // `q.shape(2)<=8` verify/decode attention to the single-pass
 // `sdpa_vector` kernel while `k.shape(2)` is small, and to the
 // hierarchical `sdpa_vector_2pass` kernel once `k.shape(2)` crosses a
@@ -629,10 +607,10 @@ struct SparseVerifyFnSlot {
 static std::array<std::array<SparseVerifyFnSlot, 2>, kTotalBucketSlots>
     g_verify_sparse_compiled_by_bucket{};
 
-// Dense paged AR-decode graph (Phase 5 piece 1). Defined here so the reload
-// path `invalidate_verify_compiled_tables()` (below) can null it. Lazily
-// compiled in `compiled_dense_decode_paged()` and deliberately survives the
-// per-turn reset — see that getter for the full rationale.
+// Dense paged AR-decode graph. Defined here so the reload path
+// `invalidate_verify_compiled_tables()` (below) can null it. Lazily compiled in
+// `compiled_dense_decode_paged()` and deliberately survives the per-turn reset
+// — see that getter for the full rationale.
 static BatchedVerifyFn g_dense_decode_paged_compiled{};
 
 static bool same_sparse_target_spec(const SparseTargetSpec& a,
@@ -644,11 +622,10 @@ static bool same_sparse_target_spec(const SparseTargetSpec& a,
          a.sampler_mode == b.sampler_mode;
 }
 
-// W6.29 — bucket dispatcher opt-out. Default ON; set
-// `MLX_MTP_BUCKETED_VERIFY` to `0` / `false` / `off` (case-insensitive,
-// surrounding whitespace ignored) to force the legacy single-trace path
-// (kLegacyBucketIdx). Used as a safety hatch only; the bucket path is
-// strictly parity-safe (the tail mask is identical math).
+// Bucket dispatcher opt-out. Default ON; set `MLX_MTP_BUCKETED_VERIFY` to
+// `0` / `false` / `off` (case-insensitive, surrounding whitespace ignored) to
+// force the legacy single-trace path (kLegacyBucketIdx). Safety hatch only;
+// the bucket path is strictly parity-safe (the tail mask is identical math).
 //
 // Truthy/falsy parsing mirrors the Rust `MLX_MTP_*` readers in
 // `crates/mlx-core/src/models/qwen3_5/chat_common.rs` so the convention
@@ -700,10 +677,9 @@ static int bucket_size_for_idx(int idx) {
   return idx == kLegacyBucketIdx ? 0 : kVerifyBuckets[idx];
 }
 
-// Phase 4b — opt-OUT gate for the paged-pool MTP verify graph. Default
-// ON since Phase 4b/B4. Set `MLX_MTP_VERIFY_PAGED_ATTN` to `0` /
-// `false` / `off` (case-insensitive, surrounding whitespace ignored)
-// to fall back to the dense BHTD verify path.
+// Opt-OUT gate for the paged-pool MTP verify graph. Default ON. Set
+// `MLX_MTP_VERIFY_PAGED_ATTN` to `0` / `false` / `off` (case-insensitive,
+// surrounding whitespace ignored) to fall back to the dense BHTD verify path.
 // Mirrored in Rust by `chat_common::mtp_verify_paged_attn_enabled()`.
 static bool mtp_verify_paged_attn_enabled() {
   static const bool enabled = []() {
@@ -781,12 +757,11 @@ static BatchedVerifyFn& get_or_compile_verify_sparse_bucket(
   return slot.fn;
 }
 
-// Phase 4b — paged-pool MTP verify graph. Sibling of
-// `qwen35_verify_batched_decode_fn_bucketed` that reads K/V from the
-// vLLM-style pool instead of the BHTD `[B, Hkv, max_kv_len, D]` cache.
-// Linear-attention layers are unchanged; full-attention layers route
-// through `attn_batched_verify_fn_paged` (paged_kv_write +
-// paged_attention_varlen).
+// Paged-pool MTP verify graph. Sibling of
+// `qwen35_verify_batched_decode_fn_bucketed` that reads K/V from the vLLM-style
+// pool instead of the BHTD `[B, Hkv, max_kv_len, D]` cache. Linear-attention
+// layers are unchanged; full-attention layers route through
+// `attn_batched_verify_fn_paged` (paged_kv_write + paged_attention_varlen).
 //
 // Input vector layout:
 //   [0]                      h_3d            [1, T, hidden]              bf16
@@ -810,10 +785,10 @@ static BatchedVerifyFn& get_or_compile_verify_sparse_bucket(
 template <bool WithTape>
 static std::vector<array> qwen35_verify_batched_decode_fn_paged(
     const std::vector<array>& inputs) {
-  // Phase 4b — read layout from the paged config (`mlx_qwen35_init_paged`).
-  // The verify graph is only callable through the paged-MTP gate, which
-  // requires `g_dense_paged_inited == true`; BHTD `g_compile_config` may
-  // be unset on pure-paged turns.
+  // Read layout from the paged config (`mlx_qwen35_init_paged`). The verify
+  // graph is only callable through the paged-MTP gate, which requires
+  // `g_dense_paged_inited == true`; BHTD `g_compile_config` may be unset on
+  // pure-paged turns.
   const auto& cfg = g_dense_paged_config;
 
   auto h_3d         = inputs[0];
@@ -957,8 +932,8 @@ static BatchedVerifyFn& get_or_compile_verify_paged(bool with_tape) {
   return slot;
 }
 
-// PR #65 (mtp-reload P1) — null EVERY MTP-verify dispatch slot so the next
-// `get_or_compile_verify_*` re-traces against the CURRENT weight registry.
+// Null EVERY MTP-verify dispatch slot so the next `get_or_compile_verify_*`
+// re-traces against the CURRENT weight registry.
 //
 // The compiled verify bodies read weights via `get_weight(...)` INSIDE the
 // traced closure (NOT as compile inputs), so `mlx::core::compile(...)` bakes
@@ -1003,19 +978,17 @@ static void invalidate_verify_compiled_tables() {
 }  // namespace
 
 // =====================================================================
-// Phase 5 piece 1: full-graph paged-decode compile function.
+// Full-graph paged-decode compile function.
 //
-// Mirrors `moe_compiled_decode_fn_paged` from `mlx_qwen35_moe.cpp` but
-// without expert routing — every layer either runs `gdn_pure_fn`
-// (linear) or `attn_for_compile_paged` (full attention) followed by a
-// dense SwiGLU MLP.
+// Mirrors `moe_compiled_decode_fn_paged` from `mlx_qwen35_moe.cpp` but without
+// expert routing — every layer either runs `gdn_pure_fn` (linear) or
+// `attn_for_compile_paged` (full attention) followed by a dense SwiGLU MLP.
 //
-// Unlike the legacy `qwen35_decode_fn` flat path (which captures a
-// scalar `g_offset_int` and therefore invalidates the compile cache on
-// every step), this graph takes the offset as an array input
-// (`offset_arr`). All shapes are fixed at trace time, so
-// `mlx::core::compile(...)` produces a cache key that stays valid
-// across all decode steps within one turn.
+// Unlike the flat `qwen35_decode_fn` path (which captures a scalar
+// `g_offset_int` and therefore invalidates the compile cache on every step),
+// this graph takes the offset as an array input (`offset_arr`). All shapes are
+// fixed at trace time, so `mlx::core::compile(...)` produces a cache key that
+// stays valid across all decode steps within one turn.
 //
 // Input vector layout (matches the MoE paged graph):
 //   [0]                  h:                  embedding [B, hidden]
@@ -1065,7 +1038,7 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
   auto num_valid_blocks = inputs[5];
   auto seq_lens         = inputs[6];
 
-  // Phase 5 piece 1 hard-coded contract (matches the MoE paged graph).
+  // Hard-coded contract (matches the MoE paged graph).
   constexpr int BLOCK_SIZE = 16;
 
   constexpr int kHeader = 7;
@@ -1151,7 +1124,7 @@ static std::vector<array> dense_compiled_decode_fn_paged(const std::vector<array
 // compiled through `compile_resettable_weight_graph` so the reload path
 // (`invalidate_verify_compiled_tables()`) can null it and force a re-trace
 // against the live registry. Deliberately survives the per-turn
-// `mlx_qwen35_compiled_reset()` (cross-turn reuse) — nulled ONLY on reload.
+// `mlx_qwen35_compiled_reset()` (cross-turn reuse); nulled ONLY on reload.
 static BatchedVerifyFn& compiled_dense_decode_paged() {
   if (!g_dense_decode_paged_compiled) {
     g_dense_decode_paged_compiled =
@@ -1245,9 +1218,9 @@ void mlx_qwen35_compiled_init_from_prefill(
     g_offset_int = prefill_offset;
     g_compile_inited = true;
 
-    // W6.6 — size the per-layer tape accumulator vectors. They remain
-    // empty (each slot is `std::nullopt`) until `mlx_qwen35_compiled_tape_arm`
-    // is called and `qwen35_decode_fn` records the first step.
+    // Size the per-layer tape accumulator vectors. They remain empty (each
+    // slot is `std::nullopt`) until `mlx_qwen35_compiled_tape_arm` is called
+    // and `qwen35_decode_fn` records the first step.
     g_gdn_tape_acc.assign(num_layers, std::nullopt);
     g_gdn_k_tape_acc.assign(num_layers, std::nullopt);
     g_gdn_g_tape_acc.assign(num_layers, std::nullopt);
@@ -1323,20 +1296,18 @@ void mlx_qwen35_forward_compiled(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 — Batched verify forward.
+// Batched verify forward.
 //
-// Runs ONE compiled forward over `T = depth + 1` tokens, replacing the prior
-// `D+1` sequential `mlx_qwen35_forward_compiled` calls performed inside the
-// per-depth verify closure of `mlx_qwen35_mtp_compiled.cpp`. The compiled
-// graph emits `[1, T, vocab]` logits + `[1, T, hidden]` post-final-norm
-// hiddens in one dispatch.
+// Runs ONE compiled forward over `T = depth + 1` tokens (vs D+1 sequential
+// `mlx_qwen35_forward_compiled` calls). The compiled graph emits
+// `[1, T, vocab]` logits + `[1, T, hidden]` post-final-norm hiddens in one
+// dispatch.
 //
-// Tape integration: if `g_tape_recording_armed` is true at entry, the
-// with-tape variant is invoked and the per-layer tape buffers
+// Tape integration: if `g_tape_recording_armed` is true at entry, the with-tape
+// variant is invoked and the per-layer tape buffers
 // `(tape, k_tape, g_tape, qkv_tape)` of shape `[1, T, ...]` are stashed
-// DIRECTLY into the `g_gdn_*_tape_acc` slots (replacing the prior D+1
-// `concatenate` appends). The rollback path consumes a `slice([:, 0..K, ...])`
-// of these exactly as before — the cumulative shape is identical.
+// DIRECTLY into the `g_gdn_*_tape_acc` slots. The rollback path consumes a
+// `slice([:, 0..K, ...])` of these — the cumulative shape is identical.
 //
 // Inputs:
 //   - input_ids:        `[1, T]` int32 tokens (T = depth + 1).
@@ -1429,10 +1400,10 @@ void mlx_qwen35_forward_batched_verify(
         fflush(stderr);
       }
     }
-    // W6.29 — pick the smallest bucket >= offset + T. The legacy
-    // full-length graph is returned when offset + T exceeds the largest
-    // bucket, when the chosen bucket would exceed the allocated KV cache
-    // width, or when the dispatcher is disabled via env var.
+    // Pick the smallest bucket >= offset + T. The legacy full-length graph is
+    // returned when offset + T exceeds the largest bucket, when the chosen
+    // bucket would exceed the allocated KV cache width, or when the dispatcher
+    // is disabled via env var.
     int bucket_idx = bucket_index_for(g_offset_int + T, cfg.max_kv_len);
     auto& fn = get_or_compile_verify_bucket(bucket_idx, with_tape);
     auto outputs = fn(inputs);
@@ -1474,12 +1445,11 @@ void mlx_qwen35_forward_batched_verify(
     // Advance offset by T (one per token in the batch).
     g_offset_int += T;
 
-    // Stash tape outputs into the per-layer accumulators. The batched
-    // graph emits `[1, T, ...]` natively, so each slot gets a SINGLE
-    // assignment — no `concatenate` loop. The slot lifetime / shape
-    // contract matches the legacy per-step append (which produced
-    // `[1, recorded_steps, ...]` via repeated `concatenate(slot, step)`
-    // on axis 1).
+    // Stash tape outputs into the per-layer accumulators. The batched graph
+    // emits `[1, T, ...]` natively, so each slot gets a SINGLE assignment — no
+    // `concatenate` loop. The slot lifetime / shape contract matches a per-step
+    // append producing `[1, recorded_steps, ...]` via repeated
+    // `concatenate(slot, step)` on axis 1.
     if (with_tape) {
       int extra_base = 3 + cfg.num_layers * 2;
       for (int i = 0; i < cfg.num_layers; i++) {
@@ -1643,8 +1613,8 @@ void mlx_qwen35_forward_batched_verify_argmax_only(
   }
 }
 
-// W6.37 — stochastic MTP verifier sibling that returns compact target sparse
-// rows instead of full verifier logits.
+// Stochastic MTP verifier sibling that returns compact target sparse rows
+// instead of full verifier logits.
 void mlx_qwen35_forward_batched_verify_sparse_target(
     mlx_array* input_ids_ptr,
     mlx_array* embedding_weight_ptr,
@@ -1783,11 +1753,11 @@ void mlx_qwen35_forward_batched_verify_sparse_target(
   }
 }
 
-// Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
-// Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` (populated
-// by the paged adapter through `mlx_qwen35_init_paged`) instead of the
-// BHTD `g_compiled_caches[]`. Linear-attention layers still source
-// state from `g_dense_paged_linear_caches[]`.
+// Paged-pool sibling of `mlx_qwen35_forward_batched_verify`. Reads K/V from
+// `g_dense_k_pools[]` / `g_dense_v_pools[]` (populated by the paged adapter
+// through `mlx_qwen35_init_paged`) instead of the BHTD `g_compiled_caches[]`.
+// Linear-attention layers still source state from
+// `g_dense_paged_linear_caches[]`.
 //
 // Caller MUST construct: `offset_arr` ([1] int32), `block_table`
 // ([1, max_blocks_per_seq] int32), `slot_mapping` ([chunk_size_max]
@@ -1849,12 +1819,12 @@ void mlx_qwen35_forward_batched_verify_paged(
     fflush(stderr);
     return;
   }
-  // Phase 4b — the paged verify graph reads pool / linear-cache layout
-  // from `g_dense_paged_config` (set by `mlx_qwen35_init_paged`). The
-  // BHTD `g_compile_config` is unset when callers reach this FFI from
-  // the paged-MTP gate, so source the dimensions from the paged config
-  // instead. The two configs share an identical layout for the fields
-  // this code reads (`num_layers`, `hidden_size`, `full_attention_interval`).
+  // The paged verify graph reads pool / linear-cache layout from
+  // `g_dense_paged_config` (set by `mlx_qwen35_init_paged`). The BHTD
+  // `g_compile_config` is unset when callers reach this FFI from the paged-MTP
+  // gate, so source the dimensions from the paged config instead. The two
+  // configs share an identical layout for the fields this code reads
+  // (`num_layers`, `hidden_size`, `full_attention_interval`).
   const auto& cfg = g_dense_paged_config;
   int T = depth + 1;
 
@@ -1997,22 +1967,15 @@ void mlx_qwen35_forward_batched_verify_paged(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 follow-up — Eagerly compile the batched verify graph for ALL depths
-// in {1..5} for both `WithTape=false` and `WithTape=true` variants.
+// Eagerly compile the batched verify graph for ALL depths in {1..5} for both
+// `WithTape=false` and `WithTape=true` variants.
 //
-// PRIOR (W6.7): the `static auto fn = mlx::core::compile(...)` initializer
-// in `compiled_verify_batched_{notape,tape}()` fires on first call, so the
-// FIRST verify cycle of each turn pays the MLX trace+compile cost for the
-// depth-D shape it happens to hit. Subsequent prompts within the same
-// process reuse the cached trace, but the first prompt eats the latency
-// on its critical path.
-//
-// NOW: this entry point runs ONE dummy verify forward per (depth, with_tape)
-// pair to force `mlx::core::eval` of the compiled-graph outputs. MLX's
-// internal compile cache keys on input shape — one (depth, with_tape)
-// trace covers every subsequent verify at that same shape. Cost: ~10
-// dummy graph evals at model load; saves first-token latency on the
-// first verify cycle of each prompt.
+// Runs ONE dummy verify forward per (depth, with_tape) pair to force
+// `mlx::core::eval` of the compiled-graph outputs. MLX's internal compile cache
+// keys on input shape — one (depth, with_tape) trace covers every subsequent
+// verify at that same shape. Cost: ~10 dummy graph evals at model load; saves
+// first-token latency on the first verify cycle of each prompt (otherwise the
+// first cycle pays the trace+compile cost on its critical path).
 //
 // State preservation:
 //   - Snapshots `g_compiled_caches[]`, `g_offset_int`, `g_compiled_offset`,
@@ -2049,13 +2012,12 @@ void mlx_qwen35_prewarm_verify_compiled() {
   // all-zero `dummy_ids`, so a single dense bf16 row suffices: `take` of
   // index 0 yields `[T, hidden]` regardless of vocabulary size.
   //
-  // We deliberately do NOT fetch the real `embedding.weight` from
-  // `g_weights`: on quantized-embedding checkpoints that entry is a
-  // PACKED `[vocab, hidden * bits / 32]` table, and `take` + `reshape`
-  // to dense `[1, T, hidden]` would fail (the reason this prewarm
-  // previously crashed on `qwen3.6-27b-nvfp4-mtp`). A dense dummy is
-  // correct for every checkpoint — the real verify path passes its own
-  // dense embedding via the FFI pointer argument.
+  // We deliberately do NOT fetch the real `embedding.weight` from `g_weights`:
+  // on quantized-embedding checkpoints that entry is a PACKED
+  // `[vocab, hidden * bits / 32]` table, and `take` + `reshape` to dense
+  // `[1, T, hidden]` would fail. A dense dummy is correct for every checkpoint
+  // — the real verify path passes its own dense embedding via the FFI pointer
+  // argument.
   array embedding_weight = zeros({1, cfg.hidden_size}, mlx::core::bfloat16);
 
   // Snapshot mutable state so post-prewarm the main path looks untouched.
@@ -2125,24 +2087,22 @@ void mlx_qwen35_prewarm_verify_compiled() {
   };
 
   try {
-    // W6.29 — Prewarm strategy: trace ONLY the bucket the first verify
-    // cycle will hit. With 6 buckets + legacy slot × 5 depths × 2 tape
-    // variants = 70 possible traces, eagerly prewarming all of them at
-    // model load would cost ~75s (~1s per dense forward at depth 5).
-    // Lazy-tracing other buckets shifts that cost to first-use of each
-    // (bucket, depth, tape) combo — typically <0.5s per shape because
-    // the underlying weight load + kernel dispatch is already warm by
-    // the time the larger buckets are hit.
+    // Prewarm strategy: trace ONLY the bucket the first verify cycle will hit.
+    // With 6 buckets + legacy slot × 5 depths × 2 tape variants = 70 possible
+    // traces, eagerly prewarming all of them at model load would cost ~75s
+    // (~1s per dense forward at depth 5). Lazy-tracing other buckets shifts
+    // that cost to first-use of each (bucket, depth, tape) combo — typically
+    // <0.5s per shape because the underlying weight load + kernel dispatch is
+    // already warm by the time the larger buckets are hit.
     //
     // The "first verify cycle bucket" is the one that fits
-    // `g_offset_int + max_depth + 1` — i.e. the post-prefill offset plus
-    // the maximum verify window. Calling `mlx_qwen35_forward_batched_verify`
-    // with `g_offset_int = saved_offset_int` (real prefill offset)
-    // routes through `bucket_index_for(...)` exactly like a real cycle
-    // would, so the trace MLX caches IS the trace the first real cycle
-    // hits. Subsequent prompts at different offsets that don't fit this
-    // bucket re-trace on first use (one-time cost amortised over the
-    // turn).
+    // `g_offset_int + max_depth + 1` — i.e. the post-prefill offset plus the
+    // maximum verify window. Calling `mlx_qwen35_forward_batched_verify` with
+    // `g_offset_int = saved_offset_int` (real prefill offset) routes through
+    // `bucket_index_for(...)` exactly like a real cycle would, so the trace MLX
+    // caches IS the trace the first real cycle hits. Subsequent prompts at
+    // different offsets that don't fit this bucket re-trace on first use
+    // (one-time cost amortised over the turn).
     for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/false);
     for (int d = 1; d <= 5; d++) run_one(d, /*with_tape=*/true);
   } catch (const std::exception& e) {
@@ -2186,16 +2146,14 @@ void mlx_qwen35_eval_token_and_compiled_caches(mlx_array* next_token_ptr) {
   }
 }
 
-// W6.5-resume — same async_eval batch as
-// `mlx_qwen35_eval_token_and_compiled_caches` but also folds an
-// arbitrary `extra` array into the dispatch. Used by the chained-cycles
-// MTP path (`MLX_MTP_CHAINED_CYCLES=1`) at end-of-iteration to fuse the
-// `verify_hidden[K]` slice eval with the next cycle's first draft
-// inputs. Without this, the slice stays lazy until the next-cycle
-// draft graph is built — at which point materializing it forces a
-// mid-cycle Metal command-buffer roundtrip on the chained path that
-// the Step-A bypass doesn't pay (because Step A produces `hidden` and
-// `token` as siblings of a single fused eval).
+// Same async_eval batch as `mlx_qwen35_eval_token_and_compiled_caches` but also
+// folds an arbitrary `extra` array into the dispatch. Used by the
+// chained-cycles MTP path (`MLX_MTP_CHAINED_CYCLES=1`) at end-of-iteration to
+// fuse the `verify_hidden[K]` slice eval with the next cycle's first draft
+// inputs. Without this, the slice stays lazy until the next-cycle draft graph
+// is built — at which point materializing it forces a mid-cycle Metal
+// command-buffer roundtrip on the chained path that the Step-A bypass doesn't
+// pay (Step A produces `hidden` and `token` as siblings of a single fused eval).
 //
 // `extra_ptr` MAY be null, in which case behaviour is identical to
 // `mlx_qwen35_eval_token_and_compiled_caches`.
@@ -2227,18 +2185,16 @@ void mlx_qwen35_compiled_adjust_offset(int delta) {
   g_compiled_offset = array(g_offset_int, mlx::core::int32);
 }
 
-// W6 (MTP) Bug #4 — snapshot the GDN linear-attention caches plus
-// the decode offset. Called by the MTP cycle macro AFTER Step A and
-// BEFORE verify. The snapshot keeps the pre-verify recurrent /
-// conv state alive (MLX arrays are ref-counted; we just bump the
-// refcount via copy construction) while the global continues to
-// mutate inside the verify loop. Restore via
+// MTP — snapshot the GDN linear-attention caches plus the decode offset.
+// Called by the MTP cycle macro AFTER Step A and BEFORE verify. The snapshot
+// keeps the pre-verify recurrent / conv state alive (MLX arrays are
+// ref-counted; copy construction just bumps the refcount) while the global
+// continues to mutate inside the verify loop. Restore via
 // `mlx_qwen35_compiled_restore_linear_caches`.
 //
-// Only linear-attention layer slots are populated; full-attention
-// slots are stored as bf16 zero placeholders so per-layer indexing
-// stays uniform. Idempotent — calling twice overwrites the previous
-// snapshot.
+// Only linear-attention layer slots are populated; full-attention slots are
+// stored as bf16 zero placeholders so per-layer indexing stays uniform.
+// Idempotent — calling twice overwrites the previous snapshot.
 void mlx_qwen35_compiled_snapshot_linear_caches() {
   if (!g_compile_inited) {
     g_linear_snapshot_taken = false;
@@ -2272,13 +2228,12 @@ void mlx_qwen35_compiled_snapshot_linear_caches() {
   }
 }
 
-// W6 (MTP) Bug #4 — restore the GDN linear caches AND the decode
-// offset from the most recent snapshot. Called on verify rejection
-// (any `accepted_drafts < depth`) BEFORE replaying the K accepted
-// drafts via `mlx_qwen35_forward_compiled`. Full-attention K/V slots
-// are intentionally left as-is — their offsets are rewound via the
-// offset restore here, and later writes will overwrite the stale
-// post-verify slots.
+// MTP — restore the GDN linear caches AND the decode offset from the most
+// recent snapshot. Called on verify rejection (any `accepted_drafts < depth`)
+// BEFORE replaying the K accepted drafts via `mlx_qwen35_forward_compiled`.
+// Full-attention K/V slots are intentionally left as-is — their offsets are
+// rewound via the offset restore here, and later writes will overwrite the
+// stale post-verify slots.
 //
 // No-op if no snapshot has been taken since the last reset.
 void mlx_qwen35_compiled_restore_linear_caches() {
@@ -2302,12 +2257,12 @@ void mlx_qwen35_compiled_restore_linear_caches() {
   }
 }
 
-// Phase 4b — paged-pool sibling of `mlx_qwen35_compiled_snapshot_linear_caches`.
-// Captures the pre-verify GDN linear-attention state out of
-// `g_dense_paged_linear_caches` so a partial-accept rollback can
-// restore it. Full-attention slots store bf16 zero placeholders so the
-// per-layer indexing in the snapshot vector matches the cache vector.
-// Idempotent — calling twice overwrites the previous snapshot.
+// Paged-pool sibling of `mlx_qwen35_compiled_snapshot_linear_caches`. Captures
+// the pre-verify GDN linear-attention state out of
+// `g_dense_paged_linear_caches` so a partial-accept rollback can restore it.
+// Full-attention slots store bf16 zero placeholders so the per-layer indexing
+// in the snapshot vector matches the cache vector. Idempotent — calling twice
+// overwrites the previous snapshot.
 void mlx_qwen35_compiled_snapshot_paged_linear_caches() {
   if (!g_dense_paged_inited) {
     g_dense_paged_linear_snapshot_taken = false;
@@ -2342,13 +2297,12 @@ void mlx_qwen35_compiled_snapshot_paged_linear_caches() {
   }
 }
 
-// Phase 4b — restore the paged GDN linear caches from the snapshot.
-// Called on FULL rollback (no draft accepted) BEFORE the next forward.
-// No-op when no snapshot is recorded. The paged-pool full-attention K/V
-// slots are intentionally left as-is — the Rust adapter's block-table
-// cursor rewinds via `rollback_last_tokens`, and the kernel's per-query
-// effective-context derives only from the post-rollback `seq_lens` so
-// stale slots are not read.
+// Restore the paged GDN linear caches from the snapshot. Called on FULL
+// rollback (no draft accepted) BEFORE the next forward. No-op when no snapshot
+// is recorded. The paged-pool full-attention K/V slots are intentionally left
+// as-is — the Rust adapter's block-table cursor rewinds via
+// `rollback_last_tokens`, and the kernel's per-query effective-context derives
+// only from the post-rollback `seq_lens` so stale slots are not read.
 void mlx_qwen35_compiled_restore_paged_linear_caches() {
   if (!g_dense_paged_inited || !g_dense_paged_linear_snapshot_taken) return;
   const auto& cfg = g_dense_paged_config;
@@ -2372,19 +2326,13 @@ void mlx_qwen35_compiled_restore_paged_linear_caches() {
   }
 }
 
-// Phase 4b — partial-accept rollback for paged GDN linear caches.
+// Partial-accept rollback for paged GDN linear caches.
 //
-// Restores the pre-verify snapshot, then re-runs the first
-// `accepted_steps` (= K + 1) verify tokens through the GDN kernel so the
-// linear state matches the accepted prefix. This is the paged sibling of
-// `mlx_qwen35_compiled_tape_replay`; the simpler unrecorded restore is
-// adequate here because B3 will wire B1's tape outputs into the same
-// `g_gdn_*_tape_acc` accumulators (the paged verify graph already emits
-// them under `g_tape_recording_armed`), so a future tape-driven replay
-// becomes a one-FFI extension. For B2 the API surface is fixed; the
-// stub falls back to a snapshot-only restore when called with
-// `accepted_steps <= 0` (full reject) and logs to stderr otherwise — B3
-// supplies the tape-replay execution.
+// Restores the pre-verify snapshot, then re-runs the first `accepted_steps`
+// (= K + 1) verify tokens through the GDN kernel so the linear state matches
+// the accepted prefix. Paged sibling of `mlx_qwen35_compiled_tape_replay`.
+// Falls back to a snapshot-only restore when called with `accepted_steps <= 0`
+// (full reject) and logs to stderr otherwise.
 //
 // Preconditions:
 //   - `mlx_qwen35_compiled_snapshot_paged_linear_caches` has been called
@@ -2428,17 +2376,16 @@ void mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
   mlx_qwen35_compiled_restore_paged_linear_caches();
 }
 
-// W6.6 — Arm tape recording. After this call, `qwen35_decode_fn` routes
-// linear-attention layers through `gdn_pure_fn_with_tape` and appends
-// the per-step `(tape, k, g, qkv)` tensors into the per-layer
-// accumulator vectors. Must be called BEFORE the MTP verify FFI's D+1
-// sequential forwards. Idempotent — clearing accumulators is safe to
-// repeat. No-op if `g_compile_inited` is false.
+// Arm tape recording. After this call, `qwen35_decode_fn` routes
+// linear-attention layers through `gdn_pure_fn_with_tape` and appends the
+// per-step `(tape, k, g, qkv)` tensors into the per-layer accumulator vectors.
+// Must be called BEFORE the MTP verify FFI's D+1 sequential forwards.
+// Idempotent. No-op if `g_compile_inited` is false.
 //
-// The companion `_snapshot_linear_caches` is still required (the
-// rollback path uses the snapshot as the starting state for the replay
-// kernel). This call only turns on tape recording; the snapshot lives
-// in `g_compiled_linear_snapshot`.
+// The companion `_snapshot_linear_caches` is still required (the rollback path
+// uses the snapshot as the starting state for the replay kernel). This call
+// only turns on tape recording; the snapshot lives in
+// `g_compiled_linear_snapshot`.
 void mlx_qwen35_compiled_tape_arm() {
   if (!g_compile_inited) {
     g_tape_recording_armed = false;
@@ -2452,8 +2399,8 @@ void mlx_qwen35_compiled_tape_arm() {
   g_tape_recording_armed = true;
 }
 
-// W6.6 — Disarm tape recording and drop accumulators. Normally reached
-// through `_tape_replay`; explicit calls are cleanup-only. Idempotent.
+// Disarm tape recording and drop accumulators. Normally reached through
+// `_tape_replay`; explicit calls are cleanup-only. Idempotent.
 void mlx_qwen35_compiled_tape_disarm() {
   g_tape_recording_armed = false;
   // Drop refcounts so the lazy MLX graphs can be released. The vectors
@@ -2464,22 +2411,18 @@ void mlx_qwen35_compiled_tape_disarm() {
   for (auto& slot : g_gdn_qkv_tape_acc) slot.reset();
 }
 
-// W6.6 — Restore the GDN linear-attention recurrent + conv states by
-// applying the first `accepted_steps` recorded innovations to the
-// pre-verify snapshot, then advance the decode offset to
-// `snapshot_offset + accepted_steps`.
-//
-// This REPLACES the K+1 main-model forwards the old Bug #4 rollback
-// path ran (`restore_linear_caches` + K `mlx_qwen35_forward_compiled`
-// calls). After this call:
+// Restore the GDN linear-attention recurrent + conv states by applying the
+// first `accepted_steps` recorded innovations to the pre-verify snapshot, then
+// advance the decode offset to `snapshot_offset + accepted_steps`. After this
+// call:
 //   - g_compiled_caches[i*2]   == conv_state at "snapshot + accepted_steps innovations"
 //   - g_compiled_caches[i*2+1] == recurrent_state at "snapshot + accepted_steps innovations"
 //   - g_offset_int             == g_linear_snapshot_offset + accepted_steps
 //
-// Note: `accepted_steps` here is `K + 1` in the MTP cycle terminology
-// (the verify processes `last_committed_id + K accepted drafts` =
-// `K + 1` tokens that survive). The caller computes this from
-// `accepted_drafts + 1` and passes it as `accepted_steps`.
+// `accepted_steps` here is `K + 1` in the MTP cycle terminology (the verify
+// processes `last_committed_id + K accepted drafts` = `K + 1` tokens that
+// survive). The caller computes this from `accepted_drafts + 1` and passes it
+// as `accepted_steps`.
 //
 // Preconditions:
 //   - `_snapshot_linear_caches` has been called for this cycle.
@@ -2599,13 +2542,14 @@ void mlx_qwen35_compiled_tape_replay(int accepted_steps) {
   mlx_qwen35_compiled_tape_disarm();
 }
 
-// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_arm`.
+// Paged variant of `mlx_qwen35_compiled_tape_arm`.
 //
-// The dense BHTD arm function gates on `g_compile_inited`, which is false
-// on pure-paged turns. The paged verify graph (`qwen35_verify_batched_decode_fn_paged<true>`)
-// already writes per-layer tape into the SHARED `g_gdn_*_tape_acc[]`
-// accumulators when `g_tape_recording_armed == true`, so all we need is
-// an arm that flips the flag based on `g_dense_paged_inited` instead.
+// The dense BHTD arm function gates on `g_compile_inited`, which is false on
+// pure-paged turns. The paged verify graph
+// (`qwen35_verify_batched_decode_fn_paged<true>`) already writes per-layer tape
+// into the SHARED `g_gdn_*_tape_acc[]` accumulators when
+// `g_tape_recording_armed == true`, so this just flips the flag based on
+// `g_dense_paged_inited` instead.
 void mlx_qwen35_compiled_tape_arm_paged() {
   if (!g_dense_paged_inited) {
     g_tape_recording_armed = false;
@@ -2619,14 +2563,13 @@ void mlx_qwen35_compiled_tape_arm_paged() {
   g_tape_recording_armed = true;
 }
 
-// Phase 4b B4 — paged variant of `mlx_qwen35_compiled_tape_replay`.
+// Paged variant of `mlx_qwen35_compiled_tape_replay`.
 //
-// Reads the tape from the same shared `g_gdn_*_tape_acc[]` accumulators
-// the BHTD replay reads, but applies the first `accepted_steps`
-// innovations to `g_dense_paged_linear_snapshot[]` and writes the result
-// back into `g_dense_paged_linear_caches[]`. Mirrors
-// `mlx_qwen35_compiled_tape_replay` line-for-line on the GDN side; only
-// the snapshot and target arrays differ.
+// Reads the tape from the same shared `g_gdn_*_tape_acc[]` accumulators the
+// BHTD replay reads, but applies the first `accepted_steps` innovations to
+// `g_dense_paged_linear_snapshot[]` and writes the result back into
+// `g_dense_paged_linear_caches[]`. Mirrors `mlx_qwen35_compiled_tape_replay`
+// line-for-line on the GDN side; only the snapshot and target arrays differ.
 void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
   if (!g_dense_paged_inited) {
     g_tape_recording_armed = false;
@@ -2722,19 +2665,18 @@ void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
   mlx_qwen35_compiled_tape_disarm();
 }
 
-// PR #65 (mtp-reload P1) — invalidate ALL compiled MTP-verify dispatch
-// tables so the next `get_or_compile_verify_*` re-traces against the
-// CURRENT weight registry.
+// Invalidate ALL compiled MTP-verify dispatch tables so the next
+// `get_or_compile_verify_*` re-traces against the CURRENT weight registry.
 //
 // Called by the Rust loaders (`register_weights_with_cpp` /
-// `register_moe_weights_with_cpp`) on EVERY model reload, immediately
-// after `mlx_clear_weights()` and INSIDE the `COMPILED_WEIGHTS_RWLOCK`
-// write critical section, so it is serialized against in-flight
-// compiled reads. Unlike `mlx_qwen35_compiled_reset()` (a PER-TURN
-// reset that deliberately keeps the verify tables for cross-turn reuse),
-// this is a PER-RELOAD invalidation: without it a second same-shape
-// Qwen3.5/3.6 model loaded in the same process would verify speculative
-// tokens with the FIRST model's baked weights (silent corruption).
+// `register_moe_weights_with_cpp`) on EVERY model reload, immediately after
+// `mlx_clear_weights()` and INSIDE the `COMPILED_WEIGHTS_RWLOCK` write critical
+// section, so it is serialized against in-flight compiled reads. Unlike
+// `mlx_qwen35_compiled_reset()` (a PER-TURN reset that deliberately keeps the
+// verify tables for cross-turn reuse), this is a PER-RELOAD invalidation:
+// without it a second same-shape Qwen3.5/3.6 model loaded in the same process
+// would verify speculative tokens with the FIRST model's baked weights (silent
+// corruption).
 //
 // See `invalidate_verify_compiled_tables()` for the slot-nulling →
 // lazy-re-trace mechanism and its thread-safety rationale. That helper also
@@ -2746,41 +2688,38 @@ void mlx_qwen35_invalidate_compiled_graphs() {
   mlx_qwen35_mtp_invalidate_compiled_graphs();
 }
 
-// Reset BOTH the legacy flat compiled state AND the Phase 5 piece 1
-// paged-path globals. Keeping these symmetric is required because
-// `mlx_qwen35_init_paged` flips `g_dense_paged_inited` to true
-// independently of `g_compile_inited`; without clearing the paged side
-// here, a later `mlx_qwen35_forward_paged()` would pass the init guard
-// and reuse stale KV pools / scales / linear caches / offset from a
-// previous request or model. Mirrors `mlx_qwen35_moe_reset` from the
-// MoE path.
+// Reset BOTH the flat compiled state AND the paged-path globals. Keeping these
+// symmetric is required because `mlx_qwen35_init_paged` flips
+// `g_dense_paged_inited` to true independently of `g_compile_inited`; without
+// clearing the paged side here, a later `mlx_qwen35_forward_paged()` would pass
+// the init guard and reuse stale KV pools / scales / linear caches / offset
+// from a previous request or model. Mirrors `mlx_qwen35_moe_reset`.
 void mlx_qwen35_compiled_reset() {
-  // Legacy flat-path compiled globals.
+  // Flat-path compiled globals.
   g_compiled_caches.clear();
   g_compiled_offset = std::nullopt;
   g_offset_int = 0;
   g_compile_inited = false;
 
-  // W6 (MTP) — clear the stashed last-hidden so a subsequent reset →
-  // re-init turn doesn't see a stale handle whose underlying buffer
-  // is no longer valid.
+  // Clear the stashed last-hidden so a subsequent reset → re-init turn doesn't
+  // see a stale handle whose underlying buffer is no longer valid.
   g_last_hidden = std::nullopt;
 
-  // W6 (MTP) Bug #4 — drop any pending linear-cache snapshot so it
-  // can't leak across turns / model loads.
+  // Drop any pending linear-cache snapshot so it can't leak across turns /
+  // model loads.
   g_compiled_linear_snapshot.clear();
   g_linear_snapshot_offset = 0;
   g_linear_snapshot_taken = false;
 
-  // W6.6 — drop any pending tape recording so a stale armed flag /
-  // half-recorded accumulator can't leak across model reloads.
+  // Drop any pending tape recording so a stale armed flag / half-recorded
+  // accumulator can't leak across model reloads.
   g_tape_recording_armed = false;
   g_gdn_tape_acc.clear();
   g_gdn_k_tape_acc.clear();
   g_gdn_g_tape_acc.clear();
   g_gdn_qkv_tape_acc.clear();
 
-  // Phase 5 piece 1 paged-path globals.
+  // Paged-path globals.
   g_dense_paged_config = CompileConfig{};
   g_dense_k_pools.clear();
   g_dense_v_pools.clear();
@@ -2793,16 +2732,16 @@ void mlx_qwen35_compiled_reset() {
   g_dense_paged_linear_snapshot.clear();
   g_dense_paged_linear_snapshot_taken = false;
 
-  // Phase 4b — drop the paged last-hidden stash so cross-turn handles
-  // can't outlive the underlying compile cache.
+  // Drop the paged last-hidden stash so cross-turn handles can't outlive the
+  // underlying compile cache.
   g_last_hidden_paged = std::nullopt;
 }
 
-// W6 (MTP) — export a heap-allocated deep copy of the post-final-norm
-// hidden state of the last decoded token, captured by the most recent
-// `mlx_qwen35_forward_compiled` invocation. Returns nullptr if no
-// forward has run since the last reset / the stash is unpopulated.
-// Caller owns the returned `mlx_array*` (use `mlx_array_delete`).
+// Export a heap-allocated deep copy of the post-final-norm hidden state of the
+// last decoded token, captured by the most recent `mlx_qwen35_forward_compiled`
+// invocation. Returns nullptr if no forward has run since the last reset / the
+// stash is unpopulated. Caller owns the returned `mlx_array*` (use
+// `mlx_array_delete`).
 //
 // The returned handle is a lazy MLX array whose graph references the
 // final_norm output; the caller MUST `eval()` it before reading any
@@ -2828,10 +2767,10 @@ void mlx_qwen35_export_last_hidden(mlx_array** out) {
   }
 }
 
-// Phase 4b — paged-path sibling of `mlx_qwen35_export_last_hidden`.
-// Exports a heap-allocated deep copy of the post-final-norm hidden
-// captured by the most recent `mlx_qwen35_forward_paged` invocation.
-// Returns nullptr if no paged forward has run since the last reset.
+// Paged-path sibling of `mlx_qwen35_export_last_hidden`. Exports a
+// heap-allocated deep copy of the post-final-norm hidden captured by the most
+// recent `mlx_qwen35_forward_paged` invocation. Returns nullptr if no paged
+// forward has run since the last reset.
 //
 // Lifetime contract: the returned handle is a lazy MLX array whose graph
 // references the paged decode's final_norm output. The caller MUST eval
@@ -2872,39 +2811,39 @@ int mlx_qwen35_get_cache_offset() {
   return g_offset_int;
 }
 
-// Exposed for `mlx_qwen35_mtp_compiled_init_from_main` so the MTP init
-// can fail loudly if the main path hasn't been initialised yet. Without
-// this guard, `mlx_qwen35_get_cache_offset()` silently returns 0 from a
-// fresh `g_offset_int`, and the MTP path would build attention masks
-// against a phantom prefix.
+// Exposed for `mlx_qwen35_mtp_compiled_init_from_main` so the MTP init can fail
+// loudly if the main path hasn't been initialised yet. Without this guard,
+// `mlx_qwen35_get_cache_offset()` silently returns 0 from a fresh
+// `g_offset_int`, and the MTP path would build attention masks against a
+// phantom prefix.
 //
-// Phase 4b: the paged dense path inits via `mlx_qwen35_init_paged`
-// (which sets `g_dense_paged_inited`) instead of
-// `mlx_qwen35_compiled_init_from_prefill`. Both flags signal "weights
-// have been registered and the main forward is ready to run for this
-// model"; either is sufficient for the MTP init precondition.
+// The paged dense path inits via `mlx_qwen35_init_paged` (which sets
+// `g_dense_paged_inited`) instead of `mlx_qwen35_compiled_init_from_prefill`.
+// Both flags signal "weights have been registered and the main forward is
+// ready to run for this model"; either is sufficient for the MTP init
+// precondition.
 int mlx_qwen35_is_compile_inited() {
   return (g_compile_inited || g_dense_paged_inited) ? 1 : 0;
 }
 
-// Test-only helper: forcibly mark the main compiled path as initialised
-// (or not) without going through the full `init_from_prefill` flow that
-// requires real per-layer KV cache arrays. Used by W5 MTP FFI smoke
-// tests so they can satisfy the new `is_compile_inited` precondition in
-// `mlx_qwen35_mtp_compiled_init_from_main` without standing up a full
-// dense decoder cache. Production code MUST NOT call this — use
+// Test-only helper: forcibly mark the main compiled path as initialised (or
+// not) without going through the full `init_from_prefill` flow that requires
+// real per-layer KV cache arrays. Used by MTP FFI smoke tests so they can
+// satisfy the `is_compile_inited` precondition in
+// `mlx_qwen35_mtp_compiled_init_from_main` without standing up a full dense
+// decoder cache. Production code MUST NOT call this — use
 // `mlx_qwen35_compiled_init_from_prefill` instead.
 void mlx_qwen35_compiled_test_force_inited(int inited) {
   g_compile_inited = (inited != 0);
 }
 
-// Phase 4b test-only helper. Stands up `g_dense_paged_linear_caches[]`
+// Test-only helper. Stands up `g_dense_paged_linear_caches[]`
 // (size = num_layers * 2) populated with bf16 scalars chosen so the
 // snapshot/restore round-trip is observable (slot value = layer * 100 +
 // position * 2 + slot_offset, packed into a scalar bf16). Sets
-// `g_dense_paged_inited = true` and `g_dense_paged_config` to a minimal
-// shape that satisfies `dense_paged_is_linear_layer`. PRODUCTION CODE
-// MUST NOT CALL THIS — use `mlx_qwen35_init_paged`.
+// `g_dense_paged_inited = true` and `g_dense_paged_config` to a minimal shape
+// that satisfies `dense_paged_is_linear_layer`. PRODUCTION CODE MUST NOT CALL
+// THIS — use `mlx_qwen35_init_paged`.
 void mlx_qwen35_compiled_test_force_paged_linear_caches(
     int num_layers, int full_attention_interval) {
   g_dense_paged_config = CompileConfig{};
@@ -2922,11 +2861,11 @@ void mlx_qwen35_compiled_test_force_paged_linear_caches(
   g_dense_paged_inited = true;
 }
 
-// Phase 4b test-only inspector: read the scalar bf16 value at slot
-// `slot_idx` of `g_dense_paged_linear_caches`. Returns NaN if the slot
-// is out of range or the array shape isn't a scalar. Caller MUST have
-// previously called `mlx_qwen35_compiled_test_force_paged_linear_caches`
-// (or hold paged state from a real init).
+// Test-only inspector: read the scalar bf16 value at slot `slot_idx` of
+// `g_dense_paged_linear_caches`. Returns NaN if the slot is out of range or the
+// array shape isn't a scalar. Caller MUST have previously called
+// `mlx_qwen35_compiled_test_force_paged_linear_caches` (or hold paged state
+// from a real init).
 float mlx_qwen35_compiled_test_read_paged_linear_slot(int slot_idx) {
   if (slot_idx < 0 || slot_idx >= (int)g_dense_paged_linear_caches.size()) {
     return std::numeric_limits<float>::quiet_NaN();
@@ -2942,10 +2881,9 @@ float mlx_qwen35_compiled_test_read_paged_linear_slot(int slot_idx) {
   }
 }
 
-// Phase 4b test-only mutator: replace slot `slot_idx` with a fresh
-// scalar bf16 of `value`. Used by tests to simulate the paged-verify
-// FFI's in-place linear-cache mutation without standing up a real
-// verify forward.
+// Test-only mutator: replace slot `slot_idx` with a fresh scalar bf16 of
+// `value`. Used by tests to simulate the paged-verify FFI's in-place
+// linear-cache mutation without standing up a real verify forward.
 void mlx_qwen35_compiled_test_write_paged_linear_slot(int slot_idx, float value) {
   if (slot_idx < 0 || slot_idx >= (int)g_dense_paged_linear_caches.size()) return;
   g_dense_paged_linear_caches[slot_idx] = array(value, mlx::core::bfloat16);
@@ -2973,12 +2911,12 @@ int mlx_qwen35_get_paged_cache_offset() {
 }
 
 // =============================================================================
-// Phase 5 piece 1: paged Dense forward FFI.
+// Paged Dense forward FFI.
 //
-// These coexist alongside `mlx_qwen35_forward_compiled` /
-// `_compiled_init_from_prefill` while the Rust dispatcher decides
-// per-turn which graph to run. A single `mlx_qwen35_compiled_reset()`
-// wipes BOTH graphs' state.
+// Coexists alongside `mlx_qwen35_forward_compiled` /
+// `_compiled_init_from_prefill` while the Rust dispatcher decides per-turn
+// which graph to run. A single `mlx_qwen35_compiled_reset()` wipes BOTH graphs'
+// state.
 // =============================================================================
 
 // Initialize the paged Dense forward graph from per-layer pool / scale
@@ -2987,12 +2925,11 @@ int mlx_qwen35_get_paged_cache_offset() {
 // Layout contract (mirrors `mlx_qwen35_moe_init_paged`):
 //   - `k_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
 //     head_size/x_pack=8, block_size=16, x_pack=8]` bf16 array view.
-//     Phase 5 piece 1 hard-codes bf16 (`KvDtype::Bf16`) and
-//     `block_size = 16`.
+//     Hard-coded bf16 (`KvDtype::Bf16`) and `block_size = 16`.
 //   - `v_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
 //     head_size, block_size=16]` bf16 array view.
 //   - `k_scale_handles[i]` / `v_scale_handles[i]`: pointer to `[1]` f32
-//     scale placeholders (1.0 in Phase 5; FP8 calibration in Phase 10).
+//     scale placeholders (currently 1.0; FP8 calibration is future work).
 //   - For linear-attention layers (those satisfying
 //     `(i + 1) % full_attention_interval != 0`), the corresponding pool
 //     / scale slots may be null — they're stored as bf16 zero
@@ -3180,11 +3117,11 @@ int32_t mlx_qwen35_init_paged(
 // the Rust adapter's `build_paged_attention_inputs`; the per-layer
 // pool/scale globals come from `mlx_qwen35_init_paged`.
 //
-// PHASE 5 PIECE 1 CONTRACT: This FFI is decode-only — `input_ids` MUST
-// have exactly one element and `slot_mapping` MUST be `[1]`. Chunked
-// prefill (multi-token) is reserved for later phases. The contract is
-// enforced explicitly: violating it returns null logits without
-// modifying global state, so the Rust caller can fall back cleanly.
+// CONTRACT: This FFI is decode-only — `input_ids` MUST have exactly one element
+// and `slot_mapping` MUST be `[1]`. Chunked prefill (multi-token) is not
+// supported. The contract is enforced explicitly: violating it returns null
+// logits without modifying global state, so the Rust caller can fall back
+// cleanly.
 //
 // `output_logits` receives a heap-allocated `mlx_array*` (caller owns).
 // `cache_offset_out` receives the post-step offset (== prefill_offset
@@ -3223,13 +3160,12 @@ void mlx_qwen35_forward_paged(
     auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
     auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
 
-    // Phase 5 piece 1 contract: single-token decode only.
+    // Contract: single-token decode only.
     //
     // `attn_for_compile_paged` builds new_k / new_v with shape
-    // `[1, num_kv_heads, head_size]` and feeds `slot_mapping` directly
-    // into `paged_kv_write`, which requires
-    // `slot_mapping.shape(0) == new_k.shape(0)`. Multi-token (B > 1)
-    // is reserved for later phases.
+    // `[1, num_kv_heads, head_size]` and feeds `slot_mapping` directly into
+    // `paged_kv_write`, which requires `slot_mapping.shape(0) == new_k.shape(0)`.
+    // Multi-token (B > 1) is not supported.
     if (input_ids.size() != 1) {
       fprintf(stderr,
               "[MLX] mlx_qwen35_forward_paged: phase 5 piece 1 contract "

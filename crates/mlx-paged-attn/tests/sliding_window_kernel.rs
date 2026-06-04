@@ -1,6 +1,6 @@
-//! Phase 7 sliding-window kernel test.
+//! Sliding-window kernel test.
 //!
-//! End-to-end check that the new `sliding_window` parameter on the
+//! End-to-end check that the `sliding_window` parameter on the
 //! `paged_attention` Metal kernel actually masks K positions older than
 //! `context_len - sliding_window` from the softmax computation.
 //!
@@ -395,7 +395,7 @@ fn check_sliding_window(window: i32, label: &str) {
 }
 
 /// Sanity check: with sliding_window=0 the kernel must reproduce the
-/// pre-Phase-7 full-context behaviour.
+/// full-context (unmasked) behaviour.
 #[test]
 fn sliding_window_zero_matches_full_context() {
     check_sliding_window(0, "sliding_window_zero_matches_full_context");

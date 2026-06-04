@@ -1,4 +1,4 @@
-//! Integration test for `LayerKVPool::{key,value}_cache_array_raw` (Phase 3).
+//! Integration test for `LayerKVPool::{key,value}_cache_array_raw`.
 //!
 //! Verifies the zero-copy MLX-array view shape, dtype, and round-trip
 //! behaviour against a real `LayerKVPool` allocation. Skipped on no-Metal
@@ -127,13 +127,12 @@ fn out_of_range_layer_errors() {
     );
 }
 
-/// LIFETIME FIX (Phase 3 review finding 1): the FFI helper
-/// `mlx_array_from_metal_buffer_view` retains the underlying
-/// `MTL::Buffer*` and the array's deleter releases it on drop, so the
-/// array view is INDEPENDENT of the original `metal::Buffer` holder
-/// lifetime. Previously the deleter was a no-op and dropping the pool
-/// while keeping the array view would leave the array pointing at a
-/// freed Metal buffer (GPU use-after-free).
+/// LIFETIME: the FFI helper `mlx_array_from_metal_buffer_view` retains
+/// the underlying `MTL::Buffer*` and the array's deleter releases it on
+/// drop, so the array view is INDEPENDENT of the original `metal::Buffer`
+/// holder lifetime. A no-op deleter would instead leave the array
+/// pointing at a freed Metal buffer (GPU use-after-free) once the pool
+/// drops.
 ///
 /// This test takes a view, drops the pool, evaluates the view by
 /// running an MLX op against it (`astype` + `eval` materializes the

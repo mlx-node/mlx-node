@@ -72,30 +72,29 @@ static bool g_moe_inited = false;
 static std::vector<LayerQuantInfo> g_layer_quant;     // per-layer MoE quant info
 static std::vector<DenseMLPQuantInfo> g_dense_quant;  // per-layer dense MLP quant info
 
-// W6 MoE (MTP) — last post-final-norm hidden of the LAST committed token,
+// MTP — last post-final-norm hidden of the LAST committed token,
 // stashed at the LM-head boundary inside `moe_compiled_decode_fn` BEFORE
 // the `lm_head` linear runs. Shape is `[B, hidden_size]` after the
-// per-row final_norm produces (decode batch is `[1, 1]` → `[1, hidden]`).
-// The W6 MoE MTP seeding path consumes this via
+// per-row final_norm (decode batch is `[1, 1]` → `[1, hidden]`).
+// The MTP seeding path consumes this via
 // `mlx_qwen35_moe_export_last_hidden` to get the first draft step's
 // `prev_hidden` without re-running the main MoE forward.
 //
 // Cleared on `mlx_qwen35_moe_reset` so cross-turn stale handles never
-// leak. The C++ side keeps a `std::optional<array>` so we can
-// distinguish "never populated" from "populated with zeros".
+// leak. The `std::optional<array>` distinguishes "never populated" from
+// "populated with zeros".
 static std::optional<array> g_moe_last_hidden;
 
-// W6 MoE (MTP) Bug #4 fix — snapshot of the GDN linear-attention
-// caches (conv_state + recurrent_state) plus the decode offset taken
-// BEFORE the verify FFI runs its D+1 sequential MoE forwards. The
-// verify loop mutates `g_moe_caches` in place; for linear-attention
-// layers the recurrent / conv state advances through D+1 tokens that
-// may or may not all be accepted. On rejection we restore this
-// snapshot so the linear state matches the pre-verify "after Step A"
-// state; the caller then replays exactly K accepted drafts via the
-// main MoE forward FFI to bring the linear state forward through the
-// committed drafts only. Mirrors the dense-path snapshot
-// (`g_compiled_linear_snapshot` in mlx_qwen35.cpp).
+// MTP — snapshot of the GDN linear-attention caches (conv_state +
+// recurrent_state) plus the decode offset taken BEFORE the verify FFI
+// runs its D+1 sequential MoE forwards. The verify loop mutates
+// `g_moe_caches` in place; for linear-attention layers the recurrent /
+// conv state advances through D+1 tokens that may or may not all be
+// accepted. On rejection we restore this snapshot so the linear state
+// matches the pre-verify "after Step A" state; the caller then replays
+// exactly K accepted drafts via the main MoE forward FFI to bring the
+// linear state forward through the committed drafts only. Mirrors the
+// dense-path snapshot (`g_compiled_linear_snapshot` in mlx_qwen35.cpp).
 //
 // Cleared on `mlx_qwen35_moe_reset`.
 static std::vector<array> g_moe_linear_snapshot;
@@ -103,15 +102,13 @@ static int g_moe_linear_snapshot_offset = 0;
 static bool g_moe_linear_snapshot_taken = false;
 
 // =====================================================================
-// Phase 4 piece 1: paged-decode globals.
+// Paged-decode globals.
 //
 // Independent from the flat-path globals above so both compile graphs can
-// coexist while piece 2 wires the Rust caller. Sized at init-time from
-// the active `MoeConfig.num_layers`.
+// coexist. Sized at init-time from the active `MoeConfig.num_layers`.
 //
-// `g_paged_inited` gates the new `mlx_qwen35_moe_forward_paged` FFI. Until
-// piece 2 swaps Rust callers over, `mlx_qwen35_moe_init_paged` is the only
-// way for any of these to flip true.
+// `g_paged_inited` gates the `mlx_qwen35_moe_forward_paged` FFI;
+// `mlx_qwen35_moe_init_paged` flips it true.
 //
 // Layout (size = num_layers; one entry per layer indexed by `layer_idx`):
 //   - g_k_pools / g_v_pools / g_k_scales / g_v_scales: meaningful only for
@@ -559,14 +556,12 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
 
   // Final norm + LM head
   h = fast::rms_norm(h, get_weight("final_norm.weight"), cfg.rms_norm_eps);
-  // W6 MoE (MTP) — emit the post-final-norm hidden of the last decoded
-  // token alongside logits so `mlx_qwen35_moe_forward` can stash it
-  // into `g_moe_last_hidden`. Unlike the dense flat path (which calls
-  // `qwen35_decode_fn` directly and can assign a global from the body),
-  // MoE wraps this function in `mlx::core::compile`, so any global
-  // assignment inside the body would only fire at trace time. Returning
-  // the hidden as an extra output threads it through the compiled
-  // graph on every call. Shape after the per-row final_norm is
+  // MTP — emit the post-final-norm hidden of the last decoded token
+  // alongside logits so `mlx_qwen35_moe_forward` can stash it into
+  // `g_moe_last_hidden`. This function is wrapped in `mlx::core::compile`,
+  // so a global assignment inside the body would only fire at trace time;
+  // returning the hidden as an extra output threads it through the
+  // compiled graph on every call. Shape after the per-row final_norm is
   // `[1, hidden_size]` for the flat-path decode (batch=1, single token).
   array last_hidden = h;
   if (cfg.tie_word_embeddings) {
@@ -592,12 +587,12 @@ static std::vector<array> moe_compiled_decode_fn(const std::vector<array>& input
 // compiled bodies share `std::vector<array>(const std::vector<array>&)`.
 using MoeCompiledFn = std::function<std::vector<array>(const std::vector<array>&)>;
 
-// PR #65 (mtp-reload P1) — resettable file-scope globals. These compiled MoE
-// graphs read expert + attention weights via `get_weight(...)` INSIDE the
-// traced closure, so `mlx::core::compile(...)` bakes the captured weight
-// arrays into a process-lifetime cache. On a model RELOAD they would be
-// stale, so a second same-shape model would decode/verify with the FIRST
-// model's weights (silent corruption). The slots start empty and are lazily
+// Resettable file-scope globals. These compiled MoE graphs read expert +
+// attention weights via `get_weight(...)` INSIDE the traced closure, so
+// `mlx::core::compile(...)` bakes the captured weight arrays into a
+// process-lifetime cache. On a model RELOAD they would be stale, so a
+// second same-shape model would decode/verify with the FIRST model's
+// weights (silent corruption). The slots start empty and are lazily
 // assigned `compile(...)` on first call (on the inference thread, under the
 // Rust `COMPILED_WEIGHTS_RWLOCK.read()`); `mlx_qwen35_moe_invalidate_compiled_graphs()`
 // nulls them under the write lock so the next call re-traces against the live
@@ -618,7 +613,7 @@ static MoeCompiledFn& compiled_moe_decode() {
 }
 
 // =====================================================================
-// Paged MoE decode function — Phase 4 piece 1.
+// Paged MoE decode function.
 //
 // Mirrors `moe_compiled_decode_fn` structurally but routes full-attention
 // layers through `attn_for_compile_paged` (paged_kv_write + paged_attention)
@@ -673,7 +668,7 @@ static std::vector<array> moe_compiled_decode_fn_paged(const std::vector<array>&
   auto num_valid_blocks = inputs[5];
   auto seq_lens         = inputs[6];
 
-  // Phase 4 piece 1 hard-coded contract.
+  // Hard-coded contract.
   constexpr int BLOCK_SIZE = 16;
 
   constexpr int kHeader = 7;
@@ -753,12 +748,11 @@ static std::vector<array> moe_compiled_decode_fn_paged(const std::vector<array>&
 }
 
 // =====================================================================
-// W6.7 — MoE batched verify decode graph.
+// MoE batched verify decode graph.
 //
 // Direct MoE mirror of `qwen35_verify_batched_decode_fn<false>` in
-// `mlx_qwen35.cpp` (the MoE path doesn't ship W6.6 tape-replay yet — it
-// stays out of scope, matching the W6.6 commit body). One forward over
-// `T = depth + 1` tokens replacing the prior D+1 sequential
+// `mlx_qwen35.cpp` (the MoE path doesn't ship tape-replay). One forward
+// over `T = depth + 1` tokens replacing D+1 sequential
 // `mlx_qwen35_moe_forward` calls.
 //
 // Input vector layout (matches the per-step MoE graph plus the 3D h):
@@ -875,8 +869,7 @@ static std::vector<array> moe_verify_batched_decode_fn(
 
 // Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
 // on reload — see the `g_moe_decode_compiled` declaration above. This is the
-// MoE MTP-verify graph (the explicit PR #65 P1, sibling of the dense bucket
-// tables that ARE invalidated by `mlx_qwen35_invalidate_compiled_graphs`).
+// MoE MTP-verify graph.
 static MoeCompiledFn& compiled_moe_verify_batched() {
   if (!g_moe_verify_batched_compiled) {
     g_moe_verify_batched_compiled =
@@ -1089,9 +1082,8 @@ void mlx_qwen35_moe_forward(
         : compiled_moe_decode()(fn_inputs);
 
     // Extract outputs: [logits, new_offset, last_hidden, new_caches...].
-    // W6 MoE (MTP) introduced `last_hidden` at index 2 so caches now
-    // start at index 3. The hidden is stashed for
-    // `mlx_qwen35_moe_export_last_hidden`; non-MTP callers pay nothing
+    // `last_hidden` is at index 2 (caches start at index 3); stashed for
+    // `mlx_qwen35_moe_export_last_hidden`. Non-MTP callers pay nothing
     // beyond one extra array copy in the result vector.
     const size_t expected_outputs = 3 + static_cast<size_t>(cfg.num_layers) * 2;
     if (outputs.size() != expected_outputs) {
@@ -1125,14 +1117,13 @@ void mlx_qwen35_moe_forward(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 — MoE batched verify forward (MoE twin of
+// MoE batched verify forward (MoE twin of
 // `mlx_qwen35_forward_batched_verify`).
 //
-// Runs ONE compiled forward over `T = depth + 1` tokens, replacing the prior
-// D+1 sequential `mlx_qwen35_moe_forward` calls performed inside the per-
-// depth MoE verify closure. Emits `[1, T, vocab]` logits + `[1, T, hidden]`
-// post-final-norm hiddens in one dispatch. Does NOT support W6.6 tape-replay
-// (MoE tape-replay is deferred).
+// Runs ONE compiled forward over `T = depth + 1` tokens, replacing D+1
+// sequential `mlx_qwen35_moe_forward` calls performed inside the per-depth
+// MoE verify closure. Emits `[1, T, vocab]` logits + `[1, T, hidden]`
+// post-final-norm hiddens in one dispatch. Does NOT support tape-replay.
 //
 // Inputs:
 //   - input_ids:        `[1, T]` int32 tokens (T = depth + 1).
@@ -1253,19 +1244,16 @@ void mlx_qwen35_moe_forward_batched_verify(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 follow-up — Eagerly compile the MoE batched verify graph for ALL depths
-// in {1..5}. MoE has only ONE variant (no tape-replay — W6.6 deferred for MoE)
-// so this prewarms 5 graph shapes total.
+// Eagerly compile the MoE batched verify graph for ALL depths in {1..5}.
+// MoE has only ONE variant (no tape-replay) so this prewarms 5 graph
+// shapes total.
 //
-// PRIOR (W6.7): `compiled_moe_verify_batched()` lazily compiles its graph on
-// first call (now a resettable file-scope global; previously a function-local
-// static — same fire-on-first-call timing), so the first verify cycle of each
-// MoE prompt pays the trace+compile cost for its depth-D shape.
-//
-// NOW: this entry point runs ONE dummy verify forward per depth to force
-// `mlx::core::eval` of the compiled-graph outputs, populating MLX's
-// internal shape-keyed compile cache. Subsequent verifies at the same
-// shape hit the cache.
+// `compiled_moe_verify_batched()` lazily compiles its graph on first call,
+// so without prewarm the first verify cycle of each MoE prompt pays the
+// trace+compile cost for its depth-D shape. This entry point runs ONE
+// dummy verify forward per depth to force `mlx::core::eval` of the
+// compiled-graph outputs, populating MLX's internal shape-keyed compile
+// cache so subsequent verifies at the same shape hit the cache.
 //
 // State preservation:
 //   - Snapshots `g_moe_caches[]` and `g_moe_offset_int` before any dummy
@@ -1392,10 +1380,10 @@ void mlx_qwen35_moe_eval_token_and_caches(mlx_array* next_token_ptr) {
   }
 }
 
-// W6.5-resume — same as `mlx_qwen35_moe_eval_token_and_caches` but
-// also folds an arbitrary `extra` array into the async_eval dispatch.
-// Used by the chained-cycles MTP path on the MoE twin to fuse the
-// `verify_hidden[K]` slice with the next-cycle draft eval. Mirrors
+// Same as `mlx_qwen35_moe_eval_token_and_caches` but also folds an
+// arbitrary `extra` array into the async_eval dispatch. Used by the
+// chained-cycles MTP path on the MoE twin to fuse the `verify_hidden[K]`
+// slice with the next-cycle draft eval. Mirrors
 // `mlx_qwen35_eval_token_caches_and_extra` on the dense side; see
 // that comment block for the full rationale.
 //
@@ -1439,15 +1427,14 @@ void mlx_qwen35_moe_eval_token_caches_and_extra(
   }
 }
 
-// Reset MoE state — clears BOTH the legacy flat globals AND the
-// Phase 4 piece 1 paged globals. Keeping these symmetric is required
-// because `mlx_qwen35_moe_init_paged` flips `g_paged_inited` to true
-// independently of `g_moe_inited`; without clearing the paged side here,
-// a later `mlx_qwen35_moe_forward_paged()` would pass the init guard
-// and reuse stale KV pools / scales / linear caches / offset from a
-// previous request or model.
+// Reset MoE state — clears BOTH the flat globals AND the paged globals.
+// Keeping these symmetric is required because `mlx_qwen35_moe_init_paged`
+// flips `g_paged_inited` to true independently of `g_moe_inited`; without
+// clearing the paged side here, a later `mlx_qwen35_moe_forward_paged()`
+// would pass the init guard and reuse stale KV pools / scales / linear
+// caches / offset from a previous request or model.
 void mlx_qwen35_moe_reset() {
-  // Legacy flat-path globals.
+  // Flat-path globals.
   g_moe_caches.clear();
   g_moe_offset_int = 0;
   g_moe_inited = false;
@@ -1455,18 +1442,18 @@ void mlx_qwen35_moe_reset() {
   g_dense_quant.clear();
   g_weight_transposes_3d.clear();
 
-  // W6 MoE (MTP) — clear the stashed last-hidden so a subsequent reset →
-  // re-init turn doesn't see a stale handle whose underlying buffer is
-  // no longer valid.
+  // MTP — clear the stashed last-hidden so a subsequent reset → re-init
+  // turn doesn't see a stale handle whose underlying buffer is no longer
+  // valid.
   g_moe_last_hidden = std::nullopt;
 
-  // W6 MoE (MTP) Bug #4 — drop any pending linear-cache snapshot so it
-  // can't leak across turns / model loads.
+  // MTP — drop any pending linear-cache snapshot so it can't leak across
+  // turns / model loads.
   g_moe_linear_snapshot.clear();
   g_moe_linear_snapshot_offset = 0;
   g_moe_linear_snapshot_taken = false;
 
-  // Phase 4 piece 1 paged-path globals.
+  // Paged-path globals.
   g_paged_config = MoeConfig{};
   g_k_pools.clear();
   g_v_pools.clear();
@@ -1477,9 +1464,9 @@ void mlx_qwen35_moe_reset() {
   g_paged_inited = false;
 }
 
-// W6 MoE (MTP) — export a heap-allocated deep copy of the
-// post-final-norm hidden state of the last decoded token, captured by
-// the most recent `mlx_qwen35_moe_forward` invocation. Returns nullptr
+// MTP — export a heap-allocated deep copy of the post-final-norm hidden
+// state of the last decoded token, captured by the most recent
+// `mlx_qwen35_moe_forward` invocation. Returns nullptr
 // if no forward has run since the last reset / the stash is
 // unpopulated. Caller owns the returned `mlx_array*`
 // (use `mlx_array_delete`).
@@ -1562,10 +1549,9 @@ void mlx_qwen35_moe_adjust_offset(int delta) {
   g_moe_offset_int += delta;
 }
 
-// W6 MoE (MTP) Bug #4 — snapshot the GDN linear-attention caches
-// plus the decode offset. Mirrors the dense-path
-// `mlx_qwen35_compiled_snapshot_linear_caches`. Called by the MTP
-// cycle macro AFTER Step A and BEFORE verify.
+// MTP — snapshot the GDN linear-attention caches plus the decode offset.
+// Mirrors the dense-path `mlx_qwen35_compiled_snapshot_linear_caches`.
+// Called by the MTP cycle macro AFTER Step A and BEFORE verify.
 //
 // Only linear-attention layer slots are populated; full-attention
 // slots are stored as bf16 zero placeholders so per-layer indexing
@@ -1603,8 +1589,8 @@ void mlx_qwen35_moe_compiled_snapshot_linear_caches() {
   }
 }
 
-// W6 MoE (MTP) Bug #4 — restore the GDN linear caches AND the
-// decode offset from the most recent snapshot. Mirrors the dense-path
+// MTP — restore the GDN linear caches AND the decode offset from the most
+// recent snapshot. Mirrors the dense-path
 // `mlx_qwen35_compiled_restore_linear_caches`. Called on rejection
 // before replaying K accepted drafts via the main MoE forward FFI.
 //
@@ -1637,7 +1623,7 @@ int mlx_qwen35_moe_is_compile_inited() {
 
 // Test-only helper: forcibly mark the main MoE compiled path as initialised
 // (or not) without going through the full `init_from_prefill` flow that
-// requires real per-layer KV cache arrays. Used by the W5 MoE MTP FFI smoke
+// requires real per-layer KV cache arrays. Used by the MoE MTP FFI smoke
 // tests in `crates/mlx-core/src/models/qwen3_5_moe/mtp.rs` so they can
 // satisfy the new `is_compile_inited` precondition in
 // `mlx_qwen35_moe_mtp_compiled_init_from_main` without standing up a full
@@ -1648,10 +1634,9 @@ void mlx_qwen35_moe_compiled_test_force_inited(int inited) {
 }
 
 // =============================================================================
-// Phase 4 piece 1: paged forward FFI.
+// Paged forward FFI.
 //
-// These coexist alongside `mlx_qwen35_moe_forward` / `_init_from_prefill`
-// while piece 2 swaps the Rust callers. Piece 3 deletes the legacy pair.
+// Coexists alongside `mlx_qwen35_moe_forward` / `_init_from_prefill`.
 // =============================================================================
 
 // Initialize the paged MoE forward graph from per-layer pool / scale handles.
@@ -1659,11 +1644,11 @@ void mlx_qwen35_moe_compiled_test_force_inited(int inited) {
 // Layout contract:
 //   - `k_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
 //     head_size/x_pack=8, block_size=16, x_pack=8]` bf16 array view.
-//     Phase 4 piece 1 uses bf16 (`KvDtype::Bf16`) and `block_size = 16`.
+//     Uses bf16 (`KvDtype::Bf16`) and `block_size = 16`.
 //   - `v_pool_handles[i]`: pointer to a `[num_blocks, num_kv_heads,
 //     head_size, block_size=16]` bf16 array view.
 //   - `k_scale_handles[i]` / `v_scale_handles[i]`: pointer to `[1]` f32
-//     scale placeholders (1.0 in Phase 4; FP8 calibration in Phase 10).
+//     scale placeholders (1.0; reserved for FP8 calibration).
 //   - For linear-attention layers (those satisfying
 //     `(i + 1) % full_attention_interval != 0`), the corresponding pool /
 //     scale slots may be null — they're stored as bf16 zero placeholders
@@ -1678,7 +1663,7 @@ void mlx_qwen35_moe_compiled_test_force_inited(int inited) {
 // `prefill_offset` becomes the initial `g_paged_offset_int`. `mlp_only_layers`
 // follows the same convention as the flat init.
 //
-// Compile-graph configuration (encoded into the new FFI's signature):
+// Compile-graph configuration (encoded into the FFI's signature):
 //   - block_size       = 16
 //   - kv_dtype         = Bf16
 //   - x_pack           = 8
@@ -1916,15 +1901,14 @@ int32_t mlx_qwen35_moe_init_paged(
 }
 
 // Single-token paged decode step. Inputs (PagedAttentionInputs) come from
-// the Rust adapter's `build_paged_attention_inputs` (Phase 3); the per-
-// layer pool/scale globals come from `mlx_qwen35_moe_init_paged`.
+// the Rust adapter's `build_paged_attention_inputs`; the per-layer
+// pool/scale globals come from `mlx_qwen35_moe_init_paged`.
 //
-// PHASE 4 PIECE 1 CONTRACT: This FFI is decode-only — `input_ids` MUST
-// have exactly one element and `slot_mapping` MUST be `[1]`. Chunked
-// prefill (multi-token) goes through the legacy flat path until piece 2
-// lands a separate paged-prefill helper. The contract is enforced
-// explicitly: violating it returns null logits without modifying global
-// state, so the Rust caller can fall back cleanly. See the docstring on
+// CONTRACT: This FFI is decode-only — `input_ids` MUST have exactly one
+// element and `slot_mapping` MUST be `[1]`. Chunked prefill (multi-token)
+// goes through the flat path. The contract is enforced explicitly:
+// violating it returns null logits without modifying global state, so the
+// Rust caller can fall back cleanly. See the docstring on
 // `attn_for_compile_paged` in `mlx_qwen35_common.h` for the full
 // rationale.
 //
@@ -1965,16 +1949,15 @@ void mlx_qwen35_moe_forward_paged(
     auto& num_valid_blocks = *reinterpret_cast<array*>(num_valid_blocks_ptr);
     auto& seq_lens         = *reinterpret_cast<array*>(seq_lens_ptr);
 
-    // Phase 4 piece 1 contract: single-token decode only.
+    // Single-token decode only.
     //
     // `attn_for_compile_paged` builds new_k / new_v with shape
     // `[1, num_kv_heads, head_size]` and feeds `slot_mapping` directly
     // into `paged_kv_write`, which requires
-    // `slot_mapping.shape(0) == new_k.shape(0)`. Chunked-prefill (B > 1)
-    // is reserved for piece 2's transfer step; until then, reject any
-    // caller that tries to push more than one token through the paged
-    // FFI. Returning null here matches the existing error contract and
-    // lets the Rust caller fall back to the flat path cleanly.
+    // `slot_mapping.shape(0) == new_k.shape(0)`. Reject any caller that
+    // tries to push more than one token through the paged FFI. Returning
+    // null here matches the existing error contract and lets the Rust
+    // caller fall back to the flat path cleanly.
     if (input_ids.size() != 1) {
       fprintf(stderr,
               "[MLX] mlx_qwen35_moe_forward_paged: phase 4 piece 1 contract "
@@ -2065,8 +2048,8 @@ void mlx_qwen35_moe_forward_paged(
 }
 
 // =============================================================================
-// Phase 4 piece 1 test helper: build the paged-attention graph in isolation
-// and force-evaluate it.
+// Test helper: build the paged-attention graph in isolation and
+// force-evaluate it.
 //
 // Unlike `mlx_qwen35_moe_forward_paged`, which traces the full MoE decode
 // graph (all 40 layers + MoE routing + LM head) and therefore needs the
@@ -2087,13 +2070,12 @@ void mlx_qwen35_moe_forward_paged(
 // Splitting -1 (no-Metal skip) from -2 (real failure) prevents a broken
 // `paged_kv_write`/`paged_attention` binding from silently passing on a
 // Metal-equipped host: cargo hides passing-test stderr by default, so a
-// single "non-zero return" code lumped both cases together and the
-// originally weakened test would have accepted any failure as success.
+// single "non-zero return" code lumping both cases together would accept
+// any failure as success.
 //
-// This is the "graph build smoke" coverage that Codex's Finding 3 asked
-// for — the existing forward_paged smoke test fails inside the LM-head /
-// embedding lookup BEFORE reaching `attn_for_compile_paged`, so without
-// this helper the paged graph itself is never exercised.
+// Graph-build smoke coverage — the forward_paged smoke test fails inside
+// the LM-head / embedding lookup BEFORE reaching `attn_for_compile_paged`,
+// so without this helper the paged graph itself is never exercised.
 //
 // IMPORTANT: This helper writes to `g_weights()`, so callers MUST invoke
 // `mlx_clear_weights()` before/after if any other model state is loaded.
@@ -2253,9 +2235,9 @@ int mlx_qwen35_moe_trace_paged_attn_helper() {
   }
 }
 
-// PR #65 (mtp-reload P1) — invalidate ALL compiled MoE dispatch graphs (the
-// MTP-verify graph plus the flat + paged AR-decode graphs) so the next call
-// re-traces against the CURRENT weight registry.
+// Invalidate ALL compiled MoE dispatch graphs (the MTP-verify graph plus
+// the flat + paged AR-decode graphs) so the next call re-traces against
+// the CURRENT weight registry.
 //
 // The compiled MoE bodies read expert + attention weights via `get_weight(...)`
 // INSIDE the traced closure (NOT as compile inputs), so `mlx::core::compile(...)`

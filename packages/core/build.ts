@@ -38,8 +38,7 @@ for (const output of outputs) {
 await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
-// Also copy paged_attn.metallib (Phase 2 of the paged-attention
-// compile integration), which mlx_paged_dispatch.cpp loads via a
+// Also copy paged_attn.metallib, which mlx_paged_dispatch.cpp loads via a
 // `dladdr`-based colocated lookup at runtime.
 //
 // Both metallibs are copied to TWO destinations:
@@ -116,7 +115,7 @@ async function copyMetallibs() {
         await copyFile(mlxPath, dst);
         console.log(`Copied mlx.metallib -> ${dst}`);
       }
-      // paged_attn.metallib is also required for darwin (Phase 2).
+      // paged_attn.metallib is also required for darwin.
       // It lives next to mlx.metallib in the same lib dir.
       const pagedPath = join(libDir, 'paged_attn.metallib');
       try {

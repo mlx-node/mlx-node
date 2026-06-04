@@ -1,21 +1,16 @@
-// Phase 2 of the paged-attention compile integration.
-//
-// This header declares pure-C++ kernel dispatch wrappers that the
-// `PagedKVWrite` / `PagedAttention` `Custom` primitives call from inside
-// `eval_gpu`. Unlike Phase 1's extern-C shim into the mlx-paged-attn
-// Rust crate, these wrappers encode kernels onto MLX's own
-// `metal::CommandEncoder`, so dependency tracking is correct and no
-// `wait_until_completed` synchronization band-aid is needed.
+// Pure-C++ kernel dispatch wrappers that the `PagedKVWrite` /
+// `PagedAttention` `Custom` primitives call from inside `eval_gpu`. They
+// encode kernels onto MLX's own `metal::CommandEncoder`, so dependency
+// tracking is correct without manual synchronization.
 //
 // Kernel names + threadgroup-memory math + V1/V2 selection mirror the
 // Rust dispatcher in `crates/mlx-paged-attn/src/metal/{state,
 // reshape_and_cache, paged_attention}.rs`. The Rust dispatcher remains
-// in place: it is the active production paged path for Qwen3, LFM2,
-// and Gemma4 (whose paged forward goes through `PagedKVCacheAdapter`
-// → `LayerKVPool` → Rust `dispatch_*` calls, NOT through the C++
-// `PagedKVWrite` / `PagedAttention` Custom primitives). The C++ port
-// in this header is exclusively for the compile-traceable primitives
-// used inside the Qwen3.5 dense / Qwen3.5 MoE C++ compile graphs
+// in place: it is the active production paged path for Qwen3, LFM2, and
+// Gemma4 (whose paged forward goes through `PagedKVCacheAdapter` →
+// `LayerKVPool` → Rust `dispatch_*`, NOT these C++ Custom primitives).
+// The C++ port here is exclusively for the compile-traceable primitives
+// used inside the Qwen3.5 dense / MoE C++ compile graphs
 // (`mlx_qwen35_init_paged` / `mlx_qwen35_moe_init_paged`).
 //
 // Notes:
@@ -23,8 +18,8 @@
 //     from `crates/mlx-paged-attn/metal/*.metal`. It ships colocated
 //     with `mlx.metallib` (e.g. in `packages/core/`) and is loaded via
 //     MLX's `Device::get_library(name, path)` path overload.
-//   - `mlx::core::metal::Device::get_library` and `::get_kernel` cache
-//     by name, so we get pipeline reuse for free.
+//   - `Device::get_library` and `::get_kernel` cache by name, so we get
+//     pipeline reuse for free.
 //   - The Custom primitive's `eval_gpu` is responsible for argument
 //     validation, output allocation (`array::set_data`), and any
 //     pre-dispatch host-side checks. These functions only do the kernel
@@ -102,7 +97,8 @@ void dispatch_reshape_and_cache(
 /// underlying kernel uses `1.0` as its disabled sentinel; this function
 /// translates.
 ///
-/// Sliding window must be 0 in Phase 2 (Phase 7 adds Gemma4 support).
+/// `sliding_window`: 0 = disabled, nonzero masks older K positions;
+/// negative is rejected.
 void dispatch_paged_attention_auto(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,

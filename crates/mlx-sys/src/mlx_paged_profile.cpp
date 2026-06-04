@@ -1,4 +1,4 @@
-// Profile-run helpers for the vLLM-style auto-sized block pool (Phase 3).
+// Profile-run helpers for the vLLM-style auto-sized block pool.
 //
 // The profile-run sequence in `crates/mlx-paged-attn/src/profile.rs`:
 //   1. reset peak memory counter
@@ -73,9 +73,8 @@ int32_t mlx_total_system_memory(uint64_t* out_value) {
 // Wrap an existing MTL::Buffer (passed as `void*` for FFI) as an MLX
 // `array` view — zero-copy, no host roundtrip.
 //
-// Used by `LayerKVPool::{key,value}_cache_array` (Phase 3) to expose the
-// per-layer K/V pool buffers as MLX-traceable inputs to the compiled
-// forward graph.
+// Used by `LayerKVPool::{key,value}_cache_array` to expose the per-layer
+// K/V pool buffers as MLX-traceable inputs to the compiled forward graph.
 //
 // Inputs:
 // - `metal_buffer_ptr`: an `MTL::Buffer*` (the same pointer

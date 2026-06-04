@@ -1,16 +1,10 @@
-//! Phase 4 piece 1 smoke tests for the new `mlx_qwen35_moe_forward_paged`
-//! C++ machinery.
-//!
-//! Piece 1 lands the C++ side of paged decode (`attn_for_compile_paged`,
+//! Smoke tests for the `mlx_qwen35_moe_forward_paged` C++ machinery —
+//! the C++ side of paged decode (`attn_for_compile_paged`,
 //! `moe_compiled_decode_fn_paged`, the per-layer pool / scale globals,
-//! and the new `init_paged` / `forward_paged` FFI) without touching the
-//! Rust callers in `crates/mlx-core/src/models/qwen3_5_moe/model.rs` —
-//! piece 2 swaps the callers and piece 3 deletes the legacy flat FFI.
+//! and the `init_paged` / `forward_paged` FFI). These tests exercise the
+//! FFI surface directly to prove:
 //!
-//! Without a Rust caller, the new code is unreachable from production.
-//! These smoke tests exercise the FFI surface directly to prove:
-//!
-//! 1. The new symbols are linked (no missing-symbol crash).
+//! 1. The symbols are linked (no missing-symbol crash).
 //! 2. The early-exit guard (`g_paged_inited == false` →
 //!    `output_logits = nullptr`) works before init.
 //! 3. After `mlx_qwen35_moe_init_paged` succeeds against placeholder
@@ -19,8 +13,7 @@
 //!    catch wrapper turns the inevitable "Weight not found" exception
 //!    into a `output_logits = nullptr` return.
 //!
-//! These are deliberately not parity / numerical / end-to-end tests —
-//! piece 2 lands those once the Rust adapter calls the new FFI. The
+//! These are deliberately not parity / numerical / end-to-end tests. The
 //! goal here is "the binary linked and the path doesn't crash."
 //!
 //! All Metal-dependent setup gracefully skips on hosts where MLX can't
@@ -31,7 +24,7 @@
 use std::ptr;
 
 // =============================================================================
-// Minimal config — Phase 4 piece 1 hard-codes block_size=16, x_pack=8,
+// Minimal config — the paged path hard-codes block_size=16, x_pack=8,
 // kv_dtype=Bf16, sliding=0. This config sizes the placeholder pools so
 // every paged-op factory validator passes. The model dimensions are
 // borrowed from a typical Qwen3.5 MoE checkpoint and are unrelated to
@@ -168,18 +161,17 @@ unsafe extern "C" {
     // reset state is clean.
     fn mlx_clear_weights();
 
-    // Resets MoE state. After 2026-04-29 (Codex Finding 1 fix) this also
-    // clears the paged-path globals (`g_paged_inited`, `g_k_pools`,
-    // `g_v_pools`, `g_k_scales`, `g_v_scales`, `g_paged_linear_caches`,
-    // `g_paged_offset_int`, `g_paged_config`) — the
-    // `forward_paged_after_reset_returns_null` test below regresses that.
+    // Resets MoE state, including the paged-path globals
+    // (`g_paged_inited`, `g_k_pools`, `g_v_pools`, `g_k_scales`,
+    // `g_v_scales`, `g_paged_linear_caches`, `g_paged_offset_int`,
+    // `g_paged_config`) — the `forward_paged_after_reset_returns_null`
+    // test below regresses that.
     fn mlx_qwen35_moe_reset();
 
-    // Phase 4 piece 1 test helper that builds the
-    // `attn_for_compile_paged` graph in isolation. Self-registers +
-    // clears synthetic weights for layer 0 self-attention; eval()s the
-    // output so paged_kv_write + paged_attention actually dispatch on
-    // the Metal queue.
+    // Test helper that builds the `attn_for_compile_paged` graph in
+    // isolation. Self-registers + clears synthetic weights for layer 0
+    // self-attention; eval()s the output so paged_kv_write +
+    // paged_attention actually dispatch on the Metal queue.
     //
     // Return codes:
     //    0  — success (graph built, eval succeeded, kernels dispatched).
@@ -433,8 +425,7 @@ fn forward_paged_graph_builds_without_crash() {
 
     // Total input array count threaded into the paged compile graph:
     //   7 metadata + 4 per layer = 7 + 40 * 4 = 167 inputs.
-    // This number isn't asserted directly — it's a documentation note
-    // and matches the Phase 4 piece 1 spec.
+    // Not asserted directly — a documentation note.
 
     let mut logits: *mut mlx_sys::mlx_array = ptr::null_mut();
     let mut offset_out: i32 = -1;
@@ -495,13 +486,12 @@ fn forward_paged_graph_builds_without_crash() {
     }
 }
 
-/// Test 3 — Codex Finding 1 regression: `mlx_qwen35_moe_reset()` MUST
-/// clear the paged globals, not just the legacy flat ones. Before the
-/// 2026-04-29 fix, reset only cleared `g_moe_caches` / `g_moe_offset_int`
-/// / `g_moe_inited` / `g_layer_quant` / `g_dense_quant` /
-/// `g_weight_transposes_3d` — leaving `g_paged_inited == true` and stale
-/// pool / scale / linear-cache / offset state lying around for the next
-/// request to reuse.
+/// Test 3 — `mlx_qwen35_moe_reset()` MUST clear the paged globals, not
+/// just the legacy flat ones. Clearing only `g_moe_caches` /
+/// `g_moe_offset_int` / `g_moe_inited` / `g_layer_quant` /
+/// `g_dense_quant` / `g_weight_transposes_3d` would leave
+/// `g_paged_inited == true` and stale pool / scale / linear-cache /
+/// offset state lying around for the next request to reuse.
 ///
 /// This test:
 ///   1. Initializes the paged path (flips `g_paged_inited = true`).
@@ -632,14 +622,13 @@ fn forward_paged_after_reset_returns_null() {
             "mlx_qwen35_moe_init_paged must succeed with full pool bundle"
         );
 
-        // Reset must clear `g_paged_inited`. After the fix this returns
-        // the paged path to "uninitialized" — same state as before any
-        // init call.
+        // Reset must clear `g_paged_inited`, returning the paged path to
+        // "uninitialized" — same state as before any init call.
         mlx_qwen35_moe_reset();
 
         // With the paged init cleared, the FFI must early-exit on the
-        // null inputs. Pre-fix bug: paged_inited was still true →
-        // null deref crash inside the function body.
+        // null inputs. If paged_inited were still true the FFI would
+        // deref the null pointers and crash.
         let mut logits: *mut mlx_sys::mlx_array = ptr::null_mut();
         let mut offset_out: i32 = -1;
         mlx_qwen35_moe_forward_paged(
@@ -683,21 +672,20 @@ fn forward_paged_after_reset_returns_null() {
     }
 }
 
-/// Test 4 — Codex Finding 3 fix: prove the paged-attention graph itself
-/// is reachable and runs end-to-end on the Metal queue.
+/// Test 4 — prove the paged-attention graph itself is reachable and runs
+/// end-to-end on the Metal queue.
 ///
-/// The pre-existing `forward_paged_graph_builds_without_crash` test
-/// fails BEFORE reaching `attn_for_compile_paged` because the LM head /
-/// embedding lookup inside `moe_compiled_decode_fn_paged` happens first
-/// and throws "Weight not found" — so the path under test was never
-/// actually exercised. This test calls
-/// `mlx_qwen35_moe_trace_paged_attn_helper`, which:
+/// `forward_paged_graph_builds_without_crash` fails BEFORE reaching
+/// `attn_for_compile_paged` because the LM head / embedding lookup inside
+/// `moe_compiled_decode_fn_paged` happens first and throws "Weight not
+/// found" — so the path under test is never actually exercised there.
+/// This test calls `mlx_qwen35_moe_trace_paged_attn_helper`, which:
 ///
 ///   1. Self-registers a minimal synthetic weight bundle (layer 0
 ///      q/k/v/o + q_norm/k_norm only — no embedding, no LM head, no
 ///      MoE).
 ///   2. Builds `attn_for_compile_paged` directly with synthetic input
-///      arrays at the piece-1 contract shapes.
+///      arrays at the decode contract shapes.
 ///   3. Calls `mlx::core::eval()` on the result so paged_kv_write and
 ///      paged_attention actually dispatch on the Metal queue (graph
 ///      construction alone is lazy — eval is what proves the kernels
@@ -715,10 +703,9 @@ fn forward_paged_after_reset_returns_null() {
 ///  -2 (or any other nonzero) — graph construction, eval, weight
 ///        registration, or some other exception failed. This is a HARD
 ///        FAILURE: it proves a paged-attention binding is broken on a
-///        Metal-equipped host. The original test at this site accepted
-///        ANY nonzero code as a skip, which let `paged_kv_write` /
-///        `paged_attention` regressions pass silently because cargo
-///        suppresses passing-test stderr by default.
+///        Metal-equipped host. Treating any nonzero code as a skip would
+///        let `paged_kv_write` / `paged_attention` regressions pass
+///        silently because cargo suppresses passing-test stderr by default.
 #[test]
 fn paged_attn_graph_dispatches_on_metal() {
     unsafe {
@@ -759,11 +746,10 @@ fn paged_attn_graph_dispatches_on_metal() {
     }
 }
 
-/// Test 5 — Codex Finding 2 fix: `mlx_qwen35_moe_forward_paged` enforces
-/// the single-token decode contract. Calling with `slot_mapping.shape ==
-/// [2]` must return null logits without crashing or modifying state.
-/// This documents that piece 1 is decode-only; chunked prefill comes in
-/// piece 2.
+/// Test 5 — `mlx_qwen35_moe_forward_paged` enforces the single-token
+/// decode contract. Calling with `slot_mapping.shape == [2]` must return
+/// null logits without crashing or modifying state. This documents that
+/// the paged path is decode-only (chunked prefill is separate).
 #[test]
 fn forward_paged_rejects_multi_token_contract_violation() {
     if !metal_available() {

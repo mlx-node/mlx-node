@@ -1,15 +1,10 @@
-//! Phase 5 piece 1 smoke tests for the new `mlx_qwen35_forward_paged`
-//! C++ machinery (Dense variant).
+//! Smoke tests for the `mlx_qwen35_forward_paged` C++ machinery (Dense
+//! variant) — the C++ side of paged decode for Qwen3.5 Dense
+//! (`attn_for_compile_paged` reuse, `dense_compiled_decode_fn_paged`, the
+//! per-layer pool / scale globals, and the `init_paged` / `forward_paged`
+//! FFI). These tests exercise the FFI surface directly to prove:
 //!
-//! Phase 5 piece 1 lands the C++ side of paged decode for Qwen3.5
-//! Dense (`attn_for_compile_paged` reuse, `dense_compiled_decode_fn_paged`,
-//! the per-layer pool / scale globals, and the new `init_paged` /
-//! `forward_paged` FFI) and wires the Rust dispatcher in
-//! `crates/mlx-core/src/models/qwen3_5/model.rs` (`chat_sync_core_paged_inner`
-//! / `chat_stream_sync_core_paged_inner`). These smoke tests exercise
-//! the FFI surface directly to prove:
-//!
-//! 1. The new symbols are linked (no missing-symbol crash).
+//! 1. The symbols are linked (no missing-symbol crash).
 //! 2. The early-exit guard (`g_dense_paged_inited == false` →
 //!    `output_logits = nullptr`) works before init.
 //! 3. After `mlx_qwen35_init_paged` succeeds against placeholder
@@ -22,10 +17,8 @@
 //! 5. The single-token decode contract guard rejects multi-token
 //!    inputs without crashing.
 //!
-//! These are deliberately not parity / numerical / end-to-end tests —
-//! that's covered by `qwen3_5_paged_vs_flat_parity.rs` once it can be
-//! gated on a checkpoint. The goal here is "the binary linked and the
-//! path doesn't crash."
+//! These are deliberately not parity / numerical / end-to-end tests. The
+//! goal here is "the binary linked and the path doesn't crash."
 //!
 //! All Metal-dependent setup gracefully skips on hosts where MLX can't
 //! allocate Metal buffers; the tests are no-ops there.
@@ -35,7 +28,7 @@
 use std::ptr;
 
 // =============================================================================
-// Minimal config — Phase 5 piece 1 hard-codes block_size=16, x_pack=8,
+// Minimal config — the paged path hard-codes block_size=16, x_pack=8,
 // kv_dtype=Bf16, sliding=0. This config sizes the placeholder pools so
 // every paged-op factory validator passes. The model dimensions are
 // borrowed from a typical Qwen3.5 Dense checkpoint and are unrelated to
@@ -158,12 +151,12 @@ unsafe extern "C" {
     // reset state is clean.
     fn mlx_clear_weights();
 
-    // Resets the dense compiled state. Phase 5 piece 1 extends this to
-    // also clear the paged-path globals (`g_dense_paged_inited`,
-    // `g_dense_k_pools`, `g_dense_v_pools`, `g_dense_k_scales`,
-    // `g_dense_v_scales`, `g_dense_paged_linear_caches`,
-    // `g_dense_paged_offset_int`, `g_dense_paged_config`) — the
-    // `forward_paged_after_reset_returns_null` test below regresses that.
+    // Resets the dense compiled state, including the paged-path globals
+    // (`g_dense_paged_inited`, `g_dense_k_pools`, `g_dense_v_pools`,
+    // `g_dense_k_scales`, `g_dense_v_scales`,
+    // `g_dense_paged_linear_caches`, `g_dense_paged_offset_int`,
+    // `g_dense_paged_config`) — the `forward_paged_after_reset_returns_null`
+    // test below regresses that.
     fn mlx_qwen35_compiled_reset();
 }
 
@@ -462,11 +455,11 @@ fn forward_paged_graph_builds_without_crash() {
 }
 
 /// Test 3 — `mlx_qwen35_compiled_reset()` MUST clear the paged
-/// globals, not just the legacy flat ones. Before Phase 5 piece 1,
-/// reset only cleared `g_compiled_caches` / `g_compiled_offset` /
-/// `g_offset_int` / `g_compile_inited` — leaving
-/// `g_dense_paged_inited == true` and stale pool / scale / linear-cache
-/// / offset state lying around for the next request to reuse.
+/// globals, not just the legacy flat ones. Clearing only
+/// `g_compiled_caches` / `g_compiled_offset` / `g_offset_int` /
+/// `g_compile_inited` would leave `g_dense_paged_inited == true` and
+/// stale pool / scale / linear-cache / offset state lying around for the
+/// next request to reuse.
 ///
 /// This test:
 ///   1. Initializes the paged path (flips `g_dense_paged_inited = true`).
@@ -585,9 +578,8 @@ fn forward_paged_after_reset_returns_null() {
         );
         assert_eq!(init_status, 0, "init must succeed with full pool bundle");
 
-        // Reset must clear `g_dense_paged_inited`. After Phase 5 piece 1
-        // this returns the paged path to "uninitialized" — same state
-        // as before any init call.
+        // Reset must clear `g_dense_paged_inited`, returning the paged
+        // path to "uninitialized" — same state as before any init call.
         mlx_qwen35_compiled_reset();
 
         // With the paged init cleared, the FFI must early-exit on the
@@ -639,7 +631,7 @@ fn forward_paged_after_reset_returns_null() {
 /// Test 4 — `mlx_qwen35_forward_paged` enforces the single-token
 /// decode contract. Calling with `slot_mapping.shape == [2]` must
 /// return null logits without crashing or modifying state. This
-/// documents that piece 1 is decode-only.
+/// documents that the paged path is decode-only.
 #[test]
 fn forward_paged_rejects_multi_token_contract_violation() {
     if !metal_available() {

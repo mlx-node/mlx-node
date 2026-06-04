@@ -1,26 +1,18 @@
 //! `extern "C"` shim around the existing Rust Metal dispatch.
 //!
-//! ## What this module does (Phase 1)
+//! These thin wrappers expose the `dispatch_reshape_and_cache_raw` and
+//! `dispatch_paged_attention_auto` Rust dispatchers (in [`crate::metal`])
+//! under a stable, name-mangle-free C ABI so the MLX `Custom` primitives
+//! in `crates/mlx-sys/src/mlx_paged_ops.cpp` can call them from inside
+//! `eval_gpu`.
 //!
-//! These wrappers expose the existing `dispatch_reshape_and_cache_raw` and
-//! `dispatch_paged_attention_auto` Rust dispatchers (in
-//! [`crate::metal`]) under a stable, name-mangle-free C ABI so the new
-//! MLX `Custom` primitives in `crates/mlx-sys/src/mlx_paged_ops.cpp`
-//! can call them from inside `eval_gpu`.
-//!
-//! ## Phase boundary
-//!
-//! - **Phase 1 (this file)**: thin extern "C" wrappers. The wrappers
-//!   accept raw `MTLBuffer*` pointers, scalar params, and call straight
-//!   into the existing Rust dispatch which still uses
-//!   `mlx-paged-attn`'s separate `MetalState::command_queue`. This means
-//!   we do **not** share the MLX command queue. Callers MUST evaluate
-//!   any prior dependencies before invoking these wrappers (the C++
-//!   primitive's `eval_gpu` does this via `mlx_metal_synchronize` /
-//!   `mlx::core::synchronize`).
-//! - **Phase 2** (future): the dispatch logic moves into the C++
-//!   primitives proper, encoded directly onto MLX's command queue, and
-//!   this module is deleted.
+//! The wrappers accept raw `MTLBuffer*` pointers and scalar params, and
+//! call straight into the existing Rust dispatch which uses
+//! `mlx-paged-attn`'s separate `MetalState::command_queue` — i.e. we do
+//! **not** share the MLX command queue. Callers MUST evaluate any prior
+//! dependencies before invoking these wrappers (the C++ primitive's
+//! `eval_gpu` does this via `mlx_metal_synchronize` /
+//! `mlx::core::synchronize`).
 //!
 //! ## Calling contract
 //!
@@ -187,8 +179,7 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
         return 0;
     }
 
-    // Phase 1 contract: io dtype = cache dtype for non-FP8, BF16 for
-    // FP8. Phase 2 will pass io_dtype as a separate field.
+    // io dtype = cache dtype for non-FP8, BF16 for FP8.
     let cache_dtype = kv_dtype.to_metal();
     let input_dtype = if kv_dtype.is_fp8() {
         MetalDtype::BFloat16
@@ -272,8 +263,7 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
 ///
 /// The output is allocated by the C++ side (via MLX `set_data`). This
 /// shim blits the dispatcher's internal output buffer into the
-/// caller-supplied output buffer (Phase 2 will avoid this extra copy
-/// by extending the dispatcher to take an output buffer parameter).
+/// caller-supplied output buffer.
 ///
 /// # Safety
 /// - All pointer parameters MUST be valid `MTLBuffer*` pointers.
@@ -316,10 +306,9 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
         eprintln!("mlx_paged_attn_paged_attention_dispatch: null buffer pointer");
         return -1;
     }
-    // Phase 7: sliding_window is now plumbed end-to-end. Negative values
-    // are still nonsensical (the only well-defined sentinel for "no mask"
-    // is 0) and would otherwise reach the Metal kernel as garbage, so
-    // reject them up front.
+    // Negative sliding_window is nonsensical (the only well-defined
+    // sentinel for "no mask" is 0) and would otherwise reach the Metal
+    // kernel as garbage, so reject it up front.
     if sliding_window < 0 {
         eprintln!(
             "mlx_paged_attn_paged_attention_dispatch: sliding_window={sliding_window} \
@@ -460,12 +449,11 @@ fn blit_attention_output(
 }
 
 /// `extern "C"` wrapper around `dispatch_paged_attention_varlen_auto`
-/// (Phase 4a — multi-row paged attention for MTP speculative decoding).
+/// (multi-row paged attention for MTP speculative decoding).
 ///
 /// This is a SIBLING of `mlx_paged_attn_paged_attention_dispatch`, not a
-/// replacement: the single-row entrypoint stays the proven AR path; Phase
-/// 4b will opt the MTP verify path into this varlen entrypoint via env
-/// var, after which it can flip default.
+/// replacement: the single-row entrypoint is the AR path; the MTP verify
+/// path uses this varlen entrypoint.
 ///
 /// # Buffer layout
 /// - `queries`: `[total_queries, num_q_heads, head_size]` — ragged Q.

@@ -79,7 +79,7 @@ pub struct PagedAttentionParams {
     pub k_scale: f32,
     /// V scale for FP8 quantization (1.0 for non-FP8)
     pub v_scale: f32,
-    /// Phase 7: Sliding-window mask. When > 0, K positions older than
+    /// Sliding-window mask. When > 0, K positions older than
     /// `context_len - sliding_window` are excluded from attention. When
     /// 0 (default), no sliding mask is applied (full-context attention).
     pub sliding_window: i32,
@@ -424,7 +424,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
     encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-    // Phase 7: sliding-window mask. 0 = full context (default).
+    // sliding-window mask. 0 = full context (default).
     let sliding_window_buf = create_int_buffer(params.sliding_window);
     encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
@@ -440,8 +440,8 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     // truncates phase (2) when `max_seq_len * 4 < (NUM_WARPS/2) * HEAD_SIZE * 4`.
     // In production max_seq_len always dominates (8192 × 4 = 32 KiB ≫
     // 4 × 128 × 4 = 2 KiB), so this never surfaced. Small-context decode
-    // tests (e.g. P1C-4 toy validation: 24 tokens × HEAD_SIZE 64 → 96 < 1024)
-    // hit the truncation: upper warps' writes during the reduction tree
+    // (e.g. 24 tokens × HEAD_SIZE 64 → 96 < 1024) hits the truncation:
+    // upper warps' writes during the reduction tree
     // land at undefined positions — empirically, only some lanes' rows
     // get reduced correctly, so the gathered output equals the kernel-warp-0
     // contribution for those rows and the multi-block sum gets dropped
@@ -623,7 +623,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         encoder.set_buffer(16, Some(&kv_block_stride_buf), 0);
         encoder.set_buffer(17, Some(&kv_head_stride_buf), 0);
 
-        // Phase 7: sliding-window mask. 0 = full context (default).
+        // sliding-window mask. 0 = full context (default).
         let sliding_window_buf = create_int_buffer(params.sliding_window);
         encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
@@ -762,8 +762,8 @@ pub unsafe fn dispatch_paged_attention_auto(
 
 /// Parameters for the varlen (multi-row) paged_attention dispatch.
 ///
-/// Phase 4a (Multi-Token Prediction): the verify pass needs D+1 query
-/// tokens per sequence, so the kernel grid is `(num_q_heads, total_queries,
+/// For Multi-Token Prediction the verify pass needs D+1 query tokens per
+/// sequence, so the kernel grid is `(num_q_heads, total_queries,
 /// num_partitions)` and the query tensor is a flat ragged
 /// `[total_queries, num_q_heads, head_size]` layout.
 ///
@@ -808,7 +808,7 @@ pub struct PagedAttentionVarlenParams {
     /// V scale for FP8 quantization (1.0 for non-FP8).
     pub v_scale: f32,
     /// Sliding-window mask. Same semantics as the single-row kernel,
-    /// referenced to `effective_context_len` per query token (Phase 7).
+    /// referenced to `effective_context_len` per query token.
     pub sliding_window: i32,
 }
 
@@ -882,7 +882,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
         cache_dtype,
         params.head_size,
         params.block_size,
-        false, // use_alibi — not exercised in Phase 4a
+        false, // use_alibi — not exercised by varlen
     );
     let pipeline = state.get_pipeline(&kernel_name)?;
 

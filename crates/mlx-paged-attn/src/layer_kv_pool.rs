@@ -129,9 +129,9 @@ pub struct LayerKVPool {
     ///
     /// - `Float16` — non-FP8 cache, half-precision storage.
     /// - `BFloat16` — non-FP8 cache, bfloat16 storage. **Required** for BF16
-    ///   models (e.g. Qwen3.5 in production); without this field the gather
-    ///   path was hard-coded to `Float16`, silently reinterpreting BF16 cache
-    ///   bytes through the `(half, half)` paged-attention kernel.
+    ///   models (e.g. Qwen3.5 in production); the gather path must not be
+    ///   hard-coded to `Float16`, which would silently reinterpret BF16
+    ///   cache bytes through the `(half, half)` paged-attention kernel.
     /// - `UChar` — FP8 E4M3 quantized cache (1 byte per element).
     ///
     /// `Float32` and other dtypes are rejected at construction — the metal
@@ -489,8 +489,7 @@ impl LayerKVPool {
     }
 
     /// Wrap the K cache buffer for `layer_idx` as a zero-copy MLX `array`
-    /// view, suitable for use as an input to a compiled forward graph
-    /// (Phase 3+).
+    /// view, suitable for use as an input to a compiled forward graph.
     ///
     /// Shape: `[num_blocks, num_kv_heads, head_size/x, block_size, x]`
     /// (vLLM K layout; matches `LayerKVPool::new`'s allocation).
@@ -648,9 +647,9 @@ impl LayerKVPool {
     /// `BFloat16`, or `Float32`. The cache dtype is the one recorded on the
     /// pool at construction (see [`Self::cache_dtype`]); for FP8 mode that's
     /// `UChar`, otherwise it's the dtype the caller declared when allocating
-    /// the cache buffers. Splitting input from cache dtype avoids the
-    /// historical "input is always half" bug that silently routed BF16 / F32
-    /// K/V to the wrong kernel (or, in the FP8 case, reinterpreted BF16
+    /// the cache buffers. Input and cache dtype are split so that an
+    /// "input is always half" assumption can't silently route BF16 / F32
+    /// K/V to the wrong kernel (or, in the FP8 case, reinterpret BF16
     /// bytes as half).
     ///
     /// # Safety
@@ -868,8 +867,7 @@ impl LayerKVPool {
     /// `queries` shape on the GPU buffer is `[1, num_query_heads, head_size]`.
     /// `query_dtype` MUST be the actual element dtype of the queries buffer —
     /// passing the wrong value reinterprets the buffer bytes through the
-    /// kernel's io template, the same misroute the cache_dtype split fixed
-    /// for the cache side. For non-FP8 caches the metal source only
+    /// kernel's io template. For non-FP8 caches the metal source only
     /// instantiates same-dtype `(io, cache)` pairs (`(half, half)`,
     /// `(bfloat16_t, bfloat16_t)`, `(float, float)`), so `query_dtype` MUST
     /// equal `self.cache_dtype()` in that case; for FP8 caches (`UChar`),
@@ -877,10 +875,9 @@ impl LayerKVPool {
     /// `Float32` (the kernel dequantizes internally).
     ///
     /// The cache dtype comes from the pool's recorded `cache_dtype` field —
-    /// for BF16 production caches that's `BFloat16`, NOT `Float16`. Threading
-    /// the pool's actual cache dtype through is what fixes the silent BF16
-    /// → half misroute on the gather side (the corresponding `write_kv` was
-    /// already fixed in P1C-2).
+    /// for BF16 production caches that's `BFloat16`, NOT `Float16`. Using
+    /// the pool's actual cache dtype avoids a silent BF16 → half misroute
+    /// on the gather side.
     ///
     /// Returns the attention output as a `PagedAttentionOutput`. Hot-path
     /// callers convert it to an `MxArray` view without a host roundtrip.
@@ -993,14 +990,14 @@ impl LayerKVPool {
             q_stride,
             kv_block_stride,
             kv_head_stride,
-            // Phase 10: per-layer FP8 K/V scales threaded from
-            // `KvScaleManager` via `PagedKVCacheAdapter::read_layer_scales`,
-            // mirroring the write path in `LayerKVPool::write_kv`. Caller
-            // passes 1.0 when no manager is configured (non-FP8 path).
+            // Per-layer FP8 K/V scales threaded from `KvScaleManager` via
+            // `PagedKVCacheAdapter::read_layer_scales`, mirroring the write
+            // path in `LayerKVPool::write_kv`. Caller passes 1.0 when no
+            // manager is configured (non-FP8 path).
             k_scale,
             v_scale,
-            // Phase 7: 0 means full context; positive values mask K/V older
-            // than `context_len - sliding_window`.
+            // 0 means full context; positive values mask K/V older than
+            // `context_len - sliding_window`.
             sliding_window,
         };
 

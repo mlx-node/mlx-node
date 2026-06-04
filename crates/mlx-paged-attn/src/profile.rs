@@ -1,7 +1,7 @@
-//! Profile-run auto-sizer for the block pool (Phase 3, vLLM-aligned).
+//! Profile-run auto-sizer for the block pool (vLLM-aligned).
 //!
-//! Replaces the old static `gpu_memory_mb` / `calculate_num_blocks` config
-//! knob with a runtime profile that:
+//! A runtime alternative to the static `gpu_memory_mb` /
+//! `calculate_num_blocks` config knob that:
 //!
 //! 1. Reads total unified-memory size from MLX (sysctl-backed on Apple
 //!    Silicon).
@@ -25,9 +25,9 @@
 //!   dummy-forward pattern (single max-seq request to produce an
 //!   accurate peak-activation estimate).
 //!
-//! The model loader is supplied as a closure rather than a trait — Phase 3
-//! is the auto-sizer utility, not a per-model wiring (Phases 4-9 will hook
-//! their own model.forward(synthetic_input) closure into this).
+//! The model loader is supplied as a closure rather than a trait — this is
+//! the auto-sizer utility, not a per-model wiring; each model plugs its own
+//! `model.forward(synthetic_input)` closure into this.
 //!
 //! Env knobs:
 //! - `MLX_KV_MEMORY_UTILIZATION` (default `0.85`): fraction of total memory
@@ -529,8 +529,8 @@ fn read_peak_memory() -> Result<u64, ProfileError> {
 ///    accounts for materialized data — without `eval()` the graph never
 ///    moves the counter).
 ///
-/// Phase 3 makes this caller-supplied because the model loader is a model-
-/// specific concern (Phases 4-9 will plug their own model into this slot).
+/// This is caller-supplied because the model loader is a model-specific
+/// concern; each model plugs its own loader into this slot.
 /// Passing `max_position_embeddings` as a closure argument (rather than
 /// expecting the caller to capture it) ensures it always reaches the
 /// closure body and matches the value the auto-sizer used in its

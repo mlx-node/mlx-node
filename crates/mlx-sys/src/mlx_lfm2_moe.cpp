@@ -24,34 +24,27 @@ size_t mlx_weight_count();
 }
 
 // =============================================================================
-// LFM2.5 MoE Compiled Forward Pass — Phase 0 scaffold (INERT)
+// LFM2.5 MoE Compiled Forward Pass
 //
-// These entry points are wired through FFI and compiled into the addon, but do
-// NOTHING yet: `mlx_lfm2_get_model_id()` returns 0, so the Rust dispatcher's
-// `mlx_lfm2_get_model_id() == model_id` gate (with model_id >= 1) is NEVER
-// satisfied, and the model keeps running its Rust-native forward. The real
-// compiled graph (dense attention + ShortConv + sparse MoE, modeled on the
-// qwen3.5 compiled path) lands in later phases.
-//
-// IMPORTANT (Phase 1): before flipping the gate on, reconcile compiled-path
-// OWNERSHIP with the qwen3.5 path — both read the SAME process-global weight
-// map (`g_weights()` in mlx_qwen35_common.h). Only one model may own it at a
-// time, so the active model id must be the single source of truth and the
-// per-model id counters must not collide across models. See mlx_qwen35.cpp for
-// the ownership/registration pattern.
+// The compiled graph is dense attention + ShortConv + sparse MoE, modeled on the
+// qwen3.5 compiled path. Compiled-path OWNERSHIP is reconciled with the qwen3.5
+// path: both read the SAME process-global weight map (`g_weights()` in
+// mlx_qwen35_common.h). Only one model may own it at a time, so the active model
+// id is the single source of truth and the per-model id counters must not collide
+// across models. See mlx_qwen35.cpp for the ownership/registration pattern.
 // =============================================================================
 
 namespace {
 // Model-id ownership is the SHARED g_active_model_id atom, read via
 // qwen35_common::g_active_model_id() in mlx_lfm2_get_model_id below and published
-// by mlx_set_model_id during registration (Phase 2b-2). lfm2 keeps NO private id:
-// a separate one over the shared g_weights() map would collide with a co-resident
-// qwen3.5 model (see the QWEN35_MODEL_ID_COUNTER invariant in lfm2/model.rs).
+// by mlx_set_model_id during registration. lfm2 keeps NO private id: a separate
+// one over the shared g_weights() map would collide with a co-resident qwen3.5
+// model (see the QWEN35_MODEL_ID_COUNTER invariant in lfm2/model.rs).
 
-// Decode-graph config consumed by `lfm2_decode_fn`. Set by the caller (the
-// 2b-1 probe; 2b-2 `init_from_prefill`) before invoking the loop. `g_lfm2_config`
-// is the POD shape; `g_lfm2_is_attn` is the per-layer dispatch (1=attn, 0=conv),
-// length num_layers — kept OUT of the POD (which must stay copyable per cfg).
+// Decode-graph config consumed by `lfm2_decode_fn`. Set by the caller (the probe
+// or `init_from_prefill`) before invoking the loop. `g_lfm2_config` is the POD
+// shape; `g_lfm2_is_attn` is the per-layer dispatch (1=attn, 0=conv), length
+// num_layers — kept OUT of the POD (which must stay copyable per cfg).
 lfm2_common::Lfm2MoeConfig g_lfm2_config;
 std::vector<int> g_lfm2_is_attn;
 
@@ -79,8 +72,8 @@ std::vector<int> g_lfm2_is_attn;
 //
 // INVARIANT: every attention KV cache is padded to the SAME max_kv_len; the
 // additive decode mask (positions <= offset -> 0, else -inf) is derived from the
-// first attention layer's key cache. (2b-1 calls this EAGERLY via the probe;
-// 2b-2 wraps it in mlx::core::compile.)
+// first attention layer's key cache. (The probe calls this EAGERLY; production
+// wraps it in mlx::core::compile.)
 // =====================================================================
 std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
   using namespace lfm2_common;
@@ -136,15 +129,13 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
 
     // (2) ffn_norm BEFORE the FFN, residual after (EVERY layer).
     //
-    // Per-layer FFN dispatch (Phase 3a): a layer is a MoE layer iff the model has
-    // experts (num_experts > 0) AND its index is >= num_dense_layers; otherwise it
-    // is dense SwiGLU. A pure-dense lfm2 checkpoint has num_experts == 0, so EVERY
-    // layer takes the dense path and behavior is UNCHANGED from Phase 2 (the
-    // num_dense_layers default of 0 is irrelevant when num_experts == 0). The MoE
-    // arm runs the sparse routing: router softmax + selection-only expert_bias +
-    // top-k + switch_mlp SwiGLU + weighted sum (lfm2_moe_ffn). The Phase-2b-2 gate
-    // flip still gates on `!config.is_moe()`; the production MoE gate is lifted in
-    // Phase 3c.
+    // Per-layer FFN dispatch: a layer is a MoE layer iff the model has experts
+    // (num_experts > 0) AND its index is >= num_dense_layers; otherwise it is
+    // dense SwiGLU. A pure-dense lfm2 checkpoint has num_experts == 0, so EVERY
+    // layer takes the dense path (the num_dense_layers default of 0 is irrelevant
+    // when num_experts == 0). The MoE arm runs the sparse routing: router softmax
+    // + selection-only expert_bias + top-k + switch_mlp SwiGLU + weighted sum
+    // (lfm2_moe_ffn).
     auto ffn_in =
         mlx::core::fast::rms_norm(h, get_weight(lp + ".ffn_norm.weight"), cfg.norm_eps);
     bool is_moe_layer = cfg.num_experts > 0 && i >= cfg.num_dense_layers;
@@ -172,8 +163,8 @@ std::vector<array> lfm2_decode_fn(const std::vector<array>& inputs) {
 }
 
 // =====================================================================
-// Production decode state (2b-2 Stage B/C). Mirrors the qwen35-MoE
-// flat-path globals (`g_moe_caches` / `g_moe_offset_int` / `g_moe_inited`).
+// Production decode state. Mirrors the qwen35-MoE flat-path globals
+// (`g_moe_caches` / `g_moe_offset_int` / `g_moe_inited`).
 //
 //   g_lfm2_caches      live cache vector, uniform stride 2 by ABSOLUTE layer
 //                      idx. attn layer i -> (kv_keys, kv_values) padded to
@@ -196,20 +187,20 @@ uint64_t g_lfm2_forward_calls = 0;
 uint64_t g_lfm2_compiled_decode_calls = 0;
 
 // =====================================================================
-// PAGED decode state (Phase P1 — the compiled-paged graph). Strictly SEPARATE
-// from the flat globals above so the two paths never alias. The flat path threads
-// a fixed-shape padded KV cache + additive mask; the paged path threads the
-// shared block-paged Metal pools (`mlx::core::fast::paged_kv_write` /
-// `paged_attention`) plus per-turn conv state.
+// PAGED decode state (the compiled-paged graph). Strictly SEPARATE from the flat
+// globals above so the two paths never alias. The flat path threads a
+// fixed-shape padded KV cache + additive mask; the paged path threads the shared
+// block-paged Metal pools (`mlx::core::fast::paged_kv_write` / `paged_attention`)
+// plus per-turn conv state.
 //
-// CONV-STATE THREADING CONTRACT (the [HIGH] finding — design (A)):
+// CONV-STATE THREADING CONTRACT (design (A)):
 //   Conv state is threaded EXACTLY like qwen's linear caches: as a graph
 //   input/output cache SLOT, NOT via a side global. `lfm2_decode_fn_paged`
 //   reads each conv layer's prior state from its stride-4 INPUT slot
 //   (`inputs[base+0]`) and writes the new state to its stride-2 OUTPUT slot
 //   (`new_caches[i*kPerLayerOut]`). There is NO separate conv-state global —
-//   the per-turn storage that P2's `mlx_lfm2_moe_forward_paged` re-feeds each
-//   step is the per-layer slot vector `g_lfm2_paged_k_pools[i]`, REUSED to hold
+//   the per-turn storage that `mlx_lfm2_moe_forward_paged` re-feeds each step
+//   is the per-layer slot vector `g_lfm2_paged_k_pools[i]`, REUSED to hold
 //   the conv state for conv layers (this is qwen's exact convention: qwen
 //   stores attn pools in `g_dense_k_pools[i]` and threads linear/conv caches in
 //   the parallel `g_dense_paged_linear_caches` slots, indexed by the same `i`
@@ -228,11 +219,11 @@ uint64_t g_lfm2_compiled_decode_calls = 0;
 //                               * attn layer i: holds the paged K pool;
 //                               * conv layer i: holds the conv state
 //                                 [B, l_cache-1, hidden].
-//                             P2 feeds this into `fn_inputs[base+0]` and writes
-//                             back `outputs[2+i*2]` here every step. Threaded
-//                             WITHIN a turn only (the eager paged path reprefills
-//                             conv each turn, so there is no cross-turn conv
-//                             export — see plan risk #5).
+//                             The forward feeds this into `fn_inputs[base+0]` and
+//                             writes back `outputs[2+i*2]` here every step.
+//                             Threaded WITHIN a turn only (the eager paged path
+//                             reprefills conv each turn, so there is no cross-turn
+//                             conv export).
 //   g_lfm2_paged_v_pools /    per-ABSOLUTE-layer paged pools / scales. Meaningful
 //   g_lfm2_paged_k_scales /   for attn layers only; conv layers hold bf16/f32
 //   g_lfm2_paged_v_scales     placeholders so per-layer indexing stays uniform
@@ -241,7 +232,7 @@ uint64_t g_lfm2_compiled_decode_calls = 0;
 //                             modulo `is_linear` test like qwen's does NOT apply;
 //                             the explicit is_attn vector drives dispatch).
 //   g_lfm2_paged_offset_int   current decode position (RoPE offset for next step).
-//   g_lfm2_paged_inited       gates the (P2) paged forward FFI.
+//   g_lfm2_paged_inited       gates the paged forward FFI.
 //   g_lfm2_paged_forward_calls  cumulative count of mlx_lfm2_moe_forward_paged
 //                             calls that ran the C++ paged decode (BOTH the
 //                             compiled AND the eager MLX_NO_COMPILE arm). This is
@@ -256,7 +247,7 @@ uint64_t g_lfm2_compiled_decode_calls = 0;
 //                             TRACED compiled_lfm2_decode_paged() branch (NOT the
 //                             eager MLX_NO_COMPILE arm). Process-lifetime
 //                             engagement signal; incremented only in the compiled
-//                             arm (P2). Distinct from the flat counter above.
+//                             arm. Distinct from the flat counter above.
 // =====================================================================
 lfm2_common::Lfm2MoeConfig g_lfm2_paged_config;
 std::vector<int> g_lfm2_paged_is_attn;
@@ -289,7 +280,7 @@ static void lfm2_reset_paged_globals() {
 }
 
 // ---------------------------------------------------------------------------
-// REBUILDABLE compiled-decode closure (Phase 3c hardening).
+// REBUILDABLE compiled-decode closure.
 //
 // The compiled `lfm2_decode_fn` graph captures the weight CONSTANTS resolved by
 // `get_weight()` at TRACE time. When a NEW lfm2 model registers its weights
@@ -303,7 +294,7 @@ static void lfm2_reset_paged_globals() {
 // (and on weight clear); a mismatch forces a recompile that re-captures the
 // live constants.
 //
-// THREAD-SAFETY CONTRACT (the [HIGH] finding):
+// THREAD-SAFETY CONTRACT:
 //   * `g_lfm2_compile_epoch` is an atomic publish counter; ANY thread can bump
 //     it via `mlx_lfm2_invalidate_compiled()` (called under the registration
 //     write lock).
@@ -355,9 +346,9 @@ inline std::uintptr_t lfm2_fun_id_base() {
 // keeps every epoch's id distinct and odd. This is lfm2-LOCAL — it does not
 // touch qwen3.5's independent compiled path.
 //
-// THREAD-SAFETY (the [HIGH] finding): `g_lfm2_compiled_mu` guards the whole
-// epoch-check + (re)compile + erase (all touch the non-atomic optional / id
-// state and the MLX compile cache); we return BY VALUE so a concurrent
+// THREAD-SAFETY: `g_lfm2_compiled_mu` guards the whole epoch-check + (re)compile
+// + erase (all touch the non-atomic optional / id state and the MLX compile
+// cache); we return BY VALUE so a concurrent
 // invalidate that reassigns the optional cannot dangle the caller's handle.
 std::function<std::vector<array>(const std::vector<array>&)> compiled_lfm2_decode() {
   std::lock_guard<std::mutex> lk(g_lfm2_compiled_mu);
@@ -398,7 +389,7 @@ void lfm2_reset_compiled_closure_same_epoch() {
 }
 
 // =====================================================================
-// PAGED single-token decode loop over the lfm2 backbone (Phase P1).
+// PAGED single-token decode loop over the lfm2 backbone.
 //
 // A fork of `lfm2_decode_fn` that swaps the flat fixed-shape padded KV cache +
 // additive-mask SDPA for the block-paged KV pool (`mlx::core::fast::
@@ -440,7 +431,7 @@ void lfm2_reset_compiled_closure_same_epoch() {
 //       [2 + i*2 + 1]    new_v_pool         (post-write pool tensor)
 //
 // The 4-input / 2-output stride is identical to the qwen paged graphs and the
-// flat lfm2 graph's 2-output stride, so P2's `mlx_lfm2_moe_forward_paged` writes
+// flat lfm2 graph's 2-output stride, so `mlx_lfm2_moe_forward_paged` writes
 // the post-step caches back with the SAME indexing the flat forward uses (attn:
 // pools, conv: conv state in slot.a, slot.b left as the seeded scalar zero).
 // =====================================================================
@@ -457,7 +448,7 @@ std::vector<array> lfm2_decode_fn_paged(const std::vector<array>& inputs) {
   // uniform header with qwen's paged graphs; not read here.
   auto seq_lens = inputs[6];
 
-  // Phase P1 hard-coded contract (matches qwen attn_for_compile_paged).
+  // Hard-coded contract (matches qwen attn_for_compile_paged).
   constexpr int BLOCK_SIZE = 16;
 
   constexpr int kHeader = 7;
@@ -527,7 +518,7 @@ std::vector<array> lfm2_decode_fn_paged(const std::vector<array>& inputs) {
 }
 
 // ---------------------------------------------------------------------------
-// REBUILDABLE compiled-PAGED-decode closure (Phase P1).
+// REBUILDABLE compiled-PAGED-decode closure.
 //
 // A SECOND epoch-keyed closure that mirrors `compiled_lfm2_decode()` exactly but
 // for `lfm2_decode_fn_paged`, with a DISTINCT `fun_id` base so the flat and paged
@@ -786,7 +777,8 @@ array lfm2_run_synthetic_decode(const Lfm2SyntheticMoe& m, bool compiled) {
 
 extern "C" {
 
-// GATE source. Returns 0 in Phase 0 (no setter wired) → compiled path OFF.
+// GATE source: the shared active model id (0 when no model registered → compiled
+// path OFF).
 uint64_t mlx_lfm2_get_model_id() {
   return qwen35_common::g_active_model_id().load(std::memory_order_acquire);
 }
@@ -1061,7 +1053,7 @@ void mlx_lfm2_moe_reset() {
 // (in `compiled_lfm2_decode()`) acquire-loads under `g_lfm2_compiled_mu`, so the
 // epoch publish is ordered ahead of any decode that observes it.
 //
-// FREED-CONSTANT NOTE ([LOW] finding): `mlx_clear_weights` (mlx_common_weights
+// FREED-CONSTANT NOTE: `mlx_clear_weights` (mlx_common_weights
 // .cpp) frees the weight constants AND resets the active model id to 0, but does
 // NOT itself bump this epoch. That is SAFE: after a bare clear, the active model
 // id is 0, so `compiled_path_active()` / `mlx_lfm2_get_model_id()` no longer
@@ -1078,7 +1070,7 @@ void mlx_lfm2_invalidate_compiled() {
 }
 
 // =============================================================================
-// PAGED forward FFI (Phase P2). Mirrors qwen35's
+// PAGED forward FFI. Mirrors qwen35's
 // `mlx_qwen35_init_paged` / `mlx_qwen35_forward_paged` /
 // `mlx_qwen35_compiled_reset` (paged half) and the flat lfm2
 // `mlx_lfm2_moe_init_from_prefill` / `mlx_lfm2_moe_forward` style. Drives the
@@ -1373,7 +1365,7 @@ void mlx_lfm2_moe_forward_paged(
     auto flat_ids = reshape(input_ids, {-1});
     auto h = take(embedding, flat_ids, 0);
 
-    // Assemble fn_inputs in the P1 stride-4 order (see lfm2_decode_fn_paged):
+    // Assemble fn_inputs in the stride-4 order (see lfm2_decode_fn_paged):
     //   [0..6] header, then per ABSOLUTE layer i (stride 4):
     //     attn: k_pool, v_pool, k_scale, v_scale
     //     conv: conv_state, placeholder*3
@@ -1494,14 +1486,13 @@ uint64_t mlx_lfm2_moe_paged_forward_call_count() {
 // CALLER CONTRACT — these are DESTRUCTIVE on the process-global `g_weights()`
 // registry: each does `mlx_clear_weights -> store -> run -> mlx_clear_weights`,
 // and `mlx_clear_weights` ALSO resets the active model id. That registry is the
-// SAME one the production compiled paths (qwen3.5 / qwen3.5-MoE / gemma4, and
-// eventually lfm2) own during registration + inference, guarded process-wide by
-// the Rust `COMPILED_WEIGHTS_RWLOCK`. A probe call that overlaps a live compiled
+// SAME one the production compiled paths (qwen3.5 / qwen3.5-MoE / lfm2) own
+// during registration + inference, guarded process-wide by the Rust
+// `COMPILED_WEIGHTS_RWLOCK`. A probe call that overlaps a live compiled
 // registration/inference would wipe its weights mid-flight. So every caller MUST
 // hold `COMPILED_WEIGHTS_RWLOCK` (write) across the whole probe call — the Rust
 // parity tests do exactly this. Do NOT call these from any production path; they
-// exist solely for the component-parity gate (the full compiled forward is not
-// end-to-end runnable until the backbone lands in Phase 2+).
+// exist solely for the component-parity gate.
 // =============================================================================
 
 // Run a SEQUENCE of `T` lfm2 attention decode steps (B=1, offset 0..T-1)
@@ -1729,13 +1720,13 @@ mlx_array* mlx_lfm2_probe_attn_arr_seq(
 
 // Run a SYNTHETIC small dense lfm2 model through the FULL `lfm2_decode_fn`
 // assembly for `T` decode steps and return the LAST step's logits [1, vocab].
-// This is the 2b-1 end-to-end-SHAPED parity gate: it exercises the per-layer
-// conv-vs-attn dispatch (from is_attn[]), the operator_norm->op->+res->ffn_norm->
-// mlp->+res order, the conv-state vs KV slot interleaving at uniform stride 2,
-// the final embedding_norm, and the tied embed_tokens head — WITHOUT the real
-// checkpoint and WITHOUT flipping the production gate (mlx_lfm2_get_model_id
-// stays 0). `lfm2_decode_fn` is invoked EAGERLY (un-compiled) so a graph-trace
-// bug cannot be masked; the compiled path is validated in 2b-2.
+// End-to-end-SHAPED parity gate: it exercises the per-layer conv-vs-attn dispatch
+// (from is_attn[]), the operator_norm->op->+res->ffn_norm->mlp->+res order, the
+// conv-state vs KV slot interleaving at uniform stride 2, the final
+// embedding_norm, and the tied embed_tokens head — WITHOUT the real checkpoint
+// and WITHOUT flipping the production gate (mlx_lfm2_get_model_id stays 0).
+// `lfm2_decode_fn` is invoked EAGERLY (un-compiled) so a graph-trace bug cannot
+// be masked.
 //
 // Per-layer weights are passed as arrays-of-pointers indexed by layer; conv
 // layers ignore the attn pointers and vice versa (read per is_attn[i]). The
@@ -1783,10 +1774,10 @@ mlx_array* mlx_lfm2_probe_decode_seq(
         mlx_store_weight((lp + ".conv.in_proj.weight").c_str(), in_proj_w[i]);
         mlx_store_weight((lp + ".conv.conv.weight").c_str(), conv_w[i]);  // [H,l_cache,1]
         mlx_store_weight((lp + ".conv.out_proj.weight").c_str(), out_proj_w[i]);
-        // Phase 4 Piece 1: conv biases under the SAME keys lfm2_conv_pure_fn's
-        // get_weight reads (conv.in_proj.bias / conv.conv.bias /
-        // conv.out_proj.bias). Only when conv_bias is on, so the conv_bias==0
-        // probe call is byte-identical to before.
+        // Conv biases under the SAME keys lfm2_conv_pure_fn's get_weight reads
+        // (conv.in_proj.bias / conv.conv.bias / conv.out_proj.bias). Only when
+        // conv_bias is on, so the conv_bias==0 probe call is byte-identical to
+        // the no-bias case.
         if (conv_bias) {
           mlx_store_weight((lp + ".conv.in_proj.bias").c_str(), in_proj_b_w[i]);
           mlx_store_weight((lp + ".conv.conv.bias").c_str(), conv_b_w[i]);
@@ -1857,7 +1848,7 @@ mlx_array* mlx_lfm2_probe_decode_seq(
 
 // Run a SYNTHETIC small MoE lfm2 model through the FULL `lfm2_decode_fn`
 // assembly for `T` decode steps and return the LAST step's logits [1, vocab].
-// This is the Phase-3a end-to-end-SHAPED MoE parity gate: it exercises the
+// End-to-end-SHAPED MoE parity gate: it exercises the
 // per-layer dense-vs-MoE FFN dispatch (layers >= num_dense_layers route through
 // `lfm2_moe_ffn`: router softmax + selection-only expert_bias + top-k +
 // switch_mlp SwiGLU + weighted sum), threaded through the same conv/attn
@@ -2291,7 +2282,7 @@ int mlx_lfm2_probe_moe_ab_swap(uint64_t seed_a, uint64_t seed_b,
     };
 
     // ---- (1) MODEL A: build, compile (caches the graph), capture. ----
-    // F3: build_model just did a destructive clear+store (mlx_clear_weights +
+    // build_model just did a destructive clear+store (mlx_clear_weights +
     // re-store). Mirror register_weights_with_cpp's pre-decode epoch bump so a
     // compiled closure cached by an EARLIER probe at the current epoch cannot be
     // reused for MODEL A's freshly-stored weights. Without this, MODEL A's first

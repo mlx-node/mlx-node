@@ -239,11 +239,11 @@ fn plq_to_packed_params(plq: PerLayerQuant) -> (i32, i32, &'static str) {
 /// Load a NON-MoE `Embedding` either PACKED-quantized (ANY mode) or plain bf16,
 /// keyed off `{base}.scales`.
 ///
-/// #1b: the embedding now stays PACKED-resident. `nn::Embedding::
+/// The embedding stays PACKED-resident: `nn::Embedding::
 /// load_quantized_packed` retains the packed `.weight`/`.scales`/(`.biases`)
 /// AS-IS — it does NOT pre-dequantize the table — so a fully-quantized lfm2
 /// checkpoint (incl. the embedding) saves the full `vocab × hidden × 2` bytes
-/// the old dense table cost. `forward` gather-then-dequantizes only the looked-
+/// a dense table would cost. `forward` gather-then-dequantizes only the looked-
 /// up rows; the tied lm_head logits path calls `Embedding::as_linear` (a
 /// `mlx_quantized_matmul` on the packed tensors), so the dense table is never
 /// materialized.
@@ -280,14 +280,12 @@ fn load_embedding_affine_or_bf16(
 /// Load the separate (untied) `lm_head` `Linear` either affine-quantized or
 /// plain bf16, keyed off `{base}.scales`.
 ///
-/// SCOPE (#1a): the lm_head — like the embedding — is OUT OF SCOPE for the
-/// non-MoE mode-aware refactor. It shares the vocab dimension and is excluded
+/// The lm_head — like the embedding — shares the vocab dimension and is excluded
 /// from quantization by the converter (`should_quantize` skips `lm_head`, and
 /// `is_affine_only_key` lists it), so in practice it always loads plain bf16.
-/// We keep the affine-only fail-loud path here (matching the prior behavior)
-/// for any hand-quantized untied head: `nn::Linear::load_quantized` is
-/// affine-only, so a non-affine `.scales` is rejected rather than silently
-/// mis-dequantized. A quant-capable lm_head/embedding lands in #1b.
+/// We keep the affine-only fail-loud path here for any hand-quantized untied
+/// head: `nn::Linear::load_quantized` is affine-only, so a non-affine `.scales`
+/// is rejected rather than silently mis-dequantized.
 fn load_lm_head_affine_or_bf16(
     linear: &mut Linear,
     params: &HashMap<String, MxArray>,
@@ -726,8 +724,7 @@ fn apply_weights(
     }
 
     // Separate lm_head when tie_embedding is false (affine-quantized or bf16).
-    // Out of scope for #1a's non-MoE mode-aware refactor (vocab-dim tensor,
-    // converter-excluded); stays on the affine-only path.
+    // Vocab-dim tensor, converter-excluded; stays on the affine-only path.
     if let Some(ref mut head) = inner.lm_head {
         load_lm_head_affine_or_bf16(head, params, "lm_head", per_layer_quant, default_plq)?;
     }
@@ -1086,10 +1083,9 @@ fn validate_mandatory_weights(
 
     // The attention / conv-proj linears + the embedding are quantized
     // INDEPENDENTLY per tensor. A fully quantized `mlx_lm.convert --quantize`
-    // checkpoint quantizes every attention / conv-proj linear (the embedding
-    // stays bf16 until #1b); the loader (`load_linear_proj_quantized_or_bf16` /
-    // `load_embedding_affine_or_bf16`) resolves each tensor on its OWN
-    // `.scales` presence:
+    // checkpoint quantizes every attention / conv-proj linear; the loader
+    // (`load_linear_proj_quantized_or_bf16` / `load_embedding_affine_or_bf16`)
+    // resolves each tensor on its OWN `.scales` presence:
     //   - `.scales` present → load quantized (ANY mode for the non-MoE linears;
     //     affine-only for the embedding) from the `.weight`+`.scales` group (a
     //     lone `.scales` with no packed `.weight` is caught by the mandatory
@@ -1216,18 +1212,17 @@ fn validate_mandatory_weights(
 /// ## The packed sum IS the resident footprint (no dense deltas)
 ///
 /// The baseline `sum(params.values().nbytes())` measures the PACKED checkpoint
-/// tensors (`materialize_weights` evals exactly that set). After #1b EVERY
-/// quantized lfm2 tensor class stays PACKED-resident — none materializes a
-/// dense dequant copy:
+/// tensors (`materialize_weights` evals exactly that set). EVERY quantized lfm2
+/// tensor class stays PACKED-resident — none materializes a dense dequant copy:
 ///
 /// - **Non-MoE linears** (attention q/k/v/out, conv in/out, dense-MLP gate/up/
 ///   down) are mode-aware `LinearProj`/`MLPVariant` backed by `QuantizedLinear`:
 ///   `forward` runs `mlx_quantized_matmul` on the packed weight, never reading
-///   `get_weight()` (#1a).
+///   `get_weight()`.
 /// - **MoE experts** are `QuantizedSwitchLinear` (`gather_qmm` on packed
 ///   tensors).
-/// - **Embedding** now installs a PACKED backend via
-///   `nn::Embedding::load_quantized_packed` (#1b): the dense `vocab × hidden`
+/// - **Embedding** installs a PACKED backend via
+///   `nn::Embedding::load_quantized_packed`: the dense `vocab × hidden`
 ///   table is NEVER materialized — `forward` gather-then-dequantizes only the
 ///   looked-up rows, and the tied lm_head logits path runs
 ///   `Embedding::as_linear` (`mlx_quantized_matmul` on the packed tensors). The
@@ -1255,7 +1250,7 @@ impl Lfm2Inner {
     ///
     /// Returns the constructed inner alongside a deterministic resident
     /// weight-byte total (via [`compute_weight_bytes`]) for the cache-limit
-    /// coordinator. After #1b every quantized lfm2 tensor class (non-MoE
+    /// coordinator. Every quantized lfm2 tensor class (non-MoE
     /// linears, MoE experts, embedding) is packed-only resident, so the total is
     /// exactly the packed-tensor sum — no dense dequant copies to add. See
     /// `cache_limit.rs` module docs for why this deterministic measurement is
@@ -1323,8 +1318,8 @@ impl Lfm2Inner {
         // (see the registration gate below — it lifts the paged route well above
         // eager-PAGED), but FLAT stays the default; pin `use_block_paged_cache:
         // true` in config.json to opt into compiled-PAGED. bf16 (no `.scales`)
-        // stays `None` so `Lfm2Inner::new`'s `unwrap_or(true)` keeps PAGED (PR #66
-        // compiled-PAGED ~1.5×). Explicit `use_block_paged_cache` in config.json
+        // stays `None` so `Lfm2Inner::new`'s `unwrap_or(true)` keeps PAGED
+        // (compiled-PAGED ~1.5×). Explicit `use_block_paged_cache` in config.json
         // always wins.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
         {
@@ -1369,42 +1364,40 @@ impl Lfm2Inner {
         }
 
         // Register weights with the compiled C++ decode path for a non-quantized
-        // bf16/f16 checkpoint — DENSE or sparse-MoE, FLAT or PAGED. Phase 3c
-        // lifted the MoE exclusion: `lfm2_decode_fn`'s MoE branch (driven by the
-        // MoE config threaded into `mlx_lfm2_moe_init_from_prefill`) applies the
-        // sparse top-k `lfm2_switch_linear` FFN to MoE layers and `lfm2_dense_mlp`
-        // to the dense layers, matching the native `Lfm2Inner::forward`. Because
+        // bf16/f16 checkpoint — DENSE or sparse-MoE, FLAT or PAGED. `lfm2_decode_fn`'s
+        // MoE branch (driven by the MoE config threaded into
+        // `mlx_lfm2_moe_init_from_prefill`) applies the sparse top-k
+        // `lfm2_switch_linear` FFN to MoE layers and `lfm2_dense_mlp` to the dense
+        // layers, matching the native `Lfm2Inner::forward`. Because
         // `compiled_path_active()` is a pure id-equality probe and the id is
         // published ONLY here, gating the registration makes the compiled path
         // structurally impossible for the checkpoints still excluded below.
         //
-        // P4 WIDENED the gate: a non-quantized bf16/f16 PAGED checkpoint now ALSO
-        // registers, so the compiled-PAGED decode graph
-        // (`lfm2_decode_fn_paged`, seeded by `init_lfm2_paged_compiled_session` →
-        // `mlx_lfm2_moe_init_paged`) can read weights via `get_weight`. The same
-        // single weight map and `model_id` serve BOTH the flat
-        // (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`) compiled graphs;
-        // the per-step dispatcher (`chat_sync_core` flat vs
+        // A non-quantized bf16/f16 PAGED checkpoint ALSO registers, so the
+        // compiled-PAGED decode graph (`lfm2_decode_fn_paged`, seeded by
+        // `init_lfm2_paged_compiled_session` → `mlx_lfm2_moe_init_paged`) can read
+        // weights via `get_weight`. The same single weight map and `model_id` serve
+        // BOTH the flat (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`)
+        // compiled graphs; the per-step dispatcher (`chat_sync_core` flat vs
         // `chat_sync_core_paged_inner` paged) picks the right graph. The
-        // single-owner `g_weights`/`model_id` clobber contract is unchanged:
-        // `register_weights_with_cpp` still clears the map, stores, bumps the
-        // compile epoch, then publishes `model_id` LAST under
-        // `COMPILED_WEIGHTS_RWLOCK.write()`.
+        // single-owner `g_weights`/`model_id` clobber contract:
+        // `register_weights_with_cpp` clears the map, stores, bumps the compile
+        // epoch, then publishes `model_id` LAST under `COMPILED_WEIGHTS_RWLOCK.write()`.
         //
-        // QUANTIZED checkpoints ALSO register now (lifting the former Phase-3b
-        // exclusion): `register_weights_with_cpp_locked` publishes authoritative
-        // per-projection quant-info (`mlx_store_quant_info`) for every `.scales`
-        // companion, so the compiled `linear_proj` / `lfm2_switch_linear` dispatch
-        // the exact (mode, bits, group_size) the eager loaders use instead of the
-        // companion-tensor heuristic (which conflated MXFP4 / NVFP4 with MXFP8).
-        // Both compiled graphs (flat `lfm2_decode_fn`, paged `lfm2_decode_fn_paged`)
-        // read the same registry. Gated behind the `MLX_LFM2_DISABLE_QUANT_COMPILED`
-        // escape hatch; compiled-PAGED additionally requires the bf16-activation
-        // invariant (below) and a dense (NOT packed-quant) input embedding — the
-        // C++ does a dense `take` over `embed_tokens`, so a packed-quant embedding
+        // QUANTIZED checkpoints ALSO register:
+        // `register_weights_with_cpp_locked` publishes authoritative per-projection
+        // quant-info (`mlx_store_quant_info`) for every `.scales` companion, so the
+        // compiled `linear_proj` / `lfm2_switch_linear` dispatch the exact (mode,
+        // bits, group_size) the eager loaders use instead of the companion-tensor
+        // heuristic (which conflated MXFP4 / NVFP4 with MXFP8). Both compiled graphs
+        // (flat `lfm2_decode_fn`, paged `lfm2_decode_fn_paged`) read the same
+        // registry. Gated behind the `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch;
+        // compiled-PAGED additionally requires the bf16-activation invariant (below)
+        // and a dense (NOT packed-quant) input embedding — the C++ does a dense
+        // `take` over `embed_tokens`, so a packed-quant embedding
         // (`embed_tokens.scales` present) is barred from the compiled path here.
         //
-        // `conv_bias=true` checkpoints ARE supported (Phase 4 Piece 1): the
+        // `conv_bias=true` checkpoints ARE supported: the
         // `conv_bias` flag is threaded into `mlx_lfm2_moe_init_from_prefill` /
         // `mlx_lfm2_moe_init_paged`, so the conv pure-fn adds the three conv
         // biases (`conv.in_proj.bias`, `conv.conv.bias`, `conv.out_proj.bias`)
@@ -1506,7 +1499,7 @@ impl Lfm2Inner {
 
         // Deterministic weight-byte total for the cache-limit coordinator,
         // computed from the still-live `params` map before it is dropped at
-        // end-of-function. After #1b every quantized lfm2 tensor class is
+        // end-of-function. Every quantized lfm2 tensor class is
         // packed-only resident — the embedding installs a PACKED backend (its
         // dense `vocab × hidden` table is never materialized; `self.weight` is a
         // tiny placeholder), and the non-MoE/dense-MLP/MoE linears all run
@@ -1538,7 +1531,7 @@ impl Lfm2Inner {
 /// `.unwrap()` / `.expect()` — lock poison is recovered and a NUL byte in a
 /// weight name propagates via `?`.
 ///
-/// Handles DENSE and sparse-MoE bf16/f16 checkpoints (Phase 3c). MoE adds three
+/// Handles DENSE and sparse-MoE bf16/f16 checkpoints. MoE adds three
 /// kinds of tensors that the generic store loop below registers without any
 /// special-casing here:
 ///   * stacked experts `feed_forward.switch_mlp.{gate,up,down}_proj.weight`,
@@ -1551,16 +1544,15 @@ impl Lfm2Inner {
 ///   * `feed_forward.expert_bias`, shape `[E]` (1D, f32) — stored as-is.
 ///
 /// Still returns early (storing nothing, publishing no id) for quantized
-/// (`.scales`-suffixed, incl. quantized MoE = Phase 3b) checkpoints, mirroring
-/// the call-site gate. P4 widened the call-site gate to register BOTH flat
+/// (`.scales`-suffixed, incl. quantized MoE) checkpoints, mirroring the
+/// call-site gate. The call-site gate registers BOTH flat
 /// (`use_block_paged_cache == Some(false)`) AND paged (the default) bf16/f16
-/// checkpoints, so this registration is no longer flat-only; the per-step
-/// dispatcher picks the flat (`lfm2_decode_fn`) or paged (`lfm2_decode_fn_paged`)
-/// compiled graph against the SAME registered weight map. `conv_bias=true`
-/// checkpoints ARE registered (Phase 4 Piece 1): the three conv biases ride the
-/// generic store loop under the same keys `lfm2_conv_pure_fn`'s `get_weight`
-/// reads, and the `conv_bias` flag is threaded to the compiled decode via the
-/// config FFI.
+/// checkpoints, so this registration is not flat-only; the per-step dispatcher
+/// picks the flat (`lfm2_decode_fn`) or paged (`lfm2_decode_fn_paged`) compiled
+/// graph against the SAME registered weight map. `conv_bias=true` checkpoints ARE
+/// registered: the three conv biases ride the generic store loop under the same
+/// keys `lfm2_conv_pure_fn`'s `get_weight` reads, and the `conv_bias` flag is
+/// threaded to the compiled decode via the config FFI.
 /// Whether EVERY registered floating weight is BFloat16 — the invariant the
 /// compiled-PAGED decode graph requires (its paged KV pools + static mask are
 /// bf16-only; a non-bf16 float anywhere in the per-layer chain would flow a
@@ -2062,7 +2054,7 @@ mod tests {
         }
     }
 
-    /// F3 regression (compiled-PAGED bf16-only gate): a full bf16 MoE param map
+    /// Regression (compiled-PAGED bf16-only gate): a full bf16 MoE param map
     /// (q/k/v included) PLUS the intentional f32 `*.expert_bias` is bf16-clean,
     /// so `all_registered_float_weights_are_bf16` is TRUE — the 8B-A1B
     /// checkpoint's exact dtype shape, which must keep engaging compiled-paged.
@@ -2081,13 +2073,12 @@ mod tests {
         );
     }
 
-    /// F3 regression: bf16 q/k/v but an f16 weight ELSEWHERE in the per-layer
+    /// Regression: bf16 q/k/v but an f16 weight ELSEWHERE in the per-layer
     /// chain (norm / conv / FFN / out_proj / lm_head) must make the gate FALSE.
-    /// This is exactly the mixed-dtype hole the adversarial re-review flagged: an
-    /// f16 upstream weight makes the hidden state (hence q/new_k/new_v) non-bf16
+    /// An f16 upstream weight makes the hidden state (hence q/new_k/new_v) non-bf16
     /// before the bf16-only `paged_kv_write`/`paged_attention`, so compiled-paged
-    /// must fall back to eager. Checking embed+q/k/v alone (the prior gate) would
-    /// have WRONGLY admitted every one of these.
+    /// must fall back to eager. Checking embed+q/k/v alone would WRONGLY admit
+    /// every one of these.
     #[test]
     fn bf16_gate_rejects_f16_weight_outside_qkv() {
         // Each key is bf16 in the fixture and consumed by lfm2_decode_fn_paged;
@@ -2116,7 +2107,7 @@ mod tests {
         }
     }
 
-    /// Registration-gate regression (PR #66 review + quant compiled-decode): the
+    /// Registration-gate regression: the
     /// gate publishes `model_id` into the single, cross-family `g_active_model_id`
     /// slot and EVICTS any resident compiled model, so register only when this
     /// model can itself take a compiled path. Flat is dtype/block-generic (no paged
@@ -2202,7 +2193,7 @@ mod tests {
         );
     }
 
-    /// F1 regression: a `use_expert_bias=true` flat bf16 MoE checkpoint that
+    /// Regression: a `use_expert_bias=true` flat bf16 MoE checkpoint that
     /// OMITS every `feed_forward.expert_bias` tensor must STILL register a
     /// complete compiled weight set — `register_weights_with_cpp` synthesizes a
     /// zero `[num_experts]` f32 bias per MoE layer so the compiled C++
@@ -2277,14 +2268,14 @@ mod tests {
         );
     }
 
-    // ===== Codex No-ship gap: PRODUCTION-PATH conv_bias=true compiled parity =====
+    // ===== PRODUCTION-PATH conv_bias=true compiled parity =====
     //
     // `compiled_decode_seq_matches_native_with_conv_bias` (compiled_parity_test.rs)
     // proves the conv-bias decode math via the EAGER probe
     // `mlx_lfm2_probe_decode_seq`, which registers weights, runs `lfm2_decode_fn`
     // EAGERLY, and clears the map — it never touches the production
     // `sanitize/apply/register -> init_from_prefill -> mlx_lfm2_moe_forward`
-    // (TRACED `compiled_lfm2_decode()`) path that commit 8f7c659 actually enabled.
+    // (TRACED `compiled_lfm2_decode()`) path.
     // This test closes that gap: it builds a synthetic DENSE conv_bias=true lfm2,
     // drives the REAL production register + prefill-seed + TRACED-forward seam, and
     // asserts the compiled final-step logits match a full NATIVE `Lfm2Inner::forward`
@@ -2331,7 +2322,7 @@ mod tests {
     /// A tiny DENSE (`num_experts: None` => `is_moe()` false, every layer dense
     /// SwiGLU) lfm2 config with `conv_bias: true`, flat caches
     /// (`use_block_paged_cache: Some(false)`), and a `[conv, full_attention, conv]`
-    /// hybrid stack — the production topology the 8f7c659 gate-lift enabled.
+    /// hybrid stack.
     fn tiny_dense_conv_bias_config() -> Lfm2Config {
         Lfm2Config {
             vocab_size: 32,
@@ -2503,14 +2494,14 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// Codex No-ship closer: drive the REAL production compiled path for a
+    /// Drive the REAL production compiled path for a
     /// conv_bias=true dense lfm2 (register -> native prefill seed ->
     /// `mlx_lfm2_moe_init_from_prefill` -> TRACED `mlx_lfm2_moe_forward`) and assert
     /// the final-step logits match a full native `Lfm2Inner::forward` reference
     /// within the lfm2 bf16 tolerance, plus that the traced forward engaged.
     ///
-    /// Holds `COMPILED_WEIGHTS_RWLOCK.write()` for the whole test (like the F1
-    /// test) so it is mutually exclusive with every other compiled-path test in
+    /// Holds `COMPILED_WEIGHTS_RWLOCK.write()` for the whole test so it is
+    /// mutually exclusive with every other compiled-path test in
     /// this `--lib` binary and calls the lock-free `_locked` worker directly (the
     /// non-reentrant std RwLock would deadlock on the wrapper). Tears down the C++
     /// decode state (`mlx_lfm2_moe_reset`) and the shared weight map
@@ -2948,7 +2939,7 @@ mod tests {
         );
     }
 
-    /// Codex [medium] regression: per-expert quant companions
+    /// Regression: per-expert quant companions
     /// (`feed_forward.experts.{e}.{proj}.{scales,biases}`) that survive sanitize
     /// (only `.weight` is stackable into `switch_mlp.*`) must be REJECTED.
     /// Otherwise the packed uint32 `.weight`s would stack, the layer would
@@ -3240,12 +3231,11 @@ mod tests {
         );
     }
 
-    /// A non-MoE `LinearProj` whose RESOLVED mode is MXFP8 must now LOAD (no
-    /// fail-loud): #1a makes the non-MoE linears mode-aware, so the loader
+    /// A non-MoE `LinearProj` whose RESOLVED mode is MXFP8 must LOAD (no
+    /// fail-loud): the non-MoE linears are mode-aware, so the loader
     /// installs an MXFP8 `QuantizedLinear` (mode="mxfp8", group_size=32,
     /// bits=8, NO biases) whose packed weight dequantizes back close to the
-    /// original. This is the proof the formerly-rejected non-affine path now
-    /// works.
+    /// original.
     #[test]
     fn loader_installs_mxfp8_quantized_backend_for_non_moe_linear() {
         // out=4, in=64 (two full mxfp8 groups of 32). Use the mxfp8 group_size.
@@ -3359,12 +3349,12 @@ mod tests {
 
     // ===== Task A: cache-accounting (packed-only resident) =====
     //
-    // After #1b every quantized lfm2 tensor class — non-MoE linears, MoE
-    // experts, AND the embedding — is PACKED-only resident: none materializes a
-    // dense dequant copy. So `compute_weight_bytes` must equal the packed
-    // checkpoint sum exactly, with NO dense delta added.
+    // Every quantized lfm2 tensor class — non-MoE linears, MoE experts, AND the
+    // embedding — is PACKED-only resident: none materializes a dense dequant
+    // copy. So `compute_weight_bytes` must equal the packed checkpoint sum
+    // exactly, with NO dense delta added.
 
-    /// Packed checkpoint sum (= the resident footprint after #1b).
+    /// Packed checkpoint sum (= the resident footprint).
     fn packed_only_bytes(params: &HashMap<String, MxArray>) -> u64 {
         params
             .values()
@@ -3422,7 +3412,7 @@ mod tests {
     #[test]
     fn weight_bytes_no_dense_mlp_delta_when_num_dense_layers_positive() {
         // Two dense layers (num_dense_layers=2) whose gate/up/down_proj are
-        // affine-quantized. After #1a the dense MLP is a `MLPVariant::Quantized`
+        // affine-quantized. The dense MLP is a `MLPVariant::Quantized`
         // backed by `QuantizedLinear`: its forward runs `mlx_quantized_matmul`
         // on the PACKED weight and NEVER materializes a dense `get_weight()`
         // copy. So the resident footprint of a quantized dense-MLP projection is
@@ -3486,7 +3476,7 @@ mod tests {
     #[test]
     fn weight_bytes_no_dense_mlp_delta_for_pure_dense_quantized_checkpoint() {
         // A PURE-DENSE (non-MoE) checkpoint with every layer's dense-MLP
-        // projections affine-quantized. After #1a these are
+        // projections affine-quantized. These are
         // `MLPVariant::Quantized` (packed-only resident, no dense `get_weight()`
         // copy), so `compute_weight_bytes` must NOT add a dense-MLP delta. With
         // a plain bf16 embedding it equals the packed sum exactly.

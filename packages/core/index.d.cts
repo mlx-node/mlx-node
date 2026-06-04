@@ -1240,16 +1240,15 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
-   * loaded by `persistence::apply_weights_inner`). Snapshotted at
-   * load time from `Qwen35Inner::has_mtp_weights()` so the TS
-   * `ChatSession` can auto-default `enableMtp = true` for
-   * MTP-capable checkpoints without dispatching a command into the
-   * model thread.
+   * Whether this checkpoint shipped an MTP head (module loaded by
+   * `persistence::apply_weights_inner`). Snapshotted at load time from
+   * `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
+   * auto-default `enableMtp = true` for MTP-capable checkpoints without
+   * dispatching a command into the model thread.
    *
-   * Note: this only reports weight availability. Whether the W6
-   * speculative-decode path actually runs on a given call also
-   * requires the per-request `enableMtp` flag.
+   * Note: this only reports weight availability. Whether the
+   * speculative-decode path actually runs on a given call also requires the
+   * per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
   /**
@@ -1430,16 +1429,16 @@ export declare class Qwen35MoeModel {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
-   * loaded by `persistence::apply_weights_moe_inner`). Snapshotted
-   * at load time from `Qwen35MoeInner::has_mtp_weights()` so the TS
-   * `ChatSession` can auto-default `enableMtp = true` for
-   * MTP-capable checkpoints without dispatching a command into the
-   * model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+   * Whether this checkpoint shipped an MTP head (module loaded by
+   * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
+   * `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
+   * auto-default `enableMtp = true` for MTP-capable checkpoints without
+   * dispatching a command into the model thread. Mirrors
+   * `Qwen3_5Model::has_mtp_weights`.
    *
-   * Note: this only reports weight availability. Whether the W6
-   * speculative-decode path actually runs on a given call also
-   * requires the per-request `enableMtp` flag.
+   * Note: this only reports weight availability. Whether the
+   * speculative-decode path actually runs on a given call also requires
+   * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
   /** Load a pretrained model from a directory. */
@@ -2458,24 +2457,23 @@ export interface ChatConfig {
    */
   reuseCache?: boolean | undefined;
   /**
-   * W6 (MTP): opt-in flag enabling the Multi-Token Prediction
-   * speculative decode loop on the dense compiled path. Requires
-   * the model checkpoint to carry an MTP head (otherwise
-   * silently ignored). Default: `false`.
+   * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
+   * loop on the dense compiled path. Requires the model checkpoint to carry
+   * an MTP head (otherwise silently ignored). Default: `false`.
    */
   enableMtp?: boolean | undefined;
   /**
-   * W6 (MTP): number of draft tokens per speculative cycle. Clamped
-   * to `[1, 5]` by the W5 verify FFI contract. Default: 1.
+   * MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
+   * by the verify FFI contract. Default: 1.
    *
-   * W6.8: when `mtpAdaptiveDepth` is `true`, this value is used as
-   * the throughput-policy seed and the expected-value policy's max
-   * depth. Adaptive depth is opt-in; set
-   * `mtpAdaptiveDepth: true` explicitly to enable it.
+   * When `mtpAdaptiveDepth` is `true`, this value is used as the
+   * throughput-policy seed and the expected-value policy's max depth.
+   * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
+   * enable it.
    */
   mtpDepth?: number | undefined;
   /**
-   * W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
+   * MTP: when true, the decode loop runs the adaptive
    * depth policy. Default mode is a per-depth EMA hill-climb plus
    * DFlash-style 3-state machine `full | reduced | probe`.
    * `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the

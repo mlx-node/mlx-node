@@ -1,4 +1,4 @@
-//! Integration tests for the Phase 3 profile-run auto-sizer.
+//! Integration tests for the profile-run auto-sizer.
 //!
 //! Runs against the public API in
 //! `crates/mlx-paged-attn/src/profile.rs`. The math-only steps
@@ -16,9 +16,8 @@
 //! These tests do NOT exercise the `profile_run_and_compute_num_blocks`
 //! glue (which calls a model forward and reads `mlx_get_peak_memory()`)
 //! because (a) it requires a fully loaded model with synthetic input,
-//! which is a model-specific concern that lives in Phases 4-9, and (b)
-//! it depends on host MLX state that integration tests for Phase 3
-//! shouldn't entangle.
+//! which is a model-specific concern, and (b) it depends on host MLX
+//! state that these integration tests shouldn't entangle.
 
 use mlx_paged_attn::metal::MetalDtype;
 use mlx_paged_attn::profile::{

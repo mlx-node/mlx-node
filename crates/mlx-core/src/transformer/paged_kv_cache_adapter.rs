@@ -5,12 +5,11 @@
 //! blocks (refcount > 1) without evicting each other — the vLLM block-paged
 //! design (see `vllm/v1/core/block_pool.py` and `kv_cache_utils.py`).
 //!
-//! P1C-1 wired the block lifecycle, prefix lookup, and registration. P1C-2
-//! (this file's current state) adds GPU writes via `update_keys_values`,
-//! backed by a shared `LayerKVPool` of per-layer Metal `Buffer` pairs.
-//! `gather_kv_for_decode` (P1C-3) is still out of scope.
+//! Covers the block lifecycle, prefix lookup, registration, and GPU writes
+//! via `update_keys_values`, backed by a shared `LayerKVPool` of per-layer
+//! Metal `Buffer` pairs. `gather_kv_for_decode` is out of scope.
 //!
-//! ## Storage design (B in the design doc)
+//! ## Storage design
 //!
 //! The adapter holds `(Arc<Mutex<BlockAllocator>>, Arc<LayerKVPool>)`. The
 //! allocator owns the *logical* lifecycle (refcounts / LRU / hashing); the
@@ -331,7 +330,7 @@ pub(crate) struct QueryInputInfo {
 /// Checks:
 /// 1. `queries` is 3-D `[1, num_query_heads, head_size]`.
 /// 2. `shape_at(0) == 1` (single-request adapter; multi-sequence batching is
-///    out of scope for P1C-3).
+///    out of scope).
 /// 3. `shape_at(1) > 0` (at least one query head).
 /// 4. `shape_at(2) == config.head_size` — kernel re-derives strides from
 ///    `num_query_heads * head_size`; an inner-dim mismatch would walk past
@@ -513,14 +512,13 @@ pub struct PagedKVCacheAdapter {
     /// lifecycle.
     prefix_lookup_done: bool,
 
-    /// Optional FP8 K/V scale manager (Phase 10). When `Some`, the adapter
+    /// Optional FP8 K/V scale manager. When `Some`, the adapter
     /// reads per-layer K/V scales from the manager and threads them into
     /// `update_keys_values` and `k_scale_array` / `v_scale_array`. When
     /// `None` (the default for every model wired so far — none of which
     /// run with `use_fp8_cache: Some(true)`), the adapter falls back to
-    /// `1.0` everywhere, exactly preserving the pre-Phase-10 behavior of
-    /// the placeholder accessors and `update_keys_values`. Configured via
-    /// [`Self::set_scale_manager`].
+    /// `1.0` everywhere via the placeholder accessors and
+    /// `update_keys_values`. Configured via [`Self::set_scale_manager`].
     ///
     /// The manager is wrapped in `Arc<Mutex<...>>` so callers can hold
     /// their own clone for orchestration (e.g. EMA updates from a separate
@@ -901,8 +899,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (semantically and byte-equal to
-    /// the pre-task-#48 behavior). The first-block-only semantics align
+    /// non-zero. Pass `0` for "no salt". The first-block-only semantics align
     /// with vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`); see
     /// [`mlx_paged_attn::BlockAllocator::find_longest_cache_hit`] for the
     /// full discussion. Callers that registered cached blocks with
@@ -1058,7 +1055,7 @@ impl PagedKVCacheAdapter {
     ///
     /// Walks the prompt's prefix-cache hash chain using
     /// `extra_keys_per_block[n]` for each block n. This is the load-bearing
-    /// Phase 6 primitive for multimodal cache isolation: a request whose
+    /// primitive for multimodal cache isolation: a request whose
     /// prompt contains image tokens passes per-block image hashes (built
     /// via [`compute_per_block_image_extra_keys`]) so identical text with
     /// different images produces distinct block hashes.
@@ -1078,8 +1075,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
-    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// non-zero. Pass `0` for "no salt" (the sentinel). The first-block-only
     /// semantics align with vLLM
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`); a different salt
     /// isolates block 0 and the chain breaks at the first miss, so a
@@ -1706,14 +1702,14 @@ impl PagedKVCacheAdapter {
     /// }
     /// ```
     ///
-    /// FP8 scale management (Phase 10): when [`Self::set_scale_manager`]
+    /// FP8 scale management: when [`Self::set_scale_manager`]
     /// has wired in a [`KvScaleManager`], `update_keys_values` reads the
     /// per-layer `k_scale` / `v_scale` from the manager and threads them
     /// into the `reshape_and_cache` Metal kernel. When no manager is
     /// configured (the default for every paged-cache caller in the tree
     /// today, all of which run with `use_fp8_cache: Some(false)`), the
     /// adapter falls back to `1.0` for both scales — a no-op for the
-    /// non-FP8 kernel template and exactly the pre-Phase-10 behavior.
+    /// non-FP8 kernel template.
     #[cfg(target_os = "macos")]
     pub fn update_keys_values(
         &mut self,
@@ -1800,11 +1796,8 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        // Phase 10: read per-layer FP8 scales from `KvScaleManager` when
-        // configured. Defaults to 1.0 (no-op for non-FP8 caches) when no
-        // manager is set — preserving the pre-Phase-10 placeholder
-        // semantics and keeping every existing caller's behavior bit-
-        // identical.
+        // Read per-layer FP8 scales from `KvScaleManager` when configured.
+        // Defaults to 1.0 (no-op for non-FP8 caches) when no manager is set.
         let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
 
         // SAFETY: keys/values are valid `MxArray`s held by the caller for
@@ -2256,7 +2249,7 @@ impl PagedKVCacheAdapter {
             }
         };
 
-        // 5b. Phase 10 — read per-layer FP8 K/V scales from the configured
+        // 5b. Read per-layer FP8 K/V scales from the configured
         //     `KvScaleManager` (or `(1.0, 1.0)` when no manager is wired).
         //     Symmetric with the write path in `update_keys_values`: the
         //     gather kernel must dequantize cache bytes with the same
@@ -2264,7 +2257,7 @@ impl PagedKVCacheAdapter {
         //     FP8 cache produced by a calibrated manager would be read
         //     back through unit scales and corrupt decode output.
         //     `read_layer_scales` propagates poisoned-mutex errors instead
-        //     of silently falling back to 1.0 — see Finding 2.
+        //     of silently falling back to 1.0.
         let (k_scale, v_scale) = self.read_layer_scales(layer_idx)?;
 
         // 6. Dispatch and wrap output in an MLX view over the Metal buffer.
@@ -2901,8 +2894,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
-    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// non-zero. Pass `0` for "no salt" (the sentinel). The first-block-only
     /// semantics align with vLLM
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt the caller
     /// uses here MUST match the salt a future `find_cached_prefix` passes
@@ -3047,7 +3039,7 @@ impl PagedKVCacheAdapter {
     /// is bit-equal to `register_full_blocks_for_reuse(&[], cache_salt)`
     /// (when called with the same `cache_salt`).
     ///
-    /// Phase 6 multimodal cache isolation: callers building per-block
+    /// Multimodal cache isolation: callers building per-block
     /// image hashes via [`compute_per_block_image_extra_keys`] thread the
     /// result here so the registered cache entries are isolated by image
     /// content.
@@ -3055,8 +3047,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
-    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// non-zero. Pass `0` for "no salt" (the sentinel). The first-block-only
     /// semantics align with vLLM
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
     /// must match the salt a future `find_cached_prefix_per_block` passes
@@ -3187,8 +3178,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
-    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// non-zero. Pass `0` for "no salt" (the sentinel). The first-block-only
     /// semantics align with vLLM
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
     /// must match the salt a future `find_cached_prefix` (in another
@@ -3268,7 +3258,7 @@ impl PagedKVCacheAdapter {
     /// the partial trailing block's K/V stays live across the turn
     /// boundary. The difference vs. the uniform variant: each block is
     /// hashed with its own `extra_keys_per_block[n]`, isolating the cache
-    /// by per-block content (multimodal Phase 6).
+    /// by per-block content (multimodal).
     ///
     /// Pass an all-empty per-block vec to get behavior bit-equal to
     /// `finalize_turn_keep_live(&[], cache_salt)` (when called with the
@@ -3277,8 +3267,7 @@ impl PagedKVCacheAdapter {
     /// ## `cache_salt`
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only when it is
-    /// non-zero. Pass `0` for "no salt" (the sentinel; semantically and
-    /// byte-equal to the pre-task-#48 behavior). The first-block-only
+    /// non-zero. Pass `0` for "no salt" (the sentinel). The first-block-only
     /// semantics align with vLLM
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`). The salt used here
     /// must match the salt a future `find_cached_prefix_per_block` (in
@@ -3484,7 +3473,7 @@ impl PagedKVCacheAdapter {
     }
 
     /// Materialize the standardized `PagedAttentionInputs` for a
-    /// compiled-forward dispatch (Phase 3+).
+    /// compiled-forward dispatch.
     ///
     /// Layout (matches `mlx::core::fast::paged::PagedAttentionInputs` in
     /// `mlx_common.h`):
@@ -3585,7 +3574,7 @@ impl PagedKVCacheAdapter {
             .map_err(|e| format!("build_paged_attention_inputs offset_arr: {e}"))?;
 
         // 2. block_table: sentinel-pad to [1, max_blocks_per_seq]. The kernel
-        //    reads -1 entries as "skip" — guarded factory-side in Phase 1.
+        //    reads -1 entries as "skip" — guarded factory-side.
         let mut block_table_data: Vec<i32> = vec![-1; max_blocks_per_seq as usize];
         for (i, block) in block_table.blocks().iter().enumerate() {
             block_table_data[i] = block.block_id as i32;
@@ -3628,7 +3617,7 @@ impl PagedKVCacheAdapter {
     }
 
     /// Wrap the K cache buffer for `layer_idx` as a zero-copy MxArray view
-    /// over the per-layer Metal storage (Phase 3+).
+    /// over the per-layer Metal storage.
     ///
     /// Pass-through to [`LayerKVPool::key_cache_array_raw`] — converts the
     /// raw `*mut mlx_array` pointer into a managed `MxArray`. The
@@ -3678,15 +3667,14 @@ impl PagedKVCacheAdapter {
     /// always `[1]` and the dtype is always `Float32` — the C++ validator
     /// in `mlx_paged_ops.cpp` rejects anything else.
     ///
-    /// **Phase 10 wiring**: when [`Self::set_scale_manager`] has installed
+    /// When [`Self::set_scale_manager`] has installed
     /// a [`KvScaleManager`], the returned scalar is the manager's
     /// per-layer `k_scale(layer_idx)`. When no manager is configured (the
     /// default for every adapter in the tree today, all of which run
-    /// non-FP8 caches), the returned scalar is `1.0` — bit-identical to
-    /// the pre-Phase-10 placeholder. That makes the FP8-uncalibrated path
-    /// a no-op for the kernel template (`fp8_value = fp32_value * 1.0`)
-    /// while leaving the production wiring point in place for future
-    /// FP8 enablement.
+    /// non-FP8 caches), the returned scalar is `1.0`. That makes the
+    /// FP8-uncalibrated path a no-op for the kernel template
+    /// (`fp8_value = fp32_value * 1.0`) while leaving the production wiring
+    /// point in place for future FP8 enablement.
     pub fn k_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
         let scale = self.lookup_k_scale(layer_idx)?;
         MxArray::from_float32(&[scale], &[1])
@@ -3694,14 +3682,14 @@ impl PagedKVCacheAdapter {
     }
 
     /// Return a `[1]` fp32 V scale MxArray for `layer_idx`. See
-    /// [`Self::k_scale_array`] for the FP8 / Phase-10 contract.
+    /// [`Self::k_scale_array`] for the FP8 contract.
     pub fn v_scale_array(&self, layer_idx: u32) -> Result<MxArray, String> {
         let scale = self.lookup_v_scale(layer_idx)?;
         MxArray::from_float32(&[scale], &[1])
             .map_err(|e| format!("v_scale_array: failed to build scale array: {e}"))
     }
 
-    /// Install a shared `KvScaleManager` for FP8 K/V calibration (Phase 10).
+    /// Install a shared `KvScaleManager` for FP8 K/V calibration.
     ///
     /// Once set, [`Self::k_scale_array`], [`Self::v_scale_array`], and
     /// the per-layer scales threaded through [`Self::update_keys_values`]
@@ -3756,18 +3744,17 @@ impl PagedKVCacheAdapter {
 
     /// Helper for [`Self::k_scale_array`] / [`Self::v_scale_array`].
     ///
-    /// Phase 10 hardening: when a `KvScaleManager` is configured but its
-    /// `Mutex` is poisoned, return `Err` rather than silently falling back
-    /// to `1.0`. A unit-scale fallback would let `k_scale_array` /
-    /// `v_scale_array` initialize the compiled paged graph with placeholder
-    /// scales after a calibration/orchestration panic, while the runtime
-    /// write path (`update_keys_values` → `read_layer_scales`) fails closed
-    /// on the same poison — the asymmetry could silently corrupt FP8 K/V
-    /// writes for the affected layers.
+    /// When a `KvScaleManager` is configured but its `Mutex` is poisoned,
+    /// return `Err` rather than silently falling back to `1.0`. A unit-scale
+    /// fallback would let `k_scale_array` / `v_scale_array` initialize the
+    /// compiled paged graph with placeholder scales after a
+    /// calibration/orchestration panic, while the runtime write path
+    /// (`update_keys_values` → `read_layer_scales`) fails closed on the same
+    /// poison — the asymmetry could silently corrupt FP8 K/V writes for the
+    /// affected layers.
     ///
     /// The `1.0` fallback is reserved for the `None` case (no manager
-    /// configured), which is the documented non-FP8 / pre-Phase-10
-    /// behavior.
+    /// configured), which is the documented non-FP8 behavior.
     #[cfg(target_os = "macos")]
     fn lookup_k_scale(&self, layer_idx: u32) -> Result<f32, String> {
         self.lookup_scale(layer_idx, /* is_key */ true)
@@ -3814,7 +3801,7 @@ impl PagedKVCacheAdapter {
 
 /// Compute per-block `extra_keys` for image-aware prefix hashing.
 ///
-/// **Phase 6 multimodal threading**, mirroring vLLM commit 269bf46d. When
+/// Multimodal threading, mirroring vLLM commit 269bf46d. When
 /// a request contains image tokens (e.g. Qwen3.5 VLM, PaddleOCR-VL),
 /// identical text token sequences with different images MUST produce
 /// distinct block hashes — otherwise a paged-prefix-cache hit on a stale
@@ -3985,7 +3972,7 @@ mod tests {
         }
     }
 
-    /// Test shim mimicking the pre-P1C-2 two-arg `PagedKVCacheAdapter::new`
+    /// Test shim mimicking the legacy two-arg `PagedKVCacheAdapter::new`
     /// signature. Internally pairs the supplied allocator with a
     /// placeholder `LayerKVPool` of matching capacity. Returns `None` if
     /// Metal is unavailable so the caller can bail-with-skip; returns
@@ -4441,7 +4428,7 @@ mod tests {
         assert_eq!(res.blocks.len(), 2);
     }
 
-    /// Task #48 — adapter-level proof of vLLM's first-block-only
+    /// Adapter-level proof of vLLM's first-block-only
     /// `cache_salt` semantics: registering blocks via the adapter under
     /// `cache_salt = A` does NOT publish them to a tenant looking up
     /// under `cache_salt = B`. This is the user-facing version of the
@@ -4540,7 +4527,7 @@ mod tests {
         assert_eq!(res_hit.blocks.len(), 2);
     }
 
-    /// Task #49 — adapter-level proof of vLLM's `skip_reading_prefix_cache`
+    /// Adapter-level proof of vLLM's `skip_reading_prefix_cache`
     /// semantics (`vllm/v1/request.py:169`,
     /// `vllm/v1/core/kv_cache_manager.py:199`): when `skip_lookup = true`,
     /// `find_cached_prefix` short-circuits the lookup and returns 0
@@ -5538,7 +5525,7 @@ mod tests {
     /// Happy-path Metal dispatch on a tiny pool. The block id for the
     /// freshly allocated request is recorded, then we write 2 tokens at
     /// logical positions 0 and 1 of layer 0. We can't read back the K/V
-    /// payload (paged_attention gather lands in P1C-3) but the kernel
+    /// payload (paged_attention gather is out of scope) but the kernel
     /// dispatch must succeed without error.
     ///
     /// Uses a real `LayerKVPool` (production constructor) to exercise
@@ -5693,7 +5680,7 @@ mod tests {
 
     /// `validate_query_input` must reject queries whose leading dim != 1.
     /// The adapter is per-request (single sequence); multi-seq batching is
-    /// out of scope for P1C-3.
+    /// out of scope.
     #[test]
     fn test_gather_kv_rejects_wrong_leading_dim() {
         let cfg = validation_test_config();
@@ -7054,7 +7041,7 @@ mod tests {
         //    inference-relevant codes; int64 is intentionally absent so we
         //    don't read it back here. The kernel-side input contract is
         //    `paged_kv_write(slot_mapping, ..., dtype=int64)` enforced in
-        //    the Phase 1 factory validation.)
+        //    the factory validation.)
         assert_eq!(inputs.slot_mapping.ndim().unwrap(), 1);
         assert_eq!(inputs.slot_mapping.shape_at(0).unwrap(), 32);
 
@@ -7205,8 +7192,8 @@ mod tests {
     ///   scalar, so any divergence is a regression in the fallback path).
     ///
     /// Tests that exercise the manager-driven path live below; this one
-    /// guards the default fall-through Phase 10 keeps for backward
-    /// compatibility with all the existing non-FP8 callers.
+    /// guards the default fall-through for backward compatibility with all
+    /// the existing non-FP8 callers.
     ///
     /// The accessor body builds a CPU-side fp32 array via `from_float32`,
     /// which routes through `allocator::malloc` and on macOS goes through
@@ -7285,7 +7272,7 @@ mod tests {
         );
     }
 
-    /// Phase 10: when a `KvScaleManager` is wired in via
+    /// When a `KvScaleManager` is wired in via
     /// [`PagedKVCacheAdapter::set_scale_manager`], `k_scale_array` and
     /// `v_scale_array` MUST return the per-layer scales the manager holds
     /// (not the no-manager fallback `1.0`). This test pins:
@@ -7379,7 +7366,7 @@ mod tests {
         let _guard = manager_arc.lock().expect("orchestration arc lock");
     }
 
-    /// Phase 10: clearing the scale manager via `set_scale_manager(None)`
+    /// Clearing the scale manager via `set_scale_manager(None)`
     /// reverts the adapter to the unit-scale fallback. This is important
     /// for test/dev workflows that want to swap a calibrated manager out
     /// (e.g. comparing FP8 vs. uncalibrated baseline) without recreating
@@ -7432,7 +7419,7 @@ mod tests {
         );
     }
 
-    /// Phase 10: `scale_manager()` round-trips the installed Arc so a
+    /// `scale_manager()` round-trips the installed Arc so a
     /// caller (e.g. a calibration runner that drives EMA updates from a
     /// background task) can recover the same handle the adapter holds.
     /// Without this accessor, a caller would either need to track the Arc
@@ -7488,7 +7475,7 @@ mod tests {
         );
     }
 
-    /// Phase 10: `read_layer_scales` (the per-`update_keys_values` lookup)
+    /// `read_layer_scales` (the per-`update_keys_values` lookup)
     /// returns `(1.0, 1.0)` when no manager is configured and returns the
     /// per-layer scales when one is. Surfaces the same path that
     /// [`PagedKVCacheAdapter::update_keys_values`] uses to feed
@@ -7534,7 +7521,7 @@ mod tests {
         assert_eq!(v1, 5.0);
     }
 
-    /// Phase 10 hardening (Finding 2): when a `KvScaleManager` is wired
+    /// When a `KvScaleManager` is wired
     /// into the adapter but its `Mutex` becomes poisoned, both
     /// `k_scale_array` and `v_scale_array` MUST surface an error rather
     /// than silently fall back to `1.0`. The previous behavior (return
@@ -7619,7 +7606,7 @@ mod tests {
 
 #[cfg(test)]
 mod compute_per_block_image_extra_keys_tests {
-    //! Coverage for the Phase 6 multimodal extra_keys helper.
+    //! Coverage for the multimodal extra_keys helper.
     //!
     //! Pure-CPU: no Metal, no MLX runtime, no allocator. These tests
     //! pin the algorithm so an image-aware model integration (Qwen3.5
@@ -7760,10 +7747,9 @@ mod compute_per_block_image_extra_keys_tests {
     }
 
     /// Identical text + DIFFERENT images → different per-block extra_keys
-    /// for blocks containing image positions. Cache-isolation property:
-    /// the whole point of Phase 6 — a stale image's KV state must not
-    /// be reused for a request with a different image at the same
-    /// positions.
+    /// for blocks containing image positions. The cache-isolation property:
+    /// a stale image's KV state must not be reused for a request with a
+    /// different image at the same positions.
     #[test]
     fn identical_text_with_different_images_produces_different_extra_keys() {
         let positions_image_a: Vec<(u32, u64)> = (5u32..10).map(|p| (p, 0xAAAA)).collect();

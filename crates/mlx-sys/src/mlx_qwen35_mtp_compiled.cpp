@@ -1,8 +1,8 @@
 // =============================================================================
 // Qwen3.5 Dense MTP (Multi-Token Prediction) compiled draft + verify graphs.
 //
-// Companion to the main `mlx_qwen35.cpp` compiled forward path (W5 of the
-// MTP deepresearch plan). Provides three FFI entrypoints:
+// Companion to the main `mlx_qwen35.cpp` compiled forward path. Provides
+// three FFI entrypoints:
 //
 //   - `mlx_qwen35_mtp_compiled_init_from_main`: allocates per-MTP-layer
 //     KV caches sized to the main model's `max_kv_len` and snapshots
@@ -23,7 +23,7 @@
 //     returns logits of shape `[1, depth+1, vocab]`. Internally
 //     dispatches to a per-depth compiled function from a small table
 //     populated lazily — verify graphs for depths {1..5} get cached;
-//     `depth > 5` is rejected per the plan.
+//     `depth > 5` is rejected.
 //
 // IMPORTANT: this file READS the main path's `g_compiled_caches` /
 // `g_offset_int` via the `extern` declarations below. The verify graph
@@ -31,11 +31,9 @@
 // (`DENSE_COMPILED_MUTEX`) — Rust side enforces this. There is no
 // process-wide lock here; we trust the Rust caller.
 //
-// Per the W5 plan: MTPLX `graphbank.py` pre-compiles one verify graph
-// per depth (1..5). We mirror that with `g_verify_compiled_by_depth`,
-// populated on first use of each depth. Pre-warming at init time was
-// considered but deferred — first-use trace is one-time per process so
-// the user-visible cost is negligible (a single extra draft cycle).
+// One verify graph per depth (1..5) is held in `g_verify_compiled_by_depth`,
+// populated on first use of each depth (first-use trace cost is one-time
+// per process).
 // =============================================================================
 
 #include "mlx_qwen35_common.h"
@@ -66,22 +64,13 @@ using namespace qwen35_common;
 // Rather than make those globals header-visible (which would change the
 // main file), we go through the existing FFI surface: the main path
 // exposes `mlx_qwen35_get_cache_offset`, `mlx_qwen35_is_compile_inited`,
-// and `mlx_qwen35_export_caches` for inspection, and
-// `mlx_qwen35_forward_compiled` already mutates the main caches. The
-// verify implementation here calls the existing flat per-step body D+1
-// times in a loop (each call advances `g_offset_int` by one and updates
-// `g_compiled_caches[]` in place). That keeps the state-mutation
-// semantics identical to the main path and avoids the risk of
-// double-incrementing the offset.
+// and `mlx_qwen35_export_caches` for inspection.
 //
-// W6.7 — the verify graph is now ONE compiled forward over T = D+1
-// tokens (see `mlx_qwen35_forward_batched_verify` in `mlx_qwen35.cpp`).
-// This file's per-depth `g_verify_compiled_by_depth` table dispatches
-// into that batched FFI instead of the prior D+1 sequential single-token
-// forwards. The closure body is still NOT wrapped in
-// `mlx::core::compile` here — the heavy compile lives inside the
-// batched-verify FFI; this file's closure does shape validation +
-// FFI marshalling only.
+// The verify graph is ONE compiled forward over T = D+1 tokens (see
+// `mlx_qwen35_forward_batched_verify` in `mlx_qwen35.cpp`). This file's
+// per-depth `g_verify_compiled_by_depth` table dispatches into that
+// batched FFI; the heavy compile lives inside the batched-verify FFI,
+// so this file's closure does shape validation + FFI marshalling only.
 // =============================================================================
 
 extern "C" void mlx_qwen35_forward_compiled(
@@ -94,30 +83,21 @@ extern "C" int mlx_qwen35_get_cache_offset();
 
 extern "C" int mlx_qwen35_is_compile_inited();
 
-// W6.5 — read the LAST stashed `g_last_hidden` (refcounted clone) from the
-// main flat-path compiled state. The verify graph in this file loops
-// `mlx_qwen35_forward_compiled` D+1 times; each call reassigns
-// `g_last_hidden` to the post-final-norm hidden of THAT step's token.
-//
-// To support chained MTP cycles correctly we MUST capture the hidden after
-// EACH of the D+1 iterations (not just the last) and surface them as a
-// stacked `[1, D+1, hidden]` tensor. The Rust caller then slices position
-// `K` (= number of accepted drafts) to seed the next cycle's first MTP
-// draft — `verify_hidden[K]` is the prediction context for the
-// committed-token-at-position-K+1 (bonus on full-accept, residual on
-// rejection), matching the MTP head's training contract `(prev_hidden,
-// embed(next_token)) -> next-next logits`.
+// Read the LAST stashed `g_last_hidden` (refcounted clone) from the main
+// flat-path compiled state. To support chained MTP cycles the Rust caller
+// slices position `K` (= number of accepted drafts) of the verify hiddens
+// to seed the next cycle's first MTP draft — `verify_hidden[K]` is the
+// prediction context for the committed token at position K+1 (bonus on
+// full-accept, residual on rejection), matching the MTP head's training
+// contract `(prev_hidden, embed(next_token)) -> next-next logits`.
 //
 // Returns null when the main path is uninitialised OR no forward has run
-// since the last reset. Mirrors the public FFI used by the W6 Step-A
-// seeding path; declared here too so the verify closure can thread it
-// once per iteration without going through the FFI boundary twice.
+// since the last reset.
 extern "C" void mlx_qwen35_export_last_hidden(mlx_array** out);
 
-// W6.7 — One-shot batched verify forward. Runs the entire D+1-token
-// verify on a single compiled graph (vs the prior D+1 sequential
-// `mlx_qwen35_forward_compiled` calls) and emits `[1, D+1, vocab]`
-// logits + `[1, D+1, hidden]` hiddens + `[1, D+1]` argmax ids. Lives in
+// One-shot batched verify forward. Runs the entire D+1-token verify on a
+// single compiled graph and emits `[1, D+1, vocab]` logits +
+// `[1, D+1, hidden]` hiddens + `[1, D+1]` argmax ids. Lives in
 // `mlx_qwen35.cpp` because the graph references the main-path's
 // `g_compiled_caches` / `g_offset_int` directly. Tape-replay arming is
 // consumed via the existing `g_tape_recording_armed` global.
@@ -148,7 +128,7 @@ extern "C" void mlx_qwen35_forward_batched_verify_sparse_target(
     mlx_array** out_target_ids,
     mlx_array** out_target_probs);
 
-// Phase 4b — paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
+// Paged-pool sibling of `mlx_qwen35_forward_batched_verify`.
 // Reads K/V from `g_dense_k_pools[]` / `g_dense_v_pools[]` instead of
 // the BHTD `g_compiled_caches[]`. Caller MUST construct `offset_arr`,
 // `block_table`, `slot_mapping`, `seq_lens`, and `cu_seqlens_q` (see
@@ -167,11 +147,11 @@ extern "C" void mlx_qwen35_forward_batched_verify_paged(
     mlx_array** out_hiddens,
     mlx_array** out_argmax);
 
-// Phase 4b — paged-pool partial-accept rollback machinery (paged
-// siblings of `mlx_qwen35_compiled_snapshot_linear_caches` /
+// Paged-pool partial-accept rollback machinery (paged siblings of
+// `mlx_qwen35_compiled_snapshot_linear_caches` /
 // `mlx_qwen35_compiled_restore_linear_caches`). Defined in
 // `mlx_qwen35.cpp` where they have direct access to
-// `g_dense_paged_linear_caches`. Used by B3's MTP-on-paged gate to
+// `g_dense_paged_linear_caches`. Used by the MTP-on-paged gate to
 // rollback the GDN recurrent + conv state when the verify accepts
 // fewer than `depth + 1` tokens.
 extern "C" void mlx_qwen35_compiled_snapshot_paged_linear_caches();
@@ -179,10 +159,10 @@ extern "C" void mlx_qwen35_compiled_restore_paged_linear_caches();
 extern "C" void mlx_qwen35_compiled_replay_paged_linear_caches_for_accept(
     int accepted_steps, int depth);
 
-// W6.7 follow-up — eagerly compile the batched verify graphs for both
-// `WithTape=false` and `WithTape=true` over depths {1..5}. Defined in
-// `mlx_qwen35.cpp` where it has direct access to the main path's
-// globals (`g_compiled_caches`, `g_offset_int`, tape accumulators) for
+// Eagerly compile the batched verify graphs for both `WithTape=false`
+// and `WithTape=true` over depths {1..5}. Defined in `mlx_qwen35.cpp`
+// where it has direct access to the main path's globals
+// (`g_compiled_caches`, `g_offset_int`, tape accumulators) for
 // snapshot/restore. Best-effort: failures are logged + swallowed.
 extern "C" void mlx_qwen35_prewarm_verify_compiled();
 
@@ -205,7 +185,7 @@ struct MTPCompileConfig : BaseConfig {
 static MTPCompileConfig g_mtp_config{};
 static std::vector<array> g_mtp_compiled_caches;  // 2 * n_mtp_layers (K,V interleaved)
 static int g_mtp_offset_int = 0;                  // local MTP cache write slot
-// W6.32 — start-of-cycle offset (= main offset captured by `begin_cycle`).
+// Start-of-cycle offset (= main offset captured by `begin_cycle`).
 // The MTP attn_mask must mask out positions `[0..g_mtp_chain_start_int)`
 // because the K/V at those slots is zero (the MTP cache is zero-initialised
 // per cycle). Without that floor the softmax weight on the real chain K/V
@@ -217,7 +197,7 @@ static int g_mtp_offset_int = 0;                  // local MTP cache write slot
 static int g_mtp_chain_start_int = 0;
 static bool g_mtp_compile_inited = false;
 
-// Phase C — MTP K/V cache headroom.
+// MTP K/V cache headroom.
 //
 // The MTP K/V cache is allocated `max_kv_len + MTP_CACHE_HEADROOM` slots.
 // `begin_cycle` re-anchors the draft offset to `g_mtp_committed_len`
@@ -247,7 +227,7 @@ inline array draft_lm_head_proj(const array& x, const MTPCompileConfig& cfg) {
       : linear_proj(x, "lm_head");
 }
 
-// Phase C — committed-history MTP cache policy.
+// Committed-history MTP cache policy.
 //
 // `g_mtp_committed_len` is the number of local MTP cache slots that hold EXACT
 // committed K/V, computed from the target model's post-final-norm hidden +
@@ -318,7 +298,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
   auto rope_offset_arr = inputs[3];      // [1] int32, absolute RoPE pos
   auto chain_start_arr = inputs[4];      // [1] int32
 
-  // Mirror Qwen3_5MTPModule::forward (W2 dense Rust path):
+  // Mirror Qwen3_5MTPModule::forward (dense Rust path):
   //   h_norm = pre_fc_norm_hidden(prev_hidden)
   //   e_norm = pre_fc_norm_embedding(prev_emb)
   //   h      = fc(concat([e_norm, h_norm], axis=-1))
@@ -373,7 +353,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
 
   // MTP DecoderLayers — full-attention only (Rust enforces this in
   // Qwen3_5MTPModule::new). The per-layer key prefix is
-  // `mtp.layers.{j}` and matches the W2 Rust `apply_weights` flow.
+  // `mtp.layers.{j}` and matches the Rust `apply_weights` flow.
   for (int j = 0; j < cfg.n_mtp_layers; j++) {
     std::string lp = "mtp.layers." + std::to_string(j);
 
@@ -421,7 +401,7 @@ static std::vector<array> mtp_draft_decode_fn(const std::vector<array>& inputs) 
 }
 
 // MTP draft graph. Safe to compile because `mtp_draft_decode_fn` takes
-// offset_arr as an array input — see comment at line 166-169.
+// offset_arr as an array input.
 //
 // `mtp_draft_decode_fn` reads the MTP head weights via `get_weight("mtp.*")`
 // inside the trace, so the weights are baked into the cached tape. Held in a
@@ -444,7 +424,7 @@ compiled_mtp_draft_decode() {
 }
 
 // =====================================================================
-// Phase C — committed-history commit graph.
+// Committed-history commit graph.
 //
 // Computes the MTP layer-0 attention K/V for M committed tokens and
 // writes them into the persistent MTP KV cache. One graph per cycle,
@@ -465,11 +445,11 @@ compiled_mtp_draft_decode() {
 // k_proj / k_norm / RoPE) up to but NOT including attention output:
 // only K and V are needed to fill the cache.
 //
-// Bug 2 fix — token/hidden pairing: row `i` of `hidden_seq` already
-// holds the hidden of the token BEFORE committed token `i` (the MTP
-// `MTP(h(t), emb(t+1))` contract), and row `i` of `gathered_embs` holds
-// the embedding of committed token `i`. The pairing is done Rust-side
-// in `commit_mtp_compiled`, so this graph just consumes row `i` of each
+// Token/hidden pairing: row `i` of `hidden_seq` already holds the hidden
+// of the token BEFORE committed token `i` (the MTP `MTP(h(t), emb(t+1))`
+// contract), and row `i` of `gathered_embs` holds the embedding of
+// committed token `i`. The pairing is done Rust-side in
+// `commit_mtp_compiled`, so this graph just consumes row `i` of each
 // array at slot `i` — `fc([e_norm(emb_i), h_norm(hidden_i)])`.
 //
 // Inputs (vector order):
@@ -662,16 +642,13 @@ static const CommitFn& get_or_make_commit_fn(int m) {
 // Verify graphs: per-depth dispatcher.
 //
 // One entry per depth ∈ {1..5}. The closure for depth D dispatches to
-// `mlx_qwen35_forward_batched_verify` (W6.7) which runs a SINGLE
-// compiled graph over T = D+1 tokens, emitting `[1, D+1, vocab]` logits
-// and `[1, D+1, hidden]` post-final-norm hiddens in one launch. The
-// FFI also advances the main `g_offset_int` by D+1 and writes the
-// D+1 KV slots in place via `slice_update`, matching the prior per-step
-// semantics the chat loop relies on.
+// `mlx_qwen35_forward_batched_verify` which runs a SINGLE compiled graph
+// over T = D+1 tokens, emitting `[1, D+1, vocab]` logits and
+// `[1, D+1, hidden]` post-final-norm hiddens in one launch. The FFI also
+// advances the main `g_offset_int` by D+1 and writes the D+1 KV slots in
+// place via `slice_update`.
 //
-// Per the W5 plan we MUST reject depth > 5. Per-depth lookup is O(log
-// k) under `std::map`-style search but k ≤ 5 so we use a fixed-size
-// array indexed by depth - 1.
+// depth > 5 is rejected. We use a fixed-size array indexed by depth - 1.
 //
 // The per-depth `g_verify_compiled_by_depth` table is retained for two
 // reasons: (a) depth validation lives one place (the slot's existence
@@ -688,7 +665,7 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
-// W6.7 follow-up #3 — Process-once gate for the heavy prewarm path.
+// Process-once gate for the heavy prewarm path.
 //
 // `mlx_qwen35_mtp_compiled_prewarm_verify` must run AT MOST ONCE per
 // process (the heavy `mlx::core::compile` work is ~1.5s and reusing the
@@ -697,27 +674,17 @@ static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 // per-turn MTP reset/re-init, so reset does not re-arm this flag.
 static std::atomic<bool> g_prewarm_done{false};
 
-// W6.7 — Build a verify closure for a fixed depth. Captures NO per-call
-// state. The closure expects `input_ids` of shape `[1, depth+1]` and the
-// `embedding_weight` from the model. Returns
-// `{logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size]}`.
+// Build a verify closure for a fixed depth. Captures NO per-call state.
+// The closure expects `input_ids` of shape `[1, depth+1]` and the
+// `embedding_weight` from the model, and returns
+// `{logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size]}` via one
+// call to `mlx_qwen35_forward_batched_verify` (a single compiled graph
+// over T = depth+1 tokens). Tape-replay side-channels are populated by the
+// same dispatch when armed via `mlx_qwen35_compiled_tape_arm`.
 //
-// PRIOR (W6.5): the closure looped `mlx_qwen35_forward_compiled` D+1 times,
-// stashing the per-step `g_last_hidden` after each call and concatenating
-// the per-step `[1, 1, ...]` slices on axis 1. That cost D+1 kernel-launch
-// sequences and an extra concatenate-per-position lazy graph node.
-//
-// NOW (W6.7): one call to `mlx_qwen35_forward_batched_verify` runs a
-// single compiled graph over T = depth+1 tokens, emitting the full
-// `[1, T, vocab]` and `[1, T, hidden]` tensors natively. The tape-replay
-// side-channels (W6.6) are populated by the same dispatch when armed via
-// `mlx_qwen35_compiled_tape_arm`; the batched graph assigns one tape per
-// linear-attention layer in ONE shot (no per-step `concatenate`).
-//
-// The two distinct entrypoints `mlx_qwen35_mtp_verify_compiled` (logits
-// only) and `mlx_qwen35_mtp_verify_compiled_with_hidden` both consume the
-// same `{logits, hiddens}` tuple — the logits-only entrypoint just drops
-// the second element. Backwards compatibility preserved.
+// The two entrypoints `mlx_qwen35_mtp_verify_compiled` (logits only) and
+// `mlx_qwen35_mtp_verify_compiled_with_hidden` both consume the same
+// `{logits, hiddens}` tuple — the logits-only entrypoint drops the second.
 static VerifyFn make_verify_fn(int depth) {
   return [depth](const array& input_ids, const array& embedding_weight)
              -> std::vector<array> {
@@ -794,7 +761,7 @@ extern "C" {
 // `g_mtp_offset_int` from the main path's current offset.
 //
 // All MTP DecoderLayers share `mtp_fa_layer_idx = full_attention_interval - 1`
-// per the Rust W2 invariant — this affects RoPE only if the helper
+// per the Rust invariant — this affects RoPE only if the helper
 // inspected `layer_idx`, which our `attn_pure_fn_arr_offset` does NOT
 // (the prefix is the only parameterization). The argument is kept in
 // the config for forward compatibility / introspection.
@@ -862,7 +829,7 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     g_mtp_config.linear_value_head_dim   = linear_value_head_dim;
     g_mtp_config.linear_conv_kernel_dim  = linear_conv_kernel_dim;
     g_mtp_config.tie_word_embeddings     = (tie_word_embeddings != 0);
-    // Phase C headroom: the MTP K/V buffer is allocated
+    // Headroom: the MTP K/V buffer is allocated
     // `max_kv_len + MTP_CACHE_HEADROOM` slots so a near-tail draft /
     // commit `slice_update` (up to depth + 2 = 7 slots past
     // g_mtp_committed_len) can never run off the end. `g_mtp_config.max_kv_len`
@@ -901,8 +868,8 @@ int32_t mlx_qwen35_mtp_compiled_init_from_main(
     // the two counters consistent for any debug introspection.
     g_mtp_offset_int = mlx_qwen35_get_cache_offset();
     g_mtp_chain_start_int = g_mtp_offset_int;
-    // Phase C — committed-history policy. The MTP KV cache is its OWN
-    // sequence, independent of the main model's absolute positions: the
+    // Committed-history policy. The MTP KV cache is its OWN sequence,
+    // independent of the main model's absolute positions: the
     // prompt-prefix tokens are NEVER given MTP K/V (only tokens
     // produced during decode are committed). The committed-prefix
     // counter therefore starts at 0 — the first
@@ -1110,35 +1077,30 @@ void mlx_qwen35_mtp_verify_compiled(
 }
 
 // -----------------------------------------------------------------------------
-// W6.5 — verify pass that ALSO exports the post-final-norm hidden state
-// at EVERY verify position so the caller can chain MTP cycles without
-// running a fresh main-model forward at each cycle's "Step A".
+// Verify pass that ALSO exports the post-final-norm hidden state at EVERY
+// verify position so the caller can chain MTP cycles without running a
+// fresh main-model forward at each cycle's "Step A".
 //
 // Behaviourally identical to `mlx_qwen35_mtp_verify_compiled` for the
 // logits output (and the same `g_compiled_caches[]` / `g_offset_int`
 // mutation contract) plus one extra owned `mlx_array*` for ALL D+1
 // per-position hiddens stacked along the time axis →
-// `[1, depth+1, hidden_size]`. W6.7: the verify graph is a single
-// compiled forward over T = D+1 tokens; the hidden output is the
-// graph's `[1, T, hidden]` post-final-norm slot returned directly (no
-// `g_last_hidden` intermediate).
+// `[1, depth+1, hidden_size]`. The hidden output is the verify graph's
+// `[1, T, hidden]` post-final-norm slot returned directly.
 //
 // Why D+1 instead of just the last hidden: the Rust caller selects
 // position `K` (= number of accepted drafts) — `verify_hidden[K]` is the
 // prediction context for the committed token at position K+1 (bonus on
 // full-accept, residual on rejection), matching the MTP head's training
-// contract. The prior `*_with_hidden` shipped position D only, which
-// only matches when ALL drafts are accepted; partial-accept cycles
-// chained from the wrong context and collapsed acceptance from ~1.5 to
-// ~0.8 tokens/cycle.
+// contract. Shipping only position D matches only when ALL drafts are
+// accepted; partial-accept cycles would chain from the wrong context.
 //
 // Why an extra entrypoint instead of extending the existing one:
-//   (a) backward compat — callers that don't need the hidden keep the
-//       2-output contract and a free `nullptr` slot;
+//   (a) callers that don't need the hidden keep the 2-output contract
+//       and a free `nullptr` slot;
 //   (b) explicit caller opt-in keeps the lazy MLX graph for the hidden
-//       alive across the FFI boundary (the lifetime contract on the
-//       returned `mlx_array*` mirrors the existing FFI), avoiding a
-//       silent perf regression for non-chained callers.
+//       alive across the FFI boundary, avoiding a silent perf
+//       regression for non-chained callers.
 //
 // The hidden's lifetime contract mirrors
 // `mlx_qwen35_export_last_hidden`:
@@ -1204,11 +1166,9 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden_and_argmax(
       return;
     }
 
-    // Run the existing per-depth verify loop. After this returns,
-    // `g_compiled_caches[]` / `g_offset_int` have been advanced by D+1.
-    // The closure returns `{logits[1, D+1, vocab], hiddens[1, D+1, hidden],
-    // argmax[1, D+1]}` — the hiddens were captured per-iteration before
-    // the next forward overwrote `g_last_hidden`.
+    // Run the per-depth verify. After this returns, `g_compiled_caches[]` /
+    // `g_offset_int` have been advanced by D+1. The closure returns
+    // `{logits[1, D+1, vocab], hiddens[1, D+1, hidden], argmax[1, D+1]}`.
     const auto& verify_fn = get_or_make_verify_fn(depth);
     auto outputs = verify_fn(input_ids, embedding_weight);
     if (outputs.size() < 3) {
@@ -1419,36 +1379,25 @@ void mlx_qwen35_mtp_verify_compiled_with_hidden_and_sparse_target(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 follow-up — Pre-warm the per-depth verify dispatch closures AND the
-// underlying MLX-compiled batched verify graphs.
+// Pre-warm the per-depth verify dispatch closures AND the underlying
+// MLX-compiled batched verify graphs.
 //
 // Wire this to fire IMMEDIATELY after `mlx_qwen35_mtp_compiled_init_from_main`
 // returns 0 from the Rust caller. The work performed (first call only):
 //   1. Populates `g_verify_compiled_by_depth[D-1]` for each D ∈ {1..5}
-//      with its per-depth closure. These closures are trivial (shape
-//      validation + FFI marshalling); pre-populating saves a one-off
-//      `std::function` heap allocation on the first verify of each
-//      depth.
+//      with its per-depth closure (saves a one-off `std::function` heap
+//      allocation on the first verify of each depth).
 //   2. Delegates to `mlx_qwen35_prewarm_verify_compiled()` (in
 //      `mlx_qwen35.cpp`), which runs one dummy verify forward per
 //      (depth, with_tape) pair to force `mlx::core::eval` of the
 //      compiled graph outputs. After this returns, MLX's internal
 //      compile cache holds 10 traces (5 depths × 2 tape variants) and
-//      first-use of each shape during real verify cycles is a cache
-//      hit.
+//      first-use of each shape during real verify cycles is a cache hit.
 //
-// W6.7 follow-up #2 — `init_mtp_compiled_from_main` runs once PER TURN,
-// not once per process, so wiring the prewarm there would re-run the
-// 10 dummy verifies on every turn and burn ~1.5s of TTFT per turn. Gate
-// the body behind a once-flag so the heavy work fires exactly once per
-// process — on the FIRST turn (after MTP init has set up
-// `g_compile_inited` and `g_compiled_caches`). Subsequent turns hit the
-// already-flipped flag and return immediately.
-//
-// W6.7 follow-up #4 — Per-turn reset no longer clears the per-depth
-// closure tables, so this guard remains process-once. That avoids
-// re-running the 10 heavy dummy verify traces after every MTP turn while
-// preserving cheap closure reuse across reset/re-init.
+// Init runs once PER TURN, not once per process; the heavy work
+// (~1.5s) is gated behind a once-flag so it fires exactly once per
+// process. Per-turn reset does not clear the closure tables, so this
+// guard stays process-once.
 //
 // No-op if MTP is uninitialised. Best-effort: any failure inside the
 // underlying prewarm is logged + swallowed and the verify path simply
@@ -1458,10 +1407,9 @@ void mlx_qwen35_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  // W6.7 follow-up #4 — Atomic-bool gate. CAS-flipping `false -> true`
-  // is the entry permit. Caller is serialised on `DENSE_COMPILED_MUTEX`
-  // (Rust-side), but using an atomic keeps the check correct under any
-  // future relaxation of that contract.
+  // Atomic-bool gate. CAS-flipping `false -> true` is the entry permit.
+  // Caller is serialised on `DENSE_COMPILED_MUTEX` (Rust-side), but using
+  // an atomic keeps the check correct under any future relaxation.
   bool expected = false;
   if (!g_prewarm_done.compare_exchange_strong(expected, true)) {
     return;
@@ -1502,8 +1450,8 @@ void mlx_qwen35_mtp_compiled_reset() {
   g_mtp_compiled_caches.clear();
   g_mtp_offset_int = 0;
   g_mtp_chain_start_int = 0;
-  // Phase C — committed-history counter resets with the rest of the
-  // MTP state so a fresh turn starts with an empty committed prefix.
+  // Committed-history counter resets with the rest of the MTP state so a
+  // fresh turn starts with an empty committed prefix.
   g_mtp_committed_len = 0;
   g_mtp_position_base_int = 0;
   g_mtp_compile_inited = false;
@@ -1512,10 +1460,10 @@ void mlx_qwen35_mtp_compiled_reset() {
   // capture only the static depth and call through the current global
   // compiled state, so retaining them avoids re-running heavy prewarm on
   // the next turn.
-  // Phase C — drop the per-M commit dispatchers. The underlying
-  // weight-baking commit graphs live in the file-scope `g_commit_graph_by_m`
-  // table and are deliberately retained across the per-turn reset (they are
-  // nulled only on model reload via mlx_qwen35_mtp_invalidate_compiled_graphs).
+  // Drop the per-M commit dispatchers. The underlying weight-baking commit
+  // graphs live in the file-scope `g_commit_graph_by_m` table and are
+  // deliberately retained across the per-turn reset (they are nulled only
+  // on model reload via mlx_qwen35_mtp_invalidate_compiled_graphs).
   for (auto& slot : g_commit_compiled_by_m) {
     slot = nullptr;
   }
@@ -1530,17 +1478,14 @@ void mlx_qwen35_mtp_compiled_adjust_offset(int delta) {
 }
 
 // -----------------------------------------------------------------------------
-// Phase C — committed-history MTP cache policy: begin a fresh MTP draft
-// cycle WITHOUT zeroing the persistent MTP K/V cache.
+// Committed-history MTP cache policy: begin a fresh MTP draft cycle
+// WITHOUT zeroing the persistent MTP K/V cache.
 //
-// Prior behavior (W6 Bug #2 "Option Reset", cycle history policy): this
-// zeroed the entire MTP KV cache every cycle and re-anchored the offset
-// to `main_offset`, so the MTP heads attended ONLY over the current
-// cycle's draft chain. A ground-truth A/B against the MTPLX reference
-// proved a PERSISTENT committed-history cache (heads attend over the
-// full committed prefix) nearly doubles draft acceptance.
+// A PERSISTENT committed-history cache (heads attend over the full
+// committed prefix) nearly doubles draft acceptance vs. zeroing the
+// cache each cycle and attending only over the current draft chain.
 //
-// New behavior (committed policy):
+// Behavior:
 //   - Do NOT zero / reallocate the caches. They persist across cycles;
 //     `mlx_qwen35_mtp_compiled_commit` (called after each verify) keeps
 //     `[0 .. g_mtp_committed_len)` filled with exact committed K/V.
@@ -1580,7 +1525,7 @@ void mlx_qwen35_mtp_compiled_begin_chained_cycle(int main_offset) {
 }
 
 // -----------------------------------------------------------------------------
-// Phase C — append exact committed K/V to the persistent MTP cache.
+// Append exact committed K/V to the persistent MTP cache.
 //
 // Called once per cycle, AFTER the accept loop has determined the
 // accepted-draft count K and BEFORE the rollback. Writes M = K+2 exact
@@ -1588,12 +1533,11 @@ void mlx_qwen35_mtp_compiled_begin_chained_cycle(int main_offset) {
 // `[last_committed_id, d_0..d_{K-1}, boundary]` using the pre-assembled
 // hidden / embedding rows, then advances `g_mtp_committed_len` by M.
 //
-// Bug 1 fix — the boundary token (bonus on full accept, residual on
-// reject) IS committed here. Its hidden (`verify_hiddens[:, K, :]`) is
-// already available at commit time, so there is no deferral: the MTP
-// prefix grows by exactly M = K+2 per cycle, matching the real decode
-// sequence length. The prior "K+1, defer boundary" policy compressed
-// the prefix by 1/cycle and drifted every RoPE position.
+// The boundary token (bonus on full accept, residual on reject) IS
+// committed here. Its hidden (`verify_hiddens[:, K, :]`) is available at
+// commit time, so the MTP prefix grows by exactly M = K+2 per cycle,
+// matching the real decode sequence length (no prefix compression, no
+// RoPE drift).
 //
 // Inputs:
 //   - hidden_seq_ptr:    `[1, M, hidden]` bf16 — `hidden_seq[i]` is the
@@ -1752,9 +1696,8 @@ int mlx_qwen35_mtp_get_position_base() {
   return g_mtp_position_base_int;
 }
 
-// PR #65 (mtp-reload P1 follow-up) — invalidate the compiled dense MTP draft
-// graph and the per-M commit graphs so the next call re-traces against the
-// CURRENT weight registry.
+// Invalidate the compiled dense MTP draft graph and the per-M commit
+// graphs so the next call re-traces against the CURRENT weight registry.
 //
 // Both `mtp_draft_decode_fn` and `mtp_commit_fn<M>` read the MTP head weights
 // via `get_weight("mtp.*")` INSIDE the traced closure (NOT as compile inputs),

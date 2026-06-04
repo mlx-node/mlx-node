@@ -1,6 +1,6 @@
 //! Gated integration test for the session-based chat delta path.
 //!
-//! This test exercises the Phase 2 production surface — `chat_session_start`
+//! This test exercises the production surface — `chat_session_start`
 //! for turn 1 and `chat_session_continue` for turns 2..=4 — and validates
 //! that TTFT stays roughly flat across turns. That is direct evidence the
 //! KV caches are being reused and each new turn only pays for its delta

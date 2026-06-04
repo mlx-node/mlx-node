@@ -1,9 +1,8 @@
-//! Phase-1 component-parity gate for the lfm2 compiled C++ forward path.
+//! Component-parity gate for the lfm2 compiled C++ forward path.
 //!
-//! lfm2's compiled forward is not end-to-end runnable until the full backbone
-//! lands (Phase 2+), so we validate the parity-critical novel C++ — the
-//! attention pure-fn, the dense SwiGLU MLP, and the ShortConv operator — in
-//! ISOLATION here, against the Rust-native single-layer forward. The C++ probes
+//! Validates the parity-critical novel C++ — the attention pure-fn, the dense
+//! SwiGLU MLP, and the ShortConv operator — in ISOLATION here, against the
+//! Rust-native single-layer forward. The C++ probes
 //! (`mlx_lfm2_probe_attn_seq`, `mlx_lfm2_probe_dense_mlp`,
 //! `mlx_lfm2_probe_conv_seq`) register one layer's weights into the shared
 //! `g_weights()` map, run the compiled pure-fn, and return the output.
@@ -437,7 +436,7 @@ fn compiled_conv_seq_matches_native_with_bias() {
     run_conv_parity(true);
 }
 
-/// 2b-1 end-to-end-SHAPED gate: the full `lfm2_decode_fn` assembly (driven via
+/// End-to-end-SHAPED gate: the full `lfm2_decode_fn` assembly (driven via
 /// the synthetic-model probe) must match a hand-assembled native `[conv, attn,
 /// conv]` dense stack over the same `T`-step decode. Exercises the per-layer
 /// conv/attn dispatch (from `is_attn[]`), the operator_norm→op→+res→ffn_norm→
@@ -716,13 +715,13 @@ fn run_decode_seq_parity(conv_bias: bool) {
     );
 }
 
-/// 2b-1 full-decode parity WITHOUT conv biases (LFM2.5 production default).
+/// Full-decode parity WITHOUT conv biases (LFM2.5 production default).
 #[test]
 fn compiled_decode_seq_matches_native() {
     run_decode_seq_parity(false);
 }
 
-/// Phase 4 Piece 1: the SAME full synthetic decode-sequence parity, but with the
+/// The SAME full synthetic decode-sequence parity, but with the
 /// ShortConv biases (`conv.in_proj.bias`, `conv.conv.bias`, `conv.out_proj.bias`)
 /// seeded into the registry and applied on BOTH sides — the compiled
 /// `lfm2_decode_fn` via `cfg.conv_bias` (threaded through the probe's `conv_bias`
@@ -734,7 +733,7 @@ fn compiled_decode_seq_matches_native_with_conv_bias() {
     run_decode_seq_parity(true);
 }
 
-/// Phase-3a end-to-end-SHAPED MoE gate: the full `lfm2_decode_fn` assembly with
+/// End-to-end-SHAPED MoE gate: the full `lfm2_decode_fn` assembly with
 /// the sparse-MoE FFN branch (driven via `mlx_lfm2_probe_moe_decode_seq`) must
 /// match a hand-assembled native `[conv(dense), attn(MoE), conv(MoE)]` stack over
 /// the same `T`-step decode. The dense layer (idx 0 < num_dense_layers) routes
@@ -1094,7 +1093,7 @@ fn compiled_moe_decode_seq_matches_native() {
     );
 }
 
-/// DECISIVE H1/H2 experiment: COMPILED-vs-EAGER synthetic MoE.
+/// COMPILED-vs-EAGER synthetic MoE.
 ///
 /// Drives the process-global `compiled_lfm2_decode()` (NOT eager
 /// `lfm2_decode_fn`) with a FIXED 3-layer synthetic MoE stack and compares the
@@ -1109,7 +1108,7 @@ fn compiled_moe_decode_seq_matches_native() {
 /// (2) NEAR-TIE router (`expert_bias` gaps of 1e-4, E=32/k=4 fan-out matching
 ///     the real 8B model -> selection decided by softmax(routing) near-ties,
 ///     FP-fusion sensitive). Diagnostic: a nonzero diff here positively
-///     confirms the near-tie selection-flip mechanism (H2).
+///     confirms the near-tie selection-flip mechanism.
 ///
 /// Runs in its OWN test so its fixed synthetic topology bakes into the compiled
 /// static cleanly. `WS_TOL`, `NT_MIN_DIVERGENCE`, `ASSERT_NT_GT_WS` env vars
@@ -1205,13 +1204,13 @@ fn compiled_moe_ab_model_swap_recompiles() {
     // DIFFERENT constants than MODEL A. If `warm_seed == seed_a`, the stale closure
     // would replay constants byte-identical to MODEL A's and (wrongly) still
     // produce A's correct logits, making the MODEL-A epoch-bump non-load-bearing
-    // and the F3 gold-standard vacuous. With a different seed, removing the MODEL-A
+    // and this gold-standard vacuous. With a different seed, removing the MODEL-A
     // bump makes A's compiled run replay `warm_seed`'s weights and
     // `a_comp_vs_a_eager` blows past PARITY_TOL — which is the regression the
     // MODEL-A bump must defeat.
     let warm_seed = 0x7777_8888_9999_AAAAu64;
 
-    // F3 soundness: PRE-SEED a compiled closure at the current epoch BEFORE the
+    // Soundness: PRE-SEED a compiled closure at the current epoch BEFORE the
     // measured probe so the A-side stale-closure hazard manifests
     // DETERMINISTICALLY. The dedicated `warm_compiled_no_bump` probe registers its
     // own synthetic `warm_seed` weights, then — crucially — performs a SAME-EPOCH
@@ -1223,7 +1222,7 @@ fn compiled_moe_ab_model_swap_recompiles() {
     // well-separated compiled-vs-eager probe). It then clears the weights and, by
     // design, does NOT bump the compile epoch. So the measured A->B probe below
     // re-enters with `warm_seed`'s stale closure cached at this epoch: WITHOUT the
-    // MODEL-A `build_model` epoch bump (the F3 production-style fix), MODEL A's
+    // MODEL-A `build_model` epoch bump (the production-style fix), MODEL A's
     // compiled run reuses that stale closure, replays `warm_seed`'s frozen
     // constants, and `a_comp_vs_a_eager` blows past PARITY_TOL — i.e. removing the
     // MODEL-A bump makes THIS test fail. WITH the bump, MODEL A is epoch-fresh and

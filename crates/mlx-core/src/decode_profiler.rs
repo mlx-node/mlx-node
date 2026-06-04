@@ -85,7 +85,7 @@ pub struct DecodeProfiler {
     first_token_marked: bool,
     memory_before: Option<MemorySnapshot>,
     memory_after: Option<MemorySnapshot>,
-    /// MTP speculative-decode acceptance counters (W6.33). Updated by
+    /// MTP speculative-decode acceptance counters. Updated by
     /// `record_mtp_cycle` once per draft+verify cycle. `mtp_cycles == 0`
     /// means no MTP cycle ran (a plain autoregressive decode).
     mtp_cycles: u64,

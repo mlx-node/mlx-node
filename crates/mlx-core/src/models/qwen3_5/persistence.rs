@@ -542,7 +542,7 @@ fn augment_mtplx_mtp_quantization(
 /// MoE-flavored MTP layer, or the dense set for a dense-flavored MoE MTP layer).
 /// The single-PLQ `mtplx_mtp_quantization` block (uniform bits/group_size/mode)
 /// is sufficient for both because convert quantizes every matched MTP linear at
-/// the SAME uniform PLQ (Option A); see `convert::is_mtp_layer_quantizable_prefix`.
+/// the SAME uniform PLQ; see `convert::is_mtp_layer_quantizable_prefix`.
 ///
 /// `.entry().or_insert()` is non-clobbering: a per-key override already parsed
 /// from the main `quantization` block (which excludes `mtp.*`, so this is rare)
@@ -1073,9 +1073,9 @@ fn apply_weights_inner(
                 if let Some(w) = params.get(&format!("{}.linear_attn.A_log", prefix)) {
                     gdn.set_a_log(w)?;
                 }
-                // E51: precompute the stacked [in_proj_qkvz; in_proj_ba].T
-                // weight so forward() does one matmul + two slices instead of
-                // two separate matmuls. No-op for quantized variants.
+                // Precompute the stacked [in_proj_qkvz; in_proj_ba].T weight
+                // so forward() does one matmul + two slices instead of two
+                // separate matmuls. No-op for quantized variants.
                 gdn.finalize_in_proj()?;
             }
             AttentionType::Full(attn) => {
@@ -1201,10 +1201,10 @@ fn apply_weights_inner(
     // are in place. The module is constructed in `Qwen35Inner::new()`
     // when `config.n_mtp_layers > 0`; if construction returned `None`
     // (no MTP layers) we silently skip even if the params happen to
-    // contain `mtp.*` entries (the sanitize pass already preserved
-    // them — see W1). The W6 decode loop is the only intended caller
-    // of `mtp.forward`; for now the module just sits next to the main
-    // model and reads from the same params HashMap.
+    // contain `mtp.*` entries (the sanitize pass already preserved them).
+    // The speculative-decode loop is the only intended caller of
+    // `mtp.forward`; the module sits next to the main model and reads from
+    // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
         let missing_mtp = missing_mtp_required_weights(params, config);
         if missing_mtp.is_empty() {
@@ -1349,7 +1349,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 //   1. inline `mtp.*` tensors in the body shards (existing
                 //      checkpoints — handled implicitly by sanitize keeping them);
                 //   2. legacy `mtp.safetensors`-style sidecar (existing path);
-                //   3. mlx-vlm split `mtp-drafter/` directory (Phase 1 convert).
+                //   3. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
                 // Only attempt the sidecar/drafter merge when the body itself
                 // carries NO inline `mtp.*` tensors so inline always wins.
                 let has_inline_mtp = raw_params
@@ -1643,8 +1643,8 @@ fn register_weights_with_cpp(
     // registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights() };
 
-    // PR #65 (mtp-reload P1) — invalidate the compiled MTP-verify dispatch
-    // tables in the SAME write-lock critical section as the weight clear.
+    // Invalidate the compiled MTP-verify dispatch tables in the SAME
+    // write-lock critical section as the weight clear.
     // The verify graphs bake their weights into the compile cache (weights
     // are captured inside the traced closure, not passed as inputs) and
     // those tables deliberately survive the per-turn compiled reset for
@@ -2193,10 +2193,10 @@ mod tests {
         assert_eq!(overrides.len(), 8);
     }
 
-    /// Fix 3 (Task 36): a MoE-flavored MTP layer augments the per-layer-quant
-    /// table with the MoE MLP linear set (experts, router gate, shared expert +
-    /// gate) in addition to the shared attention projections — all at the
-    /// uniform PLQ from the `mtplx_mtp_quantization` block (Option A).
+    /// A MoE-flavored MTP layer augments the per-layer-quant table with the
+    /// MoE MLP linear set (experts, router gate, shared expert + gate) in
+    /// addition to the shared attention projections — all at the uniform PLQ
+    /// from the `mtplx_mtp_quantization` block.
     #[test]
     fn mtplx_all_quant_metadata_moe_flavor_includes_expert_and_gate_linears() {
         use crate::models::mtp_drafter::MTP_MOE_LAYER_LINEAR_SUFFIXES;
@@ -2243,9 +2243,9 @@ mod tests {
         assert_eq!(overrides.get("mtp.fc").copied(), Some(expect_plq));
         // 12 per-layer linears (4 attn + 8 MoE MLP) + mtp.fc = 13.
         assert_eq!(overrides.len(), 13);
-        // The router gate is recorded at the uniform 4-bit PLQ (Option A), NOT a
-        // separate 8-bit gate gate-default — this is what makes the single-PLQ
-        // sidecar block sufficient for produce + reload.
+        // The router gate is recorded at the uniform 4-bit PLQ, NOT a separate
+        // 8-bit gate gate-default — this is what makes the single-PLQ sidecar
+        // block sufficient for produce + reload.
         assert_eq!(overrides.get("mtp.layers.0.mlp.gate").unwrap().bits, 4);
     }
 

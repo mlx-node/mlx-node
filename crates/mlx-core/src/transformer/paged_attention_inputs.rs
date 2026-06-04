@@ -1,5 +1,5 @@
 //! `PagedAttentionInputs` — standardized metadata bundle threaded into
-//! every paged-attention model's compiled forward graph (Phase 3+).
+//! every paged-attention model's compiled forward graph.
 //!
 //! This is the Rust-side mirror of the C++ struct
 //! `mlx::core::fast::paged::PagedAttentionInputs` declared in
@@ -11,9 +11,8 @@
 //!
 //! # Why a dedicated struct?
 //!
-//! Phases 4-9 (one per model migration) all need the same 6 inputs in the
-//! same shapes/dtypes. Bundling them into a struct that's the same
-//! between all models means:
+//! All models need the same 6 inputs in the same shapes/dtypes. Bundling
+//! them into one struct shared across models means:
 //!
 //! 1. Each model's C++ forward graph has a uniform compile-cache key —
 //!    re-tracing on shape changes (per-request data variation) is

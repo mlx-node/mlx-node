@@ -705,9 +705,8 @@ export class SessionRegistry {
 
   /**
    * @deprecated **Redundant on `/v1/messages` for paged-active models.**
-   * Phase 7 of the messages-kv-reuse plan removed the only call site
-   * for paged-active full-attention models (Qwen3 + LFM2 + Gemma4
-   * today): the native block-paged KV adapter (`PagedKVCacheAdapter` +
+   * There is no call site for paged-active full-attention models (Qwen3 +
+   * LFM2 + Gemma4 today): the native block-paged KV adapter (`PagedKVCacheAdapter` +
    * `BlockAllocator` + `LayerKVPool`) recovers a turn's prefix from
    * refcounted KV blocks keyed by token-prefix hash, so the JS-side
    * single-warm slot this method walks is redundant — the native

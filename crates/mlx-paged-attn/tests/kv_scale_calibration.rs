@@ -1,11 +1,11 @@
-//! Phase 10 integration tests for FP8 K/V scale calibration determinism.
+//! Integration tests for FP8 K/V scale calibration determinism.
 //!
-//! Phase 10 wires `KvScaleManager` into `PagedKVCacheAdapter` so per-layer
-//! FP8 scales (currently `1.0` placeholders) flow through the paged decode
-//! path. The full 50-token-FP8-vs-bf16 end-to-end test from the spec
-//! requires a model checkpoint that runs with `use_fp8_cache: Some(true)`,
-//! which no production caller wires today — those tests are deferred to
-//! the FP8-cache enablement work.
+//! `KvScaleManager` is wired into `PagedKVCacheAdapter` so per-layer FP8
+//! scales (currently `1.0` placeholders) flow through the paged decode
+//! path. A full 50-token-FP8-vs-bf16 end-to-end test requires a model
+//! checkpoint that runs with `use_fp8_cache: Some(true)`, which no
+//! production caller wires today — those tests are deferred to the
+//! FP8-cache enablement work.
 //!
 //! What this test pins NOW: the GPU-backed calibration primitives
 //! (`KvScaleManager::calibrate_layer` and `update_layer_ema`) are

@@ -348,7 +348,7 @@ impl Lfm2Inner {
         // Initialize caches
         let caches = init_caches(&config);
 
-        // Block-paged KV adapter — default ON since 2026-04-28.
+        // Block-paged KV adapter — default ON.
         //
         // Chat dispatch is wired through this adapter at every chat-entry
         // site (see the `self.paged_adapter.is_some()` early-returns in
@@ -480,9 +480,8 @@ impl Lfm2Inner {
     /// atom) equals this model's [`Lfm2Inner::model_id`].
     ///
     /// The id is published ONLY by `register_weights_with_cpp` (load time), which
-    /// is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or PAGED
-    /// (Phase 3c lifted the MoE exclusion; P4 lifted the paged exclusion) — AND
-    /// now for QUANTIZED checkpoints (authoritative per-projection quant-info is
+    /// is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or PAGED —
+    /// AND for QUANTIZED checkpoints (authoritative per-projection quant-info is
     /// published, so `linear_proj` / `lfm2_switch_linear` dispatch correctly),
     /// gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense (non-packed)
     /// input embedding; see `should_register_compiled`. The single registered
@@ -761,8 +760,7 @@ impl Lfm2Inner {
 
         // Block-paged dispatch: when the adapter is configured, route
         // through the parallel `chat_sync_core_paged` path. The flat path
-        // below stays untouched so off-by-default behavior is byte-
-        // identical to before this commit.
+        // below stays untouched so the off-by-default behavior is byte-identical.
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 tokens,
@@ -1253,7 +1251,7 @@ impl Lfm2Inner {
     ///    warm `continue_turn`.
     /// 6. Session end / explicit reset / error: `release_request`.
     ///
-    /// Limitations (P1; documented in the doc comment):
+    /// Limitations:
     /// - Conv-layer prefix reuse is NOT carried across paged turns; each
     ///   paged turn reprefills conv state from the start of the prompt.
     /// - Pure-cache prompt (every prompt token already in the paged pool)
@@ -1492,16 +1490,16 @@ impl Lfm2Inner {
     /// MUST be called AFTER prefill (the adapter pools + conv caches are read
     /// here) and BEFORE the decode loop.
     fn paged_compiled_decode_setup(&mut self) -> Result<Lfm2PagedCompiledState> {
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         //
         // Mirrors the FLAT path's lock contract (`chat_sync_core`) and qwen3.5's
         // paged `cpp_session_ready` gate. The compiled-PAGED decode runs only
         // when ALL of:
         //   1. `compiled_path_active()` — weights registered for our model_id.
-        //      (The P4-widened registration gate publishes the id for ANY
-        //      non-quantized bf16/f16 checkpoint, FLAT or PAGED, so this is the
-        //      bf16/f16 + non-quant condition; a quantized checkpoint never
-        //      registers and is structurally `false` here.)
+        //      (The registration gate publishes the id for ANY non-quantized
+        //      bf16/f16 checkpoint, FLAT or PAGED, so this is the bf16/f16 +
+        //      non-quant condition; a quantized checkpoint never registers and is
+        //      structurally `false` here.)
         //   1b. The model weights are bf16. The paged adapter's `LayerKVPool` is
         //      always BFloat16 and the C++ paged graph hard-codes `KvDtype::Bf16`
         //      (its static attn mask + pool/scale dtype probes are bf16/f32), so
@@ -1532,7 +1530,7 @@ impl Lfm2Inner {
         // turn (see `chat_sync_core_paged`'s per-turn `self.caches =
         // init_caches(..)`), so the compiled-paged graph threads conv state
         // WITHIN a turn only (in the C++ paged globals) and there is no
-        // post-loop export step (plan risk #5).
+        // post-loop export step.
         use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
         let mut use_cpp_pre = self.compiled_path_active();
         // bf16-activation gate (1b): the compiled-PAGED graph + paged KV pools are
@@ -1825,7 +1823,7 @@ impl Lfm2Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         // Acquire the locks, gate, and seed the compiled-paged session for this
         // turn. The returned state holds the RAII guards (compiled lifecycle
         // mutex, weight read lock, paged reset guard) that span the whole decode
@@ -2177,7 +2175,7 @@ impl Lfm2Inner {
                 // **Limitation**: this is approximate — for exact
                 // numerical equivalence we'd need to re-run attention
                 // here too, which defeats the purpose of the prefix
-                // cache. Marked as a P1 known-issue for follow-up.
+                // cache. Known issue for follow-up.
                 continue;
             }
             // Conv layer: forward through the operator + FFN tail.
@@ -2539,7 +2537,7 @@ impl Lfm2Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // ===== Compiled C++ PAGED decode-path dispatch (P4) =====
+        // ===== Compiled C++ PAGED decode-path dispatch =====
         // Same setup the non-streaming path uses: acquire the compiled lifecycle
         // + weight locks, gate, and seed the compiled-paged session for this
         // turn. The returned state holds the RAII guards spanning the whole
@@ -2675,8 +2673,8 @@ impl Lfm2Inner {
 
         // Block-paged dispatch: when the adapter is configured, route
         // through the parallel `chat_stream_sync_core_paged` path. The
-        // flat path below stays untouched so off-by-default behavior is
-        // byte-identical to before this commit.
+        // flat path below stays untouched so the off-by-default behavior is
+        // byte-identical.
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(
                 tokens,
@@ -3922,8 +3920,7 @@ impl Drop for Lfm2CompiledResetGuard {
 /// loop returns early via `?`, so the next generation never seeds against stale
 /// paged pools.
 ///
-/// Armed by `chat_sync_core_paged_inner` (P4) when the compiled-paged seed
-/// succeeds.
+/// Armed by `chat_sync_core_paged_inner` when the compiled-paged seed succeeds.
 struct Lfm2PagedResetGuard;
 
 impl Drop for Lfm2PagedResetGuard {
@@ -4163,7 +4160,7 @@ fn init_lfm2_paged_compiled_session(
 /// gathers via `paged_attention`, while conv layers thread their state through
 /// the compiled graph's cache slots.
 ///
-/// Caller contract (enforced in the P4 decode loop, not here):
+/// Caller contract (enforced in the decode loop, not here):
 /// * `init_lfm2_paged_compiled_session` has been called this turn (so
 ///   `g_lfm2_paged_inited == true`).
 /// * `adapter.record_tokens(&[token_id])` has advanced the cursor (and lazily
@@ -4212,7 +4209,7 @@ fn forward_lfm2_cpp_paged(
 /// `&[Lfm2LayerCache]`, not the whole `Lfm2Inner`). Identical mapping:
 /// `FullAttention { paged_idx }` for attention layers (paged_idx counts only
 /// those, in original order) and `Conv` otherwise. Called by
-/// `init_lfm2_paged_compiled_session` (P4 decode-loop wiring).
+/// `init_lfm2_paged_compiled_session` (decode-loop wiring).
 fn compute_layer_kinds_for(config: &Lfm2Config, num_layers: usize) -> Vec<Lfm2LayerKind> {
     let mut kinds = Vec::with_capacity(num_layers);
     let mut paged_idx: u32 = 0;

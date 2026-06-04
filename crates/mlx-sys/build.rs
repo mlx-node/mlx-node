@@ -394,7 +394,7 @@ fn main() {
     if include_generated.exists() {
         bridge.include(&include_generated);
         // metal-cpp installs to `<install>/include/metal_cpp/Metal/Metal.hpp`.
-        // mlx_paged_dispatch.cpp (Phase 2) needs it because the public
+        // mlx_paged_dispatch.cpp needs it because the public
         // `mlx::core::metal::Device` API exposes `MTL::*` types from
         // `<Metal/Metal.hpp>`. The CMake build links MLX against
         // metal_cpp transitively but the cc-rs C++ bridge must be told

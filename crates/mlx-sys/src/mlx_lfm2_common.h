@@ -3,10 +3,9 @@
 // =============================================================================
 // LFM2.5 MoE compiled forward path — shared definitions.
 //
-// Phase 0 (inert scaffold): this header declares the config POD that the
-// compiled graph will consume and pulls in the shared MLX includes. The actual
-// graph (pure-fns, weight lookups, compiled decode closure) lands in later
-// phases, modeled on `mlx_qwen35_common.h`.
+// Declares the config POD the compiled graph consumes and pulls in the shared
+// MLX includes. The graph (pure-fns, weight lookups, compiled decode closure)
+// is defined alongside, modeled on `mlx_qwen35_common.h`.
 //
 // The process-global weight registry (`g_weights()`, `get_weight()`,
 // `linear_proj()`, `g_active_model_id()`) is process-wide and model-agnostic;
@@ -23,7 +22,6 @@ namespace lfm2_common {
 
 // Mirrors the fields of Rust `Lfm2Config` that the compiled forward needs.
 // POD only (no `mlx::core::array` members — `array` has no default ctor).
-// Phase 0: declared for the FFI init signature; populated in Phase 1.
 struct Lfm2MoeConfig {
   int num_layers = 0;
   int hidden_size = 0;
@@ -50,12 +48,11 @@ struct Lfm2MoeConfig {
   // (conv.in_proj.bias, conv.conv.bias, conv.out_proj.bias). Default false
   // (bias-free checkpoint).
   bool conv_bias = false;
-  // SUPERSEDED by the per-prefix quant-info registry (`lookup_quant_info`,
-  // populated Rust-side via `mlx_store_quant_info`). These whole-model scalars
-  // cannot express mixed recipes (affine router + fp experts), so quant dispatch
-  // no longer reads them — `lfm2_switch_linear`/`linear_proj` key off `.scales`
-  // presence + the registry. Kept (unused, default 0) for config-ABI stability;
-  // do NOT re-wire them.
+  // Unused (default 0): quant dispatch keys off `.scales` presence + the
+  // per-prefix quant-info registry (`lookup_quant_info`, populated Rust-side via
+  // `mlx_store_quant_info`), since these whole-model scalars cannot express mixed
+  // recipes (affine router + fp experts). Kept for config-ABI stability; do NOT
+  // re-wire them.
   int quant_mode = 0;
   int bits = 0;
   int group_size = 0;
@@ -175,7 +172,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn(
 // Always uses the fixed-shape padded KV cache + static additive mask
 // (positions <= offset -> 0, else -inf), the compile-safe path — so this is the
 // dynamic_kv=false branch with an array offset. The scalar fn is kept unchanged
-// so the Phase-2a operator probes stay green; the decode loop calls THIS one.
+// for the operator probes; the decode loop calls THIS one.
 // =====================================================================
 inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
     const array& x,
@@ -230,7 +227,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn_arr(
 
 // =====================================================================
 // PAGED-cache variant of `lfm2_attn_pure_fn_arr` for the COMPILED-PAGED
-// decode graph (Phase P1).
+// decode graph.
 //
 // Identical lfm2 attention MATH up through RoPE to the flat array-offset fn
 // above (GQA, per-head Q/K RMSNorm, NO q-gate/bias, neox RoPE over the full
@@ -320,7 +317,7 @@ inline Lfm2AttnResult lfm2_attn_pure_fn_arr_paged(
   auto q_pa = reshape(transpose(queries, {0, 2, 1, 3}),
                       {num_tokens, cfg.num_heads, cfg.head_dim});
 
-  // Phase P1 hard-coded contract (matches qwen attn_for_compile_paged):
+  // Hard-coded contract (matches qwen attn_for_compile_paged):
   // bf16 cache, x_pack=8, sliding=0.
   constexpr int X_PACK = 8;
   constexpr int SLIDING_WINDOW = 0;

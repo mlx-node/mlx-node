@@ -233,8 +233,8 @@ impl MetalState {
         )
     }
 
-    /// Varlen counterparts to the V1/V2/reduce kernel name helpers above
-    /// (Phase 4a). The naming convention mirrors the single-row helpers
+    /// Varlen counterparts to the V1/V2/reduce kernel name helpers above.
+    /// The naming convention mirrors the single-row helpers
     /// 1:1 except for the `varlen` infix so the metallib lookup is
     /// unambiguous; this also means a missing-kernel typo here fails
     /// loudly at pipeline-build time rather than silently selecting the

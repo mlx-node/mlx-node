@@ -1,8 +1,8 @@
 // =============================================================================
 // Qwen3.5 MoE MTP (Multi-Token Prediction) compiled draft + verify graphs.
 //
-// MoE twin of `mlx_qwen35_mtp_compiled.cpp` (W5 dense). Provides three FFI
-// entrypoints that mirror the dense ones byte-for-byte:
+// MoE twin of `mlx_qwen35_mtp_compiled.cpp` (dense). Provides three FFI
+// entrypoints that mirror the dense ones:
 //
 //   - `mlx_qwen35_moe_mtp_compiled_init_from_main`: validates that the main
 //     MoE compiled path is inited (via `mlx_qwen35_moe_is_compile_inited`),
@@ -13,29 +13,27 @@
 //
 //   - `mlx_qwen35_moe_mtp_draft_compiled`: one MTP draft step. Inputs are
 //     `(prev_hidden, prev_emb)` — both `[1, 1, hidden]`. Returns the next
-//     hidden state and the draft logits. Wrapped in `mlx::core::compile`
-//     from the start, mirroring the MoE main compiled path
-//     (`mlx_qwen35_moe.cpp:549`).
+//     hidden state and the draft logits.
 //
 //   - `mlx_qwen35_moe_mtp_verify_compiled`: one verify pass on `depth+1`
-//     tokens. Loops `mlx_qwen35_moe_forward` D+1 times (per-depth closure
-//     table populated lazily) and stacks the per-step logits.
+//     tokens via a per-depth closure table that dispatches to the batched
+//     MoE verify FFI.
 //
 // MoE-specific divergences from the dense MTP file:
 //
-//   1. MLP branch: every MTP layer dispatches on `is_moe_layer(fa_idx, cfg)`
-//      between a parameterised-prefix `sparse_moe_fn_pfx` (MoE routing,
-//      switch_mlp + shared_expert) and a parameterised-prefix
-//      `dense_mlp_fn_pfx` (plain SwiGLU). The per-MTP-layer quant info
-//      comes from `g_mtp_layer_quant` / `g_mtp_dense_quant`, populated
-//      from the loaded `mtp.layers.{j}.mlp.*` weights at init time —
-//      independent of the main path's per-layer arrays.
+//   1. MLP branch: every MTP layer dispatches on the precomputed
+//      `mtp_layer_is_moe` flag between a parameterised-prefix
+//      `sparse_moe_fn_pfx` (MoE routing, switch_mlp + shared_expert) and a
+//      parameterised-prefix `dense_mlp_fn_pfx` (plain SwiGLU). The
+//      per-MTP-layer quant info comes from `g_mtp_layer_quant` /
+//      `g_mtp_dense_quant`, populated from the loaded `mtp.layers.{j}.mlp.*`
+//      weights at init time — independent of the main path's per-layer arrays.
 //
 //   2. The MoE branch uses `gather_mm` / `gather_qmm` which want 3D
 //      pre-transposed expert weights `[E, in, out]`. The main MoE init
 //      pre-computes these into a file-static map (`g_weight_transposes_3d`)
 //      that is NOT visible across translation units. We maintain a private
-//      transpose cache (`g_mtp_3d_transposes()`) populated at MTP init for
+//      transpose cache (`g_mtp_3d_transposes`) populated at MTP init for
 //      every `mtp.layers.{j}.mlp.switch_mlp.*.weight` key that exists in
 //      `g_weights()` and is 3D.
 //
@@ -80,29 +78,20 @@ extern "C" int mlx_qwen35_moe_get_cache_offset();
 
 extern "C" int mlx_qwen35_moe_is_compile_inited();
 
-// W6.5 — read the LAST stashed `g_moe_last_hidden` (refcounted clone)
-// from the MoE main compiled state. The verify graph in this file loops
-// `mlx_qwen35_moe_forward` D+1 times; that function emits the hidden as
-// graph output slot 2 (see `mlx_qwen35_moe.cpp` line 943) and stashes
-// it into `g_moe_last_hidden` on every call.
-//
-// To support chained MTP cycles correctly we MUST capture the hidden
-// after EACH of the D+1 iterations (not just the last) and surface them
-// as a stacked `[1, D+1, hidden]` tensor. The Rust caller then slices
-// position `K` (= number of accepted drafts) to seed the next cycle's
-// first MTP draft — `verify_hidden[K]` is the prediction context for
-// the committed-token-at-position-K+1 (bonus on full-accept, residual
-// on rejection), matching the MTP head's training contract.
+// Read the LAST stashed `g_moe_last_hidden` (refcounted clone) from the
+// MoE main compiled state. To support chained MTP cycles the Rust caller
+// slices position `K` (= number of accepted drafts) of the verify hiddens
+// to seed the next cycle's first MTP draft — `verify_hidden[K]` is the
+// prediction context for the committed token at position K+1 (bonus on
+// full-accept, residual on rejection), matching the MTP head's training
+// contract.
 //
 // Returns null when the main MoE path is uninitialised OR no forward
-// has run since the last reset. Mirrors the public W6 Step-A seeding
-// FFI; declared here too so the verify closure can thread it once per
-// iteration without going through the FFI boundary twice.
+// has run since the last reset.
 extern "C" void mlx_qwen35_moe_export_last_hidden(mlx_array** out);
 
-// W6.7 — One-shot batched MoE verify forward. Runs the entire D+1-token
-// verify on a single compiled graph (vs the prior D+1 sequential
-// `mlx_qwen35_moe_forward` calls) and emits `[1, D+1, vocab]` logits +
+// One-shot batched MoE verify forward. Runs the entire D+1-token verify on
+// a single compiled graph and emits `[1, D+1, vocab]` logits +
 // `[1, D+1, hidden]` hiddens.
 extern "C" void mlx_qwen35_moe_forward_batched_verify(
     mlx_array* input_ids_ptr,
@@ -111,9 +100,9 @@ extern "C" void mlx_qwen35_moe_forward_batched_verify(
     mlx_array** out_logits,
     mlx_array** out_hiddens);
 
-// W6.7 follow-up — eagerly compile the MoE batched verify graph for
-// depths {1..5}. Defined in `mlx_qwen35_moe.cpp` where it has direct
-// access to `g_moe_caches` / `g_moe_offset_int` for snapshot/restore.
+// Eagerly compile the MoE batched verify graph for depths {1..5}.
+// Defined in `mlx_qwen35_moe.cpp` where it has direct access to
+// `g_moe_caches` / `g_moe_offset_int` for snapshot/restore.
 // Best-effort: failures are logged + swallowed.
 extern "C" void mlx_qwen35_moe_prewarm_verify_compiled();
 
@@ -122,10 +111,8 @@ namespace {
 // =====================================================================
 // MoE-specific config (mirrors `MoeConfig` in `mlx_qwen35_moe.cpp`).
 //
-// Duplicated here on purpose — the MoE main file's `MoeConfig` is in an
-// anonymous namespace and not visible across translation units. Per the
-// W5 MoE plan we accept this surgical duplication over refactoring the
-// 1600-line main MoE file.
+// Duplicated on purpose — the MoE main file's `MoeConfig` is in an
+// anonymous namespace and not visible across translation units.
 // =====================================================================
 struct MoeConfigMtp : BaseConfig {
   int num_experts;
@@ -160,7 +147,7 @@ struct DenseMLPQuantInfoMtp {
 static MoeConfigMtp g_mtp_config{};
 static std::vector<array> g_mtp_compiled_caches;  // 2 * n_mtp_layers (K,V)
 static int g_mtp_offset_int = 0;
-// W6.32 — start-of-cycle offset (= main offset captured by `begin_cycle`).
+// Start-of-cycle offset (= main offset captured by `begin_cycle`).
 // MoE twin of `g_mtp_chain_start_int` in the dense MTP file; see that file
 // for the rationale (mask out zero-K/V slots in `[0..chain_start)`).
 static int g_mtp_chain_start_int = 0;
@@ -631,17 +618,15 @@ using VerifyFn = std::function<std::vector<array>(
     const array&, const array&)>;
 static std::array<VerifyFn, MAX_VERIFY_DEPTH> g_verify_compiled_by_depth{};
 
-// W6.7 follow-up #3 — Reset-aware once-flag for the MoE prewarm path.
-// Mirrors the dense MTP file (`mlx_qwen35_mtp_compiled.cpp`); see the
-// comment there for the full rationale. TL;DR: `std::once_flag` cannot be
-// reset, so a `mlx_qwen35_moe_mtp_compiled_reset` + re-init would leave
+// Reset-aware once-flag for the MoE prewarm path. `std::once_flag` cannot
+// be reset, so a `mlx_qwen35_moe_mtp_compiled_reset` + re-init would leave
 // `g_verify_compiled_by_depth` null and force lazy-per-depth construction
 // on every first verify. An atomic-bool gate lets the reset hook re-arm
 // the prewarm.
 static std::atomic<bool> g_prewarm_done{false};
 
-// W6.7 — Dispatch to the new batched MoE verify FFI (one compiled
-// forward over T = depth+1 tokens) and surface
+// Dispatch to the batched MoE verify FFI (one compiled forward over
+// T = depth+1 tokens) and surface
 // `{logits[1, T, vocab], hiddens[1, T, hidden]}`. See the dense MTP
 // `make_verify_fn` for the design rationale.
 static VerifyFn make_verify_fn(int depth) {
@@ -960,17 +945,14 @@ void mlx_qwen35_moe_mtp_verify_compiled(
 }
 
 // -----------------------------------------------------------------------------
-// W6.5 — MoE verify pass that ALSO exports the post-final-norm hidden
-// at EVERY verify position so the caller can chain MTP cycles without
-// running a fresh main-model forward at each cycle's "Step A". MoE
-// twin of `mlx_qwen35_mtp_verify_compiled_with_hidden` — see that
-// function's docstring for the rationale, lifetime contract, and
-// failure mode.
+// MoE verify pass that ALSO exports the post-final-norm hidden at EVERY
+// verify position so the caller can chain MTP cycles without running a
+// fresh main-model forward at each cycle's "Step A". MoE twin of
+// `mlx_qwen35_mtp_verify_compiled_with_hidden` — see that function's
+// docstring for the rationale, lifetime contract, and failure mode.
 //
-// The MoE main forward (`mlx_qwen35_moe_forward`) writes
-// `g_moe_last_hidden` on every call (graph output slot 2). The verify
-// closure captures it after every iteration before the next forward
-// overwrites it, then concatenates into `[1, depth+1, hidden_size]`.
+// The batched MoE verify graph returns `[1, depth+1, hidden]` hiddens
+// directly.
 // -----------------------------------------------------------------------------
 void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
     mlx_array* input_ids_ptr,
@@ -1018,11 +1000,9 @@ void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
       return;
     }
 
-    // Run the existing per-depth verify loop. After this returns,
-    // `g_moe_caches[]` / `g_moe_offset_int` have been advanced by D+1.
-    // The closure returns `{logits[1, D+1, vocab], hiddens[1, D+1,
-    // hidden]}` — the hiddens were captured per-iteration before the
-    // next MoE forward overwrote `g_moe_last_hidden`.
+    // Run the per-depth verify. After this returns, `g_moe_caches[]` /
+    // `g_moe_offset_int` have been advanced by D+1. The closure returns
+    // `{logits[1, D+1, vocab], hiddens[1, D+1, hidden]}`.
     const auto& verify_fn = get_or_make_verify_fn(depth);
     auto outputs = verify_fn(input_ids, embedding_weight);
     if (outputs.size() < 2) {
@@ -1060,23 +1040,18 @@ void mlx_qwen35_moe_mtp_verify_compiled_with_hidden(
 }
 
 // -----------------------------------------------------------------------------
-// W6.7 follow-up — Pre-warm the per-depth verify dispatch closures AND the
-// underlying MLX-compiled batched verify graph for the MoE main path.
+// Pre-warm the per-depth verify dispatch closures AND the underlying
+// MLX-compiled batched verify graph for the MoE main path.
 //
 // Wire this to fire IMMEDIATELY after
 // `mlx_qwen35_moe_mtp_compiled_init_from_main` returns 0 from the Rust
-// caller. MoE has only ONE compiled variant (W6.6 tape-replay is deferred
-// for MoE) so this prewarms 5 shapes total instead of 10.
+// caller. MoE has only ONE compiled variant (no tape-replay) so this
+// prewarms 5 shapes total instead of 10.
 //
-// W6.7 follow-up #2 — `init_moe_mtp_compiled_from_main` runs once PER
-// TURN, not once per process. Gate the body behind a once-flag so the
-// heavy work fires exactly once per process — on the FIRST turn (after
-// MoE MTP init has set up the global state). Subsequent turns
-// short-circuit immediately.
-//
-// W6.7 follow-up #3 — The flag is `std::atomic<bool>` rather than
-// `std::once_flag` so `mlx_qwen35_moe_mtp_compiled_reset` can re-arm it.
-// See the dense MTP file for the full rationale.
+// Init runs once PER TURN, not once per process; the heavy work is gated
+// behind an atomic-bool once-flag (reset-aware, so
+// `mlx_qwen35_moe_mtp_compiled_reset` can re-arm it) that fires exactly
+// once per process. Subsequent turns short-circuit immediately.
 //
 // Best-effort: any failure is logged + swallowed, leaving the verify
 // path to fall back to lazy-at-first-use.
@@ -1085,8 +1060,7 @@ void mlx_qwen35_moe_mtp_compiled_prewarm_verify() {
   if (!g_mtp_compile_inited) {
     return;
   }
-  // W6.7 follow-up #3 — Atomic-bool gate (reset-aware) replaces
-  // `std::once_flag`. See the dense MTP file for the rationale.
+  // Atomic-bool gate (reset-aware).
   bool expected = false;
   if (!g_prewarm_done.compare_exchange_strong(expected, true)) {
     return;
@@ -1128,8 +1102,8 @@ void mlx_qwen35_moe_mtp_compiled_reset() {
   for (auto& slot : g_verify_compiled_by_depth) {
     slot = nullptr;
   }
-  // W6.7 follow-up #3 — Re-arm the prewarm gate so a subsequent re-init
-  // can repopulate `g_verify_compiled_by_depth` via the prewarm path.
+  // Re-arm the prewarm gate so a subsequent re-init can repopulate
+  // `g_verify_compiled_by_depth` via the prewarm path.
   g_prewarm_done.store(false);
 }
 
@@ -1143,10 +1117,8 @@ void mlx_qwen35_moe_mtp_compiled_adjust_offset(int delta) {
 }
 
 // -----------------------------------------------------------------------------
-// W6 Bug #2 fix (Option Reset): begin a fresh MoE MTP draft cycle aligned
-// to the main MoE path's current offset. Zeroes the MTP K/V caches and
-// sets `g_mtp_offset_int = main_offset`. See the dense MTP file for the
-// full rationale — the divergence and fix are identical here.
+// Begin a fresh MoE MTP draft cycle aligned to the main MoE path's current
+// offset. Zeroes the MTP K/V caches and sets `g_mtp_offset_int = main_offset`.
 // -----------------------------------------------------------------------------
 void mlx_qwen35_moe_mtp_compiled_begin_cycle(int main_offset) {
   if (!g_mtp_compile_inited) return;
@@ -1160,8 +1132,8 @@ void mlx_qwen35_moe_mtp_compiled_begin_cycle(int main_offset) {
         mlx::core::bfloat16);
   }
   g_mtp_offset_int = main_offset;
-  // W6.32 — see dense MTP file for full rationale on the chain-start
-  // lower-bound in the attn_mask.
+  // See dense MTP file for the rationale on the chain-start lower-bound
+  // in the attn_mask.
   g_mtp_chain_start_int = main_offset;
 }
 
@@ -1173,8 +1145,8 @@ int mlx_qwen35_moe_mtp_get_offset() {
   return g_mtp_offset_int;
 }
 
-// PR #65 (mtp-reload P1 follow-up) — invalidate the compiled MoE MTP draft
-// graph so the next call re-traces against the CURRENT weight registry.
+// Invalidate the compiled MoE MTP draft graph so the next call re-traces
+// against the CURRENT weight registry.
 //
 // `moe_mtp_draft_decode_fn` reads the MoE MTP head weights via `get_weight(...)`
 // INSIDE the traced closure (NOT as compile inputs), so the captured weight

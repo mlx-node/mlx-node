@@ -36,15 +36,14 @@ extern "C" void mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
 namespace qwen35_common {
 
 // =====================================================================
-// MTP control-flow tracing (W6.34)
+// MTP control-flow tracing
 // =====================================================================
 //
 // Gated by `MLX_MTP_TRACE`: set to `1` / `true` / `on` (case-insensitive,
 // surrounding whitespace ignored) to emit C++-side ENTER/EXIT traces for
 // the MTP draft / verify entrypoints. Default OFF so production decode is
-// not flooded. Truthy parsing mirrors the Rust `MLX_MTP_*` readers in
-// `crates/mlx-core/src/models/qwen3_5/chat_common.rs` and the C++
-// `bucketed_verify_disabled()` reader so the convention is uniform.
+// not flooded. Truthy parsing matches the Rust `MLX_MTP_*` readers so the
+// convention is uniform.
 inline bool mtp_trace_enabled() {
   static const bool enabled = []() {
     const char* raw = std::getenv("MLX_MTP_TRACE");
@@ -224,9 +223,9 @@ inline array linear_proj(const array& x, const std::string& prefix) {
     // Fallback heuristic: only the registered modes affine/mxfp8/mxfp4/nvfp4
     // are correct callers; MXFP4/NVFP4 paths under the heuristic would silently
     // mislabel as MXFP8 because none of them carry biases. The fallback exists
-    // for the dense qwen3_5 path (which does not register quant info today) —
+    // for the dense qwen3_5 path (which does not register quant info) —
     // dense models in production are MXFP8 or affine, so the heuristic remains
-    // correct there until the dense path is plumbed in a follow-up.
+    // correct there.
     static std::atomic<bool> warned_fallback{false};
     if (!warned_fallback.exchange(true)) {
       fprintf(stderr,
@@ -296,11 +295,10 @@ detect_layer_quant(const std::string& prefix) {
 }
 
 // Detect quantization for a router/shared-expert gate. Same return shape as
-// `detect_layer_quant`. Pre-PR behavior was to hardcode gates as 8-bit affine
-// gs=64 regardless of the checkpoint; with the registry, Rust drives the
-// actual values (MXFP8 gates under `--q-mxfp --q-bits 8` no-recipe path,
-// 8-bit affine in all other cases). Heuristic fallback retains the legacy
-// hardcoded value for callers that have not been plumbed.
+// `detect_layer_quant`. With the registry, Rust drives the actual values
+// (MXFP8 gates under `--q-mxfp --q-bits 8` no-recipe path, 8-bit affine in
+// all other cases). Heuristic fallback hardcodes 8-bit affine gs=64 for
+// callers that have not been plumbed.
 inline std::tuple<bool, int, int, std::string>
 detect_router_gate_quant(const std::string& prefix) {
   if (!has_weight(prefix + ".scales")) {
@@ -581,7 +579,7 @@ inline std::pair<array, array> gated_delta_kernel_call(
 }
 
 // =====================================================================
-// W6.6 — Tape-emitting GDN kernel for MTP rollback. Mirrors the standard
+// Tape-emitting GDN kernel for MTP rollback. Like the standard
 // gated-delta kernel but emits the per-step innovation `delta` as a
 // third output (`tape`, fp32, shape `[B, T, Hv, Dv]`). The MTP verify
 // path records `(tape, k, g, qkv)` per layer during the D+1 verify
@@ -589,8 +587,7 @@ inline std::pair<array, array> gated_delta_kernel_call(
 // `accepted_steps` innovations to the pre-verify snapshot state without
 // re-running the main model forward.
 //
-// See `metal/gated_delta_step_tape.metal.inc` for the kernel source
-// (ported verbatim from DFlash `_gated_delta_tape_kernel`).
+// Kernel source: `metal/gated_delta_step_tape.metal.inc`.
 // =====================================================================
 
 inline std::unique_ptr<mlx::core::fast::CustomKernelFunction>& qwen35_gd_tape_kernel() {
@@ -647,7 +644,7 @@ inline std::tuple<array, array, array> gated_delta_kernel_with_tape_call(
 }
 
 // =====================================================================
-// W6.6 — Tape-replay kernel. Takes a snapshot `state`, plus per-step
+// Tape-replay kernel. Takes a snapshot `state`, plus per-step
 // `(tape, k, g)` recorded by the tape-emitting forward kernel, and
 // returns a new state advanced by `T` steps. The recurrent_state output
 // matches what `T` calls to `gated_delta_kernel_call` with the same
@@ -717,7 +714,7 @@ inline array tape_replay_kernel_call(
 
 struct GDNPureResult { array output, conv_state, recurrent_state; };
 
-// W6.6 — extended GDN result that also returns the per-step `(tape, k, g,
+// Extended GDN result that also returns the per-step `(tape, k, g,
 // qkv)` tensors needed by the rollback tape-replay path. `tape` is fp32
 // `[B, 1, Hv, Dv]`, `k` is `[B, 1, Hk, Dk]` (model dtype), `g` is
 // `[B, 1, Hv]` (fp32), `qkv` is `[B, 1, conv_dim]` (model dtype — the
@@ -727,14 +724,12 @@ struct GDNPureResultWithTape {
   array tape, k_tape, g_tape, qkv_tape;
 };
 
-// Unified `gdn_pure_fn` templated on `WithTape`. When `WithTape=false`
-// returns `GDNPureResult`; when `WithTape=true` returns the extended
+// GDN forward templated on `WithTape`. When `WithTape=false` returns
+// `GDNPureResult`; when `WithTape=true` returns the extended
 // `GDNPureResultWithTape` that also carries the per-step `(tape, k, g,
 // qkv)` tensors consumed by the rollback tape-replay path. Both
-// instantiations are math-identical to the legacy
-// `gdn_pure_fn` / `gdn_pure_fn_with_tape` pair — only the underlying
-// Metal kernel differs (`gated_delta_kernel_call` vs
-// `gated_delta_kernel_with_tape_call`).
+// instantiations are math-identical — only the underlying Metal kernel
+// differs (`gated_delta_kernel_call` vs `gated_delta_kernel_with_tape_call`).
 template <bool WithTape>
 inline std::conditional_t<WithTape, GDNPureResultWithTape, GDNPureResult>
 gdn_pure_fn_impl(
@@ -850,9 +845,7 @@ gdn_pure_fn_impl(
   }
 }
 
-// Backwards-compatible thin wrappers. Callers continue to use
-// `gdn_pure_fn(...)` / `gdn_pure_fn_with_tape(...)` exactly as before;
-// the actual body lives in the templated `gdn_pure_fn_impl`.
+// Thin wrappers over the templated `gdn_pure_fn_impl`.
 inline GDNPureResult gdn_pure_fn(
     const array& x,
     int layer_idx,
@@ -862,11 +855,11 @@ inline GDNPureResult gdn_pure_fn(
   return gdn_pure_fn_impl<false>(x, layer_idx, conv_state, recurrent_state, cfg);
 }
 
-// W6.6 — Tape-recording variant of `gdn_pure_fn`. Identical math; the
-// only difference is the underlying Metal kernel call returns the
-// per-step `tape` innovation, and we also surface `(k, g, qkv)` for the
-// tape-replay rollback to consume. Used by the dense and MoE main
-// forwards during MTP verify cycles when tape-replay is enabled.
+// Tape-recording variant of `gdn_pure_fn`. Identical math; the
+// underlying Metal kernel call also returns the per-step `tape`
+// innovation, and we surface `(k, g, qkv)` for tape-replay rollback.
+// Used by the dense and MoE main forwards during MTP verify cycles when
+// tape-replay is enabled.
 inline GDNPureResultWithTape gdn_pure_fn_with_tape(
     const array& x,
     int layer_idx,
@@ -890,7 +883,7 @@ inline AttnPureResult attn_pure_fn(
     const array& attn_mask,  // [1, 1, 1, max_kv_len] additive mask (ignored when dynamic_kv=true)
     int offset,
     const BaseConfig& cfg,
-    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (W6.21 T=1 decode)
+    bool dynamic_kv = false) {  // true = slice KV to valid range, skip mask (T=1 decode)
   int B = x.shape(0);
   std::string pfx = "layers." + std::to_string(layer_idx) + ".self_attn.";
 
@@ -934,7 +927,7 @@ inline AttnPureResult attn_pure_fn(
   float scale = std::pow((float)cfg.head_dim, -0.5f);
   auto attn_out = [&]() -> array {
     if (dynamic_kv) {
-      // W6.21 — slice KV cache to valid range [0..offset+1], pass no mask
+      // Slice KV cache to valid range [0..offset+1], pass no mask
       // → faster SDPA kernel. Mirrors upstream mlx-lm's
       // `create_attention_mask(N=1) → None` + `cache.state` slicing
       // pattern (see ./mlx-lm/mlx_lm/models/base.py:51-52 and
@@ -970,7 +963,7 @@ inline AttnPureResult attn_pure_fn(
 }
 
 // =====================================================================
-// W5 (MTP) helper: attention forward with array-valued RoPE offset and
+// MTP helper: attention forward with array-valued RoPE offset and
 // parameterised weight prefix.
 //
 // Mirrors `attn_pure_fn` but:
@@ -1141,9 +1134,9 @@ inline AttnPureResult attn_prefill_fn(
 
 // =====================================================================
 // Attention prefill (3D input, scalar RoPE offset, causal mask).
-// E53: text-only variant. Differs from attn_prefill_fn only in the RoPE
-// step — scalar-offset fast::rope instead of M-RoPE. The first-cut
-// caller (mlx_qwen35_text_prefill) uses single-chunk prefill so offset=0
+// Text-only variant. Differs from attn_prefill_fn only in the RoPE
+// step — scalar-offset fast::rope instead of M-RoPE. The caller
+// (mlx_qwen35_text_prefill) uses single-chunk prefill so offset=0
 // and SDPA can run in "causal" string mode (no explicit mask array).
 // Returns keys/values in [B, Hkv, T, D] for cache initialization.
 // =====================================================================
@@ -1325,13 +1318,9 @@ inline GDNPureResult gdn_prefill_fn(
 // and gathers attention K/V via PagedAttention (instead of a static
 // additive mask over the flat cache).
 //
-// PHASE 4 PIECE 1 CONTRACT: SINGLE-TOKEN DECODE ONLY.
+// CONTRACT: SINGLE-TOKEN DECODE ONLY.
 //
-// This helper is used exclusively for decode steps that process exactly
-// ONE new token per call. The `mlx_qwen35_moe_forward_paged` FFI that
-// drives it is wired only into the per-step decode loop; chunked prefill
-// continues to flow through the legacy flat path until piece 2's transfer
-// step lands a separate prefill helper. As a hard invariant:
+// This helper processes exactly ONE new token per call. As a hard invariant:
 //
 //     B == num_tokens == num_seqs == 1
 //     slot_mapping.shape(0) == new_k.shape(0) == new_v.shape(0) == 1
@@ -1340,38 +1329,34 @@ inline GDNPureResult gdn_prefill_fn(
 // `paged_kv_write` requires `slot_mapping.shape(0) == new_k.shape(0)`, so
 // any caller violating the single-token invariant would crash inside the
 // kernel validator. The FFI enforces this with an explicit guard before
-// graph construction.
-//
-// When piece 2 lands chunked-prefill support (B / num_tokens > 1), this
-// helper will need a second variant that honors the
-// `num_valid_tokens` / sentinel-padded `slot_mapping` contract from
-// `PagedAttentionInputs` (see `crates/mlx-paged-attn/src/inputs.rs`).
+// graph construction. Chunked prefill (B / num_tokens > 1) would need a
+// second variant honoring the `num_valid_tokens` / sentinel-padded
+// `slot_mapping` contract (see `crates/mlx-paged-attn/src/inputs.rs`).
 //
 // Inputs:
 //   - x:                 [B=1, hidden] — 2D activation
 //   - layer_idx:         transformer layer index (used for weight prefix)
 //   - k_pool, v_pool:    per-layer paged K/V storage (shapes per
 //                        `mlx_paged_ops.h`)
-//   - k_scale, v_scale:  [1] f32 scale placeholders (Phase 4 ships 1.0;
-//                        Phase 10 swaps for FP8 calibration)
+//   - k_scale, v_scale:  [1] f32 scale placeholders (1.0; reserved for
+//                        FP8 calibration)
 //   - offset_arr:        [1] int32 — global token position of the new token
 //                        (used by RoPE; same role as in `attn_for_compile`)
 //   - block_table:       [1, max_blocks_per_seq] int32, sentinel-padded -1
-//   - slot_mapping:      [1] int64 — single active slot (NOT sentinel-padded
-//                        for piece 1; chunk_size_max MUST equal 1)
-//   - num_valid_tokens:  [1] int32 (UNUSED in piece 1; reserved for chunked
-//                        prefill in piece 2)
+//   - slot_mapping:      [1] int64 — single active slot (NOT sentinel-padded;
+//                        chunk_size_max MUST equal 1)
+//   - num_valid_tokens:  [1] int32 (UNUSED; reserved for chunked prefill)
 //   - num_valid_blocks:  [1] int32 (informational)
 //   - seq_lens:          [1] int32 — total context length so far (paged_attn
 //                        kernel reads `seq_lens[seq_idx=0]`)
 //   - cfg:               BaseConfig with num_heads, num_kv_heads, head_dim,
 //                        rope_dims, rope_theta, rms_norm_eps
 //
-// Configuration (Phase 4 piece 1 contract):
+// Configuration (hard-coded contract):
 //   - block_size = 16 (passed in via `block_size` parameter for clarity).
 //   - kv_dtype  = Bf16.
 //   - x_pack    = 8 (= 16 / sizeof(bf16)).
-//   - sliding_window = 0 (Phase 7 lifts).
+//   - sliding_window = 0.
 //
 // Returns the layer output (`AttnPureResult.keys/values` are the post-write
 // pool tensors so the compile graph dependency edges flow through
@@ -1431,7 +1416,7 @@ inline AttnPureResult attn_for_compile_paged(
   auto new_v = reshape(values,  {num_tokens, cfg.num_kv_heads, cfg.head_dim});
   auto q_pa  = reshape(queries, {num_tokens, cfg.num_heads,    cfg.head_dim});
 
-  // Phase 4 piece 1 hard-coded contract: bf16 cache, x_pack=8, sliding=0.
+  // Hard-coded contract: bf16 cache, x_pack=8, sliding=0.
   constexpr int X_PACK = 8;
   constexpr int SLIDING_WINDOW = 0;
   const auto kv_dtype = mlx::core::fast::KvDtype::Bf16;
@@ -1486,13 +1471,12 @@ inline AttnPureResult attn_for_compile_paged(
 }
 
 // =====================================================================
-// W6.7 — Batched attention forward for the MTP verify graph.
+// Batched attention forward for the MTP verify graph.
 //
 // Processes a contiguous chunk of `T` decode tokens in ONE forward (vs the
 // flat-path `attn_pure_fn` / `attn_for_compile` helpers which both
-// hard-wire T = 1). Used exclusively by the per-depth batched verify
-// graph in `mlx_qwen35.cpp` / `mlx_qwen35_moe.cpp` to replace the prior
-// D+1 sequential single-token forwards with one launch.
+// hard-wire T = 1). Used by the per-depth batched verify graph in
+// `mlx_qwen35.cpp` / `mlx_qwen35_moe.cpp`.
 //
 // Inputs:
 //   - x:                 `[B, T, hidden]` 3D activation (T = depth + 1).
@@ -1525,8 +1509,8 @@ inline AttnPureResult attn_for_compile_paged(
 //   3. The additive `tail_mask` is per-position (shape `[1, 1, T, B])
 //      where B ≤ max_kv_len is the SDPA "bucket" — see `bucket_kv_len`.
 //
-// W6.29 — `bucket_kv_len` is the static SDPA key-column count baked into
-// the compile trace. If `bucket_kv_len < max_kv_len`, the writeback
+// `bucket_kv_len` is the static SDPA key-column count baked into the
+// compile trace. If `bucket_kv_len < max_kv_len`, the writeback
 // still operates on the full `[B, Hkv, max_kv_len, D]` cache (so the
 // returned `new_kv_keys/values` are full-size and the caller's
 // `g_compiled_caches[]` mutation contract is unchanged), but the K/V
@@ -1584,7 +1568,7 @@ inline AttnPureResult attn_batched_verify_fn(
   keys    = fast::rms_norm(keys,    get_weight(pfx + "k_norm.weight"), cfg.rms_norm_eps);
 
   // RoPE: array offset; queries/keys at axis 1 (time) get positions
-  // [offset, offset+1, ..., offset+T-1]. Confirmed against mlx-lm's
+  // [offset, offset+1, ..., offset+T-1]. Matches mlx-lm's
   // `Qwen3NextAttention.__call__` (qwen3_next.py:146-147) — the same
   // single-scalar `cache.offset` is used for prefill (T>1) decode batches.
   queries = fast::rope(queries, cfg.rope_dims, false, cfg.rope_theta, 1.0f, offset_arr);
@@ -1601,7 +1585,7 @@ inline AttnPureResult attn_batched_verify_fn(
   auto new_kv_keys   = mlx::core::slice_update(kv_keys,   keys_for_write,   offset_arr, {2});
   auto new_kv_values = mlx::core::slice_update(kv_values, values_for_write, offset_arr, {2});
 
-  // W6.29 — Bucketed SDPA view. The caller supplies a bucket size that's
+  // Bucketed SDPA view. The caller supplies a bucket size that's
   // (a) ≥ `offset + T` (so every valid key column is inside the slice)
   // and (b) a static integer baked into the compile trace (so SDPA sees
   // a smaller, fixed `[B, Hkv, bucket, D]` key tensor). `bucket_kv_len==0`
@@ -1638,7 +1622,7 @@ inline AttnPureResult attn_batched_verify_fn(
   return {output, new_kv_keys, new_kv_values};
 }
 
-// Phase 4b — paged sibling of `attn_batched_verify_fn`. Replaces
+// Paged sibling of `attn_batched_verify_fn`. Replaces
 // `slice_update` + SDPA over a BHTD cache with `paged_kv_write` +
 // `paged_attention_varlen` over the vLLM-style pool. Q/K/V projection,
 // QK norm, and RoPE are identical so kernel parity with the BHTD path
@@ -1744,7 +1728,7 @@ inline AttnPureResult attn_batched_verify_fn_paged(
 }
 
 // =====================================================================
-// W6.7 — Batched GDN forward for the MTP verify graph.
+// Batched GDN forward for the MTP verify graph.
 //
 // Processes `T` decode tokens in ONE Metal kernel call starting from the
 // CURRENT recurrent + conv state (not zeros). Equivalent to looping
@@ -1764,8 +1748,8 @@ inline AttnPureResult attn_batched_verify_fn_paged(
 //                        new qkv rows were appended.
 //   - recurrent_state:   state after T recurrent advances.
 // =====================================================================
-// Unified `gdn_batched_verify_fn` templated on `WithTape`. When
-// `WithTape=false` returns `GDNPureResult`; when `WithTape=true` returns
+// Batched GDN forward templated on `WithTape`. When `WithTape=false`
+// returns `GDNPureResult`; when `WithTape=true` returns
 // `GDNPureResultWithTape` carrying the per-step `(tape, k, g, qkv)` of
 // shape `[B, T, ...]`. Mirrors `gdn_pure_fn_impl` but operates on T>=1
 // tokens in a single kernel dispatch.
@@ -1887,10 +1871,7 @@ gdn_batched_verify_fn_impl(
   }
 }
 
-// Backwards-compatible thin wrappers. Callers continue to use
-// `gdn_batched_verify_fn(...)` / `gdn_batched_verify_fn_with_tape(...)`
-// exactly as before; the actual body lives in
-// `gdn_batched_verify_fn_impl`.
+// Thin wrappers over `gdn_batched_verify_fn_impl`.
 inline GDNPureResult gdn_batched_verify_fn(
     const array& x,
     int layer_idx,
@@ -1900,14 +1881,12 @@ inline GDNPureResult gdn_batched_verify_fn(
   return gdn_batched_verify_fn_impl<false>(x, layer_idx, conv_state, recurrent_state, cfg);
 }
 
-// W6.7 — Tape-recording variant of `gdn_batched_verify_fn`. Identical
-// math; emits per-step `(tape, k, g, qkv)` tensors of shape `[B, T, ...]`
-// directly (no concatenation needed — the Metal tape kernel naturally
-// emits the T-wide tape in one dispatch). The dense main path stashes
-// these into the `g_gdn_*_tape_acc` accumulators in ONE assignment
-// (replacing the prior D+1 `concatenate` appends), and the tape-replay
-// rollback path consumes a `slice([:, 0..accepted_steps, ...])` exactly
-// like before.
+// Tape-recording variant of `gdn_batched_verify_fn`. Identical math;
+// emits per-step `(tape, k, g, qkv)` tensors of shape `[B, T, ...]`
+// directly (the Metal tape kernel emits the T-wide tape in one dispatch).
+// The dense main path stashes these into the `g_gdn_*_tape_acc`
+// accumulators in ONE assignment; the tape-replay rollback path consumes
+// a `slice([:, 0..accepted_steps, ...])`.
 inline GDNPureResultWithTape gdn_batched_verify_fn_with_tape(
     const array& x,
     int layer_idx,

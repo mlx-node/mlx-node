@@ -1,20 +1,12 @@
-// Phase 2 of the paged-attention compile integration.
-//
 // Implements the `PagedKVWrite` and `PagedAttention` MLX `Custom`
-// primitives. Their `eval_gpu` paths now dispatch onto MLX's own
-// `metal::CommandEncoder` via `crates/mlx-sys/src/mlx_paged_dispatch.cpp`
-// (Phase 2). The Phase 1 extern-C shim into `crates/mlx-paged-attn/
-// src/extern_c.rs` is no longer used by `eval_gpu`, but the shim
-// itself is left in place because the existing smoke-test suite
-// (`crates/mlx-paged-attn/tests/paged_ops_smoke.rs`) drives the Rust
-// dispatcher directly and the broader Rust kernel-dispatch code is
-// scheduled for removal in Phase 11.
+// primitives. Their `eval_gpu` paths dispatch onto MLX's own
+// `metal::CommandEncoder` via `crates/mlx-sys/src/mlx_paged_dispatch.cpp`.
 //
-// Because the dispatch is now on MLX's command queue, MLX's dependency
-// tracking is correct: callers no longer need to `eval()` ancestor
-// arrays before invoking `paged_kv_write` / `paged_attention`, nor
-// `eval()` the outputs before reading them — the standard MLX evaluation
-// order guarantees correctness.
+// Because the dispatch is on MLX's command queue, MLX's dependency
+// tracking is correct: callers do not need to `eval()` ancestor arrays
+// before invoking `paged_kv_write` / `paged_attention`, nor `eval()` the
+// outputs before reading them — the standard MLX evaluation order
+// guarantees correctness.
 
 #include "mlx_paged_ops.h"
 #include "mlx_common.h"
@@ -58,13 +50,10 @@ int x_pack_for(KvDtype kv_dtype) {
   return 8;
 }
 
-// Map the `KvDtype` enum to the matching MLX `Dtype` for io tensors.
-// Phase 1 contract (must match the Rust shim's
-// `mlx_paged_attn_reshape_and_cache_dispatch` derivation in
-// `crates/mlx-paged-attn/src/extern_c.rs`):
+// Map the `KvDtype` enum to the matching MLX `Dtype` for io tensors:
 //   - non-FP8 cache → io dtype == cache dtype
-//   - FP8 cache     → io dtype == bfloat16 (BF16-default for production;
-//                     matches `MetalState::reshape_and_cache_kernel_name`'s
+//   - FP8 cache     → io dtype == bfloat16 (matches
+//                     `MetalState::reshape_and_cache_kernel_name`'s
 //                     `(bfloat16_t, uchar)` instantiation)
 mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
   switch (kv_dtype) {
@@ -80,7 +69,7 @@ mlx::core::Dtype io_dtype_for_kv_dtype(KvDtype kv_dtype) {
 }
 
 // Map the `KvDtype` enum to the matching MLX `Dtype` for the on-cache
-// (K/V pool) storage. Phase 1 contract:
+// (K/V pool) storage:
 //   - Fp16 cache → float16
 //   - Bf16 cache → bfloat16
 //   - Fp8 cache  → uint8 (FP8 stored opaquely as bytes; the kernel
@@ -100,8 +89,8 @@ mlx::core::Dtype cache_dtype_for_kv_dtype(KvDtype kv_dtype) {
 
 // Translate the public `KvDtype` enum into the dispatch-internal
 // `paged::KvDtype` so we can call `mlx::core::fast::paged::dispatch_*`.
-// Phase 2: both enums have the same wire values; the cast just
-// satisfies the type system.
+// Both enums have the same wire values; the cast just satisfies the
+// type system.
 mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
   switch (d) {
     case KvDtype::Fp16:
@@ -116,23 +105,17 @@ mlx::core::fast::paged::KvDtype to_paged_dtype(KvDtype d) {
 
 // Reject non-row-contiguous or nonzero-offset views at the factory.
 //
-// Rationale (Phase 1 review round 8): the Metal kernels (and the Rust
-// shim) read each input as a dense row-major buffer starting at the
-// raw `MTLBuffer` pointer. For pool-side inputs (k_pool/v_pool the
-// kernel writes into) the dispatch carries the BUFFER ONLY — no
-// offset / strides — so a sliced or transposed view would silently
-// alias to offset 0 in the backing allocation and either:
+// Rationale: the Metal kernels read each input as a dense row-major
+// buffer starting at the raw `MTLBuffer` pointer. The dispatch carries
+// the BUFFER ONLY — no offset / strides — so a sliced or transposed
+// view would silently alias to offset 0 in the backing allocation and
+// either:
 //   - clobber unrelated regions of the pool (writes), or
 //   - read from the wrong start of a non-zero-offset slice (reads).
 //
-// For read-only inputs (q, new_k/new_v, block_table, seq_lens,
-// slot_mapping) the q-side path forwards `q.offset()` and `out.offset()`
-// to the dispatcher, but never k_pool/v_pool/block_table/seq_lens
-// offsets, and never any strides. Different inputs receive different
-// treatment, which is fragile. Phase-2 dispatch will eventually thread
-// strides and offsets through; Phase 1's contract is simpler: refuse
-// non-row-contiguous / nonzero-offset views and let the caller
-// materialize a `mlx::core::contiguous(...)` copy explicitly.
+// The contract is therefore: refuse non-row-contiguous / nonzero-offset
+// views and let the caller materialize a `mlx::core::contiguous(...)`
+// copy explicitly.
 //
 // This check passes on:
 //   - tracer arrays from `mlx::core::compile()` (default flags
@@ -172,27 +155,21 @@ void require_row_contiguous_zero_offset(
 }
 
 // =============================================================================
-// Phase 1 review-round-10 finding: unify factory + eval_gpu validation.
+// Unified factory + eval_gpu validation.
 //
-// Rounds 3-9 each surfaced another factory-only check that
-// `mlx::core::compile`'s cache-hit replay bypassed because the cache
-// key only compares rank/shape/dtype — `compile_replace` rebuilds the
-// cached primitive with real inputs WITHOUT re-running the factory.
-// Symptoms ranged from sliced views silently aliasing the wrong region
-// of memory to bad scalar state divide-by-zero in eval_gpu's own
-// arithmetic.
-//
-// This helper closes the entire class of "factory-only check bypassed
-// by compile cache" hazards in one swoop: every structural / scalar /
-// shape / dtype / contiguity check lives in a single helper that the
-// factory AND eval_gpu BOTH call. Future factory checks added to this
-// helper are automatically mirrored on the eval_gpu side too.
+// `mlx::core::compile`'s cache-hit replay bypasses the factory: the
+// cache key only compares rank/shape/dtype, and `compile_replace`
+// rebuilds the cached primitive with real inputs WITHOUT re-running the
+// factory. So every structural / scalar / shape / dtype / contiguity
+// check lives in a single helper that the factory AND eval_gpu BOTH
+// call, closing the "factory-only check bypassed by compile cache"
+// hazard class.
 //
 // The helper does NOT perform runtime data-dependent bounds checks
 // (slot_mapping max < pool capacity for PagedKVWrite; seq_lens /
-// block_table content checks for PagedAttention) — those have a
-// trace-vs-runtime asymmetry that requires materialized data and stays
-// in the dedicated runtime check immediately following the helper call.
+// block_table content checks for PagedAttention) — those require
+// materialized data and stay in the dedicated runtime check immediately
+// following the helper call.
 //
 // `op_name` is prefixed onto every error message so the caller knows
 // which path raised (e.g. "[paged_kv_write]" for the factory,
@@ -213,7 +190,7 @@ void validate_paged_kv_write_inputs(
     int x_pack,
     KvDtype kv_dtype,
     const char* op_name) {
-  // 1. Contiguity + zero offset on every input (round-8/9).
+  // 1. Contiguity + zero offset on every input.
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
   require_row_contiguous_zero_offset(new_k, op_name, "new_k");
@@ -222,9 +199,9 @@ void validate_paged_kv_write_inputs(
   require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
   require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
 
-  // 2. Scalar-state positivity (round-7) + x_pack/dtype agreement
-  //    (round-3 derivation). Run BEFORE shape arithmetic so a zero
-  //    scalar can never reach divide-by-zero arithmetic below.
+  // 2. Scalar-state positivity + x_pack/dtype agreement. Run BEFORE
+  //    shape arithmetic so a zero scalar can never reach divide-by-zero
+  //    arithmetic below.
   if (num_kv_heads <= 0) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] num_kv_heads (" << num_kv_heads
@@ -264,9 +241,9 @@ void validate_paged_kv_write_inputs(
     }
   }
 
-  // 3. Dtype-vs-kv_dtype validation (round-4). Fires BEFORE the
-  //    pairwise k_pool==v_pool / new_k==new_v checks so each input
-  //    slot has its own dedicated rejection path.
+  // 3. Dtype-vs-kv_dtype validation. Fires BEFORE the pairwise
+  //    k_pool==v_pool / new_k==new_v checks so each input slot has its
+  //    own dedicated rejection path.
   {
     auto expected_cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
     if (k_pool.dtype() != expected_cache_dtype) {
@@ -455,14 +432,14 @@ void validate_paged_kv_write_inputs(
   }
 }
 
-// Sister helper for `paged_attention(...)`. Same defense-in-depth
-// rationale as `validate_paged_kv_write_inputs`: every structural
-// check lives in one place and runs on BOTH factory and eval_gpu
-// paths so compile-cache replay can never bypass any of them.
+// Sister helper for `paged_attention(...)`. Same rationale as
+// `validate_paged_kv_write_inputs`: every structural check runs on BOTH
+// the factory and eval_gpu paths so compile-cache replay cannot bypass
+// any of them.
 //
-// `paged_attention` does not take an `x_pack` parameter — it derives
-// from `kv_dtype` via `x_pack_for(...)`. We compute it locally and
-// validate it the same way as the write-side helper.
+// `paged_attention` has no `x_pack` parameter — it derives from
+// `kv_dtype` via `x_pack_for(...)`. We compute it locally and validate
+// it the same way as the write-side helper.
 void validate_paged_attention_inputs(
     const array& q,
     const array& k_pool,
@@ -487,10 +464,9 @@ void validate_paged_attention_inputs(
   require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
   require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
 
-  // 2. Phase 7 lifts the Phase 1 sliding_window=0 restriction. Negative
-  // values are still nonsensical (the only "no mask" sentinel is 0) so
-  // reject them up-front; the Metal kernel masks K positions older than
-  // `context_len - sliding_window` when sliding_window > 0.
+  // 2. The Metal kernel masks K positions older than
+  // `context_len - sliding_window` when sliding_window > 0. Negative
+  // values are nonsensical (the only "no mask" sentinel is 0) — reject.
   if (sliding_window < 0) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name
@@ -499,7 +475,7 @@ void validate_paged_attention_inputs(
     throw std::invalid_argument(msg.str());
   }
 
-  // 3. Scalar-state positivity + GQA divisibility (rounds 6 + 7).
+  // 3. Scalar-state positivity + GQA divisibility.
   if (num_kv_heads <= 0) {
     std::ostringstream msg;
     msg << "[validator] [" << op_name << "] num_kv_heads (" << num_kv_heads
@@ -542,9 +518,9 @@ void validate_paged_attention_inputs(
   }
 
   // Derive x_pack from kv_dtype and verify head_size divisibility.
-  // Round-7 / round-9 hazard: a future divergence between the dtype
-  // and the structural pool check (k_pool.shape(2)/(4)) would otherwise
-  // surface as a kernel buffer-size mismatch.
+  // A divergence between the dtype and the structural pool check
+  // (k_pool.shape(2)/(4)) would otherwise surface as a kernel
+  // buffer-size mismatch.
   int x_pack_expected = x_pack_for(kv_dtype);
   if (x_pack_expected <= 0) {
     std::ostringstream msg;
@@ -750,19 +726,15 @@ void PagedKVWrite::eval_gpu(
   const array& k_scale = inputs[5];
   const array& v_scale = inputs[6];
 
-  // Phase 1 review-round-10 contract: every structural / scalar /
-  // shape / dtype / contiguity check lives in
-  // `validate_paged_kv_write_inputs`, which the public
-  // `paged_kv_write(...)` factory ALSO calls. Running it here closes
-  // the entire class of "factory-only check bypassed by compile cache"
-  // hazards (rounds 3-9) in a single call: `mlx::core::compile`'s
-  // cached re-traces rebuild the primitive with real inputs via
-  // `compile_replace` WITHOUT re-running the factory, so any check
-  // that lives only in the factory is silently skipped by the cached
-  // path. The helper uses the primitive's stored scalar state — if a
-  // future code path ever constructs the primitive directly with
-  // mismatched scalars, the eval_gpu validation rejects before the
-  // dispatch path can touch the buffers.
+  // Every structural / scalar / shape / dtype / contiguity check lives
+  // in `validate_paged_kv_write_inputs`, which the public
+  // `paged_kv_write(...)` factory ALSO calls. Running it here closes the
+  // "factory-only check bypassed by compile cache" hazard:
+  // `mlx::core::compile`'s cached re-traces rebuild the primitive with
+  // real inputs via `compile_replace` WITHOUT re-running the factory.
+  // The helper uses the primitive's stored scalar state, so a direct
+  // construction with mismatched scalars is also rejected before the
+  // dispatch path touches the buffers.
   validate_paged_kv_write_inputs(
       k_pool,
       v_pool,
@@ -791,14 +763,13 @@ void PagedKVWrite::eval_gpu(
   // already enforced rank 3.
   int num_tokens = static_cast<int>(new_k.shape(0));
 
-  // Slot-id bounds check (Phase 2 safety; runs on EVERY runtime call,
-  // including the compile-cached path). Stays out of the validator
-  // because it requires materialized data that tracer arrays do not
-  // have. The Metal kernel does NOT bounds-check `slot_idx`; a value
-  // `>= num_blocks * block_size` writes past the K/V pool. MLX
-  // evaluates all primitive inputs before invoking `eval_gpu`, so
-  // `slot_mapping.data<int64_t>()` is materialized and safe to read
-  // host-side.
+  // Slot-id bounds check (runs on EVERY runtime call, including the
+  // compile-cached path). Stays out of the validator because it requires
+  // materialized data that tracer arrays do not have. The Metal kernel
+  // does NOT bounds-check `slot_idx`; a value `>= num_blocks *
+  // block_size` writes past the K/V pool. MLX evaluates all primitive
+  // inputs before invoking `eval_gpu`, so `slot_mapping.data<int64_t>()`
+  // is materialized and safe to read host-side.
   if (slot_mapping.shape(0) > 0) {
     const int32_t num_blocks_runtime = static_cast<int32_t>(k_pool.shape(0));
     const int64_t pool_capacity = static_cast<int64_t>(num_blocks_runtime) *
@@ -826,8 +797,8 @@ void PagedKVWrite::eval_gpu(
     }
   }
 
-  // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
-  // tracking handles ordering against any preceding/following ops.
+  // Dispatch onto MLX's command encoder. MLX's dependency tracking
+  // handles ordering against any preceding/following ops.
   auto& s = stream();
   auto& d = mlx::core::metal::device(s.device);
   auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
@@ -900,22 +871,17 @@ void PagedAttention::eval_gpu(
 
   array& out = outputs[0];
 
-  // Phase 1 review-round-10 contract: every structural / scalar /
-  // shape / dtype / contiguity check lives in
-  // `validate_paged_attention_inputs`, which the public
+  // Every structural / scalar / shape / dtype / contiguity check lives
+  // in `validate_paged_attention_inputs`, which the public
   // `paged_attention(...)` factory ALSO calls. Running it here closes
-  // the entire class of "factory-only check bypassed by compile cache"
-  // hazards (rounds 3-9) in a single call: `mlx::core::compile`'s
-  // cached re-traces rebuild the primitive with real inputs via
-  // `compile_replace` WITHOUT re-running the factory, so any check
-  // that lives only in the factory is silently skipped by the cached
-  // path. The helper uses the primitive's stored scalar state — if a
-  // future code path ever constructs the primitive directly with
-  // mismatched scalars, the eval_gpu validation rejects before the
-  // dispatch path can touch the buffers. Run BEFORE any host reads
-  // (seq_lens.data<int32_t>(), block_table.data<int32_t>() etc.) and
-  // BEFORE the encoder dispatch so the throw fires before we touch
-  // the buffers.
+  // the "factory-only check bypassed by compile cache" hazard:
+  // `mlx::core::compile`'s cached re-traces rebuild the primitive with
+  // real inputs via `compile_replace` WITHOUT re-running the factory.
+  // The helper uses the primitive's stored scalar state, so a direct
+  // construction with mismatched scalars is also rejected. Run BEFORE
+  // any host reads (seq_lens.data<int32_t>(), block_table.data<int32_t>()
+  // etc.) and BEFORE the encoder dispatch so the throw fires before we
+  // touch the buffers.
   validate_paged_attention_inputs(
       q,
       k_pool,
@@ -943,8 +909,7 @@ void PagedAttention::eval_gpu(
   const int32_t* seq_lens_data = seq_lens.data<int32_t>();
 
   // Per-runtime bounds check on `seq_lens` and `block_table` contents
-  // (Phase 1 safety; runs on EVERY runtime call, including the
-  // compile-cached path).
+  // (runs on EVERY runtime call, including the compile-cached path).
   //
   // The Metal kernel does NOT bounds-check either input. For each
   // sequence the kernel:
@@ -958,16 +923,12 @@ void PagedAttention::eval_gpu(
   //
   // Without per-call validation, a too-large `seq_lens[i]` reads past
   // that row's block-table region, and a negative or `>= num_blocks`
-  // entry in `block_table` addresses outside the K/V pool. Mirror the
-  // pattern used immediately above for `PagedKVWrite::eval_gpu`'s
-  // slot-mapping check: the factory's structural validation only
-  // covers shape/dtype, and `mlx::core::compile`'s cached re-traces
-  // bypass the factory entirely, so the runtime-content check must
-  // live in `eval_gpu`.
+  // entry in `block_table` addresses outside the K/V pool. Like the
+  // slot-mapping check above, this lives in `eval_gpu` because the
+  // factory's structural validation only covers shape/dtype and the
+  // compile-cached path bypasses the factory.
   //
   // Cost: O(num_seqs * max_blocks_per_seq) host-side reads per call.
-  // Acceptable for Phase 1 correctness; Phase 2 may push this
-  // kernel-side or gate it on a configured trust mode.
   //
   // Run BEFORE the max-context computation below so a malformed input
   // surfaces the descriptive `std::invalid_argument` error instead of
@@ -1036,10 +997,10 @@ void PagedAttention::eval_gpu(
   // the buffer must exist by the time the dispatch runs.
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // Phase 2: dispatch onto MLX's command encoder. MLX's dependency
-  // tracking handles ordering against any preceding/following ops,
-  // so callers no longer need to `eval()` ancestors before invoking
-  // `paged_attention` nor `eval()` the output before reading.
+  // Dispatch onto MLX's command encoder. MLX's dependency tracking
+  // handles ordering against any preceding/following ops, so callers do
+  // not need to `eval()` ancestors before invoking `paged_attention` nor
+  // `eval()` the output before reading.
   auto& s = stream();
   auto& d = mlx::core::metal::device(s.device);
   auto& compute_encoder = mlx::core::metal::get_command_encoder(s);
@@ -1125,22 +1086,19 @@ std::pair<array, array> paged_kv_write(
     StreamOrDevice s_) {
   auto s = to_stream(s_);
 
-  // Fallback: Phase 1 has no pure-MLX implementation of paged write
-  // (the kernel is the implementation). The fallback is only invoked
-  // by VJP/JVP transformations, which we throw on. Provide a stub
-  // that raises so unintended fallback paths surface immediately.
+  // No pure-MLX fallback exists (the kernel is the implementation). The
+  // fallback is only invoked by VJP/JVP transformations, which we throw
+  // on. Provide a stub that raises so unintended fallback paths surface
+  // immediately.
   auto fallback = [](std::vector<array> /*inputs*/) -> std::vector<array> {
     throw std::runtime_error(
         "paged_kv_write has no fallback implementation (inference-only)");
   };
 
-  // Phase 1 review-round-10 contract: structural / scalar / shape /
-  // dtype / contiguity checks live in the shared helper that
-  // `PagedKVWrite::eval_gpu` ALSO calls. A factory-only check is
-  // bypassed by `mlx::core::compile`'s cached re-traces (which
-  // rebuild the cached primitive with real inputs via
-  // `compile_replace` WITHOUT re-running the factory), so the helper
-  // is the single source of truth for both paths.
+  // Structural / scalar / shape / dtype / contiguity checks live in the
+  // shared helper that `PagedKVWrite::eval_gpu` ALSO calls — the single
+  // source of truth for both paths (compile-cache replay bypasses the
+  // factory).
   validate_paged_kv_write_inputs(
       k_pool,
       v_pool,
@@ -1156,22 +1114,17 @@ std::pair<array, array> paged_kv_write(
       kv_dtype,
       "paged_kv_write");
 
-  // Slot-id range check (Phase 1 safety; eval-based, factory-only).
+  // Slot-id range check (eval-based, factory-only).
   //
   // The Metal kernel does NOT bounds-check `slot_idx`; a value
-  // `>= num_blocks * block_size` writes past the K/V pool. Phase 2
-  // will move this check kernel-side using a constant uniform.
-  //
-  // Phase 1 contract:
+  // `>= num_blocks * block_size` writes past the K/V pool.
   //   - When called with concrete data (most production callers), the
   //     factory evals `max(slot_mapping)` here and throws on overflow.
   //   - When called inside `mlx::core::compile`'s trace
   //     (`mlx::core::detail::in_tracing()` is true), we SKIP the eval
   //     because tracer arrays have no backing data and `eval()` would
-  //     fail. The compile-path caller is responsible for a separate
-  //     bounds check on the runtime slot_mapping before invoking the
-  //     compiled lambda. This matches the documented Phase 1 contract:
-  //     callers `eval()` inputs before invoking the primitive.
+  //     fail. The mirrored runtime check inside `eval_gpu` covers the
+  //     compile-cached path instead.
   //
   // The eval is a one-shot host read of an int64 reduction — small
   // enough to be acceptable next to the Metal dispatch cost.
@@ -1242,13 +1195,10 @@ array paged_attention(
         "paged_attention has no fallback implementation (inference-only)");
   };
 
-  // Phase 1 review-round-10 contract: structural / scalar / shape /
-  // dtype / contiguity checks live in the shared helper that
-  // `PagedAttention::eval_gpu` ALSO calls. A factory-only check is
-  // bypassed by `mlx::core::compile`'s cached re-traces (which
-  // rebuild the cached primitive with real inputs via
-  // `compile_replace` WITHOUT re-running the factory), so the helper
-  // is the single source of truth for both paths.
+  // Structural / scalar / shape / dtype / contiguity checks live in the
+  // shared helper that `PagedAttention::eval_gpu` ALSO calls — the
+  // single source of truth for both paths (compile-cache replay bypasses
+  // the factory).
   validate_paged_attention_inputs(
       q,
       k_pool,
@@ -1946,14 +1896,12 @@ bool mlx_paged_kv_write_forward(
 }
 
 // =============================================================================
-// FFI test helpers (Phase 1 only)
+// FFI test helpers
 //
 // These give the Rust unit tests in
 // `crates/mlx-paged-attn/tests/paged_ops_smoke.rs` enough surface to
 // exercise the C++ primitives' `is_equivalent` and `vjp` behaviour
-// without standing up a full C++ test runner. Phase 2 may delete
-// these once the dispatch path is C++-native and unit tests live in
-// mlx-sys directly.
+// without standing up a full C++ test runner.
 // =============================================================================
 
 /// Construct two `PagedKVWrite` primitives with the supplied scalar
@@ -2176,12 +2124,10 @@ int mlx_paged_attention_test_output_shapes(
 /// `std::invalid_argument` when called with sliding_window=-1.
 /// Returns 0 if it doesn't throw or throws a different exception.
 ///
-/// Phase 7 lifts the Phase 1 sliding_window=0 restriction; the factory
-/// now accepts any non-negative value. Negative values remain illegal
-/// because the only "no mask" sentinel is 0, so we test a NEGATIVE
-/// value here to keep the test exercising the rejection path. The
-/// pool/q arrays use tracer-only construction (no backing data needed —
-/// the throw fires before eval_gpu).
+/// The factory accepts any non-negative value; negative is illegal (the
+/// only "no mask" sentinel is 0), so we test a NEGATIVE value to
+/// exercise the rejection path. The pool/q arrays use tracer-only
+/// construction (the throw fires before eval_gpu).
 int mlx_paged_attention_factory_rejects_sliding_window() {
   using namespace mlx::core;
   using namespace mlx::core::fast;
@@ -2268,7 +2214,7 @@ int mlx_paged_attention_factory_rejects_q_shape_mismatch() {
 }
 
 // =============================================================================
-// Phase 1 review-round-3 negative-validation test helpers.
+// Negative-validation test helpers.
 //
 // Each helper constructs `paged_attention` / `paged_kv_write` factory
 // inputs that are well-formed EXCEPT for one specific dim or dtype.
@@ -2285,10 +2231,8 @@ namespace {
 // Helper: invoke `paged_attention(...)` with a custom (q, k_pool,
 // v_pool, block_table, seq_lens) and well-formed scalar state. Returns
 // 1 on `std::invalid_argument`, 0 otherwise. Used by the negative-test
-// helpers below to keep them concise.
-//
-// `kv_dtype` defaults to `Bf16`, matching the original Phase 1 review
-// callers. Round-4 review adds Fp8 cases that pass `kv_dtype = Fp8`.
+// helpers below to keep them concise. `kv_dtype` defaults to `Bf16`;
+// Fp8 cases pass `kv_dtype = Fp8`.
 int call_paged_attention_expecting_throw(
     const mlx::core::array& q,
     const mlx::core::array& k_pool,
@@ -2327,8 +2271,8 @@ int call_paged_attention_expecting_throw(
 }
 
 // Helper: invoke `paged_kv_write(...)` with custom inputs and the
-// supplied (kv_dtype, x_pack) pair. Round-4 review uses this with
-// `KvDtype::Fp8 + x_pack=16` to validate FP8 dtype rejection.
+// supplied (kv_dtype, x_pack) pair. Used with `KvDtype::Fp8 + x_pack=16`
+// to validate FP8 dtype rejection.
 int call_paged_kv_write_expecting_throw(
     const mlx::core::array& k_pool,
     const mlx::core::array& v_pool,
@@ -2511,7 +2455,7 @@ int mlx_paged_kv_write_factory_rejects_slot_mapping_length() {
 }
 
 /// slot_mapping with a max value >= num_blocks * block_size must be
-/// rejected (Phase 1 safety check).
+/// rejected (safety check).
 ///
 /// This case requires REAL data — the eval-based bounds check only
 /// fires when slot_mapping has a backing buffer that can be evaluated.
@@ -2564,14 +2508,13 @@ int mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
   return 0;
 }
 
-/// Round-13 finding: assert the factory-side slot_mapping bounds
-/// guard's `std::invalid_argument` message contains the `[runtime]`
-/// marker. The factory and the compile-cached eval_gpu path BOTH guard
-/// the same data-dependent property (slot value < num_blocks *
-/// block_size); both must use the `[runtime]` prefix so callers / test
-/// infrastructure can distinguish runtime-content guards from the
-/// `[validator]`-tagged structural validators that produce different
-/// throw classes.
+/// Assert the factory-side slot_mapping bounds guard's
+/// `std::invalid_argument` message contains the `[runtime]` marker. The
+/// factory and the compile-cached eval_gpu path BOTH guard the same
+/// data-dependent property (slot value < num_blocks * block_size); both
+/// must use the `[runtime]` prefix so callers / test infrastructure can
+/// distinguish runtime-content guards from the `[validator]`-tagged
+/// structural validators.
 ///
 /// Returns:
 ///   1   — factory threw `std::invalid_argument` AND the message
@@ -2942,7 +2885,7 @@ int mlx_paged_kv_write_compile_trace_smoke(int num_tokens) {
     return count_after_second;
   }
 
-  // Eval-based verification (Phase 1 second-call-contents check).
+  // Eval-based verification (second-call-contents check).
   //
   // Skip if Metal isn't available — the dispatch path is GPU-only,
   // so on a non-Metal host we can only verify the trace-count
@@ -3023,7 +2966,7 @@ int mlx_paged_kv_write_compile_trace_smoke(int num_tokens) {
     }
   }
 
-  // V-pool byte verification (Phase 1 review-round-4 addition).
+  // V-pool byte verification.
   //
   // K-only verification can pass even if input 3 (`new_v`) was left
   // stale by a `compile_replace` bug that correctly threaded inputs
@@ -3128,11 +3071,10 @@ int mlx_paged_kv_write_factory_rejects_pool_shape_mismatch() {
 }
 
 // =============================================================================
-// Phase 1 review-round-4 dtype-mismatch negative tests for paged_kv_write.
+// Dtype-mismatch negative tests for paged_kv_write.
 //
-// Round 4 finding B: the factory previously checked only pairwise dtype
-// equality (k_pool == v_pool, new_k == new_v) — it did NOT verify the
-// dtype matched the cache/io dtype implied by `kv_dtype`. These helpers
+// The factory verifies each input's dtype against the cache/io dtype
+// implied by `kv_dtype` (not just pairwise equality). These helpers
 // each construct factory inputs that are well-formed EXCEPT for one
 // dtype slot, then assert `std::invalid_argument` is thrown.
 // =============================================================================
@@ -3153,10 +3095,9 @@ int mlx_paged_kv_write_factory_rejects_k_pool_dtype_bf16() {
 }
 
 /// v_pool dtype is uint8 instead of the expected bfloat16 for Bf16.
-/// k_pool stays at the right dtype so the k_pool kv_dtype check
-/// passes; v_pool is the only mismatch, exercising the v_pool-vs-
-/// kv_dtype check directly (the kv_dtype checks fire BEFORE the
-/// pairwise check now, see the factory's reordered validation).
+/// k_pool stays at the right dtype so the k_pool kv_dtype check passes;
+/// v_pool is the only mismatch, exercising the v_pool-vs-kv_dtype check
+/// directly (the kv_dtype checks fire BEFORE the pairwise check).
 int mlx_paged_kv_write_factory_rejects_v_pool_dtype_bf16() {
   using namespace mlx::core;
   array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
@@ -3185,8 +3126,7 @@ int mlx_paged_kv_write_factory_rejects_new_k_dtype_bf16() {
 /// new_v dtype is float32 instead of the expected bfloat16 for Bf16.
 /// new_k stays at the right dtype so the new_k kv_dtype check passes;
 /// new_v is the only mismatch, exercising the new_v-vs-kv_dtype check
-/// directly (the kv_dtype checks fire BEFORE the pairwise check now,
-/// see the factory's reordered validation).
+/// directly (the kv_dtype checks fire BEFORE the pairwise check).
 int mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() {
   using namespace mlx::core;
   array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
@@ -3219,7 +3159,7 @@ int mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() {
   using namespace mlx::core::fast;
   array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
   array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
-  // new_k/new_v float16 — pair agrees, but Phase 1 contract demands
+  // new_k/new_v float16 — pair agrees, but the contract demands
   // bfloat16 io for FP8 cache.
   array new_k(Shape{2, 4, 64}, float16, nullptr, {});
   array new_v(Shape{2, 4, 64}, float16, nullptr, {});
@@ -3229,13 +3169,13 @@ int mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() {
 }
 
 // =============================================================================
-// Phase 1 review-round-4 dtype-mismatch negative tests for paged_attention.
+// Dtype-mismatch negative tests for paged_attention.
 //
-// Round 4 finding C: the factory validated scale dtype, q rank/shape,
-// pool layout, and index-buffer dtypes, but never validated `q.dtype()`
-// or `k_pool`/`v_pool` dtypes against `kv_dtype`. These helpers
-// construct factory inputs that are well-formed EXCEPT for one dtype
-// slot, then assert `std::invalid_argument` is thrown.
+// The factory validates `q.dtype()` and `k_pool`/`v_pool` dtypes against
+// `kv_dtype` (on top of scale dtype, q rank/shape, pool layout, and
+// index-buffer dtypes). These helpers construct factory inputs that are
+// well-formed EXCEPT for one dtype slot, then assert
+// `std::invalid_argument` is thrown.
 // =============================================================================
 
 /// q dtype is float32 instead of the expected bfloat16 for Bf16.
@@ -3255,9 +3195,9 @@ int mlx_paged_attention_factory_rejects_q_dtype_bf16() {
 int mlx_paged_attention_factory_rejects_q_dtype_fp8() {
   using namespace mlx::core;
   using namespace mlx::core::fast;
-  // FP8 cache: q must be bfloat16 (Phase 1 contract). Pass float16 to
-  // trigger the throw. Pools at FP8-correct (uint8, x_pack=16) so the
-  // q-dtype check is the only mismatch.
+  // FP8 cache: q must be bfloat16. Pass float16 to trigger the throw.
+  // Pools at FP8-correct (uint8, x_pack=16) so the q-dtype check is the
+  // only mismatch.
   array q(Shape{1, 8, 64}, float16, nullptr, {});
   array k_pool(Shape{4, 4, 4, 16, 16}, uint8, nullptr, {});
   array v_pool(Shape{4, 4, 64, 16}, uint8, nullptr, {});
@@ -3295,7 +3235,7 @@ int mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() {
 }
 
 // =============================================================================
-// Phase 1 review-round-6 finding: GQA head-group divisibility.
+// GQA head-group divisibility.
 //
 // The Metal kernel computes
 //   num_queries_per_kv = num_heads / num_kv_heads
@@ -3303,7 +3243,7 @@ int mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() {
 // (paged_attention.metal:839-840). Passing num_kv_heads=0,
 // num_q_heads<num_kv_heads, or num_q_heads not divisible by
 // num_kv_heads turns a structurally shape-consistent call into a GPU
-// fault (division by zero) or an out-of-pool K/V read. The factory now
+// fault (division by zero) or an out-of-pool K/V read. The factory
 // rejects these cases up front. Each helper builds shape-consistent
 // well-formed inputs that match the supplied (num_q_heads, num_kv_heads)
 // scalar state, and asserts `std::invalid_argument` is thrown.
@@ -3523,17 +3463,16 @@ int mlx_paged_attention_factory_rejects_zero_head_size() {
 } // extern "C"
 
 // =============================================================================
-// Phase 1 review-round-4 finding A: compile-cached path slot-bounds test.
+// Compile-cached path slot-bounds test.
 //
 // `paged_kv_write`'s factory eval-checks slot bounds, but
 // `mlx::core::compile` skips the factory on cache hits and routes
-// runtime `slot_mapping` straight into `eval_gpu`. The fix is to also
-// check bounds inside `PagedKVWrite::eval_gpu` (which fires on every
-// runtime call, including the compile-cached path). This helper
-// exercises that path: compile a function, call it once with a valid
-// slot_mapping (cache miss → factory check passes), then call it again
-// with an out-of-range slot_mapping. The second call MUST throw from
-// `eval_gpu` because the cached graph bypasses the factory.
+// runtime `slot_mapping` straight into `eval_gpu`, which mirrors the
+// bounds check (fires on every runtime call). This helper exercises
+// that path: compile a function, call it once with a valid slot_mapping
+// (cache miss → factory check passes), then call it again with an
+// out-of-range slot_mapping. The second call MUST throw from `eval_gpu`
+// because the cached graph bypasses the factory.
 // =============================================================================
 
 namespace {
@@ -3719,17 +3658,16 @@ int mlx_paged_kv_write_compile_cached_oob_throws() {
 } // extern "C"
 
 // =============================================================================
-// Phase 1 review-round-5 finding: PagedAttention::eval_gpu must
-// runtime-bounds-check `seq_lens` and `block_table` contents.
+// PagedAttention::eval_gpu runtime bounds check on `seq_lens` /
+// `block_table` contents.
 //
-// The Metal kernel reinterprets seq_lens as `uint32_t*` (so a
-// negative int32 value sneaks in as a huge unsigned context length)
-// and uses block_table entries directly as `physical_block_number *
+// The Metal kernel reinterprets seq_lens as `uint32_t*` (so a negative
+// int32 value sneaks in as a huge unsigned context length) and uses
+// block_table entries directly as `physical_block_number *
 // kv_block_stride` for K/V pool reads. The factory does only structural
-// validation (rank/shape/dtype), and `mlx::core::compile`'s cached
-// re-traces bypass the factory entirely. The fix puts the runtime
-// check in `PagedAttention::eval_gpu` so it fires on every replay.
-// These helpers exercise that check end-to-end.
+// validation (rank/shape/dtype) and the compile-cached path bypasses it,
+// so the runtime check lives in `PagedAttention::eval_gpu` and fires on
+// every replay. These helpers exercise that check end-to-end.
 // =============================================================================
 
 namespace {
@@ -4052,23 +3990,21 @@ int mlx_paged_attention_compile_cached_oob_throws() {
 } // extern "C"
 
 // =============================================================================
-// Phase 1 review-round-8 finding: factory must reject non-row-contiguous
-// or nonzero-offset views for ALL inputs.
+// Factory rejection of non-row-contiguous / nonzero-offset views.
 //
 // MLX arrays support strided / sliced / transposed views with valid
-// logical shapes/dtypes. The Metal kernels (and the Rust shim) read
-// each input as a dense row-major buffer, and the dispatch path only
-// forwards a single offset for q/out (and slot_mapping/new_k/new_v on
-// the write side). Pool-side and metadata-side inputs (k_pool, v_pool,
-// block_table, seq_lens) are passed as bare buffers — a sliced view
-// would silently alias to offset 0 in the backing allocation.
+// logical shapes/dtypes, but the Metal kernels read each input as a
+// dense row-major buffer and the dispatch path passes pool-side /
+// metadata inputs (k_pool, v_pool, block_table, seq_lens) as bare
+// buffers — a sliced view would silently alias to offset 0 in the
+// backing allocation. So the factory rejects such views early.
 //
-// Reject early at the factory; tests below assert the rejection fires
-// for transposed q / sliced k_pool / sliced block_table / sliced
-// seq_lens. They use real data-backed source arrays (so MLX's
-// `slice` / `transpose` ops actually produce non-row-contiguous /
-// nonzero-offset views) and are gated on `metal::is_available()` because
-// `eval()` is needed to materialize the slice/transpose results.
+// Tests below assert the rejection fires for transposed q / sliced
+// k_pool / sliced block_table / sliced seq_lens. They use real
+// data-backed source arrays (so MLX's `slice` / `transpose` ops
+// actually produce non-row-contiguous / nonzero-offset views) and are
+// gated on `metal::is_available()` because `eval()` is needed to
+// materialize the slice/transpose results.
 // =============================================================================
 
 namespace {
@@ -4559,24 +4495,24 @@ int mlx_paged_kv_write_forward_eval_smoke() {
 } // extern "C"
 
 // =============================================================================
-// Phase 1 review-round-9 finding: PagedKVWrite::eval_gpu and
-// PagedAttention::eval_gpu must mirror the row-contiguous / zero-offset
-// check that the factories already perform, because `mlx::core::compile`
-// cache hits rebuild the cached primitive with real inputs via
-// `compile_replace` WITHOUT re-running the factory — the cache key only
-// compares rank/shape/dtype. A graph first traced with contiguous inputs
-// can later be replayed with a same-shape sliced/transposed view.
+// eval_gpu must mirror the factory row-contiguous / zero-offset check.
 //
-// These helpers verify the eval_gpu mirrored check fires on the second
-// (compile-cached) eval. Layout is shared with the round-3/round-4 OOB
-// tests so the cache keys remain independent of those existing tests.
+// `mlx::core::compile` cache hits rebuild the cached primitive with real
+// inputs via `compile_replace` WITHOUT re-running the factory — the
+// cache key only compares rank/shape/dtype. So a graph first traced with
+// contiguous inputs can later be replayed with a same-shape
+// sliced/transposed view, which the eval_gpu mirrored check must catch.
+//
+// These helpers verify that mirrored check fires on the second
+// (compile-cached) eval. Layout is disjoint from the other OOB tests so
+// the cache keys stay independent.
 // =============================================================================
 
 namespace {
 
 /// Trace function for the compile-cached non-contiguous `paged_kv_write`
 /// test. Hard-coded scalars match the second-call invocation so the
-/// cache key is consistent across compile+replay. Independent of
+/// cache key is consistent across compile+replay. Distinct from
 /// `paged_kv_write_oob_trace_fn` to keep the per-test compile cache
 /// disjoint.
 std::vector<mlx::core::array> paged_kv_write_non_contig_trace_fn(
@@ -4975,25 +4911,20 @@ int mlx_paged_attention_compile_cached_non_contiguous_throws() {
 } // extern "C"
 
 // =============================================================================
-// Phase 1 review-round-10 finding: factory + eval_gpu validation must be
-// unified.
+// eval_gpu catches bad scalar state on its own (factory not consulted).
 //
 // `mlx::core::compile`'s cached re-traces rebuild the cached primitive
-// with real inputs via `compile_replace` WITHOUT re-running the
-// factory. To prove eval_gpu now catches bad scalar state on its own
-// (without relying on the factory having already rejected the inputs),
-// these helpers construct a primitive DIRECTLY with deliberately bad
-// scalar state, wire it into an MLX graph via `array::make_arrays(...)`,
-// and call `mlx::core::eval(...)` to invoke `eval_gpu`. The factory is
-// never called. The throw must come from the validator inside
-// `eval_gpu` itself, demonstrating that the defense-in-depth helper
-// closes the entire class of "factory-only check bypassed by compile
-// cache" hazards.
+// with real inputs via `compile_replace` WITHOUT re-running the factory.
+// To prove eval_gpu catches bad scalar state without relying on the
+// factory, these helpers construct a primitive DIRECTLY with
+// deliberately bad scalar state, wire it into an MLX graph via
+// `array::make_arrays(...)`, and call `mlx::core::eval(...)` to invoke
+// `eval_gpu`. The throw must come from the validator inside `eval_gpu`
+// itself.
 //
 // All input arrays are tracer-only (built via `array(Shape{...}, dtype,
-// nullptr, {})`). `eval_gpu` must reject BEFORE attempting to read
-// data, so this is sufficient to drive the rejection without Metal
-// being available.
+// nullptr, {})`). `eval_gpu` must reject BEFORE attempting to read data,
+// so this drives the rejection without Metal being available.
 // =============================================================================
 
 namespace {
@@ -5001,16 +4932,16 @@ namespace {
 /// Build a primitive with deliberately bad scalar state, wire it into
 /// the MLX graph via `array::make_arrays`, and `eval()` the result.
 ///
-/// Return-code contract (round-12 tightening): the helper must
-/// strictly prove the throw came from `PagedKVWrite::eval_gpu`'s
-/// validator — not from the graph-construction step (`make_arrays`),
-/// not from a different code path that happens to throw the same
-/// exception class, and crucially NOT from a later runtime-content
-/// guard inside `PagedKVWrite::eval_gpu` itself (slot_mapping bounds
-/// check, etc.). The runtime guards in the same `eval_gpu` body emit
-/// messages tagged "[runtime] PagedKVWrite::eval_gpu" — those would
-/// otherwise pass a substring match on the operation tag alone and
-/// falsely report rc=1 even if the scalar validator regressed.
+/// Return-code contract: the helper must strictly prove the throw came
+/// from `PagedKVWrite::eval_gpu`'s validator — not from the
+/// graph-construction step (`make_arrays`), not from a different code
+/// path that happens to throw the same exception class, and crucially
+/// NOT from a later runtime-content guard inside `PagedKVWrite::eval_gpu`
+/// itself (slot_mapping bounds check, etc.). The runtime guards in the
+/// same `eval_gpu` body emit messages tagged "[runtime]
+/// PagedKVWrite::eval_gpu" — those would otherwise pass a substring
+/// match on the operation tag alone and falsely report rc=1 even if the
+/// scalar validator regressed.
 ///
 /// To distinguish, the validator helper `validate_paged_kv_write_inputs`
 /// (and its sister `require_row_contiguous_zero_offset`) prepend the
@@ -5348,17 +5279,16 @@ int eval_paged_attention_with_bad_state(
 
 extern "C" {
 
-// Round-13 hardening: every extern-C eval_gpu test helper below wraps
-// its body in a catch-all so NO C++ exception ever crosses into Rust.
-// The inner helpers (`eval_paged_kv_write_with_bad_state` /
-// `eval_paged_attention_with_bad_state`) already catch known throw
-// sites (graph construction + eval), but a stray exception from any
-// other code path inside this boundary (array destructors, MLX
-// internals, allocator failures, etc.) would otherwise propagate
-// through the FFI boundary and abort the test harness with "Rust
-// cannot catch foreign exceptions". Returning `-1` here keeps the
-// existing rc contract (-1 == internal helper error) so the Rust
-// `assert_eval_gpu_rejects_bad_state` matcher reports a clean
+// Every extern-C eval_gpu test helper below wraps its body in a
+// catch-all so NO C++ exception ever crosses into Rust. The inner
+// helpers (`eval_paged_kv_write_with_bad_state` /
+// `eval_paged_attention_with_bad_state`) already catch known throw sites
+// (graph construction + eval), but a stray exception from any other code
+// path inside this boundary (array destructors, MLX internals, allocator
+// failures, etc.) would otherwise propagate through the FFI boundary and
+// abort the test harness with "Rust cannot catch foreign exceptions".
+// Returning `-1` keeps the rc contract (-1 == internal helper error) so
+// the Rust `assert_eval_gpu_rejects_bad_state` matcher reports a clean
 // failure with the underlying message on stderr.
 //
 // All helpers must satisfy: `try { ... return rc; } catch (...) {
@@ -5422,18 +5352,16 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
   }
 }
 
-/// Round-12 regression: prove the scalar validator (NOT the runtime
-/// slot_mapping bounds guard) is the throw site for `block_size=0`.
-/// The previous helper used slot_mapping={0,16}, which means a
-/// regressed validator could still surface rc=1 because the runtime
+/// Prove the scalar validator (NOT the runtime slot_mapping bounds
+/// guard) is the throw site for `block_size=0`. With slot_mapping={0,16}
+/// a regressed validator could still surface rc=1 because the runtime
 /// guard would fire (pool_capacity = num_blocks*block_size = 0,
-/// max_slot=16 >= 0). With `benign_slot_mapping=true` the
-/// slot_mapping is `{-1,-1}` — the runtime guard excludes negative
-/// sentinels from its max-slot reduction, so it can NEVER fire on
-/// this input. The ONLY throw site capable of producing an
-/// `std::invalid_argument` here is `validate_paged_kv_write_inputs`
-/// rejecting `block_size <= 0`; if its `[validator]` marker is
-/// missing, the helper returns rc=-2 by contract.
+/// max_slot=16 >= 0). With `benign_slot_mapping=true` the slot_mapping
+/// is `{-1,-1}` — the runtime guard excludes negative sentinels from its
+/// max-slot reduction, so it can NEVER fire on this input. The ONLY
+/// throw site capable of producing an `std::invalid_argument` here is
+/// `validate_paged_kv_write_inputs` rejecting `block_size <= 0`; if its
+/// `[validator]` marker is missing, the helper returns rc=-2 by contract.
 int mlx_paged_kv_write_eval_gpu_validator_proof_zero_block_size() {
   try {
     using namespace mlx::core::fast;
@@ -5589,8 +5517,7 @@ int mlx_paged_attention_eval_gpu_rejects_indivisible_grouping() {
 }
 
 /// Primitive directly constructed with `sliding_window_<0`. eval_gpu's
-/// validator must reject — Phase 7 lifts the Phase 1 sliding_window=0
-/// restriction but negative values are still illegal (the only "no
+/// validator must reject — negative values are illegal (the only "no
 /// mask" sentinel is 0).
 int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
   try {
@@ -5652,7 +5579,7 @@ int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
   }
 }
 
-/// Phase 2 stress test (mixed paged + non-paged ops, correctness +
+/// Stress test (mixed paged + non-paged ops, correctness +
 /// determinism + V1/V2 coverage).
 ///
 /// Builds a small graph that:
@@ -5665,8 +5592,7 @@ int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
 /// dependency tracking — `paged_kv_write` mutates k_pool/v_pool in
 /// place (registered via `set_output_array`), which `paged_attention`
 /// then reads (registered via `set_input_array`). MLX's encoder must
-/// fence these correctly. Phase 1's separate-queue dispatch
-/// fundamentally cannot get this right; Phase 2 does.
+/// fence these correctly.
 ///
 /// Correctness + determinism criteria:
 ///
@@ -6003,10 +5929,10 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph_v(
 
       // Step 1c: paged_attention reads from the just-written pools.
       // The encoder must fence between the write (Step 1b) and this
-      // read; if Phase 2 dispatch is correct, MLX's `set_output_array`
-      // → `set_input_array` chain handles it. NOTE: no `eval()`
-      // between the write and this read in the stress runs — the
-      // whole point is to test the encoder's automatic fencing.
+      // read; MLX's `set_output_array` → `set_input_array` chain handles
+      // it. NOTE: no `eval()` between the write and this read in the
+      // stress runs — the whole point is to test the encoder's automatic
+      // fencing.
       array attn = paged_attention(
           q_offset,
           k_pool_after,
@@ -6109,8 +6035,8 @@ extern "C" int mlx_paged_phase2_stress_mixed_graph(int iterations) {
 // =============================================================================
 // PagedAttentionVarlen FFI test helpers.
 //
-// Smoke-test the new sibling primitive at the C++ boundary without
-// requiring a full Metal/MLX environment. The Rust integration tests in
+// Smoke-test the sibling primitive at the C++ boundary without requiring
+// a full Metal/MLX environment. The Rust integration tests in
 // `crates/mlx-paged-attn/tests/paged_ops_smoke.rs` bind these.
 // =============================================================================
 

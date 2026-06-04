@@ -33,10 +33,10 @@ pub struct GatedDeltaNet {
     value_dim: i32,
     conv_dim: i32,
     conv_kernel_dim: i32,
-    /// E51: pre-stacked `[w_qkvz; w_ba]` then transposed to
-    /// `[hidden, qkvz_dim + ba_dim]`. Populated by `finalize_in_proj()` after
-    /// weights are loaded. When present (and non-quantized), `forward()` does
-    /// ONE matmul + two slices instead of two separate matmuls.
+    /// Pre-stacked `[w_qkvz; w_ba]` transposed to `[hidden, qkvz_dim + ba_dim]`.
+    /// Populated by `finalize_in_proj()` after weights are loaded. When present
+    /// (and non-quantized), `forward()` does ONE matmul + two slices instead of
+    /// two separate matmuls.
     in_proj_qkvz_ba_t: Option<MxArray>,
 }
 
@@ -105,10 +105,10 @@ impl GatedDeltaNet {
         })
     }
 
-    /// E51: precompute the stacked `[qkvz; ba]^T` weight once after both
-    /// in_proj weights have been loaded. Forward will then use one matmul
-    /// (x @ wqb_t) plus two axis-2 slices instead of two matmuls (x @ w_qkvz.T)
-    /// + (x @ w_ba.T). Safe to call repeatedly (idempotent).
+    /// Precompute the stacked `[qkvz; ba]^T` weight once after both in_proj
+    /// weights have been loaded. Forward will then use one matmul (x @ wqb_t)
+    /// plus two axis-2 slices instead of two matmuls (x @ w_qkvz.T) + (x @ w_ba.T).
+    /// Safe to call repeatedly (idempotent).
     ///
     /// Only applies when both in_proj_qkvz and in_proj_ba are non-quantized
     /// Standard linears. Quantized models continue on the legacy 2-matmul
@@ -146,9 +146,8 @@ impl GatedDeltaNet {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
-        // E51: when the stacked weight is available, do one matmul + two
-        // slices. Env-toggle MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to
-        // the two-matmul path.
+        // When the stacked weight is available, do one matmul + two slices.
+        // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to the two-matmul path.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
         let ba_dim = (self.num_v_heads * 2) as i64;
         let (qkvz, ba) = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
@@ -315,7 +314,7 @@ impl GatedDeltaNet {
     // ========== Weight accessors (standard mode) ==========
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
-        self.in_proj_qkvz_ba_t = None; // E51: invalidate stacked cache
+        self.in_proj_qkvz_ba_t = None; // invalidate stacked cache
         self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {

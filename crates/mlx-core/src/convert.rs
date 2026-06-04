@@ -345,17 +345,15 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
-    // LFM2 mxfp/nvfp now SUPPORTED for non-MoE linears (fast-follow #1a): the
-    // lfm2 loader's attention / conv / dense-MLP projections are mode-aware
+    // LFM2 mxfp/nvfp is supported for non-MoE linears: the lfm2 loader's
+    // attention / conv / dense-MLP projections are mode-aware
     // `LinearProj`/`MLPVariant` backed by `QuantizedLinear`, which threads the
     // resolved mode (affine / mxfp4 / mxfp8 / nvfp4) into `mlx_quantized_matmul`
-    // at forward time. The MoE experts/gate already supported all four modes.
-    // The EMBEDDING and lm_head remain excluded from quantization (vocab-dim
-    // tensors): `should_quantize` skips `embed_tokens`/`lm_head`, so an
-    // mxfp8/mxfp4/nvfp4 lfm2 checkpoint ships quantized experts + attn/conv/
-    // dense-MLP and a plain bf16 embedding — which the #1a loader can load. A
-    // quant-capable embedding lands in #1b; the prior affine-only gate is thus
-    // removed.
+    // at forward time. The MoE experts/gate support all four modes. The
+    // embedding and lm_head are excluded from quantization (vocab-dim tensors):
+    // `should_quantize` skips `embed_tokens`/`lm_head`, so an mxfp8/mxfp4/nvfp4
+    // lfm2 checkpoint ships quantized experts + attn/conv/dense-MLP and a plain
+    // bf16 embedding.
 
     // Validate recipe
     if let Some(ref recipe) = quant_recipe {
@@ -563,9 +561,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let is_privacy_filter = matches!(model_type.as_deref(), Some("privacy-filter"));
 
     // Refuse `--quantize` against pre-quantized MTP sources for Qwen3.5/3.6.
-    // The W6.15 convert path retains `mtp.*` tensors untouched (MTPLX
-    // "final form" convention), which means existing `mtp.*.scales` /
-    // `.biases` flow through to the output. Re-quantizing the
+    // The convert path retains `mtp.*` tensors untouched (MTPLX "final form"
+    // convention), which means existing `mtp.*.scales` / `.biases` flow
+    // through to the output. Re-quantizing the
     // language-model body simultaneously rewrites the global `quantization`
     // block in `config.json` to whatever bits/group_size/mode the user
     // asked for, and the load path (`mtp.rs::apply_weights`) resolves
@@ -761,7 +759,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             // projections (q/k/v/o) and MoE experts (gate_up_proj, down_proj);
             // quantize routers at 8-bit affine when --q-mode affine; leave
             // embeddings, classifier head, norms, biases, and attention sinks
-            // at bf16. Inference path is bf16-only until Phase C lands.
+            // at bf16. Inference path is currently bf16-only.
             let preserved_extra = if quant_mode == "affine" {
                 "8-bit-affine routers"
             } else {

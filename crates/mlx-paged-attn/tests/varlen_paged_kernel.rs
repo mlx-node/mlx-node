@@ -1,7 +1,7 @@
-//! Phase 4a varlen paged-attention kernel tests.
+//! Varlen paged-attention kernel tests.
 //!
 //! End-to-end verification of the multi-row paged-attention kernel
-//! introduced for MTP speculative decoding. The single-row kernel ships
+//! used for MTP speculative decoding. The single-row kernel ships
 //! one Q vector per sequence; the varlen kernel ships
 //! `cu_seqlens_q[num_seqs]` Q vectors and uses an on-GPU binary search
 //! plus per-query causal cutoff

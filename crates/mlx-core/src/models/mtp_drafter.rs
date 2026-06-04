@@ -1,9 +1,9 @@
 //! Shared detection + key-normalization for the mlx-vlm `qwen3_5_mtp`
 //! split MTP-drafter directory.
 //!
-//! `mlx convert --q-mtp split` (Phase 1) emits a checkpoint laid out as a
-//! BODY (no `mtp.*` tensors) plus a sibling `mtp-drafter/` subdirectory in
-//! mlx-vlm's `qwen3_5_mtp` drafter format:
+//! `mlx convert --q-mtp split` emits a checkpoint laid out as a BODY (no
+//! `mtp.*` tensors) plus a sibling `mtp-drafter/` subdirectory in mlx-vlm's
+//! `qwen3_5_mtp` drafter format:
 //!
 //! ```text
 //! <checkpoint>/
@@ -198,14 +198,13 @@ pub fn reprefix_drafter_key(key: &str) -> String {
 /// every path.
 ///
 /// ORDER IS LOAD-BEARING: the longest wrapper (`model.language_model.model.`)
-/// MUST be tried before the shorter overlapping `model.language_model.`. Per
-/// PR #65 review (Cursor Bugbot), omitting the longest variant let the shorter
-/// strip fire on `model.language_model.model.mtp.fc.weight`, leaving
-/// `model.mtp.fc.weight` — which doesn't start with `mtp.` — so the key was
-/// silently dropped (or wrongly re-prefixed). Longest-first is strictly safe
-/// for the generic body strips too: a longer match is only attempted before
-/// the shorter ones, so the existing double-wrap `model.language_model.`
-/// handling is preserved.
+/// MUST be tried before the shorter overlapping `model.language_model.`.
+/// Omitting the longest variant lets the shorter strip fire on
+/// `model.language_model.model.mtp.fc.weight`, leaving `model.mtp.fc.weight` —
+/// which doesn't start with `mtp.` — so the key is silently dropped (or wrongly
+/// re-prefixed). Longest-first is strictly safe for the generic body strips
+/// too: a longer match is only attempted before the shorter ones, so the
+/// existing double-wrap `model.language_model.` handling is preserved.
 pub(crate) fn strip_wrapper_prefix(key: &str) -> &str {
     key.strip_prefix("model.language_model.model.")
         .or_else(|| key.strip_prefix("model.language_model."))
@@ -257,7 +256,7 @@ pub fn detect_drafter_safetensors(model_dir: &Path) -> Option<PathBuf> {
 ///
 /// Requires BOTH a `model.safetensors` weights file AND a `config.json` whose
 /// `model_type == "qwen3_5_mtp"`. The `config.json` gate is the authoritative
-/// signal Phase 1 writes; a stray directory without it is ignored.
+/// signal convert writes; a stray directory without it is ignored.
 fn drafter_dir_if_valid(dir: &Path) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
@@ -642,13 +641,12 @@ mod tests {
         );
     }
 
-    /// PR #65 review (Cursor Bugbot) regression: the longest wrapper
-    /// `model.language_model.model.` must be stripped BEFORE the shorter
-    /// overlapping `model.language_model.`. Previously the function omitted the
-    /// longest variant, so the shorter strip fired first and left
-    /// `model.mtp.fc.weight` — which doesn't start with `mtp.` — getting wrongly
+    /// Regression: the longest wrapper `model.language_model.model.` must be
+    /// stripped BEFORE the shorter overlapping `model.language_model.`. Omitting
+    /// the longest variant lets the shorter strip fire first, leaving
+    /// `model.mtp.fc.weight` — which doesn't start with `mtp.` — wrongly
     /// reprefixed to `mtp.model.mtp.fc.weight`. The wrapper set + longest-first
-    /// order now mirror `normalize_mtp_prefix` in `convert.rs`.
+    /// order mirror `normalize_mtp_prefix` in `convert.rs`.
     #[test]
     fn reprefix_strips_longest_wrapper_first() {
         // The exact reported bug case (already-mtp key under the longest wrapper).
@@ -825,7 +823,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    // ── Finding 2 regression: shared drafter validation ───────────────────
+    // ── Shared drafter validation ─────────────────────────────────────────
 
     fn scalar() -> MxArray {
         MxArray::scalar_float(1.0).expect("scalar array")
@@ -892,10 +890,10 @@ mod tests {
         assert!(missing.contains(&"mtp.layers.0.mlp.gate.weight".to_string()));
     }
 
-    /// Fix A regression: the shared expert is UNCONDITIONAL, so a MoE checkpoint
-    /// missing ONLY a shared-expert tensor (switch_mlp + router gate all present)
-    /// must still be flagged incomplete — otherwise the head loads random
-    /// shared-expert weights and corrupts speculative decode.
+    /// The shared expert is UNCONDITIONAL, so a MoE checkpoint missing ONLY a
+    /// shared-expert tensor (switch_mlp + router gate all present) must still be
+    /// flagged incomplete — otherwise the head loads random shared-expert
+    /// weights and corrupts speculative decode.
     #[test]
     fn partial_moe_drafter_missing_shared_expert_rejected() {
         // (a) missing a shared_expert projection weight.
@@ -921,8 +919,8 @@ mod tests {
         assert_eq!(missing, vec!["mtp.fc.weight".to_string()]);
     }
 
-    /// Fix B regression: a packed `Uint32` required `.weight` with NO sibling
-    /// `.scales` must be flagged (the missing `.scales`), mirroring the dense
+    /// A packed `Uint32` required `.weight` with NO sibling `.scales` must be
+    /// flagged (the missing `.scales`), mirroring the dense
     /// loader's `require_mtp_linear`. The MoE `SwitchLinear::set_weight` performs
     /// no shape/dtype check, so a quantized `.weight` without scales would load
     /// as silent garbage. Needs Metal to allocate the Uint32 array — skip when

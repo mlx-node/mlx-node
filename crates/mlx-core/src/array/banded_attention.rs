@@ -1,16 +1,14 @@
 //! Bidirectional banded attention with per-head sinks — reference implementation.
 //!
-//! This is the **correctness oracle** for the future Metal kernel (Task B2). It
-//! composes existing MLX ops (matmul, softmax, mask construction, concat,
-//! slice) instead of running a single fused kernel, so it is intentionally
-//! slow but provably correct.
+//! This is the **correctness oracle** for the fused Metal kernel. It composes
+//! existing MLX ops (matmul, softmax, mask construction, concat, slice) instead
+//! of running a single fused kernel, so it is intentionally slow but provably
+//! correct.
 //!
-//! Architectural note: the eventual kernel-backed primitive lives in
-//! `mlx-paged-attn`, but adding `mlx-core` as a dependency there would create a
-//! cycle (`mlx-core → mlx-paged-attn` already exists). We therefore keep this
-//! reference alongside `attention.rs` in `mlx-core`. The B2 kernel will be able
-//! to depend on this crate via `dev-dependencies` for its tests, or duplicate
-//! a minimal Rust-side scaffold for input prep.
+//! Architectural note: the kernel-backed primitive lives in `mlx-paged-attn`,
+//! but adding `mlx-core` as a dependency there would create a cycle
+//! (`mlx-core → mlx-paged-attn` already exists). We therefore keep this
+//! reference alongside `attention.rs` in `mlx-core`.
 //!
 //! ## Math
 //!

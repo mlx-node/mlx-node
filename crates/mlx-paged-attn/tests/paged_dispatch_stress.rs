@@ -1,10 +1,10 @@
-//! Phase 2 stress test for the C++-side paged-attention dispatch.
+//! Stress test for the C++-side paged-attention dispatch.
 //!
-//! After Phase 2, `PagedKVWrite::eval_gpu` and `PagedAttention::eval_gpu`
-//! encode their kernels onto MLX's own `metal::CommandEncoder` (via
-//! `crates/mlx-sys/src/mlx_paged_dispatch.cpp`) instead of the Phase 1
-//! extern-C shim into the mlx-paged-attn Rust crate's separate command
-//! queue. This test stresses that integration:
+//! `PagedKVWrite::eval_gpu` and `PagedAttention::eval_gpu` encode their
+//! kernels onto MLX's own `metal::CommandEncoder` (via
+//! `crates/mlx-sys/src/mlx_paged_dispatch.cpp`) rather than the extern-C
+//! shim into the mlx-paged-attn Rust crate's separate command queue. This
+//! test stresses that integration:
 //!
 //! - Build a graph that interleaves paged ops with standard MLX ops:
 //!   `q' = q + bias` (non-paged op),

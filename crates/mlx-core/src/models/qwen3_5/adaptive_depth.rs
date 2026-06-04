@@ -1,4 +1,4 @@
-//! W6.8 — Adaptive MTP depth policy.
+//! Adaptive MTP depth policy.
 //!
 //! Per-session policy that picks the MTP draft depth `D ∈ {1..=5}` for
 //! each cycle by maintaining an EMA of the effective decode rate
@@ -9,10 +9,9 @@
 //! * `Explore` — initial bootstrap. Sweeps every depth in `{1..=5}`
 //!   for `MIN_COLD_SAMPLES` cycles each so every per-depth EMA gets
 //!   real observations BEFORE the first hill-climb decision. Without
-//!   this, the policy was effectively stuck at its seed depth
-//!   (codex-flagged design flaw: `pick_depth()` returns
-//!   `current_depth`, so non-current depths never get samples and
-//!   can never win the hill-climb).
+//!   this the policy is stuck at its seed depth, since `pick_depth()`
+//!   returns `current_depth`, so non-current depths never get samples
+//!   and can never win the hill-climb.
 //! * `Full` — run at `current_depth` and re-evaluate the hill-climb
 //!   every cycle. Every `FULL_REPROBE_INTERVAL` cycles, launch a
 //!   `NeighborProbe` burst to refresh adjacent depths' EMAs.
@@ -23,18 +22,18 @@
 //!   back up to `current_depth`.
 //!
 //! Reference: `dflash-mlx/dflash_mlx/engine/spec_epoch.py`
-//! `_AdaptiveBlockPolicy` (lines 190-418). The DFlash policy is keyed
-//! on a "block length" (full vs. min vs. probe), where ours is keyed
-//! on draft depth. The drop-acceptance threshold (`0.75`) and probe-
-//! interval pattern are lifted directly.
+//! `_AdaptiveBlockPolicy`. The DFlash policy is keyed on a "block length"
+//! (full vs. min vs. probe), where ours is keyed on draft depth. The
+//! drop-acceptance threshold (`0.75`) and probe-interval pattern are lifted
+//! directly.
 //!
 //! The compiled MTP verify graphs are pre-warmed at model load for every
-//! depth in `{1..=5}` (W6.7), so switching depth between cycles is
-//! zero-cost from the compile side — the policy can swing freely.
+//! depth in `{1..=5}`, so switching depth between cycles is zero-cost from
+//! the compile side — the policy can swing freely.
 
 use std::time::Duration;
 
-/// Min and max draft depths supported by the W5 verify FFI contract.
+/// Min and max draft depths supported by the verify FFI contract.
 /// Mirrors the clamp in `extract_chat_params`.
 pub(crate) const MIN_DEPTH: u8 = 1;
 pub(crate) const MAX_DEPTH: u8 = 5;
@@ -143,23 +142,17 @@ const NEIGHBOR_PROBE_CYCLES: u32 = MIN_COLD_SAMPLES;
 
 /// Adaptive state machine.
 ///
-/// **Why an explicit `Explore` state**: the codex adversarial review
-/// flagged that the prior design's `Full` state could never discover
-/// non-seed depths — `pick_depth()` returned `current_depth` and the
-/// hill-climb only considered candidates with `sample_count >=
-/// MIN_COLD_SAMPLES` observations, but production callers in
-/// `decode_loop_mtp!` only ever record observations at the depth
-/// `pick_depth()` returned, so the EMA for unsampled depths stays at
-/// 0.0 forever. Result: a 3-seeded policy could only oscillate between
-/// {3, 1} (Full vs. Reduced), never trying 2/4/5.
+/// Why an explicit `Explore` state: production callers in `decode_loop_mtp!`
+/// only ever record observations at the depth `pick_depth()` returned, so
+/// without bootstrap the EMA for unsampled depths stays 0.0 forever and the
+/// hill-climb can never discover a non-seed depth (a 3-seeded policy would
+/// only oscillate between {3, 1}, never trying 2/4/5).
 ///
-/// The new `Explore` state runs through every depth in `{1..=5}` for
-/// `MIN_COLD_SAMPLES` cycles each at decode start, seeding all
-/// per-depth EMAs. After exploration, the policy commits to the
-/// best-rate depth in `Full`. Subsequent periodic `NeighborProbe`
-/// re-checks the adjacent depths so a regime change mid-decode (e.g.
-/// going from a high-acceptance code block to a low-acceptance prose
-/// block) gets re-discovered without dropping all the way to
+/// `Explore` runs through every depth in `{1..=5}` for `MIN_COLD_SAMPLES`
+/// cycles each at decode start, seeding all per-depth EMAs, then commits to
+/// the best-rate depth in `Full`. Periodic `NeighborProbe` re-checks adjacent
+/// depths so a mid-decode regime change (e.g. high-acceptance code → low-
+/// acceptance prose) gets re-discovered without dropping all the way to
 /// `Reduced`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdaptiveState {
@@ -255,19 +248,12 @@ impl ExpectedValueDepthPolicy {
             confidence_weight: env_f64("MLX_MTP_EV_CONFIDENCE_WEIGHT", 0.25).clamp(0.0, 1.0),
             min_extra_accept_probability: env_f64("MLX_MTP_EV_MIN_EXTRA_ACCEPT_PROBABILITY", 0.30)
                 .clamp(0.0, 1.0),
-            // Default ON: a model-backed T=0 parity smoke (affine
-            // mtplx-optimized-speed-mtp, depth 3, counting + prose prompts;
-            // examples/_ev-deepen-probe.ts) confirmed intra-cycle deepening
-            // (mean_effective_depth 1.000 -> 1.950 counting / 1.027 prose,
-            // exercising the compiled verify graph's depth-keyed argmax)
-            // produces byte-identical T=0 output ON vs OFF on BOTH prompts,
-            // reproduced deterministically. The earlier "M5 Max traces showed
-            // deepening can violate T=0 byte-equivalence" caveat did not
-            // reproduce. The C2 unit gate
-            // (ev_deepen_t0_committed_tokens_byte_identical) continues to guard
-            // the accept/commit layer. `MLX_MTP_EV_ALLOW_DEEPEN=0` opts out.
-            // Note: only consulted in EV mode (MLX_MTP_ADAPTIVE_DEPTH_MODE=ev);
-            // the default Throughput mode never reaches this gate.
+            // Default ON: intra-cycle deepening produces byte-identical T=0
+            // output ON vs OFF — it only extends the proposal prefix; the
+            // accept/commit layer is unchanged. `MLX_MTP_EV_ALLOW_DEEPEN=0`
+            // opts out. Only consulted in EV mode
+            // (MLX_MTP_ADAPTIVE_DEPTH_MODE=ev); the default Throughput mode
+            // never reaches this gate.
             allow_deepen: env_bool("MLX_MTP_EV_ALLOW_DEEPEN", true),
         }
     }
@@ -289,13 +275,12 @@ impl ExpectedValueDepthPolicy {
         policy
     }
 
-    /// Test-only override for the intra-cycle deepen gate. The
-    /// production default is sourced from `MLX_MTP_EV_ALLOW_DEEPEN`
-    /// (adaptive_depth.rs `new`); tests must NOT mutate that env var
-    /// (unsafe in Rust 2024, racy under parallel `cargo test`, and the
-    /// value may be cached). This setter lets the C2 T=0-safety test
-    /// drive the shallow (`false`, stop at `base_depth`) vs deep
-    /// (`true`, extend to `max_depth`) policies in-process.
+    /// Test-only override for the intra-cycle deepen gate. The production
+    /// default is sourced from `MLX_MTP_EV_ALLOW_DEEPEN` (in `new`); tests
+    /// must NOT mutate that env var (unsafe in Rust 2024, racy under parallel
+    /// `cargo test`, and the value may be cached). This setter drives the
+    /// shallow (`false`, stop at `base_depth`) vs deep (`true`, extend to
+    /// `max_depth`) policies in-process.
     #[cfg(test)]
     pub(crate) fn set_allow_deepen(&mut self, allow_deepen: bool) {
         self.allow_deepen = allow_deepen;
@@ -497,12 +482,11 @@ impl AdaptiveDepthPolicy {
     /// Construct with an initial depth (typically the user's
     /// `mtpDepth` value or the default `3`).
     ///
-    /// Starts in `Explore` state, which sweeps every depth in
-    /// `{1..=5}` for `MIN_COLD_SAMPLES` cycles each before
-    /// transitioning to `Full` at the best-rate depth. This guarantees
-    /// every depth gets observations in production (codex review fix
-    /// — the prior `Full`-start design could never sample non-seed
-    /// depths because `pick_depth()` only returned `current_depth`).
+    /// Starts in `Explore` state, which sweeps every depth in `{1..=5}`
+    /// for `MIN_COLD_SAMPLES` cycles each before transitioning to `Full`
+    /// at the best-rate depth, guaranteeing every depth gets observations
+    /// (a `Full`-start design could never sample non-seed depths because
+    /// `pick_depth()` only returns `current_depth`).
     pub fn new(initial_depth: u8) -> Self {
         let d = initial_depth.clamp(MIN_DEPTH, MAX_DEPTH);
         Self {
@@ -715,24 +699,14 @@ impl AdaptiveDepthPolicy {
     /// so `total_cycles >= last_sampled_cycle` always holds — and we use
     /// `saturating_sub` to make that obvious at the call site.
     ///
-    /// Historical note (PR #65, Cursor Bugbot, Low): the ORIGINAL code
-    /// pushed *every* in-range neighbor unconditionally and returned the
-    /// min-by-count, so — because `current_depth ∈ [MIN_DEPTH, MAX_DEPTH]`
-    /// and `MIN_DEPTH != MAX_DEPTH` — at least one candidate always
-    /// existed and the function never returned `None`, making the "both
-    /// neighbors fresh enough" branch dead code. The first fix gated
-    /// purely on `sample_count < MIN_COLD_SAMPLES`, which over-corrected:
-    /// `record_cycle` SATURATES `sample_count` at `MIN_COLD_SAMPLES` (it
-    /// increments only on the cold-start branch, then switches to the EMA
-    /// branch and never increments again), so after a normal `Explore`
-    /// sweep every depth sits at exactly `MIN_COLD_SAMPLES`, the filter
-    /// is always empty, and the count-only `stale_neighbor` returned
-    /// `None` FOREVER — silently killing the documented periodic drift
-    /// refresh. Gating on freshness (under-seeded OR aged out by
-    /// `FULL_REPROBE_INTERVAL` cycles) (a) restores that periodic drift
-    /// reprobe the count-only fix had killed, and (b) still lets
-    /// `stale_neighbor` return `None` when a neighbor was recently
-    /// sampled, keeping the else-branch live.
+    /// Note: `record_cycle` SATURATES `sample_count` at `MIN_COLD_SAMPLES`
+    /// (it increments only on the cold-start branch, then switches to the EMA
+    /// branch), so after a normal `Explore` sweep every depth sits at exactly
+    /// `MIN_COLD_SAMPLES`. A count-only filter (`sample_count <
+    /// MIN_COLD_SAMPLES`) would therefore be empty forever and never reprobe.
+    /// Gating on freshness (under-seeded OR aged out by `FULL_REPROBE_INTERVAL`
+    /// cycles) keeps the periodic drift reprobe alive while still letting this
+    /// return `None` when a neighbor was recently sampled.
     fn stale_neighbor(&self) -> Option<u8> {
         let cur = self.current_depth;
         let mut candidates: Vec<u8> = Vec::with_capacity(2);
@@ -835,7 +809,7 @@ impl AdaptiveDepthPolicy {
 
 #[cfg(test)]
 mod tests {
-    //! W6.8 — Pure-Rust unit tests for the adaptive depth policy.
+    //! Pure-Rust unit tests for the adaptive depth policy.
     //! No Metal, no MLX, no model load — these run in `cargo test
     //! -p mlx-core --lib adaptive_depth`.
     //!
@@ -945,8 +919,7 @@ mod tests {
 
     /// Bootstrap: the policy must spend `EXPLORE_TOTAL` cycles in
     /// `Explore` and visit every depth in `{1..=5}` before entering
-    /// `Full`. **This is the regression test the codex review asked
-    /// for** — the policy is driven entirely via `pick_depth()`, never
+    /// `Full`. The policy is driven entirely via `pick_depth()`, never
     /// manually fed unpicked depths.
     #[test]
     fn explore_visits_every_depth_then_enters_full() {
@@ -1060,11 +1033,11 @@ mod tests {
         assert_eq!(p.state, AdaptiveState::Full);
     }
 
-    /// **Codex regression test**: the policy must be able to discover
-    /// a non-seed depth as the optimum, driven entirely through the
-    /// production `pick_depth()`→`record_cycle()` loop. Bound the
-    /// acceptance to "good" so we stay out of Reduced and let
-    /// Explore + NeighborProbe do their job.
+    /// The policy must be able to discover a non-seed depth as the
+    /// optimum, driven entirely through the production
+    /// `pick_depth()`→`record_cycle()` loop. Bound the acceptance to
+    /// "good" so we stay out of Reduced and let Explore + NeighborProbe
+    /// do their job.
     ///
     /// Setup: rate is monotonically increasing in depth. Seed = 1
     /// (intentionally the worst). The policy must discover depth 5
@@ -1142,14 +1115,12 @@ mod tests {
         );
     }
 
-    /// PR #65 / age-based-fix regression test (B) — **else-branch
-    /// reachable**: `stale_neighbor` returns `None` (and so
+    /// Else-branch reachable: `stale_neighbor` returns `None` (and so
     /// `maybe_full_transition` takes its "both neighbors fresh enough"
     /// branch) when both in-range neighbors are well-seeded AND were
     /// sampled recently (within the last `FULL_REPROBE_INTERVAL`
-    /// cycles). This proves a recently-sampled, well-seeded neighbor is
-    /// NOT a reprobe candidate, so the else-branch is live — the
-    /// original unconditional-`Some` made it dead code.
+    /// cycles). Proves a recently-sampled, well-seeded neighbor is NOT a
+    /// reprobe candidate, so the else-branch is live.
     ///
     /// Hand-seeds the per-depth state and calls `stale_neighbor`
     /// directly (the "both fresh" configuration is unreachable via the
@@ -1176,14 +1147,12 @@ mod tests {
         );
     }
 
-    /// PR #65 / age-based-fix regression test (C) — **drift reprobe
-    /// restored** (the anti-regression for this finding). With every
-    /// depth seeded to `MIN_COLD_SAMPLES`, the policy enters `Full` at
-    /// depth 3 and runs constant-rate, full-accept cycles at depth 3
-    /// only. The neighbors (depths 2 and 4) therefore go un-sampled, and
-    /// once they age out by `>= FULL_REPROBE_INTERVAL` cycles the
-    /// periodic drift `NeighborProbe` MUST fire. This is exactly the
-    /// test that FAILS under the broken count-only filter (which never
+    /// Drift reprobe restored. With every depth seeded to
+    /// `MIN_COLD_SAMPLES`, the policy enters `Full` at depth 3 and runs
+    /// constant-rate, full-accept cycles at depth 3 only. The neighbors
+    /// (depths 2 and 4) therefore go un-sampled, and once they age out by
+    /// `>= FULL_REPROBE_INTERVAL` cycles the periodic drift `NeighborProbe`
+    /// MUST fire — this fails under a count-only filter (which never
     /// re-fires once every depth saturates at `MIN_COLD_SAMPLES`).
     /// Acceptance is kept maximal (committed = depth + 1) so the policy
     /// never drops to `Reduced` before the reprobe fires.

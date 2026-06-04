@@ -703,7 +703,7 @@ impl Qwen3Inner {
         // `use_block_paged_cache`), route through the parallel
         // `chat_sync_core_paged` path that uses `forward_paged_adapter`
         // instead of `forward_fused`. The flat path is left untouched so
-        // turning the flag off is byte-identical to before this commit.
+        // turning the flag off is byte-identical to the non-paged path.
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 token_ids_vec,
@@ -1217,10 +1217,8 @@ impl Qwen3Inner {
     /// 5. Session end / explicit reset / error: `release_request`
     ///    decrefs every block in the table.
     ///
-    /// **Status**: P1 wiring. Numerical validation is deferred to a
-    /// follow-up — this commit's tests assert non-empty / valid-token
-    /// output via shape checks, not exact-token equivalence to the flat
-    /// path.
+    /// Note: tests assert non-empty / valid-token output via shape checks,
+    /// not exact-token equivalence to the flat path.
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged(
         &mut self,
@@ -2566,7 +2564,7 @@ impl Qwen3Inner {
         // `chat_stream_sync_core_paged` path that uses
         // `forward_paged_adapter` instead of `forward_fused`. The flat
         // path is left untouched so turning the flag off is byte-identical
-        // to before this commit. Mirrors the dispatch added to the
+        // to the non-paged path. Mirrors the dispatch in the
         // non-streaming `chat_sync_core`.
         if self.paged_adapter.is_some() {
             return self.chat_stream_sync_core_paged(messages, config, eos_token_id, cb, cancelled);
@@ -6838,8 +6836,8 @@ mod tests {
     ///
     /// What we do NOT assert: numerical equivalence to the flat path.
     /// Weights are random, so output values are arbitrary. Numerical
-    /// validation is deferred to an end-to-end test with loaded weights
-    /// (a follow-up commit, gated on tokenizer + checkpoint loading).
+    /// validation is covered by an end-to-end test with loaded weights
+    /// (gated on tokenizer + checkpoint loading).
     ///
     /// Skips on no-Metal hosts via the `Qwen3Inner::new` Metal-availability
     /// check (existing pattern from
@@ -7333,7 +7331,7 @@ mod tests {
             .collect()
     }
 
-    /// **Phase B parity test**: chunked prefill with the same weights and
+    /// Chunked-prefill parity test: chunked prefill with the same weights and
     /// the same suffix tokens MUST produce the same final logits as the
     /// legacy single-shot prefill, modulo small bf16 rounding noise.
     ///
@@ -7478,7 +7476,7 @@ mod tests {
         }
     }
 
-    /// **Phase B state test (per-chunk progression)**: drive the chunked
+    /// Per-chunk progression test: drive the chunked
     /// prefill chunk-by-chunk through `run_paged_prefill_one_chunk` and
     /// assert the adapter's bookkeeping advances correctly **after every
     /// chunk**, not just at the end.
@@ -7645,7 +7643,7 @@ mod tests {
         }
     }
 
-    /// **Phase B uneven-tail parity test**: prove the chunked path handles
+    /// Uneven-tail parity test: prove the chunked path handles
     /// a final partial chunk correctly. 97 tokens at chunk_size=16 produces
     /// 6 full chunks of 16 tokens + 1 trailing chunk of 1 token. This is
     /// the worst case for off-by-one bugs at chunk boundaries (the trailing
@@ -7793,13 +7791,13 @@ mod tests {
         }
     }
 
-    /// **Phase B cached-prefix parity test**: exercise the
+    /// Cached-prefix parity test: exercise the
     /// `cached_prefix_len > 0` (Q < K) branch of `forward_paged_adapter`
     /// that the chunked path relies on for chunks N>0 — but with a
     /// genuinely non-zero cached prefix at the START of the prefill
     /// (rather than only synthesized by the chunked driver itself).
     ///
-    /// Setup uses the practical proxy from the spec: turn 1 prefills the
+    /// Setup: turn 1 prefills the
     /// first 32 tokens, registers full blocks, releases. Turn 2 then
     /// prefills the full 96-token prompt (whose first 32 tokens are
     /// identical to turn 1's). On turn 2, `find_cached_prefix` returns
@@ -8023,7 +8021,7 @@ mod tests {
         }
     }
 
-    /// **Phase B fallback test**: legacy callers that rely on the env-var
+    /// Env-var fallback test: callers that rely on the env-var
     /// default (chunk_size = 0) MUST still get the byte-equivalent
     /// single-shot path. We exercise this by calling the public
     /// `run_paged_prefill_chunk` (which reads the OnceLock-cached env)

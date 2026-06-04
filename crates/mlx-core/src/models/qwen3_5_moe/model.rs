@@ -311,11 +311,10 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Multi-Token Prediction head — `Some` when `config.n_mtp_layers > 0`
     /// (the checkpoint shipped MTP weights), `None` otherwise. Owned by
-    /// the model thread; the speculative-decode loop (W6) reads it
-    /// directly. Weight loading happens after construction in
-    /// `apply_weights_moe_inner`.
+    /// the model thread; the speculative-decode loop reads it directly.
+    /// Weight loading happens after construction in `apply_weights_moe_inner`.
     pub(crate) mtp: Option<Qwen3_5MoeMTPModule>,
-    /// W7 (MTP): set `true` by `apply_weights_moe_inner` ONLY after the MTP
+    /// Set `true` by `apply_weights_moe_inner` ONLY after the MTP
     /// head's required weight set was found COMPLETE. Mirrors the dense
     /// `Qwen35Inner::mtp_weights_loaded`. The module itself is constructed
     /// purely from config (`n_mtp_layers > 0`), so `mtp.is_some()` alone does
@@ -1645,16 +1644,16 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_compiled");
 
-            // W6 MoE (MTP) — opt-in speculative decode. Effective only
-            // when both the per-request flag and the model checkpoint
-            // carry an MTP head. The init mirrors the main MoE path's
+            // MoE MTP opt-in speculative decode. Effective only when both
+            // the per-request flag and the model checkpoint carry an MTP head.
+            // The init mirrors the main MoE path's
             // `mlx_qwen35_moe_init_from_prefill` and shares the C++
-            // `g_weights` store. Init failure (no MTP weights,
-            // mismatched config) silently disables MTP for this turn —
-            // the regular single-token loop continues to work. We
-            // already hold `MOE_COMPILED_MUTEX` + `COMPILED_WEIGHTS_RWLOCK`
-            // here so the entire draft+verify cycle is safely serialised
-            // against any other turn's main MoE forward.
+            // `g_weights` store. Init failure (no MTP weights, mismatched
+            // config) silently disables MTP for this turn — the regular
+            // single-token loop continues to work. We already hold
+            // `MOE_COMPILED_MUTEX` + `COMPILED_WEIGHTS_RWLOCK` here so the
+            // entire draft+verify cycle is safely serialised against any
+            // other turn's main MoE forward.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
                 match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
                     Ok(()) => true,
@@ -1685,10 +1684,9 @@ impl Qwen35MoeInner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-MoE forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-MoE forward.
                         {
                             let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
                                 ids,
@@ -1704,7 +1702,7 @@ impl Qwen35MoeInner {
                         // MoE MTP path only. The main MoE path's offset
                         // and GDN linear caches are restored via the
                         // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix). Calling
+                        // pair below. Calling
                         // `mlx_qwen35_moe_adjust_offset(delta)` here
                         // would double-rewind the main offset.
                         //
@@ -1721,17 +1719,15 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — MoE twin: fold the chained
-                    // `verify_hidden[K]` slice into the same async_eval
-                    // dispatch as the post-cycle token + (optional) MoE
-                    // caches. See the dense site for the full rationale.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval dispatch as the post-cycle token + (optional)
+                    // MoE caches. See the dense site for the full rationale.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
-                    // and re-anchor MTP offset to the main MoE path's
-                    // current offset before each draft cycle. See the
-                    // dense site for the full rationale.
+                    // Reset MoE MTP K/V and re-anchor MTP offset to the main
+                    // MoE path's current offset before each draft cycle. See
+                    // the dense site for the full rationale.
                     begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
@@ -1744,20 +1740,19 @@ impl Qwen35MoeInner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
-                    // GDN linear caches + offset BEFORE the verify FFI
-                    // runs its D+1 sequential MoE forwards. Verify
-                    // mutates `g_moe_caches` in place; without restoring
-                    // on rejection the GDN recurrent state stays polluted
-                    // and the next Step A produces wrong logits.
+                    // Snapshot the main MoE path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential MoE
+                    // forwards. Verify mutates `g_moe_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted and the next Step A produces wrong logits.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
                     },
-                    // W6 MoE Bug #4 fix — on rejection: restore linear
-                    // caches + offset, then replay the K accepted drafts
-                    // via `forward_moe_compiled_with_hidden` so the main
-                    // MoE linear state matches the committed token
-                    // stream. Mirrors the dense-path closure.
+                    // On rejection: restore linear caches + offset, then
+                    // replay the K accepted drafts via
+                    // `forward_moe_compiled_with_hidden` so the main MoE linear
+                    // state matches the committed token stream. Mirrors the
+                    // dense-path closure.
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -1771,11 +1766,9 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history is dense-only at this
-                    // task scope. The MoE path keeps the legacy
-                    // cycle-history policy (its C++ `begin_cycle` still
-                    // zeroes the MTP cache), so its commit hook is a
-                    // no-op.
+                    // Committed-history is dense-only. The MoE path keeps the
+                    // legacy cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a no-op.
                     commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
                                  _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
@@ -1783,8 +1776,8 @@ impl Qwen35MoeInner {
                                  _k_accepted: usize,
                                  _emb: &MxArray|
                      -> Result<()> { Ok(()) },
-                    // Phase C — committed-history is dense-only; the
-                    // MoE path keeps the legacy cycle-history policy.
+                    // Committed-history is dense-only; the MoE path keeps the
+                    // legacy cycle-history policy.
                     committed_history_active: false,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -2049,7 +2042,7 @@ impl Qwen35MoeInner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys. See `chat_sync_core_paged` in
+        // Per-block extra_keys. See `chat_sync_core_paged` in
         // qwen3_5/model.rs for the rationale; text-only paged dispatch
         // builds an all-empty per-block vec which is bit-equal to
         // passing `&[]` to the uniform API. VLM-paged would replace the
@@ -2660,7 +2653,7 @@ impl Qwen35MoeInner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys. See comments above.
+        // Per-block extra_keys. See comments above.
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason("MoE chat_stream_sync_core_paged: paged_adapter is None")
@@ -3827,8 +3820,8 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_stream_compiled");
 
-            // W6 MoE (MTP) — opt-in speculative decode. See sync sibling
-            // for rationale. We already hold MOE_COMPILED_MUTEX +
+            // MoE MTP opt-in speculative decode. See sync sibling for
+            // rationale. We already hold MOE_COMPILED_MUTEX +
             // COMPILED_WEIGHTS_RWLOCK.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
                 match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
@@ -3860,10 +3853,9 @@ impl Qwen35MoeInner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-MoE forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-MoE forward.
                         {
                             let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
                                 ids,
@@ -3879,7 +3871,7 @@ impl Qwen35MoeInner {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
                         // MoE dispatch site (chat_sync_core_compiled_inner)
-                        // for the full W6 Bug #4 rationale.
+                        // for the full rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
@@ -3891,17 +3883,15 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — MoE twin: fold the chained
-                    // `verify_hidden[K]` slice into the same async_eval
-                    // dispatch as the post-cycle token + (optional) MoE
-                    // caches. See the dense site for the full rationale.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval dispatch as the post-cycle token + (optional)
+                    // MoE caches. See the dense site for the full rationale.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
-                    // and re-anchor MTP offset to the main MoE path's
-                    // current offset before each draft cycle. See the
-                    // dense site for the full rationale.
+                    // Reset MoE MTP K/V and re-anchor MTP offset to the main
+                    // MoE path's current offset before each draft cycle. See
+                    // the dense site for the full rationale.
                     begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
@@ -3914,20 +3904,19 @@ impl Qwen35MoeInner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
-                    // GDN linear caches + offset BEFORE the verify FFI
-                    // runs its D+1 sequential MoE forwards. Verify
-                    // mutates `g_moe_caches` in place; without restoring
-                    // on rejection the GDN recurrent state stays polluted
-                    // and the next Step A produces wrong logits.
+                    // Snapshot the main MoE path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential MoE
+                    // forwards. Verify mutates `g_moe_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted and the next Step A produces wrong logits.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
                     },
-                    // W6 MoE Bug #4 fix — on rejection: restore linear
-                    // caches + offset, then replay the K accepted drafts
-                    // via `forward_moe_compiled_with_hidden` so the main
-                    // MoE linear state matches the committed token
-                    // stream. Mirrors the dense-path closure.
+                    // On rejection: restore linear caches + offset, then
+                    // replay the K accepted drafts via
+                    // `forward_moe_compiled_with_hidden` so the main MoE linear
+                    // state matches the committed token stream. Mirrors the
+                    // dense-path closure.
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -3941,11 +3930,9 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history is dense-only at this
-                    // task scope. The MoE path keeps the legacy
-                    // cycle-history policy (its C++ `begin_cycle` still
-                    // zeroes the MTP cache), so its commit hook is a
-                    // no-op.
+                    // Committed-history is dense-only. The MoE path keeps the
+                    // legacy cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a no-op.
                     commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
                                  _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
@@ -3953,8 +3940,8 @@ impl Qwen35MoeInner {
                                  _k_accepted: usize,
                                  _emb: &MxArray|
                      -> Result<()> { Ok(()) },
-                    // Phase C — committed-history is dense-only; the
-                    // MoE path keeps the legacy cycle-history policy.
+                    // Committed-history is dense-only; the MoE path keeps the
+                    // legacy cycle-history policy.
                     committed_history_active: false,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -4533,8 +4520,8 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_delta_compiled");
 
-            // W6 MoE (MTP) — opt-in speculative decode. See the chat
-            // sync site for full rationale.
+            // MoE MTP opt-in speculative decode. See the chat sync site
+            // for full rationale.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
                 match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
                     Ok(()) => true,
@@ -4565,10 +4552,9 @@ impl Qwen35MoeInner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-MoE forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-MoE forward.
                         {
                             let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
                                 ids,
@@ -4584,7 +4570,7 @@ impl Qwen35MoeInner {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
                         // MoE dispatch site (chat_sync_core_compiled_inner)
-                        // for the full W6 Bug #4 rationale.
+                        // for the full rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
@@ -4596,17 +4582,15 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — MoE twin: fold the chained
-                    // `verify_hidden[K]` slice into the same async_eval
-                    // dispatch as the post-cycle token + (optional) MoE
-                    // caches. See the dense site for the full rationale.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval dispatch as the post-cycle token + (optional)
+                    // MoE caches. See the dense site for the full rationale.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
-                    // and re-anchor MTP offset to the main MoE path's
-                    // current offset before each draft cycle. See the
-                    // dense site for the full rationale.
+                    // Reset MoE MTP K/V and re-anchor MTP offset to the main
+                    // MoE path's current offset before each draft cycle. See
+                    // the dense site for the full rationale.
                     begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
@@ -4619,20 +4603,19 @@ impl Qwen35MoeInner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
-                    // GDN linear caches + offset BEFORE the verify FFI
-                    // runs its D+1 sequential MoE forwards. Verify
-                    // mutates `g_moe_caches` in place; without restoring
-                    // on rejection the GDN recurrent state stays polluted
-                    // and the next Step A produces wrong logits.
+                    // Snapshot the main MoE path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential MoE
+                    // forwards. Verify mutates `g_moe_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted and the next Step A produces wrong logits.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
                     },
-                    // W6 MoE Bug #4 fix — on rejection: restore linear
-                    // caches + offset, then replay the K accepted drafts
-                    // via `forward_moe_compiled_with_hidden` so the main
-                    // MoE linear state matches the committed token
-                    // stream. Mirrors the dense-path closure.
+                    // On rejection: restore linear caches + offset, then
+                    // replay the K accepted drafts via
+                    // `forward_moe_compiled_with_hidden` so the main MoE linear
+                    // state matches the committed token stream. Mirrors the
+                    // dense-path closure.
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -4646,11 +4629,9 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history is dense-only at this
-                    // task scope. The MoE path keeps the legacy
-                    // cycle-history policy (its C++ `begin_cycle` still
-                    // zeroes the MTP cache), so its commit hook is a
-                    // no-op.
+                    // Committed-history is dense-only. The MoE path keeps the
+                    // legacy cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a no-op.
                     commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
                                  _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
@@ -4658,8 +4639,8 @@ impl Qwen35MoeInner {
                                  _k_accepted: usize,
                                  _emb: &MxArray|
                      -> Result<()> { Ok(()) },
-                    // Phase C — committed-history is dense-only; the
-                    // MoE path keeps the legacy cycle-history policy.
+                    // Committed-history is dense-only; the MoE path keeps the
+                    // legacy cycle-history policy.
                     committed_history_active: false,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -5360,8 +5341,8 @@ impl Qwen35MoeInner {
 
             profiler.set_label("moe_chat_stream_delta_compiled");
 
-            // W6 MoE (MTP) — opt-in speculative decode. See the chat
-            // sync site for full rationale.
+            // MoE MTP opt-in speculative decode. See the chat sync site
+            // for full rationale.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
                 match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
                     Ok(()) => true,
@@ -5392,10 +5373,9 @@ impl Qwen35MoeInner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-MoE forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-MoE forward.
                         {
                             let (logits, hiddens) = forward_moe_mtp_verify_compiled_with_hidden(
                                 ids,
@@ -5411,7 +5391,7 @@ impl Qwen35MoeInner {
                         // MoE MTP path only — main offset/linear restored
                         // via `restore_and_replay_main`. See the first
                         // MoE dispatch site (chat_sync_core_compiled_inner)
-                        // for the full W6 Bug #4 rationale.
+                        // for the full rationale.
                         let delta = accepted_drafts as i32 - depth as i32;
                         if delta != 0 {
                             mlx_sys::mlx_qwen35_moe_mtp_compiled_adjust_offset(delta);
@@ -5423,17 +5403,15 @@ impl Qwen35MoeInner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — MoE twin: fold the chained
-                    // `verify_hidden[K]` slice into the same async_eval
-                    // dispatch as the post-cycle token + (optional) MoE
-                    // caches. See the dense site for the full rationale.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval dispatch as the post-cycle token + (optional)
+                    // MoE caches. See the dense site for the full rationale.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_moe_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MoE MTP K/V
-                    // and re-anchor MTP offset to the main MoE path's
-                    // current offset before each draft cycle. See the
-                    // dense site for the full rationale.
+                    // Reset MoE MTP K/V and re-anchor MTP offset to the main
+                    // MoE path's current offset before each draft cycle. See
+                    // the dense site for the full rationale.
                     begin_cycle: |_| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_moe_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_moe_get_cache_offset();
@@ -5446,20 +5424,19 @@ impl Qwen35MoeInner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 MoE Bug #4 fix — snapshot the main MoE path's
-                    // GDN linear caches + offset BEFORE the verify FFI
-                    // runs its D+1 sequential MoE forwards. Verify
-                    // mutates `g_moe_caches` in place; without restoring
-                    // on rejection the GDN recurrent state stays polluted
-                    // and the next Step A produces wrong logits.
+                    // Snapshot the main MoE path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential MoE
+                    // forwards. Verify mutates `g_moe_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted and the next Step A produces wrong logits.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_moe_compiled_snapshot_linear_caches();
                     },
-                    // W6 MoE Bug #4 fix — on rejection: restore linear
-                    // caches + offset, then replay the K accepted drafts
-                    // via `forward_moe_compiled_with_hidden` so the main
-                    // MoE linear state matches the committed token
-                    // stream. Mirrors the dense-path closure.
+                    // On rejection: restore linear caches + offset, then
+                    // replay the K accepted drafts via
+                    // `forward_moe_compiled_with_hidden` so the main MoE linear
+                    // state matches the committed token stream. Mirrors the
+                    // dense-path closure.
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -5473,11 +5450,9 @@ impl Qwen35MoeInner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history is dense-only at this
-                    // task scope. The MoE path keeps the legacy
-                    // cycle-history policy (its C++ `begin_cycle` still
-                    // zeroes the MTP cache), so its commit hook is a
-                    // no-op.
+                    // Committed-history is dense-only. The MoE path keeps the
+                    // legacy cycle-history policy (its C++ `begin_cycle` still
+                    // zeroes the MTP cache), so its commit hook is a no-op.
                     commit_mtp: |_anchor: chat_common::MtpCommitAnchor,
                                  _seed_hidden: &MxArray,
                                  _verify_hiddens: &MxArray,
@@ -5485,8 +5460,8 @@ impl Qwen35MoeInner {
                                  _k_accepted: usize,
                                  _emb: &MxArray|
                      -> Result<()> { Ok(()) },
-                    // Phase C — committed-history is dense-only; the
-                    // MoE path keeps the legacy cycle-history policy.
+                    // Committed-history is dense-only; the MoE path keeps the
+                    // legacy cycle-history policy.
                     committed_history_active: false,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -7426,12 +7401,11 @@ impl Qwen35MoeInner {
         Ok(params)
     }
 
-    /// W6 MoE (MTP): true when this checkpoint includes an MTP head
-    /// (W2 module loaded by `persistence::apply_weights_moe_inner`).
-    /// The W6 speculative decode loop gates on this together with the
-    /// per-request `enable_mtp` flag — both must be true for the
-    /// MTP-accelerated path to take over. Mirrors the dense
-    /// `Qwen35Inner::has_mtp_weights`.
+    /// True when this checkpoint includes an MTP head (module loaded by
+    /// `persistence::apply_weights_moe_inner`). The speculative decode loop
+    /// gates on this together with the per-request `enable_mtp` flag — both
+    /// must be true for the MTP-accelerated path to take over. Mirrors the
+    /// dense `Qwen35Inner::has_mtp_weights`.
     pub(crate) fn has_mtp_weights(&self) -> bool {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
@@ -7456,12 +7430,11 @@ pub struct Qwen3_5MoeModel {
     /// chat turns are rejected at runtime by the chat-entry sites.
     /// Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
-    /// W7 (MTP): snapshot of `Qwen35MoeInner::has_mtp_weights()`
-    /// captured at construction time, mirroring `paged_active`.
-    /// Surfaced through the `hasMtpWeights()` NAPI method so the TS
-    /// ChatSession can auto-default `enableMtp = true` for checkpoints
-    /// that ship an MTP head without round-tripping through the model
-    /// thread.
+    /// Snapshot of `Qwen35MoeInner::has_mtp_weights()` captured at
+    /// construction time, mirroring `paged_active`. Surfaced through the
+    /// `hasMtpWeights()` NAPI method so the TS ChatSession can auto-default
+    /// `enableMtp = true` for checkpoints that ship an MTP head without
+    /// round-tripping through the model thread.
     pub(crate) mtp_active: bool,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
@@ -7495,16 +7468,16 @@ impl Qwen3_5MoeModel {
         self.paged_active
     }
 
-    /// W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
-    /// loaded by `persistence::apply_weights_moe_inner`). Snapshotted
-    /// at load time from `Qwen35MoeInner::has_mtp_weights()` so the TS
-    /// `ChatSession` can auto-default `enableMtp = true` for
-    /// MTP-capable checkpoints without dispatching a command into the
-    /// model thread. Mirrors `Qwen3_5Model::has_mtp_weights`.
+    /// Whether this checkpoint shipped an MTP head (module loaded by
+    /// `persistence::apply_weights_moe_inner`). Snapshotted at load time from
+    /// `Qwen35MoeInner::has_mtp_weights()` so the TS `ChatSession` can
+    /// auto-default `enableMtp = true` for MTP-capable checkpoints without
+    /// dispatching a command into the model thread. Mirrors
+    /// `Qwen3_5Model::has_mtp_weights`.
     ///
-    /// Note: this only reports weight availability. Whether the W6
-    /// speculative-decode path actually runs on a given call also
-    /// requires the per-request `enableMtp` flag.
+    /// Note: this only reports weight availability. Whether the
+    /// speculative-decode path actually runs on a given call also requires
+    /// the per-request `enableMtp` flag.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
@@ -8304,11 +8277,10 @@ fn eval_token_and_moe_caches(next_token: &MxArray) {
     }
 }
 
-/// W6.5-resume (MoE twin) — evaluate `next_token`, the chained
-/// `verify_hidden[K]` slice, and (when `MLX_EVAL_ALL_CACHES` is set)
-/// the MoE compiled caches in a SINGLE `async_eval` batch. Mirrors
-/// `eval_token_caches_and_chained_hidden` on the dense side; see the
-/// dense doc comment for the full rationale.
+/// Evaluate `next_token`, the chained `verify_hidden[K]` slice, and (when
+/// `MLX_EVAL_ALL_CACHES` is set) the MoE compiled caches in a SINGLE
+/// `async_eval` batch. Mirrors `eval_token_caches_and_chained_hidden` on the
+/// dense side; see the dense doc comment for the full rationale.
 fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &MxArray) {
     unsafe {
         mlx_sys::mlx_qwen35_moe_eval_token_caches_and_extra(
@@ -8318,10 +8290,9 @@ fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden
     }
 }
 
-/// W6 MoE (MTP): one compiled MoE forward step that ALSO exports the
-/// post-final-norm hidden of the decoded token. Calls
-/// `forward_moe_cpp` first, then asks the C++ side for the stashed
-/// hidden from that step.
+/// One compiled MoE forward step that ALSO exports the post-final-norm
+/// hidden of the decoded token. Calls `forward_moe_cpp` first, then asks the
+/// C++ side for the stashed hidden from that step.
 ///
 /// Returns `(logits, hidden)` where `logits` is `[1, vocab]` and
 /// `hidden` is `[1, hidden_size]` bf16. The hidden state is the
@@ -8334,7 +8305,7 @@ fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden
 /// hidden is stashed in a process-wide `g_moe_last_hidden` global on
 /// the C++ side and is only valid until the next main-path forward
 /// or reset. Mirrors `forward_compiled_with_hidden` on the dense side.
-// W6 MoE chat-session integration is the only intended caller.
+// The MoE chat-session integration is the only intended caller.
 fn forward_moe_compiled_with_hidden(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -8356,16 +8327,16 @@ fn forward_moe_compiled_with_hidden(
 }
 
 // ============================================================================
-// W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (MoE).
+// Compiled C++ MTP (Multi-Token Prediction) wrappers (MoE).
 //
 // MoE twin of the dense `init_mtp_compiled_from_main` /
-// `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled` trio
-// (`crates/mlx-core/src/models/qwen3_5/model.rs:7418`). The C++ side
-// lives in `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` and
-// shares `g_weights()` with the main MoE path.
+// `forward_mtp_draft_compiled` / `forward_mtp_verify_compiled` trio in
+// `qwen3_5/model.rs`. The C++ side lives in
+// `crates/mlx-sys/src/mlx_qwen35_moe_mtp_compiled.cpp` and shares
+// `g_weights()` with the main MoE path.
 //
 // Locking contract:
-//   - Production callers (W6 chat-session loop) MUST hold
+//   - Production callers (chat-session loop) MUST hold
 //     `MOE_COMPILED_MUTEX` (NOT `DENSE_COMPILED_MUTEX`!) AND the
 //     `COMPILED_WEIGHTS_RWLOCK` read guard across the entire
 //     draft+verify cycle — the verify FFI loops the main MoE forward
@@ -8376,18 +8347,18 @@ fn forward_moe_compiled_with_hidden(
 //     to this module. They instead serialise on `FFI_LOCK`, which is
 //     sufficient in the absence of concurrent main-path forward calls.
 //
-// W6 integration contract:
+// Integration contract:
 //   1. After `mlx_qwen35_moe_init_from_prefill(...)` succeeds for the
 //      current turn, call `init_moe_mtp_compiled_from_main(...)` ONCE
 //      with the same config / max_kv_len.
 //   2. For each draft+verify cycle:
-//      a. Snapshot caches (W3) and main offset.
+//      a. Snapshot caches and main offset.
 //      b. Call `forward_moe_mtp_draft_compiled(...)` D times.
 //      c. Call `forward_moe_mtp_verify_compiled(...)` ONCE.
-//      d. Accept / reject per W4 sampler. On reject, rewind the main
-//         MoE offset via `mlx_qwen35_moe_adjust_offset` AND the MoE MTP
-//         offset via `mlx_qwen35_moe_mtp_compiled_adjust_offset` to
-//         keep the two paths in lock-step.
+//      d. Accept / reject. On reject, rewind the main MoE offset via
+//         `mlx_qwen35_moe_adjust_offset` AND the MoE MTP offset via
+//         `mlx_qwen35_moe_mtp_compiled_adjust_offset` to keep the two
+//         paths in lock-step.
 //   3. On turn end, call `mlx_qwen35_moe_mtp_compiled_reset()` (FFI).
 // ============================================================================
 
@@ -8404,7 +8375,7 @@ fn forward_moe_compiled_with_hidden(
 /// is left uninitialised and subsequent draft/verify calls become
 /// null-pointer no-ops so the caller can fall back to the eager Rust
 /// MoE MTP forward.
-// W6 (chat-session integration) is the only intended caller.
+// The chat-session integration is the only intended caller.
 pub(super) fn init_moe_mtp_compiled_from_main(
     config: &Qwen3_5MoeConfig,
     max_kv_len: i32,
@@ -8449,10 +8420,10 @@ pub(super) fn init_moe_mtp_compiled_from_main(
         )));
     }
 
-    // W6.7 follow-up — eagerly compile the MoE batched verify graph for
-    // depths {1..5} (no-tape variant only; MoE tape-replay is deferred
-    // per W6.6). Best-effort: failure inside the FFI is logged + swallowed
-    // and the verify path falls back to lazy-at-first-use.
+    // Eagerly compile the MoE batched verify graph for depths {1..5}
+    // (no-tape variant only; MoE tape-replay is not wired). Best-effort:
+    // failure inside the FFI is logged + swallowed and the verify path
+    // falls back to lazy-at-first-use.
     unsafe {
         sys::mlx_qwen35_moe_mtp_compiled_prewarm_verify();
     }
@@ -8582,7 +8553,7 @@ mod mtp_compiled_flavor_flag_tests {
 /// Returns `Err` if the C++ side returns null pointers (init not
 /// done, exception). On `Err` the MTP state is left as-is — the
 /// caller should fall back to the eager Rust MoE MTP forward.
-// W6 MoE chat-session integration is the only intended caller.
+// The MoE chat-session integration is the only intended caller.
 pub(super) fn forward_moe_mtp_draft_compiled(
     prev_hidden: &MxArray,
     prev_emb: &MxArray,
@@ -8628,20 +8599,19 @@ pub(super) fn forward_moe_mtp_draft_compiled(
 ///
 /// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
 /// `depth + 1` and writes K/V into the main MoE `g_moe_caches[]` at
-/// the corresponding positions. Production callers (W6 chat-session
-/// loop) MUST already hold `MOE_COMPILED_MUTEX` and the
-/// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
-/// offset / cache state during the verify. Tests serialise via
-/// `FFI_LOCK` in the absence of concurrent main-path forward calls —
-/// see `compiled_ffi_tests` in `mtp.rs`.
+/// the corresponding positions. Production callers (chat-session loop)
+/// MUST already hold `MOE_COMPILED_MUTEX` and the `COMPILED_WEIGHTS_RWLOCK`
+/// read guard so no other turn can race the offset / cache state during the
+/// verify. Tests serialise via `FFI_LOCK` in the absence of concurrent
+/// main-path forward calls — see `compiled_ffi_tests` in `mtp.rs`.
 ///
-/// **W6.5 status:** All production MoE callers now use
-/// [`forward_moe_mtp_verify_compiled_with_hidden`] (chained-cycle
-/// path). This logits-only wrapper is kept as the backward-compatible
-/// surface and as the natural fallback when a future env-flag opt-out
-/// is needed; flagged with `#[allow(dead_code)]` so the dead-code
-/// lint doesn't fire while the chained path is the only active caller.
-// W6 MoE chat-session integration is the only intended caller.
+/// All production MoE callers use
+/// [`forward_moe_mtp_verify_compiled_with_hidden`] (chained-cycle path).
+/// This logits-only wrapper is kept as the backward-compatible surface and
+/// as the natural fallback when an env-flag opt-out is needed; flagged with
+/// `#[allow(dead_code)]` so the dead-code lint doesn't fire while the chained
+/// path is the only active caller.
+// The MoE chat-session integration is the only intended caller.
 #[allow(dead_code)]
 pub(super) fn forward_moe_mtp_verify_compiled(
     input_ids: &MxArray,
@@ -8674,8 +8644,8 @@ pub(super) fn forward_moe_mtp_verify_compiled(
     MxArray::from_handle(out_ptr, "moe_mtp_verify_logits")
 }
 
-/// W6.5 — MoE verify pass that ALSO exports the post-final-norm hidden
-/// state at EVERY verify position. MoE twin of
+/// MoE verify pass that ALSO exports the post-final-norm hidden state at
+/// EVERY verify position. MoE twin of
 /// [`super::super::qwen3_5::model::forward_mtp_verify_compiled_with_hidden`]
 /// — see that function's docstring for the chaining rationale and
 /// slice-K semantics.
@@ -8778,8 +8748,8 @@ pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
 /// so the caller can fall back to the pure-Rust paged decode path.
 /// Mirrors the `mlx_qwen35_moe_init_paged` exception safety: a non-OK
 /// return leaves `g_paged_inited == false` on the C++ side, AND the
-/// status code is now propagated back to Rust (Phase 4 piece 3 review
-/// fix) so a failed init can never be mistaken for a successful one.
+/// status code is propagated back to Rust so a failed init can never be
+/// mistaken for a successful one.
 fn init_paged_moe_compiled_session(
     config: &Qwen3_5MoeConfig,
     caches: &[Qwen3_5LayerCache],
@@ -9410,9 +9380,9 @@ mod paged_construction_tests {
         );
     }
 
-    /// Phase 4 piece 3 review fix (Finding 1): the C++ compiled paged
-    /// graph hard-codes block_size=16. The dispatcher MUST gate
-    /// `cpp_session_ready` on `adapter.block_size() == 16` so a config
+    /// The C++ compiled paged graph hard-codes block_size=16. The
+    /// dispatcher MUST gate `cpp_session_ready` on
+    /// `adapter.block_size() == 16` so a config
     /// with `paged_block_size: Some(8)` (or 32) falls back to the
     /// pure-Rust paged path instead of corrupting KV state by mixing
     /// adapter-encoded slot/block tables (block_size=8) with
@@ -9499,15 +9469,13 @@ mod paged_construction_tests {
         );
     }
 
-    /// Phase 4 piece 3 review fix (Finding 2): the C++ FFI now returns
-    /// `int32_t` (0 success / -1 failure) instead of `void`. The Rust
-    /// `init_paged_moe_compiled_session` propagates non-zero status as
-    /// `Err` so the dispatcher's `cpp_session_ready` becomes false on
-    /// init failure and falls back to the pure-Rust paged decode. This
-    /// test forces the C++ side's null-handle rejection branch by
-    /// passing null pool handles for the full-attention layers, and
-    /// asserts the FFI returns -1 (post-fix) instead of silently
-    /// succeeding (pre-fix).
+    /// The C++ FFI returns `int32_t` (0 success / -1 failure) instead of
+    /// `void`. The Rust `init_paged_moe_compiled_session` propagates non-zero
+    /// status as `Err` so the dispatcher's `cpp_session_ready` becomes false
+    /// on init failure and falls back to the pure-Rust paged decode. This
+    /// test forces the C++ side's null-handle rejection branch by passing
+    /// null pool handles for the full-attention layers, and asserts the FFI
+    /// returns -1 instead of silently succeeding.
     ///
     /// Note: this test bypasses `init_paged_moe_compiled_session` and
     /// calls the FFI directly with synthetic null handles, because the

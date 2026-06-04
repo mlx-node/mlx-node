@@ -1,4 +1,4 @@
-//! Phase 6 multimodal cache-isolation integration tests for the paged
+//! Multimodal cache-isolation integration tests for the paged
 //! adapter's per-block extra_keys API.
 //!
 //! Pinpoints the load-bearing property: two requests with identical text
@@ -20,10 +20,10 @@
 //! Pure-CPU bookkeeping checks (no GPU dispatch). The fixture goes through
 //! `LayerKVPool::new_for_validation_only`, which never touches the Metal
 //! device, so these tests run identically on Metal hosts and on sandboxed
-//! CI VMs without a Metal device. Previously the fixture used
-//! `new_for_test`, which calls `MetalState::get` and silently early-
-//! returned `None` on non-Metal hosts — producing green test runs that
-//! had not actually exercised the load-bearing adapter code.
+//! CI VMs without a Metal device. `new_for_test` must NOT be used here: it
+//! calls `MetalState::get` and silently early-returns `None` on non-Metal
+//! hosts — producing green test runs that never exercise the load-bearing
+//! adapter code.
 
 use std::sync::{Arc, Mutex};
 
@@ -97,7 +97,7 @@ fn run_request(
 }
 
 /// Two requests with the SAME text and SAME image produce a cache hit.
-/// This is the cross-conversation reuse half of Phase 6 — the load-bearing
+/// The cross-conversation reuse half — the load-bearing
 /// "same prompt + same image → block reuse" property.
 #[test]
 fn same_text_same_image_hits_cache() {
@@ -122,7 +122,7 @@ fn same_text_same_image_hits_cache() {
 }
 
 /// Two requests with the SAME text but DIFFERENT images MUST miss the
-/// cache. This is the load-bearing isolation half of Phase 6 — preventing
+/// cache. The load-bearing isolation half — preventing
 /// stale-image KV state from being silently reused for a request bearing
 /// a different image.
 #[test]

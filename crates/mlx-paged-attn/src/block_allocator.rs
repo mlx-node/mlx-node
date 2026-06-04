@@ -53,7 +53,7 @@
 //!   when available before returning a cache hit.
 //! - For multi-tenant deployments and adversarial settings, switch to
 //!   SHA-256 by replacing `hash_tokens`'s hasher (small mechanical
-//!   change). Tracked as future work.
+//!   change).
 //! - For deterministic reproducibility across processes, switch to
 //!   xxhash with a fixed seed (vLLM's default).
 
@@ -207,17 +207,12 @@ impl BlockAllocator {
             block_hashes: HashMap::new(),
             lru_order: VecDeque::new(),
             // Scale the prefix-cache capacity to `num_blocks` so the cache
-            // can accommodate the full live block set. The previous fixed
-            // ceiling of 1024 silently capped cross-turn prefix reuse on
-            // any conversation longer than ~16k tokens at block_size=16:
-            // turn 1's chain registration evicted its own head blocks
-            // (block 0 first), so turn 2's `find_longest_cache_hit` walk
-            // missed at block 0 and reported `cached_prefix_len = 0`.
-            // `num_blocks` is the natural upper bound — no more than that
-            // many blocks can ever be live, so this can't cause additional
-            // eviction beyond what `try_evict_lru_for_allocation` already
-            // performs on physical-pool exhaustion. Per-instance overrides
-            // remain available via `set_max_prefix_cache_entries`.
+            // can accommodate the full live block set. `num_blocks` is the
+            // natural upper bound — no more than that many blocks can ever
+            // be live, so this can't cause additional eviction beyond what
+            // `try_evict_lru_for_allocation` already performs on
+            // physical-pool exhaustion. Per-instance overrides remain
+            // available via `set_max_prefix_cache_entries`.
             max_prefix_cache_entries: num_blocks as usize,
         }
     }
@@ -576,9 +571,8 @@ impl BlockAllocator {
     /// [`Self::find_longest_cache_hit_per_block`] instead.
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only (when it is
-    /// non-zero). Pass `0` for "no salt" — semantically and byte-equal to
-    /// the pre-task-#48 behavior. The first-block-only semantics align with
-    /// vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`), which adds the
+    /// non-zero). Pass `0` for "no salt". The first-block-only semantics
+    /// align with vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`), which adds the
     /// request's `cache_salt` to `extra_keys` only when
     /// `start_token_idx == 0`. A non-zero salt isolates the per-request
     /// prefix from the cross-tenant prefix pool while still allowing
@@ -729,9 +723,8 @@ impl BlockAllocator {
     /// cache isolation), use [`Self::cache_full_blocks_per_block`].
     ///
     /// `cache_salt` is mixed into the FIRST block's hash only (when it is
-    /// non-zero). Pass `0` for "no salt" — semantically and byte-equal to
-    /// the pre-task-#48 behavior. The first-block-only semantics mirror
-    /// vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`): the request's
+    /// non-zero). Pass `0` for "no salt". The first-block-only semantics
+    /// mirror vLLM (`vllm/v1/core/kv_cache_utils.py:521-531`): the request's
     /// `cache_salt` is added to `extra_keys` only for the leading block,
     /// so two requests with the same tokens but different salts publish
     /// distinct first-block cache identities while later blocks (which
@@ -985,7 +978,7 @@ impl BlockAllocator {
 /// collision resistance is the better trade-off and we don't need stable
 /// hashes across runs.
 ///
-// FIXME(p1c-followup): SipHash u64 is not cryptographically collision-resistant.
+// FIXME: SipHash u64 is not cryptographically collision-resistant.
 // `find_longest_cache_hit` walks chained block hashes via `lookup_prefix`, so a
 // mid-chain collision between two different token chains could cause a
 // mixed-prefix lookup for entries registered without block identity metadata.
@@ -1237,10 +1230,8 @@ mod tests {
         assert!(!allocator.prefix_cache.is_empty());
     }
 
-    // -------------------------------------------------------------------
-    // Phase 1A additions: hash_tokens(extra_keys), find_longest_cache_hit,
-    // cache_full_blocks, refcount lifecycle, LRU eviction order.
-    // -------------------------------------------------------------------
+    // hash_tokens(extra_keys), find_longest_cache_hit, cache_full_blocks,
+    // refcount lifecycle, LRU eviction order.
 
     #[test]
     fn test_hash_tokens_extra_keys() {
@@ -1379,7 +1370,7 @@ mod tests {
         assert_eq!(n, 8);
     }
 
-    /// Task #48: `cache_salt` participates in block 0's hash only — not in
+    /// `cache_salt` participates in block 0's hash only — not in
     /// blocks 1+ — matching vLLM's first-block-only semantics
     /// (`vllm/v1/core/kv_cache_utils.py:521-531`).
     ///
@@ -1548,7 +1539,7 @@ mod tests {
         allocator.free(cached_block0);
     }
 
-    /// Task #48: `cache_salt` composes with non-empty uniform `extra_keys`
+    /// `cache_salt` composes with non-empty uniform `extra_keys`
     /// per the contract `[existing_extra_keys..., cache_salt]` (salt
     /// APPENDED to the existing keys, not prepended, not replacing). This
     /// test pins down the exact byte composition by registering a chain
@@ -1631,7 +1622,7 @@ mod tests {
         allocator.free(cached_block1);
     }
 
-    /// Task #48: per-block-extra_keys variant of the salt composition
+    /// Per-block-extra_keys variant of the salt composition
     /// contract. Each block has its OWN extra_keys vector
     /// (`extra_keys_per_block[n]`); salt is appended only to block 0's
     /// per-block keys, and blocks 1+ use their per-block keys verbatim
@@ -1773,11 +1764,9 @@ mod tests {
         assert_eq!(b1.get_ref_count(), 1);
     }
 
-    // -------------------------------------------------------------------
-    // Phase 1A bugfix: register_prefix must evict stale aliases when the
-    // same block is re-registered under a different hash, otherwise a
-    // freed block can leak back through lookup_prefix on the stale hash.
-    // -------------------------------------------------------------------
+    // register_prefix must evict stale aliases when the same block is
+    // re-registered under a different hash, otherwise a freed block can
+    // leak back through lookup_prefix on the stale hash.
 
     #[test]
     fn test_register_prefix_re_registers_same_block_different_hash() {
@@ -1828,8 +1817,8 @@ mod tests {
 
     #[test]
     fn test_cache_full_blocks_extra_keys_re_register_isolation() {
-        // The Codex-identified scenario: cache the same blocks under two
-        // different extra_keys (no_keys vs [99]). After freeing, neither
+        // Cache the same blocks under two different extra_keys (no_keys
+        // vs [99]). After freeing, neither
         // hash can hand back the freed block via find_longest_cache_hit —
         // i.e. extra_keys isolation must hold across freed entries.
         let mut allocator = BlockAllocator::new(4, 4);
@@ -2203,13 +2192,10 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
     // register_prefix bool return contract + cache_full_blocks abort-on-
     // collision behavior. Closes the silent-corruption path where a
     // dropped registration in the middle of a chain would leave later
-    // blocks linked to a ghost predecessor (see commit message for
-    // details).
-    // -------------------------------------------------------------------
+    // blocks linked to a ghost predecessor.
 
     /// `register_prefix` must return the right bool for each of its four
     /// paths: insertion, idempotent refresh, Case 1 displacement, Case 2
@@ -2446,9 +2432,7 @@ mod tests {
         assert!(allocator.block_hashes.contains_key(&new_ids[3]));
     }
 
-    // -------------------------------------------------------------------
-    // Phase 6: per-block extra_keys variants for multimodal cache isolation.
-    // -------------------------------------------------------------------
+    // Per-block extra_keys variants for multimodal cache isolation.
 
     /// Per-block API with all-empty per-block keys must produce IDENTICAL
     /// hashes (and therefore IDENTICAL cache hits) to the uniform API with
@@ -2498,9 +2482,9 @@ mod tests {
     }
 
     /// Two requests with identical text but DIFFERENT per-block image
-    /// hashes must produce DIFFERENT cache identities. This is the load-
-    /// bearing Phase 6 property: a stale image's KV state must NOT be
-    /// reused for a request with a different image at the same positions.
+    /// hashes must produce DIFFERENT cache identities: a stale image's KV
+    /// state must NOT be reused for a request with a different image at
+    /// the same positions.
     #[test]
     fn test_per_block_image_hash_isolation() {
         let tokens: Vec<u32> = (0..8).collect();
@@ -2628,11 +2612,11 @@ mod tests {
         assert_eq!(n, 2 * block_size as usize);
     }
 
-    /// Reproduces task #47: turn 1 of a 31k-token prompt registers ~1942
-    /// blocks at block_size=16. With the previous hardcoded cap of 1024
-    /// prefix-cache entries, the first ~921 blocks evicted before finalize
-    /// returned, so turn 2's lookup walking from block 0 missed instantly
-    /// and reported cached_prefix_len=0. The cap now scales to num_blocks.
+    /// Turn 1 of a 31k-token prompt registers ~1942 blocks at
+    /// block_size=16. With a fixed cap of 1024 prefix-cache entries, the
+    /// first ~921 blocks would evict before finalize returned, so turn 2's
+    /// lookup walking from block 0 would miss instantly and report
+    /// cached_prefix_len=0. The cap scales to num_blocks to prevent this.
     #[test]
     fn long_chain_survives_registration_without_head_eviction() {
         let mut a = BlockAllocator::new(2000, 16);

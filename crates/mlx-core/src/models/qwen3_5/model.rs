@@ -322,7 +322,7 @@ pub(crate) struct Qwen35Inner {
     /// The compiled C++ forward path is bypassed entirely on the paged
     /// path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
-    /// PR #65 (mtp-reload P2) — true when a paged-core turn has populated
+    /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention
     /// prefill, so the flat `self.caches` full-attention slots do NOT
     /// reflect the conversation history. The streaming dense-MTP fallback
@@ -335,14 +335,12 @@ pub(crate) struct Qwen35Inner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
-    /// Optional Multi-Token Prediction head (W2 of the MTP plan).
+    /// Optional Multi-Token Prediction head.
     ///
-    /// Constructed when `config.n_mtp_layers > 0`. The W6 speculative
-    /// decode loop is the only intended caller; the existing
-    /// single-token decode path ignores this field, so MTP is invisible
-    /// to the current chat session until W6 wires it in. Weight loading
-    /// is performed by `persistence::apply_weights_inner` after the
-    /// main per-layer weights are loaded.
+    /// Constructed when `config.n_mtp_layers > 0`. The speculative decode loop
+    /// is the only intended caller; the single-token decode path ignores this
+    /// field. Weight loading is performed by `persistence::apply_weights_inner`
+    /// after the main per-layer weights are loaded.
     pub(crate) mtp: Option<Qwen3_5MTPModule>,
     /// True only after persistence has seen a complete MTP tensor set and
     /// applied it to `mtp`. The module may exist from config alone; this
@@ -766,7 +764,7 @@ pub(crate) struct ChatDecodeInputs {
     pub generation_stream: Stream,
     pub params: super::chat_common::ChatParams,
 
-    // --- Phase C: prompt-prefix MTP prefill -----------------------------
+    // --- prompt-prefix MTP prefill --------------------------------------
     /// Post-final-norm hidden state for every prefilled prompt token,
     /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
     /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran
@@ -1578,8 +1576,8 @@ impl Qwen35Inner {
     /// / [`Self::chat_tokens_delta_sync`] calls can append a raw delta on
     /// top of without re-rendering the jinja template.
     ///
-    /// Unlike the pre-refactor contract, this method no longer resets the
-    /// caches up-front. The core path runs `verify_cache_prefix_direct`
+    /// This method does not reset the caches up-front. The core path runs
+    /// `verify_cache_prefix_direct`
     /// against the freshly-tokenized prompt and reuses the cached prefix
     /// on an exact-append hit or resets + fully prefills on a miss. This
     /// is what enables prefix-cache reuse for stateless agent clients
@@ -1693,10 +1691,8 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Phase 4b — paged dispatch with native MTP support inside
-        // `chat_sync_core_paged_inner`. The Phase 1 bypass that routed
-        // MTP-on-paged to the dense path is removed; the paged path
-        // now self-handles MTP via the gate at `chat_sync_core_paged_inner`.
+        // Paged dispatch with native MTP support; the paged path self-handles
+        // MTP via the gate inside `chat_sync_core_paged_inner`.
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -1868,18 +1864,16 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Phase C — prompt-prefix MTP prefill. When MTP is active for
-        // this turn the prefill runs the hidden-emitting
-        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens
-        // can be committed into the MTP committed-history cache; this
-        // raises draft acceptance (especially for long prompts). The VLM
-        // / cached-prefix branches keep the cheaper logits-only prefill —
-        // they do not feed the dense MTP committed-history path.
+        // Prompt-prefix MTP prefill. When MTP is active for this turn the
+        // prefill runs the hidden-emitting `chunked_prefill_with_hidden` so the
+        // per-prompt-token hiddens can be committed into the MTP
+        // committed-history cache; this raises draft acceptance (especially for
+        // long prompts). The VLM / cached-prefix branches keep the cheaper
+        // logits-only prefill — they do not feed the dense MTP
+        // committed-history path.
         //
         // `MLX_MTP_NO_PROMPT_PREFILL=1` opts OUT — the prefill stays
-        // logits-only and the MTP committed-history starts empty (the
-        // pre-Phase-C-prompt-prefill behaviour). Kept as an A/B /
-        // escape-hatch toggle.
+        // logits-only and the MTP committed-history starts empty.
         //
         // Cache-reuse turns: when `cached_prefix_len > 0` the prefill
         // only processes the uncached SUFFIX, so the captured hidden
@@ -2012,9 +2006,8 @@ impl Qwen35Inner {
             embedding_weight_t,
             generation_stream,
             params: p,
-            // Phase C — `prompt_hidden` is `Some` iff the hidden-emitting
-            // prefill ran; pair it with the exact prompt tail whose hiddens
-            // it holds.
+            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran;
+            // pair it with the exact prompt tail whose hiddens it holds.
             prompt_hidden_ids: prompt_hidden.as_ref().map(|_| {
                 let start = mtp_prompt_history
                     .hidden_start_token_index()
@@ -2089,7 +2082,7 @@ impl Qwen35Inner {
             .clone();
 
         // Session path: use <|im_end|> as eos, NOT config.eos_token_id.
-        // This yields clean cache boundaries (see Phase 0 validation notes).
+        // This yields clean cache boundaries.
         let eos_id = tokenizer
             .im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
@@ -2117,9 +2110,8 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Phase 4b — paged dispatch with native MTP support inside
-        // `chat_sync_core_paged_inner`. The Phase 1 bypass that routed
-        // MTP-on-paged to the dense path is removed.
+        // Paged dispatch with native MTP support inside
+        // `chat_sync_core_paged_inner`.
         if self.paged_adapter.is_some() {
             return self.chat_sync_core_paged(
                 full_token_history.clone(),
@@ -2522,12 +2514,11 @@ impl Qwen35Inner {
 
             profiler.set_label("chat_compiled");
 
-            // W6 (MTP) — opt-in speculative decode. Effective only when
-            // both the per-request flag and the model checkpoint carry
-            // an MTP head. The init mirrors the main path's
-            // `mlx_qwen35_compiled_init_from_prefill` and shares the
-            // C++ `g_weights` store. Init failure (no MTP weights,
-            // mismatched config) silently disables MTP for this turn —
+            // Opt-in speculative decode (MTP). Effective only when both the
+            // per-request flag and the model checkpoint carry an MTP head. Init
+            // mirrors the main path's `mlx_qwen35_compiled_init_from_prefill`
+            // and shares the C++ `g_weights` store. Init failure (no MTP
+            // weights, mismatched config) silently disables MTP for this turn —
             // the regular single-token loop continues to work.
             let cond_enable_mtp = p.enable_mtp;
             let cond_has_mtp_weights = self.has_mtp_weights();
@@ -2579,13 +2570,12 @@ impl Qwen35Inner {
                 // error path so the next turn always re-inits cleanly.
                 let _mtp_compiled_guard = MtpCompiledResetGuard;
 
-                // Phase C — prompt-prefix MTP prefill. With MTP just
-                // inited and `g_mtp_committed_len == 0`, commit the
-                // prompt prefix (+ the first sampled token `y`) into the
-                // MTP committed-history cache BEFORE the decode loop so
-                // the MTP heads attend over the prompt from cycle 1.
-                // Gated on `prompt_hidden` being captured by the
-                // hidden-emitting prefill; the commit run is
+                // Prompt-prefix MTP prefill. With MTP just inited and
+                // `g_mtp_committed_len == 0`, commit the prompt prefix (+ the
+                // first sampled token `y`) into the MTP committed-history cache
+                // BEFORE the decode loop so the MTP heads attend over the
+                // prompt from cycle 1. Gated on `prompt_hidden` being captured
+                // by the hidden-emitting prefill; the commit run is
                 // `[prefill_tokens[1..], y]` so cycle 1's slot-0 seam is
                 // contiguous (see `prefill_mtp_commit`).
                 if let (Some(ph), Some(ph_ids)) =
@@ -2637,10 +2627,9 @@ impl Qwen35Inner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-model forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-model forward.
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     verify_step_argmax_only: Some(Box::new(
@@ -2670,29 +2659,26 @@ impl Qwen35Inner {
                         },
                     )),
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Phase C — committed-history policy. The MTP
-                        // offset is driven ABSOLUTELY by the commit FFI
+                        // Committed-history policy: the MTP offset is driven
+                        // ABSOLUTELY by the commit FFI
                         // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`),
-                        // which already ran BEFORE this rollback. The
-                        // previous cycle-policy `adjust_offset(K-depth)`
-                        // call is REMOVED — double-adjusting would
-                        // corrupt the absolute offset.
+                        // `g_mtp_offset_int = g_mtp_committed_len`), which
+                        // already ran BEFORE this rollback. No cycle-policy
+                        // `adjust_offset` here — double-adjusting would corrupt
+                        // the absolute offset.
                         //
-                        // The MAIN path's offset and GDN linear caches
-                        // are still restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix) — unchanged.
+                        // The MAIN path's offset and GDN linear caches are
+                        // still restored via the `snapshot_main_linear` /
+                        // `restore_and_replay_main` pair below.
                         let _ = (accepted_drafts, depth);
-                        // W6.6/W6.35 — on full accept the verifier wrote
-                        // exactly `depth + 1` surviving main-cache steps
-                        // (`last_committed` plus all drafts). Do not keep
-                        // the raw batched GDN recurrent state: the D+1
-                        // verifier recurrence keeps fp32 state across the
-                        // whole window, while AR observes the per-token
-                        // cache dtype round-trip. Replay the full accepted
-                        // prefix from the tape so the next Step A sees the
-                        // same cache state as serial decode. `_tape_replay`
+                        // On full accept the verifier wrote exactly `depth + 1`
+                        // surviving main-cache steps (`last_committed` plus all
+                        // drafts). Do not keep the raw batched GDN recurrent
+                        // state: the D+1 verifier recurrence keeps fp32 state
+                        // across the whole window, while AR observes the
+                        // per-token cache dtype round-trip. Replay the full
+                        // accepted prefix from the tape so the next Step A sees
+                        // the same cache state as serial decode. `_tape_replay`
                         // disarms internally.
                         if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
@@ -2704,25 +2690,22 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — fold the chained `verify_hidden[K]`
-                    // slice into the same async_eval batch as the
-                    // post-cycle token + compiled caches. See the comment
-                    // block at the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs) for why this
-                    // matters: without it the slice stays lazy across
-                    // the iteration boundary and the next cycle's draft
-                    // graph build forces a Metal roundtrip the Step-A
-                    // bypass doesn't pay.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval batch as the post-cycle token + compiled
+                    // caches. See the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs): without this the
+                    // slice stays lazy across the iteration boundary and the
+                    // next cycle's draft graph build forces a Metal roundtrip
+                    // the Step-A bypass doesn't pay.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
-                    // re-anchor MTP offset to the main path's current
-                    // offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's
-                    // forward + verify[0]'s forward both write to the
-                    // main path but not to the MTP path), so MTP RoPE
-                    // positions become wrong and drafts diverge.
+                    // Reset MTP K/V and re-anchor MTP offset to the main path's
+                    // current offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's forward +
+                    // verify[0]'s forward both write to the main path but not
+                    // to the MTP path), so MTP RoPE positions become wrong and
+                    // drafts diverge.
                     begin_cycle: |chained_anchor: bool| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
@@ -2739,43 +2722,38 @@ impl Qwen35Inner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 Bug #4 fix — snapshot the main path's GDN
-                    // linear caches + offset BEFORE the verify FFI runs
-                    // its D+1 sequential forwards. Verify mutates
-                    // `g_compiled_caches` in place; without restoring on
-                    // rejection the GDN recurrent state stays polluted
-                    // with rejected-draft positions and the next Step A
-                    // produces wrong logits.
+                    // Snapshot the main path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential forwards.
+                    // Verify mutates `g_compiled_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted with rejected-draft positions and the next Step
+                    // A produces wrong logits.
                     //
-                    // W6.6 — when tape-replay is ENABLED (default; opt
-                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
-                    // GDN tape recorder so the rollback path can replay
-                    // accepted innovations into the snapshot state via
-                    // a single Metal kernel instead of K+1 main-model
-                    // forwards. Snapshot is still required — the tape
-                    // replay starts from the snapshot state.
+                    // When tape-replay is ENABLED (default; opt out via
+                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
+                    // recorder so the rollback path can replay accepted
+                    // innovations into the snapshot state via a single Metal
+                    // kernel instead of K+1 main-model forwards. Snapshot is
+                    // still required — the tape replay starts from the snapshot
+                    // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
                         if chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
-                    // W6 Bug #4 fix — on rejection: restore linear caches
-                    // + offset, then replay the K accepted drafts via
-                    // forward_compiled so the main linear state matches
-                    // the committed token stream. Each replay call
-                    // advances the offset by 1; K calls bring the main
-                    // offset to `snapshot_offset + K`, matching what the
-                    // previous direct `adjust_offset(K - depth)` rollback
-                    // would have produced.
+                    // On rejection: restore linear caches + offset, then replay
+                    // the K accepted drafts via forward_compiled so the main
+                    // linear state matches the committed token stream. Each
+                    // replay call advances the offset by 1; K calls bring the
+                    // main offset to `snapshot_offset + K`.
                     //
-                    // W6.6 — when tape-replay is ENABLED, replace the
-                    // K+1 forwards with a single `_tape_replay` FFI that
-                    // applies the recorded innovations to the snapshot
-                    // state. `accepted_drafts.len()` is `K + 1` here
-                    // (the slice contains `[last_committed_id, d_0,
-                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
-                    // `replay_ids` construction).
+                    // When tape-replay is ENABLED, replace the K+1 forwards
+                    // with a single `_tape_replay` FFI that applies the
+                    // recorded innovations to the snapshot state.
+                    // `accepted_drafts.len()` is `K + 1` here (the slice
+                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
+                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -2799,11 +2777,10 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history commit hook (dense
-                    // path). Appends exact MTP K/V for this cycle's
-                    // K+1 committed tokens to the persistent MTP cache
-                    // so the next cycle's drafts attend the full
-                    // committed prefix. Runs unconditionally (full
+                    // Committed-history commit hook (dense path). Appends exact
+                    // MTP K/V for this cycle's K+1 committed tokens to the
+                    // persistent MTP cache so the next cycle's drafts attend
+                    // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
                     commit_mtp: |anchor: chat_common::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
@@ -2829,9 +2806,9 @@ impl Qwen35Inner {
                             }
                         }
                     },
-                    // Phase C — dense committed-history path. Forces the
-                    // fused-draft path OFF (its mask excludes the
-                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    // Dense committed-history path. Forces the fused-draft path
+                    // OFF (its mask excludes the committed prefix) — see
+                    // `run_mtp_cycle_inner`.
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -3081,11 +3058,11 @@ impl Qwen35Inner {
             return Err(Error::from_reason("Empty prompt"));
         }
 
-        // PR #65 (mtp-reload P2) — this paged turn writes full-attention K/V
-        // into the paged adapter pool, NOT the flat `self.caches`, so the flat
-        // full-attention slots no longer reflect the conversation. A later
-        // streaming dense-MTP fallback must rebuild the flat caches before
-        // decoding. See `paged_full_attn_caches_dirty`.
+        // This paged turn writes full-attention K/V into the paged adapter
+        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
+        // longer reflect the conversation. A later streaming dense-MTP fallback
+        // must rebuild the flat caches before decoding. See
+        // `paged_full_attn_caches_dirty`.
         self.paged_full_attn_caches_dirty = true;
 
         let prompt_token_count = tokens.len() as u32;
@@ -3143,12 +3120,11 @@ impl Qwen35Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys for prefix-cache lookup. Text-only
-        // dispatch (current state — image-bearing turns route to the flat
-        // path) yields all-empty per-block vecs; the resulting hashes are
-        // bit-equal to passing `&[]` to the uniform API. When VLM-paged
-        // forward integration lands, this call site swaps in real image-
-        // position pairs to enable image-aware cache isolation.
+        // Per-block extra_keys for prefix-cache lookup. Text-only dispatch
+        // (image-bearing turns route to the flat path) yields all-empty
+        // per-block vecs; the resulting hashes are bit-equal to passing `&[]`
+        // to the uniform API. VLM-paged forward integration would swap in real
+        // image-position pairs here to enable image-aware cache isolation.
         let block_size = {
             let adapter = self
                 .paged_adapter
@@ -3373,14 +3349,12 @@ impl Qwen35Inner {
     /// out so the caller can wrap it with `release_request` on either
     /// path.
     ///
-    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
-    /// `use_cpp_paged` is true. The pure-Rust paged prefill always runs
-    /// (it populates the GDN linear caches and writes K/V into the
-    /// adapter pool); after prefill, decode steps choose between
-    /// `mlx_qwen35_forward_paged` (fast) and
-    /// `paged_forward::run_paged_decode_step` (fallback) based on
-    /// adapter block size and `init_paged_dense_compiled_session`
-    /// success.
+    /// Uses a C++ compiled paged decode dispatcher when `use_cpp_paged` is
+    /// true. The pure-Rust paged prefill always runs (it populates the GDN
+    /// linear caches and writes K/V into the adapter pool); after prefill,
+    /// decode steps choose between `mlx_qwen35_forward_paged` (fast) and
+    /// `paged_forward::run_paged_decode_step` (fallback) based on adapter block
+    /// size and `init_paged_dense_compiled_session` success.
     #[allow(clippy::too_many_arguments)]
     fn chat_sync_core_paged_inner(
         &mut self,
@@ -3412,15 +3386,14 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
-        // Phase 4b B3.1 — paged prompt-prefix MTP prefill. Mirrors the
-        // dense gate's `want_prompt_hidden` predicate at model.rs:1890.
-        // Capturing the post-`final_norm` hidden for every prompt token
-        // lets the paged-MTP gate seed `g_mtp_committed_len = N` via
-        // `prefill_mtp_commit` before cycle 1, so MTP drafts attend
-        // over the prompt (matches the dense MTP path). The
-        // `cached_prefix_len == 0` clause matches dense: on a
-        // cache-reuse turn the suffix-only prefill cannot produce the
-        // full prompt's hidden tensor.
+        // Paged prompt-prefix MTP prefill. Mirrors the dense gate's
+        // `want_prompt_hidden` predicate. Capturing the post-`final_norm`
+        // hidden for every prompt token lets the paged-MTP gate seed
+        // `g_mtp_committed_len = N` via `prefill_mtp_commit` before cycle 1, so
+        // MTP drafts attend over the prompt (matches the dense MTP path). The
+        // `cached_prefix_len == 0` clause matches dense: on a cache-reuse turn
+        // the suffix-only prefill cannot produce the full prompt's hidden
+        // tensor.
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
             && chat_common::mtp_verify_paged_attn_enabled()
@@ -3538,7 +3511,7 @@ impl Qwen35Inner {
 
         // RAII guard: resets BOTH g_compiled_* and g_dense_paged_*
         // globals (single `mlx_qwen35_compiled_reset` symbol clears
-        // both per Phase 5 piece 1) when this scope ends. Always armed
+        // both) when this scope ends. Always armed
         // when init succeeded — even if a later forward fails and we
         // flip `cpp_session_ready=false`, the guard still runs at scope
         // exit so stale C++ globals don't leak into the next request.
@@ -3575,9 +3548,9 @@ impl Qwen35Inner {
             max_seq.div_ceil(adapter.block_size())
         };
 
-        // Phase 4b — paged-MTP gate. Mirrors the dense MTP gate at
-        // `chat_sync_core`. Default ON since Phase 4b/B4; opt out with
-        // `MLX_MTP_VERIFY_PAGED_ATTN=0` to fall back to AR paged decode.
+        // Paged-MTP gate. Mirrors the dense MTP gate at `chat_sync_core`.
+        // Default ON; opt out with `MLX_MTP_VERIFY_PAGED_ATTN=0` to fall back
+        // to AR paged decode.
         //
         // Requires `cpp_session_ready` because the AR step inside the
         // cycle (`forward_with_hidden`) consumes the C++ paged graph's
@@ -3628,12 +3601,11 @@ impl Qwen35Inner {
 
             let embedding_weight = self.embedding.get_weight();
 
-            // Phase 4b B3.1 — prompt-prefix MTP commit. With MTP just
-            // inited and `g_mtp_committed_len == 0`, commit the prompt
-            // prefix (+ first sampled token `y`) into the MTP
-            // committed-history cache BEFORE the decode loop so the
-            // MTP heads attend over the prompt from cycle 1. Mirrors
-            // the dense gate at model.rs:2586-2616.
+            // Prompt-prefix MTP commit. With MTP just inited and
+            // `g_mtp_committed_len == 0`, commit the prompt prefix (+ first
+            // sampled token `y`) into the MTP committed-history cache BEFORE
+            // the decode loop so the MTP heads attend over the prompt from
+            // cycle 1. Mirrors the dense gate.
             //
             // Gated on `prompt_hidden` being captured by the
             // hidden-emitting paged prefill (only runs when
@@ -4125,10 +4097,10 @@ impl Qwen35Inner {
             return Err(Error::from_reason("Empty prompt"));
         }
 
-        // PR #65 (mtp-reload P2) — this paged turn writes full-attention K/V
-        // into the paged adapter pool, NOT the flat `self.caches`, so a later
-        // streaming dense-MTP fallback must rebuild the flat caches before
-        // decoding. See `paged_full_attn_caches_dirty`.
+        // This paged turn writes full-attention K/V into the paged adapter
+        // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
+        // fallback must rebuild the flat caches before decoding. See
+        // `paged_full_attn_caches_dirty`.
         self.paged_full_attn_caches_dirty = true;
 
         let prompt_token_count = tokens.len() as u32;
@@ -4188,8 +4160,8 @@ impl Qwen35Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Phase 6: per-block extra_keys for prefix-cache lookup. See the
-        // matching comment in `chat_sync_core_paged`.
+        // Per-block extra_keys for prefix-cache lookup. See the matching
+        // comment in `chat_sync_core_paged`.
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
@@ -4476,7 +4448,7 @@ impl Qwen35Inner {
     /// [`Self::chat_stream_sync_core_paged`]. Mirrors LFM2's
     /// `chat_stream_sync_core_paged_inner`.
     ///
-    /// Phase 5 piece 1 adds a C++ compiled paged decode dispatcher when
+    /// Uses a C++ compiled paged decode dispatcher when
     /// `use_cpp_paged` is true. See the sync sibling
     /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
     /// rationale.
@@ -5134,7 +5106,7 @@ impl Qwen35Inner {
 
         let model_id = self.model_id;
 
-        // Phase 4b — paged streaming path does not yet carry an MTP gate;
+        // Paged streaming path does not carry an MTP gate;
         // MTP-on-paged streams continue to fall through to the dense
         // compiled streaming path. Non-MTP paged streams take the paged
         // streaming core.
@@ -5200,7 +5172,7 @@ impl Qwen35Inner {
         // every other delta turn prefills only the delta.
         profiler.snapshot_memory_before();
 
-        // PR #65 mtp-reload P2 — paged→dense-MTP cache-source transition.
+        // Paged→dense-MTP cache-source transition.
         //
         // When `mtp_takes_dense_path` is true we arrived here off a PAGED
         // session (`self.paged_adapter.is_some()`) that fell through the
@@ -5439,10 +5411,9 @@ impl Qwen35Inner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-model forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-model forward.
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     verify_step_argmax_only: Some(Box::new(
@@ -5472,25 +5443,22 @@ impl Qwen35Inner {
                         },
                     )),
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Phase C — committed-history policy. The MTP
-                        // offset is driven ABSOLUTELY by the commit FFI
+                        // Committed-history policy: the MTP offset is driven
+                        // ABSOLUTELY by the commit FFI
                         // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`),
-                        // which already ran BEFORE this rollback. The
-                        // previous cycle-policy `adjust_offset(K-depth)`
-                        // call is REMOVED — double-adjusting would
-                        // corrupt the absolute offset.
+                        // `g_mtp_offset_int = g_mtp_committed_len`), which
+                        // already ran BEFORE this rollback. No cycle-policy
+                        // `adjust_offset` here — double-adjusting would corrupt
+                        // the absolute offset.
                         //
-                        // The MAIN path's offset and GDN linear caches
-                        // are still restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix) — unchanged.
+                        // The MAIN path's offset and GDN linear caches are
+                        // still restored via the `snapshot_main_linear` /
+                        // `restore_and_replay_main` pair below.
                         let _ = (accepted_drafts, depth);
-                        // W6.6/W6.35 — on full accept the verifier wrote
-                        // exactly `depth + 1` surviving main-cache steps.
-                        // Replay that full prefix from the GDN tape rather
-                        // than keeping the raw batched recurrent state.
-                        // `_tape_replay` disarms internally.
+                        // On full accept the verifier wrote exactly `depth + 1`
+                        // surviving main-cache steps. Replay that full prefix
+                        // from the GDN tape rather than keeping the raw batched
+                        // recurrent state. `_tape_replay` disarms internally.
                         if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
                         }
@@ -5501,25 +5469,22 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — fold the chained `verify_hidden[K]`
-                    // slice into the same async_eval batch as the
-                    // post-cycle token + compiled caches. See the comment
-                    // block at the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs) for why this
-                    // matters: without it the slice stays lazy across
-                    // the iteration boundary and the next cycle's draft
-                    // graph build forces a Metal roundtrip the Step-A
-                    // bypass doesn't pay.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval batch as the post-cycle token + compiled
+                    // caches. See the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs): without this the
+                    // slice stays lazy across the iteration boundary and the
+                    // next cycle's draft graph build forces a Metal roundtrip
+                    // the Step-A bypass doesn't pay.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
-                    // re-anchor MTP offset to the main path's current
-                    // offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's
-                    // forward + verify[0]'s forward both write to the
-                    // main path but not to the MTP path), so MTP RoPE
-                    // positions become wrong and drafts diverge.
+                    // Reset MTP K/V and re-anchor MTP offset to the main path's
+                    // current offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's forward +
+                    // verify[0]'s forward both write to the main path but not
+                    // to the MTP path), so MTP RoPE positions become wrong and
+                    // drafts diverge.
                     begin_cycle: |chained_anchor: bool| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
@@ -5536,43 +5501,38 @@ impl Qwen35Inner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 Bug #4 fix — snapshot the main path's GDN
-                    // linear caches + offset BEFORE the verify FFI runs
-                    // its D+1 sequential forwards. Verify mutates
-                    // `g_compiled_caches` in place; without restoring on
-                    // rejection the GDN recurrent state stays polluted
-                    // with rejected-draft positions and the next Step A
-                    // produces wrong logits.
+                    // Snapshot the main path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential forwards.
+                    // Verify mutates `g_compiled_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted with rejected-draft positions and the next Step
+                    // A produces wrong logits.
                     //
-                    // W6.6 — when tape-replay is ENABLED (default; opt
-                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
-                    // GDN tape recorder so the rollback path can replay
-                    // accepted innovations into the snapshot state via
-                    // a single Metal kernel instead of K+1 main-model
-                    // forwards. Snapshot is still required — the tape
-                    // replay starts from the snapshot state.
+                    // When tape-replay is ENABLED (default; opt out via
+                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
+                    // recorder so the rollback path can replay accepted
+                    // innovations into the snapshot state via a single Metal
+                    // kernel instead of K+1 main-model forwards. Snapshot is
+                    // still required — the tape replay starts from the snapshot
+                    // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
                         if chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
-                    // W6 Bug #4 fix — on rejection: restore linear caches
-                    // + offset, then replay the K accepted drafts via
-                    // forward_compiled so the main linear state matches
-                    // the committed token stream. Each replay call
-                    // advances the offset by 1; K calls bring the main
-                    // offset to `snapshot_offset + K`, matching what the
-                    // previous direct `adjust_offset(K - depth)` rollback
-                    // would have produced.
+                    // On rejection: restore linear caches + offset, then replay
+                    // the K accepted drafts via forward_compiled so the main
+                    // linear state matches the committed token stream. Each
+                    // replay call advances the offset by 1; K calls bring the
+                    // main offset to `snapshot_offset + K`.
                     //
-                    // W6.6 — when tape-replay is ENABLED, replace the
-                    // K+1 forwards with a single `_tape_replay` FFI that
-                    // applies the recorded innovations to the snapshot
-                    // state. `accepted_drafts.len()` is `K + 1` here
-                    // (the slice contains `[last_committed_id, d_0,
-                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
-                    // `replay_ids` construction).
+                    // When tape-replay is ENABLED, replace the K+1 forwards
+                    // with a single `_tape_replay` FFI that applies the
+                    // recorded innovations to the snapshot state.
+                    // `accepted_drafts.len()` is `K + 1` here (the slice
+                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
+                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -5596,11 +5556,10 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history commit hook (dense
-                    // path). Appends exact MTP K/V for this cycle's
-                    // K+1 committed tokens to the persistent MTP cache
-                    // so the next cycle's drafts attend the full
-                    // committed prefix. Runs unconditionally (full
+                    // Committed-history commit hook (dense path). Appends exact
+                    // MTP K/V for this cycle's K+1 committed tokens to the
+                    // persistent MTP cache so the next cycle's drafts attend
+                    // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
                     commit_mtp: |anchor: chat_common::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
@@ -5626,9 +5585,9 @@ impl Qwen35Inner {
                             }
                         }
                     },
-                    // Phase C — dense committed-history path. Forces the
-                    // fused-draft path OFF (its mask excludes the
-                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    // Dense committed-history path. Forces the fused-draft path
+                    // OFF (its mask excludes the committed prefix) — see
+                    // `run_mtp_cycle_inner`.
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -5939,7 +5898,7 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // Phase 4b — paged streaming path does not yet carry an MTP gate;
+        // Paged streaming path does not carry an MTP gate;
         // MTP-on-paged streams continue to fall through to the dense
         // compiled streaming path. Non-MTP paged streams take the paged
         // streaming core.
@@ -6038,7 +5997,7 @@ impl Qwen35Inner {
             self.caches.is_some(),
         );
 
-        // PR #65 mtp-reload P2 — same paged→dense-MTP stale-flat-cache hazard
+        // Same paged→dense-MTP stale-flat-cache hazard
         // as the streaming delta path, but for the stream-START dense
         // fallback. A prior paged-core turn wrote full-attention K/V into the
         // paged adapter pool, leaving the flat `self.caches` full-attention
@@ -6155,15 +6114,15 @@ impl Qwen35Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // Phase C — prompt-prefix MTP prefill (streaming path). Mirrors
-        // the non-streaming `chat_with_caches_inner` logic: when MTP is
-        // active for this turn the prefill runs the hidden-emitting
-        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens
-        // can be committed into the MTP committed-history cache before
-        // decode. Gated OFF on cache-reuse turns (`cached_prefix_len >
-        // 0`) — the prompt-prefill seed requires the FULL prompt's
-        // hiddens and the prefill only processes the uncached suffix
-        // there. `MLX_MTP_NO_PROMPT_PREFILL=1` opts out.
+        // Prompt-prefix MTP prefill (streaming path). Mirrors the
+        // non-streaming `chat_with_caches_inner` logic: when MTP is active for
+        // this turn the prefill runs the hidden-emitting
+        // `chunked_prefill_with_hidden` so the per-prompt-token hiddens can be
+        // committed into the MTP committed-history cache before decode. Gated
+        // OFF on cache-reuse turns (`cached_prefix_len > 0`) — the
+        // prompt-prefill seed requires the FULL prompt's hiddens and the
+        // prefill only processes the uncached suffix there.
+        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts out.
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
             && !chat_common::mtp_no_prompt_prefill()
@@ -6249,7 +6208,7 @@ impl Qwen35Inner {
         };
         profiler.end_prefill();
 
-        // PR #65 mtp-reload P2 — on a paged→dense-MTP transition the dirty gate
+        // On a paged→dense-MTP transition the dirty gate
         // forced `cached_prefix_len = 0`, so the prefill above was a full reset
         // + full re-prefill and the flat full-attention caches now cover the
         // entire prompt. We do NOT clear `paged_full_attn_caches_dirty` here:
@@ -6261,9 +6220,9 @@ impl Qwen35Inner {
         // trusting half-advanced flat caches against a stale committed history.
         // (No-op on the common non-paged path, where the flag is never set.)
 
-        // Phase C — pair the captured prompt hiddens with the exact
-        // `prefill_tokens` whose hiddens they hold. `Some` iff the
-        // hidden-emitting prefill ran above.
+        // Pair the captured prompt hiddens with the exact `prefill_tokens`
+        // whose hiddens they hold. `Some` iff the hidden-emitting prefill ran
+        // above.
         let prompt_hidden_ids: Option<Vec<u32>> = prompt_hidden.as_ref().map(|_| {
             let start = mtp_prompt_history
                 .hidden_start_token_index()
@@ -6402,15 +6361,14 @@ impl Qwen35Inner {
                 // error path so the next turn always re-inits cleanly.
                 let _mtp_compiled_guard = MtpCompiledResetGuard;
 
-                // Phase C — prompt-prefix MTP prefill (streaming path).
-                // Mirrors the non-streaming `chat_with_caches_inner`
-                // region: with MTP just inited and `g_mtp_committed_len
-                // == 0`, commit the prompt prefix (+ first sampled
-                // token `y`) into the MTP committed-history cache BEFORE
-                // the decode loop so the MTP heads attend over the
-                // prompt from cycle 1. Gated on `prompt_hidden` being
-                // captured by the hidden-emitting prefill (skipped on
-                // cache-reuse turns and when opted out).
+                // Prompt-prefix MTP prefill (streaming path). Mirrors the
+                // non-streaming `chat_with_caches_inner` region: with MTP just
+                // inited and `g_mtp_committed_len == 0`, commit the prompt
+                // prefix (+ first sampled token `y`) into the MTP
+                // committed-history cache BEFORE the decode loop so the MTP
+                // heads attend over the prompt from cycle 1. Gated on
+                // `prompt_hidden` being captured by the hidden-emitting prefill
+                // (skipped on cache-reuse turns and when opted out).
                 if let (Some(ph), Some(ph_ids)) =
                     (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
                 {
@@ -6458,10 +6416,9 @@ impl Qwen35Inner {
                                   emb: &MxArray,
                                   depth: usize|
                      -> Result<chat_common::MtpVerifyOutput> {
-                        // W6.5 — return (logits, verify-final hidden)
-                        // so the cycle macro can chain into the next
-                        // cycle's first MTP draft and skip Step A's
-                        // ~150 ms main-model forward.
+                        // Return (logits, verify-final hidden) so the cycle
+                        // macro can chain into the next cycle's first MTP draft
+                        // and skip Step A's ~150 ms main-model forward.
                         forward_mtp_verify_compiled_with_hidden(ids, emb, depth as i32)
                     },
                     verify_step_argmax_only: Some(Box::new(
@@ -6491,25 +6448,22 @@ impl Qwen35Inner {
                         },
                     )),
                     rollback: |accepted_drafts: usize, depth: usize| unsafe {
-                        // Phase C — committed-history policy. The MTP
-                        // offset is driven ABSOLUTELY by the commit FFI
+                        // Committed-history policy: the MTP offset is driven
+                        // ABSOLUTELY by the commit FFI
                         // (`mlx_qwen35_mtp_compiled_commit` sets
-                        // `g_mtp_offset_int = g_mtp_committed_len`),
-                        // which already ran BEFORE this rollback. The
-                        // previous cycle-policy `adjust_offset(K-depth)`
-                        // call is REMOVED — double-adjusting would
-                        // corrupt the absolute offset.
+                        // `g_mtp_offset_int = g_mtp_committed_len`), which
+                        // already ran BEFORE this rollback. No cycle-policy
+                        // `adjust_offset` here — double-adjusting would corrupt
+                        // the absolute offset.
                         //
-                        // The MAIN path's offset and GDN linear caches
-                        // are still restored via the
-                        // `snapshot_main_linear` / `restore_and_replay_main`
-                        // pair below (W6 Bug #4 fix) — unchanged.
+                        // The MAIN path's offset and GDN linear caches are
+                        // still restored via the `snapshot_main_linear` /
+                        // `restore_and_replay_main` pair below.
                         let _ = (accepted_drafts, depth);
-                        // W6.6/W6.35 — on full accept the verifier wrote
-                        // exactly `depth + 1` surviving main-cache steps.
-                        // Replay that full prefix from the GDN tape rather
-                        // than keeping the raw batched recurrent state.
-                        // `_tape_replay` disarms internally.
+                        // On full accept the verifier wrote exactly `depth + 1`
+                        // surviving main-cache steps. Replay that full prefix
+                        // from the GDN tape rather than keeping the raw batched
+                        // recurrent state. `_tape_replay` disarms internally.
                         if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
                         }
@@ -6520,25 +6474,22 @@ impl Qwen35Inner {
                             logits.eval();
                         }
                     },
-                    // W6.5-resume — fold the chained `verify_hidden[K]`
-                    // slice into the same async_eval batch as the
-                    // post-cycle token + compiled caches. See the comment
-                    // block at the chained-end-of-iteration call in
-                    // `decode_loop_mtp!` (chat_common.rs) for why this
-                    // matters: without it the slice stays lazy across
-                    // the iteration boundary and the next cycle's draft
-                    // graph build forces a Metal roundtrip the Step-A
-                    // bypass doesn't pay.
+                    // Fold the chained `verify_hidden[K]` slice into the same
+                    // async_eval batch as the post-cycle token + compiled
+                    // caches. See the chained-end-of-iteration call in
+                    // `decode_loop_mtp!` (chat_common.rs): without this the
+                    // slice stays lazy across the iteration boundary and the
+                    // next cycle's draft graph build forces a Metal roundtrip
+                    // the Step-A bypass doesn't pay.
                     eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
                         eval_token_caches_and_chained_hidden(token, chained_hidden);
                     },
-                    // W6 Bug #2 fix (Option Reset): reset MTP K/V and
-                    // re-anchor MTP offset to the main path's current
-                    // offset before each draft cycle. Without this the
-                    // MTP offset drifts 2 behind per cycle (Step A's
-                    // forward + verify[0]'s forward both write to the
-                    // main path but not to the MTP path), so MTP RoPE
-                    // positions become wrong and drafts diverge.
+                    // Reset MTP K/V and re-anchor MTP offset to the main path's
+                    // current offset before each draft cycle. Without this the
+                    // MTP offset drifts 2 behind per cycle (Step A's forward +
+                    // verify[0]'s forward both write to the main path but not
+                    // to the MTP path), so MTP RoPE positions become wrong and
+                    // drafts diverge.
                     begin_cycle: |chained_anchor: bool| unsafe {
                         let old_mtp_offset = mlx_sys::mlx_qwen35_mtp_get_offset();
                         let main_offset = mlx_sys::mlx_qwen35_get_cache_offset();
@@ -6555,43 +6506,38 @@ impl Qwen35Inner {
                             "MTP begin_cycle: cache re-anchored to main offset"
                         );
                     },
-                    // W6 Bug #4 fix — snapshot the main path's GDN
-                    // linear caches + offset BEFORE the verify FFI runs
-                    // its D+1 sequential forwards. Verify mutates
-                    // `g_compiled_caches` in place; without restoring on
-                    // rejection the GDN recurrent state stays polluted
-                    // with rejected-draft positions and the next Step A
-                    // produces wrong logits.
+                    // Snapshot the main path's GDN linear caches + offset
+                    // BEFORE the verify FFI runs its D+1 sequential forwards.
+                    // Verify mutates `g_compiled_caches` in place; without
+                    // restoring on rejection the GDN recurrent state stays
+                    // polluted with rejected-draft positions and the next Step
+                    // A produces wrong logits.
                     //
-                    // W6.6 — when tape-replay is ENABLED (default; opt
-                    // out via `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the
-                    // GDN tape recorder so the rollback path can replay
-                    // accepted innovations into the snapshot state via
-                    // a single Metal kernel instead of K+1 main-model
-                    // forwards. Snapshot is still required — the tape
-                    // replay starts from the snapshot state.
+                    // When tape-replay is ENABLED (default; opt out via
+                    // `MLX_MTP_USE_TAPE_REPLAY=0`), also arm the GDN tape
+                    // recorder so the rollback path can replay accepted
+                    // innovations into the snapshot state via a single Metal
+                    // kernel instead of K+1 main-model forwards. Snapshot is
+                    // still required — the tape replay starts from the snapshot
+                    // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
                         if chat_common::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
-                    // W6 Bug #4 fix — on rejection: restore linear caches
-                    // + offset, then replay the K accepted drafts via
-                    // forward_compiled so the main linear state matches
-                    // the committed token stream. Each replay call
-                    // advances the offset by 1; K calls bring the main
-                    // offset to `snapshot_offset + K`, matching what the
-                    // previous direct `adjust_offset(K - depth)` rollback
-                    // would have produced.
+                    // On rejection: restore linear caches + offset, then replay
+                    // the K accepted drafts via forward_compiled so the main
+                    // linear state matches the committed token stream. Each
+                    // replay call advances the offset by 1; K calls bring the
+                    // main offset to `snapshot_offset + K`.
                     //
-                    // W6.6 — when tape-replay is ENABLED, replace the
-                    // K+1 forwards with a single `_tape_replay` FFI that
-                    // applies the recorded innovations to the snapshot
-                    // state. `accepted_drafts.len()` is `K + 1` here
-                    // (the slice contains `[last_committed_id, d_0,
-                    // .., d_{K-1}]` — see `run_mtp_cycle_inner`'s
-                    // `replay_ids` construction).
+                    // When tape-replay is ENABLED, replace the K+1 forwards
+                    // with a single `_tape_replay` FFI that applies the
+                    // recorded innovations to the snapshot state.
+                    // `accepted_drafts.len()` is `K + 1` here (the slice
+                    // contains `[last_committed_id, d_0, .., d_{K-1}]` — see
+                    // `run_mtp_cycle_inner`'s `replay_ids` construction).
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
@@ -6615,11 +6561,10 @@ impl Qwen35Inner {
                         }
                         Ok(())
                     },
-                    // Phase C — committed-history commit hook (dense
-                    // path). Appends exact MTP K/V for this cycle's
-                    // K+1 committed tokens to the persistent MTP cache
-                    // so the next cycle's drafts attend the full
-                    // committed prefix. Runs unconditionally (full
+                    // Committed-history commit hook (dense path). Appends exact
+                    // MTP K/V for this cycle's K+1 committed tokens to the
+                    // persistent MTP cache so the next cycle's drafts attend
+                    // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
                     commit_mtp: |anchor: chat_common::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
@@ -6645,9 +6590,9 @@ impl Qwen35Inner {
                             }
                         }
                     },
-                    // Phase C — dense committed-history path. Forces the
-                    // fused-draft path OFF (its mask excludes the
-                    // committed prefix) — see `run_mtp_cycle_inner`.
+                    // Dense committed-history path. Forces the fused-draft path
+                    // OFF (its mask excludes the committed prefix) — see
+                    // `run_mtp_cycle_inner`.
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
@@ -8265,11 +8210,10 @@ impl Qwen35Inner {
         Ok(params)
     }
 
-    /// W6 (MTP): true when this model checkpoint includes an MTP head
-    /// (W2 module loaded by `persistence::apply_weights_inner`). The
-    /// W6 speculative decode loop gates on this together with the
-    /// per-request `enable_mtp` flag — both must be true for the
-    /// MTP-accelerated path to take over.
+    /// True when this model checkpoint includes an MTP head (module loaded by
+    /// `persistence::apply_weights_inner`). The speculative decode loop gates
+    /// on this together with the per-request `enable_mtp` flag — both must be
+    /// true for the MTP-accelerated path to take over.
     pub(crate) fn has_mtp_weights(&self) -> bool {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
@@ -8279,8 +8223,8 @@ impl Qwen35Inner {
 /// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
 ///
 /// This allows the macro to work unchanged for both:
-/// - MoE model: passes a real `ThreadsafeFunction` (old path, until Phase 4)
-/// - Dense model: passes this `StreamSender` (new dedicated-thread path)
+/// - MoE model: passes a real `ThreadsafeFunction`
+/// - Dense model: passes this `StreamSender` (dedicated-thread path)
 struct StreamSender(StreamTx<ChatStreamChunk>);
 
 impl StreamSender {
@@ -8429,22 +8373,21 @@ pub struct ChatConfig {
     /// avoiding redundant computation for multi-turn conversations.
     #[napi(ts_type = "boolean | undefined")]
     pub reuse_cache: Option<bool>,
-    /// W6 (MTP): opt-in flag enabling the Multi-Token Prediction
-    /// speculative decode loop on the dense compiled path. Requires
-    /// the model checkpoint to carry an MTP head (otherwise
-    /// silently ignored). Default: `false`.
+    /// MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
+    /// loop on the dense compiled path. Requires the model checkpoint to carry
+    /// an MTP head (otherwise silently ignored). Default: `false`.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
-    /// W6 (MTP): number of draft tokens per speculative cycle. Clamped
-    /// to `[1, 5]` by the W5 verify FFI contract. Default: 1.
+    /// MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
+    /// by the verify FFI contract. Default: 1.
     ///
-    /// W6.8: when `mtpAdaptiveDepth` is `true`, this value is used as
-    /// the throughput-policy seed and the expected-value policy's max
-    /// depth. Adaptive depth is opt-in; set
-    /// `mtpAdaptiveDepth: true` explicitly to enable it.
+    /// When `mtpAdaptiveDepth` is `true`, this value is used as the
+    /// throughput-policy seed and the expected-value policy's max depth.
+    /// Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
+    /// enable it.
     #[napi(ts_type = "number | undefined")]
     pub mtp_depth: Option<i32>,
-    /// W6.8 (MTP): when true, the decode loop runs the W6.8 adaptive
+    /// MTP: when true, the decode loop runs the adaptive
     /// depth policy. Default mode is a per-depth EMA hill-climb plus
     /// DFlash-style 3-state machine `full | reduced | probe`.
     /// `MLX_MTP_ADAPTIVE_DEPTH_MODE=expected-value` instead uses the
@@ -8553,7 +8496,7 @@ pub struct Qwen3_5Model {
     /// the chat-entry sites. Surfaced through the
     /// `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
-    /// W7 (MTP): snapshot of `Qwen35Inner::has_mtp_weights()` captured
+    /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
     /// at construction time, mirroring `paged_active`. Surfaced through
     /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
     /// auto-default `enableMtp = true` for checkpoints that ship an MTP
@@ -8590,16 +8533,15 @@ impl Qwen3_5Model {
         self.paged_active
     }
 
-    /// W7 (MTP): whether this checkpoint shipped an MTP head (W2 module
-    /// loaded by `persistence::apply_weights_inner`). Snapshotted at
-    /// load time from `Qwen35Inner::has_mtp_weights()` so the TS
-    /// `ChatSession` can auto-default `enableMtp = true` for
-    /// MTP-capable checkpoints without dispatching a command into the
-    /// model thread.
+    /// Whether this checkpoint shipped an MTP head (module loaded by
+    /// `persistence::apply_weights_inner`). Snapshotted at load time from
+    /// `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
+    /// auto-default `enableMtp = true` for MTP-capable checkpoints without
+    /// dispatching a command into the model thread.
     ///
-    /// Note: this only reports weight availability. Whether the W6
-    /// speculative-decode path actually runs on a given call also
-    /// requires the per-request `enableMtp` flag.
+    /// Note: this only reports weight availability. Whether the
+    /// speculative-decode path actually runs on a given call also requires the
+    /// per-request `enableMtp` flag.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
@@ -9282,9 +9224,9 @@ fn chunked_prefill_with_size(
     Ok(last_logits)
 }
 
-/// Phase C — `chunked_prefill` variant that ALSO returns the
-/// post-final-norm hidden state for the prompt tail needed by MTP,
-/// concatenated along the time axis -> `[1, kept_len, hidden]`.
+/// `chunked_prefill` variant that ALSO returns the post-final-norm hidden
+/// state for the prompt tail needed by MTP, concatenated along the time axis
+/// -> `[1, kept_len, hidden]`.
 ///
 /// Used only when MTP is active for the turn: the prompt hiddens are
 /// needed to commit the prompt prefix into the MTP committed-history
@@ -9572,14 +9514,13 @@ fn eval_token_and_compiled_caches(next_token: &MxArray) {
     }
 }
 
-/// W6.5-resume — evaluate `next_token`, the `chained_hidden` slice, and
-/// all compiled cache arrays in a SINGLE `async_eval` batch. Used by the
-/// chained-cycles MTP path at end-of-iteration so the chained
-/// `verify_hidden[K]` slice becomes a sibling of the next-cycle draft's
-/// first inputs — mirroring the Step-A bypass's fused
-/// `(logits, hidden)` dispatch and eliminating the mid-cycle Metal
-/// command-buffer roundtrip the lazy slice would otherwise force when
-/// the next cycle's draft graph reads `prev_hidden`.
+/// Evaluate `next_token`, the `chained_hidden` slice, and all compiled cache
+/// arrays in a SINGLE `async_eval` batch. Used by the chained-cycles MTP path
+/// at end-of-iteration so the chained `verify_hidden[K]` slice becomes a
+/// sibling of the next-cycle draft's first inputs — mirroring the Step-A
+/// bypass's fused `(logits, hidden)` dispatch and eliminating the mid-cycle
+/// Metal command-buffer roundtrip the lazy slice would otherwise force when the
+/// next cycle's draft graph reads `prev_hidden`.
 ///
 /// `chained_hidden` is `[1, 1, hidden]` bf16 — the `verify_hiddens[:, K, :]`
 /// slice produced by `run_mtp_cycle_inner`.
@@ -9592,10 +9533,9 @@ fn eval_token_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &M
     }
 }
 
-/// W6 (MTP): one compiled forward step that ALSO exports the
-/// post-final-norm hidden of the decoded token. Calls
-/// `forward_compiled` first, then asks the C++ side for the stashed
-/// hidden from that step.
+/// One compiled forward step that ALSO exports the post-final-norm hidden of
+/// the decoded token. Calls `forward_compiled` first, then asks the C++ side
+/// for the stashed hidden from that step.
 ///
 /// Returns `(logits, hidden)` where `logits` is `[1, vocab]` and
 /// `hidden` is `[1, hidden_size]` bf16. The hidden state is the
@@ -9608,7 +9548,7 @@ fn eval_token_caches_and_chained_hidden(next_token: &MxArray, chained_hidden: &M
 /// hidden is stashed in a process-wide `g_last_hidden` global on
 /// the C++ side and is only valid until the next main-path forward
 /// or reset.
-// W6 chat-session integration is the only intended caller. below
+// The chat-session integration is the only intended caller.
 pub(super) fn forward_compiled_with_hidden(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
@@ -9629,7 +9569,7 @@ pub(super) fn forward_compiled_with_hidden(
     Ok((logits, hidden))
 }
 
-/// Phase 4b — export the post-final-norm hidden captured by the most
+/// Export the post-final-norm hidden captured by the most
 /// recent `mlx_qwen35_forward_paged` invocation. Wraps the C++ FFI and
 /// converts a null return into a structured `Err` so the paged-MTP gate
 /// can surface seeding failures cleanly instead of crashing.
@@ -9655,14 +9595,14 @@ fn export_last_hidden_paged() -> Result<MxArray> {
 }
 
 // ============================================================================
-// W5 — Compiled C++ MTP (Multi-Token Prediction) wrappers (dense).
+// Compiled C++ MTP (Multi-Token Prediction) wrappers (dense).
 //
 // Companions to `forward_compiled` / `eval_token_and_compiled_caches`.
 // The C++ side lives in `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp`
 // and shares `g_weights()` / `g_compiled_caches` with the main path.
 //
 // Locking contract:
-//   - Production callers (W6 chat-session loop) MUST hold
+//   - Production callers (chat-session loop) MUST hold
 //     `DENSE_COMPILED_MUTEX` and `COMPILED_WEIGHTS_RWLOCK` (read) across
 //     the entire draft+verify cycle — the verify FFI mutates the main
 //     compiled state in place, so any concurrent main-path forward would
@@ -9671,18 +9611,16 @@ fn export_last_hidden_paged() -> Result<MxArray> {
 //     `DENSE_COMPILED_MUTEX` directly because it is `static` (private)
 //     to this module. They instead serialise on `FFI_LOCK`, which is
 //     sufficient in the absence of concurrent main-path forward calls.
-// The plan W5 says to "reuse `DENSE_COMPILED_MUTEX`" rather than adding
-// a new lock; the W6 chat-session integration will arrange that.
 //
-// W6 integration contract:
+// Integration contract:
 //   1. After `mlx_qwen35_compiled_init_from_prefill(...)` succeeds for
 //      the current turn, call `init_mtp_compiled_from_main(...)` ONCE
 //      with the same config / max_kv_len.
 //   2. For each draft+verify cycle:
-//      a. Snapshot caches (W3) and main offset.
+//      a. Snapshot caches and main offset.
 //      b. Call `forward_mtp_draft_compiled(...)` D times.
 //      c. Call `forward_mtp_verify_compiled(...)` ONCE.
-//      d. Accept / reject per W4 sampler. On reject, rewind the main
+//      d. Accept / reject per the sampler. On reject, rewind the main
 //         offset via `mlx_qwen35_compiled_adjust_offset` AND the MTP
 //         offset via `mlx_qwen35_mtp_compiled_adjust_offset` to keep
 //         the two paths in lock-step.
@@ -9702,7 +9640,7 @@ fn export_last_hidden_paged() -> Result<MxArray> {
 /// is left uninitialised and subsequent draft/verify calls become
 /// null-pointer no-ops so the caller can fall back to the eager Rust
 /// MTP forward.
-// W6 (chat-session integration) is the only intended caller.
+// The chat-session integration is the only intended caller.
 pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i32) -> Result<()> {
     use mlx_sys as sys;
 
@@ -9744,7 +9682,7 @@ pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i3
         )));
     }
 
-    // W6.7 follow-up — eagerly compile the batched verify graphs for all
+    // Eagerly compile the batched verify graphs for all
     // depths in {1..5} for both `WithTape=false` and `WithTape=true`. The
     // FFI is best-effort: any failure inside is logged to stderr and
     // swallowed, leaving the verify path to fall back to lazy compile on
@@ -9772,7 +9710,7 @@ pub(super) fn init_mtp_compiled_from_main(config: &Qwen3_5Config, max_kv_len: i3
 /// Returns `Err` if the C++ side returns null pointers (init not
 /// done, exception). On `Err` the MTP state is left as-is — the
 /// caller should fall back to the eager Rust MTP forward.
-// W6 chat-session integration is the only intended caller.
+// The chat-session integration is the only intended caller.
 pub(super) fn forward_mtp_draft_compiled(
     prev_hidden: &MxArray,
     prev_emb: &MxArray,
@@ -9808,7 +9746,7 @@ pub(super) fn forward_mtp_draft_compiled(
     Ok((h_next, logits))
 }
 
-/// Phase C — committed-history commit. Append exact MTP K/V for the
+/// Committed-history commit. Append exact MTP K/V for the
 /// FULL `K+2` committed token sequence of this cycle to the persistent
 /// MTP cache so the next cycle's drafts attend over the full committed
 /// prefix.
@@ -9977,7 +9915,7 @@ pub(super) fn commit_mtp_compiled_from_verify_prefix(
     Ok(())
 }
 
-/// Phase C — prompt-prefix MTP prefill.
+/// Prompt-prefix MTP prefill.
 ///
 /// Commits the prompt prefix or selected prompt tail (plus the first sampled
 /// token `y`) into the
@@ -10174,21 +10112,21 @@ fn partition_prefill_chunks(total: usize) -> Vec<usize> {
 ///
 /// SIDE EFFECTS: advances the MAIN compiled path's offset by
 /// `depth + 1` and writes K/V into the main `g_compiled_caches[]` at
-/// the corresponding positions. Production callers (W6 chat-session
+/// the corresponding positions. Production callers (chat-session
 /// loop) MUST already hold `DENSE_COMPILED_MUTEX` and the
 /// `COMPILED_WEIGHTS_RWLOCK` read guard so no other turn can race the
 /// offset / cache state during the verify. Tests serialise via
 /// `FFI_LOCK` in the absence of concurrent main-path forward calls —
 /// see `compiled_ffi_tests` in `mtp.rs`.
 ///
-/// **W6.5 status:** All production callers now use
+/// All production callers now use
 /// [`forward_mtp_verify_compiled_with_hidden`] (chained-cycle path).
 /// This thin logits-only wrapper is kept as the backward-compatible
 /// surface for the underlying C++ FFI and as the natural fallback
 /// when a future opt-out (env-flag) is needed; flagged with
 /// `#[allow(dead_code)]` so the dead-code lint doesn't fire while
 /// the chained path is the only active caller.
-// W6 chat-session integration is the only intended caller.
+// The chat-session integration is the only intended caller.
 #[allow(dead_code)]
 pub(super) fn forward_mtp_verify_compiled(
     input_ids: &MxArray,
@@ -10221,7 +10159,7 @@ pub(super) fn forward_mtp_verify_compiled(
     MxArray::from_handle(out_ptr, "mtp_verify_logits")
 }
 
-/// W6.5 — verify pass that ALSO exports the post-final-norm hidden
+/// Verify pass that ALSO exports the post-final-norm hidden
 /// state at EVERY verify position. The caller uses this to chain MTP
 /// cycles without running a fresh main-model forward at "Step A" —
 /// after the accept loop computes K (= number of accepted drafts), it
@@ -10453,8 +10391,8 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
     Ok(chat_common::MtpVerifyOutput::sparse(hiddens, target_sparse))
 }
 
-/// Phase 4b — paged-pool sibling of
-/// [`forward_mtp_verify_compiled_with_hidden`]. Drives the new
+/// Paged-pool sibling of
+/// [`forward_mtp_verify_compiled_with_hidden`]. Drives the
 /// `mlx_qwen35_forward_batched_verify_paged` FFI which reads K/V from
 /// the paged adapter's pool tensors (via the C++ `g_dense_k_pools[]` /
 /// `g_dense_v_pools[]` globals seeded by `mlx_qwen35_init_paged`) and
@@ -10482,11 +10420,10 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
 /// allocates one trace per depth value (5 traces max) — same scaling
 /// factor as the BHTD bucket dispatch.
 ///
-/// Phase 4b B2 status: defined and unit-tested (via the
+/// Defined and unit-tested (via the
 /// `compiled_ffi_tests::paged_verify_shape_smoke` regression in
-/// `mtp.rs`) but not yet wired into production decode — the routing
-/// gate inside `chat_sync_core_paged_inner` is reserved for B3. The
-/// `dead_code` allow keeps the lint quiet until B3 lands.
+/// `mtp.rs`) but not wired into production decode; the `dead_code` allow
+/// keeps the lint quiet.
 #[allow(dead_code)]
 pub(super) fn forward_mtp_verify_paged(
     input_ids: &MxArray,
@@ -10582,7 +10519,7 @@ pub(super) fn forward_mtp_verify_paged(
 }
 
 // ============================================================================
-// Phase 5 piece 1: C++ compiled paged-decode dispatcher (Dense).
+// C++ compiled paged-decode dispatcher (Dense).
 //
 // Mirrors `init_paged_moe_compiled_session` / `forward_moe_cpp_paged`
 // from `crates/mlx-core/src/models/qwen3_5_moe/model.rs` but without
@@ -12679,7 +12616,7 @@ mod paged_construction_tests {
         );
     }
 
-    /// Phase 5 piece 1: hard-fails fast when caller passes a `caches`
+    /// Hard-fails fast when caller passes a `caches`
     /// slice whose length disagrees with `config.num_layers`. The
     /// check runs BEFORE any FFI dispatch so we don't perturb the C++
     /// paged globals — making this the only branch of
@@ -12733,7 +12670,7 @@ mod paged_construction_tests {
         );
     }
 
-    /// Phase 5 piece 1: the C++ compiled paged graph hard-codes
+    /// The C++ compiled paged graph hard-codes
     /// block_size=16. The dispatcher MUST gate `cpp_session_ready` on
     /// `adapter.block_size() == 16` so a config with
     /// `paged_block_size: Some(8)` falls back to the pure-Rust paged
@@ -12747,7 +12684,7 @@ mod paged_construction_tests {
         );
     }
 
-    /// Phase 5 piece 1: build an adapter with `block_size != 16` and
+    /// Build an adapter with `block_size != 16` and
     /// verify that the dispatcher gate
     /// (`adapter.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE`) would
     /// correctly reject it. The gate runs BEFORE
@@ -12960,7 +12897,7 @@ mod paged_construction_tests {
         adapter.release_request().expect("release_request");
     }
 
-    /// Phase 5 piece 1: the C++ FFI returns `int32_t` (0 success / -1
+    /// The C++ FFI returns `int32_t` (0 success / -1
     /// failure). The Rust `init_paged_dense_compiled_session`
     /// propagates non-zero status as `Err` so the dispatcher's
     /// `cpp_session_ready` becomes false on init failure and falls

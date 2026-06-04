@@ -26,16 +26,15 @@
 //! ```
 //!
 //! Callers apply `lm_head` to the returned hidden state to obtain draft
-//! logits. The compiled C++ MTP draft graph (W5) will register the same
-//! `mtp.*` weights through `mlx_qwen35_common.h::g_weights()` so the
-//! Rust-eager forward here and the future compiled forward read from the
-//! same store.
+//! logits. The compiled C++ MTP draft graph registers the same `mtp.*`
+//! weights through `mlx_qwen35_common.h::g_weights()`, so the Rust-eager
+//! forward here and the compiled forward read from the same store.
 //!
 //! Weight loading mirrors the per-layer attn/mlp/norm flow in
-//! `persistence::apply_weights_inner` (lines 325-534): MTP layers are
-//! full-attention only, so the GDN branch is unreachable but kept as a
-//! defensive `Err` return for catastrophic config mismatches caught at
-//! load time rather than at decode time.
+//! `persistence::apply_weights_inner`: MTP layers are full-attention only,
+//! so the GDN branch is unreachable but kept as a defensive `Err` return
+//! for catastrophic config mismatches caught at load time rather than at
+//! decode time.
 
 use std::collections::HashMap;
 
@@ -56,9 +55,8 @@ use super::quantized_linear::{
 /// Multi-Token Prediction head for Qwen3.5 dense.
 ///
 /// One instance is owned by `Qwen35Inner` when
-/// `config.n_mtp_layers > 0`. The decode loop (W6) is the only intended
-/// caller of [`forward`](Self::forward). See module docs for the
-/// architecture.
+/// `config.n_mtp_layers > 0`. The decode loop is the only intended caller
+/// of [`forward`](Self::forward). See module docs for the architecture.
 pub struct Qwen3_5MTPModule {
     pre_fc_norm_hidden: RMSNorm,
     pre_fc_norm_embedding: RMSNorm,
@@ -209,8 +207,8 @@ impl Qwen3_5MTPModule {
     ///
     /// Quantization-resolution closure inlines the same logic as
     /// `apply_weights_inner::try_build_ql`, intentionally duplicated to
-    /// keep the MTP scope surgical (W2 contract) rather than refactoring
-    /// the dense persistence loader.
+    /// keep the MTP scope surgical rather than refactoring the dense
+    /// persistence loader.
     ///
     /// Keys consumed:
     ///   - `mtp.fc.weight` (+ `.scales` / `.biases` if affine-quantized)
@@ -228,9 +226,8 @@ impl Qwen3_5MTPModule {
         let is_quantized = is_quantized_checkpoint(params);
 
         // Fresh per-prefix quant resolver, duplicating the closure in
-        // `apply_weights_inner` (lines 254-287). See the W2 contract:
-        // surgical duplication is preferred over a wide refactor for
-        // first-cut MTP wiring.
+        // `apply_weights_inner`. Surgical duplication is preferred over a
+        // wide refactor of the dense persistence loader.
         let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
             let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
             match plq.mode {
@@ -749,7 +746,7 @@ mod tests {
 
 #[cfg(test)]
 mod compiled_ffi_tests {
-    //! Compiled-path smoke tests for the W5 MTP FFI.
+    //! Compiled-path smoke tests for the MTP FFI.
     //!
     //! These exercise the C++ entrypoints declared in
     //! `crates/mlx-sys/src/mlx_qwen35_mtp_compiled.cpp`
@@ -961,7 +958,7 @@ mod compiled_ffi_tests {
         // No weights registered → C++ side sees no `mtp.norm.weight`.
         // We also force the main-path inited flag so the test reaches
         // the `has_weight` check rather than failing earlier on the
-        // is_compile_inited precondition added in W5.
+        // is_compile_inited precondition.
         unsafe {
             sys::mlx_clear_weights();
             sys::mlx_qwen35_compiled_test_force_inited(1);
@@ -991,10 +988,10 @@ mod compiled_ffi_tests {
 
         // Initialize the MTP compiled path. max_kv_len chosen to be
         // larger than any draft we'll run (we run 1 step here). The
-        // test-only force-inited helper satisfies the W5
-        // `is_compile_inited` precondition without standing up a real
-        // per-layer main-path KV cache (we don't need one — this test
-        // never calls the main forward, only MTP draft).
+        // test-only force-inited helper satisfies the `is_compile_inited`
+        // precondition without standing up a real per-layer main-path KV
+        // cache (we don't need one — this test never calls the main
+        // forward, only MTP draft).
         unsafe { sys::mlx_qwen35_compiled_test_force_inited(1) };
         let max_kv_len = 32i32;
         if let Err(e) = init_mtp_compiled_from_main(&cfg, max_kv_len) {
@@ -1065,10 +1062,10 @@ mod compiled_ffi_tests {
         teardown();
     }
 
-    /// W6 smoke: `mlx_qwen35_export_last_hidden` returns nullptr
-    /// when no main-path forward has run since the last reset (the
-    /// MTP draft FFI advances only the MTP offset, not the main
-    /// path; it must NOT populate `g_last_hidden`).
+    /// Smoke: `mlx_qwen35_export_last_hidden` returns nullptr when no
+    /// main-path forward has run since the last reset (the MTP draft FFI
+    /// advances only the MTP offset, not the main path; it must NOT
+    /// populate `g_last_hidden`).
     #[test]
     fn export_last_hidden_null_without_main_forward() {
         let _g = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1088,7 +1085,7 @@ mod compiled_ffi_tests {
         teardown();
     }
 
-    /// Phase 4b — smoke-test the Rust wrapper around
+    /// Smoke-test the Rust wrapper around
     /// `mlx_qwen35_forward_batched_verify_paged`. Confirms:
     /// 1. `forward_mtp_verify_paged` validates `depth` and rejects out
     ///    of `[1, 5]` before any FFI call;
@@ -1189,8 +1186,8 @@ mod compiled_ffi_tests {
         teardown();
     }
 
-    /// Phase 4b regression — partial-accept rollback of
-    /// `g_dense_paged_linear_caches`. The paged verify FFI mutates the
+    /// Partial-accept rollback of `g_dense_paged_linear_caches`.
+    /// The paged verify FFI mutates the
     /// linear slots in-place after processing the entire D+1 window;
     /// the snapshot/restore pair is what lets the MTP rollback path
     /// recover the pre-verify state when fewer drafts accept. This
@@ -1288,13 +1285,12 @@ mod compiled_ffi_tests {
         teardown();
     }
 
-    /// Phase 4b B3 — pool-seeding regression. The paged-MTP gate
-    /// inside `chat_sync_core_paged_inner` depends on the paged
-    /// linear-cache pool being populated by paged prefill before the
-    /// first MTP cycle (decision C in the path-A spec). If the pool
-    /// is empty / un-snapshotted at cycle-1 entry the snapshot FFI
-    /// silently no-ops and `restore_and_replay_main` would leave
-    /// stale state in place on a partial reject.
+    /// Pool-seeding regression. The paged-MTP gate inside
+    /// `chat_sync_core_paged_inner` depends on the paged linear-cache pool
+    /// being populated by paged prefill before the first MTP cycle. If the
+    /// pool is empty / un-snapshotted at cycle-1 entry the snapshot FFI
+    /// silently no-ops and `restore_and_replay_main` would leave stale
+    /// state in place on a partial reject.
     ///
     /// This test exercises the pool-seeding contract from the gate's
     /// perspective: force-init the paged linear caches (the same way
