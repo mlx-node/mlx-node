@@ -20,15 +20,21 @@ type ConcreteStage = 'tokenize' | 'embed' | 'block' | 'final-norm' | 'lm-head' |
 type StageSpec = ConcreteStage | readonly ConcreteStage[] | 'meta' | 'all';
 
 // One chip per forward-pass stage, in execution order. `key` is the stable
-// React key and the concrete stage this chip represents.
-type StageChip = { key: ConcreteStage; label: string };
+// React key and the concrete stage this chip represents. `title` is an
+// optional hover tooltip (used to flag the hybrid layer stack without
+// lengthening the chip label).
+type StageChip = { key: ConcreteStage; label: string; title?: string };
 
 // The six canonical stage labels, reusing the exact strings already shown to
 // users elsewhere in the course (see ChapterIndex's fixed chips / layer header).
 const STAGE_CHIPS: readonly StageChip[] = [
   { key: 'tokenize', label: 'Tokenize' },
   { key: 'embed', label: 'Embedding lookup' },
-  { key: 'block', label: '× 24 layers' },
+  {
+    key: 'block',
+    label: '× 24 layers',
+    title: 'Hybrid stack: 6 full-attention layers + 18 cheaper linear-attention (GatedDeltaNet) layers',
+  },
   { key: 'final-norm', label: 'Final RMSNorm' },
   { key: 'lm-head', label: 'LM head' },
   { key: 'sample', label: 'Sampling' },
@@ -107,6 +113,7 @@ export function PipelineCue({ chapterId }: { chapterId: string }) {
                 </span>
               )}
               <span
+                title={chip.title}
                 className={[
                   'rounded border px-1.5 py-0.5 text-[10px] sm:text-[11px]',
                   lit

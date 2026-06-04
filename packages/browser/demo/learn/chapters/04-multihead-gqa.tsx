@@ -67,6 +67,11 @@ export const learning: ChapterLearningData = {
       definition: 'How many query heads run in parallel per layer. Qwen3.5-0.8B uses 8.',
     },
     {
+      term: 'd_model (hidden)',
+      definition:
+        'The width of the residual stream flowing between layers. Qwen3.5-0.8B uses 1024 — W_O projects the concatenated heads (8 × 256 = 2048) back to this width.',
+    },
+    {
       term: 'num_kv_heads (G)',
       definition:
         'How many K/V heads exist. Under GQA each K/V head is shared across H/G query heads. Qwen3.5-0.8B uses 2.',
@@ -93,9 +98,9 @@ export const learning: ChapterLearningData = {
   ],
   exercise: {
     prompt:
-      'After the auto-run, click the Q1 chip in the GQA lane diagram, then click Q2 (its group-mate). Compare the two heatmaps. Are the patterns identical, similar, or very different?',
+      'After the auto-run, the lane diagram starts on Q0 and the side-by-side compares it against Q1 (its group-mate). Click around the other Q0–Q3 chips in the same group and compare the heatmaps. Are the patterns identical, similar, or very different?',
     answer:
-      'They share the same K and V, so the patterns rhyme but are not identical — both still light up similar key positions, but the per-row weights differ because Q1 and Q2 have separate Wq. That is exactly the expressivity GQA preserves: same keys, different questions.',
+      'They share the same K and V, so the patterns rhyme but are not identical — both still light up similar key positions, but the per-row weights differ because Q0 and Q1 have separate Wq. That is exactly the expressivity GQA preserves: same keys, different questions.',
   },
   quiz: [
     {
@@ -247,7 +252,9 @@ export function MultiheadGqaChapterBody() {
         <p>
           Qwen3.5 also alternates two kinds of layer, and the layer selector below restricts to the classic{' '}
           <em>full-attention</em> layers with softmax scores you can inspect (the other kind is covered in{' '}
-          <strong>Advanced</strong> below).
+          <strong>Advanced</strong> below). Only every fourth layer — <strong>6 of the 24</strong> — runs this
+          full-softmax attention and keeps a growing KV cache; the other 18 are linear (GatedDeltaNet) layers that carry
+          a fixed-size recurrent state instead. So the cache numbers below count only those 6 layers, not all 24.
         </p>
 
         {/* Optional deep-dive: the Qwen-3.5–specific complications that interrupt
@@ -675,7 +682,7 @@ export function MultiheadGqaDemo({ workerRef, abortRef }: MultiheadGqaDemoProps)
 
       <DemoCallout
         items={[
-          "Q1 and Q2 in the same group share their K and V projections — that's the GQA cache savings.",
+          "Q0 and Q1 in the same group share their K and V projections — that's the GQA cache savings.",
           'Each query in a group can still learn a different attention pattern even though the keys are shared.',
           'Compare a full-attention layer with a linear (GatedDeltaNet) layer to see how Qwen3.5 mixes both.',
         ]}

@@ -54,6 +54,11 @@ export const learning: ChapterLearningData = {
       definition:
         'A reserved token (e.g. <|im_start|>, <|im_end|>) that marks structure — turn boundaries, roles, end-of-turn — rather than literal text.',
     },
+    {
+      term: 'tool calling',
+      definition:
+        'The chat template can list available tools in a <tools>…</tools> system block; the model then emits a structured <tool_call><function=NAME><parameter=NAME>VALUE</parameter></function></tool_call> instead of prose, which the app runs and feeds the result back. The live chat exposes this as the "tools" pill.',
+    },
   ],
   takeaways: [
     'A base model only continues text; instruction tuning is what makes it answer instructions in an assistant role.',
@@ -64,7 +69,7 @@ export const learning: ChapterLearningData = {
     prompt:
       "Toggle the chat-template widget to 'Raw text the model sees'. Which special token appears right before the model starts generating, and which one tells it to stop?",
     answer:
-      'Generation begins right after <|im_start|>assistant (and a newline); the model stops when it emits <|im_end|>. Instruction tuning is what taught it to produce that end-of-turn token instead of rambling into a fake next turn.',
+      'Generation begins right after <|im_start|>assistant (and a newline); the model stops when it emits <|im_end|>. One subtlety: the literal next tokens after that assistant marker are not free-form text but the reasoning block — <think>\\n when thinking is on, or a pre-closed <think>\\n\\n</think>\\n\\n when it is off — and only then does the answer start. Instruction tuning is what taught it to produce that end-of-turn token instead of rambling into a fake next turn.',
   },
   quiz: [
     {
@@ -154,8 +159,11 @@ export function PostTrainingChapterBody() {
           <strong>RLHF</strong> does this with a separate <strong>reward model</strong> — a second model trained on the
           human comparisons to predict how much people would like a given response, which the main model is then
           optimized to score well on — and reinforcement learning; <strong>DPO</strong> optimizes the preference
-          directly, skipping the reward model. Either way the objective is no longer plain next-token cross-entropy —
-          this is the one stage that genuinely departs from the loss you've seen.
+          directly, skipping the reward model. DPO isn't full RL and it isn't next-token cross-entropy either: it's a
+          preference (classification-style) loss over <strong>(preferred, rejected)</strong> pairs that simply raises
+          the model's relative likelihood of the preferred response over the rejected one. So this stage departs from
+          the plain next-token loss you've seen — but, in the DPO case, it's still a supervised loss on a fixed dataset
+          of pairs, not the trial-and-error rollouts of classic RL.
         </p>
         <p>
           Pick which response a human prefers and apply the update a few times to see what "training on a preference"
@@ -179,6 +187,17 @@ export function PostTrainingChapterBody() {
           trailing <code>{'<|im_start|>assistant'}</code>, and lets the model generate the answer — stopping the moment
           it emits <code>{'<|im_end|>'}</code>. SFT is what taught the model to <em>emit</em> that end-of-turn token
           instead of inventing a fake next user message.
+        </p>
+        <p>
+          The same template threads in two more things you'll see as pills in the live chat. The <strong>think</strong>{' '}
+          pill controls a reasoning block: right after the assistant marker the template injects either{' '}
+          <code>{'<think>\\n'}</code> (thinking on — the model reasons, then closes <code>{'</think>'}</code> before its
+          answer) or a pre-closed <code>{'<think>\\n\\n</think>\\n\\n'}</code> (thinking off). The <strong>tools</strong>{' '}
+          pill adds a <code>{'<tools>…</tools>'}</code> system block describing functions the model may call; instead of
+          prose it then emits a structured call —{' '}
+          <code>{'<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>'}</code> —
+          which the app executes and feeds back as another turn. Both are pure formatting conventions: the network is
+          unchanged; SFT taught it to honor them.
         </p>
 
         <h2>It is still the same model</h2>

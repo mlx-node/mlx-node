@@ -24,8 +24,8 @@ type Step = { cands: Cand[] };
 const STEPS: Step[] = [
   {
     cands: [
-      { text: ' mat', prob: 0.42 },
-      { text: ' floor', prob: 0.19 },
+      { text: ' floor', prob: 0.42 },
+      { text: ' mat', prob: 0.19 },
       { text: ' rug', prob: 0.12 },
       { text: ' couch', prob: 0.08 },
       { text: ' bed', prob: 0.05 },

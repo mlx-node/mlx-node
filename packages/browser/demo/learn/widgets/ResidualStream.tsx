@@ -47,7 +47,7 @@ const HEIGHTS = [22, 30, 38, 48, 60];
 // Overwrite mode: each sub-block REPLACES the stream with just its own output,
 // so the column jumps to roughly one block's magnitude and never accumulates.
 // Same length as HEIGHTS so every geometry helper indexes identically.
-const OVERWRITE_HEIGHTS = [22, 27, 24, 28, 23];
+const OVERWRITE_HEIGHTS = [24, 21, 26, 20, 25];
 const COLORS = [
   'oklch(0.65 0.13 250)', // h0 — cool blue, "input"
   'oklch(0.68 0.14 230)',

@@ -19,7 +19,7 @@ import { ScaledSoftmax } from '../widgets/ScaledSoftmax';
 import { ToyAttentionExample } from '../widgets/ToyAttentionExample';
 
 /**
- * Chapter 3 — Self-attention.
+ * Chapter 4 — Self-attention.
  *
  * This is the only fully-authored chapter for the first cut. The prose
  * teaches the mechanism end-to-end; the right-hand panel runs the real
@@ -51,7 +51,7 @@ export type AttentionDemoProps = {
 };
 
 /**
- * Scaffolding metadata for chapter 3 — drives the header, glossary,
+ * Scaffolding metadata for chapter 4 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
  * `chapterId` must match `CHAPTERS[2].id` in `learn/chapters.ts`.
  */
@@ -302,6 +302,19 @@ export function AttentionChapterBody() {
           Different heads end up specializing — one might track "the previous token," another "the start of the
           sentence," another "syntactically related noun." Stacking attention layers lets later layers compose these
           patterns: chapter 5 looks at heads, chapter 9 at the full stack.
+        </p>
+        <p>
+          One subtlety about <em>this</em> model: it is hybrid. Only every 4th layer — 6 of its 24 — uses the full
+          softmax self-attention you have been reading about. The other 18 use a cheaper linear-attention variant
+          (GatedDeltaNet) that keeps a fixed-size running state instead of attending over all past tokens (covered in the
+          KV-cache chapter). The live heatmap on the right reflects that: scrub the layer slider onto one of the 6
+          full-attention layers to see real scores; land on a linear layer and the panel just notes that it does not
+          expose a softmax attention matrix.
+        </p>
+        <p className="text-muted-foreground">
+          A note on the head slider: this model has <strong>8 query heads</strong> but only <strong>2 key/value
+          groups</strong> that those heads share — grouped-query attention (GQA), which the next chapter unpacks. For
+          now, just read each head as its own attention pattern.
         </p>
 
         <h2>Working a tiny example by hand</h2>

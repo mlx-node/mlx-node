@@ -25,7 +25,7 @@ const STEPS = [
   'embedding lookup — read row of embed_tokens.weight',
   'flow through 24 transformer layers (residual stream)',
   'final RMSNorm + LM head — project against the SAME matrix',
-  'top-K vocab scores — model predicts " mat"',
+  'top-K vocab scores — model predicts " floor"',
 ] as const;
 
 export function WeightTyingVisual() {
@@ -68,7 +68,7 @@ export function WeightTyingVisual() {
     { x: topMatX + matW / 2, y: topMatY + matH / 2, label: '"the"' },
     { x: stackX + stackW / 2, y: stackY + stackH / 2, label: 'h₀ … h₂₃' },
     { x: botMatX + matW / 2, y: botMatY + matH / 2, label: 'h_last' },
-    { x: botMatX + matW + 30, y: botMatY + matH / 2, label: '" mat"' },
+    { x: botMatX + matW + 30, y: botMatY + matH / 2, label: '" floor"' },
   ];
   const particle = ANCHORS[step]!;
   const topActive = step === 0;

@@ -87,7 +87,7 @@ export const learning: ChapterLearningData = {
   ],
   takeaways: [
     'The MLP touches every token in isolation — there is no cross-token information flow inside an MLP block.',
-    "Most of a model's parameters live in gate_proj/up_proj/down_proj — these three matrices dominate the parameter count.",
+    'gate_proj/up_proj/down_proj are one of the largest parameter blocks — about a third of Qwen3.5-0.8B (≈264M), roughly on par with the embedding table.',
     "Each MLP writes a small correction to the residual stream; the prediction is the sum of many small writes, not the last block's output.",
   ],
   exercise: {
@@ -136,7 +136,7 @@ export const learning: ChapterLearningData = {
     },
     {
       id: 'q3-where-params-live',
-      prompt: "Why does the chapter describe the MLP as 'where most of the parameters live'?",
+      prompt: 'Why is the MLP one of the largest blocks of parameters in the model?',
       options: [
         {
           id: 'a',
@@ -145,7 +145,7 @@ export const learning: ChapterLearningData = {
         {
           id: 'b',
           label:
-            'gate_proj, up_proj, and down_proj are large (hidden_dim by intermediate_dim, intermediate_dim ≈ 3-4 × hidden_dim), so the three together dwarf the attention projections.',
+            'gate_proj, up_proj, and down_proj are large (hidden_dim × intermediate_dim, intermediate_dim ≈ 3-4 × hidden_dim), so across all layers they add up to about a third of the model — one of its largest parameter blocks.',
         },
         {
           id: 'c',
@@ -154,7 +154,7 @@ export const learning: ChapterLearningData = {
       ],
       correctId: 'b',
       explanation:
-        "Each of those three matrices is hidden_dim × intermediate_dim. Multiply that by every layer and you have the bulk of the model's parameters.",
+        "Each of those three matrices is hidden_dim × intermediate_dim. Multiplied across every layer, they make up about a third of the model's parameters — one of its largest blocks, roughly on par with the embedding table.",
     },
   ],
 };
@@ -219,9 +219,10 @@ export function MlpChapterBody() {
           <code>down_proj</code>.
         </p>
         <p>
-          The intermediate dimension is where the model has its "scratch space" — usually around 4× the hidden dim
-          (Qwen3.5-0.8B uses 3584 for a 1024-dim hidden state). Most of the model's parameters live in these three
-          matrices.
+          The intermediate dimension is where the model has its "scratch space" — around 3.5× the hidden dim here
+          (Qwen3.5-0.8B uses 3584 for a 1024-dim hidden state; 3–4× is common across models). These three matrices are
+          one of the largest blocks of parameters in the model — about a third of the ~0.8B total (≈264M), roughly on
+          par with the embedding table.
         </p>
 
         <FfnNeurons />
@@ -264,6 +265,11 @@ export function MlpChapterBody() {
           MLP contribution varies across depth: some layers contribute more than others, but no single layer dominates.
           Predictions emerge from the sum of many small writes — which is exactly the design choice that makes deep
           transformers learnable.
+        </p>
+        <p>
+          One unifying point for Qwen3.5's hybrid stack: <strong>every layer — full-attention or linear — has this same
+          MLP block.</strong> Only the token-mixing half differs between the two layer kinds; the SwiGLU MLP that follows
+          it is identical everywhere.
         </p>
       </Prose>
     </ChapterFrame>

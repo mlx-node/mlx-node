@@ -58,7 +58,7 @@ export function SwiGluVsPlain() {
   const gatePct = swiglu ? (8 / 3 / 8) * 100 : 0; // 33.3% | 0
   const upPct = swiglu ? (8 / 3 / 8) * 100 : (4 / 8) * 100; // 33.3% | 50%
   const downPct = upPct; // gate/up/down share equally in swiglu; up==down in plain
-  const units = swiglu ? '2⅔' : '4';
+  const units = swiglu ? '8⁄3' : '4';
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">

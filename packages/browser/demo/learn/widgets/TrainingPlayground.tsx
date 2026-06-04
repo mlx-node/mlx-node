@@ -547,7 +547,6 @@ export function TrainingPlayground({ workerRef, abortRef }: TrainingPlaygroundPr
                   : 'idle'}
           </div>
         </div>
-        <LiveLossCurve losses={losses} maxStep={TOTAL_STEPS} />
         <p className="text-[11px] leading-relaxed text-muted-foreground">
           <strong className="font-medium text-foreground/80">This is intentional overfitting.</strong> The corpus is
           tiny and repetitive, so the model <em>memorizes</em> it within a few hundred steps and the loss falls to near
@@ -555,6 +554,7 @@ export function TrainingPlayground({ workerRef, abortRef }: TrainingPlaygroundPr
           memorize and has to <em>generalize</em> (Chapter 14). The point here is to make learning <em>visible</em> in
           seconds, not to be realistic.
         </p>
+        <LiveLossCurve losses={losses} maxStep={TOTAL_STEPS} />
         {scatterCheck.kind === 'fail' ? (
           <div
             role="alert"
@@ -572,8 +572,8 @@ export function TrainingPlayground({ workerRef, abortRef }: TrainingPlaygroundPr
       <div className="space-y-2 rounded-md border border-border bg-background p-3">
         <div className="text-xs uppercase tracking-wider text-muted-foreground">Generated sample</div>
         <div className="text-[11px] text-muted-foreground">
-          Greedy-ish continuation of <span className="font-mono">{JSON.stringify(corpus.samplePrompt)}</span>, refreshed
-          as training proceeds.
+          Sampled continuation of <span className="font-mono">{JSON.stringify(corpus.samplePrompt)}</span>, refreshed as
+          training proceeds.
         </div>
         <pre className="min-h-[2.5rem] overflow-x-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-2 font-mono text-[12px] text-foreground/90">
           {sampleText || (running ? 'sampling…' : 'Press Train to generate text from the tiny model.')}

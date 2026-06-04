@@ -252,8 +252,8 @@ export function FfnNeurons() {
       <div className="text-[11px] text-muted-foreground">
         Two parallel projections widen <span className="font-mono">hidden → intermediate</span>. Their element-wise
         product is the gated activation — the gate branch decides which features survive, the up branch carries the
-        values. <span className="font-mono">down_proj</span> collapses back. ~⅔ of Qwen3.5-0.8B's parameters live in
-        these three matrices.
+        values. <span className="font-mono">down_proj</span> collapses back. Together these three matrices are about a
+        third of Qwen3.5-0.8B (≈264M), roughly on par with the embedding table.
       </div>
     </div>
   );

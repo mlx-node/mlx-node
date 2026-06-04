@@ -177,7 +177,9 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — on
         <p>
           Inside that one forward pass, a token's journey is: text → <strong>tokens</strong> → <strong>vectors</strong>{' '}
           (embeddings) → a deep stack of <strong>attention + MLP</strong> blocks → a final{' '}
-          <strong>score for every token</strong> (the LM head) → <strong>sample</strong> one → append, and loop. Every
+          <strong>score for every token</strong> (the LM head) → <strong>sample</strong> one → append, and loop. (That
+          "deep stack" is hybrid: only every 4th layer — 6 of its 24 — uses full softmax self-attention; the other 18
+          use a cheaper linear-attention variant, covered in the KV-cache chapter.) Every
           remaining chapter opens up one of those boxes; the{' '}
           <Link to="/chapters/$chapterId" params={{ chapterId: 'architecture' }} search={(prev) => prev}>
             architecture chapter

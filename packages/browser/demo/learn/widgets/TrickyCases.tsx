@@ -74,15 +74,16 @@ const CASES: Case[] = [
   {
     label: 'Devanagari',
     input: 'नमस्ते',
-    tokens: ['न', 'म', 'स', '्', 'त', 'े'],
-    takeaway: 'Rarer scripts decompose into byte-level fragments. The chars/token ratio drops well below 1.',
+    tokens: ['⟨b⟩', '⟨b⟩', '⟨b⟩', '⟨b⟩'],
+    takeaway:
+      'Rarer scripts decompose into byte-level fragments that do not line up with visible characters — here 6 characters become 4 opaque byte tokens (shown as ⟨b⟩). The chars/token ratio drops well below 1.',
   },
   {
     label: 'Number with commas',
     input: '1,000,000',
-    tokens: ['1', ',', '000', ',', '000'],
+    tokens: ['1', ',', '0', '0', '0', ',', '0', '0', '0'],
     takeaway:
-      'Digits group by triplets in the training corpus. The commas remain separate, and "000" recurs as a single id.',
+      'Numbers are split into individual digits — there is no "000" token. The commas stay separate too, so the model reasons over numbers one digit at a time.',
   },
 ];
 

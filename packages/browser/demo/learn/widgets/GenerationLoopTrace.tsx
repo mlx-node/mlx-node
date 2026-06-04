@@ -24,17 +24,18 @@ import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
  */
 
 // Scripted sequence. Prompt is prefilled once; the rest is decoded one token
-// at a time. (Mirrors the chapter's DECODE_* script so the two views agree.)
+// at a time. Matches the chapter's DECODE_GENERATED_TOKENS = [' floor', '.', ' It']
+// (10-kv-cache.tsx) so the two views agree on the measured continuation.
 const PROMPT: ReadonlyArray<string> = ['The', ' cat', ' sat', ' on', ' the'];
-const GENERATED: ReadonlyArray<string> = [' mat', '.', ' It'];
+const GENERATED: ReadonlyArray<string> = [' floor', '.', ' It'];
 
 // Per-decode-step next-token candidates; index 0 is the sampled (greedy) token.
 type Cand = { text: string; prob: number };
 const DECODE_STEPS: ReadonlyArray<{ cands: Cand[] }> = [
   {
     cands: [
-      { text: ' mat', prob: 0.42 },
-      { text: ' floor', prob: 0.19 },
+      { text: ' floor', prob: 0.42 },
+      { text: ' mat', prob: 0.19 },
       { text: ' rug', prob: 0.12 },
       { text: ' couch', prob: 0.08 },
       { text: ' bed', prob: 0.05 },

@@ -51,7 +51,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'teacher forcing',
       definition:
-        "During training, the input at position i+1 is the true token from position i (not the model's predicted token). Lets every position be trained independently in parallel.",
+        "During training, the input at position i+1 is the true token from position i (not the model's predicted token). This supplies a valid ground-truth target at every position, so the model learns from correct context instead of its own (initially terrible) guesses.",
     },
     {
       term: 'one training step',
@@ -81,7 +81,7 @@ export const learning: ChapterLearningData = {
   ],
   takeaways: [
     'The entire training objective is one line: minimize -log p(next_token) at every position of every sequence.',
-    'Teacher forcing + causal mask is what makes training parallelizable: 1024 positions update in one forward pass, all valid.',
+    'The causal mask is what makes training parallel — every position computes its loss in one forward pass without peeking at the future; teacher forcing supplies the ground-truth target at each position so those parallel predictions are learning from correct context.',
     'There is no separate "training mode" architecture — the same forward pass you run at inference is run during training, just scored against ground truth.',
   ],
   exercise: {
@@ -188,9 +188,12 @@ export function TrainingChapterBody() {
         </p>
         <p>
           The fix is <strong>teacher forcing</strong>. Instead of feeding the model's own prediction back as the next
-          input, feed the <em>true</em> token. Now every position's input context is correct ground-truth text, every
-          position's target is independent, and the causal mask (chapter 4) keeps each position from peeking at the
-          target. <em>All N positions train in one parallel forward pass.</em>
+          input, feed the <em>true</em> token. That's all teacher forcing does: it supplies a valid ground-truth target
+          at every position, so the model learns from correct context rather than its own initially-terrible guesses.
+          The <em>parallelism</em> comes from a separate mechanism — the causal mask (chapter 4). Because each position
+          can only attend backward, every position's loss can be computed in a <em>single</em> forward pass without any
+          position peeking at its own target. <em>Ground-truth targets (teacher forcing) + single-pass parallelism
+          (causal mask) together let all N positions train at once.</em>
         </p>
 
         <TeacherForcingAnimation />

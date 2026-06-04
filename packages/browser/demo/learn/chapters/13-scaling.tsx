@@ -24,7 +24,7 @@ import { WarmupLossCurve } from '../widgets/WarmupLossCurve';
 export const learning: ChapterLearningData = {
   chapterId: 'scaling',
   objective:
-    'Read a real LLM training config (LR, warmup, clip, weight decay) and explain what each knob is preventing from going wrong.',
+    'Read a representative LLM training config (LR, warmup, clip, weight decay) and explain what each knob is preventing from going wrong.',
   problem:
     "Cross-entropy + AdamW on a deep transformer isn't enough — the loss diverges, the gradients explode, or the model overfits without specific engineering tricks.",
   minutes: 7,
@@ -150,9 +150,10 @@ export function ScalingChapterBody() {
         <p>
           Plain stochastic gradient descent (<code>θ := θ - η·g</code> — nudge each weight <code>θ</code> against its
           gradient <code>g</code>, scaled by a learning rate <code>η</code>) doesn't work well for transformers.
-          Different parameters need very different step sizes — embedding rows for rare tokens need much larger updates
-          than dense weights, for example. <strong>Adam</strong> tracks per-parameter running averages of <code>g</code>{' '}
-          and <code>g²</code>, then takes a step normalized by <code>√g²</code>. <strong>AdamW</strong> adds{' '}
+          Different parameters see gradients of wildly different magnitudes — a single global step size is either too
+          big for the loud parameters or too small for the quiet ones. <strong>Adam</strong> tracks per-parameter
+          running averages of <code>g</code> and <code>g²</code>, then takes a step normalized by <code>√g²</code>, so
+          each parameter's step is rescaled by its <em>own</em> gradient history rather than one shared rate. <strong>AdamW</strong> adds{' '}
           <em>decoupled weight decay</em>: instead of penalising <code>||θ||²</code> through the loss, the optimizer
           subtracts a small fraction of <code>θ</code> from itself at every step. This is the standard recipe for every
           modern LLM pretrain.
@@ -219,10 +220,10 @@ export function ScalingChapterBody() {
           non-zero values (typically 0.05-0.1) in the fine-tuning recipe.
         </p>
 
-        <h2>Reading a real config</h2>
+        <h2>Reading a representative config</h2>
         <p>
           The combination of tricks above turns a training run from "diverges immediately" into "converges at all." A
-          typical LLM pretrain config looks roughly like:
+          representative pretraining config — generic, not any specific model's published settings — looks roughly like:
         </p>
         <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 text-[12px]">
           {`optimizer:   AdamW(beta1=0.9, beta2=0.95, eps=1e-8, weight_decay=0.1)
@@ -269,23 +270,5 @@ total_steps: 500,000`}
         </p>
       </Prose>
     </ChapterFrame>
-  );
-}
-
-export type ScalingDemoProps = {
-  workerRef: React.RefObject<Worker | null>;
-  abortRef: React.RefObject<AbortController | null>;
-};
-
-export function ScalingDemo(_: ScalingDemoProps) {
-  return (
-    <div className="space-y-3 rounded-md border border-dashed border-border bg-background p-4">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">No live run for this chapter</div>
-      <p className="text-[13px] text-foreground/85">
-        Training is out-of-process for this browser app — the interactive widgets live inside the chapter body. Try
-        sliding the LR schedule's warmup down to 0 and watching the curve start at the peak: that's exactly the curve
-        every "loss exploded on step 1" run starts with.
-      </p>
-    </div>
   );
 }

@@ -80,14 +80,14 @@ const NORM_PAIRS: Array<{
   outputLabel: string;
 }> = [
   {
-    label: 'Attention RMSNorm',
+    label: 'Input RMSNorm (pre-mixer)',
     inputPoint: 'pre_attn_input',
     outputPoint: 'post_attn_norm',
-    inputLabel: 'Pre-attention norm input',
-    outputLabel: 'Pre-attention norm output',
+    inputLabel: 'Input RMSNorm input',
+    outputLabel: 'Input RMSNorm output',
   },
   {
-    label: 'MLP RMSNorm',
+    label: 'Pre-MLP RMSNorm',
     inputPoint: 'post_attn_residual',
     outputPoint: 'post_mlp_norm',
     inputLabel: 'Pre-MLP norm input',
@@ -218,7 +218,7 @@ export const learning: ChapterLearningData = {
       ],
       correctId: 'b',
       explanation:
-        'RMSNorm makes mean(x^2) ≈ 1, so the L2 of x is ≈ sqrt(hidden_dim). The learned gain modulates that per feature but never moves it by orders of magnitude.',
+        'RMSNorm makes mean(x^2) ≈ 1, so the L2 of x is ≈ sqrt(hidden_dim) (the learned gain can scale this up or down). The learned gain modulates that per feature but never moves it by orders of magnitude.',
     },
   ],
 };
@@ -232,8 +232,9 @@ export function RmsNormChapterBody() {
           <strong>One sentence:</strong> each of Qwen3.5's 24 layers adds attention and MLP outputs back into the same
           residual stream — without something holding magnitudes in check, the hidden vector grows until softmaxes
           saturate and gradient updates stop being meaningful. RMSNorm is the cheap, almost-stateless trick that puts
-          the brakes on. The chart on the right shows a real prompt: the residual still climbs about 15× over depth
-          (visible bottom line), but the input to each sub-block is held flat near √hidden_dim by RMSNorm (pink line).
+          the brakes on. The chart on the right shows a real prompt: the residual still climbs roughly an order of
+          magnitude over depth (visible bottom line), but the input to each sub-block is held flat near √hidden_dim by
+          RMSNorm (pink line).
         </p>
         <p>
           Before the formula, feel the problem the brakes solve. &ldquo;Softmaxes saturate&rdquo; sounds abstract — this

@@ -257,9 +257,10 @@ export function LmHeadWalkthrough() {
 
       <p className="text-[11px] text-muted-foreground">
         Every output entry is one inner product:{' '}
-        <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>. Each column of the matrix is the
-        "fingerprint" of one vocab token — when that column points in roughly the same direction as the hidden state,
-        the logit for that token is high.
+        <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>. Each column of this{' '}
+        <span className="font-mono">[d, V]</span> matrix — equivalently, a row of the untransposed{' '}
+        <span className="font-mono">[V, d]</span> weight — is the "fingerprint" of one vocab token; when that fingerprint
+        points in roughly the same direction as the hidden state, the logit for that token is high.
       </p>
 
       <p className="text-[10px] text-muted-foreground">

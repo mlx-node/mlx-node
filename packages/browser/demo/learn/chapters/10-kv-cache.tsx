@@ -869,7 +869,10 @@ function LayerSidePanel({ layerIdx, contextLen }: { layerIdx: number; contextLen
 
       {isFull ? (
         <div className="space-y-2 text-[12px] text-foreground/85">
-          <p>Stores K and V for every token. Cache scales linearly with context length.</p>
+          <p>
+            Stores K and V for every token (the leading <code>2</code> is the K/V pair, same as the{' '}
+            <code>[layers, 2, …]</code> shape above). Cache scales linearly with context length.
+          </p>
           <pre className="overflow-x-auto rounded bg-muted p-2 font-mono text-[11px] leading-5">
             <code>{`shape = [2, kv_heads=${NUM_KV_HEADS}, seq_len, d=${HEAD_DIM}]
 bytes = 2 · ${NUM_KV_HEADS} · seq_len · ${HEAD_DIM} · ${BYTES_PER_FLOAT}

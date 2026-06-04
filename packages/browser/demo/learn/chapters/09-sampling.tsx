@@ -241,6 +241,12 @@ export function SamplingChapterBody() {
           <em>actually</em> sampled (using its own internal sampler); compare it to the highest bar under your slider
           settings to see how a different temperature might have steered the generation.
         </p>
+        <p className="text-muted-foreground">
+          One caveat on the heights: the bars are softmax/top-p renormalized over only the captured top-
+          <code>{TOP_K}</code> logits, not the full 248,320-token vocabulary. The omitted tail
+          still carries real probability mass, so every bar reads a little higher than its true full-vocab probability —
+          most noticeably at high temperature, where the model spreads more mass into that discarded tail.
+        </p>
 
         <h2>When sampling goes wrong</h2>
         <p>

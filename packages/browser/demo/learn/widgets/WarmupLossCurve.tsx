@@ -266,7 +266,8 @@ export function WarmupLossCurve() {
 
       <p className="text-[10px] text-muted-foreground">
         Illustrative — both curves are scripted formulas (exponential decay vs a clamped blow-up), not live training
-        output.
+        output. The loss axis is compressed for legibility: a true random-init cross-entropy for a vocab this large is
+        ≈ ln(248,320) ≈ 12.4, not 6.5.
       </p>
     </div>
   );

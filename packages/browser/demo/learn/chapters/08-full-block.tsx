@@ -208,8 +208,8 @@ export function FullBlockChapterBody() {
             scores and MLP activations don't explode.
           </li>
           <li>
-            <strong>MLP</strong> (chapter 8) — a per-token feed-forward with the SwiGLU gated nonlinearity. It is where
-            most of the parameters live, and where per-token feature computation happens.
+            <strong>MLP</strong> (chapter 8) — a per-token feed-forward with the SwiGLU gated nonlinearity. It holds one
+            of the largest blocks of the model's parameters, and is where per-token feature computation happens.
           </li>
         </ul>
 
@@ -240,7 +240,8 @@ export function FullBlockChapterBody() {
           residual stream grows in L2 (the vector's length — the √ of the sum of its squared components) with depth,
           since each layer adds a non-zero contribution, while every <em>individual</em> sub-block's output stays small.
           The 3D widget on the right colors each ring by the per-token L2 of the layer output — you can see the
-          magnitude climb as you scan up the tower, exactly mirroring the bar growing in the animation.
+          magnitude generally climb as you scan up the tower (the trend is upward, though any single layer can dip),
+          roughly mirroring the bar growing in the animation.
         </p>
         <p className="text-muted-foreground">
           <strong>Mental model:</strong> think of the residual stream as a piece of working memory that the network
@@ -251,8 +252,8 @@ export function FullBlockChapterBody() {
         <h2>Hybrid attention: not every layer is "full"</h2>
         <p>
           Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast linear-attention variant called{' '}
-          <em>GatedDeltaNet</em>; only every fourth layer (indices 3, 7, 11, 15, 19, 23 on the 0.8B model) uses the
-          classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 4. Linear-attention layers do almost all the
+          <em>GatedDeltaNet</em>; only every fourth layer (indices 3, 7, 11, 15, 19, 23, 0-indexed, on the 0.8B model)
+          uses the classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 4. Linear-attention layers do almost all the
           across-token mixing under the tight memory budget of long contexts; full-attention layers appear at fixed
           intervals to do the heavy modelling that linear attention can't. The 3D widget highlights full-attention
           layers in a warmer color so you can see the interleave at a glance. Chapter 12 will dig into how this hybrid

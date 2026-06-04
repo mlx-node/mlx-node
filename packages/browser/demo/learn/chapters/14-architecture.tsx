@@ -629,6 +629,13 @@ const DETAILS: Record<string, Detail> = {
     body: 'Text becomes integer token ids and is embedded into the residual stream. The only input path the browser demo runs.',
     related: [{ chapterId: 'tokenization', label: 'Tokenization' }],
   },
+
+  // --- auxiliary MTP draft head (not used by this demo) ---
+  'mtp-head': {
+    title: 'MTP head — auxiliary draft',
+    facts: '1 extra layer · multi-token prediction · speculative decoding',
+    body: `A small multi-token-prediction head (mtp_num_hidden_layers 1) the checkpoint carries to predict an extra future token. It acts as an auxiliary objective during training, and supported runtimes can also use it at inference for speculative decoding — drafting a candidate next token that the main model then verifies. It is greyed out here because this browser demo (and ordinary, non-speculative generation) doesn't use it: a token's logits come only from the tied LM head. Like the vision encoder, it is part of the full checkpoint but off the path a token travels in this demo.`,
+  },
 };
 
 /** Live detail for the central `sequence` block, depending on the mixer toggle. */
@@ -912,7 +919,7 @@ function PosterSvg({
 
       {/* ---- captions ---- */}
       <text x={248} y={452} fontSize={15} fontWeight={700} textAnchor="middle" fill={ACCENT.ffn}>
-        Dense SwiGLU expert
+        Dense SwiGLU FFN
       </text>
       <text x={248} y={473} fontSize={11.5} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
         every layer, not a mixture of experts
@@ -1138,6 +1145,34 @@ function PosterSvg({
       })}
       {ib({ id: 'vision-project', x: 266, y: 1052, w: 184, h: 38, variant: 'state', label: 'project to hidden 1024' })}
       {ib({ id: 'text-input', x: 524, y: 1018, w: 102, h: 74, variant: 'io', label: 'Text', sub: 'token IDs · 248k' })}
+
+      {/* ---- auxiliary MTP draft head (greyed; not used by this demo) ---- */}
+      {/* Greyed dashed panel + faint branch off the LM-head region, mirroring how
+          the optional vision path is set apart. The box itself is interactive. */}
+      <DashedPanel x={950} y={150} w={196} h={86} color="currentColor" />
+      <path
+        d="M 910 204 C 932 204, 938 193, 950 193"
+        fill="none"
+        stroke="currentColor"
+        strokeOpacity={0.25}
+        strokeWidth={1.5}
+        strokeDasharray="6 5"
+      />
+      <text x={1048} y={172} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.45}>
+        not used by this demo
+      </text>
+      <g opacity={0.55}>
+        {ib({
+          id: 'mtp-head',
+          x: 966,
+          y: 184,
+          w: 164,
+          h: 44,
+          variant: 'io',
+          label: 'MTP head',
+          sub: 'speculative decoding · not in this demo',
+        })}
+      </g>
     </svg>
   );
 }

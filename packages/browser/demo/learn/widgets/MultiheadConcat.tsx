@@ -20,9 +20,10 @@ import { Button } from '../../components/ui/button';
  */
 
 const H = 8; // num heads (matches Qwen3.5-0.8B)
-const D_HEAD = 64;
+const D_HEAD = 256; // Qwen3.5-0.8B head_dim
 const SEQ_LEN = 5;
-const D_MODEL = H * D_HEAD; // 512
+const CONCAT_DIM = H * D_HEAD; // 8 × 256 = 2048 — the concatenated width
+const HIDDEN = 1024; // residual-stream width W_O projects back to (non-square)
 
 // One color per head — rotate around an oklch hue wheel so neighbours are
 // always distinguishable but the palette stays low-saturation enough not to
@@ -73,14 +74,14 @@ export function MultiheadConcat() {
         </span>
         . We stack them side-by-side along the feature axis to recover a{' '}
         <span className="font-mono">
-          [{SEQ_LEN}, {D_MODEL}]
+          [{SEQ_LEN}, {CONCAT_DIM}]
         </span>{' '}
         matrix, then project by the learned output matrix{' '}
         <span className="font-mono">
           W<sub>O</sub>
         </span>{' '}
-        back to <span className="font-mono">d_model</span>. Heads don't talk to each other inside attention — they only
-        mix afterward, here.
+        back to the <span className="font-mono">{HIDDEN}</span>-dim residual stream. Heads don't talk to each other
+        inside attention — they only mix afterward, here.
       </p>
 
       <svg
@@ -202,7 +203,7 @@ export function MultiheadConcat() {
           fill="currentColor"
           fillOpacity={0.8}
         >
-          concat · [seq={SEQ_LEN}, {H} × {D_HEAD} = {D_MODEL}]
+          concat · [seq={SEQ_LEN}, {H} × {D_HEAD} = {CONCAT_DIM}]
         </text>
 
         {/* × W_O step */}
@@ -251,7 +252,7 @@ export function MultiheadConcat() {
           fillOpacity={0.5}
           style={{ animation: `mhFade 400ms ease-out 1050ms both` }}
         >
-          [{D_MODEL}, {D_MODEL}]
+          [{CONCAT_DIM}, {HIDDEN}]
         </text>
 
         {/* arrow to final Z_attention */}
@@ -299,7 +300,7 @@ export function MultiheadConcat() {
           fillOpacity={0.55}
           style={{ animation: `mhFade 400ms ease-out 1250ms both` }}
         >
-          [seq={SEQ_LEN}, {D_MODEL}]
+          [seq={SEQ_LEN}, {HIDDEN}]
         </text>
       </svg>
 

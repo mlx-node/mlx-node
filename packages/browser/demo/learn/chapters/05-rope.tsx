@@ -23,6 +23,12 @@ import { RopeRelativeDial } from '../widgets/RopeRelativeDial';
 // `text_config.rope_parameters` block in the model's config.json. RoPE only
 // rotates the first `head_dim * partial_rotary_factor` = 64 features of each
 // 256-dim head, which is 32 pairs.
+//
+// Footnote: the real config is actually a multimodal/sectioned RoPE (mRoPE,
+// mrope_section [11, 11, 10]) because the base is a vision-language model that
+// also positions image tiles. For plain 1-D text generation that variant
+// reduces to the ordinary 1-D RoPE this chapter visualises, so we show the
+// 1-D core and skip the multimodal sectioning.
 const HEAD_DIM = 256;
 const PARTIAL_ROTARY_FACTOR = 0.25;
 const ROPE_DIMS = HEAD_DIM * PARTIAL_ROTARY_FACTOR; // 64 rotated dims
@@ -328,6 +334,12 @@ export function RopeChapterBody() {
           lowest-frequency pairs barely rotate at all over the model's <code>{MAX_POSITION.toLocaleString()}</code>
           -token context window — a key ingredient for long-context extrapolation.
         </p>
+        <p>
+          One more wrinkle specific to Qwen3.5's hybrid design: this RoPE rotation is applied{' '}
+          <strong>only on the 6 full-attention layers</strong> (those rotate the first <code>{ROPE_DIMS}</code> of{' '}
+          <code>{HEAD_DIM}</code> head dims, as above). The other 18 layers are linear (GatedDeltaNet) and encode
+          position implicitly through their recurrence plus a short causal convolution — no RoPE at all.
+        </p>
 
         <h2>The relative-position property</h2>
         <p>
@@ -340,8 +352,9 @@ export function RopeChapterBody() {
         <p>
           The third panel on the right makes this concrete. Holding the query position fixed at{' '}
           <code>m = {DOT_QUERY_POS}</code> and varying the key position <code>n</code>, the rotated dot product peaks
-          sharply at <code>n - m = 0</code> and decays as you move further apart. That decay is exactly the inductive
-          bias that makes attention "want" nearby tokens more than distant ones, with no per-position parameters at all.
+          sharply at <code>n - m = 0</code> and falls off (with ripples) either side as you move further apart. That
+          fall-off is exactly the inductive bias that makes attention "want" nearby tokens more than distant ones, with
+          no per-position parameters at all.
         </p>
         <p>
           You can feel the offset-only dependence directly. Shift both positions together and the score never budges:

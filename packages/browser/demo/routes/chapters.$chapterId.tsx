@@ -23,7 +23,7 @@ import { LmHeadChapterBody, LmHeadDemo } from '../learn/chapters/09-lm-head';
 import { SamplingChapterBody, SamplingDemo } from '../learn/chapters/09-sampling';
 import { KvCacheChapterBody, KvCacheDemo } from '../learn/chapters/10-kv-cache';
 import { TrainingChapterBody, TrainingDemo } from '../learn/chapters/12-training';
-import { ScalingChapterBody, ScalingDemo } from '../learn/chapters/13-scaling';
+import { ScalingChapterBody } from '../learn/chapters/13-scaling';
 import { ArchitectureChapterBody } from '../learn/chapters/14-architecture';
 import { PostTrainingChapterBody } from '../learn/chapters/15-post-training';
 import { LessonLayout } from '../learn/LessonLayout';
@@ -77,7 +77,7 @@ function ChapterRouteComponent() {
   // WebGPU bring-up. The model/device demos are wrapped in <ModelConsentLayer>
   // (below), which surfaces an explicit consent CTA. Loading happens only on a
   // user click (that CTA or the global header Load button). Pure-JS `none`
-  // demos (rope, kv-cache, scaling) render immediately and need nothing.
+  // demos (rope, kv-cache) render immediately and need nothing.
 
   // errorBanner is a single GLOBAL loader state. A failed load on a prior
   // chapter would otherwise carry its error message into THIS freshly-opened
@@ -94,10 +94,10 @@ function ChapterRouteComponent() {
   // the root route's head manager (routes/__root.tsx) on pathname change.
 
   // The chapter's live demo, or null for panel-less chapters (overview,
-  // post-training, architecture — their inline content/poster lives in the
-  // body). `none`-resource demos (rope, kv-cache, scaling) render here
-  // immediately; model/device demos are gated by <ModelConsentLayer> at the
-  // wire-in below, so they only mount once their resource is ready.
+  // post-training, architecture, scaling — their inline content/poster lives in
+  // the body). `none`-resource demos (rope, kv-cache) render here immediately;
+  // model/device demos are gated by <ModelConsentLayer> at the wire-in below, so
+  // they only mount once their resource is ready.
   const demoPanel =
     chapter.id === 'attention' ? (
       <AttentionDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
@@ -123,11 +123,9 @@ function ChapterRouteComponent() {
       <KvCacheDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
     ) : chapter.id === 'training' ? (
       <TrainingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
-    ) : chapter.id === 'scaling' ? (
-      <ScalingDemo workerRef={mlxWorkerRef} abortRef={inspectorAbortRef} />
     ) : null;
-  // 'architecture', 'overview', 'post-training' render inline in the body and
-  // intentionally have no "Try it now" panel (the column is dropped).
+  // 'scaling', 'architecture', 'overview', 'post-training' render inline in the
+  // body and intentionally have no "Try it now" panel (the column is dropped).
 
   const hasDemoPanel = demoPanel !== null;
 
@@ -164,8 +162,8 @@ function ChapterRouteComponent() {
         // Gate ONLY the demo panel; the reading body always renders. model and
         // device demos are wrapped in <ModelConsentLayer>, which shows a
         // consent CTA (no auto-download) and mounts the live demo only once its
-        // resource is ready. Pure-JS `none` demos (rope, kv-cache, scaling)
-        // need nothing and render directly.
+        // resource is ready. Pure-JS `none` demos (rope, kv-cache) need nothing
+        // and render directly.
         hasDemoPanel && (isModelPanelChapter || isDeviceOnlyChapter) ? (
           <ModelConsentLayer mode={isDeviceOnlyChapter ? 'device' : 'model'}>{demoPanel}</ModelConsentLayer>
         ) : (

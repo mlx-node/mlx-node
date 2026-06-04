@@ -611,7 +611,8 @@ export function EmbeddingsChapterBody() {
         <p>
           Click <strong>Load embeddings</strong>. The widget tokenizes ~110 words from six categories (animals, numbers,
           colors, countries, verbs, food), looks up each word's first-token embedding through the model worker, and runs
-          PCA in your browser. Expect to see:
+          PCA in your browser. Each word is plotted by its <em>first</em> sub-word token only, so a word that tokenizes
+          into several pieces is represented here by just its opening fragment. Expect to see:
         </p>
         <ul>
           <li>

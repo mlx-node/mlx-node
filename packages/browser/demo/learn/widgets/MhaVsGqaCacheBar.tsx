@@ -6,7 +6,10 @@ import * as React from 'react';
  * context length. All numbers derived from the model's config below.
  */
 
-const NUM_LAYERS = 24;
+// Only the 6 full-attention layers keep a growing KV cache. The other 18
+// layers are linear (GatedDeltaNet) and hold a fixed-size recurrent state
+// instead, so they contribute nothing to the cache that grows with context.
+const NUM_KV_LAYERS = 6;
 const NUM_HEADS = 8;
 const NUM_KV_HEADS = 2;
 const HEAD_DIM = 256;
@@ -14,7 +17,7 @@ const BYTES_PER_FLOAT = 2; // bf16
 const SEQ_LEN = 8192;
 
 function cacheBytes(kvHeads: number): number {
-  return NUM_LAYERS * 2 * kvHeads * HEAD_DIM * SEQ_LEN * BYTES_PER_FLOAT;
+  return NUM_KV_LAYERS * 2 * kvHeads * HEAD_DIM * SEQ_LEN * BYTES_PER_FLOAT;
 }
 
 function formatBytes(bytes: number): string {
@@ -62,7 +65,9 @@ export function MhaVsGqaCacheBar() {
         <div className="text-xs uppercase tracking-wider text-muted-foreground">
           KV cache · whole model · seq_len = {SEQ_LEN.toLocaleString()}
         </div>
-        <div className="text-[11px] text-muted-foreground">24 layers · head_dim = {HEAD_DIM} · bf16</div>
+        <div className="text-[11px] text-muted-foreground">
+          {NUM_KV_LAYERS} full-attention layers · head_dim = {HEAD_DIM} · bf16
+        </div>
       </div>
 
       <div className="space-y-2">
@@ -94,6 +99,11 @@ export function MhaVsGqaCacheBar() {
             </div>
           );
         })}
+      </div>
+
+      <div className="text-[11px] text-muted-foreground">
+        Only the {NUM_KV_LAYERS} full-attention layers keep a KV cache; the other 18 linear layers hold a fixed-size
+        recurrent state, so they don&apos;t grow with context.
       </div>
 
       <div className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-[12px] text-foreground/90">
