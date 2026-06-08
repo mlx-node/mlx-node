@@ -1,16 +1,19 @@
 // routes/chapters.index.tsx — Chapters index route (/chapters).
 //
 // The chapter list is pure, model-free content and ALWAYS renders — it is
-// never gated behind the model. Opening this route does NOT auto-download the
-// ~1.6 GB model: loading happens only via explicit user action (the consent
-// layer on a chapter's live panel, or the global header Load button).
+// never gated behind the model. Landing here pre-warms the model: when a HOSTED
+// model is available the route auto-starts the fetch on entry (gesture-free), so
+// it is ready by the time the reader opens a chapter. When no hosted model
+// exists the load needs the local-file picker (a user gesture), so we leave the
+// explicit affordances in place instead.
 //
-// The one model-dependent piece here is the <ForwardPassFlow> hero demo inside
-// <ChapterIndex>; it only auto-runs once the model is ready, and otherwise
-// surfaces its own "load the model" affordance. Navigation targets are driven
-// through the TanStack Router useNavigate hook.
+// The model-dependent piece here is the <ForwardPassFlow> hero demo inside
+// <ChapterIndex>; it auto-runs once the model is ready, and otherwise surfaces
+// its own "load the model" affordance. Navigation targets are driven through
+// the TanStack Router useNavigate hook.
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { useEffect } from 'react';
 
 import { ChapterIndex } from '../learn/ChapterIndex';
 import { triggerLocalPicker } from '../lib/local-model-picker';
@@ -21,6 +24,17 @@ function ChaptersIndexRouteComponent() {
   const navigate = useNavigate();
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
   const { status, hostedModelAvailable, kickoffLoad } = useModelLoader();
+
+  // Pre-warm on entry: auto-start the hosted-model fetch when landing on the
+  // index, so the model is loading/ready before the reader opens a chapter.
+  // Guarded to status 'idle' (never auto-retries a failed load or disturbs an
+  // in-flight/ready model) and to hostedModelAvailable === true (the no-hosted
+  // path needs triggerLocalPicker, which browsers only allow from a real user
+  // gesture). kickoffLoad is idempotent, so a re-run is harmless.
+  useEffect(() => {
+    if (status !== 'idle') return;
+    if (hostedModelAvailable === true) kickoffLoad();
+  }, [status, hostedModelAvailable, kickoffLoad]);
 
   return (
     <ChapterIndex
