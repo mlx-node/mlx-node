@@ -109,6 +109,65 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
     Ok(())
 }
 
+/// Pre-warm the OS page cache for every checkpoint shard under `dir` by reading
+/// each `*.safetensors` file sequentially on the CPU (top-level dir + the
+/// mlx-vlm `mtp-drafter/` sibling).
+///
+/// MLX loads weights as lazy mmap-backed arrays. The first GPU op to touch a
+/// cold mmap region page-faults inside a Metal command buffer; on slow storage
+/// (e.g. a model served off a USB SSD) that stall can exceed the macOS GPU
+/// command-buffer watchdog (~5 s) and abort the process uncatchably with
+/// `kIOGPUCommandBufferCallbackErrorTimeout`. A plain CPU read is immune to the
+/// GPU watchdog and populates the unified buffer cache the mmap shares, so every
+/// subsequent eval hits resident pages — the in-engine equivalent of a manual
+/// `cat model.safetensors >/dev/null`. Best-effort: open/read errors are logged
+/// and ignored (load then proceeds exactly as it would have without pre-warming).
+fn prewarm_checkpoint_pages(dir: &Path) {
+    use std::io::Read;
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    for d in [dir.to_path_buf(), dir.join("mtp-drafter")] {
+        let Ok(read_dir) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+                files.push(p);
+            }
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    files.sort();
+
+    let start = std::time::Instant::now();
+    let mut buf = vec![0u8; 32 << 20];
+    let mut total: u64 = 0;
+    for p in &files {
+        match fs::File::open(p) {
+            Ok(mut f) => loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n as u64,
+                    Err(e) => {
+                        warn!("prewarm read error for {}: {}", p.display(), e);
+                        break;
+                    }
+                }
+            },
+            Err(e) => warn!("prewarm open error for {}: {}", p.display(), e),
+        }
+    }
+    info!(
+        "Pre-warmed {} checkpoint shard(s) ({:.1} GB) into the page cache in {:.1}s",
+        files.len(),
+        total as f64 / (1u64 << 30) as f64,
+        start.elapsed().as_secs_f64(),
+    );
+}
+
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
@@ -1480,7 +1539,31 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
 
-                // Apply weights
+                // WATCHDOG / cold-mmap pre-warm.
+                //
+                // `apply_weights_inner` (and the materialize below) eval the lazy
+                // mmap-backed weights. Those evals dispatch GPU copies/kernels
+                // that read the checkpoint bytes DIRECTLY from the mmap. On a slow
+                // / cold mmap source (e.g. a model served from a USB SSD) a GPU
+                // command buffer stalls on the page fault, and a single chunk /
+                // transpose can exceed the macOS GPU command-buffer watchdog
+                // (~5 s) → an uncatchable `kIOGPUCommandBufferCallbackErrorTimeout`
+                // abort mid-load (observed in materialize chunk 1 / ~layer 12 of
+                // qwen3.5-9B-bf16 off USB).
+                //
+                // Fix: sequentially READ the checkpoint files on the CPU first, so
+                // their pages are resident in the OS unified buffer cache (which
+                // the mmap shares) before any GPU op touches them. A plain CPU
+                // read is immune to the GPU watchdog — a slow read just takes
+                // longer, it never aborts — and turns every subsequent GPU eval
+                // into the proven-safe warm regime. (Note: routing the eval via
+                // the CPU *stream* does NOT help — the mmap arrays were created
+                // GPU-bound during load, so their eval runs on the GPU regardless
+                // of the current default stream. Warming the page cache is what
+                // the manual `cat model.safetensors >/dev/null` workaround does.)
+                prewarm_checkpoint_pages(path);
+
+                // Apply weights (GPU finalize precompute reads now-resident pages).
                 apply_weights_inner(
                     &mut inner,
                     &params,
@@ -1508,7 +1591,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     quant_group_size,
                 );
 
-                // Materialize mmap-backed weights
+                // Materialize mmap-backed weights. Pages were pre-warmed above, so
+                // the chunked eval runs in the warm regime (no GPU page-fault
+                // stalls); the chunking is still a defensive watchdog guard.
                 {
                     let arrays: Vec<&MxArray> = params.values().collect();
                     crate::array::memory::materialize_weights(&arrays)?;
