@@ -81,6 +81,17 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
   // the model, so it is unaffected.
   const hostedUnavailable = mode === 'model' && hostedModelAvailable === false;
 
+  // This layer only ever wraps the chapter route's demo, which AUTO-STARTS the
+  // load on entry (see routes/chapters.$chapterId.tsx). A 'prompt' state here
+  // therefore does NOT mean "click to begin" — the load is already coming, or
+  // the hosted-model probe (hostedModelAvailable === null) is still resolving.
+  // Showing a "Load model" CTA in that window is misleading (the user thinks a
+  // click is required) and is the source of the "I still had to click" report.
+  // Render the loading spinner instead — EXCEPT when there is genuinely no
+  // hosted model to auto-fetch (hostedUnavailable): that path needs a manual
+  // local-model-directory pick (a real user gesture), so it keeps the CTA.
+  const effectiveState = state === 'prompt' && !hostedUnavailable ? 'loading' : state;
+
   // The kickoff for this mode's CTA. For model mode without a hosted model, we
   // open the local-model directory picker instead.
   const kickoff = () => {
@@ -97,13 +108,14 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
 
   // Loading — reuse the existing PanelLoading visuals (spinner + progress +
   // aria-live announcement). The CTA is implicitly "disabled" because we render
-  // the spinner instead of the button.
-  if (state === 'loading') {
-    return <PanelLoading status={loadingText || null} progress={loadingProgress} />;
+  // the spinner instead of the button. `loadingText` is empty in the brief
+  // pre-kickoff/probe window, so fall back to a neutral "Preparing…" label.
+  if (effectiveState === 'loading') {
+    return <PanelLoading status={loadingText || 'Preparing the model…'} progress={loadingProgress} />;
   }
 
   // Error — surface the message + a Retry that re-triggers the kickoff.
-  if (state === 'error') {
+  if (effectiveState === 'error') {
     return (
       <div className="flex flex-col items-start gap-3 rounded-lg border border-destructive/50 bg-destructive/5 p-4">
         <p className="text-sm font-medium text-foreground">Couldn’t load the model</p>

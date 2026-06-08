@@ -2,11 +2,13 @@ import { ArrowLeftIcon, MessageSquareIcon } from 'lucide-react';
 import * as React from 'react';
 
 import type { AttentionRun } from '../../src/inspector-types';
+import { PanelLoading } from '../components/loading/PanelLoading';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Textarea } from '../components/ui/textarea';
 import { runForInspector } from '../lib/inspector-client';
+import { useModelLoader } from '../providers/model-loader';
 import { CHAPTERS, findChapter, type ChapterMeta } from './chapters';
 import { cleanupTokenText, renderTokenDisplay } from './inspector/TopKBars';
 import { RunButton } from './scaffolding/RunButton';
@@ -284,6 +286,12 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
   const [activeIdx, setActiveIdx] = React.useState<number>(0);
   const [speed, setSpeed] = React.useState<Speed>(1);
   const reducedMotion = usePrefersReducedMotion();
+  // Loader state for the consent gate below. The route auto-starts the load on
+  // entry, so the hero must show a loading spinner while that is in flight (or
+  // while the hosted-model probe is still resolving) rather than a misleading
+  // "Load model" CTA. `status` is aliased to avoid colliding with the local run
+  // status above.
+  const { status: loaderStatus, loadingText, loadingProgress, hostedModelAvailable } = useModelLoader();
 
   const fullAttentionLayerIndices = React.useMemo(() => {
     if (!run) return DEFAULT_FULL_ATTN_SET;
@@ -596,6 +604,29 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
   // run has captured a trace (`run != null`) we keep the full interactive view
   // even if the worker is later torn down.
   if (!modelReady && run == null) {
+    // The /chapters route auto-starts the model load on entry. So a not-ready
+    // hero almost always means "loading", not "waiting for a click": the load
+    // is in flight (loaderStatus === 'loading'), about to fire, or the hosted
+    // probe (hostedModelAvailable === null) is still resolving. Gating only on
+    // `modelReady` (the old behavior) kept this CTA visible for the WHOLE multi-
+    // second load, so the user saw "Load model" and clicked it even though it
+    // was already loading. Show the spinner for all those cases. Only fall back
+    // to the manual CTA when there is genuinely no hosted model to auto-fetch
+    // (hostedModelAvailable === false → needs a local-directory pick, a user
+    // gesture) or a load errored (the CTA doubles as Retry).
+    const needsManualAction = hostedModelAvailable === false || loaderStatus === 'error';
+    if (!needsManualAction) {
+      return (
+        <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+              One forward pass, end to end — real model run
+            </div>
+          </div>
+          <PanelLoading status={loadingText || 'Preparing the model…'} progress={loadingProgress} />
+        </div>
+      );
+    }
     return (
       <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -606,16 +637,16 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
         <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
           <p className="text-sm font-medium text-foreground">Watch the model think — live, in your browser</p>
           <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
-            Loads the real Qwen3.5-0.8B (~1.6 GB) and runs one forward pass, replaying every layer through a card stack.
-            Runs entirely on your device — nothing leaves your browser. The chapters below are fully readable without
-            it.
+            {hostedModelAvailable === false
+              ? 'This live demo needs the model. No hosted model is available here — choose a local model directory to run it. Everything runs on your device.'
+              : 'Loads the real Qwen3.5-0.8B (~1.6 GB) and runs one forward pass, replaying every layer through a card stack. Runs entirely on your device — nothing leaves your browser. The chapters below are fully readable without it.'}
           </p>
           <button
             type="button"
             onClick={onLoadModel}
             className="rounded-lg border border-primary/50 bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
           >
-            Load model
+            {loaderStatus === 'error' ? 'Retry' : hostedModelAvailable === false ? 'Choose local model' : 'Load model'}
           </button>
         </div>
       </div>
