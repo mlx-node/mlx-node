@@ -36,12 +36,13 @@ import { useModelLoader } from '../providers/model-loader';
 // by the resource it needs:
 //
 //   model  — needs the full ~1.6 GB model ('ready'); wrapped in a
-//            <ModelConsentLayer mode="model">, which shows a consent CTA until
-//            the user explicitly loads the model. NOTHING auto-downloads.
+//            <ModelConsentLayer mode="model">. On entry the route auto-starts a
+//            HOSTED fetch (see the auto-load effect below); when no hosted model
+//            is available the layer's CTA stays as the local-picker fallback.
 //   device — needs only the WebGPU device + WASM runtime, NOT the model
 //            (Training trains a tiny from-scratch transformer); wrapped in a
-//            <ModelConsentLayer mode="device">, whose CTA brings up WebGPU with
-//            no download.
+//            <ModelConsentLayer mode="device">. On entry the route auto-brings
+//            up WebGPU (no download); the CTA remains as a manual/retry fallback.
 //   none   — pure JS, needs nothing; the demo renders immediately with no
 //            consent gate and triggers NO load.
 //
@@ -68,16 +69,41 @@ function ChapterRouteComponent() {
   const { chapter } = Route.useRouteContext();
   const navigate = useNavigate();
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
-  const { status, hostedModelAvailable, kickoffLoad, clearLoadError } = useModelLoader();
+  const { status, hostedModelAvailable, kickoffLoad, kickoffDeviceOnly, clearLoadError } = useModelLoader();
 
   const isModelPanelChapter = MODEL_PANEL_CHAPTERS.has(chapter.id);
   const isDeviceOnlyChapter = DEVICE_ONLY_CHAPTERS.has(chapter.id);
 
-  // No auto-kickoff: opening a chapter NEVER starts the ~1.6 GB download or a
-  // WebGPU bring-up. The model/device demos are wrapped in <ModelConsentLayer>
-  // (below), which surfaces an explicit consent CTA. Loading happens only on a
-  // user click (that CTA or the global header Load button). Pure-JS `none`
-  // demos (rope, kv-cache) render immediately and need nothing.
+  // Auto-load on chapter entry: opening a chapter whose demo needs a resource
+  // now starts the load automatically instead of waiting for a click — but only
+  // along the paths that need NO user gesture:
+  //   - device-only chapters (Training): bring the WebGPU device up. No model
+  //     download; kickoffDeviceOnly is idempotent.
+  //   - model-panel chapters: only when a HOSTED model is available, so the
+  //     fetch is a gesture-free download. When no hosted model exists the load
+  //     needs the local-file picker (triggerLocalPicker), which browsers only
+  //     allow from a real user gesture — so we leave that chapter's consent CTA
+  //     in place rather than failing to open a dialog.
+  // Guarded to status 'idle': this never auto-retries a failed load (which could
+  // loop on an unsupported device) and never disturbs an in-flight/ready model.
+  // The <ModelConsentLayer> still renders the loading/error/ready states; its
+  // CTA stays as the manual fallback (notably the local-picker path above).
+  useEffect(() => {
+    if (status !== 'idle') return;
+    if (isDeviceOnlyChapter) {
+      kickoffDeviceOnly();
+    } else if (isModelPanelChapter && hostedModelAvailable === true) {
+      kickoffLoad();
+    }
+  }, [
+    chapter.id,
+    status,
+    isModelPanelChapter,
+    isDeviceOnlyChapter,
+    hostedModelAvailable,
+    kickoffLoad,
+    kickoffDeviceOnly,
+  ]);
 
   // errorBanner is a single GLOBAL loader state. A failed load on a prior
   // chapter would otherwise carry its error message into THIS freshly-opened
@@ -160,10 +186,11 @@ function ChapterRouteComponent() {
       }}
       tryItPanel={
         // Gate ONLY the demo panel; the reading body always renders. model and
-        // device demos are wrapped in <ModelConsentLayer>, which shows a
-        // consent CTA (no auto-download) and mounts the live demo only once its
-        // resource is ready. Pure-JS `none` demos (rope, kv-cache) need nothing
-        // and render directly.
+        // device demos are wrapped in <ModelConsentLayer>, which surfaces the
+        // loading/error/ready states (and a manual CTA fallback) and mounts the
+        // live demo only once its resource is ready. The route auto-starts the
+        // load on entry (see the auto-load effect above). Pure-JS `none` demos
+        // (rope, kv-cache) need nothing and render directly.
         hasDemoPanel && (isModelPanelChapter || isDeviceOnlyChapter) ? (
           <ModelConsentLayer mode={isDeviceOnlyChapter ? 'device' : 'model'}>{demoPanel}</ModelConsentLayer>
         ) : (
