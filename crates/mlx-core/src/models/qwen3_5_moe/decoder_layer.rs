@@ -21,6 +21,15 @@ pub enum AttentionType {
 }
 
 /// MLP type for a decoder layer.
+///
+/// The `Dense` variant carries an inline `MLPVariant` (which embeds a dense
+/// `MLP`); the `MoE` variant is already boxed. The `MLP` struct gained the
+/// Stage-3 int8 W8A8 prefill quant fields (`gate_up_w_i8`/`s_w`,
+/// `down_w_i8`/`s_w`), pushing the inline `Dense` payload just past clippy's
+/// 200-byte `large_enum_variant` threshold. Boxing `Dense` would ripple through
+/// ~37 MoE match sites for no runtime benefit — this enum is constructed once
+/// per layer at load, never in a hot loop — so we allow the size asymmetry.
+#[allow(clippy::large_enum_variant)]
 pub enum MLPType {
     Dense(MLPVariant),
     MoE(Box<SparseMoeBlock>),
