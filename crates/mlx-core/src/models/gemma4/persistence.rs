@@ -13,6 +13,7 @@ use crate::models::quant_dispatch::{
 };
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    prewarm_checkpoint_pages,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -1286,6 +1287,18 @@ impl Gemma4Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
+
+        // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
+        // of any mmap-backed weight (FP8 dequant in `dequant_fp8_weights`,
+        // `sanitize_weights`, the MoE gate/up concatenate fusion below,
+        // `apply_weights`, and the final `materialize_weights`). On a slow/cold
+        // mmap source (e.g. a model served off a USB SSD) the first GPU op to
+        // page-fault a cold region can exceed the macOS GPU command-buffer
+        // watchdog (~5 s) and abort uncatchably. Reading the shards on the CPU
+        // first makes every later eval hit resident pages. See
+        // `prewarm_checkpoint_pages`.
+        prewarm_checkpoint_pages(path);
+
         info!("Loaded {} tensors from safetensors", params.len());
 
         // FP8 dequantization (if applicable)

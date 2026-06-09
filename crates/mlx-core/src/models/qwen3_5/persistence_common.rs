@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::utils::safetensors::load_safetensors_lazy;
@@ -90,6 +90,118 @@ pub(crate) fn load_all_safetensors(
     }
 
     Ok(all_params)
+}
+
+/// The directories a model loader may mmap checkpoint shards from, scanned
+/// (non-recursively) by the prewarm. Besides the model dir itself, MTP-capable
+/// checkpoints keep the speculative-decode head in a `mtp-drafter/` or `mtp/`
+/// subdir, or in a sibling `<name>-mtp/` directory — the layouts probed by
+/// `detect_drafter_safetensors` and `mtp_sidecar_candidates`. Every entry is
+/// best-effort and simply no-ops where absent, so this list is safe for every
+/// family (only Qwen3.5 dense/MoE actually populate the MTP locations).
+fn standard_checkpoint_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.to_path_buf(), dir.join("mtp-drafter"), dir.join("mtp")];
+    if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
+        dirs.push(parent.join(format!("{}-mtp", name.to_string_lossy())));
+    }
+    dirs
+}
+
+/// Collect every `*.safetensors` directly under each of `dirs` (missing dirs
+/// skipped), plus any `extra_files` that actually exist. Sorted and de-duped so
+/// a file reachable via two layouts (e.g. `mtp.safetensors` both top-level and
+/// as a sidecar candidate) is warmed once.
+fn collect_safetensors(dirs: &[PathBuf], extra_files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        let Ok(read_dir) = fs::read_dir(d) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+                files.push(p);
+            }
+        }
+    }
+    // `extra_files` may name not-yet-resolved sidecar candidates; keep only the
+    // ones present so a non-existent custom path is silently skipped (no warn).
+    for f in extra_files {
+        if f.is_file() {
+            files.push(f.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Sequentially read each file on the CPU into a throwaway buffer. Best-effort:
+/// open/read errors are logged and ignored.
+fn prewarm_files(files: &[PathBuf]) {
+    use std::io::Read;
+
+    if files.is_empty() {
+        return;
+    }
+    let start = std::time::Instant::now();
+    let mut buf = vec![0u8; 32 << 20];
+    let mut total: u64 = 0;
+    for p in files {
+        match fs::File::open(p) {
+            Ok(mut f) => loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n as u64,
+                    Err(e) => {
+                        warn!("prewarm read error for {}: {}", p.display(), e);
+                        break;
+                    }
+                }
+            },
+            Err(e) => warn!("prewarm open error for {}: {}", p.display(), e),
+        }
+    }
+    info!(
+        "Pre-warmed {} checkpoint shard(s) ({:.1} GB) into the page cache in {:.1}s",
+        files.len(),
+        total as f64 / (1u64 << 30) as f64,
+        start.elapsed().as_secs_f64(),
+    );
+}
+
+/// Pre-warm the OS page cache for every checkpoint shard a loader may mmap by
+/// reading each `*.safetensors` file sequentially on the CPU. Covers the model
+/// dir plus the MTP head layouts ([`standard_checkpoint_dirs`]).
+///
+/// MLX loads weights as lazy mmap-backed arrays. The first GPU op to touch a
+/// cold mmap region page-faults inside a Metal command buffer; on slow storage
+/// (e.g. a model served off a USB SSD) that stall can exceed the macOS GPU
+/// command-buffer watchdog (~5 s) and abort the process uncatchably with
+/// `kIOGPUCommandBufferCallbackErrorTimeout`. A plain CPU read is immune to the
+/// GPU watchdog and populates the unified buffer cache the mmap shares, so every
+/// subsequent eval (FP8 dequant, weight finalize, materialize) hits resident
+/// pages — the in-engine equivalent of a manual `cat model.safetensors >/dev/null`.
+/// Routing GPU evals via the CPU *stream* does NOT help: the mmap arrays are
+/// created GPU-bound during load, so their eval runs on the GPU regardless of
+/// the current default stream. Warming the page cache is the fix.
+///
+/// Best-effort: open/read errors are logged and ignored, so load then proceeds
+/// exactly as it would have without pre-warming. Shared across every model
+/// family that loads via [`load_all_safetensors`].
+pub(crate) fn prewarm_checkpoint_pages(dir: &Path) {
+    prewarm_files(&collect_safetensors(&standard_checkpoint_dirs(dir), &[]));
+}
+
+/// Like [`prewarm_checkpoint_pages`] but also warms `extra_files` — explicit
+/// sidecar paths a loader resolves from config (e.g. a non-standard
+/// `mlx_lm_extra_tensors.mtp_file`) that the [`standard_checkpoint_dirs`] scan
+/// would not reach. Non-existent entries are skipped.
+pub(crate) fn prewarm_checkpoint_pages_with(dir: &Path, extra_files: &[PathBuf]) {
+    prewarm_files(&collect_safetensors(
+        &standard_checkpoint_dirs(dir),
+        extra_files,
+    ));
 }
 
 /// FP8 E4M3 block-wise dequantization: weight * scale_inv with block_size=128
@@ -247,4 +359,69 @@ pub(crate) fn get_config_bool(
         }
     }
     default
+}
+
+#[cfg(test)]
+mod prewarm_tests {
+    use super::*;
+
+    fn touch(p: &Path) {
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(p, b"").expect("touch");
+    }
+
+    // Regression for the cold-mmap prewarm: the set of files we warm MUST cover
+    // every safetensors location a loader can later mmap — the model dir AND the
+    // MTP head layouts (`mtp-drafter/`, `mtp/`, sibling `<name>-mtp/`) plus an
+    // explicit non-standard sidecar passed as an `extra_file`. Missing any of
+    // these re-opens the watchdog hole this fix closes.
+    #[test]
+    fn collect_safetensors_covers_mtp_sidecar_and_drafter_layouts() {
+        let root = std::env::temp_dir().join(format!("prewarm_cover_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let model = root.join("my-model");
+
+        let top = model.join("model.safetensors");
+        let mtp_subdir = model.join("mtp").join("weights.safetensors");
+        let drafter = model.join("mtp-drafter").join("model.safetensors");
+        let sibling = root.join("my-model-mtp").join("model.safetensors");
+        let custom = model.join("custom").join("mtp-sidecar.safetensors");
+        for p in [&top, &mtp_subdir, &drafter, &sibling, &custom] {
+            touch(p);
+        }
+        // A non-existent extra candidate (e.g. an unmatched sidecar name) and a
+        // non-safetensors file must both be excluded.
+        let absent = model.join("nope.safetensors");
+        touch(&model.join("config.json"));
+
+        let found = collect_safetensors(
+            &standard_checkpoint_dirs(&model),
+            &[custom.clone(), absent.clone()],
+        );
+
+        for p in [&top, &mtp_subdir, &drafter, &sibling, &custom] {
+            assert!(found.contains(p), "prewarm set missing {}", p.display());
+        }
+        assert!(!found.contains(&absent), "non-existent extra leaked in");
+        assert!(
+            !found.iter().any(|p| p.ends_with("config.json")),
+            "non-safetensors file leaked in"
+        );
+
+        // De-dup: a path reachable both via the dir scan and as an explicit
+        // extra appears exactly once.
+        let with_dup = collect_safetensors(
+            &standard_checkpoint_dirs(&model),
+            std::slice::from_ref(&top),
+        );
+        assert_eq!(
+            with_dup.iter().filter(|p| **p == top).count(),
+            1,
+            "top-level shard duplicated"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

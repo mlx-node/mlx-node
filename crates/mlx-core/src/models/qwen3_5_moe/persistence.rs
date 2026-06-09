@@ -19,6 +19,7 @@ use crate::models::qwen3_5::persistence::{
 };
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    prewarm_checkpoint_pages,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -1039,6 +1040,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Load all weights
                     let mut raw_params = load_all_safetensors(path, false)?;
+
+                    // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
+                    // of any mmap-backed weight (FP8 dequant + MTP-norm probe in
+                    // `sanitize_weights`, the per-layer finalize in
+                    // `apply_weights_moe_inner`, and the final `materialize_weights`).
+                    // On a slow/cold mmap source (e.g. a model served off a USB SSD)
+                    // the first GPU op to page-fault a cold region can exceed the
+                    // macOS GPU command-buffer watchdog (~5 s) and abort uncatchably.
+                    // Reading the shards (plus any `mtp-drafter/`) on the CPU first
+                    // makes every later eval hit resident pages. See
+                    // `prewarm_checkpoint_pages`.
+                    prewarm_checkpoint_pages(path);
+
                     // MTP head discovery precedence (backward-compat mandatory):
                     //   1. inline `mtp.*` tensors in the body shards (existing
                     //      MoE-MTP checkpoints — kept as-is by sanitize);

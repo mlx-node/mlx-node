@@ -14,6 +14,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
+use crate::models::qwen3_5::persistence_common::prewarm_checkpoint_pages;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
 
@@ -489,6 +490,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
 
                     // Load weights
                     let mapped_params = load_safetensors_mapped(path)?;
+
+                    // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU
+                    // eval of any mmap-backed weight (the per-layer `set_weight`
+                    // finalize below). On a slow/cold mmap source (e.g. a model
+                    // served off a USB SSD) the first GPU op to page-fault a cold
+                    // region can exceed the macOS GPU command-buffer watchdog
+                    // (~5 s) and abort uncatchably. Reading the shards on the CPU
+                    // first makes every later eval hit resident pages. See
+                    // `prewarm_checkpoint_pages`.
+                    prewarm_checkpoint_pages(path);
 
                     // Validate parameters
                     validate_loaded_parameters(&mapped_params, &config)?;

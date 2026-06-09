@@ -12,7 +12,9 @@ use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
     load_quant_settings_from_disk, resolve_default_mode,
 };
-use crate::models::qwen3_5::persistence_common::{dequant_fp8_weights, load_all_safetensors};
+use crate::models::qwen3_5::persistence_common::{
+    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+};
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
@@ -1296,6 +1298,18 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
+
+        // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
+        // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor
+        // rewiring in `sanitize_weights`, the per-layer finalize in
+        // `apply_weights`, and the final `materialize_weights`). On a slow/cold
+        // mmap source (e.g. a model served off a USB SSD) the first GPU op to
+        // page-fault a cold region can exceed the macOS GPU command-buffer
+        // watchdog (~5 s) and abort uncatchably. Reading the shards on the CPU
+        // first makes every later eval hit resident pages. See
+        // `prewarm_checkpoint_pages`.
+        prewarm_checkpoint_pages(path);
+
         info!("Loaded {} tensors from safetensors", params.len());
 
         // FP8 dequantization (if applicable)
