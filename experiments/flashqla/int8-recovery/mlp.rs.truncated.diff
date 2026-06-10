@@ -1,0 +1,250 @@
+diff --git a/crates/mlx-core/src/transformer/mlp.rs b/crates/mlx-core/src/transformer/mlp.rs
+index 7921c672..30d89925 100644
+--- a/crates/mlx-core/src/transformer/mlp.rs
++++ b/crates/mlx-core/src/transformer/mlp.rs
+@@ -1,10 +1,39 @@
+ use crate::array::MxArray;
+-#[cfg(test)]
++use crate::models::qwen3_5::int8_gemm;
+ use crate::nn::Activations;
+ use crate::nn::Linear;
+ use mlx_sys as sys;
+ use napi::bindgen_prelude::*;
+ 
++/// Default minimum `M = batch * seq_len` at which the int8 W8A8 prefill GEMM is
++/// worth taking. Below this (notably `M == 1` decode), per-token activation
++/// quant overhead dominates and int8 regresses vs bf16, so we fall through to
++/// the bf16 path. Override via `MLX_INT8_PREFILL_MIN_M`.
++const INT8_PREFILL_MIN_M_DEFAULT: i64 = 256;
++
++/// Returns `true` when `MLX_INT8_PREFILL` is set to a truthy value (non-empty,
++/// not "0"/"false"). The int8 W8A8 prefill path is OFF by default — the bf16
++/// fused path is the unchanged default.
++fn int8_prefill_enabled() -> bool {
++    match std::env::var("MLX_INT8_PREFILL") {
++        Ok(v) => {
++            let v = v.trim();
++            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
++        }
++        Err(_) => false,
++    }
++}
++
++/// The `M` threshold (`batch * seq_len`) at or above which the int8 path is
++/// taken. Reads `MLX_INT8_PREFILL_MIN_M`, falling back to the default.
++fn int8_prefill_min_m() -> i64 {
++    std::env::var("MLX_INT8_PREFILL_MIN_M")
++        .ok()
++        .and_then(|v| v.trim().parse::<i64>().ok())
++        .filter(|&v| v >= 0)
++        .unwrap_or(INT8_PREFILL_MIN_M_DEFAULT)
++}
++
+ /// Multi-Layer Perceptron with SwiGLU activation.
+ ///
+ /// Uses the gated linear unit activation popularized by models like Llama and Qwen:
+@@ -23,6 +52,19 @@ pub struct MLP {
+     /// E39: pre-transposed down_proj weight `[hidden, intermediate]`. Same idea:
+     /// hoist the per-forward transpose to load time.
+     down_proj_wt: Option<MxArray>,
++    /// Stage 3 (NA int8 W8A8 prefill): opaque int8 quant of the fused
++    /// `[gate; up]` weight `[2*intermediate, hidden]` (rows = output channels =
++    /// `N`, matching `quantize_weight_int8`'s `[N, K]` contract). Populated by
++    /// `finalize_gate_up()` ONLY when `MLX_INT8_PREFILL` is truthy. `None` keeps
++    /// the bf16 path as the unchanged default.
++    gate_up_w_i8: Option<MxArray>,
++    /// Per-output-channel f32 scale `[2*intermediate]` for `gate_up_w_i8`.
++    gate_up_s_w: Option<MxArray>,
++    /// Opaque int8 quant of the down_proj weight `[hidden, intermediate]`
++    /// (`[N=hidden, K=intermediate]`).
++    down_w_i8: Option<MxArray>,
++    /// Per-output-channel f32 scale `[hidden]` for `down_w_i8`.
++    down_s_w: Option<MxArray>,
+ }
+ 
+ impl MLP {
+@@ -43,6 +85,10 @@ impl MLP {
+             down_proj,
+             gate_up_proj_wt: None,
+             down_proj_wt: None,
++            gate_up_w_i8: None,
++            gate_up_s_w: None,
++            down_w_i8: None,
++            down_s_w: None,
+         })
+     }
+ 
+@@ -70,9 +116,142 @@ impl MLP {
+         wd_t.eval();
+         self.gate_up_proj_wt = Some(wgu_t);
+         self.down_proj_wt = Some(wd_t);
++
++        // Stage 3 (NA int8 W8A8 prefill, opt-in via MLX_INT8_PREFILL): quantize
++        // the fused gate_up and down weights to int8 ONCE at load.
++        //
++        // LAYOUT: `quantize_weight_int8` expects `[N, K]` with rows = output
++        // channels so its `s_w[N]` scale broadcasts onto the GEMM accumulator
++        // `acc[M, N]`. The UN-transposed `stacked` is `[2*intermediate, hidden]`
++        // = `[N=2*intermediate, K=hidden]`, and `w_down` is
++        // `[hidden, intermediate]` = `[N=hidden, K=intermediate]` — both already
++        // in `[N, K]`, so we pass them straight in (the `*_wt` transposed forms
++        // are for the bf16 matmul ONLY and must NOT be quantized here).
++        //
++        // Stage 4b: `quantize_weight_int8` now ALSO hoists the per-forward
++        // transpose — it returns the opaque int8 weight already in the `[K, N]`
++        // kernel layout, so `try_forward_int8` does zero weight reshaping. The
++        // stored orientation is opaque to Rust; we still pass the `[N, K]` input.
++        //
++        // SCOPE: int8 prefill is DENSE qwen3_5 ONLY. qwen3_5_moe routes its MLP
++        // through the per-expert SwitchMLP / gather_qmm persistence path and never
++        // calls this `finalize_gate_up()`, so `MLX_INT8_PREFILL` is a silent bf16
++        // no-op on MoE (intended — not wired for MoE; documented, not fixed).
++        //
++        // MEMORY: with the flag ON, BOTH the bf16 stacked/transposed weight
++        // (`gate_up_proj_wt` / `down_proj_wt`, above) AND the int8 weight stay
++        // resident — the bf16 form is the per-call `Err`-fallback target in
++        // `try_forward_int8`. Opt-in trades extra weight memory for prefill speed.
++        //
++        // VALIDATED REGIME: opt-in, greedy (T=0), bf16 models, prefill M>=256.
++        // Sampling / MTP / long-context (>8k) are NOT yet validation-gated, which
++        // is why this path is deliberately default-OFF.
++        self.gate_up_w_i8 = None;
++        self.gate_up_s_w = None;
++        self.down_w_i8 = None;
++        self.down_s_w = None;
++        if int8_prefill_enabled() {
++            // Fail-soft: if quant fails (e.g. unsupported shape), leave the
++            // fields None so forward() stays on the unchanged bf16 path.
++            if let Ok((gu_i8, gu_s)) = int8_gemm::quantize_weight_int8(&stacked) {
++                gu_i8.eval();
++                gu_s.eval();
++                self.gate_up_w_i8 = Some(gu_i8);
++                self.gate_up_s_w = Some(gu_s);
++            }
++            if let Ok((d_i8, d_s)) = int8_gemm::quantize_weight_int8(&w_down) {
++                d_i8.eval();
++                d_s.eval();
++                self.down_w_i8 = Some(d_i8);
++                self.down_s_w = Some(d_s);
++            }
++        }
+         Ok(())
+     }
+ 
++    /// Stage 3 NA int8 W8A8 prefill MLP path.
++    ///
++    /// Returns:
++    ///   * `Ok(Some(out))` — the int8 path ran and produced the MLP output.
++    ///   * `Ok(None)`      — not eligible (flag off / no int8 weights / `M`
++    ///     below threshold / a fail-soft int8-op `Err`); caller must use bf16.
++    ///   * `Err`           — only a genuine non-int8 error (reshape/shape).
++    ///
++    /// Pipeline (mirrors `mlx_swiglu_mlp_forward_stacked`):
++    ///   `x[B,T,hidden]` → `[M, hidden]`
++    ///   → `gate_up = int8_w8a8(x, gate_up_w_i8, gate_up_s_w)` `[M, 2*inter]`
++    ///   → split → `swiglu = silu(gate) * up` (bf16, no f32 promotion)
++    ///   → `out = int8_w8a8(swiglu, down_w_i8, down_s_w)` `[M, hidden]`
++    ///   → reshape back to the original leading dims.
++    ///
++    /// The int8 op narrows its result to bf16 internally, so the residual add in
++    /// the caller is not promoted to f32.
++    fn try_forward_int8(&self, x: &MxArray) -> Result<Option<MxArray>> {
++        // Gate 1: flag + quantized weights present.
++        let (Some(gu_i8), Some(gu_s), Some(d_i8), Some(d_s)) = (
++            &self.gate_up_w_i8,
++            &self.gate_up_s_w,
++            &self.down_w_i8,
++            &self.down_s_w,
++        ) else {
++            return Ok(None);
++        };
++        if !int8_prefill_enabled() {
++            return Ok(None);
++        }
++
++        // Gate 2: M = product of leading dims (everything but the last). For
++        // `[B, T, hidden]`, M = B*T; for already-2D `[M, hidden]`, M = M.
++        let shape = x.shape()?;
++        let dims: &[i64] = &shape;
++        if dims.len() < 2 {
++            return Ok(None);
++        }
++        let hidden = dims[dims.len() - 1];
++        let m: i64 = dims[..dims.len() - 1].iter().product();
++        // M == 1 (decode) and small prefill regress vs bf16 → fall through.
++        if m < int8_prefill_min_m() {
++            return Ok(None);
++        }
++
++        // Reshape to 2D [M, hidden] for the int8 GEMM.
++        let x2d = x.reshape(&[m, hidden])?;
++
++        // gate_up: int8 W8A8. On Err (e.g. gen<17 / K%16!=0) fall back to bf16.
++        let gate_up = match int8_gemm::int8_w8a8_matmul(&x2d, gu_i8, gu_s) {
++            Ok(v) => v,
++            Err(_) => return Ok(None),
++        };
++        // gate_up: [M, 2*intermediate] → split halves.
++        let two_inter = gate_up.shape_at(1)?;
++        let intermediate = two_inter / 2;
++        let gate = gate_up.slice(&[0, 0], &[m, intermediate])?;
++        let up = gate_up.slice(&[0, intermediate], &[m, two_inter])?;
++
++        // swiglu = silu(gate) * up. `Activations::silu` preserves bf16 dtype, so
++        // `gated` stays bf16 (no f32 promotion).
++        let gate_act = Activations::silu(&gate)?;
++        let gated = gate_act.mul(&up)?;
++
++        // down: int8 W8A8 → [M, hidden]. On Err fall back to bf16.
++        let out2d = match int8_gemm::int8_w8a8_matmul(&gated, d_i8, d_s) {
++            Ok(v) => v,
++            Err(_) => return Ok(None),
++        };
++
++        // Optional debug breadcrumb so a smoke test can confirm the int8 path
++        // actually fired (gated so it never pollutes the default path).
++        if std::env::var("MLX_INT8_PREFILL_DEBUG").is_ok() {
++            eprintln!("[int8-prefill] fired: M={m} hidden={hidden} two_inter={two_inter}");
++        }
++
++        // Reshape [M, hidden] back to the original leading dims (mirror bf16).
++        let mut out_shape: Vec<i64> = dims[..dims.len() - 1].to_vec();
++        out_shape.push(hidden);
++        let out = out2d.reshape(&out_shape)?;
++        Ok(Some(out))
++    }
++
+     /// Forward pass: down(silu(gate(x)) * up(x))
+     ///
+     /// Uses fused C++ implementation for maximum performance (1 FFI call vs 8).
+@@ -83,6 +262,14 @@ impl MLP {
+     /// # Returns
+     /// Output tensor, shape: (batch, seq_len, hidden_size)
+     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
++        // Stage 3 (NA int8 W8A8 prefill, opt-in): route the fused gate_up and
++        // down matmuls through the int8 GEMM when enabled, eligible, and the
++        // weights are quantized. Any failure inside falls through to the bf16
++        // path below (returns Ok(None)). OFF by default ⇒ zero change.
++        if let Some(out) = self.try_forward_int8(x)? {
++            return Ok(out);
++        }
++
+         // E39: fast path — pre-stacked + pre-transposed weights.
+         // Env-toggle MLX_DISABLE_E39_STACKED_MLP=1 reverts to the legacy
+         // two-matmul path for A/B testing.
+@@ -138,18 +325,25 @@ impl MLP {
+         self.gate_proj.set_weight(weight)?;
+         // Invalidate the E39 stacked cache — caller must call finalize_gate_up().
+         self.gate_up_proj_wt = None;
++        // Stage 3: also invalidate the int8 quant of the fused gate_up weight.
++        self.gate_up_w_i8 = None;
++        self.gate_up_s_w = None;
+         Ok(())
+     }
+ 
+     pub fn set_up_proj_weight(&mut self, weight: &MxArray) -> Result<()> {
+         self.up_proj.set_weight(weight)?;
+         self.gate_up_proj_wt = None;
++        self.gate_up_w_i8 = None;
++        self.gate_up_s_w = None;
+         Ok(())

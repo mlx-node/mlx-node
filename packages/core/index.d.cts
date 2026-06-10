@@ -2651,7 +2651,11 @@ export interface ConversionOptions {
   quantBits?: number;
   /** Quantization group size (default: 64 for affine, 32 for mxfp8) */
   quantGroupSize?: number;
-  /** Quantization mode: "affine" (default), "mxfp4", "mxfp8", or "nvfp4" */
+  /**
+   * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
+   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 ONLY in v1,
+   * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
+   */
   quantMode?: string;
   /**
    * Quantization recipe for per-layer mixed-bit quantization.
@@ -2814,6 +2818,8 @@ export declare const enum DType {
   BFloat16 = 3,
   Uint32 = 4,
   Uint8 = 5,
+  /** Signed int8 — sym8 per-output-channel symmetric quantized weights. */
+  Int8 = 6,
 }
 
 /** Document element type */

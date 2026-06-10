@@ -74,6 +74,7 @@ impl SafeTensorDType {
             SafeTensorDType::I32 => Some(DType::Int32),
             SafeTensorDType::U8 => Some(DType::Uint8),
             SafeTensorDType::U32 => Some(DType::Uint32),
+            SafeTensorDType::I8 => Some(DType::Int8),
             _ => None, // Unsupported dtypes
         }
     }
@@ -252,13 +253,23 @@ impl SafeTensorsFile {
                 // Load as raw uint8 - FP8 dequantization or MXFP8 scales
                 MxArray::from_uint8(&buffer, &shape)
             }
+            SafeTensorDType::I8 => {
+                // Load as raw int8 - sym8 per-channel symmetric quantized
+                // weights. Bit-reinterpret the bytes (from_int8), NOT
+                // from_uint8 + astype (that converts numerically: 0xFF would
+                // become 255, not -1).
+                let i8_data: &[i8] = unsafe {
+                    std::slice::from_raw_parts(buffer.as_ptr() as *const i8, buffer.len())
+                };
+                MxArray::from_int8(i8_data, &shape)
+            }
             SafeTensorDType::U32 => {
                 // Load as uint32 - packed quantized weights
                 let u32_data = bytes_to_u32(&buffer);
                 MxArray::from_uint32(&u32_data, &shape)
             }
             _ => Err(Error::from_reason(format!(
-                "Unsupported dtype for tensor {}: {:?}. Supported: F32, F16, BF16, I32, U8, U32, F8_E4M3",
+                "Unsupported dtype for tensor {}: {:?}. Supported: F32, F16, BF16, I8, I32, U8, U32, F8_E4M3",
                 name, info.dtype
             ))),
         }
@@ -648,6 +659,12 @@ fn array_to_bytes(array: &MxArray) -> Result<Vec<u8>> {
             let data = array.to_uint8()?;
             Ok(data)
         }
+        DType::Int8 => {
+            // sym8 quantized weights: int8 bytes are bit-identical to their
+            // unsigned reinterpretation, so the cast is lossless.
+            let data = array.to_int8()?;
+            Ok(data.into_iter().map(|x| x as u8).collect())
+        }
     }
 }
 
@@ -660,6 +677,7 @@ fn dtype_to_safetensor_str(dtype: DType) -> String {
         DType::Int32 => "I32".to_string(),
         DType::Uint32 => "U32".to_string(),
         DType::Uint8 => "U8".to_string(),
+        DType::Int8 => "I8".to_string(),
     }
 }
 
@@ -764,5 +782,32 @@ mod tests {
         let ints = bytes_to_i32(&bytes);
         assert_eq!(ints.len(), 1);
         assert_eq!(ints[0], 10);
+    }
+
+    // sym8 contract: an Int8 tensor written by save_safetensors must round-trip
+    // bit-exactly through the eager SafeTensorsFile reader (I8 arm). Negative
+    // values prove the bit-reinterpret path (from_uint8+astype would map
+    // 0xFF -> 255, not -1).
+    #[test]
+    fn test_int8_save_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!("st_i8_rt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("i8.safetensors");
+
+        let vals: Vec<i8> = vec![-127, -1, 0, 1, 64, 127];
+        let arr = MxArray::from_int8(&vals, &[2, 3]).unwrap();
+        assert_eq!(arr.dtype().unwrap(), DType::Int8);
+        let mut tensors = HashMap::new();
+        tensors.insert("w".to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        let f = SafeTensorsFile::load(&path).unwrap();
+        let loaded = f.load_tensors(&path).unwrap();
+        let w = loaded.get("w").unwrap();
+        assert_eq!(w.dtype().unwrap(), DType::Int8);
+        assert_eq!(w.shape().unwrap().to_vec(), vec![2i64, 3]);
+        assert_eq!(w.to_int8().unwrap(), vals);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

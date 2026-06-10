@@ -71,6 +71,17 @@ impl MxArray {
         MxArray::from_handle(handle, "array_from_uint8")
     }
 
+    /// Create an MxArray from raw int8 bytes (bit-reinterpret, no numeric
+    /// conversion). Used for loading sym8 per-channel symmetric int8 weights
+    /// (1 byte per element). NOT from_uint8 + astype — that would numerically
+    /// convert (e.g. 255 -> 255i32 saturated) instead of reinterpreting -1.
+    pub fn from_int8(data: &[i8], shape: &[i64]) -> Result<Self> {
+        validate_data_shape(data.len(), shape, "from_int8")?;
+        let handle =
+            unsafe { sys::mlx_array_from_int8(data.as_ptr(), shape.as_ptr(), shape.len()) };
+        MxArray::from_handle(handle, "array_from_int8")
+    }
+
     /// Convert FP8 E4M3 array to target dtype using MLX's from_fp8.
     /// Input must be a uint8 array containing FP8 E4M3 encoded values.
     pub fn from_fp8(&self, target_dtype: DType) -> Result<Self> {

@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
+    PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for, has_sym8_mode,
     load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence_common::{
@@ -50,6 +50,9 @@ fn build_lfm2_qsl(
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
+        // Unreachable: `apply_weights` rejects sym8 checkpoints up front
+        // (sym8 v1 is dense Qwen3.5 only).
+        PerLayerMode::Sym8 => None,
     }
 }
 
@@ -76,6 +79,8 @@ fn build_lfm2_gate_ql(
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
+        // Unreachable: `apply_weights` rejects sym8 checkpoints up front.
+        PerLayerMode::Sym8 => None,
     }
 }
 
@@ -100,6 +105,8 @@ fn build_lfm2_non_moe_ql(
         PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, base),
         PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, base),
         PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
+        // Unreachable: `apply_weights` rejects sym8 checkpoints up front.
+        PerLayerMode::Sym8 => None,
     }
 }
 
@@ -235,6 +242,10 @@ fn plq_to_packed_params(plq: PerLayerQuant) -> (i32, i32, &'static str) {
         PerLayerMode::Mxfp8 => (MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8"),
         PerLayerMode::Mxfp4 => (MXFP4_GROUP_SIZE, MXFP4_BITS, "mxfp4"),
         PerLayerMode::Nvfp4 => (NVFP4_GROUP_SIZE, NVFP4_BITS, "nvfp4"),
+        // Unreachable: `apply_weights` rejects sym8 checkpoints up front. If
+        // it ever leaks through, "sym8" is rejected by the MLX quantized ops
+        // (fail-loud) instead of silently mis-packing as another mode.
+        PerLayerMode::Sym8 => (plq.group_size, plq.bits, "sym8"),
     }
 }
 
@@ -692,6 +703,14 @@ fn apply_weights(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
+    // sym8 is consumed by the DENSE Qwen3.5 loader only — fail loud rather
+    // than let the Sym8 match arms below silently fall back or mis-pack.
+    if has_sym8_mode(top_level_mode, per_layer_quant) {
+        return Err(Error::from_reason(
+            "sym8 checkpoints are not supported by the lfm2 loader \
+             (sym8 v1 is dense Qwen3.5 only). Re-convert with an affine quant mode.",
+        ));
+    }
     // Fail loudly on partial/renamed checkpoints before ever running inference
     // with randomly-initialized projections.
     validate_mandatory_weights(params, &inner.config, inner.layers.len())?;

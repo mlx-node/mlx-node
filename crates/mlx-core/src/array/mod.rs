@@ -48,6 +48,8 @@ pub enum DType {
     BFloat16 = 3,
     Uint32 = 4,
     Uint8 = 5,
+    /// Signed int8 — sym8 per-output-channel symmetric quantized weights.
+    Int8 = 6,
 }
 
 impl DType {
@@ -61,7 +63,7 @@ impl DType {
         match self {
             DType::Float32 | DType::Int32 | DType::Uint32 => 4,
             DType::Float16 | DType::BFloat16 => 2,
-            DType::Uint8 => 1,
+            DType::Uint8 | DType::Int8 => 1,
         }
     }
 }
@@ -77,6 +79,7 @@ impl TryFrom<i32> for DType {
             3 => Ok(DType::BFloat16),
             4 => Ok(DType::Uint32),
             5 => Ok(DType::Uint8),
+            6 => Ok(DType::Int8),
             other => Err(Error::from_reason(format!(
                 "Unsupported dtype code {other}"
             ))),

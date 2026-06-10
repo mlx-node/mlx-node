@@ -1,0 +1,225 @@
+diff --git a/crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs b/crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs
+index e0f7d3cc..4fdaa28b 100644
+--- a/crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs
++++ b/crates/mlx-core/src/models/qwen3_5/gated_delta_net.rs
+@@ -5,9 +5,44 @@ use napi::bindgen_prelude::*;
+ use super::arrays_cache::ArraysCache;
+ use super::config::Qwen3_5Config;
+ use super::gated_delta::gated_delta_update;
++use super::int8_gemm;
+ use super::quantized_linear::{LinearProj, QuantizedLinear};
+ use super::rms_norm_gated::RMSNormGated;
+ 
++/// Default minimum `M = batch * seq_len` at which the int8 W8A8 prefill GEMM is
++/// worth taking for the GDN `in_proj_qkvz` projection. Mirrors the MLP path
++/// (`crate::transformer::mlp`): below this (notably `M == 1` decode) per-token
++/// activation-quant overhead dominates and int8 regresses vs bf16, so we fall
++/// through to the bf16 stacked/legacy path. Override via the SHARED
++/// `MLX_INT8_PREFILL_MIN_M` env (same knob the MLP uses).
++const INT8_PREFILL_MIN_M_DEFAULT: i64 = 256;
++
++/// Returns `true` when `MLX_INT8_PREFILL_QKVZ` is set to a truthy value
++/// (non-empty, not "0"/"false"). The int8 W8A8 path for the GDN qkvz projection
++/// is OFF by default and is kept INDEPENDENT of the MLP's `MLX_INT8_PREFILL`
++/// flag so the two can be A/B-attributed separately (and the MLP-only verify
++/// stays reproducible).
++fn int8_prefill_qkvz_enabled() -> bool {
++    match std::env::var("MLX_INT8_PREFILL_QKVZ") {
++        Ok(v) => {
++            let v = v.trim();
++            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
++        }
++        Err(_) => false,
++    }
++}
++
++/// The `M` threshold (`batch * seq_len`) at or above which the int8 qkvz path is
++/// taken. Reads the SHARED `MLX_INT8_PREFILL_MIN_M` env (same knob as the MLP),
++/// falling back to the default.
++fn int8_prefill_min_m() -> i64 {
++    std::env::var("MLX_INT8_PREFILL_MIN_M")
++        .ok()
++        .and_then(|v| v.trim().parse::<i64>().ok())
++        .filter(|&v| v >= 0)
++        .unwrap_or(INT8_PREFILL_MIN_M_DEFAULT)
++}
++
+ /// GatedDeltaNet: Linear attention module using gated delta recurrence.
+ ///
+ /// This replaces standard attention in most layers of Qwen3.5.
+@@ -38,6 +73,20 @@ pub struct GatedDeltaNet {
+     /// weights are loaded. When present (and non-quantized), `forward()` does
+     /// ONE matmul + two slices instead of two separate matmuls.
+     in_proj_qkvz_ba_t: Option<MxArray>,
++    /// NA int8 W8A8 prefill (opt-in via `MLX_INT8_PREFILL_QKVZ`): opaque int8
++    /// quant of the UN-stacked `in_proj_qkvz` weight `[qkvz_dim, hidden]`
++    /// (rows = output channels = `N`, matching `quantize_weight_int8`'s `[N, K]`
++    /// contract). Populated by `finalize_in_proj()` ONLY when the flag is truthy
++    /// and the projection is a non-quantized Standard linear. `None` keeps the
++    /// bf16 stacked/legacy path as the unchanged default.
++    ///
++    /// Only the qkvz weight is int8'd — `in_proj_ba` (b/a recurrence gates) stays
++    /// bf16, so on the int8 path the E51 single-matmul fusion is dropped and we
++    /// do TWO matmuls (int8 qkvz + bf16 ba). The int8 qkvz GEMM is faster than
++    /// the stacked bf16 matmul and ba is tiny, so this is still a net win.
++    qkvz_w_i8: Option<MxArray>,
++    /// Per-output-channel f32 scale `[qkvz_dim]` for `qkvz_w_i8`.
++    qkvz_s_w: Option<MxArray>,
+ }
+ 
+ impl GatedDeltaNet {
+@@ -102,6 +151,8 @@ impl GatedDeltaNet {
+             conv_dim,
+             conv_kernel_dim,
+             in_proj_qkvz_ba_t: None,
++            qkvz_w_i8: None,
++            qkvz_s_w: None,
+         })
+     }
+ 
+@@ -124,9 +175,110 @@ impl GatedDeltaNet {
+         let stacked_t = stacked.transpose(Some(&[1, 0]))?; // [hidden, qkvz_dim+ba_dim]
+         stacked_t.eval();
+         self.in_proj_qkvz_ba_t = Some(stacked_t);
++
++        // NA int8 W8A8 prefill (opt-in via MLX_INT8_PREFILL_QKVZ): quantize ONLY
++        // the qkvz weight to int8 ONCE at load. `in_proj_ba` stays bf16 (its b/a
++        // outputs gate the recurrence and are deliberately excluded from quant;
++        // see convert.rs `in_proj_ba.` exclusion), so the int8 path forgoes the
++        // E51 single-matmul fusion and does TWO matmuls (int8 qkvz + bf16 ba).
++        //
++        // LAYOUT: `quantize_weight_int8` expects `[N, K]` with rows = output
++        // channels so its `s_w[N]` scale broadcasts onto the GEMM accumulator
++        // `acc[M, N]`. The UN-transposed `w_qkvz` is `[qkvz_dim, hidden]` =
++        // `[N=qkvz_dim, K=hidden]`, already in `[N, K]`, so we pass it straight in
++        // (the stacked `*_t` transposed form is for the bf16 matmul ONLY and must
++        // NOT be quantized here). `quantize_weight_int8` ALSO hoists the
++        // per-forward transpose, returning the opaque int8 weight already in the
++        // `[K, N]` kernel layout (opaque to Rust).
++        //
++        // SCOPE: int8 prefill is DENSE qwen3_5 ONLY. qwen3_5_moe's decoder layer
++        // never constructs/finalizes this GDN path with int8 wiring through the
++        // MoE persistence route, so `MLX_INT8_PREFILL_QKVZ` is a silent bf16 no-op
++        // on MoE (intended — not wired for MoE; documented, not fixed).
++        //
++        // MEMORY: with the flag ON, BOTH the bf16 stacked `in_proj_qkvz_ba_t`
++        // (above) AND the int8 qkvz weight stay resident — the bf16 stacked form
++        // is the per-call `Err`-fallback target in `try_forward_qkvz_int8`. Opt-in
++        // trades extra weight memory for prefill speed.
++        //
++        // VALIDATED REGIME: opt-in, greedy (T=0), bf16 models, prefill M>=256.
++        // Sampling / MTP / long-context (>8k) are NOT yet validation-gated, which
++        // is why this path is deliberately default-OFF.
++        self.qkvz_w_i8 = None;
++        self.qkvz_s_w = None;
++        if int8_prefill_qkvz_enabled() {
++            // Fail-soft: if quant fails (e.g. unsupported shape), leave the
++            // fields None so forward() stays on the unchanged bf16 path.
++            if let Ok((qkvz_i8, qkvz_s)) = int8_gemm::quantize_weight_int8(&w_qkvz) {
++                qkvz_i8.eval();
++                qkvz_s.eval();
++                self.qkvz_w_i8 = Some(qkvz_i8);
++                self.qkvz_s_w = Some(qkvz_s);
++            }
++        }
+         Ok(())
+     }
+ 
++    /// NA int8 W8A8 prefill path for the GDN `in_proj_qkvz` projection.
++    ///
++    /// Returns:
++    ///   * `Ok(Some(qkvz))` — the int8 path ran and produced the qkvz output
++    ///     `[B, T, qkvz_dim]` (bf16). The caller computes `ba` separately as
++    ///     bf16 (`in_proj_ba` stays full precision).
++    ///   * `Ok(None)`       — not eligible (flag off / no int8 weights / `M`
++    ///     below threshold / a fail-soft int8-op `Err`); caller uses bf16.
++    ///   * `Err`            — only a genuine non-int8 error (reshape/shape).
++    ///
++    /// Pipeline:
++    ///   `x[B,T,hidden]` → `[M, hidden]`
++    ///   → `qkvz = int8_w8a8(x, qkvz_w_i8, qkvz_s_w)` `[M, qkvz_dim]`
++    ///   → reshape back to `[B, T, qkvz_dim]`.
++    ///
++    /// The int8 op narrows its result to bf16 internally, so the downstream conv
++    /// / recurrence (which expect bf16) are not promoted to f32.
++    fn try_forward_qkvz_int8(&self, x: &MxArray) -> Result<Option<MxArray>> {
++        // Gate 1: flag + quantized weights present.
++        let (Some(qkvz_i8), Some(qkvz_s)) = (&self.qkvz_w_i8, &self.qkvz_s_w) else {
++            return Ok(None);
++        };
++        if !int8_prefill_qkvz_enabled() {
++            return Ok(None);
++        }
++
++        // Gate 2: M = product of leading dims (everything but the last).
++        let shape = x.shape()?;
++        let dims: &[i64] = &shape;
++        if dims.len() < 2 {
++            return Ok(None);
++        }
++        let hidden = dims[dims.len() - 1];
++        let m: i64 = dims[..dims.len() - 1].iter().product();
++        // M == 1 (decode) and small prefill regress vs bf16 → fall through.
++        if m < int8_prefill_min_m() {
++            return Ok(None);
++        }
++
++        // Reshape to 2D [M, hidden] for the int8 GEMM.
++        let x2d = x.reshape(&[m, hidden])?;
++
++        // int8 W8A8. On Err (e.g. gen<17 / K%16!=0) fall back to bf16.
++        let qkvz2d = match int8_gemm::int8_w8a8_matmul(&x2d, qkvz_i8, qkvz_s) {
++            Ok(v) => v,
++            Err(_) => return Ok(None),
++        };
++        let qkvz_dim = qkvz2d.shape_at(1)?;
++
++        if std::env::var("MLX_INT8_PREFILL_QKVZ_DEBUG").is_ok() {
++            eprintln!("[int8-prefill-qkvz] fired: M={m} hidden={hidden} qkvz_dim={qkvz_dim}");
++        }
++
++        // Reshape [M, qkvz_dim] back to the original leading dims + qkvz_dim.
++        let mut out_shape: Vec<i64> = dims[..dims.len() - 1].to_vec();
++        out_shape.push(qkvz_dim);
++        let qkvz = qkvz2d.reshape(&out_shape)?;
++        Ok(Some(qkvz))
++    }
++
+     /// Forward pass for GatedDeltaNet.
+     ///
+     /// # Arguments
+@@ -151,7 +303,13 @@ impl GatedDeltaNet {
+         // the two-matmul path.
+         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
+         let ba_dim = (self.num_v_heads * 2) as i64;
+-        let (qkvz, ba) = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
++        let (qkvz, ba) = if let Some(qkvz_i8) = self.try_forward_qkvz_int8(x)? {
++            // NA int8 W8A8 prefill (opt-in): qkvz via int8 GEMM (bf16 out), ba
++            // stays bf16 (recurrence gates excluded from quant). This forgoes
++            // the E51 single-matmul fusion ONLY on the int8 path.
++            let ba = self.in_proj_ba.forward(x)?;
++            (qkvz_i8, ba)
++        } else if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
+             && std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err()
+         {
+             let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
+@@ -316,6 +474,9 @@ impl GatedDeltaNet {
+ 
+     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
+         self.in_proj_qkvz_ba_t = None; // E51: invalidate stacked cache
++        // NA int8: invalidate the qkvz int8 quant (re-quantized in finalize).
++        self.qkvz_w_i8 = None;
++        self.qkvz_s_w = None;
+         self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
+     }
+     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
+@@ -354,6 +515,9 @@ impl GatedDeltaNet {
+ 
+     pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
+         self.in_proj_qkvz_ba_t = None;
++        // NA int8: a quantized (affine/fp) qkvz can't use the int8 W8A8 path.
++        self.qkvz_w_i8 = None;
++        self.qkvz_s_w = None;
+         self.in_proj_qkvz.set_quantized(ql);
+     }
+     pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {

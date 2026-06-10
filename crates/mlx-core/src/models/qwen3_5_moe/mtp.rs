@@ -339,6 +339,9 @@ impl Qwen3_5MoeMTPModule {
                 PerLayerMode::Affine => {
                     try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
                 }
+                // Unreachable: `apply_weights_moe_inner` rejects sym8
+                // checkpoints before the MTP load runs.
+                PerLayerMode::Sym8 => None,
             }
         };
         let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
@@ -353,6 +356,8 @@ impl Qwen3_5MoeMTPModule {
                     plq.group_size,
                     plq.bits,
                 ),
+                // Unreachable: see try_build_ql above.
+                PerLayerMode::Sym8 => None,
             }
         };
 

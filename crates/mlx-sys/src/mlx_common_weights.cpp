@@ -41,6 +41,18 @@ void mlx_clear_quant_info() {
   g_quant_info().clear();
 }
 
+// Round-trip check: does the registry hold `prefix` with EXACTLY `mode`?
+// Used by the Rust loader's load-time assertion that a sym8 layer's mode
+// survived registration verbatim (a sym8 entry silently coerced/missing
+// would make the compiled forward read the int8 operand as MXFP8/affine).
+bool mlx_quant_info_mode_matches(const char* prefix, const char* mode) {
+  if (prefix == nullptr || mode == nullptr) return false;
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+  auto it = g_quant_info().find(std::string(prefix));
+  if (it == g_quant_info().end()) return false;
+  return it->second.mode == mode;
+}
+
 void mlx_clear_weights() {
   std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
   g_weights().clear();

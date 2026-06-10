@@ -311,6 +311,21 @@ impl MxArray {
         }
     }
 
+    /// Extract raw int8 values from int8 arrays.
+    /// Used by SafeTensors writer for sym8 per-channel symmetric weights.
+    pub(crate) fn to_int8(&self) -> Result<Vec<i8>> {
+        let len = unsafe { sys::mlx_array_size(self.handle.0) };
+        let mut buffer = vec![0i8; len];
+        let ok = unsafe { sys::mlx_array_to_int8(self.handle.0, buffer.as_mut_ptr(), len) };
+        if ok {
+            Ok(buffer)
+        } else {
+            Err(Error::from_reason(
+                "Failed to extract int8 from array (must be int8 dtype)",
+            ))
+        }
+    }
+
     /// Extract raw uint16 values from bf16/f16 arrays without f32 round-trip.
     /// Used by SafeTensors writer to avoid tripling memory for 16-bit tensors.
     pub(crate) fn to_uint16_native(&self) -> Result<Vec<u16>> {

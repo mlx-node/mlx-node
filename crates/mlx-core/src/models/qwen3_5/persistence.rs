@@ -11,8 +11,8 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, merge_per_layer, parse_mode_str, parse_quant_block,
-    resolve_default_mode,
+    default_per_layer_quant, effective_plq_for, has_sym8_mode, merge_per_layer, parse_mode_str,
+    parse_quant_block, resolve_default_mode,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -33,6 +33,7 @@ use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MLPVariant, PerLayerMode, PerLayerQuant,
     is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
     try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 
@@ -669,6 +670,11 @@ fn mode_to_str(mode: PerLayerMode) -> &'static str {
         PerLayerMode::Mxfp8 => "mxfp8",
         PerLayerMode::Mxfp4 => "mxfp4",
         PerLayerMode::Nvfp4 => "nvfp4",
+        // Only reachable from the MTPLX draft-lm-head quantize/dequantize
+        // helpers, which thread the string into `mlx_quantize`/
+        // `mlx_dequantize` — C++ rejects "sym8" there, so a (nonsensical)
+        // sym8 draft-head spec fails loud instead of mis-packing.
+        PerLayerMode::Sym8 => "sym8",
     }
 }
 
@@ -908,7 +914,9 @@ fn apply_weights_inner(
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
 
-    let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
+    let try_build_ql = |params: &HashMap<String, MxArray>,
+                        prefix: &str|
+     -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         // Per-layer override lookup. For merged GDN projections (in_proj_qkvz,
         // in_proj_ba) the source overrides may live under the split keys; if
         // the two sides disagree we pick the higher-precision combination:
@@ -933,14 +941,19 @@ fn apply_weights_inner(
                 }
             })
             .unwrap_or(default_plq);
-        match plq.mode {
+        // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
+        // to the dense-weight branch"; `Err` = fail-loud (only sym8 emits
+        // errors today — a malformed sym8 layer must never silently fall
+        // back, see `try_build_sym8_quantized_linear`).
+        Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
-        }
+            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+        })
     };
 
     // Embedding
@@ -998,7 +1011,7 @@ fn apply_weights_inner(
             AttentionType::Linear(gdn) => {
                 if is_quantized {
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))?
                     {
                         gdn.set_quantized_in_proj_qkvz(ql);
                     } else if let Some(w) =
@@ -1007,7 +1020,7 @@ fn apply_weights_inner(
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))?
                     {
                         gdn.set_quantized_in_proj_ba(ql);
                     } else if let Some(w) =
@@ -1016,7 +1029,7 @@ fn apply_weights_inner(
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))?
                     {
                         gdn.set_quantized_out_proj(ql);
                     } else if let Some(w) =
@@ -1081,7 +1094,7 @@ fn apply_weights_inner(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))?
                     {
                         attn.set_quantized_q_proj(ql);
                     } else if let Some(w) =
@@ -1089,7 +1102,7 @@ fn apply_weights_inner(
                     {
                         attn.set_q_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))?
                     {
                         attn.set_quantized_k_proj(ql);
                     } else if let Some(w) =
@@ -1097,7 +1110,7 @@ fn apply_weights_inner(
                     {
                         attn.set_k_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))?
                     {
                         attn.set_quantized_v_proj(ql);
                     } else if let Some(w) =
@@ -1105,7 +1118,7 @@ fn apply_weights_inner(
                     {
                         attn.set_v_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))?
                     {
                         attn.set_quantized_o_proj(ql);
                     } else if let Some(w) =
@@ -1155,9 +1168,9 @@ fn apply_weights_inner(
                     let gate_key = format!("{}.mlp.gate_proj", prefix);
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
-                    let q_gate = try_build_ql(params, &gate_key);
-                    let q_up = try_build_ql(params, &up_key);
-                    let q_down = try_build_ql(params, &down_key);
+                    let q_gate = try_build_ql(params, &gate_key)?;
+                    let q_up = try_build_ql(params, &up_key)?;
+                    let q_down = try_build_ql(params, &down_key)?;
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
                     } else {
@@ -1207,19 +1220,35 @@ fn apply_weights_inner(
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        let missing_mtp = missing_mtp_required_weights(params, config);
-        if missing_mtp.is_empty() {
-            mtp.apply_weights(params, default_plq, per_layer_quant)?;
-            inner.mtp_weights_loaded = true;
-        } else {
+        // sym8 v1 scope: MTP is OUT. The sym8 compiled coverage is the FLAT
+        // decode only (`qwen35_decode_fn`, atomic eager C++); the MTP
+        // draft/verify graphs are `mlx::core::compile`d and the sym8 custom
+        // Metal kernels are unproven inside a compile trace. Loading the MTP
+        // head through the affine builders would also mis-pack int8 tensors —
+        // skip the load and fail soft into plain AR decode, mirroring the
+        // missing-weights branch.
+        if has_sym8_mode(top_level_mode, per_layer_quant) {
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5 config declares {} MTP layer(s), but MTP weights are incomplete; \
-                 disabling speculative MTP. Missing first entries: {:?} ({} total)",
-                config.n_mtp_layers,
-                &missing_mtp[..missing_mtp.len().min(12)],
-                missing_mtp.len()
+                "Qwen3.5: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on the sym8 (eager int8) path; disabling speculative MTP.",
+                config.n_mtp_layers
             );
+        } else {
+            let missing_mtp = missing_mtp_required_weights(params, config);
+            if missing_mtp.is_empty() {
+                mtp.apply_weights(params, default_plq, per_layer_quant)?;
+                inner.mtp_weights_loaded = true;
+            } else {
+                inner.mtp_weights_loaded = false;
+                warn!(
+                    "Qwen3.5 config declares {} MTP layer(s), but MTP weights are incomplete; \
+                     disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                    config.n_mtp_layers,
+                    &missing_mtp[..missing_mtp.len().min(12)],
+                    missing_mtp.len()
+                );
+            }
         }
     }
 
@@ -1333,7 +1362,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 let raw: Value = serde_json::from_str(&config_data)
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
-                let config = parse_config(&raw)?;
+                let mut config = parse_config(&raw)?;
 
                 info!(
                     "Qwen3.5 config: {} layers, hidden={}, heads={}, kv_heads={}",
@@ -1455,6 +1484,24 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 let (top_level_mode, mut per_layer_quant) =
                     parse_quant_block(quant_cfg, quant_group_size);
                 augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant);
+
+                // sym8 v1 scope: the compiled C++ path covers the FLAT decode
+                // only (`qwen35_decode_fn` — atomic eager C++, no
+                // `mlx::core::compile`). The block-paged decode graph IS
+                // `mlx::core::compile`d, and the sym8 custom Metal kernels are
+                // unproven inside a compile trace — force the flat path so a
+                // paged-opt-in config (or MLX_QWEN35_PAGED_OVERRIDE=1) cannot
+                // route sym8 through it.
+                if has_sym8_mode(top_level_mode, &per_layer_quant)
+                    && config.use_block_paged_cache == Some(true)
+                {
+                    warn!(
+                        "Qwen3.5: sym8 checkpoint requested block-paged KV cache; \
+                         the sym8 compiled path is flat-only — forcing \
+                         use_block_paged_cache=false."
+                    );
+                    config.use_block_paged_cache = Some(false);
+                }
                 let runtime_default_mode =
                     resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&params));
                 let runtime_default_plq =
@@ -1510,9 +1557,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // which keys off the per-projection quant-info entries this
                 // call populates alongside the weights themselves. With
                 // every layer's (mode, bits, group_size) recorded
-                // explicitly, MXFP4 / MXFP8 / NVFP4 / affine checkpoints
-                // all take the compiled decode path — no more Rust
-                // forward-path fallback bypass.
+                // explicitly, MXFP4 / MXFP8 / NVFP4 / affine / sym8
+                // checkpoints all take the compiled decode path — no more
+                // Rust forward-path fallback bypass. (sym8 prefixes store
+                // the [K,N] int8 kernel operand, not the checkpoint [N,K]
+                // tensor — see `register_weights_with_cpp`.)
                 register_weights_with_cpp(
                     &params,
                     inner.model_id,
@@ -1534,6 +1583,26 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 if let Some(tok) = tokenizer {
                     inner.set_tokenizer(Arc::new(tok));
                 }
+
+                // sym8 v1 scope is TEXT-ONLY: with the model registered for
+                // the compiled path, an image turn would route through the
+                // C++ VLM prefill (`mlx_qwen35_vlm_prefill`), which does raw
+                // `get_weight_t` bf16 matmuls — it would multiply against
+                // the registered [K,N] int8 kernel operands and emit
+                // garbage. Skip the vision encoder entirely so image turns
+                // fail loud ("vision encoder/processor not loaded") instead.
+                let vision_params = if has_sym8_mode(top_level_mode, &per_layer_quant) {
+                    if vision_params.is_some() {
+                        warn!(
+                            "Qwen3.5: sym8 checkpoint ships a vision tower, but sym8 \
+                             v1 is text-only — skipping vision encoder load (image \
+                             turns will be rejected)."
+                        );
+                    }
+                    None
+                } else {
+                    vision_params
+                };
 
                 // Load vision encoder if present
                 if let Some(ref vparams) = vision_params {
@@ -1650,6 +1719,45 @@ fn register_weights_with_cpp(
 ) {
     use mlx_sys as sys;
 
+    // sym8 checkpoints DO register with the C++ compiled forward: the
+    // compiled `linear_proj` dispatches mode=="sym8" to the shared
+    // `na_int8::{qmv,w8a8_linear}_lazy` builders (mlx_qwen35_common.h
+    // `sym8_linear_proj`), so the FLAT decode runs as ONE atomic C++ forward
+    // per token instead of ~150 per-projection Rust→FFI round trips.
+    //
+    // Layout contract (the C++ side asserts it at dispatch): for a sym8
+    // prefix we store the CONTIGUOUS [K,N] int8 KERNEL OPERAND as
+    // `{prefix}.weight` — NOT the checkpoint's [N,K] tensor — plus the f32
+    // [N] `.scales`. This mirrors the load-time hoist the eager
+    // `QuantizedLinear::new_sym8` does (`int8_gemm::sym8_kernel_operand`),
+    // so per-forward weight reshaping stays zero on both paths. The operand
+    // built here is a SECOND int8 copy of each sym8 layer (the eager layers
+    // keep their own for prefill + fallback); acceptable at current sizes,
+    // shareable later if memory pressure demands.
+    //
+    // Any sym8 registration failure aborts via `abort_registration` below:
+    // weights + quant-info are cleared and model_id is NEVER set, so every
+    // forward fail-safes onto the eager Rust path (correct, just slower).
+    let sym8_checkpoint = has_sym8_mode(top_level_mode, per_layer_quant);
+
+    // MLX_QWEN35_FORCE_EAGER=1 (read ONCE per process) skips compiled C++
+    // registration for ANY Qwen3.5 checkpoint — same dispatch consequence as
+    // the sym8 skip above (`mlx_qwen35_get_model_id() != model_id` → every
+    // forward takes the eager Rust path). Perf-isolation control: lets an
+    // affine/mxfp checkpoint run the exact eager path sym8 is forced onto, so
+    // compiled-vs-eager overhead can be measured apart from kernel deltas.
+    static FORCE_EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_EAGER
+        .get_or_init(|| crate::inference_trace::env_flag_enabled("MLX_QWEN35_FORCE_EAGER"))
+    {
+        info!(
+            "MLX_QWEN35_FORCE_EAGER: skipping C++ compiled-forward weight registration \
+             (model_id={} stays unregistered → eager Rust forward path)",
+            model_id
+        );
+        return;
+    }
+
     // Write-lock the weight RwLock for the entire registration.
     // This blocks any in-flight compiled inference from reading weights
     // until registration is complete and model_id is set.
@@ -1670,6 +1778,28 @@ fn register_weights_with_cpp(
     // `get_or_compile_verify_*` to re-trace against the weights we store
     // just below.
     unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
+
+    // Fail-safe abort for sym8 registration errors: wipe the half-populated
+    // C++ state and leave model_id UNSET (`mlx_qwen35_get_model_id() !=
+    // model_id`), so every forward for this model takes the eager Rust path.
+    // Correctness is preserved (eager sym8 is the reference path); only the
+    // compiled-decode speedup is lost — and loudly.
+    let abort_registration = |reason: &str| {
+        warn!(
+            "sym8 compiled registration ABORTED for model_id={}: {} — clearing \
+             C++ weights; model stays unregistered (eager Rust forward path).",
+            model_id, reason
+        );
+        unsafe { sys::mlx_clear_weights() };
+    };
+
+    // Resolve the default PLQ BEFORE the store loop: sym8 prefixes swap in
+    // the [K,N] kernel operand at store time, which needs the same
+    // per-prefix mode resolution `apply_weights_inner` used. Dense Qwen3.5
+    // has no MoE router/shared gates, so `gate_default` is `None`.
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
 
     // Track every quantized prefix we actually stored (i.e. every name that
     // ends in `.scales`). The defensive merge branches below promote split
@@ -1697,6 +1827,23 @@ fn register_weights_with_cpp(
     let mut handled_splits: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (name, array) in params {
+        // The defensive split-projection merges below concatenate `.weight`
+        // tensors WITHOUT their `.scales` companions. They are inert in the
+        // normal load path (`sanitize_weights -> merge_split_projections`
+        // already merged both), but if one ever fired for a sym8 checkpoint
+        // it would register a scale-less raw [N,K] int8 concat that the
+        // compiled path cannot dispatch — abort to eager instead.
+        if sym8_checkpoint
+            && (name.ends_with(".linear_attn.in_proj_qkv.weight")
+                || name.ends_with(".linear_attn.in_proj_b.weight"))
+        {
+            abort_registration(&format!(
+                "unmerged split GDN projection '{}' present at registration \
+                 time on a sym8 checkpoint (sanitize should have merged it)",
+                name
+            ));
+            return;
+        }
         if name.ends_with(".linear_attn.in_proj_qkv.weight") {
             let prefix = name.strip_suffix(".in_proj_qkv.weight").unwrap();
             let z_key = format!("{}.in_proj_z.weight", prefix);
@@ -1732,6 +1879,38 @@ fn register_weights_with_cpp(
         }
 
         if !handled_splits.contains(name) {
+            // sym8 layout swap: register the [K,N] int8 kernel operand under
+            // `{prefix}.weight` (see the layout-contract comment above). The
+            // gate mirrors `try_build_sym8_quantized_linear`'s "is this layer
+            // sym8-quantized" signal: a `.scales` companion + an effective
+            // PLQ mode of Sym8. Non-sym8 layers in a mixed checkpoint (e.g. a
+            // K%16-failed layer forced to affine) store verbatim.
+            if sym8_checkpoint
+                && let Some(prefix) = name.strip_suffix(".weight")
+                && params.contains_key(&format!("{prefix}.scales"))
+                && effective_plq_for(prefix, per_layer_quant, default_plq, None).mode
+                    == PerLayerMode::Sym8
+            {
+                match super::int8_gemm::sym8_kernel_operand(array) {
+                    Ok(w_kn) => store(name, &w_kn),
+                    Err(e) => {
+                        abort_registration(&format!(
+                            "failed to build [K,N] kernel operand for '{}': {}",
+                            name, e.reason
+                        ));
+                        return;
+                    }
+                }
+                // ALSO register the [N,K] CHECKPOINT tensor under
+                // `{prefix}.weight_nk`: the compiled decode QMV's simd_sum
+                // kernel streams the [N,K] row-major orientation (the [K,N]
+                // operand above stays for the prefill GEMM + fallback
+                // kernels). This stores the params-map array HANDLE — the
+                // buffer is shared with the eager layer's checkpoint tensor,
+                // so the only double-stored copy remains the [K,N] operand.
+                store(&format!("{prefix}.weight_nk"), array);
+                continue;
+            }
             store(name, array);
         }
     }
@@ -1739,19 +1918,12 @@ fn register_weights_with_cpp(
     let count = unsafe { sys::mlx_weight_count() };
     info!("Registered {} weights with C++ fused forward pass", count);
 
-    // Compute the same default PLQs that `apply_weights_inner` uses, so
-    // the C++ side gets the exact (mode, bits, group_size) tuple the Rust
-    // loader chose for each layer. Dense Qwen3.5 has no MoE router/shared
-    // gates, so `gate_default` is `None`.
-    let is_mxfp8 = is_mxfp8_checkpoint(params);
-    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
-    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
-
     // Walk only the prefixes we actually stored. Any quantized projection
     // surfaced a `.scales` companion above; for each we resolve the
     // effective PLQ via the same logic `apply_weights_inner` uses and
     // hand the (mode, bits, group_size) tuple to the C++ registry.
     let mut quant_info_count = 0usize;
+    let mut sym8_info_count = 0usize;
     for prefix in &stored_quant_prefixes {
         let plq = effective_plq_for(prefix, per_layer_quant, default_plq, None);
         let mode_str = match plq.mode {
@@ -1759,18 +1931,52 @@ fn register_weights_with_cpp(
             PerLayerMode::Mxfp8 => "mxfp8",
             PerLayerMode::Mxfp4 => "mxfp4",
             PerLayerMode::Nvfp4 => "nvfp4",
+            // The compiled `linear_proj` dispatches "sym8" to the int8 W8A8
+            // kernel path; the matching `.weight` entry stored above is the
+            // [K,N] kernel operand (see the layout-contract comment).
+            PerLayerMode::Sym8 => "sym8",
         };
         let c_prefix = CString::new(prefix.as_str()).expect("Prefix contains null byte");
         let c_mode = CString::new(mode_str).expect("Mode string contains null byte");
         unsafe {
             sys::mlx_store_quant_info(c_prefix.as_ptr(), c_mode.as_ptr(), plq.bits, plq.group_size);
         }
+        // Load-time safety assertion: a sym8 layer must round-trip out of the
+        // C++ registry as EXACTLY "sym8". A coerced/missing entry would make
+        // the compiled forward fall through to quantized_matmul (or the
+        // legacy no-biases mxfp8 heuristic) and read the int8 operand as a
+        // packed-uint32 pack — garbage logits. Fail-safe: abort registration
+        // so the model decodes on the eager Rust path instead.
+        if plq.mode == PerLayerMode::Sym8 {
+            let round_trips =
+                unsafe { sys::mlx_quant_info_mode_matches(c_prefix.as_ptr(), c_mode.as_ptr()) };
+            if !round_trips {
+                abort_registration(&format!(
+                    "quant-info mode for sym8 prefix '{}' did not round-trip as \"sym8\"",
+                    prefix
+                ));
+                return;
+            }
+            sym8_info_count += 1;
+        }
         quant_info_count += 1;
     }
     info!(
-        "Registered {} quant-info entries with C++ dense forward pass",
-        quant_info_count
+        "Registered {} quant-info entries with C++ dense forward pass ({} sym8)",
+        quant_info_count, sym8_info_count
     );
+
+    // Belt-and-braces for the sym8 layout contract: a sym8 checkpoint whose
+    // default mode is sym8 must have registered at least one sym8 entry —
+    // zero means the detection gates above silently disagreed (e.g. a
+    // prefix-normalization drift between `apply_weights_inner` and this
+    // function) and the compiled path would mis-dispatch. Abort to eager.
+    if sym8_checkpoint && top_level_mode == Some(PerLayerMode::Sym8) && sym8_info_count == 0 {
+        abort_registration(
+            "checkpoint is sym8-default but no sym8 quant-info entries were registered",
+        );
+        return;
+    }
 
     // Set model ID AFTER all weights are stored. This ordering ensures no
     // inference sees a partially-populated map with the new model's ID.

@@ -78,6 +78,21 @@ mlx_array* mlx_array_from_uint8(const uint8_t* data,
   }
 }
 
+// Create array from int8 raw bytes (bit-reinterpret, no numeric conversion)
+// Used for loading sym8 per-channel symmetric int8 weights (1 byte per element)
+mlx_array* mlx_array_from_int8(const int8_t* data,
+                               const int64_t* shape,
+                               size_t ndim) {
+  try {
+    Shape target_shape = make_shape(shape, ndim);
+    auto arr = new array(data, target_shape, mlx::core::int8);
+    return reinterpret_cast<mlx_array*>(arr);
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_array_from_int8: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
 // Convert FP8 E4M3 array to target dtype using MLX's from_fp8
 // Input must be a uint8 array containing FP8 E4M3 encoded values
 // target_dtype: 0=float32, 2=float16, 3=bfloat16
@@ -568,6 +583,36 @@ bool mlx_array_to_uint8(mlx_array* handle, uint8_t* out, size_t len) {
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] mlx_array_to_uint8: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+// Extract int8 data from an int8 array (used for sym8 weights in SafeTensors writer)
+bool mlx_array_to_int8(mlx_array* handle, int8_t* out, size_t len) {
+  if (!out) {
+    return false;
+  }
+  auto arr = reinterpret_cast<array*>(handle);
+  if (!arr) {
+    return false;
+  }
+  try {
+    auto flat = flatten(*arr);
+    flat.eval();
+
+    if (flat.size() != len) {
+      return false;
+    }
+
+    if (flat.dtype() != mlx::core::int8) {
+      return false;
+    }
+
+    const auto* data = flat.data<int8_t>();
+    std::memcpy(out, data, len * sizeof(int8_t));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_array_to_int8: " << e.what() << std::endl;
     return false;
   }
 }

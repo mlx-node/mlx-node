@@ -29,6 +29,12 @@ pub enum PerLayerMode {
     Mxfp4,
     /// NVFP4 (E2M1 4-bit format with E4M3 uint8 scales, group_size 16).
     Nvfp4,
+    /// sym8: per-output-channel symmetric int8 (int8 `[N,K]` weight + f32
+    /// `[N]` scales, no biases, group_size is null/meaningless). Consumed by
+    /// the int8 kernels (`int8_w8a16_qmv` decode / `int8_w8a8_matmul`
+    /// prefill), NEVER by `mlx_quantized_matmul` (there is no affine pack).
+    /// Dense Qwen3.5 only.
+    Sym8,
 }
 
 /// Per-layer quantization metadata parsed from `config.json`.
@@ -54,8 +60,25 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
         Some("mxfp8") => Some(PerLayerMode::Mxfp8),
         Some("nvfp4") => Some(PerLayerMode::Nvfp4),
         Some("affine") => Some(PerLayerMode::Affine),
+        Some("sym8") => Some(PerLayerMode::Sym8),
         _ => None,
     }
+}
+
+/// True when the resolved quantization settings reference sym8 anywhere
+/// (top-level default mode OR any per-layer override).
+///
+/// Used by the dense Qwen3.5 loader to bypass the C++ compiled-forward
+/// registration (the compiled `linear_proj`/registry would mis-handle a
+/// sym8 layer — the legacy no-biases heuristic reads it as MXFP8), and by
+/// the other family loaders (qwen3_5_moe, gemma4, lfm2) to fail loud:
+/// only the dense Qwen3.5 eager path consumes sym8 checkpoints.
+pub fn has_sym8_mode(
+    top_level_mode: Option<PerLayerMode>,
+    per_layer: &HashMap<String, PerLayerQuant>,
+) -> bool {
+    top_level_mode == Some(PerLayerMode::Sym8)
+        || per_layer.values().any(|p| p.mode == PerLayerMode::Sym8)
 }
 
 /// Build the fallback `PerLayerQuant` used when no per-layer override exists.
@@ -270,7 +293,11 @@ pub fn effective_plq_for(
 /// keys (e.g. `in_proj_qkv` + `in_proj_z`) but our model expects the merged
 /// projection (`in_proj_qkvz`). When the two sides disagree we pick the
 /// higher-precision side: higher `bits` wins; on equal bits, prefer
-/// `Affine` > `Mxfp8` > `Nvfp4` > `Mxfp4`.
+/// `Affine` > `Sym8` > `Mxfp8` > `Nvfp4` > `Mxfp4`. (Sym8 ranks below
+/// Affine-8 — group-wise scale+bias beats per-output-channel symmetric —
+/// and above Mxfp8's power-of-two E8M0 scales. In practice convert emits
+/// the same mode on both GDN split sides, so a sym8 merge conflict never
+/// occurs from our own pipeline.)
 pub fn merge_per_layer(
     lhs: Option<&PerLayerQuant>,
     rhs: Option<&PerLayerQuant>,
@@ -280,7 +307,8 @@ pub fn merge_per_layer(
 ) -> Option<PerLayerQuant> {
     fn mode_rank(m: PerLayerMode) -> u8 {
         match m {
-            PerLayerMode::Affine => 3,
+            PerLayerMode::Affine => 4,
+            PerLayerMode::Sym8 => 3,
             PerLayerMode::Mxfp8 => 2,
             PerLayerMode::Nvfp4 => 1,
             PerLayerMode::Mxfp4 => 0,
@@ -346,8 +374,69 @@ mod tests {
         assert_eq!(parse_mode_str(Some("mxfp4")), Some(PerLayerMode::Mxfp4));
         assert_eq!(parse_mode_str(Some("mxfp8")), Some(PerLayerMode::Mxfp8));
         assert_eq!(parse_mode_str(Some("affine")), Some(PerLayerMode::Affine));
+        assert_eq!(parse_mode_str(Some("sym8")), Some(PerLayerMode::Sym8));
         assert_eq!(parse_mode_str(Some("bogus")), None);
         assert_eq!(parse_mode_str(None), None);
+    }
+
+    /// A sym8-default checkpoint carries complete affine override entries for
+    /// forced-affine tensors (routers/gates, 3-D experts, K%16!=0 linears,
+    /// affine-only keys like lm_head). The override must WIN over the sym8
+    /// default so those layers build through the affine path.
+    #[test]
+    fn sym8_top_level_with_affine_per_layer_override_dispatches_affine() {
+        let quant_cfg = serde_json::json!({
+            "group_size": null,
+            "bits": 8,
+            "mode": "sym8",
+            "language_model.model.lm_head": {
+                "bits": 8,
+                "group_size": 64,
+                "mode": "affine"
+            }
+        });
+        let (top_level_mode, per_layer) = parse_quant_block(Some(&quant_cfg), 64);
+        assert_eq!(top_level_mode, Some(PerLayerMode::Sym8));
+        assert!(has_sym8_mode(top_level_mode, &per_layer));
+
+        let default_plq = default_per_layer_quant(
+            8,
+            64,
+            resolve_default_mode(top_level_mode, /* is_mxfp8 */ false),
+        );
+        assert_eq!(default_plq.mode, PerLayerMode::Sym8);
+
+        // The forced-affine override wins for its prefix (key normalized
+        // from the `language_model.model.` wrapper)…
+        let lm_head = effective_plq_for("lm_head", &per_layer, default_plq, None);
+        assert_eq!(lm_head.mode, PerLayerMode::Affine);
+        assert_eq!((lm_head.bits, lm_head.group_size), (8, 64));
+
+        // …while un-overridden projections stay on the sym8 default.
+        let proj = effective_plq_for("layers.0.mlp.up_proj", &per_layer, default_plq, None);
+        assert_eq!(proj.mode, PerLayerMode::Sym8);
+    }
+
+    #[test]
+    fn has_sym8_mode_detects_top_level_and_per_layer() {
+        let empty: HashMap<String, PerLayerQuant> = HashMap::new();
+        // Top-level sym8.
+        assert!(has_sym8_mode(Some(PerLayerMode::Sym8), &empty));
+        // No sym8 anywhere.
+        assert!(!has_sym8_mode(Some(PerLayerMode::Affine), &empty));
+        assert!(!has_sym8_mode(None, &empty));
+        // Per-layer sym8 override under a non-sym8 default.
+        let mut overrides: HashMap<String, PerLayerQuant> = HashMap::new();
+        overrides.insert(
+            "layers.0.mlp.up_proj".into(),
+            PerLayerQuant {
+                bits: 8,
+                group_size: 64,
+                mode: PerLayerMode::Sym8,
+            },
+        );
+        assert!(has_sym8_mode(None, &overrides));
+        assert!(has_sym8_mode(Some(PerLayerMode::Affine), &overrides));
     }
 
     #[test]

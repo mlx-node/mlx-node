@@ -9,7 +9,8 @@ use tracing::info;
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
+    default_per_layer_quant, has_sym8_mode, load_quant_settings_from_disk, merge_per_layer,
+    resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
@@ -604,6 +605,14 @@ fn apply_weights(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
+    // sym8 is consumed by the DENSE Qwen3.5 loader only — fail loud rather
+    // than let the Sym8 match arms below silently fall back to dense weights.
+    if has_sym8_mode(top_level_mode, per_layer_quant) {
+        return Err(Error::from_reason(
+            "sym8 checkpoints are not supported by the gemma4 loader \
+             (sym8 v1 is dense Qwen3.5 only). Re-convert with an affine quant mode.",
+        ));
+    }
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -636,6 +645,9 @@ fn apply_weights(
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
+            // Unreachable: the sym8 guard at the top of `apply_weights`
+            // rejects sym8 checkpoints before any builder runs.
+            PerLayerMode::Sym8 => None,
         }
     };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
@@ -648,6 +660,8 @@ fn apply_weights(
             PerLayerMode::Affine => {
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
+            // Unreachable: see try_build_ql above.
+            PerLayerMode::Sym8 => None,
         }
     };
 

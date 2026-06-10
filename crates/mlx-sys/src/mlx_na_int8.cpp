@@ -48,6 +48,33 @@ const char* kNaInt8QuantBody =
 const char* kNaInt8RescaleBody =
 #include "metal/na_int8_rescale.metal.inc"
     ;
+// sym8 DECODE matvec (QMV). Memory-BW-bound matvec for small M (decode): the
+// prefill 128x64 GEMM wastes 127/128 rows at M=1, so decode needs a dedicated
+// matvec that streams each int8 weight byte once + applies s_x[m]*s_w[n] inline.
+// Reuses the shared na_int8_quant kernel for the activation int8 quant.
+const char* kNaInt8QmvBody =
+#include "metal/na_int8_qmv.metal.inc"
+    ;
+// FUSED sym8 DECODE matvec: takes bf16 x directly, folds the per-token int8
+// activation quant INTO the matvec kernel (single kernel, like affine qmv).
+const char* kNaInt8QmvFusedBody =
+#include "metal/na_int8_qmv_fused.metal.inc"
+    ;
+// W8A16 sym8 DECODE matvec: bf16 x read directly, NO activation quant at all —
+// single-pass f32-accumulate mixed-precision matvec. The act-quant passes of
+// the fused W8A8 qmv are pure overhead at M=1 (e2e -0.50x vs affine-Q8); this
+// kernel removes them AND makes decode activation-exact.
+const char* kNaInt8QmvW8a16Body =
+#include "metal/na_int8_qmv_w8a16.metal.inc"
+    ;
+// W8A16 sym8 DECODE matvec, MLX-affine-qmv style (the PRODUCTION decode
+// kernel): simdgroup-per-rows on the [N,K] checkpoint orientation, wide
+// contiguous per-lane weight loads, simd_sum epilogue, zero threadgroup
+// memory/barriers. Fixes the 2D-block kernel's DRAM streaming deficit
+// (54.7us -> ~affine-parity in the in-stream decode chain).
+const char* kNaInt8QmvW8a16SgBody =
+#include "metal/na_int8_qmv_w8a16_sg.metal.inc"
+    ;
 
 // MEASUREMENT ONLY (diagnostic). Identical to kNaInt8GemmBody but uses
 // mode::multiply (overwrite C) instead of multiply_accumulate, so the dispatch
@@ -182,6 +209,81 @@ mlx::core::fast::CustomKernelFunction& get_int8_rescale_kernel() {
   return kernel.value();
 }
 
+// sym8 DECODE: cached JIT kernel for the int8 matvec (QMV). Streams the [K,N]
+// int8 weight + applies the s_x[m]*s_w[n] rescale inline -> bf16 [M,N].
+mlx::core::fast::CustomKernelFunction& get_int8_qmv_kernel() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "na_int8_qmv",
+        /* input_names  */ {"x_i8", "w_i8", "s_x", "s_w", "M", "N", "K"},
+        /* output_names */ {"y"},
+        /* source(body) */ kNaInt8QmvBody,
+        /* header       */ "",
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
+// FUSED sym8 DECODE matvec kernel (bf16 x in, single kernel). Folds the per-token
+// int8 activation quant into the matvec — no separate na_int8_quant pass.
+mlx::core::fast::CustomKernelFunction& get_int8_qmv_fused_kernel() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "na_int8_qmv_fused",
+        /* input_names  */ {"x", "w_i8", "s_w", "M", "N", "K"},
+        /* output_names */ {"y"},
+        /* source(body) */ kNaInt8QmvFusedBody,
+        /* header       */ "",
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
+// W8A16 sym8 DECODE matvec kernel (bf16 x in, NO act quant, f32 accumulate).
+mlx::core::fast::CustomKernelFunction& get_int8_qmv_w8a16_kernel() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "na_int8_qmv_w8a16",
+        /* input_names  */ {"x", "w_i8", "s_w", "M", "N", "K"},
+        /* output_names */ {"y"},
+        /* source(body) */ kNaInt8QmvW8a16Body,
+        /* header       */ "",
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
+// W8A16 sym8 DECODE matvec kernel, simd_sum style ([N,K] checkpoint
+// orientation — see metal/na_int8_qmv_w8a16_sg.metal.inc).
+mlx::core::fast::CustomKernelFunction& get_int8_qmv_w8a16_sg_kernel() {
+  static std::mutex mtx;
+  static std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+  std::lock_guard<std::mutex> lock(mtx);
+  if (!kernel.has_value()) {
+    kernel = mlx::core::fast::metal_kernel(
+        "na_int8_qmv_w8a16_sg",
+        /* input_names  */ {"x", "w_i8", "s_w", "M", "N", "K"},
+        /* output_names */ {"y"},
+        /* source(body) */ kNaInt8QmvW8a16SgBody,
+        /* header       */ "",
+        /* ensure_row_contiguous */ true,
+        /* atomic_outputs        */ false);
+  }
+  return kernel.value();
+}
+
 // v1 (2): fused per-token int8 activation quant. Input x [M,K] bf16; returns a
 // pair {x_i8 int8 [M,K], s_x f32 [M,1]}. ONE kernel (two strided passes over x)
 // replaces the lazy absmax/round/clip/astype chain. Output is LAZY — composes
@@ -241,6 +343,335 @@ mlx::core::array int8_rescale(const mlx::core::array& acc,
       threadgroup,
       /* template_args */ {},
       /* init_value */ std::nullopt,  // every element written; no fill needed
+      /* verbose */ false,
+      default_stream(Device::gpu));
+  return results[0];
+}
+
+// sym8 DECODE CORE. int8 matvec: x_i8 [M,K] int8 @ w_i8 [K,N] int8 with the
+// s_x[m]*s_w[n] rescale folded in -> bf16 [M,N]. One thread per output column n
+// (for each token row m); each thread accumulates over K in int32 then narrows
+// to bf16. x[m,:] is staged into threadgroup memory in chunks so it is read once
+// per group; the [K,N] weight read is coalesced (consecutive threads = consecutive
+// n = contiguous bytes). Output is LAZY (composes into the forward graph). See
+// metal/na_int8_qmv.metal.inc for the kernel + dispatch contract.
+mlx::core::array int8_qmv_core(const mlx::core::array& x_i8,
+                               const mlx::core::array& w_kn,
+                               const mlx::core::array& s_x,
+                               const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  const int M = x_i8.shape(0);
+  const int K = x_i8.shape(1);
+  const int N = w_kn.shape(1);  // w_kn is [K,N]
+  array M_arr(M, int32);
+  array N_arr(N, int32);
+  array K_arr(K, int32);
+
+  // 2D-blocked GEMV: threadgroup owns BN output columns x BK k-workers
+  // (BN*BK threads). BK must be a power of two (tree reduce). Default 64x16
+  // (1024 threads). Tunable via env for A/B (INT8_QMV_BN / INT8_QMV_BK /
+  // INT8_QMV_STAGEX).
+  int BN = 32;
+  int BK = 16;
+  if (const char* e = std::getenv("INT8_QMV_BN")) {
+    int v = std::atoi(e);
+    if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256) BN = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV_BK")) {
+    int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16 || v == 32) BK = v;
+  }
+  // STAGE_X: stage x[m,:] into threadgroup memory (off by default — the x read
+  // is a broadcast that caches well; staging adds tg-memory pressure). MAXK is
+  // the compile-time tg array bound; only used when STAGE_X != 0. Round K up to
+  // a few buckets so the JIT instantiates a small fixed set (cache-friendly).
+  int STAGE_X = 0;
+  if (const char* e = std::getenv("INT8_QMV_STAGEX")) {
+    STAGE_X = (std::atoi(e) != 0) ? 1 : 0;
+  }
+  int MAXK = 1;
+  if (STAGE_X) {
+    // Smallest power-of-two-ish bucket >= K (covers all real proj K up to 17408).
+    int buckets[] = {2560, 5120, 9216, 17408, 18432, 34816};
+    MAXK = 34816;
+    for (int b : buckets) {
+      if (K <= b) {
+        MAXK = b;
+        break;
+      }
+    }
+  }
+
+  std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
+      {"BN", BN},
+      {"BK", BK},
+      {"STAGE_X", STAGE_X},
+      {"MAXK", MAXK},
+  };
+
+  // dispatch_threads: total threads = grid. Each tg = BN*BK threads laid out
+  // along grid.x; one tg per BN-column block; grid.y = M (one tg-row per token).
+  const int tgN = (N + BN - 1) / BN;        // number of column blocks
+  const int tgThreads = BN * BK;            // threads per threadgroup
+  std::tuple<int, int, int> grid{tgThreads * tgN, M, 1};
+  std::tuple<int, int, int> threadgroup{tgThreads, 1, 1};
+  auto results = get_int8_qmv_kernel()(
+      {x_i8, w_kn, s_x, s_w, M_arr, N_arr, K_arr},
+      /* output_shapes */ {Shape{M, N}},
+      /* output_dtypes */ {bfloat16},
+      grid,
+      threadgroup,
+      template_args,
+      /* init_value */ std::nullopt,  // every in-bounds element written; no fill
+      /* verbose */ false,
+      default_stream(Device::gpu));
+  return results[0];
+}
+
+// FUSED sym8 DECODE matvec: bf16 x in, single kernel (act-quant folded in).
+// x_bf16 [M,K] bf16, w_kn [K,N] int8, s_w [N] f32 -> bf16 [M,N]. Same 2D-block
+// geometry as int8_qmv_core (env-tunable BN/BK); MAXK is the tg x-stage bound.
+mlx::core::array int8_qmv_fused_core(const mlx::core::array& x_bf16,
+                                     const mlx::core::array& w_kn,
+                                     const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  const int M = x_bf16.shape(0);
+  const int K = x_bf16.shape(1);
+  const int N = w_kn.shape(1);  // w_kn is [K,N]
+  array M_arr(M, int32);
+  array N_arr(N, int32);
+  array K_arr(K, int32);
+
+  int BN = 32;
+  int BK = 16;
+  if (const char* e = std::getenv("INT8_QMV_BN")) {
+    int v = std::atoi(e);
+    if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256) BN = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV_BK")) {
+    int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16 || v == 32) BK = v;
+  }
+  // VEC4: each thread owns 4 columns via char4 weight reads. Needs N%4==0 and
+  // BN%4==0. MEASURED to HURT the large-K (down) shape — the smaller thread count
+  // it implies starves the in-kernel quant's K-stride passes — so it is OFF by
+  // default; INT8_QMV_VEC4=1 opts in for A/B.
+  int VEC4 = 0;
+  if (const char* e = std::getenv("INT8_QMV_VEC4")) {
+    if (std::atoi(e) != 0) VEC4 = 1;
+  }
+  if (N % 4 != 0 || BN % 4 != 0) VEC4 = 0;  // hard safety gate
+
+  // MAXK: smallest bucket >= K (fixed small set so the JIT instantiates few).
+  int MAXK;
+  {
+    int buckets[] = {2560, 5120, 9216, 17408, 18432, 34816};
+    MAXK = 34816;
+    for (int b : buckets) {
+      if (K <= b) {
+        MAXK = b;
+        break;
+      }
+    }
+  }
+  std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
+      {"BN", BN},
+      {"BK", BK},
+      {"VEC4", VEC4},
+      {"MAXK", MAXK},
+  };
+
+  const int CC = VEC4 ? 4 : 1;
+  const int tgN = (N + BN - 1) / BN;
+  const int tgThreads = (BN / CC) * BK;       // NT (matches kernel)
+  std::tuple<int, int, int> grid{tgThreads * tgN, M, 1};
+  std::tuple<int, int, int> threadgroup{tgThreads, 1, 1};
+  auto results = get_int8_qmv_fused_kernel()(
+      {x_bf16, w_kn, s_w, M_arr, N_arr, K_arr},
+      /* output_shapes */ {Shape{M, N}},
+      /* output_dtypes */ {bfloat16},
+      grid,
+      threadgroup,
+      template_args,
+      /* init_value */ std::nullopt,
+      /* verbose */ false,
+      default_stream(Device::gpu));
+  return results[0];
+}
+
+// W8A16 sym8 DECODE matvec: bf16 x in, single pass, NO activation quant.
+// x_bf16 [M,K] bf16, w_kn [K,N] int8, s_w [N] f32 -> bf16 [M,N]. Same 2D-block
+// geometry as int8_qmv_fused_core but with SEPARATE env tunables
+// (INT8_QMV16_BN / INT8_QMV16_BK / INT8_QMV16_VEC4 / INT8_QMV16_STAGEX) so the
+// W8A16 sweep is independent of the W8A8 one.
+mlx::core::array int8_qmv_w8a16_core(const mlx::core::array& x_bf16,
+                                     const mlx::core::array& w_kn,
+                                     const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  const int M = x_bf16.shape(0);
+  const int K = x_bf16.shape(1);
+  const int N = w_kn.shape(1);  // w_kn is [K,N]
+  array M_arr(M, int32);
+  array N_arr(N, int32);
+  array K_arr(K, int32);
+
+  // SHAPE-AWARE default geometry (in-stream chained decode bench + e2e paired
+  // A/B, M5 Max, 2026-06-10). The decode regime streams each weight from DRAM
+  // exactly once (weights don't fit cache across the 150+ calls/token), so the
+  // kernel is bound by DRAM transaction width:
+  //   * N % 128 == 0 (every 4B decode shape except the N=64 GDN gate projs):
+  //     BN=128/BK=32/VEC4=1 (NT=1024) — each simdgroup streams 128 CONTIGUOUS
+  //     weight bytes per k step (char4 x 32 column-threads), the affine-qmv
+  //     access pattern. In-stream 54.2us/call vs 67.3 for BN=32 scalar
+  //     (affine qmv 31.6); e2e decode A/B vs affine-Q8 0.65 -> ~0.86.
+  //   * otherwise: BN=32/BK=32/VEC4=0 (NT=1024) — scalar weight reads, safe
+  //     for any N (compute + epilogue both bounds-checked).
+  // Env INT8_QMV16_BN/BK/VEC4 override for A/B, subject to the hard gates
+  // below.
+  int BN = 32;
+  int BK = 32;
+  int VEC4 = 0;
+  if (N % 128 == 0) {
+    BN = 128;
+    VEC4 = 1;
+  }
+  if (const char* e = std::getenv("INT8_QMV16_BN")) {
+    int v = std::atoi(e);
+    if (v == 16 || v == 32 || v == 64 || v == 128 || v == 256) BN = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV16_BK")) {
+    int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16 || v == 32) BK = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV16_VEC4")) {
+    VEC4 = (std::atoi(e) != 0) ? 1 : 0;
+  }
+  // HARD GATES (apply to defaults AND env overrides):
+  // 1. The VEC4 path reads char4 at columns [ncol, ncol+3] with NO per-read
+  //    bounds check (only the epilogue WRITE is guarded), so the last column
+  //    block must be full: N % BN == 0 (with BN % 4 == 0 this implies the
+  //    4-alignment too). N=64 GDN gate projections fall back to scalar here.
+  if (VEC4 && (BN % 4 != 0 || N % BN != 0)) VEC4 = 0;
+  // 2. Metal caps a threadgroup at 1024 threads. Combos over the cap (e.g.
+  //    BN=64/BK=32 scalar -> NT=2048) do NOT dispatch correctly and bench
+  //    impossibly fast (~3.8 TB/s in the in-stream sweep = broken, not a
+  //    win). Halve BK (stays power-of-two for the tree reduce) until legal.
+  while ((BN / (VEC4 ? 4 : 1)) * BK > 1024 && BK > 4) {
+    BK /= 2;
+  }
+
+  // STAGE_X: stage x[m,:] into tg memory ONCE as bf16 (off by default — the x
+  // read is a simdgroup-uniform broadcast that caches well; staging adds tg
+  // pressure). MAXK is the compile-time tg bound; bf16 staging needs 2*MAXK
+  // bytes + the 4*BK*BN reduce tile, so K above the 32KB tg budget hard-gates
+  // staging OFF.
+  int STAGE_X = 0;
+  if (const char* e = std::getenv("INT8_QMV16_STAGEX")) {
+    STAGE_X = (std::atoi(e) != 0) ? 1 : 0;
+  }
+  int MAXK = 1;
+  if (STAGE_X) {
+    int buckets[] = {2560, 5120, 9216, 17408, 18432, 34816};
+    MAXK = 34816;
+    for (int b : buckets) {
+      if (K <= b) {
+        MAXK = b;
+        break;
+      }
+    }
+    // 2*MAXK (bf16 xs) + 4*BK*BN (f32 part tile) must fit the 32KB tg budget.
+    if (2 * MAXK + 4 * BK * BN > 32768) {
+      STAGE_X = 0;
+      MAXK = 1;
+    }
+  }
+  std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
+      {"BN", BN},
+      {"BK", BK},
+      {"VEC4", VEC4},
+      {"STAGE_X", STAGE_X},
+      {"MAXK", MAXK},
+  };
+
+  const int CC = VEC4 ? 4 : 1;
+  const int tgN = (N + BN - 1) / BN;
+  const int tgThreads = (BN / CC) * BK;       // NT (matches kernel)
+  std::tuple<int, int, int> grid{tgThreads * tgN, M, 1};
+  std::tuple<int, int, int> threadgroup{tgThreads, 1, 1};
+  auto results = get_int8_qmv_w8a16_kernel()(
+      {x_bf16, w_kn, s_w, M_arr, N_arr, K_arr},
+      /* output_shapes */ {Shape{M, N}},
+      /* output_dtypes */ {bfloat16},
+      grid,
+      threadgroup,
+      template_args,
+      /* init_value */ std::nullopt,
+      /* verbose */ false,
+      default_stream(Device::gpu));
+  return results[0];
+}
+
+// W8A16 sym8 DECODE matvec, simd_sum style — the PRODUCTION decode core.
+// x_bf16 [M,K] bf16, w_nk [N,K] int8 (the CHECKPOINT orientation — NOT the
+// [K,N] GEMM operand), s_w [N] f32 -> bf16 [M,N]. Geometry (defaults from the
+// in-stream chained decode bench, M5 Max 2026-06-10; env INT8_QMV16_SG_LW /
+// _RPS / _NSG override for A/B, read PER CALL):
+//   LW  = 16 weight bytes per lane per row per iteration (a simdgroup streams
+//         512 contiguous bytes per row — the affine-qmv transaction width),
+//   RPS = 4 output rows per simdgroup (x block reused across rows),
+//   NSG = 2 simdgroups per threadgroup (64 threads, 8 rows per tg).
+// HARD GATES: LW in {4,8,16} (must divide 16 = the host K%16 contract, so a
+// lane's guarded LW-read never crosses K); RPS clamped to N (the kernel's
+// N-edge clamp needs N >= RPS); 32*NSG <= 1024.
+mlx::core::array int8_qmv_w8a16_sg_core(const mlx::core::array& x_bf16,
+                                        const mlx::core::array& w_nk,
+                                        const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  const int M = x_bf16.shape(0);
+  const int K = x_bf16.shape(1);
+  const int N = w_nk.shape(0);  // w_nk is [N,K]
+  array M_arr(M, int32);
+  array N_arr(N, int32);
+  array K_arr(K, int32);
+
+  int LW = 16;
+  int RPS = 4;
+  int NSG = 2;
+  if (const char* e = std::getenv("INT8_QMV16_SG_LW")) {
+    int v = std::atoi(e);
+    if (v == 4 || v == 8 || v == 16) LW = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV16_SG_RPS")) {
+    int v = std::atoi(e);
+    if (v >= 1 && v <= 16) RPS = v;
+  }
+  if (const char* e = std::getenv("INT8_QMV16_SG_NSG")) {
+    int v = std::atoi(e);
+    if (v >= 1 && v <= 32) NSG = v;
+  }
+  // The kernel's N-edge handling clamps a partial simdgroup DOWN to the last
+  // full RPS-row window, which requires N >= RPS.
+  while (RPS > N && RPS > 1) RPS /= 2;
+
+  std::vector<std::pair<std::string, fast::TemplateArg>> template_args = {
+      {"LW", LW},
+      {"RPS", RPS},
+      {"NSG", NSG},
+  };
+
+  const int rows_per_tg = NSG * RPS;
+  const int tgN = (N + rows_per_tg - 1) / rows_per_tg;
+  const int tgThreads = 32 * NSG;
+  std::tuple<int, int, int> grid{tgThreads * tgN, M, 1};
+  std::tuple<int, int, int> threadgroup{tgThreads, 1, 1};
+  auto results = get_int8_qmv_w8a16_sg_kernel()(
+      {x_bf16, w_nk, s_w, M_arr, N_arr, K_arr},
+      /* output_shapes */ {Shape{M, N}},
+      /* output_dtypes */ {bfloat16},
+      grid,
+      threadgroup,
+      template_args,
+      /* init_value */ std::nullopt,
       /* verbose */ false,
       default_stream(Device::gpu));
   return results[0];
@@ -329,6 +760,160 @@ mlx::core::array int8_weight_to_kn(const mlx::core::array& w_i8) {
 }
 
 }  // namespace
+
+// =============================================================================
+// External-linkage lazy graph builders (declared in mlx_common.h).
+//
+// SINGLE SOURCE OF TRUTH for the sym8 W8A8 linear math: the extern "C" FFI
+// wrappers below (`mlx_w8a8_linear`, `mlx_int8_qmv` — the eager Rust path) and
+// the compiled C++ forward (`linear_proj` sym8 dispatch in
+// mlx_qwen35_common.h) both call these, so the two paths emit byte-identical
+// graphs for the same inputs. Contract checks THROW here; the FFI wrappers
+// translate to cerr + false.
+// =============================================================================
+namespace na_int8 {
+
+mlx::core::array w8a8_linear_lazy(const mlx::core::array& x,
+                                  const mlx::core::array& w_kn,
+                                  const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  if (x.ndim() != 2 || w_kn.ndim() != 2) {
+    throw std::runtime_error("[na_int8::w8a8_linear_lazy] expected 2D x,w");
+  }
+  const int K = x.shape(1);
+  // w_kn is [K,N] (pre-transposed): its row count is K.
+  if (w_kn.shape(0) != K) {
+    throw std::runtime_error(
+        "[na_int8::w8a8_linear_lazy] K mismatch: x.K=" + std::to_string(K) +
+        " w.K=" + std::to_string(w_kn.shape(0)) +
+        " (is the [K,N] kernel operand registered, not the [N,K] checkpoint "
+        "tensor?)");
+  }
+  if (!na_int8_supported(K)) {
+    throw std::runtime_error(
+        "[na_int8::w8a8_linear_lazy] unsupported (gen=" +
+        std::to_string(na_int8_gpu_gen()) + ", K=" + std::to_string(K) + ")");
+  }
+
+  // v1 (2): FUSED per-token int8 activation quant in ONE kernel (replaces the
+  // ~5-7-op lazy absmax/round/clip/astype chain). x must be bf16 (the MLP
+  // hands bf16 activations); cast defensively so a stray f32 input still
+  // works.
+  array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
+  auto [x_i8, s_x] = int8_act_quant(x_bf16);  // x_i8 int8 [M,K], s_x f32 [M,1]
+
+  // v1 (1): nofill (mode::multiply overwrite) GEMM — bit-exact for a fresh
+  // GEMM, skips the per-call full-output zero fill. w_kn already int8 [K,N].
+  array acc = int8_gemm_core_nofill(x_i8, w_kn);  // int32 [M,N]
+
+  // v1 (3): FUSED int32->bf16 rescale in ONE elementwise pass. Narrows to
+  // bf16 inside the kernel.
+  return int8_rescale(acc, s_x, s_w);  // bf16 [M,N]
+}
+
+mlx::core::array qmv_lazy(const mlx::core::array& x,
+                          const mlx::core::array& w_kn,
+                          const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  if (x.ndim() != 2 || w_kn.ndim() != 2) {
+    throw std::runtime_error("[na_int8::qmv_lazy] expected 2D x,w");
+  }
+  const int K = x.shape(1);
+  // w_kn is [K,N] (pre-transposed): its row count is K.
+  if (w_kn.shape(0) != K) {
+    throw std::runtime_error(
+        "[na_int8::qmv_lazy] K mismatch: x.K=" + std::to_string(K) +
+        " w.K=" + std::to_string(w_kn.shape(0)) +
+        " (is the [K,N] kernel operand registered, not the [N,K] checkpoint "
+        "tensor?)");
+  }
+  if (!na_int8_supported(K)) {
+    throw std::runtime_error(
+        "[na_int8::qmv_lazy] unsupported (gen=" +
+        std::to_string(na_int8_gpu_gen()) + ", K=" + std::to_string(K) + ")");
+  }
+  array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
+  // s_w must be f32 [N] for the kernel; cast defensively.
+  array sw_f32 = (s_w.dtype() == float32) ? s_w : astype(s_w, float32);
+
+  // FUSED single-kernel path (act-quant folded into the matvec) is the
+  // default; INT8_QMV_FUSED=0 falls back to the two-kernel path (separate
+  // na_int8_quant) for A/B. The fused path removes a kernel launch + the
+  // [M,K] int8 intermediate.
+  bool fused = true;
+  if (const char* e = std::getenv("INT8_QMV_FUSED")) {
+    fused = (std::atoi(e) != 0);
+  }
+  if (fused) {
+    return int8_qmv_fused_core(x_bf16, w_kn, sw_f32);
+  }
+  auto [x_i8, s_x] = int8_act_quant(x_bf16);
+  return int8_qmv_core(x_i8, w_kn, s_x, sw_f32);
+}
+
+mlx::core::array qmv_w8a16_lazy(const mlx::core::array& x,
+                                const mlx::core::array& w_kn,
+                                const mlx::core::array& w_nk,
+                                const mlx::core::array& s_w) {
+  using namespace mlx::core;
+  if (x.ndim() != 2 || w_kn.ndim() != 2 || w_nk.ndim() != 2) {
+    throw std::runtime_error("[na_int8::qmv_w8a16_lazy] expected 2D x,w");
+  }
+  const int K = x.shape(1);
+  // w_kn is [K,N] (pre-transposed): its row count is K.
+  if (w_kn.shape(0) != K) {
+    throw std::runtime_error(
+        "[na_int8::qmv_w8a16_lazy] K mismatch: x.K=" + std::to_string(K) +
+        " w.K=" + std::to_string(w_kn.shape(0)) +
+        " (is the [K,N] kernel operand registered, not the [N,K] checkpoint "
+        "tensor?)");
+  }
+  // w_nk is the [N,K] CHECKPOINT orientation: same shape transposed.
+  if (w_nk.shape(1) != K || w_nk.shape(0) != w_kn.shape(1) ||
+      w_nk.dtype() != int8) {
+    throw std::runtime_error(
+        "[na_int8::qmv_w8a16_lazy] w_nk mismatch: expected int8 [N=" +
+        std::to_string(w_kn.shape(1)) + ",K=" + std::to_string(K) +
+        "], got [" + std::to_string(w_nk.shape(0)) + "," +
+        std::to_string(w_nk.shape(1)) +
+        "] (the [N,K] checkpoint tensor must be plumbed alongside the [K,N] "
+        "kernel operand)");
+  }
+  if (!na_int8_supported(K)) {
+    throw std::runtime_error(
+        "[na_int8::qmv_w8a16_lazy] unsupported (gen=" +
+        std::to_string(na_int8_gpu_gen()) + ", K=" + std::to_string(K) + ")");
+  }
+  array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
+  // s_w must be f32 [N] for the kernel; cast defensively.
+  array sw_f32 = (s_w.dtype() == float32) ? s_w : astype(s_w, float32);
+
+  // Same-binary A/B escape hatch: INT8_QMV_W8A16=0 reroutes sym8 DECODE back
+  // to the W8A8 act-quant qmv (the old path). Lives HERE — inside the single
+  // shared builder — so the eager Rust forward and the compiled C++ forward
+  // stay byte-identical under EITHER env value. Default ON (W8A16).
+  bool w8a16 = true;
+  if (const char* e = std::getenv("INT8_QMV_W8A16")) {
+    w8a16 = (std::atoi(e) != 0);
+  }
+  if (!w8a16) {
+    return qmv_lazy(x_bf16, w_kn, sw_f32);
+  }
+  // Kernel-variant switch: the simd_sum-style kernel on the [N,K] checkpoint
+  // orientation is the default; INT8_QMV16_SG=0 falls back to the 2D-block
+  // kernel on the [K,N] operand for same-binary A/B. Read PER CALL (test
+  // sweeps re-dispatch without rebuilding).
+  bool sg = true;
+  if (const char* e = std::getenv("INT8_QMV16_SG")) {
+    sg = (std::atoi(e) != 0);
+  }
+  if (!sg) {
+    return int8_qmv_w8a16_core(x_bf16, w_kn, sw_f32);
+  }
+  return int8_qmv_w8a16_sg_core(x_bf16, w_nk, sw_f32);
+}
+
+}  // namespace na_int8
 
 extern "C" {
 
@@ -430,6 +1015,91 @@ bool mlx_quantize_weight_int8(mlx_array* w_handle, mlx_array** out_w_i8,
   }
 }
 
+// CONVERT-time sym8 quantizer: per-output-channel symmetric int8, STORABLE
+// checkpoint layout.
+//   w: [N,K] float (bf16/f16/f32)  ->  out_q:      int8 [N,K]  (row-major, SAME
+//                                                  orientation as the source)
+//                                      out_scales: f32  [N]    (s[n] = max_k|w[n,k]| / 127)
+//
+// Identical math to mlx_quantize_weight_int8 above but WITHOUT the [K,N]
+// transpose: that function emits the runtime KERNEL operand; this one emits the
+// on-disk CHECKPOINT tensors ({prefix}.weight int8 [N,K] + {prefix}.scales f32
+// [N], no .biases). The loader re-derives the [K,N] kernel operand at load
+// time. Dequant contract: w[n,k] ≈ scales[n] * q[n,k].
+bool mlx_sym8_quantize_store(mlx_array* w_handle, mlx_array** out_q,
+                             mlx_array** out_scales) {
+  using namespace mlx::core;
+  if (out_q) *out_q = nullptr;
+  if (out_scales) *out_scales = nullptr;
+  try {
+    auto& w = *reinterpret_cast<array*>(w_handle);
+    if (w.ndim() != 2) {
+      std::cerr << "[mlx_sym8_quantize_store] expected 2D [N,K] weight\n";
+      return false;
+    }
+    array w_f32 = astype(w, float32);
+    // Per-row (per-output-channel) absmax over K. keepdims for broadcast.
+    array absmax = max(abs(w_f32), /* axis */ 1, /* keepdims */ true);  // [N,1]
+    // Avoid divide-by-zero on all-zero rows: scale = max(absmax,eps)/127.
+    array eps = array(1e-12f, float32);
+    array denom = maximum(absmax, eps);                                  // [N,1]
+    array s_w = divide(denom, array(127.0f, float32));                   // [N,1]
+    // Quantize: round(w / s_w) clamped to [-127,127], cast to int8 [N,K].
+    array q = clip(round(divide(w_f32, s_w)),
+                   std::optional<array>(array(-127.0f, float32)),
+                   std::optional<array>(array(127.0f, float32)));
+    array q_i8 = astype(q, int8);                  // [N,K], storage orientation
+    array s_w_flat = reshape(s_w, {w.shape(0)});   // [N]
+    eval(q_i8);
+    eval(s_w_flat);
+    *out_q = reinterpret_cast<mlx_array*>(new array(std::move(q_i8)));
+    *out_scales = reinterpret_cast<mlx_array*>(new array(std::move(s_w_flat)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_sym8_quantize_store] EXCEPTION: " << e.what()
+              << std::endl;
+    if (out_q) *out_q = nullptr;
+    if (out_scales) *out_scales = nullptr;
+    return false;
+  }
+}
+
+// LOAD-time sym8 kernel-operand builder: the stored checkpoint int8 [N,K]
+// weight (from mlx_sym8_quantize_store) -> the contiguous [K,N] int8 kernel
+// operand consumed by mlx_w8a8_linear / mlx_int8_qmv. This is EXACTLY the
+// transpose+contiguous tail of mlx_quantize_weight_int8 (int8_weight_to_kn),
+// minus the quantization — the checkpoint already holds the quantized values,
+// so the load is requant-free and bit-exact with the convert-time quantizer.
+//
+// Fail-loud: rejects non-2D and non-int8 inputs (a sym8 checkpoint that
+// surfaces anything else here is corrupt). Evals before returning so the
+// transpose copy is materialized ONCE at load, not per forward.
+bool mlx_sym8_kernel_operand(mlx_array* w_handle, mlx_array** out_w_kn) {
+  using namespace mlx::core;
+  if (out_w_kn) *out_w_kn = nullptr;
+  try {
+    auto& w = *reinterpret_cast<array*>(w_handle);
+    if (w.ndim() != 2) {
+      std::cerr << "[mlx_sym8_kernel_operand] expected 2D [N,K] int8 weight, "
+                << "got ndim=" << w.ndim() << "\n";
+      return false;
+    }
+    if (w.dtype() != int8) {
+      std::cerr << "[mlx_sym8_kernel_operand] expected int8 weight\n";
+      return false;
+    }
+    array w_kn = int8_weight_to_kn(w);  // [K,N] contiguous int8
+    eval(w_kn);
+    *out_w_kn = reinterpret_cast<mlx_array*>(new array(std::move(w_kn)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_sym8_kernel_operand] EXCEPTION: " << e.what()
+              << std::endl;
+    if (out_w_kn) *out_w_kn = nullptr;
+    return false;
+  }
+}
+
 // W8A8 linear: per-token (per-row) dynamic int8 activation quant + int8 GEMM +
 // rescale. Returns bf16 [M,N] = x @ w^T (lossy by int8 quant noise).
 //
@@ -460,40 +1130,89 @@ bool mlx_w8a8_linear(mlx_array* x_handle, mlx_array* w_kn_handle,
     auto& x = *reinterpret_cast<array*>(x_handle);
     auto& w_kn = *reinterpret_cast<array*>(w_kn_handle);
     auto& s_w = *reinterpret_cast<array*>(s_w_handle);
-    if (x.ndim() != 2 || w_kn.ndim() != 2) {
-      std::cerr << "[mlx_w8a8_linear] expected 2D x,w\n";
-      return false;
-    }
-    const int K = x.shape(1);
-    // w_kn is [K,N] (pre-transposed): its row count is K.
-    if (w_kn.shape(0) != K) {
-      std::cerr << "[mlx_w8a8_linear] K mismatch: x.K=" << K
-                << " w.K=" << w_kn.shape(0) << "\n";
-      return false;
-    }
-    if (!na_int8_supported(K)) {
-      std::cerr << "[mlx_w8a8_linear] unsupported (gen=" << na_int8_gpu_gen()
-                << ", K=" << K << ")\n";
-      return false;
-    }
-
-    // v1 (2): FUSED per-token int8 activation quant in ONE kernel (replaces the
-    // ~5-7-op lazy absmax/round/clip/astype chain). x must be bf16 (the MLP hands
-    // bf16 activations); cast defensively so a stray f32 input still works.
-    array x_bf16 = (x.dtype() == bfloat16) ? x : astype(x, bfloat16);
-    auto [x_i8, s_x] = int8_act_quant(x_bf16);  // x_i8 int8 [M,K], s_x f32 [M,1]
-
-    // v1 (1): nofill (mode::multiply overwrite) GEMM — bit-exact for a fresh GEMM,
-    // skips the per-call full-output zero fill. w_kn already int8 [K,N] from load.
-    array acc = int8_gemm_core_nofill(x_i8, w_kn);  // int32 [M,N]
-
-    // v1 (3): FUSED int32->bf16 rescale in ONE elementwise pass (replaces the
-    // multi-pass lazy astype/mul/mul/astype). Narrows to bf16 inside the kernel.
-    array y_bf16 = int8_rescale(acc, s_x, s_w);  // bf16 [M,N]
+    // Shared builder (na_int8::w8a8_linear_lazy) — the SAME graph the compiled
+    // C++ forward emits for sym8 projections. Contract violations throw and
+    // surface as cerr + false below.
+    array y_bf16 = na_int8::w8a8_linear_lazy(x, w_kn, s_w);  // bf16 [M,N]
     *out_bf16 = reinterpret_cast<mlx_array*>(new array(std::move(y_bf16)));
     return true;
   } catch (const std::exception& e) {
     std::cerr << "[mlx_w8a8_linear] EXCEPTION: " << e.what() << std::endl;
+    if (out_bf16) *out_bf16 = nullptr;
+    return false;
+  }
+}
+
+// sym8 DECODE matvec (QMV): per-token int8 act quant + int8 MATVEC + rescale ->
+// bf16 [M,N] = x @ w^T. The small-M (decode, M=1..~16) analogue of
+// mlx_w8a8_linear: reuses the SAME activation int8 quant (int8_act_quant) and the
+// SAME [K,N] pre-transposed weight + per-channel s_w from mlx_quantize_weight_int8,
+// but runs a dedicated BW-bound matvec (one thread per output column) instead of
+// the 128x64 prefill tile (which wastes 127/128 rows at M=1). Caller routes small
+// M here, large M to mlx_w8a8_linear.
+//
+//   x_bf16: [M,K] bf16 activations
+//   w_kn:   [K,N] int8 weight, PRE-TRANSPOSED at load (from mlx_quantize_weight_int8)
+//   s_w:    [N]   f32 per-output-channel weight scale
+//
+// Output is LAZY (no per-call eval), narrowed to bf16 inside the kernel. Returns
+// false (Rust falls back to bf16) when unsupported (gen<17 or K%16!=0) or on error.
+bool mlx_int8_qmv(mlx_array* x_handle, mlx_array* w_kn_handle,
+                  mlx_array* s_w_handle, mlx_array** out_bf16) {
+  using namespace mlx::core;
+  if (out_bf16) *out_bf16 = nullptr;
+  try {
+    auto& x = *reinterpret_cast<array*>(x_handle);
+    auto& w_kn = *reinterpret_cast<array*>(w_kn_handle);
+    auto& s_w = *reinterpret_cast<array*>(s_w_handle);
+    // Shared builder (na_int8::qmv_lazy) — the SAME graph the compiled C++
+    // forward emits for sym8 decode projections (incl. the INT8_QMV_FUSED
+    // env dispatch). Contract violations throw -> cerr + false below.
+    array y_bf16 = na_int8::qmv_lazy(x, w_kn, s_w);
+    *out_bf16 = reinterpret_cast<mlx_array*>(new array(std::move(y_bf16)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_int8_qmv] EXCEPTION: " << e.what() << std::endl;
+    if (out_bf16) *out_bf16 = nullptr;
+    return false;
+  }
+}
+
+// W8A16 sym8 DECODE matvec (QMV): bf16 activations read DIRECTLY (NO act
+// quant) against the SAME [K,N] pre-transposed int8 weight + per-channel s_w
+// as mlx_int8_qmv, f32 accumulate, y = bf16(acc * s_w[n]). Single kernel pass —
+// removes the absmax + int8-staging front-end that made the W8A8 qmv ~+70us/call
+// over affine qmv at M=1 — and decode becomes activation-EXACT (only weight
+// quant error remains).
+//
+//   x_bf16: [M,K] bf16 activations
+//   w_kn:   [K,N] int8 weight, PRE-TRANSPOSED at load (GEMM operand — consumed
+//           by the 2D-block fallback kernel and the W8A8 A/B reroute)
+//   w_nk:   [N,K] int8 CHECKPOINT weight (source orientation — consumed by the
+//           default simd_sum-style kernel; buffer-shared with the params-map /
+//           registry tensor, NOT an extra copy)
+//   s_w:    [N]   f32 per-output-channel weight scale
+//
+// Output is LAZY (no per-call eval), narrowed to bf16 inside the kernel.
+// Returns false when unsupported (gen<17 or K%16!=0) or on error.
+bool mlx_int8_qmv_w8a16(mlx_array* x_handle, mlx_array* w_kn_handle,
+                        mlx_array* w_nk_handle, mlx_array* s_w_handle,
+                        mlx_array** out_bf16) {
+  using namespace mlx::core;
+  if (out_bf16) *out_bf16 = nullptr;
+  try {
+    auto& x = *reinterpret_cast<array*>(x_handle);
+    auto& w_kn = *reinterpret_cast<array*>(w_kn_handle);
+    auto& w_nk = *reinterpret_cast<array*>(w_nk_handle);
+    auto& s_w = *reinterpret_cast<array*>(s_w_handle);
+    // Shared builder (na_int8::qmv_w8a16_lazy) — the SAME graph the compiled
+    // C++ forward emits for sym8 decode projections (incl. the INT8_QMV_W8A16
+    // env dispatch). Contract violations throw -> cerr + false below.
+    array y_bf16 = na_int8::qmv_w8a16_lazy(x, w_kn, w_nk, s_w);
+    *out_bf16 = reinterpret_cast<mlx_array*>(new array(std::move(y_bf16)));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[mlx_int8_qmv_w8a16] EXCEPTION: " << e.what() << std::endl;
     if (out_bf16) *out_bf16 = nullptr;
     return false;
   }

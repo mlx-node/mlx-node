@@ -25,6 +25,7 @@ unsafe extern "C-unwind" {
         ndim: usize,
     ) -> *mut mlx_array;
     pub fn mlx_array_from_uint8(data: *const u8, shape: *const i64, ndim: usize) -> *mut mlx_array;
+    pub fn mlx_array_from_int8(data: *const i8, shape: *const i64, ndim: usize) -> *mut mlx_array;
     pub fn mlx_array_from_float32(
         data: *const f32,
         shape: *const i64,
@@ -285,6 +286,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
     pub fn mlx_array_to_uint32(handle: *mut mlx_array, out: *mut u32, len: usize) -> bool;
     pub fn mlx_array_to_uint8(handle: *mut mlx_array, out: *mut u8, len: usize) -> bool;
+    pub fn mlx_array_to_int8(handle: *mut mlx_array, out: *mut i8, len: usize) -> bool;
     pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
@@ -1452,6 +1454,23 @@ unsafe extern "C-unwind" {
         out_s_w: *mut *mut mlx_array,
     ) -> bool;
 
+    // CONVERT-time sym8 quantizer (checkpoint layout). Same per-output-channel
+    // symmetric math as mlx_quantize_weight_int8 but WITHOUT the [K,N] kernel
+    // transpose: returns the STORABLE int8 [N,K] weight (source orientation)
+    // plus f32 [N] scales. Dequant: w[n,k] ≈ scales[n] * q[n,k]. 2D-only.
+    pub fn mlx_sym8_quantize_store(
+        w: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_scales: *mut *mut mlx_array,
+    ) -> bool;
+
+    // LOAD-time sym8 kernel-operand builder: stored checkpoint int8 [N,K]
+    // weight -> contiguous [K,N] int8 kernel operand (the exact
+    // transpose+contiguous tail of mlx_quantize_weight_int8, requant-free).
+    // Fail-loud on non-2D / non-int8 input. Evals before returning so the
+    // transpose copy happens ONCE at load.
+    pub fn mlx_sym8_kernel_operand(w: *mut mlx_array, out_w_kn: *mut *mut mlx_array) -> bool;
+
     // W8A8 linear: per-token int8 act quant + int8 GEMM + rescale -> bf16 [M,N].
     // x_bf16: [M,K], w_i8: [K,N] int8 (opaque, pre-transposed at load), s_w:
     // f32 [N]. Returns a LAZY array (Stage 4b — no force-eval); caller evals at
@@ -1461,6 +1480,99 @@ unsafe extern "C-unwind" {
         w_i8: *mut mlx_array,
         s_w: *mut mlx_array,
         out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // sym8 DECODE matvec (QMV): per-token int8 act quant + int8 MATVEC + rescale
+    // -> bf16 [M,N] = x @ w^T. The small-M (decode, M=1..~16) analogue of
+    // mlx_w8a8_linear — reuses the SAME activation int8 quant + the SAME [K,N]
+    // pre-transposed weight / f32 [N] s_w, but runs a dedicated BW-bound matvec
+    // (one thread per output column) instead of the 128x64 prefill tile (which
+    // wastes 127/128 rows at M=1). x_bf16: [M,K], w_i8: [K,N] int8 (opaque,
+    // pre-transposed at load), s_w: f32 [N]. Returns a LAZY array; caller evals
+    // at end of forward. Returns false (Rust falls back) on gen<17 / K%16!=0.
+    pub fn mlx_int8_qmv(
+        x: *mut mlx_array,
+        w_i8: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // W8A16 sym8 DECODE matvec (QMV): bf16 activations read DIRECTLY — NO
+    // activation quant (single kernel pass, f32 accumulate, activation-exact).
+    // y[m,n] = bf16(s_w[n] * sum_k x[m,k]*w[n,k]). Takes BOTH weight
+    // orientations: w_kn [K,N] (the GEMM operand — consumed by the 2D-block
+    // fallback under INT8_QMV16_SG=0 and the INT8_QMV_W8A16=0 W8A8 reroute)
+    // and w_nk [N,K] int8 (the CHECKPOINT tensor — consumed by the DEFAULT
+    // simd_sum-style kernel, which streams [N,K] row-major like MLX's affine
+    // qmv; buffer-shared with the stored checkpoint, not an extra copy).
+    // This is the PRODUCTION sym8 decode op (M<=2). Returns a LAZY array;
+    // caller evals at end of forward. false on gen<17 / K%16!=0.
+    pub fn mlx_int8_qmv_w8a16(
+        x: *mut mlx_array,
+        w_kn: *mut mlx_array,
+        w_nk: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // MEASUREMENT ONLY (de-risk microbench). Affine-group W8A8 linear directly
+    // on the model's EXACT affine packed weight (no re-quant). Computes
+    //   y[m,n] = s_x[m] * sum_g ( scale[n,g]*P[m,n,g] + bias[n,g]*S[m,g] )
+    // with per-token int8 activation quant (identical to the symmetric path).
+    //   x:        [M,K] bf16
+    //   packed_w: [N, K/4] uint32 affine 8-bit packed weight
+    //   scales:   [N, K/group_size] f32
+    //   biases:   [N, K/group_size] f32
+    // Returns bf16 [M,N]. Returns false (Rust falls back) when gen<17, bits!=8,
+    // or K % group_size != 0. NOT a production op.
+    pub fn mlx_affine_w8a8_linear(
+        x: *mut mlx_array,
+        packed_w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+
+    // MEASUREMENT ONLY (de-risk microbench). LOAD-TIME prepare for the TILED
+    // affine-group W8A8 GEMM (runs once per quantized linear). Unpacks the
+    // affine packed weight into the SIGNED int8 [K,N] kernel operand the tiled
+    // matmul2d wants, keeps the f32 scale, and precomputes
+    // bias_adj = 128*scale + bias.
+    //   packed_w: [N, K/4] uint32 affine 8-bit packed weight
+    //   scales:   [N, K/group_size] f32
+    //   biases:   [N, K/group_size] f32
+    //   -> out_q_s:   opaque int8 [K,N] (q - 128, kernel operand)
+    //      out_scale: f32 [N, K/group_size] (scale kept)
+    //      out_badj:  f32 [N, K/group_size] (= 128*scale + bias)
+    // Returns false (Rust falls back) when gen<17, bits!=8, or K%group_size!=0.
+    pub fn mlx_affine_w8a8_prepare(
+        packed_w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out_q_s: *mut *mut mlx_array,
+        out_scale: *mut *mut mlx_array,
+        out_badj: *mut *mut mlx_array,
+    ) -> bool;
+
+    // MEASUREMENT ONLY (de-risk microbench). Per-FORWARD prepared linear (the
+    // TIMED hot path). Per-token int8 act quant + per-group act-sum S, then the
+    // TILED grouped matmul2d GEMM.
+    //   x:     [M,K] bf16
+    //   q_s:   [K,N] int8 (signed, from mlx_affine_w8a8_prepare)
+    //   scale: [N, K/group_size] f32 (kept)
+    //   badj:  [N, K/group_size] f32 (= 128*scale + bias)
+    //   -> out: bf16 [M,N] (LAZY). Returns false on gen<17, K%group_size!=0.
+    pub fn mlx_affine_w8a8_linear_prepared(
+        x: *mut mlx_array,
+        q_s: *mut mlx_array,
+        scale: *mut mlx_array,
+        badj: *mut mlx_array,
+        group_size: i32,
+        out: *mut *mut mlx_array,
     ) -> bool;
 
     // MEASUREMENT ONLY (profiler/test scope). Pure int8 GEMM with a
@@ -1552,6 +1664,16 @@ unsafe extern "C-unwind" {
     /// explicit-clear callers (e.g. test setup that wants to wipe the quant
     /// registry without touching weights); also invoked from `mlx_clear_weights`.
     pub fn mlx_clear_quant_info();
+
+    /// Round-trip check: does the C++ quant-info registry hold `prefix` with
+    /// EXACTLY `mode`? Used by the Rust loader's load-time assertion that a
+    /// sym8 layer's mode survived registration verbatim (a sym8 entry silently
+    /// coerced or missing would make the compiled forward read the int8
+    /// kernel operand as an MXFP8/affine pack — garbage logits).
+    pub fn mlx_quant_info_mode_matches(
+        prefix: *const std::os::raw::c_char,
+        mode: *const std::os::raw::c_char,
+    ) -> bool;
 
     /// Clear all stored weights (called on model destruction)
     pub fn mlx_clear_weights();

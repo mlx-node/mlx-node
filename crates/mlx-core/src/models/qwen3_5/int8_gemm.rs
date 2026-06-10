@@ -72,6 +72,31 @@ pub fn quantize_weight_int8(w: &MxArray) -> Result<(MxArray, MxArray)> {
     Ok((w_i8, s_w))
 }
 
+/// LOAD-time sym8 kernel-operand builder (runs once per sym8 linear).
+///
+/// `w_i8_nk` is the STORED checkpoint weight — int8 `[N,K]`, source
+/// orientation, as emitted by `mlx convert --q-mode sym8`
+/// (`mlx_sym8_quantize_store`). Returns the opaque contiguous `[K,N]` int8
+/// kernel operand that [`int8_w8a8_matmul`] / [`int8_w8a8_qmv`] consume —
+/// the EXACT transpose+contiguous tail of [`quantize_weight_int8`], minus
+/// the quantization. The checkpoint already holds the quantized values, so
+/// this is requant-free: bit-exact with what `quantize_weight_int8` would
+/// have produced from the original float weight at convert time.
+///
+/// Fail-loud: `Err` on non-2D / non-int8 input (corrupt sym8 checkpoint) or
+/// FFI failure. The result is eval'd C++-side, so the transpose copy is
+/// materialized ONCE at load, never per forward.
+pub fn sym8_kernel_operand(w_i8_nk: &MxArray) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe { sys::mlx_sym8_kernel_operand(w_i8_nk.as_raw_ptr(), &mut out) };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_sym8_kernel_operand failed (expected int8 [N,K] weight; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "sym8_kernel_operand")
+}
+
 /// W8A8 linear: per-token int8 activation quant + int8 GEMM + rescale -> bf16.
 ///
 /// `x` is `[M, K]` bf16 activations; `w_i8` / `s_w` come from
@@ -103,6 +128,219 @@ pub fn int8_w8a8_matmul(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<Mx
         ));
     }
     MxArray::from_handle(out, "int8_w8a8_matmul")
+}
+
+/// sym8 DECODE matvec (QMV): the small-M analogue of [`int8_w8a8_matmul`].
+///
+/// `x` is `[M,K]` bf16 activations (decode `M` is small, 1..~16); `w_i8` / `s_w`
+/// come from [`quantize_weight_int8`] (the `w_i8` handle is the opaque
+/// pre-transposed `[K,N]` kernel layout, EXACTLY the operand
+/// [`int8_w8a8_matmul`] consumes). Returns bf16 `[M,N] = x @ w^T`.
+///
+/// Why a separate op: the prefill GEMM ([`int8_w8a8_matmul`]) uses a 128x64 tile
+/// that wastes 127/128 rows at `M=1`, so reusing it for sym8 DECODE is a
+/// 1.4-1.8x regression vs affine qmv. This op runs a dedicated memory-BW-bound
+/// matvec (one thread per output channel, streaming each int8 weight byte once)
+/// that reaches parity with affine qmv. It reuses the SAME per-token activation
+/// int8 quant (`na_int8_quant`) and applies `s_x[m]*s_w[n]` inline. The forward
+/// path picks `qmv` for small `M`, `matmul` (gemm) for large `M`.
+///
+/// The result is **lazy** (composes into the surrounding forward graph) and
+/// narrowed to bf16 inside C++ (so a downstream bf16 residual add is not promoted
+/// to f32 by an f32 scale). Returns `Err` when unsupported (gen < 17 or
+/// `K % 16 != 0`) or on a kernel/FFI failure — the caller falls back to bf16.
+pub fn int8_w8a8_qmv(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_int8_qmv(
+            x.as_raw_ptr(),
+            w_i8.as_raw_ptr(),
+            s_w.as_raw_ptr(),
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_int8_qmv failed (unsupported gen/K or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "int8_w8a8_qmv")
+}
+
+/// W8A16 sym8 DECODE matvec (QMV): the PRODUCTION decode op (`M <= 2`).
+///
+/// Unlike [`int8_w8a8_qmv`], the bf16 activations are read DIRECTLY by the
+/// kernel — there is NO per-token activation quant (no absmax pass, no int8
+/// staging). One pass: `y[m,n] = bf16(s_w[n] * sum_k x[m,k] * w_i8[k,n])`,
+/// f32 accumulate. At decode `M` the act-quant passes of the W8A8 qmv are pure
+/// overhead (the memory bottleneck is the identical 1-byte/weight stream), so
+/// this removes the in-stream cost AND makes decode activation-EXACT — the
+/// only remaining quantization error is the weight's.
+///
+/// Operands: `w_kn` is the opaque pre-transposed `[K,N]` int8 kernel layout
+/// (EXACTLY what [`int8_w8a8_qmv`] / [`int8_w8a8_matmul`] consume — used by
+/// the 2D-block fallback kernel under `INT8_QMV16_SG=0` and the W8A8
+/// reroute); `w_nk` is the `[N,K]` int8 CHECKPOINT tensor (source
+/// orientation — consumed by the DEFAULT simd_sum-style decode kernel, which
+/// streams `[N,K]` row-major like MLX's affine qmv; the eager layer passes
+/// its stored checkpoint weight, so this is buffer-shared, not a copy);
+/// `s_w` f32 `[N]`. The result is **lazy** and narrowed to bf16 inside the
+/// kernel. `INT8_QMV_W8A16=0` (read inside the shared C++ builder, so eager
+/// and compiled stay byte-identical) reroutes back to the W8A8 qmv for
+/// same-binary A/B. Returns `Err` when unsupported (gen < 17 or
+/// `K % 16 != 0`) or on a kernel/FFI failure.
+pub fn int8_w8a16_qmv(
+    x: &MxArray,
+    w_kn: &MxArray,
+    w_nk: &MxArray,
+    s_w: &MxArray,
+) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_int8_qmv_w8a16(
+            x.as_raw_ptr(),
+            w_kn.as_raw_ptr(),
+            w_nk.as_raw_ptr(),
+            s_w.as_raw_ptr(),
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_int8_qmv_w8a16 failed (unsupported gen/K or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "int8_w8a16_qmv")
+}
+
+/// MEASUREMENT ONLY (de-risk microbench — NOT a production path).
+///
+/// Affine-group W8A8 linear directly on the model's **EXACT** affine packed
+/// weight (no re-quant). `x` is `[M,K]` bf16; `packed_w` is the MLX affine
+/// packed uint32 weight `[N, K/4]` (4 uint8 per word, 8-bit); `scales`/`biases`
+/// are f32 `[N, K/group_size]`. Returns bf16 `[M,N] = x @ dequant(packed_w)^T`
+/// with per-token int8-quantized activation (identical activation quant to the
+/// symmetric [`int8_w8a8_matmul`] path).
+///
+/// Math (`q` UNSIGNED in `[0,255]`, dequant `w[n,k]=scale[n,g]*q[n,k]+bias[n,g]`,
+/// `g=k/group_size`; act per-token symmetric int8 `x_q[m,k]` in `[-127,127]`,
+/// `s_x[m]=absmax_k|x[m,k]|/127`):
+/// ```text
+///   P[m,n,g] = sum_{k in g} x_q[m,k] * q[n,k]
+///   S[m,g]   = sum_{k in g} x_q[m,k]
+///   y[m,n]   = s_x[m] * sum_g ( scale[n,g]*P[m,n,g] + bias[n,g]*S[m,g] )  -> bf16
+/// ```
+///
+/// Returns `Err` when unsupported (gen<17, `bits != 8`, or `K % group_size != 0`)
+/// or on a kernel/FFI failure — the caller is expected to fall back.
+pub fn affine_w8a8_matmul(
+    x: &MxArray,
+    packed_w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+    group_size: i32,
+    bits: i32,
+) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_affine_w8a8_linear(
+            x.as_raw_ptr(),
+            packed_w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+            group_size,
+            bits,
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_affine_w8a8_linear failed (unsupported gen/bits/group_size or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "affine_w8a8_matmul")
+}
+
+/// MEASUREMENT ONLY (de-risk microbench — NOT a production path).
+///
+/// LOAD-TIME prepare for the TILED affine-group W8A8 GEMM (runs once per
+/// quantized linear). Unpacks the affine packed `uint32` weight `[N, K/4]` into
+/// the SIGNED int8 `[K,N]` kernel operand (`q - 128`) the tiled `matmul2d`
+/// wants, keeps the f32 `scales` `[N, K/group_size]`, and precomputes
+/// `bias_adj = 128*scale + bias` `[N, K/group_size]`.
+///
+/// Returns `(q_s, scale_kept, bias_adj)` opaque handles for
+/// [`affine_w8a8_linear_prepared`]. Returns `Err` when unsupported (gen<17,
+/// `bits != 8`, or `K % group_size != 0`) or on a kernel/FFI failure.
+#[cfg(test)]
+pub fn affine_w8a8_prepare(
+    packed_w: &MxArray,
+    scales: &MxArray,
+    biases: &MxArray,
+    group_size: i32,
+    bits: i32,
+) -> Result<(MxArray, MxArray, MxArray)> {
+    let mut out_q_s: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_scale: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_badj: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_affine_w8a8_prepare(
+            packed_w.as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
+            group_size,
+            bits,
+            &mut out_q_s,
+            &mut out_scale,
+            &mut out_badj,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_affine_w8a8_prepare failed (unsupported gen/bits/group_size or kernel error; see stderr)",
+        ));
+    }
+    Ok((
+        MxArray::from_handle(out_q_s, "affine_w8a8_prepare:q_s")?,
+        MxArray::from_handle(out_scale, "affine_w8a8_prepare:scale")?,
+        MxArray::from_handle(out_badj, "affine_w8a8_prepare:badj")?,
+    ))
+}
+
+/// MEASUREMENT ONLY (de-risk microbench — NOT a production path).
+///
+/// Per-FORWARD prepared affine-group W8A8 linear (the TIMED hot path). Per-token
+/// int8 activation quant + per-group act-sum `S`, then the TILED grouped
+/// `matmul2d` GEMM. `x` is `[M,K]` bf16; `q_s` / `scale` / `bias_adj` come from
+/// [`affine_w8a8_prepare`]. Returns bf16 `[M,N]` (lazy).
+///
+/// Returns `Err` when unsupported (gen<17 or `K % group_size != 0`) or on a
+/// kernel/FFI failure.
+#[cfg(test)]
+pub fn affine_w8a8_linear_prepared(
+    x: &MxArray,
+    q_s: &MxArray,
+    scale: &MxArray,
+    bias_adj: &MxArray,
+    group_size: i32,
+) -> Result<MxArray> {
+    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_affine_w8a8_linear_prepared(
+            x.as_raw_ptr(),
+            q_s.as_raw_ptr(),
+            scale.as_raw_ptr(),
+            bias_adj.as_raw_ptr(),
+            group_size,
+            &mut out,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_affine_w8a8_linear_prepared failed (unsupported gen/group_size or kernel error; see stderr)",
+        ));
+    }
+    MxArray::from_handle(out, "affine_w8a8_linear_prepared")
 }
 
 /// MEASUREMENT ONLY (profiler/test scope — NOT a production path).
@@ -1315,6 +1553,1025 @@ mod tests {
         run("27B", 4096, 5120, 12288);
     }
 
+    // ================= AFFINE-GROUP W8A8 GROUPING OVERHEAD =================
+    // DE-RISK MICROBENCH. Isolates the per-group flush + affine bias OVERHEAD of
+    // the affine-group W8A8 kernel (`affine_w8a8_matmul`) OVER the proven
+    // symmetric W8A8 kernel (`int8_w8a8_matmul`, the realized +39-83% prefill
+    // path), at identical dense-MLP shapes. Also reports the actual WIN vs the
+    // affine `quantized_matmul` (qmm) baseline on the SAME packed affine weight.
+    //
+    // For each (M, N, K) it times three ops (warm, many iters, eval+sync between):
+    //   (1) AFFINE-GROUP W8A8 : affine_w8a8_matmul on the model's EXACT affine
+    //       packed uint32 weight (no re-quant). The kernel under de-risk.
+    //   (2) SYMMETRIC  W8A8   : int8_w8a8_matmul. Needs a symmetric int8 weight of
+    //       the SAME [N,K] shape — built by DEQUANTIZing the affine packed weight
+    //       to bf16 and running quantize_weight_int8 on it.
+    //   (3) AFFINE qmm        : mlx_quantized_matmul(transpose=true) on the SAME
+    //       packed affine weight/scales/biases — the production quant baseline.
+    //
+    // Reports median GPU ms/op and the two ratios:
+    //   grouped/symmetric  = the OVERHEAD (the de-risk number; >1 = grouping costs)
+    //   grouped/qmm        = the actual WIN (<1 = grouped beats qmm).
+    //
+    // The de-risk question is NOT "is grouped faster than qmm in absolute" (this
+    // grouped kernel is a plain int32-accumulator reference, not a tuned matmul2d)
+    // — it is how much the per-group flush + bias add OVER the symmetric kernel.
+    //
+    // Run:
+    //   cargo test -p mlx-core --lib int8_gemm::tests::profile_grouping_overhead \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual affine-group W8A8 grouping-overhead microbench; run with --ignored"]
+    fn profile_grouping_overhead() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+        if gpu_gen() < 17 {
+            eprintln!("[grp] SKIP gpu gen {} < 17 (NA needs M5+)", gpu_gen());
+            return;
+        }
+
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let iters = 50;
+        let warm = 12;
+
+        let bench = |f: &dyn Fn() -> MxArray| -> f64 {
+            for _ in 0..warm {
+                let o = f();
+                o.eval();
+            }
+            synchronize();
+            let t = Instant::now();
+            for _ in 0..iters {
+                let o = f();
+                o.eval();
+            }
+            synchronize();
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+
+        // Local affine quantize / dequantize / qmm wrappers (test scope).
+        let affine_quantize = |w: &MxArray| -> (MxArray, MxArray, MxArray) {
+            let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                    &mut q,
+                    &mut s,
+                    &mut b,
+                )
+            };
+            assert!(ok, "mlx_quantize(affine) failed");
+            (
+                MxArray::from_handle(q, "grp:packed_w").unwrap(),
+                MxArray::from_handle(s, "grp:scales").unwrap(),
+                MxArray::from_handle(b, "grp:biases").unwrap(),
+            )
+        };
+        let affine_dequantize = |q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_dequantize(
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    3, // bfloat16 (BridgeDType: FLOAT32=0,INT32=1,FLOAT16=2,BFLOAT16=3,UINT32=4,UINT8=5)
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "grp:dequant").unwrap()
+        };
+        let affine_qmm = |x: &MxArray, q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.as_raw_ptr(),
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    true, // transpose: [N,K] weight -> x @ w^T = [M,N]
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "grp:qmm").unwrap()
+        };
+
+        // One (M,N,K) shape: build the affine packed weight once, the symmetric
+        // int8 weight from its dequant, then time the three ops.
+        let run = |label: &str, m: i64, n: i64, k: i64| {
+            // bf16 activations + weight [N,K] (rows = output channels).
+            let x = MxArray::random_normal(&[m, k], 0.0, 0.05, Some(DType::BFloat16)).unwrap();
+            let w = MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+            x.eval();
+            w.eval();
+
+            // (1) operands: the model's EXACT affine packed weight (no re-quant).
+            let (packed_w, scales, biases) = affine_quantize(&w);
+            packed_w.eval();
+            scales.eval();
+            biases.eval();
+
+            // (2) operands: symmetric int8 weight of the SAME [N,K] shape, built
+            // from the DEQUANTIZED affine weight (so both paths quantize the SAME
+            // numeric weight — apples-to-apples).
+            let w_deq = affine_dequantize(&packed_w, &scales, &biases);
+            w_deq.eval();
+            let (sym_i8, sym_s) = quantize_weight_int8(&w_deq).unwrap();
+            sym_i8.eval();
+            sym_s.eval();
+
+            // (1') LOAD-TIME prepare for the TILED grouped GEMM — runs ONCE,
+            // OUTSIDE the timed loop (mirrors quantize_weight_int8 for the
+            // symmetric path). Unpacks the affine weight to the signed int8 [K,N]
+            // operand + bias_adj, so the timed closure measures only the GEMM.
+            let (grp_q_s, grp_scale, grp_badj) =
+                affine_w8a8_prepare(&packed_w, &scales, &biases, group_size, bits).unwrap();
+            grp_q_s.eval();
+            grp_scale.eval();
+            grp_badj.eval();
+            synchronize();
+
+            // The three timed closures. `grouped` now times ONLY the prepared
+            // per-forward linear (act-quant + S + tiled grouped matmul2d), NOT
+            // the one-time weight unpack.
+            let grouped = || {
+                affine_w8a8_linear_prepared(&x, &grp_q_s, &grp_scale, &grp_badj, group_size)
+                    .unwrap()
+            };
+            let symmetric = || int8_w8a8_matmul(&x, &sym_i8, &sym_s).unwrap();
+            let qmm = || affine_qmm(&x, &packed_w, &scales, &biases);
+
+            // 3 runs each, interleaved; report medians (host bench drift ~10-15%).
+            let mut g = [0.0f64; 3];
+            let mut s = [0.0f64; 3];
+            let mut q = [0.0f64; 3];
+            for r in 0..3 {
+                g[r] = bench(&grouped);
+                s[r] = bench(&symmetric);
+                q[r] = bench(&qmm);
+            }
+            let median = |mut v: [f64; 3]| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[1]
+            };
+            let gm = median(g);
+            let sm = median(s);
+            let qm = median(q);
+
+            eprintln!(
+                "[grp] === {label}: M={m} N={n} K={k} (group_size={group_size}, bits={bits}) ==="
+            );
+            eprintln!(
+                "[grp] grouped (ms): {:.3} {:.3} {:.3} -> median {gm:.3}",
+                g[0], g[1], g[2]
+            );
+            eprintln!(
+                "[grp] symmetric(ms): {:.3} {:.3} {:.3} -> median {sm:.3}",
+                s[0], s[1], s[2]
+            );
+            eprintln!(
+                "[grp] qmm     (ms): {:.3} {:.3} {:.3} -> median {qm:.3}",
+                q[0], q[1], q[2]
+            );
+            eprintln!(
+                "[grp] OVERHEAD grouped/symmetric = {:.3}  (>1 = per-group flush+bias costs)",
+                gm / sm
+            );
+            eprintln!(
+                "[grp] WIN      grouped/qmm       = {:.3}  (<1 = grouped beats qmm)",
+                gm / qm
+            );
+        };
+
+        eprintln!("[grp] === affine-group W8A8 grouping overhead, real Qwen3.5-4B MLP shapes ===");
+        // Real dense-MLP shapes: K in {2560, 9216}, N in {9216, 2560}, M in
+        // {1024, 4096}. 4B: gate_up is K=hidden=2560 -> N=intermediate=9216
+        // (intermediate per gate/up branch); down is K=9216 -> N=2560.
+        for &m in &[1024i64, 4096] {
+            run("gate_up", m, 9216, 2560); // x[M,2560] @ deq(w[9216,2560])^T
+            run("down", m, 2560, 9216); // x[M,9216] @ deq(w[2560,9216])^T
+        }
+    }
+
+    // ===================== PHASE 0: sym8 DECODE de-risk =====================
+    // A sym8 (per-channel symmetric int8) checkpoint routes BOTH prefill AND
+    // DECODE through int8_w8a8_matmul — a sym8 weight has NO affine packed form to
+    // fall back to at M=1. This gate answers the two open DECODE questions BEFORE
+    // any convert/loader plumbing (kills the project cheaply if decode is bad):
+    //   (1) CORRECTNESS at M=1 / tiny M: does int8_w8a8_matmul produce a faithful
+    //       result on a 1-row (partial-tile) activation? (s1b proves bit-exact
+    //       partial tiles; this confirms cosine vs an f32 reference at M=1.)
+    //   (2) DECODE PERF: is sym8-GEMM-at-M=1 within parity of affine qmv (today's
+    //       decode path)? Both stream ~1 byte/weight (BW-bound). A dedicated sym8
+    //       qmv (Phase 6) is justified ONLY if this REGRESSES.
+    // The weight is quantized from the bf16 SOURCE (quantize_weight_int8 = the true
+    // Option-B single-quant path), and the affine baseline affine-quantizes the
+    // SAME w (apples-to-apples sym8-decode vs affine-Q8-decode).
+    // Run:
+    //   cargo test -p mlx-core --lib int8_gemm::tests::profile_sym8_decode \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual sym8 decode de-risk (correctness@M=1 + decode perf vs affine qmv); run with --ignored"]
+    fn profile_sym8_decode() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+        if gpu_gen() < 17 {
+            eprintln!("[sym8dec] SKIP gpu gen {} < 17 (NA needs M5+)", gpu_gen());
+            return;
+        }
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let iters = 100;
+        let warm = 20;
+
+        let bench = |f: &dyn Fn() -> MxArray| -> f64 {
+            for _ in 0..warm {
+                f().eval();
+            }
+            synchronize();
+            let t = Instant::now();
+            for _ in 0..iters {
+                f().eval();
+            }
+            synchronize();
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+        let affine_quantize = |w: &MxArray| -> (MxArray, MxArray, MxArray) {
+            let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                    &mut q,
+                    &mut s,
+                    &mut b,
+                )
+            };
+            assert!(ok, "mlx_quantize(affine) failed");
+            (
+                MxArray::from_handle(q, "sym8dec:packed").unwrap(),
+                MxArray::from_handle(s, "sym8dec:scales").unwrap(),
+                MxArray::from_handle(b, "sym8dec:biases").unwrap(),
+            )
+        };
+        let affine_qmm = |x: &MxArray, q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.as_raw_ptr(),
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    true,
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "sym8dec:qmm").unwrap()
+        };
+
+        let run = |label: &str, m: i64, n: i64, k: i64| {
+            let x = MxArray::random_normal(&[m, k], 0.0, 0.05, Some(DType::BFloat16)).unwrap();
+            let w = MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+            x.eval();
+            w.eval();
+            // sym8 (Option B) — quantize from bf16 SOURCE (single quant).
+            let (w_i8, s_w) = quantize_weight_int8(&w).unwrap();
+            w_i8.eval();
+            s_w.eval();
+            // affine-Q8 baseline of the SAME weight.
+            let (packed_w, scales, biases) = affine_quantize(&w);
+            packed_w.eval();
+            scales.eval();
+            biases.eval();
+
+            // (1) CORRECTNESS — per-row cosine vs f32 reference (x_f32 @ w_f32^T).
+            let y = int8_w8a8_matmul(&x, &w_i8, &s_w).unwrap();
+            y.eval();
+            let wt = w
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+            let y_ref = x.astype(DType::Float32).unwrap().matmul(&wt).unwrap();
+            y_ref.eval();
+            let got = y.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let got: &[f32] = &got;
+            let refv = y_ref.to_float32().unwrap();
+            let refv: &[f32] = &refv;
+            let mut min_cos = f64::INFINITY;
+            let mut sum_cos = 0.0f64;
+            for mi in 0..m as usize {
+                let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+                for ni in 0..n as usize {
+                    let a = got[mi * n as usize + ni] as f64;
+                    let b = refv[mi * n as usize + ni] as f64;
+                    dot += a * b;
+                    na += a * a;
+                    nb += b * b;
+                }
+                let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                min_cos = min_cos.min(cos);
+                sum_cos += cos;
+            }
+            let mean_cos = sum_cos / m as f64;
+
+            // (2) DECODE PERF — sym8 GEMM vs affine qmv, same weight.
+            let sym = || int8_w8a8_matmul(&x, &w_i8, &s_w).unwrap();
+            let qmm = || affine_qmm(&x, &packed_w, &scales, &biases);
+            let median = |mut v: [f64; 3]| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[1]
+            };
+            let mut sv = [0.0f64; 3];
+            let mut qv = [0.0f64; 3];
+            for r in 0..3 {
+                sv[r] = bench(&sym);
+                qv[r] = bench(&qmm);
+            }
+            let sm = median(sv);
+            let qm = median(qv);
+            eprintln!(
+                "[sym8dec] {label} M={m} N={n} K={k}: cos min={min_cos:.6} mean={mean_cos:.6} | sym8={sm:.4}ms qmv={qm:.4}ms  sym8/qmv={:.3} ({})",
+                sm / qm,
+                if sm / qm <= 1.05 {
+                    "PARITY-OK"
+                } else {
+                    "REGRESSION?"
+                }
+            );
+            assert!(
+                min_cos >= 0.999,
+                "sym8 decode cosine below gate at {label} M={m}: min={min_cos:.6}"
+            );
+        };
+
+        eprintln!(
+            "[sym8dec] === sym8 decode de-risk: correctness@M=1 + perf vs affine qmv (4B shapes) ==="
+        );
+        for &m in &[1i64, 4, 8] {
+            run("gate_up", m, 9216, 2560);
+            run("down", m, 2560, 9216);
+            run("o_proj", m, 2560, 2560);
+        }
+    }
+
+    // ===================== PHASE 6: sym8 DECODE QMV =====================
+    // GATE: the DEDICATED sym8 matvec (int8_w8a8_qmv) must be a FAITHFUL decode
+    // matvec — per-row cosine vs an f32 reference (x_f32 @ w_f32^T) >= 0.999 at
+    // M in {1,4,8} on the three 4B projection shapes {gate_up, down, o_proj}.
+    // Mirrors profile_sym8_decode but exercises the qmv path (which Phase-0
+    // proved is needed because reusing the 128x64 prefill GEMM at M=1 wastes
+    // 127/128 rows -> 1.4-1.8x regression vs affine qmv). The weight is quantized
+    // from the bf16 SOURCE (quantize_weight_int8 = the true Option-B single-quant
+    // path). This phase's bar is correctness + that it RUNS; the perf verdict (qmv
+    // vs affine qmv) is the NEXT phase — we time it here only as a smoke check.
+    // Run:
+    //   cargo test -p mlx-core --lib int8_gemm::tests::profile_sym8_qmv \
+    //     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual sym8 decode QMV correctness (cosine@M=1/4/8) + smoke timing; run with --ignored"]
+    fn profile_sym8_qmv() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+        if gpu_gen() < 17 {
+            eprintln!("[sym8qmv] SKIP gpu gen {} < 17 (NA needs M5+)", gpu_gen());
+            return;
+        }
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let iters = 100;
+        let warm = 20;
+        let bench = |f: &dyn Fn() -> MxArray| -> f64 {
+            for _ in 0..warm {
+                f().eval();
+            }
+            synchronize();
+            let t = Instant::now();
+            for _ in 0..iters {
+                f().eval();
+            }
+            synchronize();
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+        // affine-Q8 baseline of the SAME weight (the production decode path:
+        // mlx_quantized_matmul transpose=true). This is the apples-to-apples
+        // affine qmv the dedicated sym8 qmv must reach parity with at M=1.
+        let affine_quantize = |w: &MxArray| -> (MxArray, MxArray, MxArray) {
+            let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                    &mut q,
+                    &mut s,
+                    &mut b,
+                )
+            };
+            assert!(ok, "mlx_quantize(affine) failed");
+            (
+                MxArray::from_handle(q, "sym8qmv:packed").unwrap(),
+                MxArray::from_handle(s, "sym8qmv:scales").unwrap(),
+                MxArray::from_handle(b, "sym8qmv:biases").unwrap(),
+            )
+        };
+        let affine_qmm = |x: &MxArray, q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.as_raw_ptr(),
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    true,
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "sym8qmv:qmm").unwrap()
+        };
+
+        let run = |label: &str, m: i64, n: i64, k: i64| {
+            let x = MxArray::random_normal(&[m, k], 0.0, 0.05, Some(DType::BFloat16)).unwrap();
+            let w = MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+            x.eval();
+            w.eval();
+            // sym8 (Option B) — quantize from bf16 SOURCE (single quant). Same
+            // (w_i8 [K,N], s_w [N]) operands int8_w8a8_matmul consumes.
+            let (w_i8, s_w) = quantize_weight_int8(&w).unwrap();
+            w_i8.eval();
+            s_w.eval();
+            // affine-Q8 baseline of the SAME weight.
+            let (packed_w, scales, biases) = affine_quantize(&w);
+            packed_w.eval();
+            scales.eval();
+            biases.eval();
+
+            // CORRECTNESS — per-row cosine vs f32 reference (x_f32 @ w_f32^T).
+            let y = int8_w8a8_qmv(&x, &w_i8, &s_w).unwrap();
+            y.eval();
+            assert_eq!(
+                y.dtype().unwrap(),
+                DType::BFloat16,
+                "qmv output must be bf16"
+            );
+            assert_eq!(y.shape_at(0).unwrap(), m, "qmv rows");
+            assert_eq!(y.shape_at(1).unwrap(), n, "qmv cols");
+            let wt = w
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+            let y_ref = x.astype(DType::Float32).unwrap().matmul(&wt).unwrap();
+            y_ref.eval();
+            let got = y.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let got: &[f32] = &got;
+            let refv = y_ref.to_float32().unwrap();
+            let refv: &[f32] = &refv;
+            let mut min_cos = f64::INFINITY;
+            let mut sum_cos = 0.0f64;
+            for mi in 0..m as usize {
+                let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+                for ni in 0..n as usize {
+                    let a = got[mi * n as usize + ni] as f64;
+                    let b = refv[mi * n as usize + ni] as f64;
+                    dot += a * b;
+                    na += a * a;
+                    nb += b * b;
+                }
+                let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                min_cos = min_cos.min(cos);
+                sum_cos += cos;
+            }
+            let mean_cos = sum_cos / m as f64;
+
+            // DECODE PARITY — dedicated sym8 qmv vs affine qmv (production decode
+            // path), same weight. Mirrors profile_sym8_decode's bench structure
+            // exactly: warm 20, iters 100, 3 interleaved runs, median, sync
+            // between. The gemm column stays as a smoke reference.
+            let qmv = || int8_w8a8_qmv(&x, &w_i8, &s_w).unwrap();
+            let gemm = || int8_w8a8_matmul(&x, &w_i8, &s_w).unwrap();
+            let affqmv = || affine_qmm(&x, &packed_w, &scales, &biases);
+            let median = |mut v: [f64; 3]| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[1]
+            };
+            let mut qv = [0.0f64; 3];
+            let mut gv = [0.0f64; 3];
+            let mut av = [0.0f64; 3];
+            for r in 0..3 {
+                qv[r] = bench(&qmv);
+                av[r] = bench(&affqmv);
+                gv[r] = bench(&gemm);
+            }
+            let qm = median(qv);
+            let gm = median(gv);
+            let am = median(av);
+            eprintln!(
+                "[sym8qmv] {label} M={m} N={n} K={k}: cos min={min_cos:.6} mean={mean_cos:.6} | int8_qmv={qm:.4}ms affine_qmv={am:.4}ms gemm={gm:.4}ms  int8_qmv/affine_qmv={:.3} ({})  qmv/gemm={:.3}",
+                qm / am,
+                if qm / am <= 1.05 {
+                    "PARITY-OK"
+                } else {
+                    "REGRESSION?"
+                },
+                qm / gm
+            );
+            assert!(
+                min_cos >= 0.999,
+                "sym8 qmv cosine below gate at {label} M={m}: min={min_cos:.6}"
+            );
+        };
+
+        eprintln!(
+            "[sym8qmv] === sym8 decode QMV: correctness@M=1/4/8 + parity vs affine qmv (4B shapes) ==="
+        );
+        for &m in &[1i64, 4, 8] {
+            run("gate_up", m, 9216, 2560);
+            run("down", m, 2560, 9216);
+            run("o_proj", m, 2560, 2560);
+        }
+    }
+
+    // ===================== W8A16 sym8 DECODE QMV =====================
+    // GATE: the W8A16 decode matvec (int8_w8a16_qmv — bf16 activations read
+    // directly, NO act quant, f32 accumulate) must be a FAITHFUL decode matvec:
+    // per-row cosine vs an f32 reference (x_f32 @ w_f32^T) >= 0.999 at M in
+    // {1,2} (the decode dispatch range) on the three 4B projection shapes.
+    // Because the activation is EXACT (only weight-quant error remains), the
+    // cosine must also be >= the W8A8 qmv's on the same inputs — asserted
+    // directly. PERF (informational — the e2e paired A/B is the real gate):
+    // W8A16 qmv vs affine qmv (production affine decode path) vs the old W8A8
+    // qmv at M=1, plus an INT8_QMV16_BN/BK geometry sweep.
+    // Run:
+    //   cargo test -p mlx-core --release int8_gemm::tests::profile_sym8_qmv_w8a16 \
+    //     -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "manual W8A16 sym8 decode QMV correctness (cosine@M=1/2) + microbench; run with --ignored"]
+    fn profile_sym8_qmv_w8a16() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+        if gpu_gen() < 17 {
+            eprintln!("[w8a16qmv] SKIP gpu gen {} < 17 (NA needs M5+)", gpu_gen());
+            return;
+        }
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let iters = 100;
+        let warm = 20;
+        let bench = |f: &dyn Fn() -> MxArray| -> f64 {
+            for _ in 0..warm {
+                f().eval();
+            }
+            synchronize();
+            let t = Instant::now();
+            for _ in 0..iters {
+                f().eval();
+            }
+            synchronize();
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+        let affine_quantize = |w: &MxArray| -> (MxArray, MxArray, MxArray) {
+            let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                    &mut q,
+                    &mut s,
+                    &mut b,
+                )
+            };
+            assert!(ok, "mlx_quantize(affine) failed");
+            (
+                MxArray::from_handle(q, "w8a16qmv:packed").unwrap(),
+                MxArray::from_handle(s, "w8a16qmv:scales").unwrap(),
+                MxArray::from_handle(b, "w8a16qmv:biases").unwrap(),
+            )
+        };
+        let affine_qmm = |x: &MxArray, q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.as_raw_ptr(),
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    true,
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "w8a16qmv:qmm").unwrap()
+        };
+        // Per-row cosine of `got` vs `refv`, both [M,N] row-major f32.
+        let row_cosines = |got: &[f32], refv: &[f32], m: usize, n: usize| -> (f64, f64) {
+            let mut min_cos = f64::INFINITY;
+            let mut sum_cos = 0.0f64;
+            for mi in 0..m {
+                let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+                for ni in 0..n {
+                    let a = got[mi * n + ni] as f64;
+                    let b = refv[mi * n + ni] as f64;
+                    dot += a * b;
+                    na += a * a;
+                    nb += b * b;
+                }
+                let cos = dot / (na.sqrt() * nb.sqrt()).max(1e-12);
+                min_cos = min_cos.min(cos);
+                sum_cos += cos;
+            }
+            (min_cos, sum_cos / m as f64)
+        };
+
+        let run = |label: &str, m: i64, n: i64, k: i64| {
+            let x = MxArray::random_normal(&[m, k], 0.0, 0.05, Some(DType::BFloat16)).unwrap();
+            let w = MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+            x.eval();
+            w.eval();
+            // sym8 weight quant from the bf16 SOURCE — the same (w_i8 [K,N],
+            // s_w [N]) operands the production forward consumes. The decode
+            // matvec ALSO takes the [N,K] checkpoint orientation; rebuild it
+            // from the [K,N] operand (sym8_kernel_operand is just a
+            // transpose+contiguous — bit-exact with the stored checkpoint).
+            let (w_i8, s_w) = quantize_weight_int8(&w).unwrap();
+            w_i8.eval();
+            s_w.eval();
+            let w_nk = sym8_kernel_operand(&w_i8).unwrap();
+            w_nk.eval();
+            // affine-Q8 baseline of the SAME weight (production affine decode).
+            let (packed_w, scales, biases) = affine_quantize(&w);
+            packed_w.eval();
+            scales.eval();
+            biases.eval();
+
+            // CORRECTNESS — per-row cosine vs f32 reference (x_f32 @ w_f32^T).
+            let y = int8_w8a16_qmv(&x, &w_i8, &w_nk, &s_w).unwrap();
+            y.eval();
+            assert_eq!(
+                y.dtype().unwrap(),
+                DType::BFloat16,
+                "w8a16 qmv output must be bf16"
+            );
+            assert_eq!(y.shape_at(0).unwrap(), m, "w8a16 qmv rows");
+            assert_eq!(y.shape_at(1).unwrap(), n, "w8a16 qmv cols");
+            let wt = w
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+            let y_ref = x.astype(DType::Float32).unwrap().matmul(&wt).unwrap();
+            y_ref.eval();
+            let got = y.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let refv = y_ref.to_float32().unwrap();
+            let (min_cos, mean_cos) = row_cosines(&got, &refv, m as usize, n as usize);
+            // W8A8 qmv on the SAME inputs — the W8A16 cosine must be >= it
+            // (activation quant error removed; weight error identical).
+            let y8 = int8_w8a8_qmv(&x, &w_i8, &s_w).unwrap();
+            y8.eval();
+            let got8 = y8.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let (min_cos8, mean_cos8) = row_cosines(&got8, &refv, m as usize, n as usize);
+            eprintln!(
+                "[w8a16qmv] {label} M={m} N={n} K={k}: cos min={min_cos:.6} mean={mean_cos:.6} | w8a8 cos min={min_cos8:.6} mean={mean_cos8:.6} ({})",
+                if min_cos >= min_cos8 {
+                    "W8A16>=W8A8 OK"
+                } else {
+                    "W8A16 BELOW W8A8?"
+                }
+            );
+            assert!(
+                min_cos >= 0.999,
+                "w8a16 qmv cosine below gate at {label} M={m}: min={min_cos:.6}"
+            );
+            assert!(
+                mean_cos >= mean_cos8 - 1e-9,
+                "w8a16 qmv mean cosine ({mean_cos:.7}) below the W8A8 qmv's \
+                 ({mean_cos8:.7}) at {label} M={m} — activation-exact path must \
+                 not be LESS accurate"
+            );
+
+            // PERF (informational) at this M — W8A16 vs affine qmv vs old W8A8.
+            let w8a16 = || int8_w8a16_qmv(&x, &w_i8, &w_nk, &s_w).unwrap();
+            let w8a8 = || int8_w8a8_qmv(&x, &w_i8, &s_w).unwrap();
+            let affqmv = || affine_qmm(&x, &packed_w, &scales, &biases);
+            let median = |mut v: [f64; 3]| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[1]
+            };
+            let mut nv = [0.0f64; 3];
+            let mut ov = [0.0f64; 3];
+            let mut av = [0.0f64; 3];
+            for r in 0..3 {
+                nv[r] = bench(&w8a16);
+                av[r] = bench(&affqmv);
+                ov[r] = bench(&w8a8);
+            }
+            let nm = median(nv);
+            let am = median(av);
+            let om = median(ov);
+            eprintln!(
+                "[w8a16qmv] {label} M={m} N={n} K={k}: w8a16={nm:.4}ms affine_qmv={am:.4}ms w8a8_qmv={om:.4}ms  w8a16/affine={:.3} ({})  w8a16/w8a8={:.3}",
+                nm / am,
+                if nm / am <= 1.05 {
+                    "PARITY-OK"
+                } else {
+                    "REGRESSION?"
+                },
+                nm / om
+            );
+        };
+
+        eprintln!(
+            "[w8a16qmv] === W8A16 sym8 decode QMV: correctness@M=1/2 + perf vs affine/W8A8 qmv (4B shapes) ==="
+        );
+        for &m in &[1i64, 2] {
+            run("gate_up", m, 9216, 2560);
+            run("down", m, 2560, 9216);
+            run("o_proj", m, 2560, 2560);
+            // N=64 GDN gate projection: N % 128 != 0 -> exercises the host's
+            // scalar fallback under the shape-aware default geometry.
+            run("gdn_gate", m, 64, 2560);
+            // Largest real decode shape (qkvz fused): VEC4/BN=128 default path.
+            run("qkvz", m, 12288, 2560);
+        }
+
+        // GEOMETRY SWEEP (M=1, informational): default BN=32/BK=16 vs
+        // alternatives. The env vars are read PER CALL inside
+        // int8_qmv_w8a16_core, so set_var between runs re-dispatches. SAFETY:
+        // tests in this profile scope run with --test-threads=1 (GPU strictly
+        // serial), so the process-global env mutation cannot race.
+        let sweep = |bn: &str, bk: &str, stagex: &str| {
+            unsafe {
+                std::env::set_var("INT8_QMV16_BN", bn);
+                std::env::set_var("INT8_QMV16_BK", bk);
+                std::env::set_var("INT8_QMV16_STAGEX", stagex);
+            }
+            for (label, n, k) in [
+                ("gate_up", 9216i64, 2560i64),
+                ("down", 2560, 9216),
+                ("o_proj", 2560, 2560),
+            ] {
+                let x = MxArray::random_normal(&[1, k], 0.0, 0.05, Some(DType::BFloat16)).unwrap();
+                let w = MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+                x.eval();
+                w.eval();
+                let (w_i8, s_w) = quantize_weight_int8(&w).unwrap();
+                w_i8.eval();
+                s_w.eval();
+                let w_nk = sym8_kernel_operand(&w_i8).unwrap();
+                w_nk.eval();
+                let f = || int8_w8a16_qmv(&x, &w_i8, &w_nk, &s_w).unwrap();
+                let t = bench(&f);
+                eprintln!(
+                    "[w8a16qmv][sweep] BN={bn} BK={bk} STAGEX={stagex} {label} M=1 N={n} K={k}: {t:.4}ms"
+                );
+            }
+        };
+        sweep("32", "16", "0"); // default
+        sweep("64", "16", "0");
+        sweep("32", "32", "0");
+        sweep("32", "16", "1"); // tg-staged x (host gates off where it can't fit)
+        unsafe {
+            std::env::remove_var("INT8_QMV16_BN");
+            std::env::remove_var("INT8_QMV16_BK");
+            std::env::remove_var("INT8_QMV16_STAGEX");
+        }
+    }
+
+    // =============== IN-STREAM decode-shaped attribution bench ===============
+    // The e2e paired A/B proved isolated per-call microbenches UNDER-represent
+    // the in-stream cost of the sym8 qmv at decode M=1 (W8A8 was
+    // isolated-parity yet ~2x slower e2e). This bench reproduces the decode
+    // call pattern: a DEPENDENT chain of 150 M=1 projections (50 rounds of
+    // gate_up -> down -> o_proj, each consuming the previous output) built
+    // LAZILY and eval'd ONCE — exactly how the forward graph streams qmv
+    // calls — for three arms: W8A16 qmv, affine quantized_matmul (production
+    // baseline), old W8A8 qmv. A second TINY chain (64x64: GPU work ~0)
+    // prices the PER-CALL NODE OVERHEAD (graph node + encode + dispatch) of
+    // the fast::metal_kernel path vs the native affine primitive — splitting
+    // the in-stream delta into "kernel GPU time" vs "custom-kernel node cost".
+    // Run:
+    //   cargo test -p mlx-core --release int8_gemm::tests::profile_sym8_qmv_instream \
+    //     -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore = "manual in-stream decode-chain attribution bench; run with --ignored"]
+    fn profile_sym8_qmv_instream() {
+        use crate::array::memory::synchronize;
+        use std::time::Instant;
+        if gpu_gen() < 17 {
+            eprintln!("[instream] SKIP gpu gen {} < 17 (NA needs M5+)", gpu_gen());
+            return;
+        }
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let affine_quantize = |w: &MxArray| -> (MxArray, MxArray, MxArray) {
+            let mut q: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut s: *mut sys::mlx_array = std::ptr::null_mut();
+            let mut b: *mut sys::mlx_array = std::ptr::null_mut();
+            let ok = unsafe {
+                sys::mlx_quantize(
+                    w.as_raw_ptr(),
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                    &mut q,
+                    &mut s,
+                    &mut b,
+                )
+            };
+            assert!(ok, "mlx_quantize(affine) failed");
+            (
+                MxArray::from_handle(q, "instream:packed").unwrap(),
+                MxArray::from_handle(s, "instream:scales").unwrap(),
+                MxArray::from_handle(b, "instream:biases").unwrap(),
+            )
+        };
+        let affine_qmm = |x: &MxArray, q: &MxArray, s: &MxArray, b: &MxArray| -> MxArray {
+            let handle = unsafe {
+                sys::mlx_quantized_matmul(
+                    x.as_raw_ptr(),
+                    q.as_raw_ptr(),
+                    s.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    true,
+                    group_size,
+                    bits,
+                    c"affine".as_ptr(),
+                )
+            };
+            MxArray::from_handle(handle, "instream:qmm").unwrap()
+        };
+
+        // One weight set: (N, K) with std 1/sqrt(K) so the dependent chain's
+        // activation magnitude stays ~constant across 50 rounds (no bf16
+        // overflow/underflow that would change absmax/quant work mid-chain).
+        struct WSet {
+            k: i64,
+            w_i8: MxArray,
+            w_nk: MxArray,
+            s_w: MxArray,
+            q: MxArray,
+            s: MxArray,
+            b: MxArray,
+        }
+        let mk = |n: i64, k: i64| -> WSet {
+            let std = 1.0 / (k as f64).sqrt();
+            let w = MxArray::random_normal(&[n, k], 0.0, std, Some(DType::BFloat16)).unwrap();
+            w.eval();
+            let (w_i8, s_w) = quantize_weight_int8(&w).unwrap();
+            w_i8.eval();
+            s_w.eval();
+            // [N,K] checkpoint orientation for the simd_sum decode kernel
+            // (transpose+contiguous of the [K,N] operand — bit-exact).
+            let w_nk = sym8_kernel_operand(&w_i8).unwrap();
+            w_nk.eval();
+            let (q, s, b) = affine_quantize(&w);
+            q.eval();
+            s.eval();
+            b.eval();
+            WSet {
+                k,
+                w_i8,
+                w_nk,
+                s_w,
+                q,
+                s,
+                b,
+            }
+        };
+
+        // chain(arm, weights, rounds): x0 [1, K0] -> rounds * (each WSet in
+        // order) dependent M=1 calls, ONE eval at the end. Returns ms/chain.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Arm {
+            W8a16,
+            W8a8,
+            Affine,
+        }
+        let bench_chain = |arm: Arm, sets: &[&WSet], rounds: usize, iters: usize| -> f64 {
+            let k0 = sets[0].k;
+            let x0 = MxArray::random_normal(&[1, k0], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+            x0.eval();
+            synchronize();
+            let run_once = || -> MxArray {
+                let mut x = x0.clone();
+                for _ in 0..rounds {
+                    for ws in sets {
+                        x = match arm {
+                            Arm::W8a16 => int8_w8a16_qmv(&x, &ws.w_i8, &ws.w_nk, &ws.s_w).unwrap(),
+                            Arm::W8a8 => int8_w8a8_qmv(&x, &ws.w_i8, &ws.s_w).unwrap(),
+                            Arm::Affine => affine_qmm(&x, &ws.q, &ws.s, &ws.b),
+                        };
+                    }
+                }
+                x
+            };
+            // warm
+            for _ in 0..3 {
+                run_once().eval();
+            }
+            synchronize();
+            let t = Instant::now();
+            for _ in 0..iters {
+                run_once().eval();
+            }
+            synchronize();
+            t.elapsed().as_secs_f64() * 1e3 / iters as f64
+        };
+
+        // ---- PRODUCTION-SHAPED chain: 50 rounds x (gate_up, down, o_proj) ----
+        let gate_up = mk(9216, 2560);
+        let down = mk(2560, 9216);
+        let o_proj = mk(2560, 2560);
+        let sets: [&WSet; 3] = [&gate_up, &down, &o_proj];
+        let rounds = 50usize; // 150 dependent M=1 calls / chain
+        let calls = (rounds * sets.len()) as f64;
+        let iters = 20usize;
+        let median = |mut v: [f64; 3]| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[1]
+        };
+        let mut a16 = [0.0f64; 3];
+        let mut aff = [0.0f64; 3];
+        let mut a8 = [0.0f64; 3];
+        for r in 0..3 {
+            a16[r] = bench_chain(Arm::W8a16, &sets, rounds, iters);
+            aff[r] = bench_chain(Arm::Affine, &sets, rounds, iters);
+            a8[r] = bench_chain(Arm::W8a8, &sets, rounds, iters);
+        }
+        let (m16, maff, m8) = (median(a16), median(aff), median(a8));
+        eprintln!(
+            "[instream] 4B-shaped chain ({} calls): w8a16={m16:.3}ms affine={maff:.3}ms w8a8={m8:.3}ms",
+            calls as usize
+        );
+        eprintln!(
+            "[instream]   per-call: w8a16={:.2}us affine={:.2}us w8a8={:.2}us | delta(w8a16-affine)={:.2}us/call ratio={:.3}",
+            m16 * 1e3 / calls,
+            maff * 1e3 / calls,
+            m8 * 1e3 / calls,
+            (m16 - maff) * 1e3 / calls,
+            m16 / maff
+        );
+
+        // ---- TINY chain (64x64): GPU work ~0 -> per-call NODE overhead ----
+        let tiny = mk(64, 64);
+        let tiny_sets: [&WSet; 1] = [&tiny];
+        let tiny_rounds = 150usize;
+        let tcalls = tiny_rounds as f64;
+        let mut t16 = [0.0f64; 3];
+        let mut taff = [0.0f64; 3];
+        let mut t8 = [0.0f64; 3];
+        for r in 0..3 {
+            t16[r] = bench_chain(Arm::W8a16, &tiny_sets, tiny_rounds, iters);
+            taff[r] = bench_chain(Arm::Affine, &tiny_sets, tiny_rounds, iters);
+            t8[r] = bench_chain(Arm::W8a8, &tiny_sets, tiny_rounds, iters);
+        }
+        let (tm16, tmaff, tm8) = (median(t16), median(taff), median(t8));
+        eprintln!(
+            "[instream] tiny 64x64 chain ({} calls, GPU~0): w8a16={tm16:.3}ms affine={tmaff:.3}ms w8a8={tm8:.3}ms",
+            tiny_rounds
+        );
+        eprintln!(
+            "[instream]   per-call node overhead: w8a16={:.2}us affine={:.2}us w8a8={:.2}us | delta(w8a16-affine)={:.2}us/call",
+            tm16 * 1e3 / tcalls,
+            tmaff * 1e3 / tcalls,
+            tm8 * 1e3 / tcalls,
+            (tm16 - tmaff) * 1e3 / tcalls
+        );
+        // Attribution split: in-stream per-call delta = node-overhead delta
+        // (tiny chain) + kernel GPU-time delta (the remainder).
+        let total_delta = (m16 - maff) * 1e3 / calls;
+        let node_delta = (tm16 - tmaff) * 1e3 / tcalls;
+        eprintln!(
+            "[instream] ATTRIBUTION per call: total={total_delta:.2}us node={node_delta:.2}us kernel-gpu={:.2}us ({}% node)",
+            total_delta - node_delta,
+            if total_delta.abs() > 1e-9 {
+                (node_delta / total_delta * 100.0).round()
+            } else {
+                f64::NAN
+            }
+        );
+    }
+
     // ============================ STAGE 2 ============================
     // GATE S2: per-ROW cosine >= 0.999 on a real projection shape.
     // x[M=512, hidden=2560] @ w[N=intermediate, K=2560]^T, weight quantized once.
@@ -1414,5 +2671,278 @@ mod tests {
                 "W8A8 per-row cosine below gate at M={m} K={k} N={n}: min={min_cos:.6}"
             );
         }
+    }
+
+    // ===================== AFFINE-GROUP W8A8 PARITY =====================
+    // GATE (TDD — drives the new affine_w8a8_matmul op): the int8-activation x
+    // EXACT-affine-weight kernel must equal the reference
+    //   y_ref = x_rec @ dequant(packed_w)^T
+    // where x_rec = s_x * x_q is x quantized to int8 EXACTLY the way the kernel
+    // does (the SAME per-token symmetric quant as the symmetric W8A8 path — we
+    // reuse act_quant_lazy to get the kernel's exact x_q + s_x), and
+    // dequant(packed_w) is MLX's own affine dequant of the model's EXACT packed
+    // weight (NO re-quantization of the weight). Because both sides apply the
+    // identical x_q and the identical affine weight, the only error is bf16/f32
+    // narrowing — so the gate is TIGHT: per-row cosine >= 0.9995 AND small max
+    // relative error.
+    //
+    // This test will NOT compile until the Implement phase adds
+    // `affine_w8a8_matmul` (TDD). Do not run before then.
+    #[test]
+    fn affine_w8a8_cosine_parity() {
+        if gpu_gen() < 17 {
+            eprintln!(
+                "[affine] SKIP: gpu gen {} < 17 (NA matmul2d needs M5+)",
+                gpu_gen()
+            );
+            return;
+        }
+
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        // N=128, K=256: K % group_size == 0 (4 groups/row); K_packed = K/4 = 64.
+        let n: usize = 128;
+        let k: usize = 256;
+        let m: usize = 256; // realistic prefill tile, >= 256 per spec.
+        let gs = group_size as usize;
+        let groups_per_row = k / gs; // 4
+        // MLX affine bits=8 packs 4 consecutive uint8 q-values per uint32 along K
+        // (el_per_int = 32/bits = 4), low element in the low byte (shift 0,8,16,24).
+        // See crates/mlx-sys/mlx/mlx/backend/cpu/quantized.cpp `quantize()`:
+        //   out_el |= (uint64_t)w_el << (k * bits)  for k in [0,4), bits=8.
+        let pack_factor = 32 / bits as usize; // 4
+        let k_packed = k / pack_factor; // 64
+
+        let mut state: u64 = 0xa771_4e8e_d00d_b16e;
+
+        // ---- Build the affine-quantized weight DIRECTLY (no re-quant) ----
+        // uint8 q[N,K] in [0,255].
+        let mut qv = vec![0u8; n * k];
+        for v in qv.iter_mut() {
+            *v = next_int(&mut state, 0, 255) as u8;
+        }
+        // Pack to uint32 [N, K_packed]: packed[ni, j] holds q[ni,4j..4j+4],
+        // low element in the low byte.
+        let mut packed = vec![0u32; n * k_packed];
+        for ni in 0..n {
+            for j in 0..k_packed {
+                let mut w_el: u32 = 0;
+                for p in 0..pack_factor {
+                    let q = qv[ni * k + j * pack_factor + p] as u32;
+                    w_el |= q << (p * bits as usize);
+                }
+                packed[ni * k_packed + j] = w_el;
+            }
+        }
+        let packed_w = MxArray::from_uint32(&packed, &[n as i64, k_packed as i64]).unwrap();
+        packed_w.eval();
+        assert_eq!(
+            packed_w.dtype().unwrap(),
+            DType::Uint32,
+            "packed affine weight must be uint32"
+        );
+
+        // f32 scales / biases [N, K/group_size]. Realistic affine ranges:
+        // scale ~ small positive-ish (can be either sign in MLX affine, but a
+        // simple positive small scale is a valid affine weight); bias centers it.
+        let mut sc = vec![0f32; n * groups_per_row];
+        for v in sc.iter_mut() {
+            // ~[0.001, 0.05]
+            *v = (next_int(&mut state, 1, 50) as f32) / 1000.0;
+        }
+        let mut bi = vec![0f32; n * groups_per_row];
+        for v in bi.iter_mut() {
+            // ~[-0.5, 0.5] so dequant weight ~ bias + scale*q spans a real range.
+            *v = (next_int(&mut state, -500, 500) as f32) / 1000.0;
+        }
+        let scales = MxArray::from_float32(&sc, &[n as i64, groups_per_row as i64]).unwrap();
+        let biases = MxArray::from_float32(&bi, &[n as i64, groups_per_row as i64]).unwrap();
+        scales.eval();
+        biases.eval();
+
+        // ---- Random bf16 activation x [M,K] with realistic magnitudes + outliers ----
+        let mut xf = vec![0f32; m * k];
+        for v in xf.iter_mut() {
+            *v = next_int(&mut state, -200, 200) as f32 / 1000.0;
+        }
+        for mi in 0..m {
+            let col = next_int(&mut state, 0, (k - 1) as i32) as usize;
+            xf[mi * k + col] = if mi % 2 == 0 { 1.4 } else { -1.1 };
+        }
+        let x = MxArray::from_float32(&xf, &[m as i64, k as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        x.eval();
+
+        // ---- REFERENCE: dequant the EXACT affine weight to f32 [N,K] ----
+        // out_dtype = Float32 (=0) so the dense table is f32 regardless of the
+        // f32 scales/biases dtype. mode = "affine".
+        let w_deq_handle = unsafe {
+            sys::mlx_dequantize(
+                packed_w.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                group_size,
+                bits,
+                DType::Float32 as i32, // f32 dense table
+                c"affine".as_ptr(),
+            )
+        };
+        assert!(!w_deq_handle.is_null(), "mlx_dequantize(affine) failed");
+        let w_deq = MxArray::from_handle(w_deq_handle, "affine_dequant").unwrap();
+        w_deq.eval();
+        assert_eq!(w_deq.shape_at(0).unwrap(), n as i64);
+        assert_eq!(w_deq.shape_at(1).unwrap(), k as i64);
+
+        // ---- REFERENCE: quantize x to int8 the SAME way the kernel does ----
+        // act_quant_lazy returns the kernel's EXACT per-token int8 x_q (widened to
+        // int32) and s_x f32 [M,1]; reconstruct x_rec = s_x * x_q in f32 so the
+        // reference applies the identical activation quantization the kernel uses.
+        let (xq_i32, s_x_arr) = act_quant_lazy(&x).unwrap();
+        xq_i32.eval();
+        s_x_arr.eval();
+        let xq = xq_i32.to_int32().unwrap();
+        let xq: &[i32] = &xq;
+        let sx = s_x_arr.to_float32().unwrap();
+        let sx: &[f32] = &sx;
+        assert_eq!(xq.len(), m * k);
+        assert_eq!(sx.len(), m);
+        let mut xrec = vec![0f32; m * k];
+        for mi in 0..m {
+            let s = sx[mi];
+            for ki in 0..k {
+                xrec[mi * k + ki] = s * xq[mi * k + ki] as f32;
+            }
+        }
+        let x_rec = MxArray::from_float32(&xrec, &[m as i64, k as i64]).unwrap();
+        x_rec.eval();
+
+        // y_ref = x_rec @ w_deq^T  (f32 matmul; w_deq is [N,K] so transpose to [K,N]).
+        let wt = w_deq.transpose(Some(&[1, 0])).unwrap();
+        let y_ref = x_rec.matmul(&wt).unwrap();
+        y_ref.eval();
+
+        // ---- KERNEL: the new affine-group W8A8 op ----
+        let y = affine_w8a8_matmul(&x, &packed_w, &scales, &biases, group_size, bits).unwrap();
+        y.eval();
+        assert_eq!(
+            y.dtype().unwrap(),
+            DType::BFloat16,
+            "affine W8A8 output must be bf16"
+        );
+
+        let got = y.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let got: &[f32] = &got;
+        let refv = y_ref.to_float32().unwrap();
+        let refv: &[f32] = &refv;
+        assert_eq!(got.len(), m * n);
+        assert_eq!(refv.len(), m * n);
+
+        // Per-row cosine + max relative error. Both sides apply the SAME x_q and
+        // the SAME affine weight, so they differ only by bf16/f32 narrowing.
+        let mut min_cos = f64::INFINITY;
+        let mut sum_cos = 0.0f64;
+        let mut max_rel = 0.0f64;
+        for mi in 0..m {
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            let mut row_absmax = 0.0f64;
+            for ni in 0..n {
+                let a = got[mi * n + ni] as f64;
+                let b = refv[mi * n + ni] as f64;
+                dot += a * b;
+                na += a * a;
+                nb += b * b;
+                row_absmax = row_absmax.max(b.abs());
+            }
+            let denom = (na.sqrt() * nb.sqrt()).max(1e-12);
+            let cos = dot / denom;
+            min_cos = min_cos.min(cos);
+            sum_cos += cos;
+            // Relative error normalized by the row's reference scale (robust to
+            // near-zero individual elements).
+            let rel_denom = row_absmax.max(1e-6);
+            for ni in 0..n {
+                let a = got[mi * n + ni] as f64;
+                let b = refv[mi * n + ni] as f64;
+                max_rel = max_rel.max((a - b).abs() / rel_denom);
+            }
+        }
+        let mean_cos = sum_cos / m as f64;
+        eprintln!(
+            "[affine] N={n} K={k} M={m} gs={group_size}: min_row_cos={min_cos:.6} \
+             mean_row_cos={mean_cos:.6} max_rel(row-norm)={max_rel:.6}"
+        );
+        assert!(
+            min_cos >= 0.9995,
+            "affine W8A8 per-row cosine below gate: min={min_cos:.6} (N={n} K={k} gs={group_size})"
+        );
+        // bf16 has ~8 mantissa bits (~1/256 rel); allow a small multiple for the
+        // group-accumulated narrowing.
+        assert!(
+            max_rel <= 0.02,
+            "affine W8A8 max relative error too large: {max_rel:.6} (N={n} K={k})"
+        );
+    }
+
+    // ============== AFFINE-GROUP W8A8 FALLBACK (K % group_size != 0) ==============
+    // GATE: the op must return Err cleanly (Rust falls back to bf16) when the shape
+    // is unsupported. K % group_size != 0 is the affine-specific unsupported case
+    // (group dequant requires K divisible by group_size). Here K=200, group_size=64
+    // -> 200 % 64 == 8 != 0, so affine_w8a8_matmul must Err (the C++ op returns
+    // false). We build a minimally-valid packed weight of the WRONG K so the only
+    // reason to fail is the K%group_size gate.
+    #[test]
+    fn affine_w8a8_fallback_bad_k() {
+        if gpu_gen() < 17 {
+            eprintln!("[affine-fb] SKIP: gpu gen {} < 17", gpu_gen());
+            return;
+        }
+        let group_size: i32 = 64;
+        let bits: i32 = 8;
+        let n: usize = 32;
+        let k: usize = 200; // 200 % 64 == 8 != 0  -> unsupported affine shape.
+        let m: usize = 256;
+        let groups_per_row = k.div_ceil(group_size as usize); // ceil so scales fit
+        let pack_factor = 32 / bits as usize; // 4
+        // K=200 is divisible by 4, so K_packed is whole; the affine gate (not the
+        // pack gate) is what must reject this shape.
+        let k_packed = k / pack_factor; // 50
+
+        let mut state: u64 = 0x4444_5555_6666_7777;
+        // Pack 4 random uint8 q-values per uint32 (same layout as the parity test);
+        // the actual bytes are irrelevant — the op must reject on shape before use.
+        let mut packed = vec![0u32; n * k_packed];
+        for v in packed.iter_mut() {
+            let mut w_el: u32 = 0;
+            for p in 0..pack_factor {
+                w_el |= (next_int(&mut state, 0, 255) as u32) << (p * bits as usize);
+            }
+            *v = w_el;
+        }
+        let packed_w = MxArray::from_uint32(&packed, &[n as i64, k_packed as i64]).unwrap();
+        let sc = vec![0.01f32; n * groups_per_row];
+        let bi = vec![0.0f32; n * groups_per_row];
+        let scales = MxArray::from_float32(&sc, &[n as i64, groups_per_row as i64]).unwrap();
+        let biases = MxArray::from_float32(&bi, &[n as i64, groups_per_row as i64]).unwrap();
+        let x = MxArray::random_normal(&[m as i64, k as i64], 0.0, 0.05, Some(DType::BFloat16))
+            .unwrap();
+        packed_w.eval();
+        scales.eval();
+        biases.eval();
+        x.eval();
+
+        let res = affine_w8a8_matmul(&x, &packed_w, &scales, &biases, group_size, bits);
+        assert!(
+            res.is_err(),
+            "affine_w8a8_matmul must Err on K%group_size != 0 (K={k} gs={group_size}) so the \
+             caller falls back to bf16; got Ok"
+        );
+        eprintln!(
+            "[affine-fb] OK: K={k} gs={group_size} (K%gs={}) -> Err (fallback)",
+            k % group_size as usize
+        );
     }
 }

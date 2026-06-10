@@ -129,7 +129,7 @@ inline bool has_weight(const std::string& name) {
 // =====================================================================
 
 struct QuantInfo {
-  std::string mode;  // "affine" | "mxfp8" | "mxfp4" | "nvfp4"
+  std::string mode;  // "affine" | "mxfp8" | "mxfp4" | "nvfp4" | "sym8"
   int bits;
   int group_size;
 };
@@ -188,6 +188,83 @@ inline std::mutex& g_linear_proj_logged_mutex() {
   return instance;
 }
 
+// sym8 projection (per-output-channel symmetric int8, W8A8 kernels).
+//
+// Layout contract (decided at registration, see Rust
+// `register_weights_with_cpp` in qwen3_5/persistence.rs): for sym8 prefixes
+// Rust stores the CONTIGUOUS [K,N] int8 KERNEL OPERAND as `{prefix}.weight`
+// (NOT the checkpoint's [N,K] tensor), the [N,K] CHECKPOINT tensor as
+// `{prefix}.weight_nk` (buffer-shared with the params map — no extra copy;
+// consumed by the decode QMV's simd_sum kernel which streams [N,K] row-major),
+// and the f32 [N] per-output-channel scale as `{prefix}.scales`. There is no
+// `.biases` (sym8 is symmetric by construction).
+//
+// Dispatch mirrors the eager Rust `QuantizedLinear::forward_sym8` EXACTLY
+// (same shared `na_int8::*` builders, same M<=2/M>=3 boundary), so compiled
+// and eager sym8 forwards are byte-identical for the same inputs. All
+// contract violations THROW (fail-loud — a silent fallback to
+// quantized_matmul would read the int8 operand as an MXFP8/affine pack and
+// emit garbage logits).
+inline array sym8_linear_proj(const array& x, const array& w_kn,
+                              const array& scales,
+                              const std::optional<array>& biases,
+                              const std::string& prefix) {
+  if (biases.has_value()) {
+    throw std::runtime_error(
+        "sym8 projection '" + prefix +
+        "': unexpected .biases sidecar (sym8 is symmetric — convert never "
+        "emits one)");
+  }
+  if (w_kn.dtype() != mlx::core::int8 || w_kn.ndim() != 2) {
+    throw std::runtime_error(
+        "sym8 projection '" + prefix +
+        "': registered weight is not a 2-D int8 [K,N] kernel operand");
+  }
+  if (scales.dtype() != mlx::core::float32 || scales.ndim() != 1 ||
+      scales.shape(0) != w_kn.shape(1)) {
+    throw std::runtime_error(
+        "sym8 projection '" + prefix +
+        "': expected f32 [N] .scales matching the [K,N] operand");
+  }
+  const int K = x.shape(-1);
+  if (w_kn.shape(0) != K) {
+    throw std::runtime_error(
+        "sym8 projection '" + prefix + "': x.K=" + std::to_string(K) +
+        " != w.K=" + std::to_string(w_kn.shape(0)) +
+        " — was the [N,K] checkpoint tensor registered instead of the [K,N] "
+        "kernel operand?");
+  }
+  // Flatten leading dims to M (mirrors the Rust forward's [.., K] -> [M, K]).
+  const int64_t m64 = x.size() / static_cast<int64_t>(K);
+  const int M = static_cast<int>(m64);
+  array x2d = (x.ndim() == 2) ? x : reshape(x, {M, K});
+  // DECODE (M<=2) is the W8A16 matvec (bf16 activations read directly — no
+  // act quant, activation-exact); PREFILL (M>=3) stays the W8A8 GEMM.
+  // INT8_QMV_W8A16=0 (read inside qmv_w8a16_lazy, the shared builder) reroutes
+  // decode back to the old W8A8 qmv for same-binary A/B.
+  // The decode matvec needs the [N,K] CHECKPOINT orientation alongside the
+  // [K,N] operand (its simd_sum kernel streams [N,K] row-major). Registration
+  // stores it under `{prefix}.weight_nk`; absence is a registration bug —
+  // fail loud rather than silently transposing per call.
+  array y2d = [&]() {
+    if (M <= 2) {
+      const std::string nk_key = prefix + ".weight_nk";
+      if (!has_weight(nk_key)) {
+        throw std::runtime_error(
+            "sym8 projection '" + prefix +
+            "': missing registered [N,K] checkpoint tensor '" + nk_key +
+            "' (register_weights_with_cpp must store it for the decode QMV)");
+      }
+      return na_int8::qmv_w8a16_lazy(x2d, w_kn, get_weight(nk_key), scales);
+    }
+    return na_int8::w8a8_linear_lazy(x2d, w_kn, scales);
+  }();
+  if (x.ndim() == 2) return y2d;
+  auto out_shape = x.shape();
+  out_shape.back() = w_kn.shape(1);
+  return reshape(y2d, out_shape);
+}
+
 inline array linear_proj(const array& x, const std::string& prefix) {
   std::string scales_key = prefix + ".scales";
   bool scales_present = has_weight(scales_key);
@@ -214,6 +291,11 @@ inline array linear_proj(const array& x, const std::string& prefix) {
                   prefix.c_str(), info->mode.c_str(), info->bits,
                   info->group_size);
         }
+      }
+      // sym8 has no quantized_matmul pack — route to the int8 W8A8 kernels
+      // (same shared builders as the eager Rust path; see sym8_linear_proj).
+      if (info->mode == "sym8") {
+        return sym8_linear_proj(x, w, scales, biases, prefix);
       }
       return mlx::core::quantized_matmul(
           x, w, scales, biases, /*transpose=*/true,
@@ -282,6 +364,15 @@ detect_layer_quant(const std::string& prefix) {
     return {false, 0, 0, ""};
   }
   if (auto info = lookup_quant_info(prefix)) {
+    // Every caller feeds this tuple into quantized_matmul/gather_qmm-style
+    // ops, which have NO sym8 pack — a sym8 entry reaching here means a
+    // registration bug (the MoE/gemma4/lfm2 loaders skip C++ registration
+    // for sym8 checkpoints entirely). Fail loud instead of mis-packing.
+    if (info->mode == "sym8") {
+      throw std::runtime_error(
+          "detect_layer_quant: prefix '" + prefix +
+          "' is registered as sym8, which this caller cannot dispatch");
+    }
     return {true, info->group_size, info->bits, info->mode};
   }
   bool has_biases = has_weight(prefix + ".biases");
@@ -305,6 +396,12 @@ detect_router_gate_quant(const std::string& prefix) {
     return {false, 0, 0, ""};
   }
   if (auto info = lookup_quant_info(prefix)) {
+    // Same rationale as detect_layer_quant: no caller can dispatch sym8.
+    if (info->mode == "sym8") {
+      throw std::runtime_error(
+          "detect_router_gate_quant: prefix '" + prefix +
+          "' is registered as sym8, which this caller cannot dispatch");
+    }
     return {true, info->group_size, info->bits, info->mode};
   }
   return {true, 64, 8, "affine"};
