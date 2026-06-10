@@ -3177,17 +3177,28 @@ fn quantize_weights_inner(
             // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
             // quantized matmul), so the embedding keys must NOT be force-
             // downgraded to affine here — they keep the global non-affine mode.
-            // sym8 is the EXCEPTION-to-the-exception: the packed backend has
-            // no sym8 gather-dequant, so under a sym8 default the embedding is
-            // force-downgraded to affine-8 like the other affine-only keys.
+            let is_lfm2_packed_embed =
+                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
+            // sym8 is the EXCEPTION-to-the-exception: keep the lfm2 embedding
+            // DENSE bf16 (NO QuantEntry at all) under a sym8 default. The
+            // packed backend has no sym8 gather-dequant, and the previous
+            // forced-affine-8 downgrade emitted `embed_tokens.scales`, which
+            // bars the ENTIRE lfm2 compiled path at load time
+            // (`quant_embed_supported` in lfm2/persistence.rs keys on that
+            // tensor — the compiled forwards do a dense `take()` over the raw
+            // embedding table). Dense bf16 keeps sym8 checkpoints
+            // compiled-eligible, matching main-branch quantized-lfm2 behavior
+            // (every other quantized lfm2 recipe leaves the compiled path on).
+            if default_mode == "sym8" && is_lfm2_packed_embed {
+                continue;
+            }
             let is_non_affine_default = default_mode == "mxfp4"
                 || default_mode == "mxfp8"
                 || default_mode == "nvfp4"
                 || default_mode == "sym8";
-            let is_lfm2_packed_embed =
-                embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-            let lfm2_embed_keeps_default = is_lfm2_packed_embed && default_mode != "sym8";
-            if is_non_affine_default && is_affine_only_key(key) && !lfm2_embed_keeps_default {
+            // (`is_lfm2_packed_embed` under a sym8 default already `continue`d
+            // above, so here it always means "keeps the non-affine default".)
+            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
                 entries.push(QuantEntry {
                     key: key.clone(),
                     bits: 8,
@@ -6602,6 +6613,78 @@ mod tests {
             assert_eq!(ov["mode"], "affine");
             assert_eq!(ov["bits"], 8);
         }
+    }
+
+    #[test]
+    fn sym8_lfm2_embedding_stays_dense_bf16() {
+        // Under a sym8 default with `embed_quantizable=true` (the lfm2 /
+        // lfm2_moe convert call), the token embedding must emit NO quant
+        // entry at all — dense bf16, no `.scales` sidecar, no per-layer
+        // override. A packed (affine) embedding's `embed_tokens.scales` bars
+        // the ENTIRE lfm2 compiled path (`quant_embed_supported`), so the old
+        // forced-affine-8 downgrade silently demoted every sym8 lfm2
+        // checkpoint to eager decode.
+        let hidden = 64i64;
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let embed_key = "model.embed_tokens.weight";
+        let linear_key = "model.layers.0.self_attn.q_proj.weight";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(embed_key.into(), w(&[32, hidden]));
+        weights.insert(linear_key.into(), w(&[8, hidden]));
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", true)
+            .expect("sym8 quantize with dense embedding must succeed");
+
+        // Embedding: dense float, no sidecars, no override.
+        let e = weights.get(embed_key).expect("embedding weight present");
+        assert_eq!(
+            e.dtype().unwrap(),
+            DType::Float32,
+            "lfm2 embedding must stay DENSE under a sym8 default (a packed \
+             embedding's .scales would bar the whole compiled path)"
+        );
+        assert!(
+            !weights.contains_key("model.embed_tokens.scales"),
+            "no .scales sidecar for the embedding under sym8"
+        );
+        assert!(
+            !overrides.contains_key("model.embed_tokens"),
+            "no per-layer override for the dense embedding"
+        );
+
+        // Control: a plain attention linear in the same map still emits sym8.
+        let q = weights.get(linear_key).expect("linear weight present");
+        assert_eq!(
+            q.dtype().unwrap(),
+            DType::Int8,
+            "control linear must still quantize sym8"
+        );
+        assert!(weights.contains_key("model.layers.0.self_attn.q_proj.scales"));
+
+        // Regression for the refactor: under a NON-sym8 non-affine default
+        // (mxfp8), the lfm2 embedding still KEEPS the packed default mode
+        // (the `lfm2_embed_keeps_default` behavior — packed Uint32, no
+        // forced-affine override).
+        let mut weights2: HashMap<String, MxArray> = HashMap::new();
+        weights2.insert(embed_key.into(), w(&[32, hidden]));
+        let overrides2 = quantize_weights(&mut weights2, 8, 32, "mxfp8", true)
+            .expect("mxfp8 quantize must succeed");
+        let e2 = weights2.get(embed_key).expect("embedding weight present");
+        assert_eq!(
+            e2.dtype().unwrap(),
+            DType::Uint32,
+            "lfm2 embedding keeps the packed mxfp8 default (not downgraded, not skipped)"
+        );
+        assert!(weights2.contains_key("model.embed_tokens.scales"));
+        assert!(
+            !overrides2.contains_key("model.embed_tokens"),
+            "mxfp8 default needs no per-layer override for the embedding"
+        );
     }
 
     #[test]

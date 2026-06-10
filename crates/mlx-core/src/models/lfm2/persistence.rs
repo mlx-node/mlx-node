@@ -296,9 +296,11 @@ fn load_dense_mlp_variant(
 /// never `mlx_quantized_matmul`/`mlx_dequantize`), so the two packed-quant
 /// consumers of this helper — the embedding loader and the compiled-path
 /// quant-info registration — must fail loud rather than hand "sym8" to MLX.
-/// Convert force-emits affine-8 overrides for the lfm2 embedding under a
-/// sym8 default, and the registration gate skips sym8 checkpoints entirely,
-/// so this is defense-in-depth against a malformed checkpoint.
+/// The compiled-path quant-info loop branches sym8 to its dedicated "sym8"
+/// registration BEFORE calling here (see `register_weights_with_cpp_locked`),
+/// and convert keeps the lfm2 embedding DENSE bf16 under a sym8 default (a
+/// packed embedding's `.scales` would bar the whole compiled path), so a
+/// sym8 arrival here is defense-in-depth against a malformed checkpoint.
 fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'static str)> {
     Ok(match plq.mode {
         PerLayerMode::Affine => (plq.group_size, plq.bits, "affine"),
@@ -308,9 +310,9 @@ fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'st
         PerLayerMode::Sym8 => {
             return Err(Error::from_reason(format!(
                 "lfm2: '{ctx}' resolved to sym8 quantization, but this packed-quant path \
-                 (embedding / compiled quant-info) has no sym8 dispatch — convert force-emits \
-                 affine-8 for these tensors under a sym8 default, so this checkpoint is \
-                 malformed; refusing to load"
+                 (embedding / packed quant-info) has no sym8 dispatch — convert never emits \
+                 sym8 for these tensors (the lfm2 embedding stays dense bf16 under a sym8 \
+                 default), so this checkpoint is malformed; refusing to load"
             )));
         }
     })
@@ -1456,12 +1458,14 @@ impl Lfm2Inner {
         // (compiled-PAGED ~1.5×). Explicit `use_block_paged_cache` in config.json
         // always wins.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
-        // sym8 v1 scope: lfm2 consumes sym8 checkpoints EAGER-FLAT only. The
+        // sym8 scope: lfm2 consumes sym8 checkpoints FLAT only (compiled-FLAT
+        // when registration succeeds, eager-FLAT when it aborts). The
         // quantized default below already resolves to flat; an explicit
-        // `use_block_paged_cache: true` pin must ALSO be forced flat — the
-        // eager-PAGED loop would be numerically fine (LinearProj dispatches
-        // sym8) but slow, and v1 keeps one proven shape. Mirrors the qwen3.5
-        // sym8 paged-pin override.
+        // `use_block_paged_cache: true` pin must ALSO be forced flat —
+        // eager-PAGED would be numerically fine (LinearProj dispatches sym8)
+        // but slow, and compiled-PAGED is structurally barred anyway (the f32
+        // [N] sym8 `.scales` fail the paged arm's `non_quant_floats_bf16`
+        // invariant). Mirrors the qwen3.5 sym8 paged-pin override.
         let checkpoint_has_sym8 = has_sym8_mode(top_level_mode, &per_layer_quant);
         if checkpoint_has_sym8 && config.use_block_paged_cache == Some(true) {
             tracing::warn!(
@@ -1604,25 +1608,25 @@ impl Lfm2Inner {
         // compiled slot — same needless eviction the dtype gate closed for f16.
         let paged_block_size_ok = inner.config.paged_block_size.unwrap_or(16)
             == crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
-        // sym8 = EAGER-ONLY v1: a sym8 checkpoint must never register with the
-        // C++ compiled path. Registration stores each 2-D `.weight` verbatim
-        // (the [N,K] checkpoint orientation for quantized tensors); the shared
-        // `sym8_linear_proj` asserts the contiguous [K,N] kernel-operand layout
-        // plus a `.weight_nk` sidecar (which only qwen3.5's registration
-        // builds), so the first compiled token would throw. Keeping
-        // `compiled_path_active()` false routes decode through the eager loops
-        // via `LinearProj`, which already dispatches sym8. The full
-        // registration port (operand swap + `.weight_nk` + abort-on-error)
-        // is a follow-up.
+        // sym8 compiled-FLAT port (mirrors qwen3.5's registration): a sym8
+        // checkpoint registers like any other quantized checkpoint. The shared
+        // compiled `linear_proj` dispatches registry mode "sym8" to
+        // `sym8_linear_proj`, and `register_weights_with_cpp_locked` builds the
+        // layout it asserts — the contiguous [K,N] int8 kernel operand as
+        // `{prefix}.weight` plus the [N,K] checkpoint tensor as
+        // `{prefix}.weight_nk` — aborting to eager on ANY sym8 registration
+        // failure (weights cleared, model_id never published, load NOT failed).
+        // Compiled-PAGED stays structurally barred for sym8: the paged-pin
+        // override above forces sym8 onto FLAT, and the f32 [N] sym8 `.scales`
+        // keys fail the `non_quant_floats_bf16` invariant the paged arm
+        // requires — only the FLAT arm (which consults neither) registers.
         if should_register_compiled(
             is_quantized,
             is_flat,
             all_float_weights_bf16,
             paged_block_size_ok,
             non_quant_floats_bf16,
-            crate::models::lfm2::model::quant_compiled_enabled()
-                && quant_embed_supported
-                && !checkpoint_has_sym8,
+            crate::models::lfm2::model::quant_compiled_enabled() && quant_embed_supported,
         ) {
             register_weights_with_cpp(
                 &params,
@@ -1703,10 +1707,12 @@ impl Lfm2Inner {
 ///     transposed to `[hidden, E]` by `mlx_store_weight` like any 2D linear.
 ///   * `feed_forward.expert_bias`, shape `[E]` (1D, f32) — stored as-is.
 ///
-/// Still returns early (storing nothing, publishing no id) for quantized
-/// (`.scales`-suffixed, incl. quantized MoE) checkpoints, mirroring the
-/// call-site gate. The call-site gate registers BOTH flat
-/// (`use_block_paged_cache == Some(false)`) AND paged (the default) bf16/f16
+/// QUANTIZED checkpoints (`.scales`-suffixed, incl. quantized MoE) register
+/// too: every `.weight`/`.scales`/`.biases` is stored verbatim plus one
+/// per-prefix quant-info entry (step 4a), EXCEPT sym8 prefixes, which swap in
+/// the [K,N] int8 kernel operand + a `.weight_nk` sidecar (see the sym8 notes
+/// inside `register_weights_with_cpp_locked`). The call-site gate registers
+/// BOTH flat (`use_block_paged_cache == Some(false)`) AND paged (the default)
 /// checkpoints, so this registration is not flat-only; the per-step dispatcher
 /// picks the flat (`lfm2_decode_fn`) or paged (`lfm2_decode_fn_paged`) compiled
 /// graph against the SAME registered weight map. `conv_bias=true` checkpoints ARE
@@ -1796,11 +1802,12 @@ fn non_quant_float_weights_are_bf16(params: &HashMap<String, MxArray>) -> Result
 ///     per-projection quant-info; see `register_weights_with_cpp_locked`), but ONLY
 ///     when `quant_compiled_eligible` (the `MLX_LFM2_DISABLE_QUANT_COMPILED` escape
 ///     hatch is unset AND the input embedding is a dense, non-packed-quant table —
-///     the C++ does a dense `take` over it — AND the checkpoint carries no sym8
-///     mode: lfm2 sym8 is eager-only v1, the registration stores `.weight` in the
-///     [N,K] checkpoint orientation that the shared `sym8_linear_proj` rejects).
-///     When that bool is false, quantized checkpoints register no compiled path
-///     and run eager (the prior behavior).
+///     the C++ does a dense `take` over it). sym8 checkpoints are INCLUDED
+///     (flat-compiled): the registration builds the [K,N] kernel operand +
+///     `.weight_nk` layout the shared `sym8_linear_proj` asserts, and aborts to
+///     eager (without failing the load) on any sym8 registration error. When
+///     `quant_compiled_eligible` is false, quantized checkpoints register no
+///     compiled path and run eager (the prior behavior).
 ///
 /// Every other decline (model-id eviction race, seed-time pool failures, mid-cycle
 /// forward errors) is runtime-only and handled by the lock-release + RAII reset
@@ -1864,49 +1871,154 @@ fn register_weights_with_cpp_locked(
     // (3) Clear the shared map (also resets the active model id + quant-info).
     unsafe { mlx_sys::mlx_clear_weights() };
 
-    // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
-    // ndim==2 (incl. the MoE router gate); 3D stacked experts + 3D conv weight +
-    // 1D norms / biases / expert_bias are left untouched. Quantized checkpoints
-    // store `.weight`/`.scales`/`.biases` verbatim; per-prefix quant-info is
-    // registered in (4a) below so the compiled graph dispatches the authoritative
-    // (mode, bits, group_size) instead of inferring from companion presence.
-    for (name, arr) in params {
-        let c_name = std::ffi::CString::new(name.as_str())
-            .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
-        unsafe {
-            mlx_sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
-        }
-    }
+    // sym8 checkpoints register too (compiled-FLAT port, mirroring qwen3.5's
+    // `register_weights_with_cpp`). Layout contract (the C++ asserts it at
+    // dispatch — see `sym8_linear_proj` in mlx_qwen35_common.h): for a sym8
+    // prefix we store the CONTIGUOUS [K,N] int8 KERNEL OPERAND as
+    // `{prefix}.weight` — NOT the checkpoint's [N,K] tensor — plus the [N,K]
+    // CHECKPOINT tensor as `{prefix}.weight_nk` (the decode QMV's simd_sum
+    // kernel streams [N,K] row-major) and the f32 [N] `.scales`. This mirrors
+    // the load-time hoist the eager `QuantizedLinear::new_sym8` does
+    // (`int8_gemm::sym8_kernel_operand`), so per-forward weight reshaping
+    // stays zero on both paths. The [K,N] operand built here is a SECOND int8
+    // copy of each sym8 layer (the eager layers keep their own for fallback);
+    // the `.weight_nk` entry shares the params-map buffer (no extra copy).
+    let sym8_checkpoint = has_sym8_mode(top_level_mode, per_layer_quant);
 
-    // (4a) Register per-projection quant-info for every `.scales` companion so the
-    // compiled `linear_proj` / `lfm2_switch_linear` dispatch the Rust-authoritative
-    // (mode, bits, group_size) rather than the companion-tensor heuristic (which
-    // would silently mislabel MXFP4 / NVFP4 as MXFP8). Mirrors
-    // `qwen3_5_moe::register_moe_weights_with_cpp`, but resolves the LFM2 router
-    // gate (`*.feed_forward.gate`) via the SAME direct-lookup-then-`default_gate_plq`
-    // logic as `build_lfm2_gate_ql` (LFM2's gate prefix is `feed_forward.gate`,
-    // which `effective_plq_for`'s gate branch — keyed on `.mlp.gate` — does NOT
-    // match), and every other projection via `effective_plq_for(prefix, .., None)`
-    // exactly as `build_lfm2_qsl` / `build_lfm2_ql` do, so the compiled path
-    // dispatches the identical kernel to the eager loaders. `*.expert_bias` (no
-    // `.scales` companion) is untouched. A no-op for bf16/f16 checkpoints (no
-    // `.scales` keys). `mlx_clear_weights` above already wiped the prior map.
+    // Resolve the PLQ defaults BEFORE the store loop: sym8 prefixes swap in
+    // the [K,N] kernel operand at store time, which needs the same per-prefix
+    // mode resolution `apply_weights` used. (4a) reuses the same defaults.
     let (default_plq, default_gate_plq) =
         compute_lfm2_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
-    let mut quant_info_count = 0usize;
-    for name in params.keys() {
-        let Some(prefix) = name.strip_suffix(".scales") else {
-            continue;
-        };
-        let plq = if prefix.ends_with(".feed_forward.gate") {
+    // Per-prefix PLQ resolution shared by the sym8 store swap and the (4a)
+    // quant-info loop. LFM2's router gate (`*.feed_forward.gate`) resolves via
+    // the SAME direct-lookup-then-`default_gate_plq` logic as
+    // `build_lfm2_gate_ql` (LFM2's gate prefix is `feed_forward.gate`, which
+    // `effective_plq_for`'s gate branch — keyed on `.mlp.gate` — does NOT
+    // match); every other projection via `effective_plq_for(prefix, .., None)`
+    // exactly as `build_lfm2_qsl` / `build_lfm2_non_moe_ql` do, so the
+    // compiled path dispatches the identical kernel to the eager loaders.
+    let plq_for = |prefix: &str| -> PerLayerQuant {
+        if prefix.ends_with(".feed_forward.gate") {
             per_layer_quant
                 .get(prefix)
                 .copied()
                 .unwrap_or(default_gate_plq)
         } else {
             effective_plq_for(prefix, per_layer_quant, default_plq, None)
+        }
+    };
+
+    // Fail-safe abort for sym8 registration errors (mirrors qwen3.5's
+    // `abort_registration`): wipe the half-populated C++ state and leave
+    // model_id UNSET (`mlx_lfm2_get_model_id() != model_id`), so every forward
+    // for this model takes the eager Rust path. Correctness is preserved
+    // (eager sym8 is the reference path); only the compiled-decode speedup is
+    // lost — and loudly. A sym8 registration failure must NOT fail the load:
+    // the call sites return `Ok(())` after invoking this. The compile-epoch
+    // bump preserves the step-(5) invariant — a stale compiled closure must
+    // never stay reachable after a failed re-registration.
+    let abort_registration = |reason: &str| {
+        tracing::warn!(
+            "lfm2 sym8 compiled registration ABORTED for model_id={model_id}: {reason} — \
+             clearing C++ weights; model stays unregistered (eager Rust forward path)."
+        );
+        unsafe { mlx_sys::mlx_clear_weights() };
+        unsafe { mlx_sys::mlx_lfm2_invalidate_compiled() };
+    };
+
+    // Reserved sidecar suffix pre-scan: `{prefix}.weight_nk` is GENERATED by
+    // the sym8 store arm below (the [N,K] decode-QMV orientation). A
+    // checkpoint-supplied tensor under that suffix could clobber the generated
+    // sidecar (HashMap iteration order is arbitrary) and silently corrupt
+    // compiled decode logits. Reject BEFORE any store/operand work so the
+    // abort is deterministic and no FFI side effects run on malformed input —
+    // abort to eager (which never reads the suffix). No converter emits this
+    // key; only a corrupt/adversarial checkpoint can carry it.
+    if let Some(reserved) = params.keys().find(|k| k.ends_with(".weight_nk")) {
+        abort_registration(&format!(
+            "checkpoint key '{reserved}' uses the reserved sym8 sidecar suffix `.weight_nk`"
+        ));
+        return Ok(());
+    }
+
+    let store = |name: &str, arr: &MxArray| -> Result<()> {
+        let c_name = std::ffi::CString::new(name)
+            .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
+        unsafe {
+            mlx_sys::mlx_store_weight(c_name.as_ptr(), arr.as_raw_ptr());
+        }
+        Ok(())
+    };
+
+    // (4) Store every sanitized weight. `mlx_store_weight` auto-transposes
+    // ndim==2 (incl. the MoE router gate); 3D stacked experts + 3D conv weight +
+    // 1D norms / biases / expert_bias are left untouched. Quantized checkpoints
+    // store `.weight`/`.scales`/`.biases` verbatim — EXCEPT sym8 prefixes,
+    // which store the [K,N] kernel operand + `.weight_nk` sidecar (see the
+    // layout-contract comment above); per-prefix quant-info is registered in
+    // (4a) below so the compiled graph dispatches the authoritative
+    // (mode, bits, group_size) instead of inferring from companion presence.
+    for (name, arr) in params {
+        // sym8 layout swap: the gate mirrors `try_build_sym8_quantized_linear`'s
+        // "is this layer sym8-quantized" signal — a `.scales` companion + an
+        // effective PLQ mode of Sym8. Non-sym8 layers in a mixed checkpoint
+        // (e.g. the affine-8-forced router gate / K%16-failed linears) store
+        // verbatim below.
+        if sym8_checkpoint
+            && let Some(prefix) = name.strip_suffix(".weight")
+            && params.contains_key(&format!("{prefix}.scales"))
+            && plq_for(prefix).mode == PerLayerMode::Sym8
+        {
+            match crate::models::qwen3_5::int8_gemm::sym8_kernel_operand(arr) {
+                Ok(w_kn) => store(name, &w_kn)?,
+                Err(e) => {
+                    abort_registration(&format!(
+                        "failed to build [K,N] kernel operand for '{}': {}",
+                        name, e.reason
+                    ));
+                    return Ok(());
+                }
+            }
+            // ALSO register the [N,K] CHECKPOINT tensor under
+            // `{prefix}.weight_nk`: the compiled decode QMV's simd_sum kernel
+            // streams the [N,K] row-major orientation (the [K,N] operand above
+            // stays for the prefill GEMM + fallback kernels). This stores the
+            // params-map array HANDLE — the buffer is shared with the eager
+            // layer's checkpoint tensor, so the only double-stored copy
+            // remains the [K,N] operand.
+            store(&format!("{prefix}.weight_nk"), arr)?;
+            continue;
+        }
+        store(name, arr)?;
+    }
+
+    // (4a) Register per-projection quant-info for every `.scales` companion so the
+    // compiled `linear_proj` / `lfm2_switch_linear` dispatch the Rust-authoritative
+    // (mode, bits, group_size) rather than the companion-tensor heuristic (which
+    // would silently mislabel MXFP4 / NVFP4 as MXFP8). Mirrors
+    // `qwen3_5_moe::register_moe_weights_with_cpp`; per-prefix resolution is the
+    // shared `plq_for` above (gate-aware, identical to the eager loaders).
+    // `*.expert_bias` (no `.scales` companion) is untouched. A no-op for
+    // bf16/f16 checkpoints (no `.scales` keys). `mlx_clear_weights` above
+    // already wiped the prior map.
+    let mut quant_info_count = 0usize;
+    let mut sym8_info_count = 0usize;
+    for name in params.keys() {
+        let Some(prefix) = name.strip_suffix(".scales") else {
+            continue;
         };
-        let (group_size, bits, mode_str) = plq_to_packed_params(plq, prefix)?;
+        let plq = plq_for(prefix);
+        // sym8 has no MLX pack: `plq_to_packed_params` (which also serves the
+        // packed-embedding loader) deliberately REJECTS Sym8, so branch to the
+        // direct "sym8" registration FIRST. The compiled `linear_proj`
+        // dispatches "sym8" to the int8 W8A8/W8A16 kernel path; the matching
+        // `.weight` entry stored above is the [K,N] kernel operand.
+        let (group_size, bits, mode_str) = if plq.mode == PerLayerMode::Sym8 {
+            (plq.group_size, plq.bits, "sym8")
+        } else {
+            plq_to_packed_params(plq, prefix)?
+        };
         let c_prefix = std::ffi::CString::new(prefix)
             .map_err(|e| Error::from_reason(format!("Quant-info prefix has NUL byte: {e}")))?;
         let c_mode = std::ffi::CString::new(mode_str)
@@ -1914,12 +2026,29 @@ fn register_weights_with_cpp_locked(
         unsafe {
             mlx_sys::mlx_store_quant_info(c_prefix.as_ptr(), c_mode.as_ptr(), bits, group_size);
         }
+        // Load-time safety assertion (mirrors qwen3.5): a sym8 layer must
+        // round-trip out of the C++ registry as EXACTLY "sym8". A coerced/
+        // missing entry would make the compiled forward fall through to
+        // quantized_matmul and read the int8 operand as a packed-uint32 pack —
+        // garbage logits. Fail-safe: abort registration so the model decodes
+        // on the eager Rust path instead.
+        if plq.mode == PerLayerMode::Sym8 {
+            let round_trips =
+                unsafe { mlx_sys::mlx_quant_info_mode_matches(c_prefix.as_ptr(), c_mode.as_ptr()) };
+            if !round_trips {
+                abort_registration(&format!(
+                    "quant-info mode for sym8 prefix '{prefix}' did not round-trip as \"sym8\""
+                ));
+                return Ok(());
+            }
+            sym8_info_count += 1;
+        }
         quant_info_count += 1;
     }
     if quant_info_count > 0 {
         info!(
             "Registered {quant_info_count} per-projection quant-info entries for the lfm2 \
-             compiled forward path"
+             compiled forward path ({sym8_info_count} sym8)"
         );
     }
     debug_assert_eq!(
@@ -1927,6 +2056,18 @@ fn register_weights_with_cpp_locked(
         params.keys().filter(|k| k.ends_with(".scales")).count(),
         "every .scales companion must register exactly one quant-info entry"
     );
+
+    // Belt-and-braces for the sym8 layout contract (mirrors qwen3.5): a
+    // checkpoint whose DEFAULT mode is sym8 must have registered at least one
+    // sym8 quant-info entry — zero means the detection gates above silently
+    // disagreed with `apply_weights` (e.g. a prefix-normalization drift) and
+    // the compiled path would mis-dispatch. Abort to eager.
+    if sym8_checkpoint && top_level_mode == Some(PerLayerMode::Sym8) && sym8_info_count == 0 {
+        abort_registration(
+            "checkpoint is sym8-default but no sym8 quant-info entries were registered",
+        );
+        return Ok(());
+    }
 
     // (4b) Synthesize a ZERO expert_bias for any MoE layer that declares
     // `use_expert_bias` but whose checkpoint OMITS `feed_forward.expert_bias`
@@ -2429,6 +2570,168 @@ mod tests {
             "F1: omitting expert_bias must be backfilled by zero-synthesis \
              (count_without={count_without} count_with={count_with}); the compiled \
              path would otherwise read a missing expert_bias and diverge from native"
+        );
+    }
+
+    /// sym8 compiled-FLAT registration port: a sym8-resolved prefix must store
+    /// the [K,N] kernel operand under `{prefix}.weight` PLUS the [N,K]
+    /// checkpoint tensor under `{prefix}.weight_nk`, and its quant-info must
+    /// round-trip out of the C++ registry as EXACTLY "sym8" (the compiled
+    /// `linear_proj` dispatches that mode to `sym8_linear_proj`). No FFI
+    /// getter exists to read a stored tensor back, so the [K,N] orientation
+    /// itself is pinned by the C++ `sym8_linear_proj` fail-loud assertions at
+    /// the first compiled forward (e2e battery); this test pins the sidecar
+    /// count, the mode round-trip, and the id publish. Holds
+    /// COMPILED_WEIGHTS_RWLOCK (write, poison-recovered) and calls the
+    /// `_locked` worker directly (the wrapper would deadlock re-taking the
+    /// non-reentrant RwLock).
+    #[test]
+    fn register_sym8_stores_weight_nk_sidecar_and_sym8_quant_info() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        // bf16 MoE fixture with ONE sym8 attention projection: swap the bf16
+        // q_proj for an int8 [N,K] + f32 [N] sym8 group. Registration only
+        // builds the transpose operand (plain MLX ops, eval'd at load) — it
+        // never runs the int8 NA kernels, so no GPU-gen skip is needed.
+        let mut params = full_bf16_moe_params();
+        params.remove("layers.1.self_attn.q_proj.weight");
+        synth_sym8_group(&mut params, "layers.1.self_attn.q_proj", 4, 4);
+
+        let model_id = 0xF1F2_0001u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("well-formed sym8 registration must succeed");
+
+        let count = unsafe { mlx_sys::mlx_weight_count() };
+        assert_eq!(
+            count,
+            params.len() + 1,
+            "sym8 registration must add exactly one .weight_nk sidecar \
+             (every params tensor + the [N,K] checkpoint orientation)"
+        );
+
+        let c_prefix = std::ffi::CString::new("layers.1.self_attn.q_proj").expect("CString");
+        let c_sym8 = std::ffi::CString::new("sym8").expect("CString");
+        assert!(
+            unsafe { mlx_sys::mlx_quant_info_mode_matches(c_prefix.as_ptr(), c_sym8.as_ptr()) },
+            "sym8 prefix must round-trip out of the C++ registry as \"sym8\""
+        );
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            model_id,
+            "successful sym8 registration must publish the model id"
+        );
+
+        // Clean up the shared map so this destructive test leaves no live id.
+        unsafe { mlx_sys::mlx_clear_weights() };
+    }
+
+    /// sym8 abort fail-safe: a deliberately-broken sym8 group (a `.scales`
+    /// companion next to a bf16 — NOT int8 — `.weight`, resolving mode Sym8)
+    /// makes `sym8_kernel_operand` reject the operand build. Registration
+    /// must ABORT to eager: return `Ok` (a registration failure must NOT fail
+    /// the load), wipe the half-populated weight map, and never publish the
+    /// model id (`compiled_path_active()` stays false → eager decode).
+    #[test]
+    fn broken_sym8_registration_aborts_to_eager_without_failing_load() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        // The fixture q_proj.weight stays bf16; adding a `.scales` sibling
+        // under a sym8 default makes the prefix resolve Sym8 → the [K,N]
+        // operand build fails on the non-int8 dtype.
+        let mut params = full_bf16_moe_params();
+        params.insert("layers.1.self_attn.q_proj.scales".into(), f32a(&[4], 0.01));
+
+        let model_id = 0xF1F2_0002u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("a broken sym8 registration must abort to eager, not Err the load");
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_weight_count() },
+            0,
+            "abort must clear the half-populated weight map"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            0,
+            "abort must leave the model unregistered (compiled path stays off)"
+        );
+    }
+
+    /// Reserved-key collision: `{prefix}.weight_nk` is GENERATED by the sym8
+    /// store arm; a checkpoint-SUPPLIED tensor under that key could clobber
+    /// the generated sidecar (HashMap iteration order is arbitrary) and
+    /// silently corrupt compiled decode logits. The pre-scan must treat the
+    /// reserved suffix as malformed input and abort to eager BEFORE any
+    /// store/operand work: `Ok` return (never fail the load), weight map
+    /// wiped, model id never published. The sym8 group uses a kernel-valid
+    /// K=16 shape so the abort can only come from the reserved-key pre-scan,
+    /// never from an operand-build failure.
+    #[test]
+    fn checkpoint_supplied_weight_nk_aborts_registration() {
+        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let config = tiny_moe_config(/* use_expert_bias */ false);
+        let mut params = full_bf16_moe_params();
+        params.remove("layers.1.self_attn.q_proj.weight");
+        synth_sym8_group(&mut params, "layers.1.self_attn.q_proj", 4, 16);
+        // Adversarial: a same-shaped int8 tensor under the RESERVED sidecar
+        // key — without the pre-scan this races the generated sidecar on
+        // HashMap order and can win silently.
+        let stale: Vec<f32> = vec![9.0; 64];
+        params.insert(
+            "layers.1.self_attn.q_proj.weight_nk".into(),
+            MxArray::from_float32(&stale, &[4, 16])
+                .expect("from_float32")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+
+        let model_id = 0xF1F2_0003u64;
+        register_weights_with_cpp_locked(
+            &params,
+            model_id,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            SYM8_BITS,
+            SYM8_GROUP_SIZE,
+        )
+        .expect("a reserved-key abort must not Err the load");
+
+        assert_eq!(
+            unsafe { mlx_sys::mlx_weight_count() },
+            0,
+            "reserved `.weight_nk` checkpoint key must abort and wipe the weight map"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_lfm2_get_model_id() },
+            0,
+            "reserved-key abort must leave the model unregistered (eager decode)"
         );
     }
 
