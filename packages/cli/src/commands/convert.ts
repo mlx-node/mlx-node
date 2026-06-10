@@ -45,11 +45,12 @@ Quantization Arguments:
   --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4, sym8=8)
   --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16; not applicable to sym8)
   --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or "sym8".
-                        sym8 = per-output-channel symmetric int8 (dense qwen3_5
-                        ONLY in v1): int8 [N,K] .weight + f32 [N] .scales,
-                        no .biases, no group_size. Routers/gates and K%16!=0
-                        layers fall back to 8-bit affine with per-layer
-                        overrides. NOT mlx-lm-loadable.
+                        sym8 = per-output-channel symmetric int8 (dense qwen3_5,
+                        lfm2/lfm2_moe, gemma4 in v1): int8 [N,K] .weight +
+                        f32 [N] .scales, no .biases, no group_size.
+                        Routers/gates, 3D stacked experts, embeddings, and
+                        K%16!=0 layers fall back to 8-bit affine (or bf16)
+                        with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
                         Applies after the recipe predicate: any 8-bit affine
                         decision becomes mxfp8, any 4-bit becomes mxfp4. Requires

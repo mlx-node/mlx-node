@@ -129,7 +129,7 @@ pub struct ConversionOptions {
     pub quant_group_size: Option<i32>,
 
     /// Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-    /// "sym8" (per-output-channel symmetric int8; dense qwen3_5 ONLY in v1,
+    /// "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
     /// implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
     pub quant_mode: Option<String>,
 
@@ -359,13 +359,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // DENSE qwen3_5 ONLY: the qwen3_5_moe loader rejects sym8 up front
-        // (MoE experts/gather have no sym8 dispatch in v1), so allowing it
-        // here would emit checkpoints this package cannot load back.
-        if !matches!(model_type.as_deref(), Some("qwen3_5")) {
+        // sym8 v1 dispatch exists in the dense qwen3_5, lfm2/lfm2_moe, and
+        // gemma4 loaders (2D linears only — 3D stacked experts are auto-forced
+        // to affine-8 below). qwen3_5_moe still rejects sym8 up front (its
+        // per-expert SwitchMLP/gather path has no sym8 dispatch), so allowing
+        // it here would emit checkpoints this package cannot load back.
+        if !matches!(
+            model_type.as_deref(),
+            Some("qwen3_5") | Some("lfm2") | Some("lfm2_moe") | Some("gemma4")
+        ) {
             return Err(Error::from_reason(format!(
-                "sym8 is currently supported for model type qwen3_5 (dense) only \
-                 (got {:?}); other families' loaders have no sym8 dispatch",
+                "sym8 is currently supported for model types qwen3_5 (dense), \
+                 lfm2, lfm2_moe, and gemma4 only (got {:?}); other families' \
+                 loaders have no sym8 dispatch",
                 model_type.as_deref()
             )));
         }
@@ -2862,6 +2868,173 @@ fn sym8_quantize_store(array: &MxArray, key_for_error: &str) -> Result<(MxArray,
     Ok((q, s))
 }
 
+/// One per-key quantization decision collected by `quantize_weights_inner`'s
+/// entry phase (hoisted to module scope so `enforce_sym8_group_coherence` can
+/// operate on the decision list before the emission loop runs).
+struct QuantEntry {
+    key: String,
+    bits: i32,
+    group_size: i32,
+    mode: String,
+}
+
+/// The emission-loop quantizability gates, hoisted into ONE place so the sym8
+/// group-coherence pass (`enforce_sym8_group_coherence`) and the emission loop
+/// in `quantize_weights_inner` can never diverge: a `QuantEntry` actually
+/// emits a quantized group iff its array is 2D+ AND its last dim passes the
+/// mode-specific alignment — sym8 has no quant group (per-output-channel
+/// scale) so the int8 kernels' `K % 16 == 0` operand gate is the requirement;
+/// every other mode needs `last_dim % group_size == 0`.
+fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<bool> {
+    let ndim = array.ndim()? as usize;
+    if ndim < 2 {
+        return Ok(false);
+    }
+    let last_dim = array.shape_at((ndim - 1) as u32)? as i32;
+    Ok(if mode == "sym8" {
+        last_dim % 16 == 0
+    } else {
+        last_dim % group_size == 0
+    })
+}
+
+/// Identify the CO-QUANTIZED group a weight base key (key minus `.weight`)
+/// belongs to, returning the full canonical member base list. Returns `None`
+/// for keys whose loaders resolve quantization per tensor (attention
+/// projections, GDN, embeddings, gemma4 MoE `experts.*`, qwen3_5_moe — the
+/// latter has no sym8 dispatch and fails loud up front on any sym8 config).
+///
+/// These are the groups whose loaders are strict all-or-none:
+/// - dense MLP `{root}.mlp.{gate,up,down}_proj` — gemma4 (`gemma4/
+///   persistence.rs` rejects any mixed quantized/dense MLP tuple) AND dense
+///   qwen3_5 (a partial group falls to the dense loads, where
+///   `ensure_dense_weight_floating` rejects the quantized members' non-float
+///   weights). Both families emit this key shape from convert
+///   (`language_model.model.layers.N.mlp.*`).
+/// - lfm2 dense FFN `{root}.feed_forward.{gate,up,down}_proj` (post-sanitize
+///   names; `sanitize_lfm2_moe` renames `w1/w3/w2` before quantize) —
+///   `lfm2/persistence.rs`'s validator requires the whole trio quantized iff
+///   ANY member ships `.scales` (`dense_mlp_is_quantized`).
+/// - lfm2 MoE quartet: router `{root}.feed_forward.gate` + 3D stacked
+///   `{root}.feed_forward.switch_mlp.{gate,up,down}_proj` —
+///   `moe_layer_is_quantized` couples all four (`moe_proj_bases`).
+///
+/// `strip_suffix` is an exact tail match, so the tables cannot cross-match:
+/// `…switch_mlp.gate_proj` never strips as `.mlp.gate_proj` (the char before
+/// `mlp` is `_`, not `.`) and `…feed_forward.gate_proj` never strips as
+/// `.feed_forward.gate`.
+fn coquant_group_members(base: &str) -> Option<Vec<String>> {
+    const LFM2_MOE: [&str; 4] = [
+        ".feed_forward.gate",
+        ".feed_forward.switch_mlp.gate_proj",
+        ".feed_forward.switch_mlp.up_proj",
+        ".feed_forward.switch_mlp.down_proj",
+    ];
+    const LFM2_FFN: [&str; 3] = [
+        ".feed_forward.gate_proj",
+        ".feed_forward.up_proj",
+        ".feed_forward.down_proj",
+    ];
+    const DENSE_MLP: [&str; 3] = [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"];
+    for table in [&LFM2_MOE[..], &LFM2_FFN[..], &DENSE_MLP[..]] {
+        for suffix in table {
+            if let Some(root) = base.strip_suffix(suffix) {
+                return Some(table.iter().map(|s| format!("{root}{s}")).collect());
+            }
+        }
+    }
+    None
+}
+
+/// Group-coherence pass for the legacy (no-recipe) quantize path under a sym8
+/// default: each co-quantized group must emit ALL-quantized or ALL-dense.
+///
+/// Under `--q-mode sym8`, a sym8-ineligible member (3D stacked experts, or 2D
+/// with `K % 16 != 0`) is forced to affine-8 — and if it ALSO fails the affine
+/// `K % group_size` alignment, the emission loop silently leaves it dense
+/// while its siblings quantize. The strict loaders (gemma4 dense MLP, lfm2
+/// FFN/MoE validators, dense qwen3_5's dtype-guarded fallback) then REJECT the
+/// converter's own output. This pass re-applies the exact emission gates
+/// (`quant_entry_emits`) to every group member up front and, if ANY member
+/// will not emit quantized, removes the WHOLE group's entries so all members
+/// stay dense bf16.
+///
+/// With standard configs (all dims % 64 == 0) every member passes and this is
+/// a no-op; it exists for odd-dimension models. A member that already ships
+/// its `.scales` sidecar (pre-quantized input — the entry phase skips it)
+/// cannot be made dense, so it counts as "will be quantized" for coherence;
+/// a member whose `.weight` is absent from the map entirely does not gate the
+/// group (the strict loaders mandate every projection's `.weight`, so such a
+/// checkpoint is unloadable regardless of what this pass decides).
+fn enforce_sym8_group_coherence(
+    weights: &HashMap<String, MxArray>,
+    entries: &mut Vec<QuantEntry>,
+) -> Result<()> {
+    let entry_by_key: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.key.as_str(), i))
+        .collect();
+
+    let mut drop_keys: HashSet<String> = HashSet::new();
+    let mut seen_groups: HashSet<String> = HashSet::new();
+
+    for entry in entries.iter() {
+        let base = entry.key.strip_suffix(".weight").unwrap_or(&entry.key);
+        let Some(members) = coquant_group_members(base) else {
+            continue;
+        };
+        // Canonical group id = the first member base (stable per table).
+        if !seen_groups.insert(members[0].clone()) {
+            continue;
+        }
+        let mut blocker: Option<String> = None;
+        for member in &members {
+            let weight_key = format!("{member}.weight");
+            if weights.contains_key(&format!("{member}.scales")) {
+                continue; // already quantized on disk — counts as quantized
+            }
+            // A member whose `.weight` is absent from the map entirely does
+            // NOT gate the group: every strict loader mandates the `.weight`
+            // key per projection, so such a checkpoint is unloadable no
+            // matter what this pass decides — and skipping absence keeps
+            // lone-tensor unit fixtures (and non-group key universes that
+            // merely share a suffix) out of the coherence blast radius.
+            let Some(array) = weights.get(&weight_key) else {
+                continue;
+            };
+            let member_emits = match entry_by_key.get(weight_key.as_str()) {
+                Some(&idx) => {
+                    let e = &entries[idx];
+                    quant_entry_emits(array, &e.mode, e.group_size)?
+                }
+                // Present but no quant decision (skipped by the entry
+                // phase) → the member stays dense.
+                None => false,
+            };
+            if !member_emits {
+                blocker = Some(weight_key);
+                break;
+            }
+        }
+        if let Some(blocker) = blocker {
+            warn!(
+                "sym8 group coherence: '{}' cannot emit a quantized group (ineligible/\
+                 unaligned), forcing its whole co-quantized group dense bf16: {:?}",
+                blocker, members
+            );
+            for member in &members {
+                drop_keys.insert(format!("{member}.weight"));
+            }
+        }
+    }
+
+    if !drop_keys.is_empty() {
+        entries.retain(|e| !drop_keys.contains(&e.key));
+    }
+    Ok(())
+}
+
 /// Quantize weights in-place using MLX's quantize operation.
 ///
 /// Replaces qualifying `.weight` tensors with quantized (uint32 packed) versions
@@ -2886,14 +3059,8 @@ fn quantize_weights_inner(
     let gate_bits: i32 = 8;
     let gate_group_size: i32 = 64;
 
-    // Collect quantization decisions for each weight key
-    struct QuantEntry {
-        key: String,
-        bits: i32,
-        group_size: i32,
-        mode: String,
-    }
-
+    // Collect quantization decisions for each weight key (see the
+    // module-level `QuantEntry`).
     let mut entries: Vec<QuantEntry> = Vec::new();
 
     for key in weights.keys() {
@@ -2987,18 +3154,40 @@ fn quantize_weights_inner(
             // `embed_tokens` matches both the top-level Gemma4 embedding
             // and the PLE `embed_tokens_per_layer` via substring.
             //
+            // sym8-scoped exclusions (legacy path only — recipes reject sym8):
+            // gemma4 PLE linears (`per_layer_model_projection`,
+            // `per_layer_input_gate`, `per_layer_projection`) load DENSE-ONLY
+            // (`Linear::set_weight`), and the Rust loader skips audio-tower
+            // weights entirely. A sym8 PLE entry would keep the [N,K] shape
+            // (int8) so no shape guard trips at load — silent garbage; a
+            // forced-affine entry fails the dense-only loader too. Keep them
+            // bf16 under a sym8 default.
+            if default_mode == "sym8"
+                && (key.contains("per_layer_model_projection")
+                    || key.contains("per_layer_input_gate")
+                    || key.contains("per_layer_projection")
+                    || key.contains("audio_tower")
+                    || key.contains("audio_encoder")
+                    || key.contains("embed_audio"))
+            {
+                continue;
+            }
             // EXCEPTION (lfm2/lfm2_moe): when `embed_quantizable`, the lfm2
             // PACKED embedding backend (`load_quantized_packed`) DOES support
             // mxfp4/mxfp8/nvfp4 (mode threaded through gather-dequant +
             // quantized matmul), so the embedding keys must NOT be force-
             // downgraded to affine here — they keep the global non-affine mode.
+            // sym8 is the EXCEPTION-to-the-exception: the packed backend has
+            // no sym8 gather-dequant, so under a sym8 default the embedding is
+            // force-downgraded to affine-8 like the other affine-only keys.
             let is_non_affine_default = default_mode == "mxfp4"
                 || default_mode == "mxfp8"
                 || default_mode == "nvfp4"
                 || default_mode == "sym8";
             let is_lfm2_packed_embed =
                 embed_quantizable && (key.contains("embed_tokens") || key.contains("embedding."));
-            if is_non_affine_default && is_affine_only_key(key) && !is_lfm2_packed_embed {
+            let lfm2_embed_keeps_default = is_lfm2_packed_embed && default_mode != "sym8";
+            if is_non_affine_default && is_affine_only_key(key) && !lfm2_embed_keeps_default {
                 entries.push(QuantEntry {
                     key: key.clone(),
                     bits: 8,
@@ -3056,6 +3245,15 @@ fn quantize_weights_inner(
         }
     }
 
+    // sym8-scoped group-coherence pass (legacy/no-recipe path only; affine/
+    // mxfp/nvfp defaults are deliberately untouched): the strict loaders
+    // require co-quantized groups all-or-none, so any group with a member
+    // that will not emit quantized is forced WHOLLY dense here, before the
+    // emission loop. See `enforce_sym8_group_coherence`.
+    if predicate.is_none() && default_mode == "sym8" {
+        enforce_sym8_group_coherence(weights, &mut entries)?;
+    }
+
     info!(
         "Quantizing {} weights ({}-bit {}, group_size={})",
         entries.len(),
@@ -3073,23 +3271,10 @@ fn quantize_weights_inner(
             None => continue,
         };
 
-        // Check dimensionality — must be 2D+
-        let ndim = array.ndim()? as usize;
-        if ndim < 2 {
-            weights.insert(entry.key.clone(), array);
-            continue;
-        }
-
-        // Check last dim divisibility. sym8 has no quant group — its scale is
-        // per output channel — but the int8 kernels gate on K % 16 == 0, so
-        // that is the alignment requirement instead of group_size.
-        let last_dim = array.shape_at((ndim - 1) as u32)? as i32;
-        let aligned = if entry.mode == "sym8" {
-            last_dim % 16 == 0
-        } else {
-            last_dim % entry.group_size == 0
-        };
-        if !aligned {
+        // Quantizability gates (2D+ dimensionality and the mode-specific
+        // last-dim alignment) — hoisted into `quant_entry_emits` so the sym8
+        // group-coherence pass above mirrors this emission decision exactly.
+        if !quant_entry_emits(&array, &entry.mode, entry.group_size)? {
             weights.insert(entry.key.clone(), array);
             continue;
         }
@@ -6176,6 +6361,247 @@ mod tests {
         let ok = weights.get(ok_key).expect("v_proj present");
         assert_eq!(ok.dtype().unwrap(), DType::Int8, "K%16==0 goes sym8");
         assert!(weights.contains_key("model.layers.0.self_attn.v_proj.scales"));
+    }
+
+    #[test]
+    fn sym8_group_coherence_forces_whole_mlp_group_dense() {
+        // Round-3 converter/loader invariant: under a sym8 default the
+        // dense-MLP loaders are strict all-or-none (gemma4 rejects any mixed
+        // quantized/dense `layers.N.mlp.*` tuple; dense qwen3_5's partial-
+        // group fallback dtype-rejects the quantized members). A group where
+        // one member silently stays dense (forced affine-8 by sym8
+        // ineligibility, then alignment-skipped at emission) while siblings
+        // quantize would make the converter's own output unloadable. The
+        // coherence pass must force the WHOLE group dense instead — and ONLY
+        // that group.
+        let hidden = 64i64;
+        // 24 % 16 != 0 (sym8-ineligible → forced affine-8) AND 24 % 64 != 0
+        // (affine emission alignment skip) → this member would stay dense.
+        let odd = 24i64;
+
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Incoherent group (layer 0): gate/up are sym8-eligible (K=64), down
+        // has K=24 → would stay dense → whole group must go dense.
+        weights.insert(
+            "language_model.model.layers.0.mlp.gate_proj.weight".into(),
+            w(&[odd, hidden]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.mlp.up_proj.weight".into(),
+            w(&[odd, hidden]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.mlp.down_proj.weight".into(),
+            w(&[hidden, odd]),
+        );
+        // Control group (layer 1): fully aligned → all three quantize sym8.
+        weights.insert(
+            "language_model.model.layers.1.mlp.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "language_model.model.layers.1.mlp.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "language_model.model.layers.1.mlp.down_proj.weight".into(),
+            w(&[hidden, 32]),
+        );
+        // Non-group singleton in the SAME layer as the incoherent group —
+        // must still quantize (the drop is group-scoped, not layer-scoped).
+        weights.insert(
+            "language_model.model.layers.0.self_attn.q_proj.weight".into(),
+            w(&[16, hidden]),
+        );
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false)
+            .expect("sym8 quantize with coherence pass must succeed");
+
+        // Incoherent group: every member dense float, no sidecars, no override.
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("language_model.model.layers.0.mlp.{proj}");
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("incoherent-group member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-group coherence)"
+            );
+            assert!(
+                !weights.contains_key(&format!("{base}.scales")),
+                "{base} must not gain a scales sidecar"
+            );
+            assert!(
+                !overrides.contains_key(&base),
+                "{base} must not carry a per-layer override"
+            );
+        }
+
+        // Control group: all three sym8 (int8 weight + f32 scales).
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("language_model.model.layers.1.mlp.{proj}");
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control-group member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Int8,
+                "{base} (fully aligned group) must quantize sym8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+        }
+
+        // Singleton: still sym8 — proves the drop did not leak past the group.
+        let q = weights
+            .get("language_model.model.layers.0.self_attn.q_proj.weight")
+            .expect("q_proj present");
+        assert_eq!(
+            q.dtype().unwrap(),
+            DType::Int8,
+            "non-group tensor in the same layer must still quantize"
+        );
+    }
+
+    #[test]
+    fn sym8_group_coherence_covers_lfm2_ffn_and_moe_groups() {
+        // lfm2's loader-side validator couples whole groups: the dense FFN
+        // trio (`feed_forward.{gate,up,down}_proj`, post-sanitize names) via
+        // `dense_mlp_is_quantized`, and the MoE quartet (router
+        // `feed_forward.gate` + 3D stacked `feed_forward.switch_mlp.*`) via
+        // `moe_layer_is_quantized`. One alignment-ineligible member must
+        // force the whole group dense — for the MoE quartet that includes the
+        // (otherwise eligible) router gate.
+        let hidden = 64i64;
+        let odd = 24i64; // % 16 != 0 and % 64 != 0 → can never emit quantized
+
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Dense FFN layer 0 (incoherent): gate/up eligible, down K=24.
+        weights.insert(
+            "model.layers.0.feed_forward.gate_proj.weight".into(),
+            w(&[odd, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.feed_forward.up_proj.weight".into(),
+            w(&[odd, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.feed_forward.down_proj.weight".into(),
+            w(&[hidden, odd]),
+        );
+        // MoE layer 2 (incoherent): router gate is 2D-aligned (forced
+        // affine-8 by `is_router_gate`, 64 % 64 == 0 → would emit), but the
+        // 3D stacked experts have K=24 → forced affine then alignment-skipped
+        // → the WHOLE quartet, router included, must stay dense.
+        weights.insert(
+            "model.layers.2.feed_forward.gate.weight".into(),
+            w(&[4, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.feed_forward.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, odd]),
+        );
+        weights.insert(
+            "model.layers.2.feed_forward.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, odd]),
+        );
+        weights.insert(
+            "model.layers.2.feed_forward.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, odd]),
+        );
+        // MoE layer 3 (control): everything 64-aligned → router + experts all
+        // emit forced affine-8 with per-layer overrides (existing behavior).
+        weights.insert(
+            "model.layers.3.feed_forward.gate.weight".into(),
+            w(&[4, hidden]),
+        );
+        weights.insert(
+            "model.layers.3.feed_forward.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.3.feed_forward.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.3.feed_forward.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, hidden]),
+        );
+
+        // embed_quantizable=true mirrors the lfm2/lfm2_moe convert call.
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", true)
+            .expect("sym8 quantize with coherence pass must succeed");
+
+        // FFN trio: all dense float, no sidecars, no overrides.
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let base = format!("model.layers.0.feed_forward.{proj}");
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("FFN member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-group coherence)"
+            );
+            assert!(!weights.contains_key(&format!("{base}.scales")));
+            assert!(!overrides.contains_key(&base));
+        }
+
+        // MoE quartet (incoherent): the router gate is pulled dense by its
+        // expert siblings even though it is alignment-eligible itself.
+        for base in [
+            "model.layers.2.feed_forward.gate",
+            "model.layers.2.feed_forward.switch_mlp.gate_proj",
+            "model.layers.2.feed_forward.switch_mlp.up_proj",
+            "model.layers.2.feed_forward.switch_mlp.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("MoE member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-quartet coherence)"
+            );
+            assert!(!weights.contains_key(&format!("{base}.scales")));
+            assert!(!overrides.contains_key(base));
+        }
+
+        // MoE control quartet: all quantized (forced affine-8 under the sym8
+        // default → packed Uint32 + per-layer affine override).
+        for base in [
+            "model.layers.3.feed_forward.gate",
+            "model.layers.3.feed_forward.switch_mlp.gate_proj",
+            "model.layers.3.feed_forward.switch_mlp.up_proj",
+            "model.layers.3.feed_forward.switch_mlp.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control MoE member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} must emit forced affine-8 (coherent quartet)"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("forced-affine member must carry a per-layer override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
     }
 
     #[test]

@@ -11,7 +11,8 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, has_sym8_mode, merge_per_layer, parse_mode_str,
+    default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, merge_per_layer, parse_mode_str,
     parse_quant_block, resolve_default_mode,
 };
 use crate::nn::LayerNorm;
@@ -941,10 +942,13 @@ fn apply_weights_inner(
                 }
             })
             .unwrap_or(default_plq);
+        // int8 STORAGE with non-sym8 metadata = config drift — fail loud
+        // before the int8 tensor can flow into the affine/mxfp builders.
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5")?;
         // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
-        // to the dense-weight branch"; `Err` = fail-loud (only sym8 emits
-        // errors today — a malformed sym8 layer must never silently fall
-        // back, see `try_build_sym8_quantized_linear`).
+        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
+        // layer must never silently fall back, see
+        // `try_build_sym8_quantized_linear`).
         Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
@@ -974,6 +978,9 @@ fn apply_weights_inner(
             plq.bits
         );
     } else if let Some(w) = params.get("embedding.weight") {
+        // Dense fallback (no `.scales`): a stripped quant group must never
+        // reach the dense lookup / tied-lm_head matmul.
+        ensure_dense_weight_floating("embedding.weight", w)?;
         inner.embedding.set_weight(w)?;
     }
 
@@ -999,6 +1006,9 @@ fn apply_weights_inner(
                 plq.bits
             );
         } else if let Some(w) = params.get("lm_head.weight") {
+            // Dense fallback (no `.scales`) — same stripped-quant-group
+            // dtype guard as the embedding above.
+            ensure_dense_weight_floating("lm_head.weight", w)?;
             head.set_weight(w)?;
         }
     }
@@ -1010,6 +1020,10 @@ fn apply_weights_inner(
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
+                    // Dense fallbacks below are dtype-guarded: a truncated
+                    // sym8 group (int8 `.weight` whose `.scales` was
+                    // stripped) makes `try_build_ql` return `Ok(None)`, and
+                    // the int8 bytes must NEVER reach the dense bf16 route.
                     if let Some(ql) =
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))?
                     {
@@ -1017,6 +1031,10 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
                     if let Some(ql) =
@@ -1026,6 +1044,10 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(ql) =
@@ -1035,12 +1057,25 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.out_proj.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_out_proj_weight(w)?;
                     }
                 } else {
+                    // Unquantized-checkpoint arm. Still dtype-guarded: a
+                    // FULLY-stripped quant checkpoint (every `.scales`
+                    // removed) flips `is_quantized` false and lands here, so
+                    // packed/int8 storage must fail loud before any dense
+                    // setter.
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
                     if let Some(w) =
@@ -1049,6 +1084,14 @@ fn apply_weights_inner(
                         if let Some(z) =
                             params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix))
                         {
+                            ensure_dense_weight_floating(
+                                &format!("{}.linear_attn.in_proj_qkv.weight", prefix),
+                                w,
+                            )?;
+                            ensure_dense_weight_floating(
+                                &format!("{}.linear_attn.in_proj_z.weight", prefix),
+                                z,
+                            )?;
                             let combined = MxArray::concatenate(w, z, 0)?;
                             gdn.set_in_proj_qkvz_weight(&combined)?;
                         } else {
@@ -1061,17 +1104,33 @@ fn apply_weights_inner(
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(b) = params.get(&format!("{}.linear_attn.in_proj_b.weight", prefix))
                         && let Some(a) =
                             params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_b.weight", prefix),
+                            b,
+                        )?;
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_a.weight", prefix),
+                            a,
+                        )?;
                         let combined = MxArray::concatenate(b, a, 0)?;
                         gdn.set_in_proj_ba_weight(&combined)?;
                     }
                     if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.out_proj.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_out_proj_weight(w)?;
                     }
                 }
@@ -1094,12 +1153,18 @@ fn apply_weights_inner(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
+                    // Dense fallbacks below are dtype-guarded (see the GDN
+                    // branch above): truncated sym8 groups must fail loud.
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))?
                     {
                         attn.set_quantized_q_proj(ql);
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.q_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.q_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_q_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))?
@@ -1108,6 +1173,10 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.k_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.k_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_k_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))?
@@ -1116,6 +1185,10 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.v_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.v_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_v_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))?
@@ -1124,19 +1197,41 @@ fn apply_weights_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.o_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_o_proj_weight(w)?;
                     }
                 } else {
+                    // Unquantized-checkpoint arm — dtype-guarded for the same
+                    // fully-stripped-checkpoint reason as the GDN branch.
                     if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.q_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_q_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.k_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_k_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.v_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_v_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_o_proj_weight(w)?;
                     }
                 }
@@ -1174,24 +1269,42 @@ fn apply_weights_inner(
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
                     } else {
+                        // Dense fallback (incomplete quant group): each load
+                        // is dtype-guarded so a truncated sym8/affine group
+                        // can never push int8/packed bytes into the dense
+                        // bf16 route.
                         if let Some(w) = params.get(&format!("{}.weight", gate_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", gate_key), w)?;
                             mlp.set_gate_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", up_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", up_key), w)?;
                             mlp.set_up_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", down_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", down_key), w)?;
                             mlp.set_down_proj_weight(w)?;
                         }
                     }
                 } else {
+                    // Unquantized-checkpoint arm — dtype-guarded for the same
+                    // fully-stripped-checkpoint reason as the GDN branch.
                     if let Some(w) = params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.gate_proj.weight", prefix),
+                            w,
+                        )?;
                         mlp.set_gate_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.up_proj.weight", prefix), w)?;
                         mlp.set_up_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                            w,
+                        )?;
                         mlp.set_down_proj_weight(w)?;
                     }
                     // E39: precompute the stacked [gate;up].T + down.T weights

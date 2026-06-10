@@ -12,9 +12,9 @@ pub use crate::models::qwen3_5::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DEFAULT_QUANT_MODE, GATE_QUANT_BITS,
     GATE_QUANT_GROUP_SIZE, LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE,
     MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE,
-    PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    PerLayerMode, PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, SYM8_MODE, is_mxfp8_checkpoint,
+    is_quantized_checkpoint, try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 
 /// QuantizedSwitchLinear: Expert-indexed quantized linear layer using gather_qmm.

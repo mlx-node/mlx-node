@@ -9,8 +9,8 @@ use tracing::info;
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, has_sym8_mode, load_quant_settings_from_disk, merge_per_layer,
-    resolve_default_mode,
+    default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
+    load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence_common::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
@@ -26,7 +26,7 @@ use super::quantized_linear::{
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
-    try_build_quantized_switch_linear,
+    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 
 // Quantization-block parsing now lives in `crate::models::quant_dispatch`,
@@ -331,18 +331,21 @@ fn parse_eos_token_ids(value: &Value) -> Vec<i32> {
 /// Exhaustively checks embed_tokens, final norm, and per-layer attention + MLP weights,
 /// including o_proj, up_proj, down_proj, all 4 norms, v_proj (when !k_eq_v),
 /// and MoE weights (when enabled).
-/// Allows for quantized variants (`.scales` suffix instead of `.weight`).
+///
+/// Quantized variants are NOT special-cased: every quant format this loader
+/// understands (affine, mxfp4/mxfp8, nvfp4, sym8) stores its payload under
+/// the SAME `.weight` key (packed Uint32 / fp8 / int8) with `.scales` as a
+/// SIDECAR, so a well-formed quantized group always carries the `.weight`
+/// key too. The old `has()` accepted a lone `.scales` as satisfying a
+/// required `.weight`, which let a scales-only (stripped `.weight`) group
+/// pass validation — every quant builder then returned `None`, the dense
+/// branch found no `.weight` to load, and the model silently kept its
+/// constructor-RANDOM weights.
 fn validate_required_weights(
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
 ) -> Result<()> {
-    let has = |key: &str| -> bool {
-        params.contains_key(key)
-            || key
-                .strip_suffix(".weight")
-                .map(|p| params.contains_key(&format!("{}.scales", p)))
-                .unwrap_or(false)
-    };
+    let has = |key: &str| -> bool { params.contains_key(key) };
 
     // Model-level weights
     if !has("embed_tokens.weight") {
@@ -449,7 +452,8 @@ fn validate_required_weights(
             }
             // Expert weights: HF fused OR mlx-lm split format
             // HF uses bare keys (experts.gate_up_proj), mlx-lm uses .weight suffix.
-            // The has() helper also checks for .scales (quantized variant).
+            // Quantized groups carry the (packed) `.weight` key too, so the
+            // strict `has()` covers them.
             let has_fused_bare = params.contains_key(&format!("{}.experts.gate_up_proj", prefix))
                 && params.contains_key(&format!("{}.experts.down_proj", prefix));
             let has_fused_weight = has(&format!("{}.experts.gate_up_proj.weight", prefix))
@@ -581,8 +585,30 @@ pub fn sanitize_weights(
     // operation between f32 buffers and bf16 activations creates an AsType node,
     // adding ~700 extra ops to the decode graph and preventing Metal kernel fusion.
     // Python's load_weights handles this implicitly via tree_map dtype conversion.
+    //
+    // sym8 exemption: a sym8 layer's `.scales` sidecar is MANDATORY f32 `[N]`
+    // next to an int8 `.weight` — narrowing it to bf16 here would make
+    // `try_build_sym8_quantized_linear` fail loud on every load. The check is
+    // content-based (sibling `.weight` dtype == Int8) because quant settings
+    // are read from config.json AFTER sanitize runs, so per-layer modes are
+    // not available here. Affine `.scales` (sibling weight is packed Uint32)
+    // keep today's bf16 cast.
+    let sym8_scale_keys: std::collections::HashSet<String> = sanitized
+        .keys()
+        .filter_map(|k| k.strip_suffix(".scales").map(|p| (k, p)))
+        .filter(|(_, prefix)| {
+            sanitized
+                .get(&format!("{prefix}.weight"))
+                .and_then(|w| w.dtype().ok())
+                == Some(DType::Int8)
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
     for (key, value) in sanitized.iter_mut() {
         if key.starts_with("vision_tower.") || key.starts_with("embed_vision.") {
+            continue;
+        }
+        if sym8_scale_keys.contains(key) {
             continue;
         }
         if value.dtype().is_ok_and(|dt| dt == DType::Float32)
@@ -605,14 +631,6 @@ fn apply_weights(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
-    // sym8 is consumed by the DENSE Qwen3.5 loader only — fail loud rather
-    // than let the Sym8 match arms below silently fall back to dense weights.
-    if has_sym8_mode(top_level_mode, per_layer_quant) {
-        return Err(Error::from_reason(
-            "sym8 checkpoints are not supported by the gemma4 loader \
-             (sym8 v1 is dense Qwen3.5 only). Re-convert with an affine quant mode.",
-        ));
-    }
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -630,40 +648,63 @@ fn apply_weights(
     );
 
     // Helper closure for building quantized linears. Dispatches by per-layer
-    // mode (mxfp4 / mxfp8 / affine), falling back to `default_plq` (which
-    // honors top-level `quantization.mode`) when no per-layer override is
-    // present. The `try_build_*` builders all return `None` when the
-    // expected `.scales` key is missing, so no extra `is_quantized` guard
-    // is needed at this layer (and adding one only to the affine arm made
-    // `try_build_ql` and `try_build_qsl` asymmetric).
-    let try_build_ql = |prefix: &str| -> Option<super::quantized_linear::QuantizedLinear> {
+    // mode (mxfp4 / mxfp8 / nvfp4 / affine / sym8), falling back to
+    // `default_plq` (which honors top-level `quantization.mode`) when no
+    // per-layer override is present. `Ok(None)` = "prefix not quantized,
+    // fall back to the dense-weight branch" (every builder returns `None`
+    // when the expected `.scales` key is missing, so no extra `is_quantized`
+    // guard is needed here); `Err` = fail-loud (only sym8 errs today — a
+    // malformed sym8 layer must NEVER silently fall back to loading its
+    // int8 bytes as a dense weight, see `try_build_sym8_quantized_linear`).
+    //
+    // Paged KV stays the gemma4 default under sym8 (`use_block_paged_cache`
+    // defaults true in `model.rs`): gemma4 has NO compiled C++ forward path,
+    // and the eager paged loop drives the same `LinearProj::forward` sym8
+    // route as flat — qwen3_5's force-flat sym8 guard exists only because
+    // its compiled registry can't represent sym8, which does not transfer.
+    let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        match plq.mode {
+        // int8 STORAGE with non-sym8 metadata = config drift — fail loud
+        // before the int8 tensor can flow into the affine/mxfp builders.
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
+        Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
-            // Unreachable: the sym8 guard at the top of `apply_weights`
-            // rejects sym8 checkpoints before any builder runs.
-            PerLayerMode::Sym8 => None,
-        }
+            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+        })
     };
     // Helper for expert-batched (switch) quantized linears used by MoE layers.
-    let try_build_qsl = |prefix: &str| -> Option<super::quantized_linear::QuantizedSwitchLinear> {
-        let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-        match plq.mode {
-            PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
-            PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
-            PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
-            PerLayerMode::Affine => {
-                try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
-            }
-            // Unreachable: see try_build_ql above.
-            PerLayerMode::Sym8 => None,
-        }
-    };
+    let try_build_qsl =
+        |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedSwitchLinear>> {
+            let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+            // Same config-drift guard as `try_build_ql`: an int8 expert stack
+            // with non-sym8 metadata must not reach the affine QSL builder.
+            ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "gemma4")?;
+            Ok(match plq.mode {
+                PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
+                PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+                PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
+                PerLayerMode::Affine => {
+                    try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
+                }
+                // 3-D expert tensors are convert-forced to affine under a
+                // sym8 default; a sym8 PLQ reaching this builder means a
+                // malformed checkpoint — fail loud, a silent fallback would
+                // read the experts' int8 bytes as dense bf16 garbage.
+                PerLayerMode::Sym8 => {
+                    return Err(Error::from_reason(format!(
+                        "sym8 expert layer '{}': 3-D switch (expert) tensors cannot be sym8 \
+                         (convert forces experts to affine under a sym8 default) — \
+                         malformed checkpoint",
+                        prefix
+                    )));
+                }
+            })
+        };
 
     // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
     // companions alongside `.weight` with a packed-last-dim shape, so the
@@ -717,6 +758,9 @@ fn apply_weights(
             inner.embed_weight_t = Some(w_t);
         }
     } else if let Some(w) = params.get("embed_tokens.weight") {
+        // Dense embedding fallback (no `.scales`): a stripped quant group
+        // must never reach the dense lookup / tied-lm_head matmul.
+        ensure_dense_weight_floating("embed_tokens.weight", w)?;
         inner.embed_tokens.load_weight(w)?;
         // Pre-transpose for tied lm_head: [vocab, hidden] -> [hidden, vocab]
         if config.tie_word_embeddings {
@@ -734,11 +778,12 @@ fn apply_weights(
     if !config.tie_word_embeddings
         && let Some(ref mut head) = inner.lm_head
     {
-        if let Some(_ql) = try_build_ql("lm_head") {
+        if try_build_ql("lm_head")?.is_some() {
             return Err(Error::from_reason(
                 "Quantized lm_head not yet supported for Gemma4",
             ));
         } else if let Some(w) = params.get("lm_head.weight") {
+            ensure_dense_weight_floating("lm_head.weight", w)?;
             head.set_weight(w)?;
         }
     }
@@ -783,10 +828,16 @@ fn apply_weights(
                 )?;
                 info!("PLE embed_tokens_per_layer loaded (quantized)");
             } else if let Some(w) = params.get("embed_tokens_per_layer.weight") {
+                // Dense PLE-embedding fallback — same stripped-quant-group
+                // dtype guard as embed_tokens.
+                ensure_dense_weight_floating("embed_tokens_per_layer.weight", w)?;
                 ple.embed_tokens_per_layer.load_weight(w)?;
                 info!("PLE embed_tokens_per_layer loaded");
             }
             if let Some(w) = params.get("per_layer_model_projection.weight") {
+                // Quantizable linear (convert keeps it bf16 today) — cheap
+                // in-class dtype guard.
+                ensure_dense_weight_floating("per_layer_model_projection.weight", w)?;
                 ple.per_layer_model_projection.set_weight(w)?;
                 info!("PLE per_layer_model_projection loaded");
             }
@@ -803,15 +854,21 @@ fn apply_weights(
         // Attention weights
         let attn_prefix = format!("{}.self_attn", prefix);
 
-        if let Some(ql) = try_build_ql(&format!("{}.q_proj", attn_prefix)) {
+        // Each dense fallback below is dtype-guarded: a truncated sym8 group
+        // (int8 `.weight` whose `.scales` was stripped) makes `try_build_ql`
+        // return `Ok(None)`, and the int8 bytes must NEVER reach the dense
+        // bf16 route.
+        if let Some(ql) = try_build_ql(&format!("{}.q_proj", attn_prefix))? {
             layer.self_attn.set_quantized_q_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.q_proj.weight", attn_prefix)) {
+            ensure_dense_weight_floating(&format!("{}.q_proj.weight", attn_prefix), w)?;
             layer.self_attn.set_q_proj_weight(w)?;
         }
 
-        if let Some(ql) = try_build_ql(&format!("{}.k_proj", attn_prefix)) {
+        if let Some(ql) = try_build_ql(&format!("{}.k_proj", attn_prefix))? {
             layer.self_attn.set_quantized_k_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.k_proj.weight", attn_prefix)) {
+            ensure_dense_weight_floating(&format!("{}.k_proj.weight", attn_prefix), w)?;
             layer.self_attn.set_k_proj_weight(w)?;
         }
 
@@ -819,16 +876,18 @@ fn apply_weights(
         // k_eq_v only applies to global (full attention) layers when attention_k_eq_v is set.
         let layer_k_eq_v = config.attention_k_eq_v && config.is_global_layer(i);
         if !layer_k_eq_v {
-            if let Some(ql) = try_build_ql(&format!("{}.v_proj", attn_prefix)) {
+            if let Some(ql) = try_build_ql(&format!("{}.v_proj", attn_prefix))? {
                 layer.self_attn.set_quantized_v_proj(ql);
             } else if let Some(w) = params.get(&format!("{}.v_proj.weight", attn_prefix)) {
+                ensure_dense_weight_floating(&format!("{}.v_proj.weight", attn_prefix), w)?;
                 layer.self_attn.set_v_proj_weight(w)?;
             }
         }
 
-        if let Some(ql) = try_build_ql(&format!("{}.o_proj", attn_prefix)) {
+        if let Some(ql) = try_build_ql(&format!("{}.o_proj", attn_prefix))? {
             layer.self_attn.set_quantized_o_proj(ql);
         } else if let Some(w) = params.get(&format!("{}.o_proj.weight", attn_prefix)) {
+            ensure_dense_weight_floating(&format!("{}.o_proj.weight", attn_prefix), w)?;
             layer.self_attn.set_o_proj_weight(w)?;
         }
 
@@ -854,25 +913,80 @@ fn apply_weights(
             layer.self_attn.set_o_proj_bias(Some(w))?;
         }
 
-        // MLP weights
+        // MLP weights. Build ALL THREE projections' quantized groups first,
+        // then dispatch on the complete tuple: all-quantized installs the
+        // quantized MLP, all-dense takes the dtype-guarded dense branch, and
+        // ANY mixed combination is a truncated/malformed checkpoint — fail
+        // loud naming the projections missing their quant group. The old
+        // gate-keyed nesting silently left the randomly-initialized MLP live
+        // when gate built but up/down did not, and dense-loaded up/down
+        // sidecars unchecked when gate was dense.
         let mlp_prefix = format!("{}.mlp", prefix);
 
-        if let Some(ql_gate) = try_build_ql(&format!("{}.gate_proj", mlp_prefix)) {
-            if let (Some(ql_up), Some(ql_down)) = (
-                try_build_ql(&format!("{}.up_proj", mlp_prefix)),
-                try_build_ql(&format!("{}.down_proj", mlp_prefix)),
-            ) {
+        let ql_gate = try_build_ql(&format!("{}.gate_proj", mlp_prefix))?;
+        let ql_up = try_build_ql(&format!("{}.up_proj", mlp_prefix))?;
+        let ql_down = try_build_ql(&format!("{}.down_proj", mlp_prefix))?;
+        match (ql_gate, ql_up, ql_down) {
+            (Some(ql_gate), Some(ql_up), Some(ql_down)) => {
                 layer.set_quantized_dense_mlp(ql_gate, ql_up, ql_down);
             }
-        } else {
-            if let Some(w) = params.get(&format!("{}.gate_proj.weight", mlp_prefix)) {
-                layer.mlp.set_gate_proj_weight(w)?;
+            (None, None, None) => {
+                // All-sidecar/no-weight guard: a scales-only group (the
+                // `.scales`/`.biases` sidecars survived but `.weight` was
+                // stripped) makes EVERY builder return `None`, landing here —
+                // and the dense loads below would find no `.weight` key, set
+                // nothing, and return Ok with the constructor-RANDOM MLP
+                // live. Fail loud naming the orphaned sidecars instead.
+                let mut orphaned: Vec<String> = Vec::new();
+                for proj in ["gate_proj", "up_proj", "down_proj"] {
+                    for sidecar in ["scales", "biases"] {
+                        let key = format!("{mlp_prefix}.{proj}.{sidecar}");
+                        if params.contains_key(&key) {
+                            orphaned.push(key);
+                        }
+                    }
+                }
+                if !orphaned.is_empty() {
+                    return Err(Error::from_reason(format!(
+                        "gemma4: dense MLP '{}' has quant sidecars without a loadable quant \
+                         group (the packed '.weight' is missing/stripped): {} — refusing to \
+                         load; the dense branch would silently leave the randomly-initialized \
+                         MLP live (truncated/malformed checkpoint)",
+                        mlp_prefix,
+                        orphaned.join(", ")
+                    )));
+                }
+                if let Some(w) = params.get(&format!("{}.gate_proj.weight", mlp_prefix)) {
+                    ensure_dense_weight_floating(&format!("{}.gate_proj.weight", mlp_prefix), w)?;
+                    layer.mlp.set_gate_proj_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.up_proj.weight", mlp_prefix)) {
+                    ensure_dense_weight_floating(&format!("{}.up_proj.weight", mlp_prefix), w)?;
+                    layer.mlp.set_up_proj_weight(w)?;
+                }
+                if let Some(w) = params.get(&format!("{}.down_proj.weight", mlp_prefix)) {
+                    ensure_dense_weight_floating(&format!("{}.down_proj.weight", mlp_prefix), w)?;
+                    layer.mlp.set_down_proj_weight(w)?;
+                }
             }
-            if let Some(w) = params.get(&format!("{}.up_proj.weight", mlp_prefix)) {
-                layer.mlp.set_up_proj_weight(w)?;
-            }
-            if let Some(w) = params.get(&format!("{}.down_proj.weight", mlp_prefix)) {
-                layer.mlp.set_down_proj_weight(w)?;
+            (gate, up, down) => {
+                let mut missing: Vec<&str> = Vec::new();
+                if gate.is_none() {
+                    missing.push("gate_proj");
+                }
+                if up.is_none() {
+                    missing.push("up_proj");
+                }
+                if down.is_none() {
+                    missing.push("down_proj");
+                }
+                return Err(Error::from_reason(format!(
+                    "gemma4: dense MLP '{}' has a PARTIAL quantized group — missing the quant \
+                     group (weight+scales) for: {} — refusing to load a mixed quantized/dense \
+                     MLP (truncated/malformed checkpoint)",
+                    mlp_prefix,
+                    missing.join(", ")
+                )));
             }
         }
 
@@ -895,12 +1009,22 @@ fn apply_weights(
             layer.set_layer_scalar(w)?;
         }
 
-        // PLE per-layer weights
+        // PLE per-layer weights. The two PLE linears are quantizable
+        // projections (convert keeps them bf16 today) — cheap in-class
+        // dtype guards; the norm below is never quantized.
         if layer.has_ple() {
             if let Some(w) = params.get(&format!("{}.per_layer_input_gate.weight", prefix)) {
+                ensure_dense_weight_floating(
+                    &format!("{}.per_layer_input_gate.weight", prefix),
+                    w,
+                )?;
                 layer.set_per_layer_input_gate_weight(w)?;
             }
             if let Some(w) = params.get(&format!("{}.per_layer_projection.weight", prefix)) {
+                ensure_dense_weight_floating(
+                    &format!("{}.per_layer_projection.weight", prefix),
+                    w,
+                )?;
                 layer.set_per_layer_projection_weight(w)?;
             }
             if let Some(w) = params.get(&format!("{}.post_per_layer_input_norm.weight", prefix)) {
@@ -951,6 +1075,10 @@ fn apply_weights(
                     router_plq.bits,
                 )?;
             } else if let Some(w) = params.get(&format!("{}.weight", router_prefix)) {
+                // Dense router fallback: a stripped quant group (packed/int8
+                // `.weight`, `.scales` removed) lands here — never let
+                // non-float storage into the dense router matmul.
+                ensure_dense_weight_floating(&format!("{}.weight", router_prefix), w)?;
                 layer.set_router_proj_weight(w)?;
             }
             if let Some(w) = params.get(&format!("{}.router.per_expert_scale", prefix)) {
@@ -965,25 +1093,37 @@ fn apply_weights(
             //   experts.gate_up_proj, experts.down_proj
             {
                 let gate_up_prefix = format!("{}.experts.gate_up_proj", prefix);
-                if let Some(qsl) = try_build_qsl(&gate_up_prefix) {
+                // Both dense fallbacks below are dtype-guarded: `try_build_qsl`
+                // returns `Ok(None)` when `.scales` is absent, so a stripped
+                // expert quant group (packed/int8 `.weight`, sidecars removed)
+                // lands here. The BARE HF key form is additionally invisible
+                // to `ensure_int8_storage_resolves_sym8` (it probes only
+                // `{base}.weight`), so the install-time guard is the only
+                // dtype gate on that path.
+                if let Some(qsl) = try_build_qsl(&gate_up_prefix)? {
                     layer.set_moe_gate_up_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", gate_up_prefix)) {
                     // mlx-lm fused dense format
+                    ensure_dense_weight_floating(&format!("{}.weight", gate_up_prefix), w)?;
                     layer.set_moe_gate_up_proj(w)?;
                 } else if let Some(w) = params.get(&gate_up_prefix) {
                     // HF pre-fused bare key format
+                    ensure_dense_weight_floating(&gate_up_prefix, w)?;
                     layer.set_moe_gate_up_proj(w)?;
                 }
             }
             {
                 let down_prefix = format!("{}.experts.down_proj", prefix);
-                if let Some(qsl) = try_build_qsl(&down_prefix) {
+                // Same dtype-guard rationale as gate_up_proj above.
+                if let Some(qsl) = try_build_qsl(&down_prefix)? {
                     layer.set_moe_down_proj_quantized(qsl)?;
                 } else if let Some(w) = params.get(&format!("{}.weight", down_prefix)) {
                     // mlx-lm fused dense format
+                    ensure_dense_weight_floating(&format!("{}.weight", down_prefix), w)?;
                     layer.set_moe_down_proj(w)?;
                 } else if let Some(w) = params.get(&down_prefix) {
                     // HF pre-fused bare key format
+                    ensure_dense_weight_floating(&down_prefix, w)?;
                     layer.set_moe_down_proj(w)?;
                 }
             }
@@ -1203,6 +1343,12 @@ fn apply_vision_weights(
                 vision_plq.bits,
             )?;
         } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+            // Dense fallback — dtype-guarded: a packed/int8 `.weight` whose
+            // `.scales` sidecar was stripped lands here (the quantized branch
+            // above keys on `.scales` presence), and an unguarded
+            // `set_weight` would install non-float storage into the dense
+            // linear (the shape can validate while the dtype is garbage).
+            ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
             embedder.embedding_projection.set_weight(w)?;
         }
     }
@@ -1558,6 +1704,473 @@ impl Gemma4Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sym8's mandatory f32 `[N]` `.scales` (sibling `.weight` is Int8) must
+    /// survive `sanitize_weights`' blanket f32->bf16 cast — the exemption is
+    /// content-based because quant settings load from config.json AFTER
+    /// sanitize. Every other f32 tensor keeps today's bf16 cast, including
+    /// affine `.scales` whose sibling weight is packed Uint32.
+    #[test]
+    fn sanitize_weights_preserves_f32_scales_only_for_int8_sym8_siblings() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+        });
+        let config: Gemma4Config = serde_json::from_value(json).expect("minimal Gemma4Config");
+
+        let f32_arr =
+            |len: usize, shape: &[i64]| MxArray::from_float32(&vec![0.5f32; len], shape).unwrap();
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        // sym8-shaped layer: int8 [N,K] weight + f32 [N] scales.
+        let w_i8 = f32_arr(4 * 16, &[4, 16]).astype(DType::Int8).unwrap();
+        params.insert("layers.0.self_attn.q_proj.weight".into(), w_i8);
+        params.insert("layers.0.self_attn.q_proj.scales".into(), f32_arr(4, &[4]));
+        // affine-shaped layer: packed uint32 weight + f32 group scales.
+        let w_u32 = f32_arr(4 * 2, &[4, 2]).astype(DType::Uint32).unwrap();
+        params.insert("layers.0.self_attn.k_proj.weight".into(), w_u32);
+        params.insert(
+            "layers.0.self_attn.k_proj.scales".into(),
+            f32_arr(4, &[4, 1]),
+        );
+        // Plain f32 tensor — the cast the exemption must NOT disturb.
+        params.insert("norm.weight".into(), f32_arr(16, &[16]));
+
+        let sanitized = sanitize_weights(&mut params, &config).expect("sanitize_weights");
+        let dt = |k: &str| sanitized.get(k).unwrap().dtype().unwrap();
+        assert_eq!(
+            dt("layers.0.self_attn.q_proj.scales"),
+            DType::Float32,
+            "sym8 .scales (Int8 sibling weight) must stay f32"
+        );
+        assert_eq!(dt("layers.0.self_attn.q_proj.weight"), DType::Int8);
+        assert_eq!(
+            dt("layers.0.self_attn.k_proj.scales"),
+            DType::BFloat16,
+            "affine .scales (Uint32 sibling weight) must keep the bf16 cast"
+        );
+        assert_eq!(dt("norm.weight"), DType::BFloat16);
+    }
+
+    /// Finding 1 (partial dense-MLP quant group): a checkpoint where SOME of
+    /// gate/up/down ship a quantized group and the rest are dense is
+    /// truncated/malformed — `apply_weights` must FAIL LOUD naming the
+    /// projections missing their quant group. The old gate-keyed nesting
+    /// silently left the randomly-initialized MLP live (gate quantized,
+    /// up/down dense) or dense-loaded packed sidecar weights unchecked (gate
+    /// dense, up/down quantized). The two happy paths — all-dense and
+    /// all-quantized — must keep loading.
+    #[test]
+    fn partial_dense_mlp_quant_group_fails_loud() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            // Skip the GPU paged-KV pool (it rejects the tiny head_dim) —
+            // this is a loader-seam test, not an inference test.
+            "use_block_paged_cache": false,
+        });
+        let config: Gemma4Config = serde_json::from_value(json).expect("minimal Gemma4Config");
+
+        let bf16_w = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+        // Affine-SHAPED quant group (packed Uint32 weight + scales). The
+        // affine builder stores tensors as-is, so dummies are sufficient for
+        // this loader-seam test.
+        let quant_group = |p: &mut HashMap<String, MxArray>, base: &str| {
+            let w = MxArray::from_float32(&[0.0f32; 4 * 2], &[4, 2])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32");
+            p.insert(format!("{base}.weight"), w);
+            p.insert(format!("{base}.scales"), bf16_w(&[4, 1]));
+        };
+        let run = |params: &HashMap<String, MxArray>| {
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+        };
+
+        // (a) gate quantized, up/down dense → Err naming up_proj + down_proj.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        quant_group(&mut params, "layers.0.mlp.gate_proj");
+        params.insert("layers.0.mlp.up_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.down_proj.weight".into(), bf16_w(&[16, 16]));
+        let err = run(&params).expect_err("partial MLP quant group (gate-only) must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("up_proj") && msg.contains("down_proj") && msg.contains("layers.0.mlp"),
+            "error must name the projections missing their quant group, got: {msg}"
+        );
+
+        // (b) the inverse mix (gate dense, up/down quantized) must ALSO fail
+        // — the old code dense-loaded the packed up/down weights unchecked.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("layers.0.mlp.gate_proj.weight".into(), bf16_w(&[16, 16]));
+        quant_group(&mut params, "layers.0.mlp.up_proj");
+        quant_group(&mut params, "layers.0.mlp.down_proj");
+        let err = run(&params).expect_err("partial MLP quant group (gate dense) must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gate_proj") && !msg.contains("up_proj,"),
+            "error must name exactly the projection missing its quant group, got: {msg}"
+        );
+
+        // Control 1: all-dense MLP keeps loading through the (dtype-guarded)
+        // dense branch.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("layers.0.mlp.gate_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.up_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.down_proj.weight".into(), bf16_w(&[16, 16]));
+        run(&params).expect("all-dense MLP must keep loading");
+
+        // Control 2: all-quantized MLP keeps loading through
+        // `set_quantized_dense_mlp`.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        quant_group(&mut params, "layers.0.mlp.gate_proj");
+        quant_group(&mut params, "layers.0.mlp.up_proj");
+        quant_group(&mut params, "layers.0.mlp.down_proj");
+        run(&params).expect("all-quantized MLP must keep loading");
+    }
+
+    /// Round-2 Finding A (scales-only MLP group): if the MLP projections ship
+    /// ONLY their quant sidecars (`.scales`/`.biases`, `.weight` stripped),
+    /// every builder returns `None`, the tuple match lands in the all-dense
+    /// arm, and the dense loads find no `.weight` keys — the load used to
+    /// return Ok with the constructor-RANDOM MLP live. Must fail loud naming
+    /// the orphaned sidecars.
+    #[test]
+    fn scales_only_mlp_group_fails_loud_not_random() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+        });
+        let config: Gemma4Config = serde_json::from_value(json).expect("minimal Gemma4Config");
+        let bf16_w = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+        let run = |params: &HashMap<String, MxArray>| {
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+        };
+
+        // (a) ALL THREE projections scales-only (no `.weight` anywhere) →
+        // Err naming every orphaned sidecar.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            params.insert(format!("layers.0.mlp.{proj}.scales"), bf16_w(&[4, 1]));
+        }
+        let err = run(&params).expect_err("all-scales-only MLP group must fail loud, not random");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layers.0.mlp")
+                && msg.contains("gate_proj.scales")
+                && msg.contains("up_proj.scales")
+                && msg.contains("down_proj.scales"),
+            "error must name the MLP and every orphaned sidecar, got: {msg}"
+        );
+
+        // (b) ONE projection scales-only, the others dense — the tuple is
+        // still (None, None, None), so the orphan scan must catch the single
+        // stray sidecar too.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("layers.0.mlp.gate_proj.scales".into(), bf16_w(&[4, 1]));
+        params.insert("layers.0.mlp.up_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.down_proj.weight".into(), bf16_w(&[16, 16]));
+        let err = run(&params).expect_err("single scales-only projection must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layers.0.mlp.gate_proj.scales"),
+            "error must name the orphaned sidecar, got: {msg}"
+        );
+
+        // Control: the all-dense MLP keeps loading.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("layers.0.mlp.gate_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.up_proj.weight".into(), bf16_w(&[16, 16]));
+        params.insert("layers.0.mlp.down_proj.weight".into(), bf16_w(&[16, 16]));
+        run(&params).expect("all-dense MLP must keep loading");
+    }
+
+    /// Round-3 Finding 3 (vision embedding projection): the dense fallback of
+    /// `embed_vision.embedding_projection` must be dtype-guarded. When the
+    /// `.scales` sidecar is stripped, the quantized branch (keyed on `.scales`
+    /// presence) is skipped and the packed Uint32 `.weight` used to route
+    /// straight into `set_weight` — the shape can validate while the dtype is
+    /// garbage. Must fail loud naming the key; a bf16 dense weight keeps
+    /// loading.
+    #[test]
+    fn vision_embedding_projection_stripped_sidecar_fails_loud() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            // Tiny vision config so `Gemma4Inner::new` builds `embed_vision`.
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": false,
+                "rope_theta": 100.0,
+                "standardize": false,
+            },
+        });
+        let config: Gemma4Config =
+            serde_json::from_value(json).expect("minimal Gemma4Config with vision");
+        let run = |params: &HashMap<String, MxArray>| {
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_vision_weights(&mut inner, params, &config, 8, 64, None, &HashMap::new())
+        };
+
+        // (a) Stripped sidecar: a non-float (packed Uint32) `.weight` with NO
+        // `.scales`. Its shape matches the dense projection ([text=16,
+        // vision=16]) exactly, so the old unguarded `set_weight` would have
+        // installed the packed bytes silently — proving the new dtype guard
+        // (not an unrelated shape check) is what rejects it.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let packed = MxArray::from_float32(&[0.0f32; 16 * 16], &[16, 16])
+            .expect("from_float32")
+            .astype(DType::Uint32)
+            .expect("uint32");
+        params.insert("embed_vision.embedding_projection.weight".into(), packed);
+        let err =
+            run(&params).expect_err("non-float projection weight without .scales must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("embed_vision.embedding_projection.weight") && msg.contains("Uint32"),
+            "error must name the key and the non-float dtype, got: {msg}"
+        );
+
+        // (b) bf16 control: the dense route keeps loading.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        let dense = MxArray::from_float32(&vec![0.01f32; 16 * 16], &[16, 16])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        params.insert("embed_vision.embedding_projection.weight".into(), dense);
+        run(&params).expect("bf16 dense projection must keep loading");
+    }
+
+    /// Round-2 Finding A (validator side): `validate_required_weights`' `has()`
+    /// no longer treats a lone `.scales` as satisfying a required `.weight`.
+    /// Every quant format stores its payload under the `.weight` key (packed
+    /// Uint32 / fp8 / int8) with `.scales` as a SIDECAR, so a well-formed
+    /// quantized checkpoint still passes the strict check, while a scales-only
+    /// (stripped `.weight`) group is reported missing instead of loading as
+    /// constructor-random weights downstream.
+    #[test]
+    fn validate_required_weights_rejects_scales_only_groups() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+        });
+        let config: Gemma4Config = serde_json::from_value(json).expect("minimal Gemma4Config");
+        // The validator only checks key presence, so a 1-element dummy works.
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+
+        let full = || -> HashMap<String, MxArray> {
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            for key in [
+                "embed_tokens.weight",
+                "norm.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+            ] {
+                p.insert(key.to_string(), dummy());
+            }
+            p
+        };
+
+        // Control 1: the complete dense key set validates.
+        validate_required_weights(&full(), &config).expect("complete dense set must validate");
+
+        // Control 2: a legitimate QUANTIZED group carries BOTH `.weight`
+        // (packed) and `.scales` — the strict check must still pass.
+        let mut p = full();
+        p.insert("layers.0.mlp.gate_proj.scales".into(), dummy());
+        validate_required_weights(&p, &config)
+            .expect("quantized group (weight + scales sidecar) must validate");
+
+        // Scales-only: stripping `.weight` while keeping `.scales` must be
+        // reported as the missing `.weight` (the old `has()` accepted it).
+        let mut p = full();
+        p.remove("layers.0.mlp.gate_proj.weight");
+        p.insert("layers.0.mlp.gate_proj.scales".into(), dummy());
+        let err = validate_required_weights(&p, &config)
+            .expect_err("a lone .scales must no longer satisfy a required .weight");
+        assert!(
+            format!("{err}").contains("layers.0.mlp.gate_proj.weight"),
+            "error must name the missing .weight, got: {err}"
+        );
+    }
+
+    /// Round-2 Finding C (MoE expert dense fallback): `try_build_qsl` returns
+    /// `Ok(None)` when `.scales` is absent, so a stripped expert quant group
+    /// reaches the dense fallback — including the BARE HF fused key form
+    /// (`layers.N.experts.gate_up_proj`, no `.weight` suffix), which is
+    /// invisible to `ensure_int8_storage_resolves_sym8` (it probes only
+    /// `{base}.weight`). Both key forms — and the router-proj dense fallback —
+    /// must fail loud on non-float storage instead of installing it into the
+    /// dense expert/router matmul routes.
+    #[test]
+    fn moe_expert_dense_fallback_rejects_non_float() {
+        let json = serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            "enable_moe_block": true,
+            "num_experts": 2,
+            "top_k_experts": 1,
+            "moe_intermediate_size": 4,
+        });
+        let config: Gemma4Config = serde_json::from_value(json).expect("MoE Gemma4Config");
+        let int8 = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Int8)
+                .expect("astype int8")
+        };
+        let run = |params: &HashMap<String, MxArray>| {
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+        };
+        // Either guard is a valid fail-loud outcome: the `.weight`-suffixed
+        // form trips `ensure_int8_storage_resolves_sym8` first ("is int8
+        // (sym8 storage) but ... resolves to Affine"), while the BARE key
+        // forms are invisible to it and must be stopped by the install-time
+        // `ensure_dense_weight_floating` ("non-float dtype Int8").
+        let assert_int8_rejected = |params: &HashMap<String, MxArray>, key: &str| {
+            let err = match run(params) {
+                Err(e) => e,
+                Ok(()) => panic!("int8 '{key}' on a dense route must fail loud"),
+            };
+            let msg = format!("{err}");
+            assert!(
+                msg.to_lowercase().contains("int8") && msg.contains(key),
+                "error must name the key and the non-float dtype, got: {msg}"
+            );
+        };
+
+        // (a) BARE HF fused expert key (no `.weight` suffix), int8 storage.
+        let key = "layers.0.experts.gate_up_proj";
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(key.into(), int8(&[2, 8, 16]));
+        assert_int8_rejected(&params, key);
+
+        // (b) mlx-lm fused `.weight` key form, int8 storage (stripped scales).
+        let key = "layers.0.experts.gate_up_proj.weight";
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(key.into(), int8(&[2, 8, 16]));
+        assert_int8_rejected(&params, key);
+
+        // (c) bare down_proj form, int8 storage.
+        let key = "layers.0.experts.down_proj";
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(key.into(), int8(&[2, 16, 4]));
+        assert_int8_rejected(&params, key);
+
+        // (d) router-proj dense fallback, int8 storage (same hole class).
+        let key = "layers.0.router.proj.weight";
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(key.into(), int8(&[2, 16]));
+        assert_int8_rejected(&params, key);
+
+        // Control: dense bf16 fused experts + router keep loading.
+        let bf16_w = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.experts.gate_up_proj.weight".into(),
+            bf16_w(&[2, 8, 16]),
+        );
+        params.insert(
+            "layers.0.experts.down_proj.weight".into(),
+            bf16_w(&[2, 16, 4]),
+        );
+        params.insert("layers.0.router.proj.weight".into(), bf16_w(&[2, 16]));
+        run(&params).expect("dense bf16 MoE weights must keep loading");
+    }
 
     #[test]
     fn merge_split_experts_uses_bare_experts_prefix() {

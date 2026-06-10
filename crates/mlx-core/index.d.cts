@@ -2016,7 +2016,7 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /**
    * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 ONLY in v1,
+   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
    * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
    */
   quantMode?: string;

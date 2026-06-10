@@ -15,8 +15,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use napi::bindgen_prelude::{Error, Result};
 use serde_json::Value;
 use tracing::warn;
+
+use crate::array::{DType, MxArray};
 
 /// Per-layer quantization mode discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +36,8 @@ pub enum PerLayerMode {
     /// `[N]` scales, no biases, group_size is null/meaningless). Consumed by
     /// the int8 kernels (`int8_w8a16_qmv` decode / `int8_w8a8_matmul`
     /// prefill), NEVER by `mlx_quantized_matmul` (there is no affine pack).
-    /// Dense Qwen3.5 only.
+    /// Dispatched by dense qwen3_5, lfm2/lfm2_moe, and gemma4 (all via the
+    /// shared `try_build_sym8_quantized_linear`); qwen3_5_moe still rejects.
     Sym8,
 }
 
@@ -68,17 +72,70 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
 /// True when the resolved quantization settings reference sym8 anywhere
 /// (top-level default mode OR any per-layer override).
 ///
-/// Used by the dense Qwen3.5 loader to bypass the C++ compiled-forward
-/// registration (the compiled `linear_proj`/registry would mis-handle a
-/// sym8 layer — the legacy no-biases heuristic reads it as MXFP8), and by
-/// the other family loaders (qwen3_5_moe, gemma4, lfm2) to fail loud:
-/// only the dense Qwen3.5 eager path consumes sym8 checkpoints.
+/// Used by the loaders with sym8 dispatch (dense qwen3_5, lfm2/lfm2_moe,
+/// gemma4) to scope-gate the checkpoint: qwen3_5 pins flat KV + disables
+/// MTP/vision; lfm2 is eager-FLAT only v1, so it skips the C++
+/// compiled-forward registration (it stores 2-D `.weight` tensors in the
+/// [N,K] checkpoint orientation, which the shared `sym8_linear_proj`
+/// fail-loud rejects) and forces the flat decode shape; gemma4 has no
+/// compiled registry and keeps its eager paged default. qwen3_5_moe has no
+/// sym8 dispatch and uses this to fail loud up front.
 pub fn has_sym8_mode(
     top_level_mode: Option<PerLayerMode>,
     per_layer: &HashMap<String, PerLayerQuant>,
 ) -> bool {
     top_level_mode == Some(PerLayerMode::Sym8)
         || per_layer.values().any(|p| p.mode == PerLayerMode::Sym8)
+}
+
+/// Fail-loud guard for the DENSE (unquantized) weight fallbacks of
+/// QUANTIZABLE projections: a weight reaching a dense `set_weight` route must
+/// be floating-point. A truncated sym8 group (int8 `.weight` whose mandatory
+/// `.scales` sidecar is missing/stripped) makes every `try_build_*` builder
+/// return "not quantized", so without this guard the int8 bytes would flow
+/// into a dense bf16 matmul — the shape validates, the dtype does not, and
+/// the logits are garbage. Same for a packed `Uint32` affine weight orphaned
+/// from its `.scales`.
+///
+/// Apply ONLY at the dense fallbacks of quantizable projections — norms and
+/// additive biases are never quantized and do not need it.
+pub fn ensure_dense_weight_floating(key: &str, w: &MxArray) -> Result<()> {
+    let dtype = w.dtype()?;
+    match dtype {
+        DType::Float32 | DType::Float16 | DType::BFloat16 => Ok(()),
+        other => Err(Error::from_reason(format!(
+            "dense weight '{key}' has non-float dtype {other:?} — int8/non-float storage \
+             requires a quantized group (its '.scales' sidecar is missing/stripped from the \
+             checkpoint); refusing to load it through the dense route"
+        ))),
+    }
+}
+
+/// Fail-loud guard for metadata-skewed checkpoints: `{base}.weight` stored as
+/// int8 (sym8 storage) while the per-layer quant metadata resolves to a
+/// NON-sym8 mode. Without this, the int8 tensor flows into the affine/mxfp
+/// builders (`mlx_quantized_matmul` would read it as a packed pack — garbage)
+/// and, on lfm2, could register with the compiled C++ path as affine
+/// quant-info (the compiled gate keys on config metadata — `has_sym8_mode` —
+/// only). Call BEFORE dispatching on `plq.mode` in every per-layer builder.
+pub fn ensure_int8_storage_resolves_sym8(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    mode: PerLayerMode,
+    family: &str,
+) -> Result<()> {
+    if mode == PerLayerMode::Sym8 {
+        return Ok(());
+    }
+    if let Some(w) = params.get(&format!("{base}.weight"))
+        && w.dtype().ok() == Some(DType::Int8)
+    {
+        return Err(Error::from_reason(format!(
+            "{family}: '{base}.weight' is int8 (sym8 storage) but its per-layer quant mode \
+             resolves to {mode:?} — config drift / stale quantization metadata, refusing to load"
+        )));
+    }
+    Ok(())
 }
 
 /// Build the fallback `PerLayerQuant` used when no per-layer override exists.
