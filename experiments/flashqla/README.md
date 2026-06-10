@@ -14,6 +14,7 @@ Started from "can FlashQLA (Qwen's chunked GDN linear-attention kernel) be imple
 - **The one already-shipped prefill win:** PR #68 — per-step default GDN on M5 (chunked was a ~26× pessimization). ~2.5–3.5× prefill TTFT. Done.
 - **The remaining real lever — now BUILT + e2e VERIFIED + ADVERSARIAL-REVIEWED (2026-06-05):** **native int8 W8A8** on the MLP + GDN-qkvz GEMMs. Measured **e2e prefill TTFT: +18.6–19.7% on bf16 27B dense, +9.4–13.4% on 4B** (paired-process, clears the control band 8/8–10/10 sign-consistent), accuracy coherent (greedy near-tie flips only), decode untouched. Opt-in behind `MLX_INT8_PREFILL` (MLP) + `MLX_INT8_PREFILL_QKVZ` (qkvz). Review found **no correctness bugs** (kernels bit-faithful, fail-soft to bf16); ship-ready **default-OFF opt-in for dense qwen3_5 greedy**; default-on still needs a checked-in real-distribution accuracy gate + long-context(>8k) + sampling/MTP validation.
 - **Everything else is closed** (proofs below): chunked/FlashQLA/NA on the recurrence, the conv1d "win" (artifact), and weight-only quant for prefill (decode-only).
+- **2026-06-10 status: the bf16 opt-in path above was REMOVED.** Lossy-on-bf16 by design, it never left default-OFF; its kernels live on as the **sym8** quant mode (per-channel symmetric int8 checkpoints: W8A8 prefill + W8A16 decode, default-ON for sym8 checkpoints). `MLX_INT8_PREFILL` / `MLX_INT8_PREFILL_QKVZ` no longer exist. This dir stays as the research record.
 
 ---
 
