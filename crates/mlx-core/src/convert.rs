@@ -634,6 +634,24 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Convert tensors to target dtype
     info!("Converting tensors to {}...", target_dtype);
 
+    // sym8 loader contract: a float 1-D [N] `.scales` sidecar next to an Int8
+    // `.weight` must end up Float32 (`try_build_sym8_quantized_linear`
+    // hard-rejects any other scales dtype). Classify the sidecars up front —
+    // the loop below consumes `tensors`, and precomputing surfaces the
+    // malformed-sidecar Err BEFORE any tensor work; see
+    // `sym8_scales_cast_action`.
+    let mut sym8_scales_actions: HashMap<String, Sym8ScalesCastAction> = HashMap::new();
+    if !has_custom_sanitizer {
+        for name in tensors.keys() {
+            match sym8_scales_cast_action(name, &tensors)? {
+                Sym8ScalesCastAction::NotSym8Scales => {}
+                action => {
+                    sym8_scales_actions.insert(name.clone(), action);
+                }
+            }
+        }
+    }
+
     let mut converted_tensors: HashMap<String, MxArray> = HashMap::new();
     let mut tensor_names = Vec::new();
 
@@ -669,6 +687,32 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             converted_tensors.insert(name.clone(), array);
             tensor_names.push(name);
             continue;
+        }
+
+        // sym8 loader contract: the float 1-D [N] `.scales` sidecar next to
+        // an Int8 `.weight` must end up Float32 —
+        // `try_build_sym8_quantized_linear` hard-rejects any other scales
+        // dtype, so casting it to the target dtype (default bfloat16) would
+        // emit an unloadable checkpoint. Float32 sidecars pass through
+        // unchanged; Float16/BFloat16 sidecars are NORMALIZED to Float32
+        // (lossless upcast — also repairs sym8-shaped input whose scales were
+        // stored at half precision, which no target dtype could fix before);
+        // malformed sidecars already failed loud in the precompute above.
+        match sym8_scales_actions.get(&name) {
+            Some(Sym8ScalesCastAction::PreserveF32) => {
+                converted_tensors.insert(name.clone(), array);
+                tensor_names.push(name);
+                continue;
+            }
+            Some(Sym8ScalesCastAction::NormalizeToF32) => {
+                if verbose {
+                    info!("    Normalizing sym8 scales {:?} -> Float32", current_dtype);
+                }
+                converted_tensors.insert(name.clone(), array.astype(DType::Float32)?);
+                tensor_names.push(name);
+                continue;
+            }
+            Some(Sym8ScalesCastAction::NotSym8Scales) | None => {}
         }
 
         // Convert to target dtype if needed
@@ -2576,6 +2620,18 @@ pub(crate) const NVFP4_NO_RECIPE_ERROR: &str = "--q-mode nvfp4 requires --q-reci
      recipe's per-tensor affine fallbacks. 'qwen3_5' works without an \
      imatrix; 'unsloth' is the gold-standard but requires --imatrix-path.";
 
+/// Recipe predicates drive per-key `QuantDecision`s that bypass every
+/// sym8-scoped guard in the legacy (no-recipe) path: the `sym8_eligible`
+/// K%16 fallback, the forced-affine downgrades (router gates, 3D stacked
+/// experts), the PLE/audio/embedding exclusions, and the group-coherence
+/// pass (`enforce_sym8_group_coherence` runs only when `predicate.is_none()`).
+/// A sym8 default reaching the recipe path would emit checkpoints the strict
+/// sym8 loaders reject — or silently mis-load. sym8 is legacy-path-only.
+pub(crate) const SYM8_RECIPE_ERROR: &str = "--q-mode sym8 is incompatible with --q-recipe: recipes bypass the sym8 \
+     eligibility (K%16), forced-affine (router gates, stacked experts), \
+     PLE/audio/embedding exclusion, and group-coherence guards. Use sym8 \
+     without a recipe, or use a recipe with --q-mode affine or nvfp4.";
+
 pub(crate) fn apply_nvfp4_upgrade(
     inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync>,
 ) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
@@ -2827,6 +2883,77 @@ fn quantize_with_optional_tiling(
     };
 
     Ok((packed, scales, biases))
+}
+
+/// What the dtype-conversion passes must do with a `.scales` tensor, decided
+/// by its sibling `{prefix}.weight`. See `sym8_scales_cast_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sym8ScalesCastAction {
+    /// Not a sym8 sidecar (not `.scales`, no sibling `.weight`, or a non-Int8
+    /// sibling — affine/mxfp packs, half-quantized floats, ordinary tensors):
+    /// keep the existing generic behavior for this tensor.
+    NotSym8Scales,
+    /// Well-formed sym8 sidecar (Float32 `[N]`, N == Int8 weight rows):
+    /// preserve unchanged — the loader mandates Float32.
+    PreserveF32,
+    /// Float16/BFloat16 `[N]` sidecar next to an Int8 `[N, K]` weight:
+    /// unambiguous sym8 intent stored at half precision. NORMALIZE to Float32
+    /// (lossless upcast) so the group is loadable regardless of target dtype.
+    NormalizeToF32,
+}
+
+/// Classify a tensor for the sym8-sidecar rule in the dtype-conversion passes.
+///
+/// sym8 loader contract: an Int8 `[N, K]` `.weight` carries a MANDATORY
+/// Float32 `[N]` `{prefix}.scales` sidecar — `try_build_sym8_quantized_linear`
+/// hard-rejects any other scales dtype, so casting those scales to the target
+/// dtype (default bfloat16) would emit an unloadable checkpoint. Detection is
+/// content-based (Int8 sibling `{prefix}.weight` in the SAME tensor map), the
+/// same rule the model loaders' `sanitize_weights` uses (see the lfm2
+/// `sym8_scales` set in `models/lfm2/persistence.rs`). Affine/mxfp `.scales`
+/// (packed Uint32 / FP8 Uint8 sibling weights) are `NotSym8Scales`: they
+/// already carry the checkpoint float dtype and keep following the generic
+/// cast rule.
+///
+/// `Err` = malformed sym8-like storage: a sidecar next to an Int8 `.weight`
+/// that can be neither preserved nor losslessly normalized (non-float scales
+/// dtype, wrong rank, or length != weight rows). Whatever we emit for such a
+/// group, the strict loaders reject it, so convert fails loud instead of
+/// writing unloadable output.
+fn sym8_scales_cast_action(
+    name: &str,
+    tensors: &HashMap<String, MxArray>,
+) -> Result<Sym8ScalesCastAction> {
+    let Some(prefix) = name.strip_suffix(".scales") else {
+        return Ok(Sym8ScalesCastAction::NotSym8Scales);
+    };
+    let weight_key = format!("{prefix}.weight");
+    let Some(weight) = tensors.get(&weight_key) else {
+        return Ok(Sym8ScalesCastAction::NotSym8Scales);
+    };
+    if weight.dtype()? != DType::Int8 {
+        return Ok(Sym8ScalesCastAction::NotSym8Scales);
+    }
+    let Some(scales) = tensors.get(name) else {
+        return Ok(Sym8ScalesCastAction::NotSym8Scales);
+    };
+    let rows = weight.shape_at(0)?;
+    let scales_dtype = scales.dtype()?;
+    let well_shaped = scales.ndim()? == 1 && scales.shape_at(0)? == rows;
+    match scales_dtype {
+        DType::Float32 if well_shaped => Ok(Sym8ScalesCastAction::PreserveF32),
+        DType::Float16 | DType::BFloat16 if well_shaped => Ok(Sym8ScalesCastAction::NormalizeToF32),
+        _ => {
+            let got_shape = scales.shape()?.to_vec();
+            Err(Error::from_reason(format!(
+                "sym8 sidecar check: '{name}' sits next to Int8 weight '{weight_key}' \
+                 but is not loadable sym8 storage (requires a Float32/Float16/BFloat16 \
+                 1-D [N={rows}] scales tensor matching the weight's rows; got \
+                 {scales_dtype:?} {got_shape:?}) — pre-quantized source is unsupported; \
+                 convert from a well-formed checkpoint instead"
+            )))
+        }
+    }
 }
 
 /// sym8 (per-output-channel symmetric int8) eligibility for a weight tensor.
@@ -3174,6 +3301,17 @@ fn quantize_weights_inner(
     embed_quantizable: bool,
 ) -> Result<HashMap<String, serde_json::Value>> {
     use std::ffi::CString;
+
+    // Fail loud BEFORE any tensor work: a recipe predicate bypasses every
+    // sym8-scoped guard below (sym8_eligible K%16 fallback, forced-affine
+    // downgrades, PLE/audio/embedding exclusions, and the no-recipe-only
+    // `enforce_sym8_group_coherence` pass). The convert/GGUF option
+    // validation and the CLI already reject this combination; this guard
+    // enforces the invariant for direct crate-internal callers of
+    // `quantize_weights_with_recipe_pub`. See `SYM8_RECIPE_ERROR`.
+    if predicate.is_some() && default_mode == "sym8" {
+        return Err(Error::from_reason(SYM8_RECIPE_ERROR.to_string()));
+    }
 
     // Gate quantization defaults (used when no predicate)
     let gate_bits: i32 = 8;
@@ -3830,11 +3968,56 @@ fn sanitize_qwen35_moe(
             }
         }
 
-        // Convert remaining non-FP8 weights to target dtype. FLOAT-ONLY: never
-        // astype integer/packed quant data (sym8 Int8, packed Uint32, Uint8).
+        // Convert remaining non-FP8 weights to target dtype, handling
+        // quantized tensor groups. A MIXED checkpoint (an FP8
+        // `weight_scale_inv` pair somewhere + a pre-quantized sym8/affine
+        // pair elsewhere) must not narrow float quant sidecars: the sym8
+        // loader contract (`try_build_sym8_quantized_linear`) hard-rejects
+        // non-Float32 `.scales`, and affine `.scales`/`.biases` plus packed
+        // `.weight` tensors with a `.scales` sibling must pass through
+        // untouched. `.scales` keys follow the three-way rule of
+        // `sym8_scales_cast_action`:
+        //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
+        //     → pass through unchanged;
+        //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
+        //     through unchanged (the loader mandates Float32);
+        //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
+        //     → lossless upcast to Float32 so the group stays loadable;
+        //   * anything else next to an Int8 weight is malformed sym8-like
+        //     storage → fail loud (Err propagated).
+        // Pure-FP8 checkpoints carry no `.scales`/`.biases` keys at this point
+        // (FP8 sidecars are `weight_scale_inv`, consumed by the dequant pass
+        // above), so for them the skips are behavior-preserving.
+        let quantized_bases: std::collections::HashSet<String> = new_weights
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_string))
+            .collect();
         let keys: Vec<String> = new_weights.keys().cloned().collect();
         for k in keys {
+            // Skip quantized sidecars and packed/pre-quantized weights.
+            if k.ends_with(".biases") {
+                continue;
+            }
+            if k.ends_with(".scales") {
+                match sym8_scales_cast_action(&k, &new_weights)? {
+                    Sym8ScalesCastAction::NormalizeToF32 => {
+                        if let Some(v) = new_weights.get(&k) {
+                            let normalized = v.astype(DType::Float32)?;
+                            new_weights.insert(k, normalized);
+                        }
+                    }
+                    Sym8ScalesCastAction::NotSym8Scales | Sym8ScalesCastAction::PreserveF32 => {}
+                }
+                continue;
+            }
+            if let Some(base) = k.strip_suffix(".weight")
+                && quantized_bases.contains(base)
+            {
+                continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
+            }
             let v = new_weights.get(&k).unwrap();
+            // FLOAT-ONLY cast rule: integer/packed tensors (sym8 Int8 weights,
+            // packed Uint32, Uint8 scales) are never astype'd.
             let current_dtype = v.dtype()?;
             if matches!(
                 current_dtype,
@@ -5724,6 +5907,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sym8_recipe_error_names_bypassed_guards_and_recovery() {
+        // The error must name the guard classes the recipe path bypasses so
+        // the failure is self-explaining, and both recovery paths (sym8
+        // without a recipe, or a recipe with affine/nvfp4).
+        for needle in [
+            "eligibility",
+            "forced-affine",
+            "coherence",
+            "without a recipe",
+            "affine",
+            "nvfp4",
+        ] {
+            assert!(
+                SYM8_RECIPE_ERROR.contains(needle),
+                "error must mention '{needle}', got: {SYM8_RECIPE_ERROR}"
+            );
+        }
+    }
+
+    /// sym8 is legacy-path-only: a recipe predicate bypasses the sym8
+    /// eligibility/forced-affine/exclusion/coherence guards, so the actual
+    /// call path (`quantize_weights_with_recipe_pub`, the seam every recipe
+    /// caller funnels through) must fail loud BEFORE any tensor work.
+    #[test]
+    fn sym8_with_recipe_predicate_fails_loud_before_tensor_work() {
+        let n = 8i64;
+        let k = 64i64;
+        let key = "model.layers.0.self_attn.q_proj.weight";
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            key.into(),
+            MxArray::random_normal(&[n, k], 0.0, 0.02, Some(DType::Float32)).unwrap(),
+        );
+
+        let predicate = const_predicate(QuantDecision::Default);
+        let err = quantize_weights_with_recipe_pub(&mut weights, 8, 64, "sym8", &*predicate, false)
+            .expect_err("sym8 + recipe predicate must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(SYM8_RECIPE_ERROR),
+            "error must carry SYM8_RECIPE_ERROR, got: {msg}"
+        );
+
+        // No tensor work happened: the float weight is untouched and no
+        // quant sidecars were emitted.
+        assert_eq!(weights.len(), 1, "weights map must be untouched");
+        assert_eq!(
+            weights[key].dtype().unwrap(),
+            DType::Float32,
+            "weight must stay unquantized float"
+        );
+    }
+
     // ── apply_nvfp4_upgrade tests ────────────────────────────────────────────
     //
     // NVFP4 only promotes 4-bit decisions and uses `group_size = 16`. The
@@ -6453,6 +6690,147 @@ mod tests {
             .expect("expert tensor must carry a per-layer affine override");
         assert_eq!(expert_override["mode"], "affine");
         assert_eq!(expert_override["bits"], 8);
+    }
+
+    /// The dtype passes must end up with Float32 sym8 `.scales`: the sym8
+    /// load contract requires Float32 [N] scales next to an Int8 [N,K]
+    /// weight (`try_build_sym8_quantized_linear` hard-rejects anything else).
+    /// The decision is content-based on the Int8 sibling `.weight` and
+    /// three-way: Float32 [N] is preserved; Float16/BFloat16 [N] is
+    /// NORMALIZED up to Float32 (lossless); anything else next to an Int8
+    /// weight is malformed sym8-like storage and must fail loud. Affine
+    /// `.scales` (packed Uint32 sibling), orphaned `.scales`, and ordinary
+    /// float tensors all keep following the generic cast rule.
+    #[test]
+    fn sym8_scales_cast_action_classifies_sidecars() {
+        let n = 8i64;
+        let k = 64i64;
+        let f32_scales = |tensors: &mut HashMap<String, MxArray>, key: &str| {
+            tensors.insert(
+                key.into(),
+                MxArray::from_float32(&vec![0.5f32; n as usize], &[n]).expect("f32 scales"),
+            );
+        };
+        let int8_weight = |tensors: &mut HashMap<String, MxArray>, key: &str| {
+            tensors.insert(
+                key.into(),
+                MxArray::from_float32(&vec![1.0f32; (n * k) as usize], &[n, k])
+                    .expect("from_float32")
+                    .astype(DType::Int8)
+                    .expect("astype int8"),
+            );
+        };
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+
+        // (1) f32 [N] .scales + Int8 sibling .weight (well-formed sym8 group).
+        int8_weight(&mut tensors, "model.layers.0.self_attn.q_proj.weight");
+        f32_scales(&mut tensors, "model.layers.0.self_attn.q_proj.scales");
+
+        // (2) f32 .scales + packed Uint32 sibling .weight (affine group).
+        tensors.insert(
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            MxArray::from_uint32(&vec![0u32; (n * 4) as usize], &[n, 4])
+                .expect("packed u32 weight"),
+        );
+        f32_scales(&mut tensors, "model.layers.0.mlp.gate_proj.scales");
+
+        // (3) f32 .scales with NO sibling .weight (orphaned sidecar).
+        f32_scales(&mut tensors, "model.layers.0.mlp.up_proj.scales");
+
+        // (4) bf16 [N] .scales + Int8 sibling .weight (sym8 intent at half
+        // precision).
+        int8_weight(&mut tensors, "model.layers.0.self_attn.k_proj.weight");
+        tensors.insert(
+            "model.layers.0.self_attn.k_proj.scales".into(),
+            MxArray::from_float32(&vec![0.5f32; n as usize], &[n])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bf16"),
+        );
+
+        // (5) Uint8 .scales + Int8 sibling .weight (malformed sym8-like).
+        int8_weight(&mut tensors, "model.layers.0.self_attn.v_proj.weight");
+        tensors.insert(
+            "model.layers.0.self_attn.v_proj.scales".into(),
+            MxArray::from_float32(&vec![0.0f32; n as usize], &[n])
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+
+        // (6) f32 .scales of the WRONG length + Int8 sibling .weight.
+        int8_weight(&mut tensors, "model.layers.0.self_attn.o_proj.weight");
+        tensors.insert(
+            "model.layers.0.self_attn.o_proj.scales".into(),
+            MxArray::from_float32(&vec![0.5f32; (n + 1) as usize], &[n + 1])
+                .expect("wrong-length f32 scales"),
+        );
+
+        // (1) well-formed sym8 scales → preserve Float32.
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.self_attn.q_proj.scales", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::PreserveF32,
+            "f32 [N] .scales with an Int8 sibling .weight must be preserved"
+        );
+        // (2) affine scales → keep the generic cast rule.
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.mlp.gate_proj.scales", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::NotSym8Scales,
+            "affine .scales (packed Uint32 sibling) must keep the generic cast rule"
+        );
+        // (3) orphaned scales → keep the generic cast rule.
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.mlp.up_proj.scales", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::NotSym8Scales,
+            "orphaned .scales (no sibling .weight) must keep the generic cast rule"
+        );
+        // (4) non-.scales tensors → keep the generic rules, even the Int8
+        // weight itself (the packed-dtype rule covers it; this classifier
+        // must not).
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.input_layernorm.weight", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::NotSym8Scales,
+            "non-.scales float tensors must keep the generic cast rule"
+        );
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.self_attn.q_proj.weight", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::NotSym8Scales,
+            "the Int8 weight itself is not a .scales sidecar"
+        );
+        // (5) bf16 [N] scales next to an Int8 weight → lossless normalize.
+        assert_eq!(
+            sym8_scales_cast_action("model.layers.0.self_attn.k_proj.scales", &tensors)
+                .expect("cast action"),
+            Sym8ScalesCastAction::NormalizeToF32,
+            "bf16 [N] .scales with an Int8 sibling .weight must be normalized to Float32"
+        );
+        // (6) Uint8 scales next to an Int8 weight → fail loud, naming the
+        // tensor and the recovery path.
+        let err = sym8_scales_cast_action("model.layers.0.self_attn.v_proj.scales", &tensors)
+            .expect_err("Uint8 .scales next to an Int8 .weight must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model.layers.0.self_attn.v_proj.scales"),
+            "error must name the malformed tensor: {msg}"
+        );
+        assert!(
+            msg.contains("well-formed checkpoint"),
+            "error must point at the recovery path: {msg}"
+        );
+        // (7) f32 scales of the wrong length next to an Int8 weight → fail
+        // loud too (preserving it would emit an unloadable group).
+        let err = sym8_scales_cast_action("model.layers.0.self_attn.o_proj.scales", &tensors)
+            .expect_err("wrong-length f32 .scales next to an Int8 .weight must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model.layers.0.self_attn.o_proj.scales"),
+            "error must name the malformed tensor: {msg}"
+        );
     }
 
     #[test]
@@ -7699,6 +8077,226 @@ mod tests {
         assert!(
             msg.contains("per-expert MoE source is unsupported"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitize_qwen35_moe_fp8_branch_preserves_sym8_scales() {
+        // MIXED checkpoint regression: ONE FP8 pair anywhere flips the
+        // sanitizer into the has_fp8 branch, whose post-dequant cast loop used
+        // to astype EVERY remaining float — including a pre-quantized sym8
+        // pair's mandatory Float32 `.scales` sidecar — to the target dtype.
+        // `try_build_sym8_quantized_linear` hard-rejects non-Float32 scales,
+        // so the emitted checkpoint was unloadable. The FP8 branch must apply
+        // the same `.scales`/`.biases`/quantized-base skips as the non-FP8
+        // branch while still casting ordinary floats and dequantizing FP8.
+        let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+        // FP8 pair: `from_fp8` requires Uint8 (FP8 E4M3 bytes); `dequant_fp8`
+        // pads [8, 16] up to one 128x128 block, so scale_inv is the
+        // [m_blocks, n_blocks] = [1, 1] grid.
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight".into(),
+            MxArray::from_float32(&vec![0.0f32; 128], &[8, 16])
+                .expect("from_float32 fp8 weight")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight_scale_inv".into(),
+            MxArray::from_float32(&[1.0f32], &[1, 1]).expect("from_float32 scale_inv"),
+        );
+
+        // Valid pre-quantized sym8 pair on a different prefix: Int8 [N, K]
+        // weight + mandatory Float32 [N] scales.
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 128], &[8, 16])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.scales".into(),
+            MxArray::from_float32(&[0.5f32; 8], &[8]).expect("from_float32 sym8 scales"),
+        );
+
+        // Ordinary float tensor: must still be cast to the target dtype.
+        // All-zeros also keeps the Step-4 `already_sanitized` probe on the
+        // raw-HF path (first element 0.0 < 0.5).
+        weights.insert(
+            "model.layers.1.input_layernorm.weight".into(),
+            MxArray::from_float32(&[0.0f32; 8], &[8]).expect("from_float32 layernorm"),
+        );
+
+        let out = sanitize_qwen35_moe(weights, &cfg, "bfloat16").expect("sanitize must succeed");
+
+        // Step 1 re-prefixes `model.layers.*` → `language_model.model.layers.*`.
+        // (a) sym8 scales survive as Float32 — the loader contract.
+        let scales = out
+            .get("language_model.model.layers.1.self_attn.q_proj.scales")
+            .expect("sym8 scales must survive the FP8 branch");
+        assert_eq!(
+            scales.dtype().expect("scales dtype"),
+            DType::Float32,
+            "sym8 .scales must stay Float32 in the has_fp8 cast loop"
+        );
+        // (b) sym8 packed weight stays Int8 (float-only rule).
+        let q_weight = out
+            .get("language_model.model.layers.1.self_attn.q_proj.weight")
+            .expect("sym8 weight must survive");
+        assert_eq!(q_weight.dtype().expect("weight dtype"), DType::Int8);
+        // (c) ordinary float tensors are still cast to the target dtype.
+        let norm = out
+            .get("language_model.model.layers.1.input_layernorm.weight")
+            .expect("layernorm must survive");
+        assert_eq!(norm.dtype().expect("norm dtype"), DType::BFloat16);
+        // (d) the FP8 pair was dequantized: sidecar gone, weight at target dtype.
+        assert!(
+            !out.keys().any(|k| k.contains("weight_scale_inv")),
+            "FP8 scale_inv sidecar must be consumed by dequant"
+        );
+        let dq = out
+            .get("language_model.model.layers.0.mlp.down_proj.weight")
+            .expect("dequantized FP8 weight must survive");
+        assert_eq!(dq.dtype().expect("dequant dtype"), DType::BFloat16);
+    }
+
+    /// Codex round-3 finding: the FP8-branch `.scales` skip preserved
+    /// sym8-shaped sidecars UNCONDITIONALLY, so an Int8 weight whose [N]
+    /// scales arrived as BFloat16/Float16 passed through as-is — and the
+    /// strict sym8 loader (`try_build_sym8_quantized_linear`) rejected the
+    /// output. Half-precision [N] scales next to an Int8 [N,K] weight are
+    /// unambiguous sym8 intent, so they must be NORMALIZED to Float32 (a
+    /// lossless upcast) regardless of the target dtype.
+    #[test]
+    fn sanitize_qwen35_moe_fp8_branch_normalizes_half_precision_sym8_scales() {
+        let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
+
+        // `sanitize_qwen35_moe` consumes its map, so rebuild per target.
+        let build = || {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+            // FP8 pair: flips the sanitizer into the has_fp8 branch.
+            weights.insert(
+                "model.layers.0.mlp.down_proj.weight".into(),
+                MxArray::from_float32(&vec![0.0f32; 128], &[8, 16])
+                    .expect("from_float32 fp8 weight")
+                    .astype(DType::Uint8)
+                    .expect("astype uint8"),
+            );
+            weights.insert(
+                "model.layers.0.mlp.down_proj.weight_scale_inv".into(),
+                MxArray::from_float32(&[1.0f32], &[1, 1]).expect("from_float32 scale_inv"),
+            );
+
+            // sym8-shaped pair with HALF-PRECISION scales: Int8 [N, K] weight
+            // + BFloat16 [N] scales (0.5 is exactly representable in bf16, so
+            // the upcast must round-trip the value exactly).
+            weights.insert(
+                "model.layers.1.self_attn.q_proj.weight".into(),
+                MxArray::from_float32(&vec![1.0f32; 128], &[8, 16])
+                    .expect("from_float32 sym8 weight")
+                    .astype(DType::Int8)
+                    .expect("astype int8"),
+            );
+            weights.insert(
+                "model.layers.1.self_attn.q_proj.scales".into(),
+                MxArray::from_float32(&[0.5f32; 8], &[8])
+                    .expect("from_float32 sym8 scales")
+                    .astype(DType::BFloat16)
+                    .expect("astype bf16"),
+            );
+
+            // All-zeros keeps the Step-4 `already_sanitized` probe on the
+            // raw-HF path (first element 0.0 < 0.5).
+            weights.insert(
+                "model.layers.1.input_layernorm.weight".into(),
+                MxArray::from_float32(&[0.0f32; 8], &[8]).expect("from_float32 layernorm"),
+            );
+            weights
+        };
+
+        for target in ["bfloat16", "float32"] {
+            let out = sanitize_qwen35_moe(build(), &cfg, target).expect("sanitize must succeed");
+
+            // Step 1 re-prefixes `model.layers.*` → `language_model.model.layers.*`.
+            let scales = out
+                .get("language_model.model.layers.1.self_attn.q_proj.scales")
+                .expect("sym8 scales must survive the FP8 branch");
+            assert_eq!(
+                scales.dtype().expect("scales dtype"),
+                DType::Float32,
+                "half-precision sym8 .scales must be normalized to Float32 (target {target})"
+            );
+            let vals: Vec<f32> = scales.to_float32().expect("scales values").to_vec();
+            assert!(
+                vals.iter().all(|&v| v == 0.5),
+                "normalize must be a lossless upcast (target {target}): {vals:?}"
+            );
+            let q_weight = out
+                .get("language_model.model.layers.1.self_attn.q_proj.weight")
+                .expect("sym8 weight must survive");
+            assert_eq!(
+                q_weight.dtype().expect("weight dtype"),
+                DType::Int8,
+                "sym8 weight must stay Int8 (target {target})"
+            );
+        }
+    }
+
+    /// Malformed sym8-like storage (Int8 weight + Uint8 [N] scales) can be
+    /// neither preserved nor losslessly normalized — whatever the sanitizer
+    /// emits, the strict loaders reject it — so convert must fail loud
+    /// naming the tensor instead of writing unloadable output.
+    #[test]
+    fn sanitize_qwen35_moe_fp8_branch_rejects_malformed_sym8_scales() {
+        let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+        // FP8 pair: flips the sanitizer into the has_fp8 branch.
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight".into(),
+            MxArray::from_float32(&vec![0.0f32; 128], &[8, 16])
+                .expect("from_float32 fp8 weight")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight_scale_inv".into(),
+            MxArray::from_float32(&[1.0f32], &[1, 1]).expect("from_float32 scale_inv"),
+        );
+
+        // Int8 [N, K] weight + Uint8 [N] scales: sym8-like but unloadable.
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 128], &[8, 16])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.scales".into(),
+            MxArray::from_float32(&[0.0f32; 8], &[8])
+                .expect("from_float32 scales")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+
+        let err = sanitize_qwen35_moe(weights, &cfg, "bfloat16")
+            .err()
+            .expect("Uint8 .scales next to an Int8 .weight must be rejected");
+        let msg = err.to_string();
+        // Step 1 re-prefixes the key before the cast loop sees it.
+        assert!(
+            msg.contains("language_model.model.layers.1.self_attn.q_proj.scales"),
+            "error must name the malformed tensor: {msg}"
+        );
+        assert!(
+            msg.contains("well-formed checkpoint"),
+            "error must point at the recovery path: {msg}"
         );
     }
 

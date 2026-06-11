@@ -45,9 +45,10 @@ Quantization Arguments:
   --q-bits <int>        Quantization bits (default per --q-mode: affine=4, mxfp4=4, mxfp8=8, nvfp4=4, sym8=8)
   --q-group-size <int>  Group size (default per --q-mode: affine=64, mxfp4=32, mxfp8=32, nvfp4=16; not applicable to sym8)
   --q-mode <string>     Mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or "sym8".
-                        sym8 = per-output-channel symmetric int8 (dense qwen3_5,
-                        lfm2/lfm2_moe, gemma4 in v1): int8 [N,K] .weight +
-                        f32 [N] .scales, no .biases, no group_size.
+                        sym8 = per-output-channel symmetric int8 (SafeTensors
+                        input only; dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1):
+                        int8 [N,K] .weight + f32 [N] .scales, no .biases,
+                        no group_size.
                         Routers/gates, 3D stacked experts, embeddings, and
                         K%16!=0 layers fall back to 8-bit affine (or bf16)
                         with per-layer overrides. NOT mlx-lm-loadable.
@@ -334,6 +335,15 @@ export async function run(argv: string[]) {
     }
     if (quantMtp !== 'off') {
       console.error('Error: --q-mtp is only supported for SafeTensors Qwen MTP conversion');
+      process.exit(1);
+    }
+    // The GGUF backend (crates/mlx-core/src/utils/gguf.rs) only accepts
+    // affine/mxfp8/mxfp4/nvfp4 — reject sym8 upfront instead of surfacing a
+    // late native error.
+    if (args.quantize && quantMode === 'sym8') {
+      console.error(
+        'Error: --q-mode sym8 is not supported for GGUF input; sym8 is available for SafeTensors models (dense qwen3_5, lfm2/lfm2_moe, gemma4 in v1)',
+      );
       process.exit(1);
     }
 
