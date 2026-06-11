@@ -4031,8 +4031,22 @@ fn sanitize_qwen35_moe(
 
         info!("  After FP8 dequantization: {} tensors", new_weights.len());
     } else {
-        // Non-FP8: convert non-quantized weights to target dtype.
-        // Skip quantized tensor groups (.weight/.scales/.biases with U32/U8 dtypes).
+        // Non-FP8: convert non-quantized weights to target dtype, handling
+        // quantized tensor groups. A pre-quantized sym8/affine pair must not
+        // have its float quant sidecars narrowed: the sym8 loader contract
+        // (`try_build_sym8_quantized_linear`) hard-rejects non-Float32
+        // `.scales`, and affine `.scales`/`.biases` plus packed `.weight`
+        // tensors with a `.scales` sibling must pass through untouched.
+        // `.scales` keys follow the three-way rule of
+        // `sym8_scales_cast_action`:
+        //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
+        //     → pass through unchanged;
+        //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
+        //     through unchanged (the loader mandates Float32);
+        //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
+        //     → lossless upcast to Float32 so the group stays loadable;
+        //   * anything else next to an Int8 weight is malformed sym8-like
+        //     storage → fail loud (Err propagated).
         let quantized_bases: std::collections::HashSet<String> = new_weights
             .keys()
             .filter(|k| k.ends_with(".scales"))
@@ -4040,14 +4054,26 @@ fn sanitize_qwen35_moe(
             .collect();
         let keys: Vec<String> = new_weights.keys().cloned().collect();
         for k in keys {
-            // Skip quantized tensors: packed weights (U32), scales (U8), biases
-            if k.ends_with(".scales") || k.ends_with(".biases") {
+            // Skip quantized sidecars and packed/pre-quantized weights.
+            if k.ends_with(".biases") {
+                continue;
+            }
+            if k.ends_with(".scales") {
+                match sym8_scales_cast_action(&k, &new_weights)? {
+                    Sym8ScalesCastAction::NormalizeToF32 => {
+                        if let Some(v) = new_weights.get(&k) {
+                            let normalized = v.astype(DType::Float32)?;
+                            new_weights.insert(k, normalized);
+                        }
+                    }
+                    Sym8ScalesCastAction::NotSym8Scales | Sym8ScalesCastAction::PreserveF32 => {}
+                }
                 continue;
             }
             if k.ends_with(".weight") {
                 let base = k.strip_suffix(".weight").unwrap();
                 if quantized_bases.contains(base) {
-                    continue; // packed quantized weight
+                    continue; // quantized weight (sym8 Int8 / packed) with a .scales sibling
                 }
             }
             let v = new_weights.get(&k).unwrap();
@@ -4579,8 +4605,19 @@ fn sanitize_lfm2_moe(
     // NEVER touches packed/integer quant data (packed `Uint32` weights, integer
     // tensors) — those are left in place unchanged. EXCLUDE `expert_bias`
     // (loader keeps it f32 per `cast_predicate`) and skip any quantized tensor
-    // groups (none exist on this path, but mirror `sanitize_qwen35_moe` for
-    // safety against a pre-quantized source).
+    // groups (mirror `sanitize_qwen35_moe` against a pre-quantized source).
+    // A pre-quantized sym8 pair must not have its float quant sidecar
+    // narrowed: the sym8 loader contract (`try_build_sym8_quantized_linear`)
+    // hard-rejects non-Float32 `.scales`. `.scales` keys follow the three-way
+    // rule of `sym8_scales_cast_action`:
+    //   * NotSym8Scales (affine/mxfp/orphaned sidecar, no Int8 sibling)
+    //     → pass through unchanged;
+    //   * PreserveF32 (Float32 [N] next to an Int8 weight) → pass
+    //     through unchanged (the loader mandates Float32);
+    //   * NormalizeToF32 (Float16/BFloat16 [N] next to an Int8 weight)
+    //     → lossless upcast to Float32 so the group stays loadable;
+    //   * anything else next to an Int8 weight is malformed sym8-like
+    //     storage → fail loud (Err propagated).
     let quantized_bases: std::collections::HashSet<String> = new_weights
         .keys()
         .filter(|k| k.ends_with(".scales"))
@@ -4591,7 +4628,19 @@ fn sanitize_lfm2_moe(
         if k.ends_with(".expert_bias") {
             continue;
         }
-        if k.ends_with(".scales") || k.ends_with(".biases") {
+        if k.ends_with(".biases") {
+            continue;
+        }
+        if k.ends_with(".scales") {
+            match sym8_scales_cast_action(&k, &new_weights)? {
+                Sym8ScalesCastAction::NormalizeToF32 => {
+                    if let Some(v) = new_weights.get(&k) {
+                        let normalized = v.astype(DType::Float32)?;
+                        new_weights.insert(k, normalized);
+                    }
+                }
+                Sym8ScalesCastAction::NotSym8Scales | Sym8ScalesCastAction::PreserveF32 => {}
+            }
             continue;
         }
         if let Some(base) = k.strip_suffix(".weight")
@@ -8300,6 +8349,115 @@ mod tests {
         );
     }
 
+    /// Cursor Bugbot finding on the sym8 classifier wiring: the NON-FP8
+    /// branch's cast loop still blanket-skipped every `.scales` key, so a
+    /// pre-quantized sym8 pair whose [N] scales arrived as BFloat16/Float16
+    /// passed through unnormalized — and the strict sym8 loader
+    /// (`try_build_sym8_quantized_linear`) rejected the output. Half-precision
+    /// [N] scales next to an Int8 [N,K] weight are unambiguous sym8 intent and
+    /// must be NORMALIZED to Float32 (a lossless upcast), exactly like the
+    /// has_fp8 branch.
+    #[test]
+    fn sanitize_qwen35_moe_nonfp8_branch_normalizes_half_precision_sym8_scales() {
+        // NO `weight_scale_inv` key anywhere → has_fp8 = false → the else
+        // branch under test.
+        let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+        // sym8-shaped pair with HALF-PRECISION scales: Int8 [N, K] weight
+        // + BFloat16 [N] scales (0.5 is exactly representable in bf16, so
+        // the upcast must round-trip the value exactly).
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 512], &[8, 64])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.scales".into(),
+            MxArray::from_float32(&[0.5f32; 8], &[8])
+                .expect("from_float32 sym8 scales")
+                .astype(DType::BFloat16)
+                .expect("astype bf16"),
+        );
+
+        // Ordinary float tensor: must still be cast to the target dtype.
+        // All-zeros also keeps the Step-4 `already_sanitized` probe on the
+        // raw-HF path (first element 0.0 < 0.5).
+        weights.insert(
+            "model.layers.1.input_layernorm.weight".into(),
+            MxArray::from_float32(&[0.0f32; 8], &[8]).expect("from_float32 layernorm"),
+        );
+
+        let out = sanitize_qwen35_moe(weights, &cfg, "bfloat16").expect("sanitize must succeed");
+
+        // Step 1 re-prefixes `model.layers.*` → `language_model.model.layers.*`.
+        let scales = out
+            .get("language_model.model.layers.1.self_attn.q_proj.scales")
+            .expect("sym8 scales must survive the non-FP8 branch");
+        assert_eq!(
+            scales.dtype().expect("scales dtype"),
+            DType::Float32,
+            "half-precision sym8 .scales must be normalized to Float32"
+        );
+        let vals: Vec<f32> = scales.to_float32().expect("scales values").to_vec();
+        assert!(
+            vals.iter().all(|&v| v == 0.5),
+            "normalize must be a lossless upcast: {vals:?}"
+        );
+        let q_weight = out
+            .get("language_model.model.layers.1.self_attn.q_proj.weight")
+            .expect("sym8 weight must survive");
+        assert_eq!(q_weight.dtype().expect("weight dtype"), DType::Int8);
+        // Ordinary float tensors are still cast to the target dtype.
+        let norm = out
+            .get("language_model.model.layers.1.input_layernorm.weight")
+            .expect("layernorm must survive");
+        assert_eq!(norm.dtype().expect("norm dtype"), DType::BFloat16);
+    }
+
+    /// Malformed sym8-like storage (Int8 weight + Uint8 [N] scales) on the
+    /// NON-FP8 branch: previously silently preserved by the blanket `.scales`
+    /// skip, emitting output every strict loader rejects. Convert must fail
+    /// loud naming the tensor instead.
+    #[test]
+    fn sanitize_qwen35_moe_nonfp8_branch_rejects_malformed_sym8_scales() {
+        // NO `weight_scale_inv` key anywhere → has_fp8 = false.
+        let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+
+        // Int8 [N, K] weight + Uint8 [N] scales: sym8-like but unloadable.
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 512], &[8, 64])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        weights.insert(
+            "model.layers.1.self_attn.q_proj.scales".into(),
+            MxArray::from_float32(&[0.0f32; 8], &[8])
+                .expect("from_float32 scales")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+
+        let err = sanitize_qwen35_moe(weights, &cfg, "bfloat16")
+            .err()
+            .expect("Uint8 .scales next to an Int8 .weight must be rejected");
+        let msg = err.to_string();
+        // Step 1 re-prefixes the key before the cast loop sees it.
+        assert!(
+            msg.contains("language_model.model.layers.1.self_attn.q_proj.scales"),
+            "error must name the malformed tensor: {msg}"
+        );
+        assert!(
+            msg.contains("well-formed checkpoint"),
+            "error must point at the recovery path: {msg}"
+        );
+    }
+
     // ── --q-mtp split: drafter extraction + directory writer ──────────────
 
     fn f32_vec(arr: &MxArray) -> Vec<f32> {
@@ -8798,6 +8956,132 @@ mod tests {
             .expect("already-stacked quant group must pass");
         assert!(out.contains_key(&format!("{base}.weight")));
         assert!(out.contains_key(&format!("{base}.scales")));
+    }
+
+    /// Cursor Bugbot finding on the sym8 classifier wiring: the lfm2 Step-3
+    /// cast loop still blanket-skipped every `.scales` key, so a pre-quantized
+    /// sym8 pair whose [N] scales arrived as BFloat16/Float16 passed through
+    /// unnormalized — and the strict sym8 loader
+    /// (`try_build_sym8_quantized_linear`) rejected the output. DENSE fixture
+    /// (no `num_experts`): the pair sits on a dense feed_forward projection,
+    /// so neither the per-expert sidecar reject (scoped to
+    /// `feed_forward.experts.*`) nor expert stacking touches it, and the final
+    /// backstop passes because the Int8 weight keeps its `.scales` sidecar.
+    #[test]
+    fn sanitize_lfm2_moe_normalizes_half_precision_sym8_scales() {
+        let cfg = serde_json::json!({
+            "model_type": "lfm2",
+            "num_hidden_layers": 1,
+            "tie_word_embeddings": true,
+        });
+
+        let h = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+        // Ordinary f32 tensor: must still be cast to the target dtype.
+        p.insert(
+            "model.layers.0.operator_norm.weight".into(),
+            lfm2_f32(&[h], 1.0),
+        );
+
+        // Dense sym8 pair on `feed_forward.w1` (Step-1 renames it to
+        // `gate_proj`): Int8 [N, K] weight + BFloat16 [N] scales (0.5 is
+        // exactly representable in bf16, so the upcast must round-trip the
+        // value exactly).
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 128], &[8, 16])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w1.scales".into(),
+            lfm2_bf16(&[8], 0.5),
+        );
+
+        let out = sanitize_lfm2_moe(p, &cfg, "bfloat16", true).expect("sanitize must succeed");
+
+        let scales = out
+            .get("model.layers.0.feed_forward.gate_proj.scales")
+            .expect("sym8 scales must survive (renamed w1 → gate_proj)");
+        assert_eq!(
+            scales.dtype().expect("scales dtype"),
+            DType::Float32,
+            "half-precision sym8 .scales must be normalized to Float32"
+        );
+        let vals: Vec<f32> = scales.to_float32().expect("scales values").to_vec();
+        assert!(
+            vals.iter().all(|&v| v == 0.5),
+            "normalize must be a lossless upcast: {vals:?}"
+        );
+        let w = out
+            .get("model.layers.0.feed_forward.gate_proj.weight")
+            .expect("sym8 weight must survive");
+        assert_eq!(w.dtype().expect("weight dtype"), DType::Int8);
+        // Ordinary float tensors are still cast to the target dtype.
+        let norm = out
+            .get("model.layers.0.operator_norm.weight")
+            .expect("operator_norm must survive");
+        assert_eq!(norm.dtype().expect("norm dtype"), DType::BFloat16);
+    }
+
+    /// Malformed sym8-like storage (Int8 weight + Uint8 [N] scales) in the
+    /// lfm2 Step-3 cast loop: previously silently preserved by the blanket
+    /// `.scales` skip, emitting output every strict loader rejects. The
+    /// classifier must fail loud naming the (renamed) tensor. Dense fixture,
+    /// same as above: no earlier guard sees the pair (no `experts.` → no
+    /// per-expert reject; no stacking), so the cast loop is the rejection
+    /// point — the final backstop never runs.
+    #[test]
+    fn sanitize_lfm2_moe_rejects_malformed_sym8_scales() {
+        let cfg = serde_json::json!({
+            "model_type": "lfm2",
+            "num_hidden_layers": 1,
+            "tie_word_embeddings": true,
+        });
+
+        let h = 4i64;
+        let mut p: HashMap<String, MxArray> = HashMap::new();
+        p.insert(
+            "model.embed_tokens.weight".into(),
+            lfm2_bf16(&[16, h], 0.01),
+        );
+        p.insert("model.embedding_norm.weight".into(), lfm2_bf16(&[h], 1.0));
+
+        // Int8 [N, K] weight + Uint8 [N] scales: sym8-like but unloadable.
+        p.insert(
+            "model.layers.0.feed_forward.w1.weight".into(),
+            MxArray::from_float32(&vec![1.0f32; 128], &[8, 16])
+                .expect("from_float32 sym8 weight")
+                .astype(DType::Int8)
+                .expect("astype int8"),
+        );
+        p.insert(
+            "model.layers.0.feed_forward.w1.scales".into(),
+            MxArray::from_float32(&[0.0f32; 8], &[8])
+                .expect("from_float32 scales")
+                .astype(DType::Uint8)
+                .expect("astype uint8"),
+        );
+
+        let err = sanitize_lfm2_moe(p, &cfg, "bfloat16", true)
+            .err()
+            .expect("Uint8 .scales next to an Int8 .weight must be rejected");
+        let msg = err.to_string();
+        // Step 1 renames `w1.scales` → `gate_proj.scales` before the cast loop.
+        assert!(
+            msg.contains("model.layers.0.feed_forward.gate_proj.scales"),
+            "error must name the malformed tensor: {msg}"
+        );
+        assert!(
+            msg.contains("well-formed checkpoint"),
+            "error must point at the recovery path: {msg}"
+        );
     }
 
     #[test]
