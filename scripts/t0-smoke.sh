@@ -35,6 +35,50 @@ CURRENT_DIR="$REPO_ROOT/.t0-smoke/current"
 log() { echo "[t0-smoke] $*"; }
 log_err() { echo "[t0-smoke] ERROR: $*" >&2; }
 
+# ---------------------------------------------------------------------------
+# Metallib canary guard — run before capture OR compare.
+# Executes 4 fast behavioral tests that fail iff mlx.metallib is broken.
+# A sha-pin would false-positive on legitimate rebuilds; behavioral tests don't.
+# ---------------------------------------------------------------------------
+check_metallib_canaries() {
+    log "Running metallib canary tests ..."
+    local canary_tests=(
+        "models::lfm2::sparse_moe::tests::forward_64_index_gather_sort_branch"
+        "models::qwen3::model::tests::test_chunked_prefill_uneven_tail_matches_single_shot"
+        "nn::embedding::tests::packed_affine_as_linear_matches_dense_matmul"
+        "array::banded_attention::tests::banded_attention_matches_reference_on_random_inputs"
+    )
+
+    if PATH=/usr/bin:$PATH SDKROOT="$(xcrun --show-sdk-path)" \
+       cargo test -p mlx-core --lib -- --exact "${canary_tests[@]}" 2>&1; then
+        log "Metallib canary: OK"
+    else
+        echo "" >&2
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+        echo "  METALLIB CANARY FAILED — aborting $MODE" >&2
+        echo "" >&2
+        echo "  One or more of the following metallib canary tests failed:" >&2
+        for t in "${canary_tests[@]}"; do
+            echo "    - $t" >&2
+        done
+        echo "" >&2
+        echo "  Root cause: the locally-built target/debug/deps/mlx.metallib is likely" >&2
+        echo "  broken. This is a known nondeterministic Metal build issue — the library" >&2
+        echo "  compiles silently but drops kernel symbols, producing garbage output." >&2
+        echo "" >&2
+        echo "  Remediation (install known-good metallib and re-run):" >&2
+        echo "    cp /Users/brooklyn/workspace/github/mlx-node/packages/core/mlx.metallib \\" >&2
+        echo "       target/debug/deps/mlx.metallib" >&2
+        echo "    scripts/t0-smoke.sh $MODE" >&2
+        echo "" >&2
+        echo "  Known-good sha256:" >&2
+        echo "    84c24f93d8efd2d3930d362bc431753b3848e65a0527d8b88ec82f6bab5455b8" >&2
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+        echo "" >&2
+        exit 1
+    fi
+}
+
 # Run a single family's cargo test, writing the digest to $out_dir/<family>.json.
 # Returns 0 on success, 1 on SKIPPED (model path missing), 2 on failure.
 run_family() {
@@ -72,6 +116,7 @@ run_family() {
 # Mode: capture
 # ---------------------------------------------------------------------------
 do_capture() {
+    check_metallib_canaries
     mkdir -p "$BASELINE_DIR"
     log "Capturing baselines into $BASELINE_DIR"
 
@@ -113,6 +158,7 @@ do_capture() {
 # Mode: compare
 # ---------------------------------------------------------------------------
 do_compare() {
+    check_metallib_canaries
     if [[ ! -d "$BASELINE_DIR" ]]; then
         log_err "No baseline found at $BASELINE_DIR — run 'capture' first"
         exit 1
