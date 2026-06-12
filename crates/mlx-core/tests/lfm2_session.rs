@@ -660,7 +660,8 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
     // Reset the entire session/cache state, then run the SAME prompt
     // again with the SAME config. `reset_caches` is a sync NAPI method
     // on `&Lfm2Model`.
-    model.reset_caches().expect("reset_caches failed");
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
     let r2 = model
@@ -682,10 +683,11 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
 }
 
 /// At temperature=0, the concatenated text emitted by
-/// `chat_stream_session_start_for_test` matches the `ChatResult.text`
-/// from `chat_session_start` byte-for-byte. A `reset_caches` call
-/// between the two runs ensures both start from an identical clean
-/// session.
+/// `chat_stream_session_start_for_test` matches the `ChatResult.raw_text`
+/// from `chat_session_start` byte-for-byte (the deltas are the verbatim
+/// stream under include_reasoning=true), and the terminal chunk's parsed
+/// `text` matches the non-stream `text`. A prime turn + `reset_caches`
+/// before each run pins both to an identical post-reset session state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
@@ -704,17 +706,37 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
         .await
         .expect("failed to load LFM2 model");
 
+    let prompt_text = "Say hi in one short word.";
+
+    // Prime the paged prefix pool with one throwaway turn, then reset.
+    // The pool's content-addressed prefix blocks intentionally SURVIVE
+    // `reset_caches` (only the live request is released), and a
+    // prefix-HIT prefill (1-token suffix) rounds bf16 differently than
+    // the cold full-prompt prefill — enough to flip a greedy near-tie
+    // (observed: "says," vs "said" at token ~6 on this checkpoint).
+    // Priming pins BOTH compared runs to the same (prefix-hit) cache
+    // state so byte-for-byte parity is well-defined.
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
+    let _prime = model
+        .chat_session_start(
+            vec![user_message(prompt_text)],
+            Some(chat_config_default(32)),
+        )
+        .await
+        .expect("prime chat_session_start failed");
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+
     // Non-streaming: capture the full reply text. `ChatMessage` is not
     // `Clone`, so we reconstruct the identical prompt for both calls.
-    let prompt_text = "Say hi in one short word.";
     let cfg_ns = chat_config_default(32);
     let non_stream_result = model
         .chat_session_start(vec![user_message(prompt_text)], Some(cfg_ns))
         .await
         .expect("non-streaming chat_session_start failed");
 
-    // Reset so the streaming run starts from the same clean state.
-    model.reset_caches().expect("reset_caches failed");
+    // Reset so the streaming run starts from the same (post-reset,
+    // prefix-warm) state as the non-streaming run above.
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
     let cfg_s = chat_config_default(32);
@@ -724,21 +746,37 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
 
     let mut streamed = String::new();
     let mut saw_done = false;
+    let mut terminal_text: Option<String> = None;
     while let Some(result) = rx.recv().await {
         let chunk = result.expect("stream chunk error");
         if chunk.done {
             saw_done = true;
+            terminal_text = Some(chunk.text.clone());
             break;
         }
         streamed.push_str(&chunk.text);
     }
     assert!(saw_done, "stream never reached done=true");
 
+    // With include_reasoning=true the delta chunks carry the VERBATIM byte
+    // stream (reasoning included), so the correct non-stream counterpart is
+    // `raw_text`, NOT the reasoning-stripped `text`. The original
+    // `streamed == text` assert could never pass on a thinking trajectory
+    // (lfm2 spends the whole 32-token budget inside `<think>`, so `text` is
+    // empty) — a defect previously masked by the blocking_recv panic in
+    // `reset_caches` (fixed above).
     assert_eq!(
-        streamed, non_stream_result.text,
-        "streamed text does not match non-stream text byte-for-byte: \
-         streamed={:?} non_stream={:?}",
-        streamed, non_stream_result.text
+        streamed, non_stream_result.raw_text,
+        "streamed deltas do not match non-stream raw_text byte-for-byte: \
+         streamed={:?} non_stream_raw={:?}",
+        streamed, non_stream_result.raw_text
+    );
+    // Parsed-text parity: the terminal done-chunk carries the streaming
+    // run's finalized `text`; it must match the non-streaming `text`.
+    assert_eq!(
+        terminal_text.as_deref(),
+        Some(non_stream_result.text.as_str()),
+        "terminal chunk text does not match non-stream text byte-for-byte"
     );
 }
 

@@ -260,11 +260,23 @@ const GOLDEN_MIN_PREFIX_BYTES_MOE: usize = 138;
 /// one-ULP ' So' continuation. Asserting the FULL text (not just the 2-byte flip)
 /// gives regression teeth across the ENTIRE decode. Regenerate alongside
 /// GOLDEN_TEXT_MOE if the checkpoint changes.
-const GOLDEN_RAW_TEXT_MOE_OURS: &str = "<think>\nThe user asks: \"What is the capital of France? Answer in one short sentence.\"\n\nWe need to answer: The capital of France is Paris. So a short sentence: \"Paris is the capital of France.\" That's one short sentence. That satisfies. No extra commentary. Provide that.\n\nThus final answer: \"Paris is the capital of France.\"\n</think>\nParis is the";
+///
+/// PROVENANCE: recaptured 2026-06-13 from a live run on the real
+/// lfm2.5-8b-a1b checkpoint. The previous frozen value was captured under
+/// the pre-81a30df9 `item_at` read race and was missing exactly the true
+/// final rendered token (' capital'); the independent mlx-lm prefix gate
+/// passes and eager==compiled reproduces this tail.
+const GOLDEN_RAW_TEXT_MOE_OURS: &str = "<think>\nThe user asks: \"What is the capital of France? Answer in one short sentence.\"\n\nWe need to answer: The capital of France is Paris. So a short sentence: \"Paris is the capital of France.\" That's one short sentence. That satisfies. No extra commentary. Provide that.\n\nThus final answer: \"Paris is the capital of France.\"\n</think>\nParis is the capital";
 
 /// Our COMPILED-FLAT DENSE decode's FULL raw_text (80 tokens, golden config),
 /// byte-reproducible; first 314 bytes byte-identical to the mlx-lm golden.
-const GOLDEN_RAW_TEXT_DENSE_OURS: &str = "<think> Okay, let's see. The question is asking for the capital of France, and I need to answer in one short sentence. The user specified to put only the final answer inside a box, but first I need to make sure I get it right.\n\nThe capital of France is Paris, right? Yeah, I remember that from geography class. So I need to say that in";
+///
+/// PROVENANCE: recaptured 2026-06-13 from a live run on the real
+/// lfm2.5-1.2b-thinking-mlx checkpoint. The previous frozen value was
+/// captured under the pre-81a30df9 `item_at` read race and was missing
+/// exactly the true final rendered token (' one'); the independent mlx-lm
+/// prefix gate passes and eager==compiled reproduces this tail.
+const GOLDEN_RAW_TEXT_DENSE_OURS: &str = "<think> Okay, let's see. The question is asking for the capital of France, and I need to answer in one short sentence. The user specified to put only the final answer inside a box, but first I need to make sure I get it right.\n\nThe capital of France is Paris, right? Yeah, I remember that from geography class. So I need to say that in one";
 
 /// Greedy / deterministic chat config (temperature 0, all penalties off).
 fn greedy_chat_config(max_new_tokens: i32, reuse_cache: bool) -> ChatConfig {
