@@ -1,5 +1,7 @@
-//! Transitional shim: the shared chat/decode infrastructure moved to
-//! [`crate::engine::chat_common`].
+//! Transitional shim: the shared chat/decode infrastructure lives in the
+//! focused [`crate::engine`] submodules (`params`, `penalties`,
+//! `finalize`, `cache`, `decode`), and the MTP-specific machinery in
+//! [`crate::models::qwen3_5::mtp_decode`].
 //!
 //! This module re-exports everything the old
 //! `crate::models::qwen3_5::chat_common` path exposed (functions, types,
@@ -8,4 +10,5 @@
 //! the document models keep compiling unchanged. It will be removed once
 //! all call sites are migrated to the engine paths.
 
-pub(crate) use crate::engine::chat_common::*;
+pub(crate) use super::mtp_decode::*;
+pub(crate) use crate::engine::*;

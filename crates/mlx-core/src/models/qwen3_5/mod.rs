@@ -10,6 +10,7 @@ pub mod int8_gemm;
 pub mod layer_cache;
 pub mod model;
 pub mod mtp;
+pub(crate) mod mtp_decode;
 pub(crate) mod paged_forward;
 pub mod persistence;
 pub(crate) mod persistence_common;

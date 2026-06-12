@@ -6,7 +6,20 @@
 //! prefix-cache, decode-loop, backend-trait, and session layers so each
 //! model family only implements its forward pass.
 
-pub(crate) mod chat_common;
+pub(crate) mod cache;
 pub(crate) mod compiled_lock;
+pub(crate) mod decode;
+pub(crate) mod finalize;
+pub(crate) mod params;
+pub(crate) mod penalties;
 pub(crate) mod persistence;
 pub mod types;
+
+// Flat re-exports of the focused submodules' items so the transitional
+// `models::qwen3_5::chat_common` shim (and engine-internal callers) can
+// keep importing everything through a single `crate::engine::*` path.
+pub(crate) use cache::*;
+pub(crate) use decode::*;
+pub(crate) use finalize::*;
+pub(crate) use params::*;
+pub(crate) use penalties::*;
