@@ -8,12 +8,15 @@
 
 pub(crate) mod backend;
 pub(crate) mod cache;
+pub(crate) mod cmd;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
 pub(crate) mod finalize;
+pub(crate) mod napi_glue;
 pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;
+pub(crate) mod session;
 pub mod types;
 
 // Flat re-exports of the focused submodules' items so the transitional

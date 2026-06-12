@@ -26,6 +26,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use crate::array::MxArray;
 use crate::engine::params::ChatParams;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::stream::Stream;
 use crate::tokenizer::Qwen3Tokenizer;
 
 /// Per-step decode operations for one generation turn.
@@ -170,6 +171,19 @@ pub(crate) struct TurnSetup {
     /// Third input of `should_reapply_rope_delta` (fresh VLM prefill
     /// reusing a cached prefix).
     pub cached_prefix_len: usize,
+    /// Total post-prefill sequence length: cached prefix + freshly
+    /// prefilled tokens (i.e. the full prompt; the session-delta paths
+    /// pass `cached_history + delta`).
+    ///
+    /// S6 trait extension: the qwen3.5 compiled init sizes its fixed KV
+    /// budget from `seq_len` (`kv_capacity_round_up(seq_len,
+    /// max_new_tokens)` in `chat_with_caches_inner`), and `seq_len`
+    /// there is the TOTAL prompt length — not the prefilled tail. lfm2
+    /// deliberately ignores this field and seeds from the live
+    /// attention-KV offset instead (see the "CRITICAL: seed the
+    /// compiled decode position from the LIVE attention KV offset"
+    /// comment in `models/lfm2/model.rs`).
+    pub total_seq_len: usize,
 }
 
 /// Outcome of a whole-turn override ([`ChatBackend::paged_turn`] /
@@ -255,18 +269,34 @@ pub(crate) trait ChatBackend {
     /// [`crate::engine::params::build_chatml_continue_delta_text`], then
     /// `encode_sync` (LFM2 forces the no-`<think>` prefix variant;
     /// Gemma4 renders its own turn format).
-    fn render_continue_delta(&self, tok: &Qwen3Tokenizer, user_message: &str) -> Result<Vec<u32>>;
+    ///
+    /// S6 trait fix: gained the `config` parameter — the real qwen3.5
+    /// skeleton resolves the delta's `<think>\n` prefix from
+    /// `resolve_enable_thinking(&config)` (`chat_session_continue_sync`),
+    /// which the S5 signature could not express. lfm2 ignores it (its
+    /// template never injects the prefix).
+    fn render_continue_delta(
+        &self,
+        tok: &Qwen3Tokenizer,
+        user_message: &str,
+        config: &ChatConfig,
+    ) -> Result<Vec<u32>>;
 
     /// Render + tokenize the tool-result delta. ==
     /// [`crate::engine::params::build_chatml_tool_delta_text`] +
     /// `encode_sync` in `chat_session_continue_tool_sync` (LFM2 builds
     /// its plain `<|im_start|>tool` block inline instead).
+    ///
+    /// S6 trait fix: gained the `config` parameter for the same
+    /// `resolve_enable_thinking` reason as
+    /// [`ChatBackend::render_continue_delta`].
     fn render_tool_delta(
         &self,
         tok: &Qwen3Tokenizer,
         tool_call_id: &str,
         content: &str,
         is_error: Option<bool>,
+        config: &ChatConfig,
     ) -> Result<Vec<u32>>;
 
     /// The session's committed token history. == the
@@ -309,10 +339,23 @@ pub(crate) trait ChatBackend {
     /// per-family `eval_layer_caches` / `eval_lfm2_caches` helpers.
     fn eval_caches(&self) -> Result<()>;
 
-    /// Run the (chunked) prefill forward over `prompt` (`[1, seq]`) on
-    /// top of the live caches and return the logits. == the per-family
-    /// `chunked_prefill` / prefill-forward blocks.
-    fn prefill(&mut self, prompt: &MxArray) -> Result<MxArray>;
+    /// Run the (chunked) prefill forward over `prompt_tokens` on top of
+    /// the live caches and return **sampling-ready last-token logits**
+    /// (whatever shape `apply_all_penalties` + `sampling::sample`
+    /// accept). == the per-family `chunked_prefill` / prefill-forward
+    /// blocks **plus** their last-token slice.
+    ///
+    /// S6 trait fixes (vs the S5 `&MxArray`-in / raw-logits-out shape):
+    ///   * Takes the raw token ids — the families build their prompt
+    ///     array with DIFFERENT dtypes (lfm2: `from_int32`; qwen3.5:
+    ///     `from_uint32`), so the array construction belongs in the
+    ///     impl, not the model-neutral core.
+    ///   * Takes the turn's generation [`Stream`] — both families'
+    ///     `chunked_prefill` thread it through every chunk forward.
+    ///   * Returns LAST-token logits: qwen3.5's `chunked_prefill`
+    ///     already returns them; lfm2 folds its
+    ///     `slice_axis(1, seq-1, seq)? .squeeze(&[1])?` into the impl.
+    fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray>;
 
     /// The per-turn decode stepper, borrowing the backend for the
     /// duration of the decode loop.
@@ -342,6 +385,40 @@ pub(crate) trait ChatBackend {
     /// turns to `vision_turn`). Text-only families reject images with
     /// the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error instead.
     fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// Byte budget for the turn's `WiredLimitContext`.
+    ///
+    /// S6 trait extension — the two reference skeletons genuinely
+    /// differ: lfm2 wires `usize::MAX` (the default here), qwen3.5
+    /// wires `config.estimate_memory_bytes()` (override in S8).
+    fn wired_limit_bytes(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Whether a live session exists for the delta-continuation guard
+    /// ("requires an initialized session (call chatSessionStart
+    /// first)").
+    ///
+    /// S6 trait extension — the families check different state: lfm2
+    /// tests `!cached_token_history.is_empty()` (the default here);
+    /// qwen3.5 tests `self.caches.is_some()` (override in S8).
+    fn has_live_session(&self) -> bool {
+        !self.cached_token_history().is_empty()
+    }
+
+    /// Whether the live session currently holds image state
+    /// (`cached_image_key.is_some()` on the families that track it).
+    ///
+    /// S6 trait extension — feeds the delta-turn guard on TEXT-ONLY
+    /// families ("chat_tokens_delta_sync is text-only; session
+    /// currently holds image state", `models/lfm2/model.rs`). Families
+    /// with `supports_images() == true` accept text deltas on image
+    /// sessions (qwen3.5's documented sticky-image-key behavior), so
+    /// the session core only consults this when `supports_images()` is
+    /// `false`. Default covers families that never track image state.
+    fn session_holds_images(&self) -> bool {
         false
     }
 
