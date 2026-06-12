@@ -103,10 +103,7 @@ fn result_digest(r: &ChatResult) -> BTreeMap<&'static str, String> {
     // include_reasoning=true). Primary token-identity signal.
     m.insert("raw_text", r.raw_text.clone());
     m.insert("text", r.text.clone());
-    m.insert(
-        "thinking",
-        r.thinking.clone().unwrap_or_default(),
-    );
+    m.insert("thinking", r.thinking.clone().unwrap_or_default());
     // Render tool_calls as a stable JSON string (BTreeMap keys → sorted).
     let tool_calls_json = serde_json::to_string(&r.tool_calls).unwrap_or_default();
     m.insert("tool_calls", tool_calls_json);
@@ -164,10 +161,9 @@ async fn qwen3_smoke() {
         return;
     }
 
-    let model =
-        mlx_core::models::qwen3::persistence::load_with_thread(&model_path)
-            .await
-            .expect("failed to load Qwen3 model");
+    let model = mlx_core::models::qwen3::persistence::load_with_thread(&model_path)
+        .await
+        .expect("failed to load Qwen3 model");
 
     // Turn 1: session start
     let r1 = model
