@@ -7,7 +7,8 @@
 //! `models/qwen3_5/model.rs`):
 //!
 //! ```text
-//! reuse_cache guard → tokenizer → resolve_params → render_prompt
+//! reuse_cache guard → tokenizer → resolve_params
+//!   → pre-render image guard → render_prompt
 //!   → vision_turn probe → paged_turn probe → mtp_turn probe
 //!   → verify_cache_prefix → reset-or-delta split → prefill
 //!   → first-token sample (apply_all_penalties + sampling::sample)
@@ -389,9 +390,33 @@ fn expect_sync_result(out: Result<Option<ChatResult>>) -> Result<ChatResult> {
 }
 
 /// Map a whole-turn override's outcome into the core's return shape.
-fn whole_turn_outcome(out: Result<TurnOutput>) -> Result<Option<ChatResult>> {
+///
+/// `is_streaming` is the turn's sink presence. The streaming contract
+/// (documented on [`TurnOutput`] and the three whole-turn probes): a
+/// probe running with a sink attached MUST deliver every chunk —
+/// including the terminal done-chunk — through the sink and return
+/// [`TurnOutput::Streamed`]. A `Complete` outcome under streaming would
+/// otherwise pass through silently and close the stream with NO chunks,
+/// NO terminal done-chunk, and NO error (JS consumers hang or treat the
+/// empty stream as success). It is rejected here with a loud `Err` that
+/// the streaming entry wrappers deliver through the sink exactly like
+/// every other streaming error path — deliberately NOT auto-emitted via
+/// the emitter, which would mask family bugs during the S7+ migrations.
+/// The mirror violation (`Streamed` on the sync, sink-less path) is
+/// rejected by [`expect_sync_result`].
+fn whole_turn_outcome(out: Result<TurnOutput>, is_streaming: bool) -> Result<Option<ChatResult>> {
     match out? {
-        TurnOutput::Complete(result) => Ok(Some(*result)),
+        TurnOutput::Complete(result) => {
+            if is_streaming {
+                return Err(Error::from_reason(
+                    "whole-turn override returned TurnOutput::Complete on a streaming \
+                     (sink-bearing) turn; streaming probes must deliver all output \
+                     (including the terminal done-chunk) through the sink and return \
+                     TurnOutput::Streamed",
+                ));
+            }
+            Ok(Some(*result))
+        }
         TurnOutput::Streamed => Ok(None),
     }
 }
@@ -453,8 +478,28 @@ fn chat_turn_core<B: ChatBackend>(
     // coherence by construction).
     let (tokens, images, is_delta, prior_cached_len) = match &input {
         TurnInput::Fresh { messages } => {
-            let tokens = backend.render_prompt(&tokenizer, messages, &config)?;
+            // Pre-render image guard — TS `ChatSession` restart-routing
+            // contract: a text-only backend MUST reject an image-bearing
+            // fresh turn with the typed
+            // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error,
+            // and that rejection MUST happen BEFORE `render_prompt`.
+            // `serialize_message_for_jinja` represents image user
+            // content as an array, so a text-only family's chat
+            // template could otherwise fail with an UNTYPED template
+            // error first, breaking the prefix routing. Vision-capable
+            // backends (`supports_images() == true` — including
+            // gemma4's unconditional S10 policy, whose "no vision
+            // support" error surfaces from inside `vision_turn`) skip
+            // the rejection, render normally, and route through the
+            // `vision_turn` probe below with these exact extracted
+            // images (single extraction — no drift).
             let images = extract_images_from_messages(messages);
+            if !images.is_empty() && !backend.supports_images() {
+                return Err(Error::from_reason(format!(
+                    "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
+                )));
+            }
+            let tokens = backend.render_prompt(&tokenizer, messages, &config)?;
             (tokens, images, false, 0usize)
         }
         TurnInput::Delta { delta_tokens } => {
@@ -479,19 +524,16 @@ fn chat_turn_core<B: ChatBackend>(
             images: &images,
         };
 
-        // Vision probe. Text-only families reject image-bearing turns
-        // with the typed restart prefix the TS `ChatSession` layer
-        // matches on; image-capable families MUST take the override
-        // (the generic flow below is text-only, so silently falling
-        // through would drop the images).
+        // Vision probe. Text-only families were already rejected by the
+        // PRE-RENDER image guard above (typed restart prefix, before
+        // `render_prompt` could fail with an untyped template error) —
+        // only `supports_images() == true` backends reach this probe,
+        // and they MUST take the override (the generic flow below is
+        // text-only, so silently falling through would drop the
+        // images).
         if !images.is_empty() {
-            if !backend.supports_images() {
-                return Err(Error::from_reason(format!(
-                    "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
-                )));
-            }
             return match backend.vision_turn(&mut wt_args) {
-                Some(out) => whole_turn_outcome(out),
+                Some(out) => whole_turn_outcome(out, streaming.is_some()),
                 None => Err(Error::from_reason(
                     "model reports supports_images() but provided no vision_turn override",
                 )),
@@ -521,13 +563,13 @@ fn chat_turn_core<B: ChatBackend>(
         if backend.has_paged_adapter()
             && let Some(out) = backend.paged_turn(&mut wt_args)
         {
-            return whole_turn_outcome(out);
+            return whole_turn_outcome(out, streaming.is_some());
         }
 
         // MTP probe. == the `p.enable_mtp && has_mtp_weights` branch in
         // the qwen3.5 dense/MoE cores.
         if let Some(out) = backend.mtp_turn(&mut wt_args) {
-            return whole_turn_outcome(out);
+            return whole_turn_outcome(out, streaming.is_some());
         }
     }
 

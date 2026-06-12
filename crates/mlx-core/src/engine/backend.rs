@@ -442,13 +442,32 @@ pub(crate) struct TurnSetup<'a> {
 /// (`chat_sync_core_paged`) while the streaming cores deliver everything
 /// through the sink and return `Result<()>`
 /// (`chat_stream_sync_core_paged`).
+///
+/// # Streaming contract (load-bearing)
+///
+/// The variant MUST match the turn's sink presence
+/// ([`WholeTurnArgs::sink`]):
+///   * sink `Some` (streaming turn) → the probe must deliver every
+///     chunk INCLUDING the terminal done-chunk through the sink and
+///     return [`TurnOutput::Streamed`]. `Complete` here is a
+///     family-impl contract violation: the session core rejects it
+///     with a loud error delivered through the sink (it is NOT
+///     auto-emitted as chunks — that would mask family bugs during the
+///     S7+ migrations).
+///   * sink `None` (sync turn) → return
+///     [`TurnOutput::Complete`]; `Streamed` here is rejected by the
+///     sync entry wrappers ("returned TurnOutput::Streamed on the sync
+///     (sink-less) path").
 pub(crate) enum TurnOutput {
     /// Turn completed; result for the sync caller. Boxed — `ChatResult`
     /// is large relative to the unit `Streamed` variant
-    /// (`clippy::large_enum_variant`).
+    /// (`clippy::large_enum_variant`). MUST NOT be returned when
+    /// [`WholeTurnArgs::sink`] is `Some` — see the streaming contract
+    /// above.
     Complete(Box<ChatResult>),
     /// Turn completed; all output (including the terminal chunk) was
-    /// already delivered through the [`ChunkSink`].
+    /// already delivered through the [`ChunkSink`]. MUST NOT be
+    /// returned when [`WholeTurnArgs::sink`] is `None`.
     Streamed,
 }
 
@@ -745,7 +764,12 @@ pub(crate) trait ChatBackend {
 
     /// Whether the family can consume image inputs (routes image-bearing
     /// turns to `vision_turn`). Text-only families reject images with
-    /// the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error instead.
+    /// the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error instead — the
+    /// session core fires that rejection BEFORE
+    /// [`ChatBackend::render_prompt`] (TS `ChatSession` restart-routing
+    /// contract: the typed prefix must win over any template error the
+    /// image-bearing message array could trigger; see the fresh-turn
+    /// image guard in `chat_turn_core`).
     fn supports_images(&self) -> bool {
         false
     }
@@ -959,9 +983,19 @@ pub(crate) trait ChatBackend {
     // Consulted by the S6 cores BEFORE the generic
     // verify-prefix/prefill/decode flow. `None` means "no override —
     // run the generic flow"; `Some(result)` is the turn's outcome.
+    //
+    // Streaming contract (see [`TurnOutput`]): when `args.sink` is
+    // `Some`, an override MUST deliver all output (including the
+    // terminal done-chunk) through the sink and return
+    // `TurnOutput::Streamed`; `Complete` under streaming is rejected
+    // loudly by the session core.
 
     /// Block-paged whole-turn path. == `chat_sync_core_paged` /
     /// `chat_stream_sync_core_paged` on Qwen3.5 dense/MoE.
+    ///
+    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
+    /// attached, stream everything through the sink and return
+    /// [`TurnOutput::Streamed`], never `Complete`.
     fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         None
     }
@@ -970,12 +1004,20 @@ pub(crate) trait ChatBackend {
     /// `p.enable_mtp && has_mtp_weights` branch driving
     /// `decode_loop_mtp!` in `models/qwen3_5/model.rs` /
     /// `models/qwen3_5_moe/model.rs`.
+    ///
+    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
+    /// attached, stream everything through the sink and return
+    /// [`TurnOutput::Streamed`], never `Complete`.
     fn mtp_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         None
     }
 
     /// Vision (VLM) whole-turn path. == the image-bearing prefill
     /// branches (`args.images` non-empty) on the VLM-capable families.
+    ///
+    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
+    /// attached, stream everything through the sink and return
+    /// [`TurnOutput::Streamed`], never `Complete`.
     fn vision_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         None
     }

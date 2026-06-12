@@ -213,18 +213,19 @@ mod mock_backend_tests {
     //! without loading a model.
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use napi::bindgen_prelude::*;
 
     use super::{ChatCmd, handle_chat_cmd};
     use crate::array::MxArray;
     use crate::engine::backend::{
-        ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, ThinkingSetup, TurnSetup,
+        ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, ThinkingSetup,
+        TurnOutput, TurnSetup, WholeTurnArgs,
     };
     use crate::engine::params::{
         ChatParams, build_chatml_continue_delta_text, build_chatml_tool_delta_text,
-        extract_chat_params,
+        extract_chat_params, resolve_enable_thinking,
     };
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::Stream;
@@ -371,6 +372,14 @@ mod mock_backend_tests {
         /// D6: return `None` from `wired_limit_bytes` (qwen3's
         /// no-WiredLimitContext policy).
         wired_none_knob: bool,
+        /// Codex F1: report a paged adapter and answer the `paged_turn`
+        /// probe with `TurnOutput::Complete` — the streaming-contract
+        /// violation the session core must reject loudly.
+        paged_complete_knob: bool,
+        /// Codex F2: `render_prompt` invocation counter (interior
+        /// mutability — the hook takes `&self`). The pre-render image
+        /// guard must reject text-only image turns with this still 0.
+        render_prompt_calls: AtomicUsize,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -398,6 +407,8 @@ mod mock_backend_tests {
                 extra_eos_knob: Vec::new(),
                 force_report_perf_knob: false,
                 wired_none_knob: false,
+                paged_complete_knob: false,
+                render_prompt_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -423,6 +434,24 @@ mod mock_backend_tests {
                 enabled: true,
                 budget: config.thinking_token_budget,
             }
+        }
+
+        fn render_prompt(
+            &self,
+            tok: &Qwen3Tokenizer,
+            messages: &[ChatMessage],
+            config: &ChatConfig,
+        ) -> Result<Vec<u32>> {
+            // Counting renderer (Codex F2 regression tests): same body
+            // as the trait default, plus the invocation counter the
+            // pre-render image-guard tests assert on.
+            self.render_prompt_calls.fetch_add(1, Ordering::Relaxed);
+            tok.apply_chat_template_sync(
+                messages,
+                Some(true),
+                config.tools.as_deref(),
+                resolve_enable_thinking(config),
+            )
         }
 
         fn render_continue_delta(
@@ -478,6 +507,33 @@ mod mock_backend_tests {
                 None
             } else {
                 Some(usize::MAX)
+            }
+        }
+
+        fn has_paged_adapter(&self) -> bool {
+            self.paged_complete_knob
+        }
+
+        fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+            if self.paged_complete_knob {
+                // Deliberate streaming-contract violation under
+                // streaming (Codex F1): a probe that completes a
+                // sink-bearing turn must return Streamed, never
+                // Complete. On the sync path this is the correct shape.
+                Some(Ok(TurnOutput::Complete(Box::new(ChatResult {
+                    text: "PAGED_COMPLETE".to_string(),
+                    tool_calls: Vec::new(),
+                    thinking: None,
+                    num_tokens: 1,
+                    prompt_tokens: 1,
+                    reasoning_tokens: 0,
+                    finish_reason: "stop".to_string(),
+                    raw_text: "PAGED_COMPLETE".to_string(),
+                    cached_tokens: 0,
+                    performance: None,
+                }))))
+            } else {
+                None
             }
         }
 
@@ -1150,5 +1206,164 @@ mod mock_backend_tests {
             "chat_stream_tokens_delta requires an initialized session \
              (call chatStreamSessionStart first)",
         );
+    }
+
+    // ---- codex adversarial-review regressions ----
+
+    /// Codex F1 [HIGH] — a whole-turn probe returning
+    /// `TurnOutput::Complete` on a STREAMING turn must NOT silently
+    /// close the stream (no chunks, no done-chunk, no error — JS
+    /// consumers hang). The session core rejects the contract violation
+    /// and the streaming wrapper delivers exactly one `Err` through the
+    /// sink, mirroring every other streaming error path
+    /// (`send_stream_error` shape: Err item, never a fake done-chunk).
+    #[test]
+    fn streaming_whole_turn_complete_outcome_is_a_loud_stream_error() {
+        let mut backend = MockBackend::new(vec![]);
+        backend.paged_complete_knob = true;
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::StreamSessionStart {
+                messages: user_messages("hello"),
+                config: greedy_config(),
+                stream_tx,
+                cancelled,
+            },
+        );
+
+        let mut items: Vec<Result<ChatStreamChunk>> = Vec::new();
+        while let Some(item) = stream_rx.blocking_recv() {
+            items.push(item);
+        }
+        assert_eq!(
+            items.len(),
+            1,
+            "exactly one stream item (the Err) — no chunks, no done-chunk: {items:?}"
+        );
+        let err = items
+            .remove(0)
+            .expect_err("Complete-under-streaming must surface as Err");
+        assert!(
+            err.reason
+                .contains("TurnOutput::Complete on a streaming (sink-bearing) turn"),
+            "got: {}",
+            err.reason
+        );
+        // The probe short-circuited the turn before the generic flow:
+        // no prefill, no decode, no session state persisted.
+        assert!(backend.prefill_calls.is_empty());
+        assert!(backend.save_calls.is_empty());
+        assert!(backend.history.is_empty());
+    }
+
+    /// Codex F1 companion — the SAME `Complete` outcome on the sync
+    /// (sink-less) path is the correct contract and flows through
+    /// unchanged: the guard must only bite under streaming.
+    #[test]
+    fn sync_whole_turn_complete_outcome_flows_through() {
+        let mut backend = MockBackend::new(vec![]);
+        backend.paged_complete_knob = true;
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("sync Complete must pass through: {}", e.reason));
+        assert_eq!(r.text, "PAGED_COMPLETE");
+        assert_eq!(r.finish_reason, "stop");
+    }
+
+    /// Codex F2 [MEDIUM] (sync) — an image-bearing FRESH turn on a
+    /// text-only backend is rejected with the typed
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error BEFORE the prompt
+    /// renderer runs: `serialize_message_for_jinja` represents image
+    /// content as an array, so a text-only family's template could
+    /// otherwise fail with an UNTYPED template error first, breaking
+    /// the TS `ChatSession` restart routing.
+    #[test]
+    fn text_only_image_fresh_turn_rejected_before_render_sync() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+
+        let mut messages = user_messages("hello");
+        messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
+
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages,
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("image-bearing fresh turn must fail on a text-only backend");
+        assert_eq!(
+            err.reason,
+            "IMAGE_CHANGE_REQUIRES_SESSION_RESTART: this model is text-only; \
+             image messages are not supported",
+        );
+        assert_eq!(
+            backend.render_prompt_calls.load(Ordering::Relaxed),
+            0,
+            "renderer must never run on the rejected turn"
+        );
+        assert!(backend.prefill_calls.is_empty());
+        assert!(backend.reset_calls.is_empty());
+
+        // Counting-renderer sanity: a normal text-only start DOES
+        // render (guards the 0-assert above against being vacuous).
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("text-only start failed: {}", e.reason));
+        assert_eq!(r.finish_reason, "stop");
+        assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// Codex F2 [MEDIUM] (stream) — same rejection on the streaming
+    /// twin: exactly one typed `Err` through the sink, no done-chunk,
+    /// renderer never called.
+    #[test]
+    fn text_only_image_fresh_turn_rejected_before_render_stream() {
+        let mut backend = MockBackend::new(vec![]);
+
+        let mut messages = user_messages("hello");
+        messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::StreamSessionStart {
+                messages,
+                config: greedy_config(),
+                stream_tx,
+                cancelled,
+            },
+        );
+
+        let mut items: Vec<Result<ChatStreamChunk>> = Vec::new();
+        while let Some(item) = stream_rx.blocking_recv() {
+            items.push(item);
+        }
+        assert_eq!(
+            items.len(),
+            1,
+            "exactly one stream item (the Err) — no chunks, no done-chunk: {items:?}"
+        );
+        let err = items
+            .remove(0)
+            .expect_err("image-bearing streaming fresh turn must surface as Err");
+        assert_eq!(
+            err.reason,
+            "IMAGE_CHANGE_REQUIRES_SESSION_RESTART: this model is text-only; \
+             image messages are not supported",
+        );
+        assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 0);
+        assert!(backend.prefill_calls.is_empty());
     }
 }
