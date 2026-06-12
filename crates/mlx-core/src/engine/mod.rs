@@ -6,6 +6,7 @@
 //! prefix-cache, decode-loop, backend-trait, and session layers so each
 //! model family only implements its forward pass.
 
+pub(crate) mod backend;
 pub(crate) mod cache;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
