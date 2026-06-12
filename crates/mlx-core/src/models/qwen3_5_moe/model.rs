@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -7,15 +8,21 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use tracing::{info, warn};
 
+use crate::engine::backend::{
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
+    TurnSetup, WholeTurnArgs,
+};
+use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+use crate::engine::napi_glue::start_chat_stream;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::model_thread::ResponseTx;
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_image_token_counts_per_image, eval_layer_caches, extract_images_from_messages,
-    inject_image_placeholders, vlm_prepare_vision_features,
+    compute_image_token_counts_per_image, eval_layer_caches, inject_image_placeholders,
+    vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -30,10 +37,9 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::models::qwen3_5::chat_common;
 use crate::models::qwen3_5::chat_common::{
-    IMAGE_CHANGE_RESTART_PREFIX, apply_all_penalties, build_chatml_continue_delta_text,
-    build_synthetic_user_message, compute_image_cache_key, compute_performance_metrics,
-    extract_chat_params, finalize_chat_result, save_cache_state_direct, send_stream_error,
-    verify_cache_prefix_direct,
+    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
+    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -326,91 +332,29 @@ pub(crate) struct Qwen35MoeInner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// Whether the CURRENT generic-flow turn is streaming. Set by the
+    /// [`ChatBackend::profiler_label`] hook (the session core calls it
+    /// exactly once per generic-flow turn, before `begin_decode`);
+    /// consumed by [`ChatBackend::begin_decode`]'s compiled/eager
+    /// profiler relabel, which must pick the `moe_chat_*` vs
+    /// `moe_chat_stream_*` label family (`TurnSetup` does not carry
+    /// streaming-ness). Whole-turn override paths (vision/paged/MTP)
+    /// never consult it. Mirrors the dense S8 field.
+    turn_is_streaming: Cell<bool>,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35MoeCmd {
-    /// Start a new session via the jinja-render path with `<|im_end|>` as
-    /// the stop token. See [`Qwen35MoeInner::chat_session_start_sync`] for
-    /// the behavioural contract (full cache reset, session boundary on
-    /// `<|im_end|>`, images accepted for VLM variants).
-    ChatSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session by appending a user turn. See
-    /// [`Qwen35MoeInner::chat_session_continue_sync`] — builds a raw ChatML
-    /// delta from `user_message`, tokenizes it, and prefills on top of the
-    /// live caches.
-    ///
-    /// `images` is an opt-in guard parameter: non-empty input is rejected
-    /// with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so
-    /// the TS `ChatSession` layer can route image-changes back through a
-    /// fresh `chat_session_start`.
-    ChatSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session with a tool-result delta. See
-    /// [`Qwen35MoeInner::chat_session_continue_tool_sync`] — builds a
-    /// ChatML `<tool_response>` delta and prefills on top of the live
-    /// caches.
-    ///
-    /// `is_error` is the structured tool-error signal threaded through
-    /// from the NAPI surface (`chatSessionContinueTool(..., isError)`).
-    /// When `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper. `None` / `Some(false)` produce the
-    /// pre-feature byte-equal output.
-    ChatSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Streaming session-start: same semantics as
-    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
-    /// deltas through `stream_tx`.
-    ChatStreamSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming session-continue: same semantics as
-    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
-    /// token deltas through `stream_tx`. Carries the same opt-in
-    /// `images` guard parameter.
-    ChatStreamSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming tool-result continuation: same semantics as
-    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`. Carries the same
-    /// structured `is_error` signal.
-    ChatStreamSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
+    /// All chat-session traffic (sync + streaming starts/continues/tool
+    /// turns + cache reset), routed through the model-neutral engine
+    /// dispatcher ([`crate::engine::cmd::handle_chat_cmd`]) against the
+    /// [`ChatBackend`] impl on [`Qwen35MoeInner`]. The per-variant
+    /// behavioural contracts live on [`crate::engine::cmd::ChatCmd`].
+    Chat(ChatCmd),
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5MoeGenerationConfig,
         reply: ResponseTx<Qwen3_5MoeGenerationResult>,
-    },
-    ResetCaches {
-        reply: ResponseTx<()>,
     },
     SaveModel {
         save_path: String,
@@ -476,79 +420,13 @@ pub(crate) enum Qwen35MoeCmd {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
     match cmd {
-        Qwen35MoeCmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
-        } => {
-            // NOTE: no per-request cache drain here. On a multi-model
-            // server the MLX allocator free-pool is process-wide, so
-            // flushing after a request on model A discards blocks about
-            // to be reused by model B. The TS idle sweeper in
-            // `@mlx-node/server` handles between-turn drains.
-            let _ = reply.send(inner.chat_session_start_sync(messages, config));
-        }
-        Qwen35MoeCmd::ChatSessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
-        }
-        Qwen35MoeCmd::ChatSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-            ));
-        }
-        Qwen35MoeCmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
-        }
-        Qwen35MoeCmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_sync(
-                user_message,
-                images,
-                config,
-                stream_tx,
-                cancelled,
-            );
-        }
-        Qwen35MoeCmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                stream_tx,
-                cancelled,
-            );
+        // All chat-session traffic routes through the model-neutral
+        // engine dispatcher against `Qwen35MoeInner`'s `ChatBackend`
+        // impl. (The engine dispatcher carries the historical NOTE
+        // forward: no per-request cache drain here — the TS idle
+        // sweeper in `@mlx-node/server` handles between-turn drains.)
+        Qwen35MoeCmd::Chat(chat_cmd) => {
+            handle_chat_cmd(inner, chat_cmd);
         }
         Qwen35MoeCmd::Generate {
             prompt_tokens,
@@ -556,9 +434,6 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-        }
-        Qwen35MoeCmd::ResetCaches { reply } => {
-            let _ = reply.send(inner.reset_caches_sync());
         }
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -653,13 +528,21 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
     }
 }
 
-/// Wrapper around `StreamTx` that provides a `.call()` method matching the
-/// `ThreadsafeFunction` interface expected by the `decode_loop!` macro.
-struct StreamSender(StreamTx<ChatStreamChunk>);
+/// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
+/// `decode_loop!` / `decode_loop_mtp!` macros (and the legacy streaming
+/// cores kept behind the whole-turn probes) expect from a
+/// `ThreadsafeFunction`-like callback.
+///
+/// Pre-S9 this wrapped the raw `StreamTx`; the engine now owns the
+/// channel and hands the probes a `&dyn ChunkSink`, so the wrapper
+/// forwards `.call()` to [`ChunkSink::send`] (the call mode is
+/// meaningless on the mpsc path and is dropped, exactly like the old
+/// `StreamTx` wrapper did). Mirrors the dense S8 adapter.
+struct StreamSender<'a>(&'a dyn ChunkSink);
 
-impl StreamSender {
+impl StreamSender<'_> {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
+        self.0.send(result);
     }
 }
 
@@ -831,6 +714,7 @@ impl Qwen35MoeInner {
             mtp,
             mtp_weights_loaded: false,
             training_state: None,
+            turn_is_streaming: Cell::new(false),
         })
     }
 
@@ -1259,13 +1143,19 @@ impl Qwen35MoeInner {
 
     /// Core chat implementation (runs on model thread).
     ///
+    /// Whole-turn core for fresh SYNC turns reached through the engine's
+    /// `vision_turn` (image-bearing) and `mtp_turn` (MTP-enabled)
+    /// probes. The engine already rendered the prompt (`tokens`) and
+    /// extracted the raw image payloads (`images`); everything from the
+    /// paged dispatch onward is the legacy pipeline, byte-for-byte.
     /// `eos_token_id` is the caller-supplied stop-on token id (typically
     /// `<|im_end|>`) so the cached history ends on a clean ChatML
     /// boundary, yielding a reusable prefix for subsequent session
-    /// deltas via [`Self::chat_session_start_sync`].
+    /// deltas.
     fn chat_sync_core(
         &mut self,
-        messages: Vec<ChatMessage>,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
         config: ChatConfig,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
@@ -1278,21 +1168,12 @@ impl Qwen35MoeInner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        let has_images = !images.is_empty();
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-        let tool_defs = config.tools.as_deref();
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
 
         let p = extract_chat_params(&config);
         let max_new_tokens = p.max_new_tokens;
@@ -1350,13 +1231,12 @@ impl Qwen35MoeInner {
             if let (Some(_vision_enc), Some(img_proc)) =
                 (self.vision_encoder.as_ref(), self.image_processor.as_ref())
             {
-                let all_images = extract_images_from_messages(&messages);
-                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
                 let per_image_token_counts =
                     compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
                 let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(&all_images);
+                let cache_key = compute_image_cache_key(images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
                 (tokens.clone(), 0u64, None)
@@ -2594,8 +2474,8 @@ impl Qwen35MoeInner {
         eos_token_id: u32,
         p: chat_common::ChatParams,
         report_perf: bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -2974,8 +2854,8 @@ impl Qwen35MoeInner {
         >,
         streamed_text_len: &mut usize,
         last_is_reasoning: &mut bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
         use_cpp_paged: bool,
         gdn_prefix_already_primed: bool,
         prefill_trace_start: Option<std::time::Instant>,
@@ -3441,17 +3321,23 @@ impl Qwen35MoeInner {
 
     /// Core streaming chat implementation (runs on model thread).
     ///
-    /// `eos_token_id` is the caller-supplied stop-on token id (typically
-    /// `<|im_end|>`) so the cached history ends on a clean ChatML
-    /// boundary, yielding a reusable prefix for subsequent session
-    /// deltas via [`Self::chat_stream_session_start_sync`].
+    /// Whole-turn core for fresh STREAMING turns reached through the
+    /// engine's `vision_turn` (image-bearing) and `mtp_turn`
+    /// (MTP-enabled) probes. The engine already rendered the prompt
+    /// (`tokens`) and extracted the raw image payloads (`images`);
+    /// everything from the paged dispatch onward is the legacy
+    /// pipeline, byte-for-byte. `eos_token_id` is the caller-supplied
+    /// stop-on token id (typically `<|im_end|>`) so the cached history
+    /// ends on a clean ChatML boundary, yielding a reusable prefix for
+    /// subsequent session deltas.
     fn chat_stream_sync_core(
         &mut self,
-        messages: Vec<ChatMessage>,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
         config: ChatConfig,
         eos_token_id: u32,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -3462,22 +3348,13 @@ impl Qwen35MoeInner {
             .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
             .clone();
 
-        let has_images = messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()));
+        let has_images = !images.is_empty();
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let tool_defs = config.tools.as_deref();
         let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
 
         let p = chat_common::extract_chat_params(&config);
         let model_id = self.model_id;
@@ -3537,13 +3414,12 @@ impl Qwen35MoeInner {
             if let (Some(_vision_enc), Some(img_proc)) =
                 (self.vision_encoder.as_ref(), self.image_processor.as_ref())
             {
-                let all_images = extract_images_from_messages(&messages);
-                let image_refs: Vec<&[u8]> = all_images.iter().map(|v| v.as_slice()).collect();
+                let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
                 let processed_pre = img_proc.process_many(&image_refs)?;
                 let per_image_token_counts =
                     compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
                 let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(&all_images);
+                let cache_key = compute_image_cache_key(images);
                 (expanded, cache_key, Some(processed_pre))
             } else {
                 (tokens.clone(), 0u64, None)
@@ -4205,80 +4081,18 @@ impl Qwen35MoeInner {
         Ok(())
     }
 
-    /// Start a new chat session.
-    ///
-    /// Delegates to [`Self::chat_sync_core`] with `<|im_end|>` (from the
-    /// tokenizer vocab) as the stop token so the cached history ends on
-    /// a clean ChatML boundary that subsequent `chat_session_continue_sync`
-    /// deltas can append to without re-rendering the jinja template.
-    ///
-    /// Unlike the pre-refactor contract, this method no longer resets the
-    /// caches up-front. The core path runs `verify_cache_prefix_direct`
-    /// against the freshly-tokenized prompt and reuses the cached prefix
-    /// on an exact-append hit or resets + fully prefills on a miss. This
-    /// is what enables prefix-cache reuse for stateless agent clients
-    /// that resend the full transcript on every turn. See the matching
-    /// block comment in the method body for the GDN-safety rationale.
-    ///
-    /// Images are accepted on session start — the downstream
-    /// [`Self::chat_sync_core`] already handles the VLM prefill path via
-    /// `vlm_prefill_moe`. Subsequent turns in the same session MUST go
-    /// through `chat_session_continue_sync` which is text-only; changing
-    /// the image set mid-session requires starting a new session via
-    /// this method again.
-    pub(crate) fn chat_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The session
-        // API only makes sense with cache reuse enabled.
-        if config.reuse_cache == Some(false) {
-            return Err(Error::from_reason(
-                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
-            ));
-        }
-
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-        let im_end_id = tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
-
-        // Prefix-cache reuse contract: the caches may carry state from a
-        // prior session-start turn. `chat_sync_core` runs
-        // `verify_cache_prefix_direct` against the freshly-tokenized prompt
-        // and either (a) reuses the cached prefix and prefills only the
-        // trailing delta (exact-append hit) or (b) resets + fully prefills
-        // from scratch on a cache miss. Driving the reset from inside the
-        // core — rather than wiping up-front here — is what lets
-        // stateless-agent clients (Aider, Codex CLI, pi-mono, etc.) that
-        // resend the full transcript on every turn avoid paying an O(N)
-        // prefill cost on every turn.
-        //
-        // Safety: the invariant on `verify_cache_prefix_direct` (returns
-        // either `0` or the full cached length — never an intermediate
-        // value) guarantees a non-zero hit means the new tokens are a
-        // pure *append* on the live caches. Qwen3.5 MoE has 30 GDN
-        // linear-attention layers whose recurrent state cannot be
-        // rewound mid-sequence; the all-or-nothing return contract is
-        // what keeps that state consistent without any snapshot
-        // machinery. See the rustdoc on `verify_cache_prefix_direct`.
-
-        self.chat_sync_core(messages, config, im_end_id)
-    }
-
     /// Prefill a pre-tokenized delta on top of the existing KV caches and
-    /// run the decode loop. Text-only session primitive used by
-    /// `chat_session_continue_sync` and `chat_session_continue_tool_sync`.
+    /// run the decode loop. Whole-turn core for SYNC delta turns reached
+    /// through the engine's `mtp_turn` probe (MTP-enabled sessions;
+    /// non-MTP sync deltas run the engine's generic flow or the paged
+    /// probe).
     ///
     /// Uses `<|im_end|>` as the eos token (not `config.eos_token_id`) so
     /// the cached history continues to end on a clean ChatML boundary for
     /// the next turn. Cache save runs unconditionally at the end so the
-    /// session stays consistent even on error.
+    /// session stays consistent even on error. The engine's delta guards
+    /// already enforce the session preconditions; the checks here are
+    /// kept verbatim as defense-in-depth for the `mtp_turn` caller.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
@@ -4303,11 +4117,10 @@ impl Qwen35MoeInner {
         }
         // Text-only delta on image-bearing cache is intentional — the KV
         // cache retains the image attention state from the prior prefill.
-        // See the sibling guard's doc in `qwen3_5/model.rs`. The outer
-        // `chat_session_continue_sync` gate filters real image-set
-        // changes with the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`
-        // prefix so the TS `ChatSession` can route those through
-        // `chatSessionStart`.
+        // See the sibling guard's doc in `qwen3_5/model.rs`. The engine's
+        // `session_continue` gate filters real image-set changes with the
+        // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix so the TS
+        // `ChatSession` can route those through `chatSessionStart`.
 
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -4815,318 +4628,12 @@ impl Qwen35MoeInner {
         Ok(result)
     }
 
-    /// Session-based chat continuation via a plain user message string.
-    ///
-    /// Convenience entry point on top of `chat_tokens_delta_sync`: builds
-    /// the ChatML delta that closes the previous assistant turn, opens a
-    /// new user turn with `user_message`, and opens a fresh assistant
-    /// turn. Then tokenizes the delta and delegates to
-    /// `chat_tokens_delta_sync`.
-    ///
-    /// Text-only; `images` is an opt-in guard parameter: non-empty input
-    /// is rejected with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-
-    /// prefixed error so the TS `ChatSession` layer can route
-    /// image-changes back through a fresh `chat_session_start_sync`.
-    pub(crate) fn chat_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            return Err(Error::from_reason(format!(
-                "{} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-
-        // Match `chat_sync`'s sanitization so the session path is subject
-        // to the same role/content injection protection as the legacy path.
-        let synthetic = build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
-    }
-
-    /// Session-based chat continuation via a tool-result turn.
-    ///
-    /// Builds a ChatML `<tool_response>`-wrapped delta from `content` and
-    /// prefills it on top of the live session caches. See
-    /// [`chat_common::build_chatml_tool_delta_text`] for the exact wire
-    /// format. The `tool_call_id` is currently ignored by the wire format.
-    ///
-    /// Text-only; delegates to [`Self::chat_tokens_delta_sync`] which
-    /// inherits the same text-only-delta invariant (errors if the session
-    /// currently holds image state).
-    ///
-    /// `is_error` is forwarded verbatim to
-    /// [`chat_common::build_chatml_tool_delta_text`]: `Some(true)` injects
-    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
-    /// pre-feature byte-equal output.
-    pub(crate) fn chat_session_continue_tool_sync(
-        &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = chat_common::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
-    }
-
-    /// Streaming chat (session-start variant): same semantics as
-    /// [`Self::chat_session_start_sync`] but streams token deltas through
-    /// `stream_tx` rather than returning a `ChatResult`. Stops on
-    /// `<|im_end|>` and resets caches before prefill.
-    ///
-    /// Images are accepted on session start — the downstream
-    /// `chat_stream_sync_core` already handles VLM prefill via
-    /// `vlm_prefill_moe`.
-    pub(crate) fn chat_stream_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start cancelled before start",
-            );
-            return;
-        }
-
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). \
-                 The session API only makes sense with cache reuse enabled.",
-            );
-            return;
-        }
-
-        let im_end_id = match self.tokenizer.as_ref().and_then(|t| t.im_end_id()) {
-            Some(id) => id,
-            None => {
-                send_stream_error(
-                    &stream_tx,
-                    "chat_stream_session_start requires a tokenizer with an <|im_end|> special token",
-                );
-                return;
-            }
-        };
-
-        // Prefix-cache reuse contract: same as `chat_session_start_sync`.
-        // Any cached state from a prior turn is intentionally preserved
-        // so `chat_stream_sync_core` can run `verify_cache_prefix_direct`
-        // against the freshly-tokenized prompt. The inner path resets the
-        // caches on a miss and reuses them on an exact-append hit. See
-        // the rustdoc on `verify_cache_prefix_direct` for the GDN-safety
-        // invariant that keeps this sound on the 30 linear-attention
-        // layers.
-
-        let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Streaming chat (session-continue variant): same semantics as
-    /// [`Self::chat_session_continue_sync`] but streams token deltas
-    /// through `stream_tx`.
-    pub(crate) fn chat_stream_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue cancelled before start",
-            );
-            return;
-        }
-
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            send_stream_error(
-                &stream_tx,
-                &format!(
-                    "{} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-                    IMAGE_CHANGE_RESTART_PREFIX
-                ),
-            );
-            return;
-        }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        let synthetic = build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
-    /// `is_error` is forwarded verbatim to the wire-format renderer;
-    /// see the non-streaming entry point for the marker semantics.
-    pub(crate) fn chat_stream_session_continue_tool_sync(
-        &mut self,
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue_tool cancelled before start",
-            );
-            return;
-        }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let delta_text = chat_common::build_chatml_tool_delta_text(
-            &tool_call_id,
-            &content,
-            enable_thinking,
-            is_error,
-        );
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill the
-    /// caller-provided delta tokens on top of the existing KV caches and
-    /// stream the reply through `stream_tx`.
-    ///
-    /// Applies the same four guards as the non-streaming path and still
-    /// calls `save_cache_state_direct` at the end regardless of whether
-    /// cancellation fired, so the cache stays consistent for the next
-    /// turn even on an early abort.
-    pub(crate) fn chat_stream_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta cancelled before start",
-            );
-            return;
-        }
-
-        // --- Same four guards as chat_tokens_delta_sync ---
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            );
-            return;
-        }
-        if self.caches.is_none() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
-            );
-            return;
-        }
-        if delta_tokens.is_empty() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires a non-empty delta",
-            );
-            return;
-        }
-        // Text-only streaming deltas are allowed over image-bearing
-        // cache — see the sync sibling for the rationale. Real image-set
-        // changes are caught by the outer `chat_stream_session_continue`
-        // gate.
-
-        let cb = StreamSender(stream_tx.clone());
-        let result =
-            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
     /// Prefill the delta tokens and run the streaming decode loop.
     ///
-    /// This mirrors [`Self::chat_stream_sync_core`] but skips the
+    /// Whole-turn core for STREAMING delta turns reached through the
+    /// engine's `mtp_turn` probe (MTP-enabled sessions; non-MTP
+    /// streaming deltas run the engine's generic flow or the paged
+    /// probe). Mirrors [`Self::chat_stream_sync_core`] but skips the
     /// message rendering + prefix verification stages — the caller owns
     /// cache coherence by construction. Uses `<|im_end|>` as eos so the
     /// cached history continues to end on a clean ChatML boundary after
@@ -5135,8 +4642,8 @@ impl Qwen35MoeInner {
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -7411,6 +6918,684 @@ impl Qwen35MoeInner {
     }
 }
 
+impl Qwen35MoeInner {
+    /// Whole-turn MoE dispatch behind the engine's `vision_turn` and
+    /// `mtp_turn` probes (S9).
+    ///
+    /// Routes the four turn shapes onto the kept legacy cores VERBATIM:
+    /// fresh sync → [`Self::chat_sync_core`], delta sync →
+    /// [`Self::chat_tokens_delta_sync`], fresh streaming →
+    /// [`Self::chat_stream_sync_core`], delta streaming →
+    /// [`Self::chat_stream_tokens_delta_sync_inner`]. The kept cores own
+    /// every MoE-path subtlety the generic flow does not model: VLM
+    /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
+    /// AR), the paged-always-wins dispatch (including the
+    /// paged-text-only rejection for image turns — unlike dense, MoE
+    /// has NO `mtp_takes_dense_path` exception: its paged early-return
+    /// runs before any MTP consideration on every legacy path).
+    ///
+    /// Delta turns recover the raw delta from the engine-composed
+    /// `args.tokens` (`cached_history + delta` by construction — the
+    /// probes run before any state mutation).
+    fn moe_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        let config = args.config.clone();
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                if args.is_delta {
+                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
+                    let delta_tokens = args.tokens[delta_start..].to_vec();
+                    self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, cancelled)?;
+                } else {
+                    self.chat_stream_sync_core(
+                        args.tokens.to_vec(),
+                        args.images,
+                        config,
+                        args.eos_id,
+                        &cb,
+                        cancelled,
+                    )?;
+                }
+                Ok(TurnOutput::Streamed)
+            }
+            _ => {
+                let result = if args.is_delta {
+                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
+                    let delta_tokens = args.tokens[delta_start..].to_vec();
+                    self.chat_tokens_delta_sync(delta_tokens, config)?
+                } else {
+                    self.chat_sync_core(args.tokens.to_vec(), args.images, config, args.eos_id)?
+                };
+                Ok(TurnOutput::Complete(Box::new(result)))
+            }
+        }
+    }
+
+    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`]
+    /// (S9). Preserves the legacy dispatch sites verbatim: fresh sync /
+    /// delta sync (`chat_sync_core_paged` — image turns never reach here,
+    /// the vision probe owns them), fresh + delta streaming
+    /// (`chat_stream_sync_core_paged`).
+    fn moe_paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The legacy entry points re-derived `p` from config at each
+        // dispatch site (`extract_chat_params`); the engine's default
+        // `resolve_params` is the same extraction, so re-extracting an
+        // OWNED copy here is byte-identical.
+        let p = extract_chat_params(args.config);
+        let report_perf = args.config.report_performance.unwrap_or(false);
+        let tokenizer = args.tokenizer.clone();
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                self.chat_stream_sync_core_paged(
+                    args.tokens.to_vec(),
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                    &cb,
+                    cancelled,
+                )?;
+                Ok(TurnOutput::Streamed)
+            }
+            _ => {
+                let result = self.chat_sync_core_paged(
+                    args.tokens.to_vec(),
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                )?;
+                Ok(TurnOutput::Complete(Box::new(result)))
+            }
+        }
+    }
+}
+
+/// Per-turn decode stepper for the engine's generic (text-only,
+/// non-paged, non-MTP) flow on Qwen3.5 MoE (S9,
+/// [`ChatBackend::begin_decode`]).
+///
+/// Carries the compiled-vs-eager dispatch the deleted MoE cores'
+/// `DecodeOps` closures + lock scaffolding expressed: the compiled arm
+/// drives `forward_moe_cpp` against the C++ graph seeded by
+/// `begin_decode`, the eager arm drives the pure-Rust `forward_inner`
+/// over the flat caches.
+pub(crate) struct Qwen35MoeDecode<'a> {
+    // Field order is load-bearing: struct fields drop in DECLARATION
+    // order, and this must reproduce the legacy in-scope teardown
+    // (locals drop in REVERSE declaration order there):
+    // `MoeResetGuard` first (`mlx_qwen35_moe_reset()` runs before any
+    // lock is released), then the weights read lock, then the MoE
+    // lifecycle mutex last.
+    /// RAII compiled-state reset (`Some` iff the compiled path is live).
+    _compiled_guard: Option<MoeResetGuard>,
+    /// Read guard on the process-wide C++ weight map (shared with dense).
+    _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    /// Process-wide MoE compiled-lifecycle serialization.
+    _lifecycle_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    inner: &'a mut Qwen35MoeInner,
+    embedding_weight: MxArray,
+    embedding_weight_t: MxArray,
+    use_compiled: bool,
+    /// `params.reuse_cache` captured at `begin_decode` — gates the
+    /// compiled-cache export in [`DecodeStep::end_decode`].
+    reuse_cache: bool,
+    /// Decode-path profiler relabel (`moe_chat_*_compiled` /
+    /// `moe_chat_*_rust`), resolved in `begin_decode` from the compiled
+    /// outcome + the turn's streaming-ness and delta-ness.
+    relabel: &'static str,
+}
+
+impl DecodeStep for Qwen35MoeDecode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        if self.use_compiled {
+            // `false` == the legacy compiled `DecodeOps` closure's
+            // needs_squeeze: the compiled forward already returns
+            // `[1, vocab]`.
+            Ok((forward_moe_cpp(input_ids, &self.embedding_weight)?, false))
+        } else {
+            let inner = &mut *self.inner;
+            let logits = forward_inner(
+                input_ids,
+                &self.embedding_weight,
+                &mut inner.layers,
+                &mut inner.caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                inner.fa_idx,
+                Some(&self.embedding_weight_t),
+            )?;
+            // `true` == the eager Rust forward returns `[1, 1, vocab]`;
+            // the loop squeezes axis 1.
+            Ok((logits, true))
+        }
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        if self.use_compiled {
+            eval_token_and_moe_caches(next_token);
+            if budget_forced {
+                logits.eval();
+            }
+        } else {
+            MxArray::async_eval_arrays(&[next_token, logits]);
+        }
+    }
+
+    fn trace_offset(&self) -> Option<i64> {
+        // The legacy `decode_loop!` macro logged the DENSE compiled
+        // global unconditionally — on BOTH the compiled and eager MoE
+        // arms (the macro hardcodes `mlx_qwen35_get_cache_offset`, not
+        // the MoE `mlx_qwen35_moe_get_cache_offset`). Keep the dense
+        // global so the throttled trace line stays byte-identical;
+        // diagnostics only.
+        Some(unsafe { mlx_sys::mlx_qwen35_get_cache_offset() } as i64)
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        Some(self.relabel)
+    }
+
+    fn end_decode(&mut self) -> Result<()> {
+        // Post-loop compiled-cache export — VERBATIM move of the
+        // `if reuse_cache { mlx_qwen35_moe_export_caches … }` block
+        // shared by the deleted MoE cores. Runs while the reset guard +
+        // locks are still held; an Err aborts the turn BEFORE
+        // `save_cache_state` (the guards then fire on drop, reproducing
+        // the legacy reset-without-export error path).
+        if self.use_compiled && self.reuse_cache {
+            let inner = &mut *self.inner;
+            let num_layers = inner.config.num_layers as usize;
+            let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            let exported = unsafe {
+                mlx_sys::mlx_qwen35_moe_export_caches(
+                    export_ptrs.as_mut_ptr(),
+                    (num_layers * 2) as i32,
+                )
+            };
+            if exported > 0 {
+                let cache_offset = unsafe { mlx_sys::mlx_qwen35_moe_get_cache_offset() };
+                let mut new_caches = Vec::with_capacity(num_layers);
+                for i in 0..num_layers {
+                    let p0 = export_ptrs[i * 2];
+                    let p1 = export_ptrs[i * 2 + 1];
+                    let mut lc = if inner.config.is_linear_layer(i) {
+                        Qwen3_5LayerCache::new_linear()
+                    } else {
+                        Qwen3_5LayerCache::new_full_attention()
+                    };
+                    lc.import_ptrs(p0, p1, cache_offset);
+                    new_caches.push(lc);
+                }
+                inner.caches = Some(new_caches);
+                // Force-materialize the exported lazy cache handles
+                // before `MoeResetGuard` drops and tears down
+                // `g_compiled_caches_moe`. Without this, the arrays
+                // held by `self.caches` reference compiled-graph nodes
+                // that get freed at guard drop, so the next turn's
+                // compile init would feed stale handles to the GPU —
+                // triggering Metal page-faults / innocent-victim hangs
+                // on the first forward of the next turn.
+                eval_layer_caches(&inner.caches)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChatBackend for Qwen35MoeInner {
+    fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+        self.tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))
+    }
+
+    fn family_name(&self) -> &'static str {
+        "qwen3_5_moe"
+    }
+
+    fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
+        tok.im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
+        // Legacy: `starts_in_thinking = enable_thinking.unwrap_or(true)`
+        // (template-honoring) + the explicit config budget only.
+        ThinkingSetup {
+            enabled: chat_common::resolve_enable_thinking(config).unwrap_or(true),
+            budget: config.thinking_token_budget,
+        }
+    }
+
+    fn render_continue_delta(
+        &self,
+        tok: &Qwen3Tokenizer,
+        user_message: &str,
+        config: &ChatConfig,
+    ) -> Result<Vec<u32>> {
+        // Match `chat_sync_core`'s sanitization so the session path is
+        // subject to the same role/content injection protection as the
+        // fresh-prompt path.
+        let synthetic = build_synthetic_user_message(user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+        // Build the delta in ChatML wire format. See
+        // `chat_common::build_chatml_continue_delta_text` for the exact
+        // wire format and thinking-prefix semantics.
+        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
+        // `add_special_tokens: Some(false)` — we do NOT want the
+        // tokenizer auto-prepending BOS. The delta is already a raw
+        // ChatML snippet.
+        tok.encode_sync(&delta_text, Some(false))
+    }
+
+    fn render_tool_delta(
+        &self,
+        tok: &Qwen3Tokenizer,
+        tool_call_id: &str,
+        content: &str,
+        is_error: Option<bool>,
+        config: &ChatConfig,
+    ) -> Result<Vec<u32>> {
+        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let delta_text = chat_common::build_chatml_tool_delta_text(
+            tool_call_id,
+            content,
+            enable_thinking,
+            is_error,
+        );
+        tok.encode_sync(&delta_text, Some(false))
+    }
+
+    fn cached_token_history(&self) -> &[u32] {
+        &self.cached_token_history
+    }
+
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        match scope {
+            // == the legacy inline miss-branch reset in the deleted MoE
+            // cores: reset each live layer cache, then install a fresh
+            // hybrid cache vec. PRESERVES `cached_token_history` /
+            // `cached_image_key` / `cached_rope_deltas` (the end-of-turn
+            // save overwrites them) and the GDN checkpoints (paged-path
+            // state the flat reset never touched).
+            ResetScope::PrefixMiss => {
+                if let Some(ref mut caches) = self.caches {
+                    for cache in caches.iter_mut() {
+                        cache.reset();
+                    }
+                }
+                self.caches = Some(fresh_moe_layer_caches(&self.config));
+                Ok(())
+            }
+            // == the legacy `reset_caches_sync` (full clear including
+            // history, image key, rope deltas, GDN checkpoints).
+            ResetScope::Command => self.reset_caches_sync(),
+        }
+    }
+
+    /// All-or-nothing prefix match (NO exact-match rewind — the 30 GDN
+    /// linear-attention layers carry a recurrent state that cannot
+    /// rewind one slot; the engine's exact-match-as-miss handling
+    /// reproduces the legacy zero-delta guard's full reset +
+    /// re-prefill). Text-only by construction: the generic flow never
+    /// carries images (the vision probe owns those turns), so the
+    /// expanded-token / image-key inputs collapse to the plain prompt.
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
+        verify_cache_prefix_direct(
+            reuse_cache,
+            false,
+            tokens,
+            tokens,
+            0,
+            &self.cached_token_history,
+            &self.cached_image_key,
+            self.caches.is_some(),
+        )
+    }
+
+    fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+        // Delta continuations preserve `cached_image_key` — the KV cache
+        // still holds the prior prefill's image attention state even
+        // though this turn was text-only. Fresh turns (re)set the key
+        // from the turn's (always-false here) `has_images`.
+        if args.is_delta {
+            chat_common::save_cache_state_after_delta(
+                args.reuse_cache,
+                args.generated_tokens,
+                args.finish_reason,
+                args.save_tokens,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        } else {
+            save_cache_state_direct(
+                args.reuse_cache,
+                args.has_images,
+                args.generated_tokens,
+                args.finish_reason,
+                args.save_tokens,
+                args.save_expanded_tokens,
+                args.image_cache_key,
+                &mut self.cached_token_history,
+                &mut self.cached_image_key,
+                &mut self.cached_rope_deltas,
+                &mut self.caches,
+            );
+        }
+    }
+
+    fn eval_caches(&self) -> Result<()> {
+        // No post-prefill cache sync on the MoE reference paths:
+        // `chunked_prefill` evals internally per chunk and the decode
+        // loop schedules async evals. A blocking sync here would
+        // introduce a stall the legacy paths never paid.
+        Ok(())
+    }
+
+    fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        // Byte-identical port of the deleted MoE cores' text-only
+        // prefill block (the engine's reset-or-delta split already ran;
+        // `self.caches` holds either fresh caches or the live session
+        // state). Unlike dense, the MoE `chunked_prefill` returns the
+        // full `[1, seq, vocab]` logits — the legacy callers sliced the
+        // last position inline, so the slice+squeeze folds in here (the
+        // engine's prefill contract is last-token logits).
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let prompt = MxArray::from_uint32(prompt_tokens, &[1, prompt_tokens.len() as i64])?;
+        let fa_idx = self.fa_idx;
+        let logits = chunked_prefill(
+            &prompt,
+            &embedding_weight,
+            &mut self.layers,
+            &mut self.caches,
+            &self.final_norm,
+            &self.lm_head,
+            fa_idx,
+            Some(&embedding_weight_t),
+            stream,
+        )?;
+        let seq_len = logits.shape_at(1)?;
+        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
+        last_logits.squeeze(Some(&[1]))
+    }
+
+    type Decode<'a>
+        = Qwen35MoeDecode<'a>
+    where
+        Self: 'a;
+
+    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        let p = turn.params;
+        let model_id = self.model_id;
+
+        // Compiled-path availability + process-wide serialization —
+        // VERBATIM move of the legacy lock acquisition from the deleted
+        // MoE cores: MoE lifecycle mutex first (when the cheap pre-check
+        // passes), then the weights read lock (shared with dense — both
+        // families share the C++ weight map), then the model-id RE-check
+        // under the lock. Another model swapping `g_active_model_id`
+        // between the two checks silently demotes the turn to the eager
+        // Rust path.
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let lifecycle_lock = if use_compiled {
+            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
+        let mut weight_guard = None;
+        let use_compiled = if use_compiled {
+            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // NOTE: no decode-entry `info!` trace here — unlike dense, the
+        // legacy MoE cores never logged a "chat_decode entry" line.
+
+        let is_streaming = self.turn_is_streaming.get();
+
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+
+        let mut compiled_guard = None;
+        let relabel: &'static str;
+        if use_compiled {
+            // Arm the reset guard BEFORE the seeding block, mirroring
+            // the legacy declaration order: an Err out of
+            // `kv_capacity_round_up` must still tear the compiled state
+            // down on unwind.
+            compiled_guard = Some(MoeResetGuard);
+
+            // Graph seeding from the prefilled flat caches — VERBATIM
+            // move of the compiled-init block shared by the deleted MoE
+            // cores (the generic flow is text-only, so the VLM prefill
+            // shapes never reach here).
+            use mlx_sys as sys;
+            let prefill_len = turn.total_seq_len as i32;
+            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
+            let num_layers = self.config.num_layers as usize;
+            let mut cache_ptrs: Vec<*mut sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            if let Some(ref caches) = self.caches {
+                for (i, cache) in caches.iter().enumerate() {
+                    let (p0, p1) = cache.export_ptrs();
+                    cache_ptrs[i * 2] = p0;
+                    cache_ptrs[i * 2 + 1] = p1;
+                }
+            }
+            let mlp_only: Vec<i32> = self
+                .config
+                .mlp_only_layers
+                .as_deref()
+                .unwrap_or(&[])
+                .to_vec();
+            unsafe {
+                sys::mlx_qwen35_moe_init_from_prefill(
+                    self.config.num_layers,
+                    self.config.hidden_size,
+                    self.config.num_heads,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.rope_theta as f32,
+                    self.config.rope_dims(),
+                    self.config.rms_norm_eps as f32,
+                    self.config.full_attention_interval,
+                    self.config.linear_num_key_heads,
+                    self.config.linear_num_value_heads,
+                    self.config.linear_key_head_dim,
+                    self.config.linear_value_head_dim,
+                    self.config.linear_conv_kernel_dim,
+                    if self.config.tie_word_embeddings {
+                        1
+                    } else {
+                        0
+                    },
+                    max_kv_len,
+                    1, // batch_size
+                    self.config.num_experts,
+                    self.config.num_experts_per_tok,
+                    if self.config.norm_topk_prob { 1 } else { 0 },
+                    self.config.decoder_sparse_step,
+                    if mlp_only.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        mlp_only.as_ptr()
+                    },
+                    mlp_only.len() as i32,
+                    cache_ptrs.as_mut_ptr(),
+                    prefill_len,
+                );
+            }
+
+            // Re-apply the saved M-RoPE offset when the compiled state
+            // is being (re)initialized from a KV cache that encodes
+            // image attention (text deltas chained on an image session)
+            // — see `chat_common::should_reapply_rope_delta`. The
+            // legacy MoE delta cores re-applied unconditionally on
+            // `Some(delta)`; the fresh cores gated on `has_images` —
+            // both collapse to this helper on the text-only generic
+            // flow.
+            if let Some(delta) = self.cached_rope_deltas
+                && chat_common::should_reapply_rope_delta(
+                    true,
+                    turn.is_delta,
+                    turn.has_images,
+                    turn.cached_prefix_len,
+                )
+            {
+                unsafe {
+                    mlx_sys::mlx_qwen35_moe_adjust_offset(delta);
+                }
+            }
+
+            // Clear stale rope deltas only on fresh text-only prefills —
+            // see `chat_common::should_clear_rope_delta`. Legacy keeps
+            // this INSIDE the compiled branch (the eager arm never
+            // cleared; the end-of-turn save rewrites the field anyway).
+            if chat_common::should_clear_rope_delta(turn.is_delta, turn.has_images) {
+                self.cached_rope_deltas = None;
+            }
+
+            relabel = match (is_streaming, turn.is_delta) {
+                (false, false) => "moe_chat_compiled",
+                (false, true) => "moe_chat_delta_compiled",
+                (true, false) => "moe_chat_stream_compiled",
+                (true, true) => "moe_chat_stream_delta_compiled",
+            };
+        } else {
+            relabel = match (is_streaming, turn.is_delta) {
+                (false, false) => "moe_chat_rust",
+                (false, true) => "moe_chat_delta_rust",
+                (true, false) => "moe_chat_stream_rust",
+                (true, true) => "moe_chat_stream_delta_rust",
+            };
+        }
+
+        Ok(Qwen35MoeDecode {
+            _compiled_guard: compiled_guard,
+            _weight_guard: weight_guard,
+            _lifecycle_lock: lifecycle_lock,
+            inner: self,
+            embedding_weight,
+            embedding_weight_t,
+            use_compiled,
+            reuse_cache: p.reuse_cache,
+            relabel,
+        })
+    }
+
+    fn has_paged_adapter(&self) -> bool {
+        self.paged_adapter.is_some()
+    }
+
+    fn supports_images(&self) -> bool {
+        // Unconditionally true (S9 policy, mirrors dense S8): the vision
+        // probe owns ALL image-bearing fresh turns; a checkpoint loaded
+        // without the vision encoder/processor surfaces the legacy "VLM
+        // prefill requested but vision encoder/processor not loaded" /
+        // "Qwen3.5 MoE paged dispatch is text-only" errors from inside
+        // the kept cores, exactly like today.
+        true
+    }
+
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        // == the legacy per-turn `WiredLimitContext::new(
+        // config.estimate_memory_bytes(), …)`.
+        Some(self.config.estimate_memory_bytes() as usize)
+    }
+
+    fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
+        // Record the turn's streaming-ness for `begin_decode`'s relabel
+        // (`TurnSetup` does not carry it). The session core calls this
+        // hook exactly once per generic-flow turn, before
+        // `begin_decode`; whole-turn override paths return from the
+        // probes earlier and never consult either hook.
+        self.turn_is_streaming.set(is_streaming);
+        match (is_streaming, is_delta) {
+            (false, false) => "moe_chat",
+            (false, true) => "moe_chat_delta",
+            (true, false) => "moe_chat_stream",
+            (true, true) => "moe_chat_stream_delta",
+        }
+    }
+
+    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
+        // Contract fix (S9, mirrors the dense S8 gate-round-1 override):
+        // report the FULL history+delta length on the streaming delta
+        // terminal chunk, matching the MoE sync delta result
+        // (`prompt_tokens_for_result = full_token_history.len()`), the
+        // MoE paged streaming core (`prompt_token_count = tokens.len()`
+        // over the full history), and every other migrated family.
+        //
+        // The legacy MoE streaming-delta path reported the DELTA token
+        // count (`delta_tokens.len()`) — the same PR #48 internal
+        // inconsistency dense had, and the env-gated parity test
+        // `qwen3_5_moe_session::moe_stream_session_path_keeps_ttft_flat_
+        // across_turns` rejects it (it asserts cumulative prompt_tokens
+        // growth across streaming delta turns, which the delta count
+        // fails identically on pre-S9 legacy code). This override is
+        // therefore a deliberate, test-mandated divergence from the
+        // legacy MoE stream-delta payload, NOT an engine regression.
+        full_len as u32
+    }
+
+    fn has_live_session(&self) -> bool {
+        // Legacy delta guard: `self.caches.is_none()` → "requires an
+        // initialized session".
+        self.caches.is_some()
+    }
+
+    fn session_holds_images(&self) -> bool {
+        self.cached_image_key.is_some()
+    }
+
+    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // Unlike dense, MoE paged dispatch ALWAYS wins: every legacy
+        // entry point early-returns to the paged core BEFORE any MTP
+        // consideration (there is no `mtp_takes_dense_path` exception),
+        // so the probe never declines. MTP-enabled paged turns keep
+        // running the paged core, exactly like today (the sync paged
+        // inner self-handles its compiled dispatch; MTP never engages
+        // on the MoE paged path).
+        Some(self.moe_paged_whole_turn(args))
+    }
+
+    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // == the legacy `p.enable_mtp && has_mtp_weights` dispatch
+        // shape: such turns ran the MoE cores whose internal MTP gate
+        // does the compiled-availability check,
+        // `init_moe_mtp_compiled_from_main`, and the silent AR fallback
+        // on init failure. Everything beyond this entry condition stays
+        // inside the kept cores.
+        if !(args.params.enable_mtp && self.has_mtp_weights()) {
+            return None;
+        }
+        Some(self.moe_whole_turn(args))
+    }
+
+    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // The probe is gated on `!images.is_empty()`; the kept MoE cores
+        // own the full legacy image pipeline (VLM prefill via
+        // `vlm_prefill_moe`, M-RoPE deltas, paged-text-only rejection,
+        // missing-encoder error).
+        Some(self.moe_whole_turn(args))
+    }
+}
+
 /// Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
 ///
 /// All inference and training state lives on a dedicated OS thread. NAPI methods
@@ -7446,8 +7631,8 @@ impl Qwen3_5MoeModel {
     /// Reset all caches.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Qwen35MoeCmd::ResetCaches {
-            reply,
+        crate::model_thread::send_and_block(&self.thread, |reply| {
+            Qwen35MoeCmd::Chat(ChatCmd::ResetCaches { reply })
         })
     }
 
@@ -7539,36 +7724,13 @@ impl Qwen3_5MoeModel {
         messages: Vec<ChatMessage>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
+        let config = config.unwrap_or_default();
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35MoeCmd::Chat(ChatCmd::SessionStart {
+                messages,
+                config,
+                reply,
+            })
         })
         .await
     }
@@ -7597,39 +7759,14 @@ impl Qwen3_5MoeModel {
         images: Option<Vec<Uint8Array>>,
         config: Option<ChatConfig>,
     ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
+        let config = config.unwrap_or_default();
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35MoeCmd::ChatSessionContinue {
+            Qwen35MoeCmd::Chat(ChatCmd::SessionContinue {
                 user_message,
                 images,
                 config,
                 reply,
-            }
+            })
         })
         .await
     }
@@ -7662,40 +7799,15 @@ impl Qwen3_5MoeModel {
         config: Option<ChatConfig>,
         is_error: Option<bool>,
     ) -> Result<ChatResult> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
-
+        let config = config.unwrap_or_default();
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35MoeCmd::ChatSessionContinueTool {
+            Qwen35MoeCmd::Chat(ChatCmd::SessionContinueTool {
                 tool_call_id,
                 content,
                 is_error,
                 config,
                 reply,
-            }
+            })
         })
         .await
     }
@@ -7718,52 +7830,18 @@ impl Qwen3_5MoeModel {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
+        let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+        let plumbing = start_chat_stream(callback);
+        self.thread
+            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx: plumbing.stream_tx,
+                cancelled: plumbing.cancelled,
+            }))?;
 
-        self.thread.send(Qwen35MoeCmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming variant of `chatSessionContinue`.
@@ -7790,53 +7868,19 @@ impl Qwen3_5MoeModel {
         config: Option<ChatConfig>,
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
     ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
+        let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
+        let plumbing = start_chat_stream(callback);
+        self.thread
+            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinue {
+                user_message,
+                images,
+                config,
+                stream_tx: plumbing.stream_tx,
+                cancelled: plumbing.cancelled,
+            }))?;
 
-        self.thread.send(Qwen35MoeCmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
-
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming variant of `chatSessionContinueTool`.
@@ -7859,55 +7903,20 @@ impl Qwen3_5MoeModel {
         callback: ThreadsafeFunction<ChatStreamChunk, ()>,
         is_error: Option<bool>,
     ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or(ChatConfig {
-            max_new_tokens: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-            min_p: None,
-            repetition_penalty: None,
-            repetition_context_size: None,
-            presence_penalty: None,
-            presence_context_size: None,
-            frequency_penalty: None,
-            frequency_context_size: None,
-            max_consecutive_tokens: None,
-            max_ngram_repeats: None,
-            ngram_size: None,
-            tools: None,
-            thinking_token_budget: None,
-            include_reasoning: None,
-            reasoning_effort: None,
-            report_performance: None,
-            reuse_cache: None,
-            enable_mtp: None,
-            mtp_depth: None,
-            mtp_adaptive_depth: None,
-        });
+        let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
+        let plumbing = start_chat_stream(callback);
         self.thread
-            .send(Qwen35MoeCmd::ChatStreamSessionContinueTool {
+            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinueTool {
                 tool_call_id,
                 content,
                 is_error,
                 config,
-                stream_tx,
-                cancelled: cancelled_inner,
-            })?;
+                stream_tx: plumbing.stream_tx,
+                cancelled: plumbing.cancelled,
+            }))?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     // ---------------------------------------------------------------
@@ -7937,12 +7946,13 @@ impl Qwen3_5MoeModel {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Qwen35MoeCmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -7963,13 +7973,14 @@ impl Qwen3_5MoeModel {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Qwen35MoeCmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        self.thread
+            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinue {
+                user_message,
+                images,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -9088,7 +9099,8 @@ fn vlm_prefill_moe(
 #[cfg(test)]
 mod prefix_cache_reuse_integration_tests {
     //! End-to-end tests for the prefix KV cache reuse refactor on
-    //! Qwen3.5 MoE. These verify that `chat_session_start_sync` no longer
+    //! Qwen3.5 MoE. These verify that the session-start path (the
+    //! engine's `session_start` since S9) no longer
     //! unconditionally wipes the cache — stateless agent clients that
     //! resend the full transcript on every turn should hit the
     //! `verify_cache_prefix_direct` exact-append path and skip redundant
@@ -9140,8 +9152,8 @@ mod prefix_cache_reuse_integration_tests {
         // Pseudocode:
         //
         //   let messages = vec![ChatMessage::user("Ping")];
-        //   let r1 = model.chat_session_start_sync(messages.clone(), cfg())?;
-        //   let r2 = model.chat_session_start_sync(messages, cfg())?;
+        //   let r1 = model.chat_session_start(messages.clone(), cfg()).await?;
+        //   let r2 = model.chat_session_start(messages, cfg()).await?;
         //   // Zero-delta guard fires — full reset + re-prefill. The
         //   // second response should still be coherent (same length,
         //   // sensible tokens), not garbage from a corrupted GDN state.

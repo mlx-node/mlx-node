@@ -940,15 +940,17 @@ pub(crate) trait ChatBackend {
     /// token count (`delta_tokens.len()`) while their own sync deltas —
     /// and lfm2/qwen3 on BOTH paths, and qwen3_5's own paged streaming
     /// core — report the full history+delta. The delta count was an
-    /// internal inconsistency that the env-gated parity test
+    /// internal inconsistency that the env-gated parity tests
     /// `qwen3_5_delta_chat::stream_session_path_keeps_ttft_flat_across_turns`
-    /// rejects (it asserts cumulative growth and fails identically on
-    /// pre-S8 legacy code). qwen3_5 dense therefore overrides this to
-    /// `full_len` since the S8 migration (gate round 1); qwen3's S7
-    /// override also returns `full_len`. Default stays the legacy delta
-    /// count so the un-migrated MoE keeps today's payload until S9
-    /// decides. Sync delta results always report the full length (not
-    /// hook-controlled — no family diverges there).
+    /// and `qwen3_5_moe_session::moe_stream_session_path_keeps_ttft_flat_across_turns`
+    /// reject (they assert cumulative growth and fail identically on
+    /// pre-migration legacy code). qwen3_5 dense overrides this to
+    /// `full_len` since the S8 migration (gate round 1), MoE since S9,
+    /// and qwen3's S7 override also returns `full_len`. The default
+    /// stays the legacy delta count until the gemma4/lfm2 migrations
+    /// (S10/S11) decide for the remaining families. Sync delta results
+    /// always report the full length (not hook-controlled — no family
+    /// diverges there).
     fn stream_delta_prompt_tokens(&self, full_len: usize, delta_len: usize) -> u32 {
         let _ = full_len;
         delta_len as u32
