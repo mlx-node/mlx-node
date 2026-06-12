@@ -8319,6 +8319,25 @@ impl ChatBackend for Qwen35Inner {
         }
     }
 
+    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
+        // Contract fix (S8 gate round 1): report the FULL history+delta
+        // length on the streaming delta terminal chunk, matching the
+        // sync delta result, the qwen3_5 paged streaming core, and every
+        // other family (lfm2/qwen3 legacy + overrides).
+        //
+        // The legacy dense streaming-delta path reported the DELTA token
+        // count (`delta_tokens.len()`) since PR #48 — an internal
+        // inconsistency that was never exercised: the env-gated parity
+        // test `qwen3_5_delta_chat::stream_session_path_keeps_ttft_flat_
+        // across_turns` asserts cumulative growth and fails IDENTICALLY
+        // (17 -> 16) on pre-S8 e4eee4aa~1 (verified empirically). This
+        // override is therefore a deliberate, test-mandated divergence
+        // from the legacy dense stream-delta payload, NOT an engine
+        // regression. MoE keeps the engine default (delta count) until
+        // its S9 migration decides.
+        full_len as u32
+    }
+
     fn has_live_session(&self) -> bool {
         // Legacy delta guard: `self.caches.is_none()` → "requires an
         // initialized session".

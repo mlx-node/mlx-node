@@ -140,7 +140,35 @@ bool mlx_array_get_batch_seq_hidden(mlx_array* handle, int64_t* batch, int64_t* 
 // Read a scalar element from an evaluated array at the given index, casting to
 // the requested output type entirely on CPU.  Never creates a GPU astype+eval
 // -- that was the root cause of a 4.4 ms per-step stall in decode loops.
+//
+// PRECONDITION (enforced by ensure_readable below): the array must be
+// materialized before its buffer is dereferenced. Callers used to rely on
+// the Rust side having eval'd the array, but several decode loops read a
+// token that was only ASYNC-eval'd one step earlier. `data<T>()` does NOT
+// wait on the array's completion event, so when the GPU hadn't finished
+// the forward yet the read returned stale recycled-buffer bytes — observed
+// as nondeterministic garbage token ids (e.g. lfm2 sampling reserved
+// vocab ids 45/125 at the thinking-budget force boundary, where the forced
+// </think> path skips the next sample/eval that normally hides the race).
 namespace {
+// Make `arr` safe to read host-side: full eval when unscheduled, event
+// wait when scheduled (mirrors mlx::core::array::item<T>()). Cheap no-op
+// for already-available arrays. Returns false if evaluation threw.
+bool ensure_readable(array& arr, const char* context) {
+  try {
+    if (!arr.is_available()) {
+      arr.eval();
+    }
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error(context, e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error(context, "unknown exception");
+    return false;
+  }
+}
+
 template <typename Out>
 Out read_scalar(const array& arr, size_t index) {
   switch (arr.dtype()) {
@@ -169,6 +197,7 @@ bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_float32")) return false;
   *out = read_scalar<float>(*arr, index);
   return true;
 }
@@ -177,6 +206,7 @@ bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_int32")) return false;
   *out = read_scalar<int32_t>(*arr, index);
   return true;
 }
@@ -185,6 +215,7 @@ bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
+  if (!ensure_readable(*arr, "array_item_at_uint32")) return false;
   *out = read_scalar<uint32_t>(*arr, index);
   return true;
 }

@@ -1123,9 +1123,10 @@ mod mock_backend_tests {
 
     /// D11 — a STREAMING delta turn's terminal chunk reports the
     /// family's `stream_delta_prompt_tokens` choice (default: the DELTA
-    /// token count, qwen3_5/MoE behavior), while the sync delta result
-    /// keeps the full history+delta length (asserted in the lifecycle
-    /// test above).
+    /// token count — legacy qwen3_5 MoE behavior, kept until S9; the
+    /// dense S8 backend overrides to the full length), while the sync
+    /// delta result keeps the full history+delta length (asserted in
+    /// the lifecycle test above).
     #[test]
     fn streaming_delta_terminal_chunk_reports_delta_prompt_tokens() {
         let mut backend = MockBackend::new(vec![
