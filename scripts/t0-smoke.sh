@@ -141,7 +141,9 @@ run_family() {
             return 1
         fi
         log_err "FATAL: model path for $family not found: $model_path"
-        log_err "  Set SMOKE_${family^^}_PATH or add $family to MLX_SMOKE_ALLOW_SKIP to skip."
+        local family_upper
+        family_upper="$(echo "$family" | tr 'a-z' 'A-Z')"
+        log_err "  Set SMOKE_${family_upper}_PATH or add $family to MLX_SMOKE_ALLOW_SKIP to skip."
         exit 1
     fi
 
@@ -174,34 +176,44 @@ do_capture() {
     mkdir -p "$BASELINE_DIR"
     log "Capturing baselines into $BASELINE_DIR"
 
-    declare -A results=()
+    # Bash-3.2 compatible: per-family scalar variables instead of associative array.
+    local res_qwen3=UNKNOWN res_qwen3_5=UNKNOWN res_gemma4=UNKNOWN res_lfm2=UNKNOWN res_qwen3_5_moe=UNKNOWN
 
     # --- qwen3 ---
     run_family qwen3 qwen3_smoke "$SMOKE_QWEN3_PATH" MLX_SMOKE_QWEN3_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3]=CAPTURED || results[qwen3]=SKIPPED
+        && res_qwen3=CAPTURED || res_qwen3=SKIPPED
 
     # --- qwen3_5 ---
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3_5]=CAPTURED || results[qwen3_5]=SKIPPED
+        && res_qwen3_5=CAPTURED || res_qwen3_5=SKIPPED
 
     # --- gemma4 ---
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$BASELINE_DIR" \
-        && results[gemma4]=CAPTURED || results[gemma4]=SKIPPED
+        && res_gemma4=CAPTURED || res_gemma4=SKIPPED
 
     # --- lfm2 (allow up to 15 minutes for cold USB mmap) ---
     run_family lfm2 lfm2_smoke "$SMOKE_LFM2_PATH" MLX_SMOKE_LFM2_MODEL_PATH "$BASELINE_DIR" \
-        && results[lfm2]=CAPTURED || results[lfm2]=SKIPPED
+        && res_lfm2=CAPTURED || res_lfm2=SKIPPED
 
     # --- qwen3_5_moe (may be slow on cold USB) ---
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3_5_moe]=CAPTURED || results[qwen3_5_moe]=SKIPPED
+        && res_qwen3_5_moe=CAPTURED || res_qwen3_5_moe=SKIPPED
 
     echo ""
     echo "=== capture summary ==="
     local any_skipped=0
     for family in qwen3 qwen3_5 gemma4 lfm2 qwen3_5_moe; do
-        echo "  ${results[$family]:-UNKNOWN}  $family"
-        [[ "${results[$family]:-UNKNOWN}" == "SKIPPED" ]] && any_skipped=1
+        local fam_status
+        case "$family" in
+            qwen3)       fam_status="$res_qwen3" ;;
+            qwen3_5)     fam_status="$res_qwen3_5" ;;
+            gemma4)      fam_status="$res_gemma4" ;;
+            lfm2)        fam_status="$res_lfm2" ;;
+            qwen3_5_moe) fam_status="$res_qwen3_5_moe" ;;
+            *)           fam_status=UNKNOWN ;;
+        esac
+        echo "  $fam_status  $family"
+        [[ "$fam_status" == "SKIPPED" ]] && any_skipped=1
     done
     echo ""
     echo "Baseline written to $BASELINE_DIR"
@@ -232,30 +244,39 @@ do_compare() {
     mkdir -p "$CURRENT_DIR"
     log "Comparing against baseline in $BASELINE_DIR"
 
-    declare -A run_results=()
+    # Bash-3.2 compatible: per-family scalar variables instead of associative array.
+    local rr_qwen3=UNKNOWN rr_qwen3_5=UNKNOWN rr_gemma4=UNKNOWN rr_lfm2=UNKNOWN rr_qwen3_5_moe=UNKNOWN
 
     # Run all families into current/. run_family exits on hard errors;
     # return 1 only on MLX_SMOKE_ALLOW_SKIP soft-skip.
     run_family qwen3 qwen3_smoke "$SMOKE_QWEN3_PATH" MLX_SMOKE_QWEN3_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3]=RAN || run_results[qwen3]=SKIPPED
+        && rr_qwen3=RAN || rr_qwen3=SKIPPED
 
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3_5]=RAN || run_results[qwen3_5]=SKIPPED
+        && rr_qwen3_5=RAN || rr_qwen3_5=SKIPPED
 
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[gemma4]=RAN || run_results[gemma4]=SKIPPED
+        && rr_gemma4=RAN || rr_gemma4=SKIPPED
 
     run_family lfm2 lfm2_smoke "$SMOKE_LFM2_PATH" MLX_SMOKE_LFM2_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[lfm2]=RAN || run_results[lfm2]=SKIPPED
+        && rr_lfm2=RAN || rr_lfm2=SKIPPED
 
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3_5_moe]=RAN || run_results[qwen3_5_moe]=SKIPPED
+        && rr_qwen3_5_moe=RAN || rr_qwen3_5_moe=SKIPPED
 
     echo ""
     echo "=== compare summary ==="
     local any_failed=0
     for family in qwen3 qwen3_5 gemma4 lfm2 qwen3_5_moe; do
-        local run_status="${run_results[$family]:-UNKNOWN}"
+        local run_status
+        case "$family" in
+            qwen3)       run_status="$rr_qwen3" ;;
+            qwen3_5)     run_status="$rr_qwen3_5" ;;
+            gemma4)      run_status="$rr_gemma4" ;;
+            lfm2)        run_status="$rr_lfm2" ;;
+            qwen3_5_moe) run_status="$rr_qwen3_5_moe" ;;
+            *)           run_status=UNKNOWN ;;
+        esac
 
         if [[ "$run_status" == "SKIPPED" ]]; then
             # Skipped families must also be absent from baseline to be consistent.
