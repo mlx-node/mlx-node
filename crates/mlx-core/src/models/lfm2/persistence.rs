@@ -32,7 +32,7 @@ use crate::tokenizer::Qwen3Tokenizer;
 use crate::nn::{Embedding, Linear};
 
 use super::config::Lfm2Config;
-use super::model::{Lfm2Inner, Lfm2Model, handle_lfm2_cmd};
+use super::model::{Lfm2Inner, Lfm2Model};
 
 /// Build the quantized expert SwitchLinear for `prefix`, dispatching on the
 /// per-layer quant mode. Mirrors qwen3_5_moe's `try_build_qsl`.
@@ -2154,7 +2154,7 @@ impl Lfm2Model {
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((inner, (config, cache_limit_guard, paged_active)))
             },
-            handle_lfm2_cmd,
+            crate::engine::cmd::handle_chat_cmd::<Lfm2Inner>,
         );
 
         let (config, cache_limit_guard, paged_active) = init_rx

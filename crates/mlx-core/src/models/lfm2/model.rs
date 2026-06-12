@@ -7,20 +7,25 @@ use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
-use crate::model_thread::{ResponseTx, StreamTx};
+use crate::decode_profiler::DecodeProfiler;
+use crate::engine::backend::{
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
+    TurnSetup, WholeTurnArgs,
+};
+use crate::engine::cmd::ChatCmd;
+use crate::engine::napi_glue::start_chat_stream;
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::models::qwen3_5::chat_common::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
-    default_thinking_budget_for_effort, extract_chat_params, finalize_chat_result,
-    generated_capacity_hint, kv_capacity_round_up, parse_thinking_and_tools,
-    raw_text_with_reasoning_suppressed, resolve_enable_thinking, resolve_include_reasoning,
-    send_stream_error,
+    default_thinking_budget_for_effort, finalize_chat_result, generated_capacity_hint,
+    kv_capacity_round_up,
 };
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
+use crate::profiling::PerformanceMetrics;
 use crate::sampling::sample;
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -128,95 +133,19 @@ pub(crate) struct Lfm2Inner {
     pub(crate) non_quant_floats_bf16: bool,
 }
 
-/// Commands dispatched from NAPI methods to the dedicated model thread.
-pub(crate) enum Lfm2Cmd {
-    /// Start a new session via the jinja-render path with `<|im_end|>` as
-    /// the stop token. See [`Lfm2Inner::chat_session_start_sync`] for the
-    /// behavioural contract (full cache reset, session boundary on
-    /// `<|im_end|>`).
-    ChatSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session by appending a user turn. See
-    /// [`Lfm2Inner::chat_session_continue_sync`] — builds a raw ChatML delta
-    /// from `user_message`, tokenizes it, and prefills on top of the live
-    /// caches.
-    ///
-    /// LFM2 is text-only; `images` is an opt-in guard parameter that is
-    /// rejected with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed
-    /// error so the TS `ChatSession` layer can route image-changes back
-    /// through a fresh `chat_session_start` uniformly across model backends.
-    ChatSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Continue an existing session with a tool-result delta. See
-    /// [`Lfm2Inner::chat_session_continue_tool_sync`] — builds a plain
-    /// `<|im_start|>tool\n{content}<|im_end|>` delta (matching LFM2's
-    /// template which does NOT use Qwen3.5's `<tool_response>` wrapping)
-    /// and prefills on top of the live caches.
-    ///
-    /// `is_error` is the structured tool-error signal threaded through
-    /// from the NAPI surface. When `Some(true)`, the renderer prepends
-    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<|im_start|>tool` block. `None` / `Some(false)` produce the
-    /// pre-feature byte-equal output.
-    ChatSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        reply: ResponseTx<ChatResult>,
-    },
-    /// Streaming session-start: same semantics as
-    /// [`ChatSessionStart`](Self::ChatSessionStart) but streams token
-    /// deltas through `stream_tx`.
-    ChatStreamSessionStart {
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming session-continue: same semantics as
-    /// [`ChatSessionContinue`](Self::ChatSessionContinue) but streams
-    /// token deltas through `stream_tx`. Carries the same opt-in
-    /// `images` guard parameter.
-    ChatStreamSessionContinue {
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Streaming tool-result continuation: same semantics as
-    /// [`ChatSessionContinueTool`](Self::ChatSessionContinueTool) but
-    /// streams token deltas through `stream_tx`. Carries the same
-    /// structured `is_error` signal.
-    ChatStreamSessionContinueTool {
-        tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    },
-    /// Reset all caches and clear cached token history. Exposed so tests
-    /// and session-management code can start from a known clean state
-    /// between turns.
-    ResetCaches { reply: ResponseTx<()> },
-}
+/// Adapter giving the kept paged streaming cores their legacy
+/// `cb.call(result, mode)` shape over the engine's [`ChunkSink`].
+///
+/// Pre-S11 this wrapped the raw `StreamTx`; the engine now owns the
+/// channel and hands the paged probe a `&dyn ChunkSink`, so the wrapper
+/// forwards `.call()` to [`ChunkSink::send`] (the call mode is
+/// meaningless on the mpsc path and is dropped, exactly like the old
+/// `StreamTx` wrapper did).
+struct StreamSender<'a>(&'a dyn ChunkSink);
 
-/// Wrapper to adapt `StreamTx` to the same `call()` API as
-/// napi `ThreadsafeFunction`, so decode loop code can use a uniform interface.
-struct StreamSender(StreamTx<ChatStreamChunk>);
-
-impl StreamSender {
+impl StreamSender<'_> {
     fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        let _ = self.0.send(result);
+        self.0.send(result);
     }
 }
 
@@ -565,7 +494,13 @@ impl Lfm2Inner {
     }
 
     /// Reset all caches and cached token history.
-    fn reset_caches(&mut self) {
+    ///
+    /// Renamed from the pre-S11 inherent `reset_caches` so the
+    /// [`ChatBackend::reset_caches`] trait method (which takes a
+    /// [`ResetScope`]) cannot shadow it at concrete-typed call sites.
+    /// Both engine scopes dispatch here — lfm2 treats the turn-internal
+    /// prefix-miss reset and the explicit command reset identically.
+    fn reset_caches_internal(&mut self) {
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
         self.cached_image_key = None;
@@ -656,42 +591,6 @@ impl Lfm2Inner {
         Ok(())
     }
 
-    /// Check if tokens share a prefix with cached_token_history and return the prefix length.
-    ///
-    /// **Safety invariant**: this helper returns ONLY `0` (cache miss) or
-    /// `cached_token_history.len()` (either an exact-append hit where the
-    /// new prompt strictly extends the cached one, or an exact match where
-    /// the new prompt equals the cached one). It never returns an
-    /// intermediate value. Combined with the "no mid-sequence rewind"
-    /// policy in [`Self::chat_sync_core`], this keeps LFM2's conv-state + KV
-    /// caches safe under the prefix-reuse path.
-    ///
-    /// The caller must additionally distinguish strict-extend
-    /// (`cached_prefix_len < tokens.len()`, warm-reuse safe) from
-    /// exact-match (`cached_prefix_len == tokens.len()`). Only the
-    /// strict-extend case is served via the warm path; exact-match is
-    /// routed back through the cache-miss branch because LFM2's short-conv
-    /// layers have non-invertible left-padded state and we have no safe
-    /// "rewind-by-1" primitive. Attempting to reprefill the final cached
-    /// token over the live caches would advance conv/KV state to
-    /// `prompt + last_token` (duplicated) while `save_cache_state` only
-    /// persists `tokens` into `cached_token_history`, corrupting the next
-    /// warm-hit turn.
-    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
-        if !reuse_cache {
-            return 0;
-        }
-        let cached = &self.cached_token_history;
-        if !cached.is_empty()
-            && tokens.len() >= cached.len()
-            && tokens[..cached.len()] == cached[..]
-        {
-            cached.len()
-        } else {
-            0
-        }
-    }
-
     /// Save cache state for reuse in the next chat-session continue call.
     ///
     /// `last_token_in_cache` must reflect whether the final entry in
@@ -703,7 +602,11 @@ impl Lfm2Inner {
     /// reason string) keeps `cached_token_history` aligned with the layer
     /// caches so a later `reuse_cache=true` call can't skip prefill for an
     /// uncached tail token.
-    fn save_cache_state(
+    /// Renamed from the pre-S11 inherent `save_cache_state` so the
+    /// [`ChatBackend::save_cache_state`] trait method (which takes
+    /// [`SaveStateArgs`]) cannot shadow it; the trait impl and the kept
+    /// paged cores all dispatch here.
+    fn save_cache_state_internal(
         &mut self,
         reuse_cache: bool,
         tokens: &[u32],
@@ -720,503 +623,13 @@ impl Lfm2Inner {
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
         } else {
-            self.reset_caches();
+            self.reset_caches_internal();
         }
     }
 
-    /// Core synchronous chat implementation.
-    ///
-    /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML delimiters). Session entry
-    /// points always supply this explicitly.
-    fn chat_sync_core(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        eos_token_id: u32,
-    ) -> Result<ChatResult> {
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        let tool_defs = config.tools.as_deref();
-        let enable_thinking = resolve_enable_thinking(&config);
-        let include_reasoning = resolve_include_reasoning(&config);
-        let p = extract_chat_params(&config);
-        let reuse_cache = p.reuse_cache;
-        let report_perf = p.report_performance;
-        let max_new_tokens = p.max_new_tokens;
-
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
-
-        // Block-paged dispatch: when the adapter is configured, route
-        // through the parallel `chat_sync_core_paged` path. The flat path
-        // below stays untouched so the off-by-default behavior is byte-identical.
-        if self.paged_adapter.is_some() {
-            return self.chat_sync_core_paged(
-                tokens,
-                tokenizer,
-                think_end_id,
-                think_end_str,
-                include_reasoning,
-                p,
-                enable_thinking,
-                config.reasoning_effort.clone(),
-                report_perf,
-                eos_token_id,
-            );
-        }
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        // Cache reuse: prefix verification
-        //
-        // `verify_cache_prefix` returns 0 on miss or `cached.len()` on exact-append
-        // hit — never an intermediate value (see its rustdoc). We split tokens into
-        // "already-cached prefix" and "new delta to prefill":
-        //   * miss            → reset caches, prefill the full prompt
-        //   * strict extend   → skip the cached prefix, prefill only the tail delta
-        //   * exact match     → treat as a miss (see rationale below)
-        let cached_prefix_len_raw = self.verify_cache_prefix(&tokens, reuse_cache);
-
-        let (prefill_tokens, cached_prefix_len) =
-            if cached_prefix_len_raw > 0 && cached_prefix_len_raw < tokens.len() {
-                info!(
-                    "Cache reuse: {} cached tokens, {} new tokens to prefill",
-                    cached_prefix_len_raw,
-                    tokens.len() - cached_prefix_len_raw,
-                );
-                (
-                    tokens[cached_prefix_len_raw..].to_vec(),
-                    cached_prefix_len_raw,
-                )
-            } else {
-                // Cache miss OR exact-match (cached_prefix_len_raw == tokens.len()).
-                //
-                // Exact-match is deliberately treated as a miss: LFM2's short-conv
-                // layers carry non-invertible left-padded state that depends on
-                // every prior token, so we have no safe "rewind-by-1" primitive.
-                // An earlier version reprefilled just the last cached token to
-                // reuse live caches, but that advances conv/KV state to
-                // `prompt + last_token` (duplicated) while `save_cache_state`
-                // writes only `tokens` into `cached_token_history`. The resulting
-                // drift between live cache and history would corrupt the next
-                // warm-hit turn.
-                //
-                // Wiping caches + token history here starts the prefill from a
-                // clean slate and keeps cache state aligned with what
-                // `save_cache_state` persists after generation.
-                self.reset_caches();
-                (tokens.clone(), 0)
-            };
-
-        let eos_id = eos_token_id;
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut token_history: Vec<u32> = tokens.clone();
-        let mut finish_reason = String::from("length");
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
-
-        let prompt_token_count = tokens.len();
-
-        // Reasoning tracker
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
-
-        // Prefill: process prompt tokens through chunked forward pass
-        let token_arr: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, prefill_tokens.len() as i64])?;
-
-        let logits = self.chunked_prefill(&prompt, generation_stream)?;
-
-        // Take logits for last token only (use actual returned seq len, not total prompt len)
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-
-        // Apply penalties and sample first token
-        let sampling_config = p.sampling_config;
-        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-
-        // Eval all caches after prefill
-        eval_lfm2_caches(&self.caches)?;
-
-        // Mark first token time
-        if report_perf {
-            first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // ===== Compiled C++ decode-path dispatch =====
-        // Serialize the compiled lifecycle across model instances on the SHARED
-        // cross-family mutex (the same instance qwen3.5 locks), then re-validate
-        // ownership under the weight RwLock read guard, held for the whole
-        // decode loop. Poison-recover both locks (a panicked prior holder must
-        // not wedge inference forever — banned `.unwrap()` on these paths).
-        //
-        // LOCK CONTRACT (compiled-closure lifecycle, mirrors the qwen3.5 dense
-        // path): registration is the WRITER — `register_weights_with_cpp` holds
-        // `COMPILED_WEIGHTS_RWLOCK.write()` and, in one critical section, clears
-        // + re-stores weights, bumps the compile epoch
-        // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
-        // (`mlx_set_model_id`). Decode is the READER — the `_weight_guard`
-        // (`.read()`, poison-recovered) below spans BOTH the
-        // `mlx_lfm2_get_model_id()` re-check AND every subsequent
-        // `mlx_lfm2_moe_*` / `compiled_lfm2_decode()` invocation in this function
-        // (it is kept alive until end-of-scope, after the decode loop and the
-        // post-loop cache export). So the (epoch, id) pair this read guard
-        // validates is exactly the one the compiled graph executes against — a
-        // registration cannot interleave between the re-check and the forwards.
-        // The C++ side additionally guards the epoch-check + recompile with its
-        // own `g_lfm2_compiled_mu` and returns the closure BY VALUE, so even a
-        // hypothetical caller that did NOT hold this read lock could not dangle
-        // its closure handle.
-        let use_compiled_pre = self.compiled_path_active();
-        let _compiled_lock = if use_compiled_pre {
-            Some(
-                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        // `mut` so the seed step below can drop back to native on any failure.
-        let mut use_compiled = if use_compiled_pre {
-            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
-                _weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // Seed the compiled decode graph ONCE from the post-prefill caches.
-        // On any failure (init bailed, missing handle), drop back to native by
-        // clearing `use_compiled` for the loop. The distinct reset guard fires
-        // `mlx_lfm2_moe_reset()` on EVERY exit path (including `?`
-        // early-returns and a partial/failed seed) so no stale C++ state leaks.
-        let _compiled_reset_guard = if use_compiled {
-            Some(Lfm2CompiledResetGuard)
-        } else {
-            None
-        };
-        let embed_tokens_weight = if use_compiled {
-            // Tied dense embedding only — lfm2 compiled checkpoints (dense OR
-            // MoE) are never packed-quantized on the compiled path (the gate
-            // excludes any `.scales` checkpoint, and bf16 lfm2 ships a dense
-            // embedding). `get_weight()` is infallible (returns MxArray, not
-            // Result).
-            Some(self.embed_tokens.get_weight())
-        } else {
-            None
-        };
-        if use_compiled {
-            let num_layers = self.config.num_hidden_layers as usize;
-
-            // CRITICAL: seed the compiled decode position from the LIVE
-            // attention KV offset, NOT `seq_len`. `seq_len` is the logits
-            // length returned by `chunked_prefill`, which is only the FINAL
-            // chunk for prompts over `PREFILL_STEP_SIZE`, or just the
-            // uncached tail delta on a warm strict-extend reuse hit. The
-            // `KVCache` offset, by contrast, accumulates prefix + delta across
-            // every chunk and across reuse, so it is the true sequence
-            // position. Seeding from `seq_len` would build the C++ causal mask
-            // and KV write index from a too-small offset, masking out valid
-            // prefix tokens and overwriting live slots. All attention layers
-            // must agree on the offset; if any disagrees (corrupt/partial
-            // cache), fall back to native rather than seed a wrong position.
-            let mut cache_offset: Option<i32> = None;
-            let mut offset_ok = true;
-            for cache in self.caches.iter() {
-                if let Lfm2LayerCache::Attention(kv) = cache {
-                    let off = kv.get_offset();
-                    match cache_offset {
-                        None => cache_offset = Some(off),
-                        Some(prev) if prev != off => {
-                            offset_ok = false;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let prefill_len = cache_offset.unwrap_or(0);
-            if !offset_ok || cache_offset.is_none() {
-                // No attention layer (impossible for a real lfm2 config — every
-                // shipping checkpoint interleaves ≥1 full_attention layer) or
-                // attention layers reporting inconsistent offsets (corrupt /
-                // partial cache). Either way, refuse to seed a wrong position
-                // and fall back to native. The debug log distinguishes this
-                // from the missing-handle fallback below so a hypothetical
-                // zero-attention config doesn't fail silently.
-                tracing::debug!(
-                    "lfm2 compiled decode: no consistent attention KV offset \
-                     (offset_ok={offset_ok}, has_offset={}); using native path",
-                    cache_offset.is_some()
-                );
-                offset_ok = false;
-            }
-            // Budget the fixed padded cache from the TRUE position so decode
-            // can never exceed it (slice_update OOB / silent corruption).
-            let max_kv_len = kv_capacity_round_up(prefill_len, max_new_tokens)?;
-
-            // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
-            // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
-            let is_attn: Vec<i32> = (0..num_layers)
-                .map(|i| i32::from(self.config.is_attention_layer(i)))
-                .collect();
-
-            // Cache pointers, stride 2 by ABSOLUTE layer idx. attn layer ->
-            // KVCache keys_ref()/values_ref() (MATERIALIZED above via
-            // eval_lfm2_caches); conv layer -> ArraysCache slot 0, null at +1.
-            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                vec![std::ptr::null_mut(); num_layers * 2];
-            // Carry the offset-consistency check forward: a bad/inconsistent
-            // attention offset must also block the seed (→ native fallback).
-            let mut seed_ok = offset_ok;
-            for (i, cache) in self.caches.iter().enumerate() {
-                match cache {
-                    Lfm2LayerCache::Attention(kv) => match (kv.keys_ref(), kv.values_ref()) {
-                        (Some(k), Some(v)) => {
-                            cache_ptrs[i * 2] = k.as_raw_ptr();
-                            cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
-                        }
-                        _ => {
-                            seed_ok = false;
-                            break;
-                        }
-                    },
-                    Lfm2LayerCache::Conv(c) => match c.get(0) {
-                        Some(state) => {
-                            cache_ptrs[i * 2] = state.as_raw_ptr();
-                            // slot.b stays null — conv branch never reads it.
-                        }
-                        None => {
-                            seed_ok = false;
-                            break;
-                        }
-                    },
-                }
-            }
-
-            if seed_ok {
-                unsafe {
-                    mlx_sys::mlx_lfm2_moe_init_from_prefill(
-                        self.config.num_hidden_layers,
-                        self.config.hidden_size,
-                        self.config.num_attention_heads,
-                        self.config.num_key_value_heads,
-                        self.config.head_dim(),
-                        self.config.rope_theta as f32,
-                        self.config.norm_eps as f32,
-                        self.config.conv_l_cache,
-                        self.config.num_experts.unwrap_or(0),
-                        self.config.num_experts_per_tok.unwrap_or(0),
-                        self.config.num_dense_layers.unwrap_or(0),
-                        i32::from(self.config.norm_topk_prob.unwrap_or(true)),
-                        i32::from(self.config.use_expert_bias.unwrap_or(true)),
-                        i32::from(self.config.tie_embedding),
-                        i32::from(self.config.conv_bias),
-                        max_kv_len,
-                        1,
-                        is_attn.as_ptr(),
-                        cache_ptrs.as_mut_ptr(),
-                        prefill_len,
-                    );
-                }
-                // C++ init is `void` but can still bail internally (a null
-                // slot or a padding/concatenate exception sets g_lfm2_inited
-                // = false). Confirm it actually seeded; if not, drop to native
-                // BEFORE the loop rather than letting the first forward return
-                // null logits and be treated as a fatal error.
-                if unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() } == 0 {
-                    warn!("lfm2 compiled decode: C++ seed did not initialize; using native path");
-                    use_compiled = false;
-                }
-            } else {
-                warn!(
-                    "lfm2 compiled decode: missing/inconsistent post-prefill cache state; using native path"
-                );
-                use_compiled = false;
-            }
-        }
-
-        // Decode loop — double-buffered lazy eval pattern. The per-step forward
-        // is the compiled C++ step when `use_compiled`, else the native forward.
-        let mut last_token_in_cache = false;
-        for step in 0..max_new_tokens {
-            let next_y = if step + 1 < max_new_tokens {
-                let _stream_ctx = StreamContext::new(generation_stream);
-
-                let next_ids = y.reshape(&[1, 1])?;
-                let logits = if use_compiled {
-                    // Compiled path returns [B, vocab] (already 2D).
-                    let emb = embed_tokens_weight.as_ref().ok_or_else(|| {
-                        Error::from_reason("lfm2 compiled decode: missing embedding weight")
-                    })?;
-                    let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-                    let mut off: i32 = 0;
-                    unsafe {
-                        mlx_sys::mlx_lfm2_moe_forward(
-                            next_ids.as_raw_ptr(),
-                            emb.as_raw_ptr(),
-                            &mut out_ptr,
-                            &mut off,
-                        );
-                    }
-                    if out_ptr.is_null() {
-                        return Err(Error::from_reason(
-                            "lfm2 compiled decode: mlx_lfm2_moe_forward returned null logits",
-                        ));
-                    }
-                    MxArray::from_handle(out_ptr, "lfm2 compiled decode logits")?
-                } else {
-                    let logits = self.forward(&next_ids)?;
-                    logits.squeeze(Some(&[1]))?
-                };
-
-                // Budget enforcement
-                let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    (MxArray::from_int32(&[forced_id], &[1])?, true)
-                } else {
-                    let logits = apply_all_penalties(logits, &token_history, &p)?;
-                    let t = sample(&logits, sampling_config)?;
-                    (t, false)
-                };
-
-                if use_compiled {
-                    // Evaluating the token triggers the whole compiled graph
-                    // (logits + caches via the dependency edges).
-                    unsafe {
-                        mlx_sys::mlx_lfm2_moe_eval_token_and_caches(next_token.as_raw_ptr());
-                    }
-                } else {
-                    MxArray::async_eval_arrays(&[&next_token]);
-                }
-                Some(next_token)
-            } else {
-                None
-            };
-
-            // The forward pass inside the branch above writes the current `y`
-            // into KV/conv caches, so the token we are about to push is cached
-            // iff that branch ran (i.e. `next_y.is_some()`).
-            last_token_in_cache = next_y.is_some();
-
-            // Extract current token
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            reasoning_tracker.observe_token(token_id);
-
-            // Check stop condition
-            if token_id == eos_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            match next_y {
-                Some(next) => y = next,
-                None => break,
-            }
-
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
-        }
-
-        // TEARDOWN: when the compiled path ran and the caller wants to reuse the
-        // cache, export the C++ caches back into `self.caches` and MATERIALIZE
-        // them BEFORE `Lfm2CompiledResetGuard` drops (which calls
-        // `mlx_lfm2_moe_reset()` and frees the compiled globals). Exported
-        // handles are lazy copies whose graph still references compiled nodes;
-        // without an eval here the next turn would feed freed buffers to the
-        // GPU. Collect + eval before any fallible op so no `?` can skip
-        // materialization.
-        if use_compiled && reuse_cache {
-            self.export_compiled_caches()?;
-        }
-        // `_compiled_reset_guard` drops at end of function AFTER the export+eval
-        // above and AFTER `save_cache_state`, tearing down the C++ state. The
-        // `_compiled_lock` / `_weight_guard` are likewise held until scope end.
-
-        // Save cache state for next call
-        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
-
-        // Compute performance metrics
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill_tokens.len(),
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count as u32,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len as u32;
-        Ok(result)
-    }
-
-    /// Block-paged variant of [`Self::chat_sync_core`].
+    /// Block-paged whole-turn core (kept behind the engine's
+    /// [`ChatBackend::paged_turn`] probe since S11; pre-S11 this was the
+    /// block-paged variant of the deleted flat `chat_sync_core`).
     ///
     /// Mirrors the flat path's control flow (penalty stack, decode loop,
     /// EOS / repetition cutoff, performance timing, output post-processing)
@@ -1264,8 +677,7 @@ impl Lfm2Inner {
         think_end_id: Option<u32>,
         think_end_str: Option<String>,
         include_reasoning: bool,
-        p: crate::models::qwen3_5::chat_common::ChatParams,
-        _enable_thinking: Option<bool>,
+        p: &crate::models::qwen3_5::chat_common::ChatParams,
         reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
@@ -1397,7 +809,7 @@ impl Lfm2Inner {
             &tokens,
             cached_prefix_len,
             suffix_len,
-            &p,
+            p,
             eos_token_id,
             &sampling_config,
             &mut reasoning_tracker,
@@ -1437,7 +849,7 @@ impl Lfm2Inner {
         // Mirrors `save_cache_state(reuse_cache=true, ..., last_token_in_cache=false)`
         // on the flat path.
         let last_token_in_cache = false;
-        self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
+        self.save_cache_state_internal(true, &tokens, &generated_tokens, last_token_in_cache);
 
         // Performance metrics.
         // Paged prefill reprocesses the FULL prompt through conv layers
@@ -2223,13 +1635,12 @@ impl Lfm2Inner {
         think_end_id: Option<u32>,
         think_end_str: Option<String>,
         include_reasoning: bool,
-        p: crate::models::qwen3_5::chat_common::ChatParams,
-        _enable_thinking: Option<bool>,
+        p: &crate::models::qwen3_5::chat_common::ChatParams,
         reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
     ) -> Result<()> {
         let prompt_token_count = tokens.len();
         let sampling_config = p.sampling_config;
@@ -2353,7 +1764,7 @@ impl Lfm2Inner {
             &tokens,
             cached_prefix_len,
             suffix_len,
-            &p,
+            p,
             sampling_config,
             eos_token_id,
             &mut reasoning_tracker,
@@ -2392,7 +1803,7 @@ impl Lfm2Inner {
         // See the non-streaming `chat_sync_core_paged` for the rationale
         // on `last_token_in_cache = false`.
         let last_token_in_cache = false;
-        self.save_cache_state(true, &tokens, &generated_tokens, last_token_in_cache);
+        self.save_cache_state_internal(true, &tokens, &generated_tokens, last_token_in_cache);
 
         // Flush residual buffered bytes from decode_stream (mirrors flat
         // streaming).
@@ -2510,8 +1921,8 @@ impl Lfm2Inner {
         >,
         streamed_text_len: &mut usize,
         last_is_reasoning: &mut bool,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
@@ -2635,626 +2046,207 @@ impl Lfm2Inner {
         Ok((generated_tokens, finish_reason))
     }
 
-    /// Core streaming chat implementation.
+    /// Block-paged whole-turn dispatch behind the engine's
+    /// [`ChatBackend::paged_turn`] probe (S11).
     ///
-    /// `eos_token_id` is the caller-supplied stop-on token id (e.g.
-    /// `<|im_end|>` for Qwen-style ChatML delimiters). Session entry
-    /// points always supply this explicitly.
-    fn chat_stream_sync_core(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        eos_token_id: u32,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
+    /// Routes the two FRESH turn shapes onto the kept paged cores
+    /// verbatim: sync → [`Self::chat_sync_core_paged`], streaming →
+    /// [`Self::chat_stream_sync_core_paged`]. Delta turns never reach
+    /// this helper — [`ChatBackend::paged_turn`] declines them (legacy
+    /// lfm2 delta paths run the flat eager prefill+decode over
+    /// `self.caches` even when `paged_adapter` is `Some`).
+    ///
+    /// Parameter mapping == the deleted flat-core dispatch:
+    /// `think_end_id`/`think_end_str` from the tokenizer,
+    /// `include_reasoning`/`report_perf` from the resolved params
+    /// (`extract_chat_params` resolves `include_reasoning` via the same
+    /// `resolve_include_reasoning` the legacy dispatch called), and the
+    /// raw `config.reasoning_effort` for the thinking-budget derivation.
+    fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        let tokenizer = args.tokenizer.clone();
         let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        let tool_defs = config.tools.as_deref();
-        let enable_thinking = resolve_enable_thinking(&config);
-        let include_reasoning = resolve_include_reasoning(&config);
-        let p = extract_chat_params(&config);
-        let reuse_cache = p.reuse_cache;
-        let report_perf = p.report_performance;
-        let max_new_tokens = p.max_new_tokens;
-
-        let tokens = tokenizer.apply_chat_template_sync(
-            &messages,
-            Some(true),
-            tool_defs,
-            enable_thinking,
-        )?;
-
-        // Block-paged dispatch: when the adapter is configured, route
-        // through the parallel `chat_stream_sync_core_paged` path. The
-        // flat path below stays untouched so the off-by-default behavior is
-        // byte-identical.
-        if self.paged_adapter.is_some() {
-            return self.chat_stream_sync_core_paged(
-                tokens,
-                tokenizer,
-                think_end_id,
-                think_end_str,
-                include_reasoning,
-                p,
-                enable_thinking,
-                config.reasoning_effort.clone(),
-                report_perf,
-                eos_token_id,
-                cb,
-                cancelled,
-            );
-        }
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        // Cache reuse — see the non-streaming `chat_sync_core` for the full
-        // rationale. Invariant: `verify_cache_prefix` returns 0 or
-        // `cached.len()` only. Strict-extend reuses the live caches; exact
-        // match falls through to the miss branch because LFM2 has no safe
-        // rewind primitive for its short-conv state.
-        let cached_prefix_len_raw = self.verify_cache_prefix(&tokens, reuse_cache);
-
-        let (prefill_tokens, cached_prefix_len) =
-            if cached_prefix_len_raw > 0 && cached_prefix_len_raw < tokens.len() {
-                (
-                    tokens[cached_prefix_len_raw..].to_vec(),
-                    cached_prefix_len_raw,
-                )
-            } else {
-                // Cache miss OR exact-match (treated as miss — see chat_sync_core
-                // for full rationale).
-                self.reset_caches();
-                (tokens.clone(), 0)
-            };
-
-        let eos_id = eos_token_id;
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut token_history: Vec<u32> = tokens.clone();
-        let mut finish_reason = String::from("length");
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
-
-        let prompt_token_count = tokens.len();
-
-        // Reasoning tracker
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
-
-        // Streaming decode state
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-
-        // Prefill: chunked forward pass
-        let token_arr: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, prefill_tokens.len() as i64])?;
-
-        let logits = self.chunked_prefill(&prompt, generation_stream)?;
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-
-        let sampling_config = p.sampling_config;
-        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-        eval_lfm2_caches(&self.caches)?;
-
-        if report_perf {
-            first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // Decode loop
-        let mut last_token_in_cache = false;
-        for step in 0..max_new_tokens {
-            let next_y = if step + 1 < max_new_tokens {
-                let _stream_ctx = StreamContext::new(generation_stream);
-
-                let next_ids = y.reshape(&[1, 1])?;
-                let logits = self.forward(&next_ids)?;
-                let logits = logits.squeeze(Some(&[1]))?;
-
-                let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    (MxArray::from_int32(&[forced_id], &[1])?, true)
-                } else {
-                    let logits = apply_all_penalties(logits, &token_history, &p)?;
-                    let t = sample(&logits, sampling_config)?;
-                    (t, false)
-                };
-
-                MxArray::async_eval_arrays(&[&next_token]);
-                Some(next_token)
-            } else {
-                None
-            };
-
-            // The forward pass inside the branch above writes the current `y`
-            // into KV/conv caches, so the token we are about to push is cached
-            // iff that branch ran (i.e. `next_y.is_some()`).
-            last_token_in_cache = next_y.is_some();
-
-            // Extract current token
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            let is_reasoning = reasoning_tracker.observe_token(token_id);
-            last_is_reasoning = is_reasoning;
-
-            // Check stop condition before streaming to avoid leaking EOS text
-            if token_id == eos_id {
-                finish_reason = String::from("stop");
-                break;
+        let think_end_str = tokenizer.think_end_str().map(|st| st.to_string());
+        let reasoning_effort = args.config.reasoning_effort.clone();
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                self.chat_stream_sync_core_paged(
+                    args.tokens.to_vec(),
+                    tokenizer,
+                    think_end_id,
+                    think_end_str,
+                    args.params.include_reasoning,
+                    args.params,
+                    reasoning_effort,
+                    args.params.report_performance,
+                    args.eos_id,
+                    &cb,
+                    cancelled,
+                )?;
+                Ok(TurnOutput::Streamed)
             }
-
-            // Check cancellation
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
+            _ => {
+                let result = self.chat_sync_core_paged(
+                    args.tokens.to_vec(),
+                    tokenizer,
+                    think_end_id,
+                    think_end_str,
+                    args.params.include_reasoning,
+                    args.params,
+                    reasoning_effort,
+                    args.params.report_performance,
+                    args.eos_id,
+                )?;
+                Ok(TurnOutput::Complete(Box::new(result)))
             }
+        }
+    }
+}
 
-            // Stream delta chunk
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                &mut decode_stream,
-                tokenizer.inner(),
-                token_id,
-                &generated_tokens,
-                streamed_text_len,
-            );
-            streamed_text_len += token_text.len();
-            // Suppress reasoning deltas when include_reasoning == false.
-            // Detokenize + length-advance above stay OUTSIDE this gate.
-            if include_reasoning || !is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
+/// Eager/compiled flat decode stepper for one lfm2 turn (S11,
+/// [`ChatBackend::begin_decode`]).
+///
+/// Byte-identical port of the deleted flat cores' decode-loop step
+/// bodies: the compiled C++ step (`mlx_lfm2_moe_forward` +
+/// `mlx_lfm2_moe_eval_token_and_caches`) when the turn's seed engaged
+/// the compiled path, else the native [`Lfm2Inner::forward`]. The RAII
+/// guards captured here reproduce the legacy in-scope teardown.
+pub(crate) struct Lfm2Decode<'a> {
+    // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION
+    // order, so these three guards MUST be listed reset-guard →
+    // weight-guard → lock so that `Lfm2CompiledResetGuard::drop()`
+    // (→ `mlx_lfm2_moe_reset()`) runs WHILE the lifecycle mutex +
+    // weight read lock are STILL held — the same reverse-drop order the
+    // deleted cores' locals had (declared lock → weight → reset).
+    _compiled_reset_guard: Option<Lfm2CompiledResetGuard>,
+    _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    inner: &'a mut Lfm2Inner,
+    /// Tied dense embedding weight — captured only on the compiled path
+    /// (the eager forward reads `self.embed_tokens` itself).
+    embed_tokens_weight: Option<MxArray>,
+    use_compiled: bool,
+    /// `params.reuse_cache` captured at `begin_decode` — gates the
+    /// compiled-cache export in [`DecodeStep::end_decode`].
+    reuse_cache: bool,
+}
+
+impl DecodeStep for Lfm2Decode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        if self.use_compiled {
+            // Compiled path returns [B, vocab] (already 2D) — `false` ==
+            // no squeeze, matching the legacy compiled branch.
+            let emb = self.embed_tokens_weight.as_ref().ok_or_else(|| {
+                Error::from_reason("lfm2 compiled decode: missing embedding weight")
+            })?;
+            let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+            let mut off: i32 = 0;
+            unsafe {
+                mlx_sys::mlx_lfm2_moe_forward(
+                    input_ids.as_raw_ptr(),
+                    emb.as_raw_ptr(),
+                    &mut out_ptr,
+                    &mut off,
                 );
             }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
+            if out_ptr.is_null() {
+                return Err(Error::from_reason(
+                    "lfm2 compiled decode: mlx_lfm2_moe_forward returned null logits",
+                ));
             }
-
-            match next_y {
-                Some(next) => y = next,
-                None => break,
-            }
-
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
-        }
-
-        // Save cache state
-        self.save_cache_state(reuse_cache, &tokens, &generated_tokens, last_token_in_cache);
-
-        // Flush residual buffered bytes from decode_stream
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Residual carries the last token's reasoning state; suppress when
-            // it is reasoning text and include_reasoning == false.
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
-
-        // Build final result
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                prefill_tokens.len(),
-                generated_tokens.len(),
-            )
+            Ok((
+                MxArray::from_handle(out_ptr, "lfm2 compiled decode logits")?,
+                false,
+            ))
         } else {
-            None
-        };
+            // Eager native forward returns [1, 1, vocab]; `true` == the
+            // legacy loops' explicit `squeeze(Some(&[1]))`.
+            Ok((self.inner.forward(input_ids)?, true))
+        }
+    }
 
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
+        // Legacy lfm2 never force-evals the logits — not even on the
+        // budget-forced path (the forced branch discards them lazily).
+        if self.use_compiled {
+            // Evaluating the token triggers the whole compiled graph
+            // (logits + caches via the dependency edges).
+            unsafe {
+                mlx_sys::mlx_lfm2_moe_eval_token_and_caches(next_token.as_raw_ptr());
+            }
+        } else {
+            MxArray::async_eval_arrays(&[next_token]);
+        }
+    }
 
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count as u32,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len as u32;
-
-        // Send final chunk
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: result.text.clone(),
-                done: true,
-                finish_reason: Some(result.finish_reason.clone()),
-                tool_calls: Some(result.tool_calls.clone()),
-                thinking: result.thinking.clone(),
-                num_tokens: Some(result.num_tokens),
-                prompt_tokens: Some(result.prompt_tokens),
-                reasoning_tokens: Some(result.reasoning_tokens),
-                raw_text: Some(result.raw_text.clone()),
-                // Start path: report the matched prefix length from
-                // `verify_cache_prefix`. Zero on a miss, full cached
-                // length on an exact-append hit.
-                cached_tokens: Some(cached_prefix_len as u32),
-                performance: result.performance.clone(),
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
+    fn end_decode(&mut self) -> Result<()> {
+        // TEARDOWN: when the compiled path ran and the caller wants to
+        // reuse the cache, export the C++ caches back into
+        // `inner.caches` and MATERIALIZE them BEFORE
+        // `Lfm2CompiledResetGuard` drops (which calls
+        // `mlx_lfm2_moe_reset()` and frees the compiled globals).
+        // Exported handles are lazy copies whose graph still references
+        // compiled nodes; without the eval inside
+        // `export_compiled_caches` the next turn would feed freed
+        // buffers to the GPU. Runs while the guards (fields above) are
+        // still held; an `Err` aborts the turn BEFORE
+        // `save_cache_state`, reproducing the legacy
+        // reset-without-export error path.
+        if self.use_compiled && self.reuse_cache {
+            self.inner.export_compiled_caches()?;
+        }
         Ok(())
     }
+}
 
-    // =================================================================
-    // Session API (mirrors the Qwen3.5 MoE surface, text-only).
-    // =================================================================
-
-    /// Start a new chat session.
-    ///
-    /// Fully resets the caches and delegates to [`Self::chat_sync_core`]
-    /// with `<|im_end|>` as the stop token so the decode loop leaves the
-    /// caches on a clean ChatML boundary that subsequent
-    /// [`Self::chat_session_continue_sync`] /
-    /// [`Self::chat_session_continue_tool_sync`] calls can append a raw
-    /// delta on top of.
-    pub(crate) fn chat_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // Mirror the symmetric guard in `chat_tokens_delta_sync`. The
-        // session API only makes sense with cache reuse enabled.
-        if config.reuse_cache == Some(false) {
-            return Err(Error::from_reason(
-                "chat_session_start requires reuse_cache=true (pass ChatConfig { reuse_cache: Some(true), .. } or leave as None). The session API only makes sense with cache reuse enabled.",
-            ));
-        }
-
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-        let im_end_id = tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
-
-        // NOTE: no unconditional reset here. Prefix-reuse support
-        // (pi-mono / Aider / Codex-style stateless agents that resend the
-        // full conversation every turn) requires `chat_sync_core` to
-        // decide whether to reset based on `verify_cache_prefix`'s
-        // return. A miss triggers an internal reset; a hit preserves the
-        // live caches and prefills only the tail delta. Wiping here
-        // would make every session-start a cache miss by construction.
-        self.chat_sync_core(messages, config, im_end_id)
-    }
-
-    /// Prefill a pre-tokenized delta on top of the existing LFM2 caches
-    /// (conv state + KV) and run the decode loop. Text-only session
-    /// primitive used by [`Self::chat_session_continue_sync`] and
-    /// [`Self::chat_session_continue_tool_sync`].
-    ///
-    /// Uses `<|im_end|>` as the eos token (not `config.eos_token_id`) so
-    /// the cached history continues to end on a clean ChatML boundary
-    /// for the next turn. `save_cache_state` runs unconditionally at
-    /// the end so the session stays consistent even on error.
-    pub(crate) fn chat_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        // The delta path is a session-reuse operation by construction.
-        if config.reuse_cache == Some(false) {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            ));
-        }
-        if self.cached_token_history.is_empty() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
-            ));
-        }
-        if delta_tokens.is_empty() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync requires a non-empty delta",
-            ));
-        }
-        if self.cached_image_key.is_some() {
-            return Err(Error::from_reason(
-                "chat_tokens_delta_sync is text-only; session currently holds image state",
-            ));
-        }
-
-        let tokenizer = self
-            .tokenizer
+impl ChatBackend for Lfm2Inner {
+    fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+        self.tokenizer
             .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        // Session path: use <|im_end|> as eos, NOT config.eos_token_id.
-        let eos_id = tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        let p = extract_chat_params(&config);
-        let report_perf = p.report_performance;
-        let max_new_tokens = p.max_new_tokens;
-        let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
-
-        // Capture the full prior-cached length BEFORE appending the
-        // delta so we can report it as `cached_tokens` on the returned
-        // ChatResult. The delta path always reuses the entire cached
-        // prefix (it's a strict extension on top of the session's
-        // existing `cached_token_history`), so `prior_cached_len` IS
-        // the number of prefilled tokens that were skipped thanks to
-        // the warm cache. Without this, every LFM2 delta turn returns
-        // `cached_tokens = 0` — `finalize_chat_result` defaults the
-        // field to zero and only the HTTP layer fills it in
-        // differently — which misreports every continuation as a MISS
-        // and prevents the `/v1/responses` endpoint from promoting
-        // `X-Session-Cache` to `prefix_hit`.
-        let prior_cached_len = self.cached_token_history.len();
-
-        // Build full token history = cached_history + delta. Used for
-        // penalty context AND as the running token history in the
-        // decode loop.
-        let mut full_token_history = self.cached_token_history.clone();
-        full_token_history.extend(delta_tokens.iter().copied());
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
-
-        let prompt_token_count = full_token_history.len() as u32;
-
-        // Save snapshot for save_cache_state (prior history + delta).
-        let save_tokens = full_token_history.clone();
-
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
-
-        // Prefill: chunked forward pass of the delta on top of existing caches.
-        let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, delta_tokens.len() as i64])?;
-
-        let logits = self.chunked_prefill(&prompt, generation_stream)?;
-
-        let seq_len = logits.shape_at(1)?;
-        let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-
-        let sampling_config = p.sampling_config;
-        let mut token_history: Vec<u32> = full_token_history;
-        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-
-        // Eval all caches after prefill so the prefix is materialized.
-        eval_lfm2_caches(&self.caches)?;
-
-        if report_perf {
-            first_token_instant = Some(std::time::Instant::now());
-        }
-
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = String::from("length");
-
-        // Decode loop — double-buffered lazy eval pattern (same as chat_sync_core).
-        let mut last_token_in_cache = false;
-        for step in 0..max_new_tokens {
-            let next_y = if step + 1 < max_new_tokens {
-                let _stream_ctx = StreamContext::new(generation_stream);
-
-                let next_ids = y.reshape(&[1, 1])?;
-                let logits = self.forward(&next_ids)?;
-                let logits = logits.squeeze(Some(&[1]))?;
-
-                let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    (MxArray::from_int32(&[forced_id], &[1])?, true)
-                } else {
-                    let logits = apply_all_penalties(logits, &token_history, &p)?;
-                    let t = sample(&logits, sampling_config)?;
-                    (t, false)
-                };
-
-                MxArray::async_eval_arrays(&[&next_token]);
-                Some(next_token)
-            } else {
-                None
-            };
-
-            last_token_in_cache = next_y.is_some();
-
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            reasoning_tracker.observe_token(token_id);
-
-            if token_id == eos_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            match next_y {
-                Some(next) => y = next,
-                None => break,
-            }
-
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
-        }
-
-        // Save cache state unconditionally so the session stays
-        // consistent for the next turn. The delta path always runs with
-        // reuse_cache enabled (guarded above), so pass `true` directly.
-        self.save_cache_state(true, &save_tokens, &generated_tokens, last_token_in_cache);
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                delta_tokens.len(),
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count,
-            reasoning_tokens,
-        )?;
-        // Overwrite the default `cached_tokens = 0` from
-        // `finalize_chat_result` with the real prior-cached length.
-        // On the delta path the session's full cached prefix is
-        // reused by construction — `prior_cached_len` is the exact
-        // token count skipped by `chat_session_start_sync`'s prefix
-        // verifier equivalent on this path.
-        result.cached_tokens = prior_cached_len as u32;
-        Ok(result)
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))
     }
 
-    /// Session-based chat continuation via a plain user message string.
-    ///
-    /// Builds the ChatML delta (closes the previous `<|im_end|>` line,
-    /// opens a new user turn with `user_message`, and opens a fresh
-    /// assistant turn). Delegates to
-    /// [`Self::chat_tokens_delta_sync`] which handles the actual
-    /// prefill-on-top-of-cache + decode path.
-    ///
-    /// LFM2 is text-only; `images` is an opt-in guard parameter:
-    /// non-empty input is rejected with an
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`-prefixed error so the
-    /// TS `ChatSession` layer can route image-changes back through a
-    /// fresh `chat_session_start` uniformly across all model backends.
-    pub(crate) fn chat_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            return Err(Error::from_reason(format!(
-                "{} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
+    fn family_name(&self) -> &'static str {
+        "lfm2"
+    }
+
+    fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
+        tok.im_end_id()
+            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
+        // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // emits a <think>…</think> block, so reasoning is always tracked
+        // AND parsed. reasoningEffort controls the thinking BUDGET, not
+        // whether. Explicit thinkingTokenBudget WINS; otherwise derive
+        // from reasoningEffort (== the deleted cores' `effective_budget`).
+        ThinkingSetup {
+            enabled: true,
+            budget: config
+                .thinking_token_budget
+                .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
         }
+    }
 
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
+    // `resolve_params`: engine default (`extract_chat_params`) == the
+    // legacy `extract_chat_params(&config)` on every deleted core.
+    //
+    // `render_prompt`: engine default (jinja `apply_chat_template_sync`
+    // with `add_generation_prompt = true`, the request tools, and
+    // `resolve_enable_thinking`) == the deleted cores' render block
+    // byte-for-byte (LFM2's template itself ignores `enable_thinking`).
 
-        // Match `chat_sync`'s sanitization so the session path is
+    fn render_continue_delta(
+        &self,
+        tok: &Qwen3Tokenizer,
+        user_message: &str,
+        _config: &ChatConfig,
+    ) -> Result<Vec<u32>> {
+        // Match the legacy session path's sanitization so the delta is
         // subject to the same role/content injection protection as the
-        // legacy path.
-        let synthetic = build_synthetic_user_message(&user_message);
+        // fresh-prompt path.
+        let synthetic = build_synthetic_user_message(user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
@@ -3262,631 +2254,406 @@ impl Lfm2Inner {
         // assistant opener — the model emits `<think>` tags on its own
         // when reasoning. Always suppress the prefix by passing
         // `Some(false)` to the shared builder so the delta stays
-        // template-equivalent with the LFM2 jinja output.
+        // template-equivalent with the LFM2 jinja output (`config` is
+        // deliberately ignored — the trait gained it for qwen3.5).
         let delta_text = build_chatml_continue_delta_text(sanitized_user, Some(false));
-
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
+        tok.encode_sync(&delta_text, Some(false))
     }
 
-    /// Session-based chat continuation via a tool-result turn.
-    ///
-    /// LFM2's chat template renders tool-role messages as a plain
-    /// `<|im_start|>tool\n{content}<|im_end|>` block — it does NOT use
-    /// Qwen3.5's `<tool_response>`-wrapped `user`-role variant. We
-    /// therefore build the delta inline rather than calling
-    /// `chat_common::build_chatml_tool_delta_text` (which is
-    /// Qwen3.5-specific). The `tool_call_id` is intentionally dropped
-    /// from the wire format — LFM2's template identifies tool responses
-    /// positionally, like Qwen3.5 does.
-    ///
-    /// Delegates to [`Self::chat_tokens_delta_sync`] which inherits the
-    /// same text-only-delta invariant (errors if the session currently
-    /// holds image state).
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended
-    /// to `content` inside the `<|im_start|>tool` block via
-    /// [`crate::tokenizer::apply_tool_error_marker`]. `None` /
-    /// `Some(false)` keep the wire bytes byte-equal to the pre-feature
-    /// output.
-    pub(crate) fn chat_session_continue_tool_sync(
-        &mut self,
-        _tool_call_id: String,
-        content: String,
+    fn render_tool_delta(
+        &self,
+        tok: &Qwen3Tokenizer,
+        _tool_call_id: &str,
+        content: &str,
         is_error: Option<bool>,
-        config: ChatConfig,
-    ) -> Result<ChatResult> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
-            .clone();
-
-        let delta_text = build_lfm2_tool_delta_text(&content, is_error);
-        let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
-
-        self.chat_tokens_delta_sync(delta_tokens, config)
+        _config: &ChatConfig,
+    ) -> Result<Vec<u32>> {
+        // LFM2-specific plain tool delta — no `<tool_response>` wrapper,
+        // `tool_call_id` dropped (LFM2's template identifies tool
+        // responses positionally). See [`build_lfm2_tool_delta_text`].
+        let delta_text = build_lfm2_tool_delta_text(content, is_error);
+        tok.encode_sync(&delta_text, Some(false))
     }
 
-    /// Streaming chat (session-start variant): same semantics as
-    /// [`Self::chat_session_start_sync`] but streams token deltas
-    /// through `stream_tx`.
-    pub(crate) fn chat_stream_session_start_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        let cb = StreamSender(stream_tx.clone());
-
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start cancelled before start",
-            );
-            return;
-        }
-
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). \
-                 The session API only makes sense with cache reuse enabled.",
-            );
-            return;
-        }
-
-        let im_end_id = match self.tokenizer.as_ref().and_then(|t| t.im_end_id()) {
-            Some(id) => id,
-            None => {
-                send_stream_error(
-                    &stream_tx,
-                    "chat_stream_session_start requires a tokenizer with an <|im_end|> special token",
-                );
-                return;
-            }
-        };
-
-        // NOTE: no unconditional reset here — see `chat_session_start_sync`
-        // for the prefix-reuse rationale. `chat_stream_sync_core` runs
-        // `verify_cache_prefix` and resets internally only on a cache miss.
-        let result = self.chat_stream_sync_core(messages, config, im_end_id, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
+    fn cached_token_history(&self) -> &[u32] {
+        &self.cached_token_history
     }
 
-    /// Streaming chat (session-continue variant): same semantics as
-    /// [`Self::chat_session_continue_sync`] but streams token deltas
-    /// through `stream_tx`.
-    pub(crate) fn chat_stream_session_continue_sync(
-        &mut self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue cancelled before start",
-            );
-            return;
-        }
-
-        if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            send_stream_error(
-                &stream_tx,
-                &format!(
-                    "{} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-                    IMAGE_CHANGE_RESTART_PREFIX
-                ),
-            );
-            return;
-        }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        let synthetic = build_synthetic_user_message(&user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-
-        // LFM2 template does NOT inject `<think>\n`; always suppress.
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, Some(false));
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        // Both scopes identical for lfm2: the legacy miss-branch reset
+        // and the explicit `ResetCaches` command both called the same
+        // inherent reset (wipe caches + token history + image key and
+        // release any live paged request).
+        let _ = scope;
+        self.reset_caches_internal();
+        Ok(())
     }
 
-    /// Streaming analog of [`Self::chat_session_continue_tool_sync`].
-    /// `is_error` is forwarded verbatim to the wire-format renderer;
-    /// see the non-streaming entry point for the marker semantics.
-    pub(crate) fn chat_stream_session_continue_tool_sync(
-        &mut self,
-        _tool_call_id: String,
-        content: String,
-        is_error: Option<bool>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_session_continue_tool cancelled before start",
-            );
-            return;
+    /// **Safety invariant** (moved verbatim from the deleted inherent
+    /// `verify_cache_prefix`): returns ONLY `0` (cache miss) or
+    /// `cached_token_history.len()` (exact-append hit or exact match) —
+    /// never an intermediate value. The engine's session core routes the
+    /// exact-match case (`hit == tokens.len()`) back through the
+    /// miss/reset branch, reproducing the legacy behaviour: LFM2's
+    /// short-conv layers have non-invertible left-padded state and no
+    /// safe "rewind-by-1" primitive, so the qwen3 pure-KV exact-match
+    /// rewind exception is FORBIDDEN here (see the all-or-nothing
+    /// contract on [`ChatBackend::verify_cache_prefix`]).
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
+        if !reuse_cache {
+            return 0;
         }
-
-        let tokenizer = match self.tokenizer.as_ref() {
-            Some(t) => t.clone(),
-            None => {
-                send_stream_error(&stream_tx, "Tokenizer not loaded");
-                return;
-            }
-        };
-
-        // LFM2-specific plain tool delta (no `<tool_response>`
-        // wrapper). See `chat_session_continue_tool_sync` for the
-        // rationale.
-        let delta_text = build_lfm2_tool_delta_text(&content, is_error);
-
-        let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = stream_tx.send(Err(e));
-                return;
-            }
-        };
-
-        self.chat_stream_tokens_delta_sync(delta_tokens, config, stream_tx, cancelled);
-    }
-
-    /// Streaming analog of [`Self::chat_tokens_delta_sync`]: prefill
-    /// the caller-provided delta tokens on top of the existing LFM2
-    /// caches and stream the reply through `stream_tx`.
-    ///
-    /// Applies the same four guards as the non-streaming path and
-    /// still calls `save_cache_state` at the end regardless of whether
-    /// cancellation fired, so the cache stays consistent for the next
-    /// turn even on early abort.
-    pub(crate) fn chat_stream_tokens_delta_sync(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        if cancelled.load(Ordering::Relaxed) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta cancelled before start",
-            );
-            return;
-        }
-
-        // --- Same four guards as chat_tokens_delta_sync ---
-        if config.reuse_cache == Some(false) {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires reuse_cache to be enabled; \
-                 the delta path operates on session state by construction",
-            );
-            return;
-        }
-        if self.cached_token_history.is_empty() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
-            );
-            return;
-        }
-        if delta_tokens.is_empty() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta requires a non-empty delta",
-            );
-            return;
-        }
-        if self.cached_image_key.is_some() {
-            send_stream_error(
-                &stream_tx,
-                "chat_stream_tokens_delta is text-only; session currently holds image state",
-            );
-            return;
-        }
-
-        let cb = StreamSender(stream_tx.clone());
-        let result =
-            self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, &cancelled);
-        if let Err(e) = result {
-            let _ = stream_tx.send(Err(e));
-        }
-    }
-
-    /// Prefill the delta tokens and run the streaming decode loop.
-    ///
-    /// Mirrors [`Self::chat_stream_sync_core`] but skips the message
-    /// rendering + prefix verification stages — the caller owns cache
-    /// coherence by construction. Uses `<|im_end|>` as eos so the
-    /// cached history continues to end on a clean ChatML boundary
-    /// after the reply is saved.
-    fn chat_stream_tokens_delta_sync_inner(
-        &mut self,
-        delta_tokens: Vec<u32>,
-        config: ChatConfig,
-        cb: &StreamSender,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<()> {
-        let tokenizer = self
-            .tokenizer
-            .clone()
-            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
-
-        // Session path: use <|im_end|> as eos, NOT config.eos_token_id.
-        let eos_id = tokenizer
-            .im_end_id()
-            .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))?;
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        let p = extract_chat_params(&config);
-        let report_perf = p.report_performance;
-        let max_new_tokens = p.max_new_tokens;
-        let include_reasoning = resolve_include_reasoning(&config);
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref()));
-
-        // Build full token history = cached_history + delta.
-        // Capture `prior_cached_len` BEFORE the extend — this is the
-        // reused-prefix length reported on the terminal ChatStreamChunk's
-        // `cached_tokens` field (mirrors the non-streaming delta path's
-        // `cached_tokens` in `ChatResult`).
-        let prior_cached_len = self.cached_token_history.len() as u32;
-        let mut full_token_history = self.cached_token_history.clone();
-        full_token_history.extend(delta_tokens.iter().copied());
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
+        let cached = &self.cached_token_history;
+        if !cached.is_empty()
+            && tokens.len() >= cached.len()
+            && tokens[..cached.len()] == cached[..]
+        {
+            cached.len()
         } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
+            0
+        }
+    }
 
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+    fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+        // lfm2's persistence is identical on the fresh and delta paths
+        // (one inherent helper; `args.is_delta` is irrelevant here).
+        // `last_token_in_cache` is the lfm2-only trim signal — see
+        // [`SaveStateArgs::last_token_in_cache`] and the derivation note
+        // in the session core.
+        self.save_cache_state_internal(
+            args.reuse_cache,
+            args.save_tokens,
+            args.generated_tokens,
+            args.last_token_in_cache,
+        );
+    }
 
-        let prompt_token_count = full_token_history.len() as u32;
+    fn eval_caches(&self) -> Result<()> {
+        // == the deleted cores' post-prefill `eval_lfm2_caches` sync.
+        eval_lfm2_caches(&self.caches)
+    }
 
-        // Save snapshot for save_cache_state (prior history + delta).
-        let save_tokens = full_token_history.clone();
-
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
-
-        // Streaming decode state
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-
-        // Prefill: chunked forward pass of the delta on top of existing caches.
-        let token_arr: Vec<i32> = delta_tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&token_arr, &[1, delta_tokens.len() as i64])?;
-
-        let logits = self.chunked_prefill(&prompt, generation_stream)?;
+    fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        // Byte-identical port of the deleted cores' prefill block: lfm2
+        // builds its prompt array as int32 (dtype is load-bearing for
+        // parity), runs the chunked forward, and folds the last-token
+        // slice into the impl (S6 trait contract) using the ACTUAL
+        // returned seq len — `chunked_prefill` returns only the final
+        // chunk's logits for prompts over `PREFILL_STEP_SIZE`.
+        let token_arr: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&token_arr, &[1, prompt_tokens.len() as i64])?;
+        let logits = self.chunked_prefill(&prompt, stream)?;
         let seq_len = logits.shape_at(1)?;
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
+        last_logits.squeeze(Some(&[1]))
+    }
 
-        let sampling_config = p.sampling_config;
-        let mut token_history: Vec<u32> = full_token_history;
-        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-        eval_lfm2_caches(&self.caches)?;
+    type Decode<'a>
+        = Lfm2Decode<'a>
+    where
+        Self: 'a;
 
-        if report_perf {
-            first_token_instant = Some(std::time::Instant::now());
-        }
-
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = String::from("length");
-
-        // Decode loop
-        let mut last_token_in_cache = false;
-        for step in 0..max_new_tokens {
-            let next_y = if step + 1 < max_new_tokens {
-                let _stream_ctx = StreamContext::new(generation_stream);
-
-                let next_ids = y.reshape(&[1, 1])?;
-                let logits = self.forward(&next_ids)?;
-                let logits = logits.squeeze(Some(&[1]))?;
-
-                let (next_token, _budget_forced) = if reasoning_tracker.should_force_think_end() {
-                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                    (MxArray::from_int32(&[forced_id], &[1])?, true)
-                } else {
-                    let logits = apply_all_penalties(logits, &token_history, &p)?;
-                    let t = sample(&logits, sampling_config)?;
-                    (t, false)
-                };
-
-                MxArray::async_eval_arrays(&[&next_token]);
-                Some(next_token)
-            } else {
-                None
-            };
-
-            last_token_in_cache = next_y.is_some();
-
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            let is_reasoning = reasoning_tracker.observe_token(token_id);
-            last_is_reasoning = is_reasoning;
-
-            if token_id == eos_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
-            }
-
-            // Stream delta chunk
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                &mut decode_stream,
-                tokenizer.inner(),
-                token_id,
-                &generated_tokens,
-                streamed_text_len,
-            );
-            streamed_text_len += token_text.len();
-            // Suppress reasoning deltas when include_reasoning == false.
-            // Detokenize + length-advance above stay OUTSIDE this gate.
-            if include_reasoning || !is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            match next_y {
-                Some(next) => y = next,
-                None => break,
-            }
-
-            if (step + 1) % 256 == 0 {
-                crate::array::synchronize_and_clear_cache();
-            }
-        }
-
-        // Save cache state unconditionally — even on cancellation, the
-        // partial generated_tokens must be appended so the session
-        // stays consistent for the next turn.
-        self.save_cache_state(true, &save_tokens, &generated_tokens, last_token_in_cache);
-
-        // Flush residual buffered bytes from decode_stream
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                warn!("Failed to decode generated tokens: {}", e);
-                String::new()
+    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        // lfm2's DELTA decode loop is ALWAYS eager (panel "paged/eager
+        // delta" finding): the legacy delta cores ran the native forward
+        // unconditionally, with no compiled dispatch. Only fresh flat
+        // turns engage the compiled path below.
+        if turn.is_delta {
+            return Ok(Lfm2Decode {
+                _compiled_reset_guard: None,
+                _weight_guard: None,
+                _compiled_lock: None,
+                inner: self,
+                embed_tokens_weight: None,
+                use_compiled: false,
+                reuse_cache: turn.params.reuse_cache,
             });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
         }
 
-        // Build the final done chunk with parsed tool/thinking info.
-        let (clean_text, tool_calls, thinking) = parse_thinking_and_tools(
-            &full_text,
-            &generated_tokens,
-            thinking_enabled,
-            think_end_id,
-            think_end_str.as_deref(),
-            include_reasoning,
-        );
+        let max_new_tokens = turn.params.max_new_tokens;
 
-        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                delta_tokens.len(),
-                generated_tokens.len(),
+        // ===== Compiled C++ decode-path dispatch =====
+        // Serialize the compiled lifecycle across model instances on the SHARED
+        // cross-family mutex (the same instance qwen3.5 locks), then re-validate
+        // ownership under the weight RwLock read guard, held for the whole
+        // decode loop. Poison-recover both locks (a panicked prior holder must
+        // not wedge inference forever — banned `.unwrap()` on these paths).
+        //
+        // LOCK CONTRACT (compiled-closure lifecycle, mirrors the qwen3.5 dense
+        // path): registration is the WRITER — `register_weights_with_cpp` holds
+        // `COMPILED_WEIGHTS_RWLOCK.write()` and, in one critical section, clears
+        // + re-stores weights, bumps the compile epoch
+        // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
+        // (`mlx_set_model_id`). Decode is the READER — the weight read guard
+        // (`.read()`, poison-recovered) below spans BOTH the
+        // `mlx_lfm2_get_model_id()` re-check AND every subsequent
+        // `mlx_lfm2_moe_*` invocation this turn (the stepper holds it until it
+        // drops, after the decode loop and the post-loop cache export). So the
+        // (epoch, id) pair this read guard validates is exactly the one the
+        // compiled graph executes against — a registration cannot interleave
+        // between the re-check and the forwards. The C++ side additionally
+        // guards the epoch-check + recompile with its own `g_lfm2_compiled_mu`
+        // and returns the closure BY VALUE, so even a hypothetical caller that
+        // did NOT hold this read lock could not dangle its closure handle.
+        let use_compiled_pre = self.compiled_path_active();
+        let compiled_lock = if use_compiled_pre {
+            Some(
+                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
             )
         } else {
             None
         };
+        let mut weight_guard = None;
+        // `mut` so the seed step below can drop back to native on any failure.
+        let mut use_compiled = if use_compiled_pre {
+            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check ownership under the read lock — a concurrent load of a
+            // different model could have evicted us between the probe and here.
+            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+                weight_guard = Some(guard);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: clean_text,
-                done: true,
-                finish_reason: Some(finish_reason),
-                tool_calls: Some(tool_calls),
-                thinking,
-                num_tokens: Some(generated_tokens.len() as u32),
-                prompt_tokens: Some(prompt_token_count),
-                reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(raw_text_with_reasoning_suppressed(
-                    &full_text,
-                    &generated_tokens,
-                    thinking_enabled,
-                    think_end_id,
-                    think_end_str.as_deref(),
-                    include_reasoning,
-                )),
-                // Delta path reuses the full prior history by construction
-                // — report `prior_cached_len` (captured before the
-                // `self.cached_token_history` extend above) as the
-                // authoritative cached-prefix length.
-                cached_tokens: Some(prior_cached_len),
-                performance,
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
+        // Seed the compiled decode graph ONCE from the post-prefill caches.
+        // On any failure (init bailed, missing handle), drop back to native by
+        // clearing `use_compiled` for the loop. The distinct reset guard fires
+        // `mlx_lfm2_moe_reset()` on EVERY exit path (including `?`
+        // early-returns and a partial/failed seed) so no stale C++ state leaks.
+        let compiled_reset_guard = if use_compiled {
+            Some(Lfm2CompiledResetGuard)
+        } else {
+            None
+        };
+        let embed_tokens_weight = if use_compiled {
+            // Tied dense embedding only — lfm2 compiled checkpoints (dense OR
+            // MoE) are never packed-quantized on the compiled path (the gate
+            // excludes any packed input embedding, and bf16 lfm2 ships a dense
+            // embedding). `get_weight()` is infallible (returns MxArray, not
+            // Result).
+            Some(self.embed_tokens.get_weight())
+        } else {
+            None
+        };
+        if use_compiled {
+            let num_layers = self.config.num_hidden_layers as usize;
 
-        Ok(())
+            // CRITICAL: seed the compiled decode position from the LIVE
+            // attention KV offset, NOT the prompt length. The `KVCache`
+            // offset accumulates prefix + delta across every chunk and
+            // across reuse, so it is the true sequence position (this is
+            // why lfm2 deliberately ignores `turn.total_seq_len`). Seeding
+            // from a logits/prompt length would build the C++ causal mask
+            // and KV write index from a too-small offset, masking out valid
+            // prefix tokens and overwriting live slots. All attention layers
+            // must agree on the offset; if any disagrees (corrupt/partial
+            // cache), fall back to native rather than seed a wrong position.
+            let mut cache_offset: Option<i32> = None;
+            let mut offset_ok = true;
+            for cache in self.caches.iter() {
+                if let Lfm2LayerCache::Attention(kv) = cache {
+                    let off = kv.get_offset();
+                    match cache_offset {
+                        None => cache_offset = Some(off),
+                        Some(prev) if prev != off => {
+                            offset_ok = false;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let prefill_len = cache_offset.unwrap_or(0);
+            if !offset_ok || cache_offset.is_none() {
+                // No attention layer (impossible for a real lfm2 config — every
+                // shipping checkpoint interleaves ≥1 full_attention layer) or
+                // attention layers reporting inconsistent offsets (corrupt /
+                // partial cache). Either way, refuse to seed a wrong position
+                // and fall back to native. The debug log distinguishes this
+                // from the missing-handle fallback below so a hypothetical
+                // zero-attention config doesn't fail silently.
+                tracing::debug!(
+                    "lfm2 compiled decode: no consistent attention KV offset \
+                     (offset_ok={offset_ok}, has_offset={}); using native path",
+                    cache_offset.is_some()
+                );
+                offset_ok = false;
+            }
+            // Budget the fixed padded cache from the TRUE position so decode
+            // can never exceed it (slice_update OOB / silent corruption).
+            let max_kv_len = kv_capacity_round_up(prefill_len, max_new_tokens)?;
+
+            // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
+            // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
+            let is_attn: Vec<i32> = (0..num_layers)
+                .map(|i| i32::from(self.config.is_attention_layer(i)))
+                .collect();
+
+            // Cache pointers, stride 2 by ABSOLUTE layer idx. attn layer ->
+            // KVCache keys_ref()/values_ref() (MATERIALIZED via the engine's
+            // post-prefill `eval_caches`); conv layer -> ArraysCache slot 0,
+            // null at +1.
+            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
+                vec![std::ptr::null_mut(); num_layers * 2];
+            // Carry the offset-consistency check forward: a bad/inconsistent
+            // attention offset must also block the seed (→ native fallback).
+            let mut seed_ok = offset_ok;
+            for (i, cache) in self.caches.iter().enumerate() {
+                match cache {
+                    Lfm2LayerCache::Attention(kv) => match (kv.keys_ref(), kv.values_ref()) {
+                        (Some(k), Some(v)) => {
+                            cache_ptrs[i * 2] = k.as_raw_ptr();
+                            cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
+                        }
+                        _ => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                    Lfm2LayerCache::Conv(c) => match c.get(0) {
+                        Some(state) => {
+                            cache_ptrs[i * 2] = state.as_raw_ptr();
+                            // slot.b stays null — conv branch never reads it.
+                        }
+                        None => {
+                            seed_ok = false;
+                            break;
+                        }
+                    },
+                }
+            }
+
+            if seed_ok {
+                unsafe {
+                    mlx_sys::mlx_lfm2_moe_init_from_prefill(
+                        self.config.num_hidden_layers,
+                        self.config.hidden_size,
+                        self.config.num_attention_heads,
+                        self.config.num_key_value_heads,
+                        self.config.head_dim(),
+                        self.config.rope_theta as f32,
+                        self.config.norm_eps as f32,
+                        self.config.conv_l_cache,
+                        self.config.num_experts.unwrap_or(0),
+                        self.config.num_experts_per_tok.unwrap_or(0),
+                        self.config.num_dense_layers.unwrap_or(0),
+                        i32::from(self.config.norm_topk_prob.unwrap_or(true)),
+                        i32::from(self.config.use_expert_bias.unwrap_or(true)),
+                        i32::from(self.config.tie_embedding),
+                        i32::from(self.config.conv_bias),
+                        max_kv_len,
+                        1,
+                        is_attn.as_ptr(),
+                        cache_ptrs.as_mut_ptr(),
+                        prefill_len,
+                    );
+                }
+                // C++ init is `void` but can still bail internally (a null
+                // slot or a padding/concatenate exception sets g_lfm2_inited
+                // = false). Confirm it actually seeded; if not, drop to native
+                // BEFORE the loop rather than letting the first forward return
+                // null logits and be treated as a fatal error.
+                if unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() } == 0 {
+                    warn!("lfm2 compiled decode: C++ seed did not initialize; using native path");
+                    use_compiled = false;
+                }
+            } else {
+                warn!(
+                    "lfm2 compiled decode: missing/inconsistent post-prefill cache state; using native path"
+                );
+                use_compiled = false;
+            }
+        }
+
+        Ok(Lfm2Decode {
+            _compiled_reset_guard: compiled_reset_guard,
+            _weight_guard: weight_guard,
+            _compiled_lock: compiled_lock,
+            inner: self,
+            embed_tokens_weight,
+            use_compiled,
+            reuse_cache: turn.params.reuse_cache,
+        })
     }
-}
 
-/// Command handler for the dedicated model thread.
-pub(crate) fn handle_lfm2_cmd(inner: &mut Lfm2Inner, cmd: Lfm2Cmd) {
-    match cmd {
-        Lfm2Cmd::ChatSessionStart {
-            messages,
-            config,
-            reply,
-        } => {
-            // NOTE: no per-request cache drain here. On a multi-model
-            // server the MLX allocator free-pool is process-wide, so
-            // flushing after a request on model A discards blocks about
-            // to be reused by model B. The TS idle sweeper in
-            // `@mlx-node/server` handles between-turn drains.
-            let _ = reply.send(inner.chat_session_start_sync(messages, config));
+    // `finalize_turn`: engine default (`finalize_chat_result`) == every
+    // deleted core's finalization (the streaming delta core's manually
+    // built done-chunk was field-for-field the same construction,
+    // including the tool_calls finish-reason promotion and the raw_text
+    // reasoning scrub).
+
+    fn has_paged_adapter(&self) -> bool {
+        self.paged_adapter.is_some()
+    }
+
+    // `supports_images`: engine default `false` — LFM2 is text-only.
+    // The NAPI entry points additionally keep their legacy
+    // "LFM2 is text-only" pre-checks, which fire before any command is
+    // dispatched, so the engine's typed pre-render rejection is a
+    // defense-in-depth backstop.
+    //
+    // `text_delta_image_guard`: engine default — `!supports_images() &&
+    // session_holds_images()` with the parametrized strings
+    // ("chat_tokens_delta_sync is text-only; session currently holds
+    // image state" / the `chat_stream_tokens_delta` twin) byte-matches
+    // the legacy lfm2 guards.
+    //
+    // `extra_eos_ids` / `stream_skip_special_tokens` / `stream_emitter`
+    // / `wired_limit_bytes` (usize::MAX) / `profiler_label` /
+    // `has_live_session` (`!cached_token_history.is_empty()`): engine
+    // defaults == legacy lfm2 behaviour (lfm2's loops had no profiler;
+    // the default labels only surface when profiling is enabled).
+
+    fn eos_before_emit(&self) -> bool {
+        // BOTH legacy streaming loops check EOS before the cancellation
+        // check AND before the token's text is detokenized/emitted
+        // ("Check stop condition before streaming to avoid leaking EOS
+        // text") — which also resolves the EOS+cancel race as "stop".
+        true
+    }
+
+    fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
+        // No-op override (gemma4 precedent): lfm2 has no MTP heads
+        // (acceptance fields stay None) and its legacy metrics never
+        // carried `profile_phases`; the default would add
+        // profiling-gated extras. Keep the payload byte-stable.
+    }
+
+    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
+        // Legacy lfm2 streaming deltas report the FULL history+delta
+        // length (`prompt_tokens: Some(prompt_token_count)` where
+        // `prompt_token_count = full_token_history.len()`), like
+        // qwen3/gemma4 — not the legacy qwen3_5 delta count.
+        full_len as u32
+    }
+
+    fn session_holds_images(&self) -> bool {
+        // Always `None` for text-only LFM2 in practice; feeds the
+        // DEFAULT `text_delta_image_guard` policy.
+        self.cached_image_key.is_some()
+    }
+
+    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        // CRITICAL (engine paged-probe contract — see the DELIBERATE FIX
+        // note at the probe): lfm2's delta paths NEVER touch the paged
+        // adapter. The legacy `chat_tokens_delta_sync` /
+        // `chat_stream_tokens_delta_sync` ran the flat eager
+        // prefill+decode over `self.caches` even when `paged_adapter`
+        // was `Some`. Decline delta turns so the generic flow (eager
+        // flat delta) runs, exactly like legacy; fresh turns take the
+        // kept paged cores for both sync and streaming.
+        if args.is_delta {
+            return None;
         }
-        Lfm2Cmd::ChatSessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_sync(user_message, images, config));
-        }
-        Lfm2Cmd::ChatSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.chat_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-            ));
-        }
-        Lfm2Cmd::ChatStreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_start_sync(messages, config, stream_tx, cancelled);
-        }
-        Lfm2Cmd::ChatStreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_sync(
-                user_message,
-                images,
-                config,
-                stream_tx,
-                cancelled,
-            );
-        }
-        Lfm2Cmd::ChatStreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            stream_tx,
-            cancelled,
-        } => {
-            inner.chat_stream_session_continue_tool_sync(
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                stream_tx,
-                cancelled,
-            );
-        }
-        Lfm2Cmd::ResetCaches { reply } => {
-            inner.reset_caches();
-            let _ = reply.send(Ok(()));
-        }
+        Some(self.paged_whole_turn(args))
     }
 }
 
@@ -4261,7 +3028,12 @@ fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) -> Result<()> {
 /// commands via channels and await responses.
 #[napi]
 pub struct Lfm2Model {
-    pub(crate) thread: crate::model_thread::ModelThread<Lfm2Cmd>,
+    /// Dedicated model thread owning `Lfm2Inner`. lfm2 is chat-only (no
+    /// training/generate variants), so the thread dispatches the
+    /// model-neutral [`ChatCmd`] directly via
+    /// `engine::cmd::handle_chat_cmd::<Lfm2Inner>` — no per-family
+    /// command enum (S11).
+    pub(crate) thread: crate::model_thread::ModelThread<ChatCmd>,
     pub(crate) config: Lfm2Config,
     /// Snapshot of `Lfm2Inner::paged_adapter.is_some()` captured at
     /// construction time. The block-paged KV adapter is wired up once at
@@ -4289,7 +3061,7 @@ impl Lfm2Model {
     /// state between turns.
     #[napi]
     pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| Lfm2Cmd::ResetCaches { reply })
+        crate::model_thread::send_and_block(&self.thread, |reply| ChatCmd::ResetCaches { reply })
     }
 
     /// Whether the block-paged KV cache adapter is active on this model
@@ -4337,7 +3109,7 @@ impl Lfm2Model {
         }
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Lfm2Cmd::ChatSessionStart {
+        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionStart {
             messages,
             config,
             reply,
@@ -4373,7 +3145,7 @@ impl Lfm2Model {
     ) -> Result<ChatResult> {
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| Lfm2Cmd::ChatSessionContinue {
+        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionContinue {
             user_message,
             images,
             config,
@@ -4413,14 +3185,12 @@ impl Lfm2Model {
     ) -> Result<ChatResult> {
         let config = config.unwrap_or_default();
 
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Lfm2Cmd::ChatSessionContinueTool {
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                reply,
-            }
+        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionContinueTool {
+            tool_call_id,
+            content,
+            is_error,
+            config,
+            reply,
         })
         .await
     }
@@ -4446,26 +3216,15 @@ impl Lfm2Model {
         }
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Lfm2Cmd::ChatStreamSessionStart {
+        let plumbing = start_chat_stream(callback);
+        self.thread.send(ChatCmd::StreamSessionStart {
             messages,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: plumbing.cancelled,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming variant of `chatSessionContinue`.
@@ -4481,27 +3240,16 @@ impl Lfm2Model {
     ) -> Result<ChatStreamHandle> {
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Lfm2Cmd::ChatStreamSessionContinue {
+        let plumbing = start_chat_stream(callback);
+        self.thread.send(ChatCmd::StreamSessionContinue {
             user_message,
             images,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: plumbing.cancelled,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     /// Streaming variant of `chatSessionContinueTool`.
@@ -4523,28 +3271,17 @@ impl Lfm2Model {
     ) -> Result<ChatStreamHandle> {
         let config = config.unwrap_or_default();
 
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancelled_inner = cancelled.clone();
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-
-        self.thread.send(Lfm2Cmd::ChatStreamSessionContinueTool {
+        let plumbing = start_chat_stream(callback);
+        self.thread.send(ChatCmd::StreamSessionContinueTool {
             tool_call_id,
             content,
             is_error,
             config,
-            stream_tx,
-            cancelled: cancelled_inner,
+            stream_tx: plumbing.stream_tx,
+            cancelled: plumbing.cancelled,
         })?;
 
-        let callback = Arc::new(callback);
-        tokio::spawn(async move {
-            while let Some(result) = stream_rx.recv().await {
-                callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-            }
-        });
-
-        Ok(ChatStreamHandle { cancelled })
+        Ok(plumbing.handle)
     }
 
     // ---------------------------------------------------------------
@@ -4572,7 +3309,7 @@ impl Lfm2Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Lfm2Cmd::ChatStreamSessionStart {
+        self.thread.send(ChatCmd::StreamSessionStart {
             messages,
             config,
             stream_tx,
@@ -4599,7 +3336,7 @@ impl Lfm2Model {
         let cancelled_inner = cancelled.clone();
         let (stream_tx, stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(Lfm2Cmd::ChatStreamSessionContinue {
+        self.thread.send(ChatCmd::StreamSessionContinue {
             user_message,
             images,
             config,

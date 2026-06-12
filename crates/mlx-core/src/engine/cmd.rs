@@ -1,14 +1,14 @@
 //! Shared model-thread command enum + dispatcher.
 //!
-//! [`ChatCmd`] is the model-neutral generalization of `Lfm2Cmd`
-//! (`models/lfm2/model.rs`) — exactly its 7-variant shape and payload
-//! fields, with the family prefix dropped from the variant names.
-//! [`handle_chat_cmd`] generalizes `handle_lfm2_cmd`: each arm calls
-//! the corresponding generic session core from
-//! [`crate::engine::session`] instead of a per-family `*_sync` method.
-//! S7+ migrations swap each family's `ModelThread<FamilyCmd>` over to
-//! `ModelThread<ChatCmd>` + `handle_chat_cmd::<FamilyInner>` and delete
-//! the per-family copies.
+//! [`ChatCmd`] is the model-neutral generalization of the legacy lfm2
+//! command enum (`models/lfm2/model.rs`, deleted in S11) — exactly its
+//! 7-variant shape and payload fields, with the family prefix dropped
+//! from the variant names. [`handle_chat_cmd`] generalizes the legacy
+//! per-family command handler: each arm calls the corresponding generic
+//! session core from [`crate::engine::session`] instead of a per-family
+//! `*_sync` method. S7+ migrations swap each family's
+//! `ModelThread<FamilyCmd>` over to `ModelThread<ChatCmd>` +
+//! `handle_chat_cmd::<FamilyInner>` and delete the per-family copies.
 //!
 //! Families whose command enums carry MORE than the 7 chat variants
 //! (qwen3 / qwen3_5 / qwen3_5_moe ship Generate / SaveModel / training
@@ -33,9 +33,9 @@ use crate::tokenizer::ChatMessage;
 
 /// Commands dispatched from NAPI methods to a dedicated model thread.
 ///
-/// Same shape as `Lfm2Cmd` (the reference family enum); see the
-/// per-variant docs there for the full behavioural contracts — each
-/// generic session core's rustdoc carries the same notes.
+/// Same shape as the legacy lfm2 command enum (the reference family
+/// enum, deleted in S11); each generic session core's rustdoc carries
+/// the full behavioural contracts.
 pub(crate) enum ChatCmd {
     /// Start a new session via the jinja-render path with the family's
     /// session stop token ([`ChatBackend::session_eos_id`]). Full
@@ -108,8 +108,8 @@ pub(crate) enum ChatCmd {
     ResetCaches { reply: ResponseTx<()> },
 }
 
-/// Command handler for a dedicated model thread — the generic
-/// `handle_lfm2_cmd`.
+/// Command handler for a dedicated model thread — the generic form of
+/// the legacy lfm2 command handler (deleted in S11).
 ///
 /// NOTE (carried over from the lfm2 reference): no per-request cache
 /// drain here. On a multi-model server the MLX allocator free-pool is
