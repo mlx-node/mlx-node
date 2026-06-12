@@ -9,6 +9,13 @@
 //! S7+ migrations swap each family's `ModelThread<FamilyCmd>` over to
 //! `ModelThread<ChatCmd>` + `handle_chat_cmd::<FamilyInner>` and delete
 //! the per-family copies.
+//!
+//! Families whose command enums carry MORE than the 7 chat variants
+//! (qwen3 / qwen3_5 / qwen3_5_moe ship Generate / SaveModel / training
+//! variants) do NOT swap wholesale: they keep `ModelThread<FamilyCmd>`
+//! and either nest `Chat(engine::ChatCmd)` as a variant or delegate the
+//! 7 chat arms straight to `handle_chat_cmd::<FamilyInner>` — only lfm2
+//! (and gemma4's chat-only thread) swap the thread type itself.
 
 // consumed from S7 family migrations; remove in S12
 #![allow(dead_code)]
@@ -18,7 +25,7 @@ use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 
-use crate::engine::backend::ChatBackend;
+use crate::engine::backend::{ChatBackend, ResetScope};
 use crate::engine::session;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{ResponseTx, StreamTx};
@@ -189,7 +196,7 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
             );
         }
         ChatCmd::ResetCaches { reply } => {
-            let _ = reply.send(backend.reset_caches());
+            let _ = reply.send(backend.reset_caches(ResetScope::Command));
         }
     }
 }
@@ -213,9 +220,12 @@ mod mock_backend_tests {
     use super::{ChatCmd, handle_chat_cmd};
     use crate::array::MxArray;
     use crate::engine::backend::{
-        ChatBackend, DecodeStep, SaveStateArgs, ThinkingSetup, TurnSetup,
+        ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, ThinkingSetup, TurnSetup,
     };
-    use crate::engine::params::{build_chatml_continue_delta_text, build_chatml_tool_delta_text};
+    use crate::engine::params::{
+        ChatParams, build_chatml_continue_delta_text, build_chatml_tool_delta_text,
+        extract_chat_params,
+    };
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::Stream;
     use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -293,6 +303,9 @@ mod mock_backend_tests {
     struct MockDecode {
         script: Vec<u32>,
         pos: usize,
+        /// D1 knob: make the post-loop `end_decode` hook fail (the
+        /// compiled-export error path).
+        fail_end_decode: bool,
     }
 
     impl DecodeStep for MockDecode {
@@ -311,6 +324,14 @@ mod mock_backend_tests {
                 logits.eval();
             }
         }
+
+        fn end_decode(&mut self) -> Result<()> {
+            if self.fail_end_decode {
+                Err(Error::from_reason("mock compiled-cache export failed"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     /// Recorded `save_cache_state` call.
@@ -324,7 +345,8 @@ mod mock_backend_tests {
     /// Scripted [`ChatBackend`]: real tokenizer, lfm2-shaped session
     /// state (token-history prefix cache), scripted per-turn argmax
     /// targets. Turn script layout: `script[0]` is the prefill-sampled
-    /// first token; `script[1..]` feeds the stepper.
+    /// first token; `script[1..]` feeds the stepper. The `*_knob`
+    /// fields exercise the S6.5 panel-fix hooks.
     struct MockBackend {
         tokenizer: Arc<Qwen3Tokenizer>,
         history: Vec<u32>,
@@ -333,8 +355,22 @@ mod mock_backend_tests {
         prefill_calls: Vec<Vec<u32>>,
         begin_decode_turns: Vec<TurnSnapshot>,
         save_calls: Vec<SaveCall>,
-        reset_calls: usize,
+        reset_calls: Vec<ResetScope>,
         eval_caches_calls: usize,
+        // ---- hook knobs (default off == ChatML defaults) ----
+        /// D1: fail the stepper's `end_decode`.
+        fail_end_decode_knob: bool,
+        /// D2: tag `finalize_turn`'s output so tests can prove the
+        /// override (not the default pipeline) produced the result.
+        finalize_marker_knob: bool,
+        /// D3: extra stop ids returned from `extra_eos_ids`.
+        extra_eos_knob: Vec<u32>,
+        /// D4: force `report_performance = true` in `resolve_params`
+        /// (gemma4's always-report policy).
+        force_report_perf_knob: bool,
+        /// D6: return `None` from `wired_limit_bytes` (qwen3's
+        /// no-WiredLimitContext policy).
+        wired_none_knob: bool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -342,6 +378,7 @@ mod mock_backend_tests {
         is_delta: bool,
         cached_prefix_len: usize,
         total_seq_len: usize,
+        reuse_cache: bool,
     }
 
     impl MockBackend {
@@ -354,15 +391,18 @@ mod mock_backend_tests {
                 prefill_calls: Vec::new(),
                 begin_decode_turns: Vec::new(),
                 save_calls: Vec::new(),
-                reset_calls: 0,
+                reset_calls: Vec::new(),
                 eval_caches_calls: 0,
+                fail_end_decode_knob: false,
+                finalize_marker_knob: false,
+                extra_eos_knob: Vec::new(),
+                force_report_perf_knob: false,
+                wired_none_knob: false,
             }
         }
     }
 
     impl ChatBackend for MockBackend {
-        type Caches = ();
-
         fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
             Ok(self.tokenizer.clone())
         }
@@ -414,10 +454,53 @@ mod mock_backend_tests {
             &self.history
         }
 
-        fn reset_caches(&mut self) -> Result<()> {
+        fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
             self.history.clear();
-            self.reset_calls += 1;
+            self.reset_calls.push(scope);
             Ok(())
+        }
+
+        fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
+            let mut p = extract_chat_params(config);
+            if self.force_report_perf_knob {
+                // gemma4's always-Some(PerformanceMetrics) policy.
+                p.report_performance = true;
+            }
+            p
+        }
+
+        fn extra_eos_ids(&self) -> Vec<u32> {
+            self.extra_eos_knob.clone()
+        }
+
+        fn wired_limit_bytes(&self) -> Option<usize> {
+            if self.wired_none_knob {
+                None
+            } else {
+                Some(usize::MAX)
+            }
+        }
+
+        fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+            let mut result = crate::engine::finalize::finalize_chat_result(
+                args.tokenizer,
+                args.generated_tokens,
+                args.finish_reason,
+                args.think_end_id,
+                args.think_end_str,
+                args.performance,
+                args.include_reasoning,
+                args.thinking_enabled,
+                args.prompt_tokens,
+                args.reasoning_tokens,
+            )?;
+            if self.finalize_marker_knob {
+                result.text = format!("FINALIZED:{}", result.text);
+                // Deliberately poison cached_tokens — the session core
+                // must overwrite it AFTER this hook returns.
+                result.cached_tokens = 4242;
+            }
+            Ok(result)
         }
 
         fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
@@ -484,15 +567,19 @@ mod mock_backend_tests {
         where
             Self: 'a;
 
-        fn begin_decode(&mut self, turn: &TurnSetup) -> Result<Self::Decode<'_>> {
+        fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
             self.begin_decode_turns.push(TurnSnapshot {
                 is_delta: turn.is_delta,
                 cached_prefix_len: turn.cached_prefix_len,
                 total_seq_len: turn.total_seq_len,
+                // `turn.params` is how the real steppers capture the
+                // end_decode reuse_cache gate.
+                reuse_cache: turn.params.reuse_cache,
             });
             Ok(MockDecode {
                 script: std::mem::take(&mut self.pending_decode_script),
                 pos: 0,
+                fail_end_decode: self.fail_end_decode_knob,
             })
         }
     }
@@ -563,8 +650,9 @@ mod mock_backend_tests {
             r1.thinking.as_deref().is_some_and(|t| t.contains("hello")),
             "thinking captured: {r1:?}"
         );
-        // Cold start went through the reset branch.
-        assert_eq!(backend.reset_calls, 1);
+        // Cold start went through the reset branch — turn-internal
+        // prefix-miss scope, NOT the command scope.
+        assert_eq!(backend.reset_calls, vec![ResetScope::PrefixMiss]);
         let prompt1 = backend.prefill_calls[0].clone();
         assert!(!prompt1.is_empty());
         assert_eq!(r1.prompt_tokens as usize, prompt1.len());
@@ -582,6 +670,7 @@ mod mock_backend_tests {
                 is_delta: false,
                 cached_prefix_len: 0,
                 total_seq_len: prompt1.len(),
+                reuse_cache: true,
             }
         );
         assert!(backend.save_calls[0].last_token_in_cache);
@@ -625,11 +714,12 @@ mod mock_backend_tests {
                 is_delta: true,
                 cached_prefix_len: 0,
                 total_seq_len: h1_len + delta2.len(),
+                reuse_cache: true,
             }
         );
         assert!(backend.save_calls[1].is_delta);
         // No reset on the delta path.
-        assert_eq!(backend.reset_calls, 1);
+        assert_eq!(backend.reset_calls.len(), 1);
 
         // --- turn 3: SessionContinueTool ---
         let h2_len = backend.history.len();
@@ -656,6 +746,12 @@ mod mock_backend_tests {
             .unwrap_or_else(|e| panic!("reset reply dropped: {e}"))
             .unwrap_or_else(|e| panic!("reset failed: {}", e.reason));
         assert!(backend.history.is_empty());
+        // D12: the explicit command reset arrives with Command scope
+        // (distinct from the turn-internal PrefixMiss above).
+        assert_eq!(
+            backend.reset_calls,
+            vec![ResetScope::PrefixMiss, ResetScope::Command]
+        );
     }
 
     #[test]
@@ -758,7 +854,7 @@ mod mock_backend_tests {
         })
         .expect_err("session start with reuse_cache=false must fail");
         assert!(err.reason.contains("requires reuse_cache=true"));
-        assert_eq!(backend.reset_calls, 0);
+        assert!(backend.reset_calls.is_empty());
         assert!(backend.prefill_calls.is_empty());
 
         // Image-bearing continue → typed restart-prefix error.
@@ -792,7 +888,7 @@ mod mock_backend_tests {
         })
         .unwrap_or_else(|e| panic!("start 1 failed: {}", e.reason));
         assert_eq!(r1.cached_tokens, 0);
-        assert_eq!(backend.reset_calls, 1);
+        assert_eq!(backend.reset_calls, vec![ResetScope::PrefixMiss]);
         let h1 = backend.history.clone();
 
         // Force the next rendered prompt to extend the cached history:
@@ -821,7 +917,8 @@ mod mock_backend_tests {
             "strict-extend hit reports the matched prefix"
         );
         assert_eq!(
-            backend.reset_calls, 1,
+            backend.reset_calls.len(),
+            1,
             "no reset on a strict-extend hit (still 1 from turn 1)"
         );
         assert_eq!(
@@ -835,8 +932,223 @@ mod mock_backend_tests {
                 is_delta: false,
                 cached_prefix_len: seeded_prefix,
                 total_seq_len: probe.len(),
+                reuse_cache: true,
             }
         );
         let _ = (h1, r1);
+    }
+
+    // ---- S6.5 panel-fix seams ----
+
+    /// D1 — `end_decode` Err aborts the turn BEFORE `save_cache_state`:
+    /// the error propagates to the caller, no save call is recorded, and
+    /// the session history stays untouched (the compiled-export error
+    /// path: reset-without-export, nothing persisted).
+    #[test]
+    fn end_decode_err_aborts_before_save_cache_state() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        backend.fail_end_decode_knob = true;
+
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("end_decode failure must abort the turn");
+        assert!(
+            err.reason.contains("mock compiled-cache export failed"),
+            "got: {}",
+            err.reason
+        );
+        assert!(
+            backend.save_calls.is_empty(),
+            "save_cache_state must NOT run after an end_decode failure"
+        );
+        assert!(
+            backend.history.is_empty(),
+            "no session state may be persisted on the abort path"
+        );
+        // The decode itself ran (prefill happened) — only the post-loop
+        // export failed.
+        assert_eq!(backend.prefill_calls.len(), 1);
+    }
+
+    /// D2 — the `finalize_turn` override (not the default pipeline)
+    /// produces the result, and the session core still overwrites
+    /// `cached_tokens` AFTER the hook returns.
+    #[test]
+    fn finalize_turn_override_reaches_result_and_cached_tokens_overwrite_wins() {
+        let mut backend =
+            MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
+        backend.finalize_marker_knob = true;
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+
+        assert!(
+            r.text.starts_with("FINALIZED:"),
+            "finalize override must own the result: {r:?}"
+        );
+        assert_eq!(
+            r.cached_tokens, 0,
+            "session core must overwrite the hook's cached_tokens (poisoned to 4242)"
+        );
+    }
+
+    /// D3 — extra stop ids flow from `extra_eos_ids` through the session
+    /// core into the decode loop (stop well before the session EOS).
+    #[test]
+    fn extra_eos_ids_stop_the_session_turn() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_OK, TOK_IM_END]]);
+        backend.extra_eos_knob = vec![TOK_WORLD];
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+
+        assert_eq!(r.finish_reason, "stop");
+        assert_eq!(r.num_tokens, 2, "stopped on the extra id: {r:?}");
+    }
+
+    /// D4 — `resolve_params` override is honored end to end: forcing
+    /// `report_performance = true` (gemma4's always-report policy) on a
+    /// default config yields `Some(performance)` where the config-only
+    /// extraction (default false) yields `None`.
+    #[test]
+    fn resolve_params_override_forces_performance_reporting() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_HELLO, TOK_IM_END],
+        ]);
+
+        let r_default = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(), // report_performance unset → false
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+        assert!(r_default.performance.is_none());
+
+        backend.force_report_perf_knob = true;
+        let r_forced = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+        assert!(
+            r_forced.performance.is_some(),
+            "resolved report_performance must gate the metrics: {r_forced:?}"
+        );
+    }
+
+    /// D6 — `wired_limit_bytes() == None` skips the WiredLimitContext
+    /// entirely (qwen3's policy); the turn still completes.
+    #[test]
+    fn wired_limit_none_turn_completes() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        backend.wired_none_knob = true;
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+        assert_eq!(r.finish_reason, "stop");
+    }
+
+    /// D11 — a STREAMING delta turn's terminal chunk reports the
+    /// family's `stream_delta_prompt_tokens` choice (default: the DELTA
+    /// token count, qwen3_5/MoE behavior), while the sync delta result
+    /// keeps the full history+delta length (asserted in the lifecycle
+    /// test above).
+    #[test]
+    fn streaming_delta_terminal_chunk_reports_delta_prompt_tokens() {
+        let mut backend = MockBackend::new(vec![
+            vec![TOK_HELLO, TOK_IM_END],
+            vec![TOK_WORLD, TOK_IM_END],
+        ]);
+
+        // Turn 1: sync start to establish the session.
+        let r1 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+        assert_eq!(r1.finish_reason, "stop");
+        let h1_len = backend.history.len();
+
+        // Turn 2: streaming continue.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::StreamSessionContinue {
+                user_message: "again".to_string(),
+                images: None,
+                config: greedy_config(),
+                stream_tx,
+                cancelled,
+            },
+        );
+        let mut chunks: Vec<ChatStreamChunk> = Vec::new();
+        while let Some(item) = stream_rx.blocking_recv() {
+            chunks.push(item.unwrap_or_else(|e| panic!("stream error: {}", e.reason)));
+        }
+        let last = chunks.last().unwrap_or_else(|| panic!("no chunks"));
+        assert!(last.done);
+
+        let delta_len = backend.prefill_calls[1].len();
+        assert!(delta_len > 0 && delta_len < h1_len + delta_len);
+        assert_eq!(
+            last.prompt_tokens,
+            Some(delta_len as u32),
+            "streaming delta terminal chunk must report the DELTA count \
+             (full would be {})",
+            h1_len + delta_len,
+        );
+        // cached_tokens still reports the full prior history.
+        assert_eq!(last.cached_tokens, Some(h1_len as u32));
+    }
+
+    /// D7 — the streaming delta guards name the streaming entry points;
+    /// the sync twin keeps the sync names (asserted in
+    /// `delta_guards_reject_bad_sessions`).
+    #[test]
+    fn streaming_delta_guard_strings_name_streaming_entry_points() {
+        let mut backend = MockBackend::new(vec![]);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::StreamSessionContinue {
+                user_message: "hi".to_string(),
+                images: None,
+                config: greedy_config(),
+                stream_tx,
+                cancelled,
+            },
+        );
+        let first = stream_rx
+            .blocking_recv()
+            .unwrap_or_else(|| panic!("guard error expected"));
+        let err = first.expect_err("uninitialized streaming continue must fail");
+        assert_eq!(
+            err.reason,
+            "chat_stream_tokens_delta requires an initialized session \
+             (call chatStreamSessionStart first)",
+        );
     }
 }

@@ -16,10 +16,9 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{ChunkSink, DecodeStep};
+use crate::engine::backend::{ChunkSink, DecodeStep, StreamEmitter};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::engine::types::ChatStreamChunk;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::Qwen3Tokenizer;
 
@@ -362,6 +361,19 @@ pub(crate) struct DecodeLoopArgs<'a> {
     pub profiler: &'a mut DecodeProfiler,
     pub max_new_tokens: i32,
     pub eos_id: u32,
+    /// Additional stop-token ids honored alongside `eos_id` (S5/S6 panel
+    /// fix — BLOCKING "EOS set"). The session core computes the set ONCE
+    /// per turn from [`crate::engine::backend::ChatBackend::extra_eos_ids`]
+    /// — not per step. Empty for every ChatML family today; Gemma4's S7
+    /// migration passes its model-config `eos_token_ids`.
+    pub extra_eos_ids: &'a [u32],
+    /// Streaming-only ordering knob (S5/S6 panel fix — "streaming EOS
+    /// order"): check the stop set BEFORE cancellation/emission. From
+    /// [`crate::engine::backend::ChatBackend::eos_before_emit`]; `false`
+    /// preserves the ChatML emit-then-check order, `true` is lfm2's
+    /// check-then-emit order. Ignored on non-streaming runs (no
+    /// emission to order against).
+    pub eos_before_emit: bool,
     pub generated_tokens: &'a mut Vec<u32>,
     pub token_history: &'a mut Vec<u32>,
     pub finish_reason: &'a mut String,
@@ -386,21 +398,38 @@ pub(crate) struct StreamingCtx<'s, 't> {
     pub tokenizer: &'t tokenizers::Tokenizer,
     pub streamed_text_len: &'s mut usize,
     pub last_is_reasoning: &'s mut bool,
+    /// Per-family chunk emitter (S5/S6 panel fix — BLOCKING "streaming
+    /// pipeline"). EVERY committed token's incremental text is routed
+    /// through [`StreamEmitter::on_token_text`] — the
+    /// `include_reasoning` suppression gate lives in the emitter, so
+    /// family emitters observe suppressed (and empty) texts too. From
+    /// [`crate::engine::backend::ChatBackend::stream_emitter`], created
+    /// once per turn by the session core.
+    pub emitter: &'s mut dyn StreamEmitter,
 }
 
 /// Generic decode loop over a [`DecodeStep`] — the faithful port of the
 /// `decode_loop!` macro body (which stays until S12; families adopt this
 /// fn from S7).
 ///
-/// Behavior is byte-identical to the macro with exactly two intended
-/// differences:
+/// Behavior is byte-identical to the macro at the engine defaults, with
+/// these intended seams (each defaulting to the macro's behavior):
 ///   * (a) the throttled every-32-step trace reads
 ///     `step.trace_offset()` instead of hardcoding
 ///     `mlx_sys::mlx_qwen35_get_cache_offset()`; `None` skips the
-///     `tracing::info!` line entirely (non-qwen3.5-compiled steppers).
-///   * (b) `ChatStreamChunk` is referenced directly from
-///     `engine::types` (the macro spelled the same type via
-///     `$crate::engine::types::ChatStreamChunk`).
+///     `tracing::info!` line entirely (non-qwen3.5-dense steppers).
+///   * (b) the stop check matches `eos_id` OR any id in
+///     `args.extra_eos_ids` (empty == the macro's single-id check;
+///     Gemma4's config eos set in S7) and — gated on
+///     `args.eos_before_emit` — may run BEFORE the streaming
+///     cancellation/emission (lfm2's order; default `false` keeps the
+///     macro order). Both checks cover every committed token including
+///     the first prefill-sampled one (the step-0 commit).
+///   * (c) streaming emission is routed through
+///     [`StreamingCtx::emitter`] — [`StreamEmitter::on_token_text`]
+///     owns the `include_reasoning` suppression gate; the default
+///     emitter reproduces the macro's inline chunk emission
+///     byte-for-byte.
 ///
 /// Everything else is preserved: pipelined next-graph build, budget
 /// forcing via [`ReasoningTracker`], [`apply_all_penalties`],
@@ -409,7 +438,7 @@ pub(crate) struct StreamingCtx<'s, 't> {
 /// begin/end/mark/step calls, the `MLX_MTP_TRACE_LOGITS` diagnostic
 /// block, and the streaming sub-block (cancellation,
 /// `step_decode_stream` incremental detokenization with error recovery,
-/// `include_reasoning` suppression, `is_reasoning` tagging).
+/// `is_reasoning` tagging).
 // consumed from S7 family migrations; remove in S12
 #[allow(dead_code)]
 pub(crate) fn run_decode_loop<S: DecodeStep>(
@@ -424,6 +453,8 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         profiler,
         max_new_tokens,
         eos_id,
+        extra_eos_ids,
+        eos_before_emit,
         generated_tokens,
         token_history,
         finish_reason,
@@ -540,9 +571,23 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             );
         }
 
+        // Stop-set membership: session EOS or any extra family stop id
+        // (S5/S6 panel fix — BLOCKING "EOS set"; the set is computed
+        // once per turn by the caller, not per step).
+        let stops_at_eos = token_id == eos_id || extra_eos_ids.contains(&token_id);
+
         // Streaming-only block (the macro's optional repetition group).
         if let Some(s) = streaming.as_mut() {
             *s.last_is_reasoning = is_reasoning;
+
+            // lfm2's order ("Check stop condition before streaming to
+            // avoid leaking EOS text"): stop set BEFORE cancellation
+            // and BEFORE emission — also resolves the EOS+cancel race
+            // as "stop". Default false == ChatML emit-then-check.
+            if eos_before_emit && stops_at_eos {
+                *finish_reason = String::from("stop");
+                break;
+            }
 
             if s.cancelled.load(Ordering::Relaxed) {
                 *finish_reason = String::from("cancelled");
@@ -557,29 +602,16 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 *s.streamed_text_len,
             );
             *s.streamed_text_len += token_text.len();
-            // Suppress reasoning (<think>…</think>) deltas from the
-            // stream when include_reasoning == false. Detokenize +
-            // length-advance above stay OUTSIDE this gate so
+            // Emission is delegated to the per-family emitter; the
+            // include_reasoning suppression gate lives THERE (default
+            // emitter == the macro's inline gate + chunk). Detokenize +
+            // length-advance above stay OUTSIDE the emitter so
             // DecodeStream sees every token.
-            if p.include_reasoning || !is_reasoning {
-                s.callback.send(Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }));
-            }
+            s.emitter
+                .on_token_text(&token_text, is_reasoning, p.include_reasoning, s.callback);
         }
 
-        if token_id == eos_id {
+        if stops_at_eos {
             *finish_reason = String::from("stop");
             break;
         }
@@ -655,10 +687,10 @@ mod run_decode_loop_tests {
     use super::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
-    use crate::engine::backend::{ChunkSink, DecodeStep};
+    use crate::engine::backend::{ChunkSink, DecodeStep, DefaultStreamEmitter, StreamEmitter};
     use crate::engine::params::{ChatParams, extract_chat_params};
     use crate::engine::penalties::ReasoningTracker;
-    use crate::engine::types::{ChatConfig, ChatStreamChunk};
+    use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::{DeviceType, Stream};
 
     /// Scripted stepper: forward call N returns `[1, vocab]` logits
@@ -730,6 +762,7 @@ mod run_decode_loop_tests {
         tracker: &mut ReasoningTracker,
         max_new_tokens: i32,
         eos_id: u32,
+        extra_eos_ids: &[u32],
     ) -> Result<LoopOutcome> {
         let y = MxArray::from_int32(&[first_token as i32], &[1])?;
         let mut profiler = DecodeProfiler::new("test", "mock");
@@ -748,6 +781,8 @@ mod run_decode_loop_tests {
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
+                extra_eos_ids,
+                eos_before_emit: false,
                 generated_tokens: &mut generated_tokens,
                 token_history: &mut token_history,
                 finish_reason: &mut finish_reason,
@@ -774,7 +809,7 @@ mod run_decode_loop_tests {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut step = MockStep::new(vec![7], 16);
 
-        let out = drive(&mut step, 3, &params, &mut tracker, 10, 7)
+        let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
 
         // Step 0 commits the prefill token (3); the scripted forward
@@ -793,7 +828,7 @@ mod run_decode_loop_tests {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut step = MockStep::new(vec![5], 16);
 
-        let out = drive(&mut step, 5, &params, &mut tracker, 20, 7)
+        let out = drive(&mut step, 5, &params, &mut tracker, 20, 7, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
 
         assert_eq!(out.generated, vec![5, 5, 5]);
@@ -809,7 +844,7 @@ mod run_decode_loop_tests {
         let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END));
         let mut step = MockStep::new(vec![5], 16);
 
-        let out = drive(&mut step, 4, &params, &mut tracker, 6, 7)
+        let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
 
         // Pipeline timeline: commits [4, 5] trip the budget; the step
@@ -836,7 +871,7 @@ mod run_decode_loop_tests {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut step = MockStep::new(vec![1], 16);
 
-        let out = drive(&mut step, 1, &params, &mut tracker, 400, 15)
+        let out = drive(&mut step, 1, &params, &mut tracker, 400, 15, &[])
             .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
 
         assert_eq!(out.generated.len(), 400);
@@ -915,6 +950,7 @@ mod run_decode_loop_tests {
         let cancelled = AtomicBool::new(false);
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = false;
+        let mut emitter = DefaultStreamEmitter;
 
         let y = MxArray::from_int32(&[0], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
         let mut profiler = DecodeProfiler::new("test", "mock");
@@ -933,6 +969,8 @@ mod run_decode_loop_tests {
                 profiler: &mut profiler,
                 max_new_tokens: 10,
                 eos_id: EOS,
+                extra_eos_ids: &[],
+                eos_before_emit: false,
                 generated_tokens: &mut generated_tokens,
                 token_history: &mut token_history,
                 finish_reason: &mut finish_reason,
@@ -947,6 +985,7 @@ mod run_decode_loop_tests {
                 tokenizer: &tokenizer,
                 streamed_text_len: &mut streamed_text_len,
                 last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
             }),
         )
         .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
@@ -998,6 +1037,7 @@ mod run_decode_loop_tests {
         let cancelled = AtomicBool::new(false);
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = false;
+        let mut emitter = DefaultStreamEmitter;
 
         let y = MxArray::from_int32(&[0], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
         let mut profiler = DecodeProfiler::new("test", "mock");
@@ -1016,6 +1056,8 @@ mod run_decode_loop_tests {
                 profiler: &mut profiler,
                 max_new_tokens: 10,
                 eos_id: EOS,
+                extra_eos_ids: &[],
+                eos_before_emit: false,
                 generated_tokens: &mut generated_tokens,
                 token_history: &mut token_history,
                 finish_reason: &mut finish_reason,
@@ -1030,6 +1072,7 @@ mod run_decode_loop_tests {
                 tokenizer: &tokenizer,
                 streamed_text_len: &mut streamed_text_len,
                 last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
             }),
         )
         .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
@@ -1048,6 +1091,264 @@ mod run_decode_loop_tests {
         );
         let sent_len: usize = chunks.iter().map(|c| c.text.len()).sum();
         assert_eq!(sent_len, streamed_text_len);
+    }
+
+    // ---- S6.5 panel-fix seams ----
+
+    /// Drive `run_decode_loop` in streaming mode with a caller-supplied
+    /// emitter / ordering knob / pre-set cancellation, returning the
+    /// committed tokens, finish reason, and emitted chunks.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_streaming(
+        step: &mut MockStep,
+        first_token: u32,
+        params: &ChatParams,
+        tracker: &mut ReasoningTracker,
+        eos_id: u32,
+        extra_eos_ids: &[u32],
+        eos_before_emit: bool,
+        emitter: &mut dyn StreamEmitter,
+        cancelled_pre_set: bool,
+    ) -> (Vec<u32>, String, Vec<ChatStreamChunk>) {
+        let tokenizer = tiny_tokenizer();
+        let mut decode_stream = tokenizer.decode_stream(true);
+        let sink = RecSink {
+            chunks: Mutex::new(Vec::new()),
+        };
+        let cancelled = AtomicBool::new(cancelled_pre_set);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = false;
+
+        let y = MxArray::from_int32(&[first_token as i32], &[1])
+            .unwrap_or_else(|e| panic!("{}", e.reason));
+        let mut profiler = DecodeProfiler::new("test", "mock");
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        run_decode_loop(
+            step,
+            DecodeLoopArgs {
+                y,
+                params,
+                reasoning_tracker: tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 10,
+                eos_id,
+                extra_eos_ids,
+                eos_before_emit,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream,
+            },
+            Some(StreamingCtx {
+                callback: &sink,
+                cancelled: &cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: &tokenizer,
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        let chunks = sink
+            .chunks
+            .into_inner()
+            .unwrap_or_else(|e| panic!("sink poisoned: {e}"));
+        (generated_tokens, finish_reason, chunks)
+    }
+
+    /// D3 — extra stop ids are honored alongside the session EOS with
+    /// finish_reason "stop" (Gemma4's config eos set). The session EOS
+    /// id itself is NOT in the script, so only the extra set can stop
+    /// the run.
+    #[test]
+    fn stops_on_extra_eos_id_with_finish_reason_stop() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = MockStep::new(vec![9], 16);
+
+        let out = drive(&mut step, 3, &params, &mut tracker, 10, 7, &[9, 11])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.generated, vec![3, 9]);
+        assert_eq!(out.finish_reason, "stop");
+    }
+
+    /// D3 — the extra stop set covers the FIRST prefill-sampled token
+    /// too (the step-0 commit goes through the same in-loop check).
+    #[test]
+    fn extra_eos_stops_on_first_prefill_sampled_token() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = MockStep::new(vec![1], 16);
+
+        let out = drive(&mut step, 9, &params, &mut tracker, 10, 7, &[9])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.generated, vec![9]);
+        assert_eq!(out.finish_reason, "stop");
+    }
+
+    /// D10 — default (ChatML) order emits the EOS token's chunk before
+    /// stopping; lfm2's eos_before_emit order stops first so the EOS
+    /// text never reaches the stream. Token bytes identical either way.
+    #[test]
+    fn streaming_eos_before_emit_suppresses_eos_chunk() {
+        const EOS: u32 = 5;
+        for (eos_before_emit, expected_texts) in [
+            (false, vec!["t1", " c3", " eos"]),
+            (true, vec!["t1", " c3"]),
+        ] {
+            let params = greedy_params(|_| {});
+            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut step = MockStep::new(vec![3, EOS], 7);
+            let mut emitter = DefaultStreamEmitter;
+
+            let (generated, finish, chunks) = drive_streaming(
+                &mut step,
+                1,
+                &params,
+                &mut tracker,
+                EOS,
+                &[],
+                eos_before_emit,
+                &mut emitter,
+                false,
+            );
+
+            assert_eq!(
+                generated,
+                vec![1, 3, EOS],
+                "eos_before_emit={eos_before_emit}"
+            );
+            assert_eq!(finish, "stop", "eos_before_emit={eos_before_emit}");
+            let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(texts, expected_texts, "eos_before_emit={eos_before_emit}");
+        }
+    }
+
+    /// D10 — the EOS+cancel race: lfm2's order checks the stop set
+    /// BEFORE the cancellation flag, so a turn whose token is EOS while
+    /// cancellation is pending finishes "stop"; the default order
+    /// finishes "cancelled".
+    #[test]
+    fn streaming_eos_before_emit_wins_eos_cancel_race() {
+        const EOS: u32 = 5;
+        for (eos_before_emit, expected_finish) in [(false, "cancelled"), (true, "stop")] {
+            let params = greedy_params(|_| {});
+            let mut tracker = ReasoningTracker::new(false, None, None);
+            let mut step = MockStep::new(vec![1], 7);
+            let mut emitter = DefaultStreamEmitter;
+
+            let (generated, finish, chunks) = drive_streaming(
+                &mut step,
+                EOS, // first committed token IS the session EOS
+                &params,
+                &mut tracker,
+                EOS,
+                &[],
+                eos_before_emit,
+                &mut emitter,
+                true, // cancellation already pending
+            );
+
+            assert_eq!(generated, vec![EOS]);
+            assert_eq!(finish, expected_finish, "eos_before_emit={eos_before_emit}");
+            assert!(chunks.is_empty(), "no chunk on either race outcome");
+        }
+    }
+
+    /// D16 — recording emitter: the loop must route EVERY committed
+    /// token's text through the emitter (suppressed/reasoning ones
+    /// included — the suppression gate lives in the EMITTER, not the
+    /// loop), and the sink only sees what the emitter chooses to send
+    /// (here: nothing).
+    struct RecordingEmitter {
+        seen: Vec<(String, bool, bool)>,
+        residuals: Vec<String>,
+        finished: usize,
+    }
+
+    impl StreamEmitter for RecordingEmitter {
+        fn on_token_text(
+            &mut self,
+            token_text: &str,
+            is_reasoning: bool,
+            include_reasoning: bool,
+            _sink: &dyn ChunkSink,
+        ) {
+            self.seen
+                .push((token_text.to_string(), is_reasoning, include_reasoning));
+        }
+
+        fn on_residual(
+            &mut self,
+            residual: &str,
+            _is_reasoning: bool,
+            _include_reasoning: bool,
+            _sink: &dyn ChunkSink,
+        ) {
+            self.residuals.push(residual.to_string());
+        }
+
+        fn finish(&mut self, _result: &ChatResult, _sink: &dyn ChunkSink) {
+            self.finished += 1;
+        }
+    }
+
+    #[test]
+    fn custom_emitter_observes_suppressed_tokens_and_owns_the_sink() {
+        const THINK_END: u32 = 2;
+        const EOS: u32 = 5;
+        // include_reasoning = false: the DEFAULT emitter would suppress
+        // the reasoning deltas; a custom emitter must still observe
+        // them (Gemma4's parser needs every byte).
+        let params = greedy_params(|cfg| {
+            cfg.include_reasoning = Some(false);
+        });
+        let mut tracker = ReasoningTracker::new(true, None, Some(THINK_END));
+        let mut step = MockStep::new(vec![1, THINK_END, 3, EOS], 7);
+        let mut emitter = RecordingEmitter {
+            seen: Vec::new(),
+            residuals: Vec::new(),
+            finished: 0,
+        };
+
+        let (generated, finish, chunks) = drive_streaming(
+            &mut step,
+            0,
+            &params,
+            &mut tracker,
+            EOS,
+            &[],
+            false,
+            &mut emitter,
+            false,
+        );
+
+        assert_eq!(generated, vec![0, 1, THINK_END, 3, EOS]);
+        assert_eq!(finish, "stop");
+        // One on_token_text per committed token, reasoning tags intact,
+        // the turn's include_reasoning threaded through.
+        let texts: Vec<&str> = emitter.seen.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(texts, vec!["t0", " t1", " end", " c3", " eos"]);
+        let tags: Vec<bool> = emitter.seen.iter().map(|(_, r, _)| *r).collect();
+        assert_eq!(tags, vec![true, true, true, false, false]);
+        assert!(emitter.seen.iter().all(|(_, _, inc)| !inc));
+        // The emitter sent nothing — the loop must not bypass it.
+        assert!(chunks.is_empty(), "loop bypassed the emitter: {chunks:?}");
+        // The loop never calls on_residual/finish (those are the
+        // session core's post-loop responsibilities).
+        assert!(emitter.residuals.is_empty());
+        assert_eq!(emitter.finished, 0);
     }
 }
 

@@ -247,6 +247,19 @@ pub(crate) fn save_cache_state_after_delta(
 /// refactor that moves `reset_caches_sync()` from the outer session-start
 /// path into the `cached_prefix_len == 0` branch of `chat_sync_core` is
 /// safe for Qwen3.5 Dense and MoE.
+///
+/// ## Sanctioned exception (pure-KV only): qwen3 flat exact-match rewind
+///
+/// One family-side relaxation under clause (a) is on the books: qwen3's
+/// FLAT path (a pure standard-KV stack with an explicit `cache_idx`
+/// write pointer) handles the exact-match corner by rewinding one slot
+/// and re-forwarding the last token ("Zero delta — re-run last token"
+/// in `models/qwen3/model.rs`). Its `ChatBackend::verify_cache_prefix`
+/// impl MAY therefore return `cached.len() - 1` on an exact match —
+/// see the trait rustdoc in [`crate::engine::backend`] for the exact
+/// shape. This helper itself stays all-or-nothing; the exception lives
+/// only in that family impl, and is forbidden for any cache with
+/// recurrent (GDN / conv) state.
 pub(crate) fn verify_cache_prefix_direct(
     reuse_cache: bool,
     has_images: bool,

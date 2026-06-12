@@ -7,12 +7,12 @@
 //! `models/qwen3_5/model.rs`):
 //!
 //! ```text
-//! reuse_cache guard → tokenizer → template/render → extract_chat_params
+//! reuse_cache guard → tokenizer → resolve_params → render_prompt
 //!   → vision_turn probe → paged_turn probe → mtp_turn probe
 //!   → verify_cache_prefix → reset-or-delta split → prefill
 //!   → first-token sample (apply_all_penalties + sampling::sample)
-//!   → eval_caches → begin_decode → run_decode_loop
-//!   → save_cache_state → finalize_chat_result (+ cached_tokens overwrite)
+//!   → eval_caches → begin_decode → run_decode_loop → end_decode
+//!   → save_cache_state → finalize_turn (+ cached_tokens overwrite)
 //! ```
 //!
 //! Everywhere lfm2 and qwen3.5 genuinely differ, the difference is a
@@ -31,16 +31,15 @@ use napi::bindgen_prelude::*;
 
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, SaveStateArgs, TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, StreamEmitter,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cache::IMAGE_CHANGE_RESTART_PREFIX;
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
-use crate::engine::finalize::{compute_performance_metrics, finalize_chat_result};
-use crate::engine::params::{
-    extract_chat_params, generated_capacity_hint, resolve_enable_thinking,
-};
+use crate::engine::finalize::compute_performance_metrics;
+use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::engine::types::{ChatConfig, ChatResult};
 use crate::stream::{DeviceType, Stream};
 use crate::tokenizer::ChatMessage;
 
@@ -147,7 +146,7 @@ pub(crate) fn tokens_delta<B: ChatBackend>(
     delta_tokens: Vec<u32>,
     config: ChatConfig,
 ) -> Result<ChatResult> {
-    delta_guards(backend, &delta_tokens, &config)?;
+    delta_guards(backend, &delta_tokens, &config, DeltaEntry::Sync)?;
     expect_sync_result(chat_turn_core(
         backend,
         TurnInput::Delta { delta_tokens },
@@ -281,7 +280,7 @@ pub(crate) fn tokens_delta_stream<B: ChatBackend>(
         )));
         return;
     }
-    if let Err(e) = delta_guards(backend, &delta_tokens, &config) {
+    if let Err(e) = delta_guards(backend, &delta_tokens, &config, DeltaEntry::Stream) {
         sink.send(Err(e));
         return;
     }
@@ -299,38 +298,80 @@ pub(crate) fn tokens_delta_stream<B: ChatBackend>(
 // Shared guards / helpers
 // =====================================================================
 
+/// Which NAPI entry point invoked the delta path — selects the guard
+/// message wording (S5/S6 panel fix — "guard-string parametrization").
+/// Every family's sync and streaming delta twins emit DIFFERENT strings
+/// today (sync names `chat_tokens_delta_sync` / `chatSessionStart`,
+/// streaming names `chat_stream_tokens_delta` / `chatStreamSessionStart`
+/// — verified byte-for-byte on lfm2/qwen3/gemma4/qwen3_5/MoE); the
+/// engine reproduces both via this selector.
+#[derive(Clone, Copy)]
+enum DeltaEntry {
+    Sync,
+    Stream,
+}
+
+impl DeltaEntry {
+    /// The entry point's wire name as it appears in guard messages.
+    fn fn_name(self) -> &'static str {
+        match self {
+            DeltaEntry::Sync => "chat_tokens_delta_sync",
+            DeltaEntry::Stream => "chat_stream_tokens_delta",
+        }
+    }
+
+    /// The session-start method named in the "no live session" guard.
+    fn start_name(self) -> &'static str {
+        match self {
+            DeltaEntry::Sync => "chatSessionStart",
+            DeltaEntry::Stream => "chatStreamSessionStart",
+        }
+    }
+}
+
 /// The four delta-path guards shared by `chat_tokens_delta_sync` /
 /// `chat_stream_tokens_delta_sync` on every family. Order preserved
-/// from the reference implementations.
+/// from the reference implementations; wording per [`DeltaEntry`].
+///
+/// Documented accepted drift (gemma4): its two distinct live-session
+/// guards (empty history vs `caches.is_none()`, the latter AFTER the
+/// image guard) fold into the single `has_live_session` check here —
+/// see the [`ChatBackend::has_live_session`] rustdoc.
 fn delta_guards<B: ChatBackend>(
     backend: &B,
     delta_tokens: &[u32],
     config: &ChatConfig,
+    entry: DeltaEntry,
 ) -> Result<()> {
     if config.reuse_cache == Some(false) {
-        return Err(Error::from_reason(
-            "chat_tokens_delta_sync requires reuse_cache to be enabled; \
+        return Err(Error::from_reason(format!(
+            "{} requires reuse_cache to be enabled; \
              the delta path operates on session state by construction",
-        ));
+            entry.fn_name(),
+        )));
     }
     if !backend.has_live_session() {
-        return Err(Error::from_reason(
-            "chat_tokens_delta_sync requires an initialized session (call chatSessionStart first)",
-        ));
+        return Err(Error::from_reason(format!(
+            "{} requires an initialized session (call {} first)",
+            entry.fn_name(),
+            entry.start_name(),
+        )));
     }
     if delta_tokens.is_empty() {
-        return Err(Error::from_reason(
-            "chat_tokens_delta_sync requires a non-empty delta",
-        ));
+        return Err(Error::from_reason(format!(
+            "{} requires a non-empty delta",
+            entry.fn_name(),
+        )));
     }
-    // Text-only families reject deltas while the session holds image
-    // state (lfm2's defensive guard). Image-capable families accept
-    // text deltas on image sessions by design (qwen3.5's sticky
-    // image-key contract — see `save_cache_state_after_delta`).
-    if !backend.supports_images() && backend.session_holds_images() {
-        return Err(Error::from_reason(
-            "chat_tokens_delta_sync is text-only; session currently holds image state",
-        ));
+    // Family policy hook (S5/S6 panel fix — BLOCKING "delta guard on
+    // image sessions"). Default: text-only families reject deltas while
+    // the session holds image state (lfm2's defensive guard);
+    // image-capable families accept text deltas on image sessions by
+    // design (qwen3.5's sticky image-key contract — see
+    // `save_cache_state_after_delta`). Gemma4 overrides to REJECT with
+    // the typed restart prefix despite being image-capable.
+    if let Some(message) = backend.text_delta_image_guard(entry.fn_name()) {
+        return Err(Error::from_reason(message));
     }
     Ok(())
 }
@@ -393,26 +434,26 @@ fn chat_turn_core<B: ChatBackend>(
     let think_end_id = tokenizer.think_end_id();
     let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-    let p = extract_chat_params(&config);
+    // Family-resolved params (S5/S6 panel fix — BLOCKING "sampling
+    // resolution"): the default is the config-only `extract_chat_params`;
+    // gemma4 folds its model-config sampling defaults (unset → greedy
+    // argmax), neutralizes penalties, and forces report_performance.
+    // Everything below reads the RESOLVED params, never raw config.
+    let p = backend.resolve_params(&config);
     let reuse_cache = p.reuse_cache;
     let report_perf = p.report_performance;
     let max_new_tokens = p.max_new_tokens;
     let thinking = backend.thinking_setup(&config);
 
     // --- template/render: full prompt tokens for this turn ---
-    // Fresh: jinja-render the messages. Delta: cached history + delta
-    // (the delta paths skip the template entirely — the caller owns
-    // cache coherence by construction).
+    // Fresh: family render hook (S5/S6 panel fix — "fresh-prompt
+    // render"; default = the jinja chat-template path, gemma4 adds its
+    // manual `<|turn>` fallback). Delta: cached history + delta (the
+    // delta paths skip the template entirely — the caller owns cache
+    // coherence by construction).
     let (tokens, images, is_delta, prior_cached_len) = match &input {
         TurnInput::Fresh { messages } => {
-            let tool_defs = config.tools.as_deref();
-            let enable_thinking = resolve_enable_thinking(&config);
-            let tokens = tokenizer.apply_chat_template_sync(
-                messages,
-                Some(true),
-                tool_defs,
-                enable_thinking,
-            )?;
+            let tokens = backend.render_prompt(&tokenizer, messages, &config)?;
             let images = extract_images_from_messages(messages);
             (tokens, images, false, 0usize)
         }
@@ -462,6 +503,21 @@ fn chat_turn_core<B: ChatBackend>(
         // MTP takes precedence over paged (qwen3.5's
         // `mtp_takes_dense_path`) returns `None` here for those turns
         // so the `mtp_turn` probe below picks them up.
+        //
+        // DELIBERATE FIX (the one sanctioned S6.5 behavior change):
+        // the probe runs for Delta turns on BOTH the sync and STREAMING
+        // paths. Today qwen3's streaming delta bypasses its paged
+        // adapter entirely (`chat_stream_tokens_delta_sync_inner` runs
+        // the flat path even when `paged_adapter` is `Some`) — with the
+        // paged adapter ON (qwen3's DEFAULT) the flat inner clones the
+        // never-populated flat KV vecs and `forward_fused` reads
+        // `num_layers` KV pointers from a ZERO-length vec: latent
+        // out-of-bounds UB. Routing streaming deltas through the same
+        // paged probe as sync deltas fixes that by construction; qwen3's
+        // S7 `paged_turn` must therefore handle `is_delta` streaming
+        // turns instead of returning `None` for them. lfm2 is the
+        // opposite: its delta paths NEVER touch the paged adapter today,
+        // so ITS `paged_turn` must return `None` when `args.is_delta`.
         if backend.has_paged_adapter()
             && let Some(out) = backend.paged_turn(&mut wt_args)
         {
@@ -508,7 +564,7 @@ fn chat_turn_core<B: ChatBackend>(
                 );
                 (tokens[hit..].to_vec(), hit)
             } else {
-                backend.reset_caches()?;
+                backend.reset_caches(ResetScope::PrefixMiss)?;
                 (tokens.clone(), 0)
             }
         }
@@ -531,11 +587,15 @@ fn chat_turn_core<B: ChatBackend>(
     let mut finish_reason = String::from("length");
 
     let generation_stream = Stream::new(DeviceType::Gpu);
-    let _wired_ctx =
-        crate::stream::WiredLimitContext::new(backend.wired_limit_bytes(), vec![generation_stream]);
+    // `None` skips the WiredLimitContext ENTIRELY (qwen3 creates none
+    // today — see the `wired_limit_bytes` rustdoc); `Some(bytes)` wires
+    // the family's byte budget for the turn.
+    let _wired_ctx = backend
+        .wired_limit_bytes()
+        .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
 
     let mut profiler = DecodeProfiler::new(
-        if is_delta { "chat_delta" } else { "chat" },
+        backend.profiler_label(is_delta, streaming.is_some()),
         backend.family_name(),
     );
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
@@ -544,12 +604,25 @@ fn chat_turn_core<B: ChatBackend>(
     let mut reasoning_tracker =
         ReasoningTracker::new(thinking.enabled, thinking.budget, think_end_id);
 
-    // Streaming decode state. Created unconditionally (cheap) so the
-    // borrow structure is identical on both paths; only the streaming
-    // branch reads it.
-    let mut decode_stream = tokenizer.inner().decode_stream(true);
+    // Stop set + streaming-order knob, resolved ONCE per turn (S5/S6
+    // panel fixes — BLOCKING "EOS set" / "streaming EOS order").
+    let extra_eos_ids = backend.extra_eos_ids();
+    let eos_before_emit = backend.eos_before_emit();
+
+    // Streaming decode state. The detokenizer's skip-special flag is a
+    // family hook (ChatML cores stream `decode_stream(true)`; gemma4
+    // streams `false` so its parser sees the channel/tool-call
+    // markers). Created unconditionally (cheap) so the borrow structure
+    // is identical on both paths; only the streaming branch reads it.
+    let stream_skip_special = backend.stream_skip_special_tokens();
+    let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
     let mut streamed_text_len = 0usize;
     let mut last_is_reasoning = thinking.enabled;
+    // Per-family chunk emitter (S5/S6 panel fix — BLOCKING "streaming
+    // pipeline"). Built once per streaming turn, BEFORE `begin_decode`
+    // takes the long &mut borrow of the backend.
+    let mut emitter: Option<Box<dyn StreamEmitter>> =
+        streaming.as_ref().map(|_| backend.stream_emitter());
 
     // --- prefill ---
     profiler.begin_prefill();
@@ -573,7 +646,7 @@ fn chat_turn_core<B: ChatBackend>(
     // it so `save_cache_state` below can borrow again.
     {
         let turn_setup = TurnSetup {
-            max_new_tokens,
+            params: &p,
             is_delta,
             // The generic flow is text-only; image turns routed through
             // `vision_turn` above.
@@ -582,14 +655,23 @@ fn chat_turn_core<B: ChatBackend>(
             total_seq_len: tokens.len(),
         };
         let mut step = backend.begin_decode(&turn_setup)?;
-        let streaming_ctx = streaming.as_ref().map(|s| StreamingCtx {
-            callback: s.sink,
-            cancelled: s.cancelled,
-            decode_stream: &mut decode_stream,
-            tokenizer: tokenizer.inner(),
-            streamed_text_len: &mut streamed_text_len,
-            last_is_reasoning: &mut last_is_reasoning,
-        });
+        // Decode-path relabel (compiled/eager) — see
+        // `DecodeStep::profiler_relabel`.
+        if let Some(label) = step.profiler_relabel() {
+            profiler.set_label(label);
+        }
+        let streaming_ctx = match (streaming.as_ref(), emitter.as_mut()) {
+            (Some(s), Some(em)) => Some(StreamingCtx {
+                callback: s.sink,
+                cancelled: s.cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: tokenizer.inner(),
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: em.as_mut(),
+            }),
+            _ => None,
+        };
         run_decode_loop(
             &mut step,
             DecodeLoopArgs {
@@ -599,6 +681,8 @@ fn chat_turn_core<B: ChatBackend>(
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
+                extra_eos_ids: &extra_eos_ids,
+                eos_before_emit,
                 generated_tokens: &mut generated_tokens,
                 token_history: &mut token_history,
                 finish_reason: &mut finish_reason,
@@ -608,6 +692,13 @@ fn chat_turn_core<B: ChatBackend>(
             },
             streaming_ctx,
         )?;
+        // Fallible post-loop hook (S5/S6 panel fix — compiled-path
+        // export). Runs while the stepper (and its lock/reset guards)
+        // is still alive, BEFORE `save_cache_state` below. On Err the
+        // turn aborts here: the stepper drops (reset guards fire,
+        // reproducing today's reset-without-export error path) and NO
+        // session state is saved.
+        step.end_decode()?;
     }
 
     // lfm2's `last_token_in_cache` derivation: the loop builds the
@@ -639,78 +730,78 @@ fn chat_turn_core<B: ChatBackend>(
             prefill_tokens.len(),
             generated_tokens.len(),
         )
+        .map(|mut m| {
+            // Family perf augmentation (S5/S6 panel fix — "perf
+            // augment"; default = fill_mtp_acceptance: MTP acceptance
+            // fields + profile_phases when profiling is on).
+            backend.augment_performance(&profiler, &mut m);
+            m
+        })
     } else {
         None
     };
     let reasoning_tokens = reasoning_tracker.reasoning_token_count();
 
-    if let Some(s) = streaming.as_ref() {
+    if let (Some(s), Some(em)) = (streaming.as_ref(), emitter.as_mut()) {
         // Flush residual buffered bytes from the incremental decode
         // stream (multi-token grapheme tails the DecodeStream held
-        // back). Mirrors the per-family streaming cores: suppress when
-        // the residual is reasoning text and include_reasoning is off.
+        // back) through the emitter. Mirrors the per-family streaming
+        // cores; the default emitter suppresses when the residual is
+        // reasoning text and include_reasoning is off. The decode here
+        // uses the SAME skip-special flag as the in-loop DecodeStream
+        // so `streamed_text_len` accounting stays consistent (gemma4
+        // decodes raw).
         let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
+            .decode_sync(&generated_tokens, stream_skip_special)
             .unwrap_or_else(|e| {
                 tracing::warn!("Failed to decode generated tokens: {}", e);
                 String::new()
             });
         if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            if p.include_reasoning || !last_is_reasoning {
-                s.sink.send(Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }));
-            }
+            let residual = &full_text[streamed_text_len..];
+            em.on_residual(residual, last_is_reasoning, p.include_reasoning, s.sink);
         }
     }
 
-    let mut result = finalize_chat_result(
-        &tokenizer,
-        &generated_tokens,
+    // Streaming delta turns report the family's `prompt_tokens` choice
+    // on the terminal chunk (S5/S6 panel fix — "streaming-delta
+    // prompt_tokens": qwen3_5/MoE report the delta count, lfm2/qwen3
+    // override to the full length). Sync results always carry the full
+    // history+delta length — no family diverges there.
+    let reported_prompt_tokens: u32 = if is_delta && streaming.is_some() {
+        let delta_len = prompt_token_count - prior_cached_len;
+        backend.stream_delta_prompt_tokens(prompt_token_count, delta_len)
+    } else {
+        prompt_token_count as u32
+    };
+
+    // Family finalize hook (S5/S6 panel fix — BLOCKING "finalize/output
+    // parsing"). Default = the ChatML `finalize_chat_result` pipeline;
+    // gemma4 overrides with its raw decode + output_parser pipeline.
+    let mut result = backend.finalize_turn(FinalizeArgs {
+        tokenizer: &tokenizer,
+        generated_tokens: &generated_tokens,
         finish_reason,
         think_end_id,
-        think_end_str.as_deref(),
+        think_end_str: think_end_str.as_deref(),
         performance,
-        p.include_reasoning,
-        thinking.enabled,
-        prompt_token_count as u32,
+        include_reasoning: p.include_reasoning,
+        thinking_enabled: thinking.enabled,
+        prompt_tokens: reported_prompt_tokens,
         reasoning_tokens,
-    )?;
-    // cached_tokens overwrite: fresh turns report the matched prefix
-    // length from `verify_cache_prefix`; delta turns report the full
-    // prior history length reused by construction.
+    })?;
+    // cached_tokens overwrite stays in the session core (AFTER the
+    // finalize hook — overrides must not fill it): fresh turns report
+    // the matched prefix length from `verify_cache_prefix`; delta turns
+    // report the full prior history length reused by construction.
     result.cached_tokens = cached_tokens_for_result;
 
-    if let Some(s) = streaming.as_ref() {
-        // Terminal done-chunk, built from the finalized result —
-        // byte-identical field mapping to the per-family streaming
-        // cores' final `cb.call`.
-        s.sink.send(Ok(ChatStreamChunk {
-            text: result.text.clone(),
-            done: true,
-            finish_reason: Some(result.finish_reason.clone()),
-            tool_calls: Some(result.tool_calls.clone()),
-            thinking: result.thinking.clone(),
-            num_tokens: Some(result.num_tokens),
-            prompt_tokens: Some(result.prompt_tokens),
-            reasoning_tokens: Some(result.reasoning_tokens),
-            raw_text: Some(result.raw_text.clone()),
-            cached_tokens: Some(result.cached_tokens),
-            performance: result.performance.clone(),
-            is_reasoning: None,
-        }));
+    if let (Some(s), Some(em)) = (streaming.as_ref(), emitter.as_mut()) {
+        // Terminal done-chunk via the emitter; the default emitter's
+        // field mapping is byte-identical to the per-family streaming
+        // cores' final `cb.call`. Family emitters (gemma4) build their
+        // own terminal chunk from the finalized result.
+        em.finish(&result, s.sink);
         return Ok(None);
     }
 

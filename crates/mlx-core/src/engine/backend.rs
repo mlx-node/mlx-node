@@ -24,10 +24,13 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
 use crate::array::MxArray;
-use crate::engine::params::ChatParams;
+use crate::decode_profiler::DecodeProfiler;
+use crate::engine::finalize::finalize_chat_result;
+use crate::engine::params::{ChatParams, extract_chat_params, resolve_enable_thinking};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::profiling::PerformanceMetrics;
 use crate::stream::Stream;
-use crate::tokenizer::Qwen3Tokenizer;
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
 /// Per-step decode operations for one generation turn.
 ///
@@ -56,11 +59,63 @@ pub(crate) trait DecodeStep {
     /// Cache offset for the throttled every-32-step decode trace.
     ///
     /// Replaces the `mlx_sys::mlx_qwen35_get_cache_offset()` call the
-    /// `decode_loop!` macro hardcoded: the dense compiled Qwen3.5 step
-    /// returns the compiled global's offset; every other family returns
-    /// `None`, which skips the `tracing::info!` line entirely.
+    /// `decode_loop!` macro hardcoded. The macro read the dense compiled
+    /// global on BOTH the compiled and eager qwen3_5 paths, so the
+    /// qwen3_5 dense steppers must return
+    /// `Some(mlx_qwen35_get_cache_offset())` from BOTH variants to keep
+    /// the trace line byte-identical; every other family returns `None`,
+    /// which skips the `tracing::info!` line entirely.
     fn trace_offset(&self) -> Option<i64> {
         None
+    }
+
+    /// Profiler relabel for the decode path actually taken (S5/S6 panel
+    /// fix — "profiler labels"). Consulted once by `chat_turn_core`
+    /// right after [`ChatBackend::begin_decode`]; `Some(label)` is
+    /// applied via `DecodeProfiler::set_label`, `None` keeps the
+    /// turn-level label from [`ChatBackend::profiler_label`].
+    ///
+    /// == the per-family `profiler.set_label(..)` calls inside the
+    /// compiled-vs-eager dispatch: qwen3_5 dense relabels to
+    /// `"chat_compiled"` / `"chat_rust"` (and the `_stream` /
+    /// `_stream_delta` variants), MoE to `"moe_chat_*_compiled"` /
+    /// `"moe_chat_*_rust"`, qwen3 streaming to
+    /// `"qwen3_chat_stream[_delta]_rust"`. lfm2 / gemma4 never relabel
+    /// (default).
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Fallible post-loop hook (S5/S6 panel fix — BLOCKING for the
+    /// compiled-path families). Called by `chat_turn_core` after
+    /// [`crate::engine::decode::run_decode_loop`] returns successfully,
+    /// while the stepper is still alive (so its lock/reset guards have
+    /// NOT dropped yet) and BEFORE [`ChatBackend::save_cache_state`].
+    /// On `Err` the turn aborts: the error propagates, the stepper drops
+    /// (firing its reset guards), and `save_cache_state` is never
+    /// called.
+    ///
+    /// This is where the compiled-path families export the C++ decode
+    /// caches back into their Rust caches, gated on the turn's
+    /// `reuse_cache` (available via [`TurnSetup::params`], captured at
+    /// `begin_decode` time):
+    ///   * qwen3_5 dense: `mlx_qwen35_export_caches` + `import_ptrs` +
+    ///     fallible `eval_layer_caches(&self.caches)?` before
+    ///     `CompiledResetGuard` drops;
+    ///   * qwen3_5_moe: the same against the MoE globals before
+    ///     `MoeResetGuard` drops;
+    ///   * lfm2: `export_compiled_caches()` before
+    ///     `Lfm2CompiledResetGuard` drops.
+    ///
+    /// The error-path equivalence is exact: today a decode error skips
+    /// the export but still resets (guards drop), and an export/eval
+    /// error propagates as the turn's error before any session state is
+    /// saved — drop-without-`end_decode` reproduces reset-without-export
+    /// byte-for-byte. A `Drop`-based export could not express this
+    /// (`Drop` swallows the abort-the-turn error). Families without a
+    /// compiled path keep the default no-op.
+    fn end_decode(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -93,6 +148,162 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
         // `StreamSender` wrappers.
         let _ = tokio::sync::mpsc::UnboundedSender::send(self, chunk);
     }
+}
+
+/// Per-family streaming-chunk emitter driven by the generic decode loop
+/// and the session core's post-loop flush (S5/S6 panel fix — BLOCKING
+/// "streaming pipeline").
+///
+/// The generic loop routes EVERY committed token's incremental text
+/// through [`StreamEmitter::on_token_text`] — the
+/// `include_reasoning`-suppression gate lives in the emitter, not the
+/// loop, so family emitters that must observe every byte (Gemma4's
+/// `Gemma4StreamParser`, which segments on special tokens and buffers
+/// pending reasoning) see suppressed-and-empty texts too. The default
+/// emitter ([`DefaultStreamEmitter`]) reproduces the raw per-token
+/// emission of the per-family ChatML streaming cores byte-for-byte.
+///
+/// Gemma4's S7 emitter maps as: `on_token_text` →
+/// `Gemma4StreamParser::feed` + `Gemma4StreamDispatchState::
+/// dispatch_segments` (pending-reasoning buffering, channel-only
+/// promotion, empty-chunk filtering); `on_residual` → the same
+/// `feed(residual)` path; `finish` → `stream_parser.flush()` dispatch +
+/// the done-chunk carrying `text: ""` and the parser-accumulated
+/// `tool_calls()` / `thinking()` instead of `result.text`.
+pub(crate) trait StreamEmitter {
+    /// One committed token's incremental detokenized text (may be empty
+    /// for partial-grapheme steps). `is_reasoning` is the
+    /// [`crate::engine::penalties::ReasoningTracker`] tag for this
+    /// token; `include_reasoning` is the turn's suppression setting —
+    /// the DEFAULT emitter applies the
+    /// `include_reasoning || !is_reasoning` gate, family emitters may
+    /// gate differently (or not at all).
+    fn on_token_text(
+        &mut self,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    );
+
+    /// Residual buffered text flushed after the decode loop (multi-token
+    /// grapheme tails the incremental `DecodeStream` held back). Called
+    /// only when a non-empty residual exists; emitters needing an
+    /// unconditional end-of-stream hook use [`StreamEmitter::finish`].
+    fn on_residual(
+        &mut self,
+        residual: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    );
+
+    /// Emit the terminal `done: true` chunk. `result` is the output of
+    /// [`ChatBackend::finalize_turn`] (with `cached_tokens` already
+    /// overwritten by the session core), so the terminal chunk is
+    /// family-controlled end to end: a family's finalize override feeds
+    /// its own parse into its emitter's terminal chunk.
+    fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink);
+}
+
+/// Default [`StreamEmitter`]: byte-identical port of the inline
+/// streaming emission the `decode_loop!` macro and the per-family
+/// ChatML streaming cores perform today (raw per-token text gated by
+/// `include_reasoning`, full-result done-chunk).
+pub(crate) struct DefaultStreamEmitter;
+
+impl DefaultStreamEmitter {
+    fn emit_text(text: String, is_reasoning: bool, include_reasoning: bool, sink: &dyn ChunkSink) {
+        // Suppress reasoning (<think>…</think>) deltas when
+        // include_reasoning == false — same gate the macro applies.
+        if include_reasoning || !is_reasoning {
+            sink.send(Ok(ChatStreamChunk {
+                text,
+                done: false,
+                finish_reason: None,
+                tool_calls: None,
+                thinking: None,
+                num_tokens: None,
+                prompt_tokens: None,
+                reasoning_tokens: None,
+                raw_text: None,
+                cached_tokens: None,
+                performance: None,
+                is_reasoning: Some(is_reasoning),
+            }));
+        }
+    }
+}
+
+impl StreamEmitter for DefaultStreamEmitter {
+    fn on_token_text(
+        &mut self,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        Self::emit_text(
+            token_text.to_string(),
+            is_reasoning,
+            include_reasoning,
+            sink,
+        );
+    }
+
+    fn on_residual(
+        &mut self,
+        residual: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        Self::emit_text(residual.to_string(), is_reasoning, include_reasoning, sink);
+    }
+
+    fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink) {
+        // Terminal done-chunk built from the finalized result —
+        // byte-identical field mapping to the per-family ChatML
+        // streaming cores' final `cb.call`.
+        sink.send(Ok(ChatStreamChunk {
+            text: result.text.clone(),
+            done: true,
+            finish_reason: Some(result.finish_reason.clone()),
+            tool_calls: Some(result.tool_calls.clone()),
+            thinking: result.thinking.clone(),
+            num_tokens: Some(result.num_tokens),
+            prompt_tokens: Some(result.prompt_tokens),
+            reasoning_tokens: Some(result.reasoning_tokens),
+            raw_text: Some(result.raw_text.clone()),
+            cached_tokens: Some(result.cached_tokens),
+            performance: result.performance.clone(),
+            is_reasoning: None,
+        }));
+    }
+}
+
+/// Arguments for [`ChatBackend::finalize_turn`] (S5/S6 panel fix —
+/// BLOCKING "finalize/output parsing").
+///
+/// Everything the default ChatML finalization
+/// ([`crate::engine::finalize::finalize_chat_result`]) consumes. A
+/// family override owns the raw-text decode entirely — including the
+/// `skip_special_tokens` flag (Gemma4 decodes with
+/// `decode_sync(generated_tokens, false)` so its `output_parser` sees
+/// the channel/tool-call DSL markers, then runs
+/// `parse_gemma4_output` + `promote_channel_only_output` instead of the
+/// Hermes `<tool_call>`/`<think>` parse).
+pub(crate) struct FinalizeArgs<'a> {
+    pub tokenizer: &'a Qwen3Tokenizer,
+    pub generated_tokens: &'a [u32],
+    pub finish_reason: String,
+    pub think_end_id: Option<u32>,
+    pub think_end_str: Option<&'a str>,
+    pub performance: Option<PerformanceMetrics>,
+    pub include_reasoning: bool,
+    pub thinking_enabled: bool,
+    pub prompt_tokens: u32,
+    pub reasoning_tokens: u32,
 }
 
 /// Resolved thinking-mode state for one turn.
@@ -150,17 +361,54 @@ pub(crate) struct SaveStateArgs<'a> {
     pub last_token_in_cache: bool,
 }
 
+/// Why [`ChatBackend::reset_caches`] is being invoked (S5/S6 panel fix
+/// — "reset scope distinction").
+///
+/// Two call sites reset today, and qwen3_5 dense/MoE do DIFFERENT work
+/// per site: the turn-internal prefix-miss reset only rebuilds the
+/// layer-cache vec and PRESERVES `cached_rope_deltas` / image key, while
+/// the explicit command reset (`reset_caches_sync`) clears everything —
+/// history, image key, rope deltas, GDN prefix checkpoints. Every other
+/// family treats both scopes identically; their impls may ignore the
+/// parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResetScope {
+    /// `verify_cache_prefix` returned 0 (miss) or exact-match on a fresh
+    /// turn — the session core resets before re-prefilling the full
+    /// prompt. == the inline miss-branch reset in the per-family cores
+    /// (qwen3_5 `models/qwen3_5/model.rs` miss reset; MoE inline
+    /// fresh-`Some(caches)` install).
+    PrefixMiss,
+    /// Explicit reset: [`crate::engine::cmd::ChatCmd::ResetCaches`] /
+    /// session-management fresh start. == the per-family
+    /// `reset_caches_sync` (full clear including reuse state).
+    Command,
+}
+
 /// Turn-constant inputs for [`ChatBackend::begin_decode`].
 ///
 /// Minimal field set derived from what the existing compiled/eager
 /// decode-setup blocks actually read (`models/lfm2/model.rs` compiled
 /// seed block ~873-1100, `models/qwen3_5/model.rs` compiled-init
 /// branches):
-pub(crate) struct TurnSetup {
-    /// KV budget input: lfm2's compiled seed sizes its fixed padded cache
-    /// via `kv_capacity_round_up(prefill_len, max_new_tokens)`; the
-    /// qwen3.5 compiled init does the same.
-    pub max_new_tokens: i32,
+pub(crate) struct TurnSetup<'a> {
+    /// The turn's resolved [`ChatParams`] (S6.5 trait extension). Two
+    /// consumers the S5 field set could not express:
+    ///   * `params.reuse_cache` gates the compiled-cache export in
+    ///     [`DecodeStep::end_decode`] — the stepper captures it here at
+    ///     `begin_decode` time (qwen3_5 dense/MoE `if p.reuse_cache`
+    ///     export blocks, lfm2 `if use_compiled && reuse_cache`);
+    ///   * `params.enable_mtp` / `params.mtp_depth` /
+    ///     `params.max_new_tokens` feed the qwen3_5 decode-entry
+    ///     `info!` trace (`chat_with_caches_inner` "chat_decode entry"
+    ///     block).
+    ///
+    /// `params.max_new_tokens` is also the KV budget input: lfm2's
+    /// compiled seed sizes its fixed padded cache via
+    /// `kv_capacity_round_up(prefill_len, max_new_tokens)`; the qwen3.5
+    /// compiled init does the same. (There is deliberately no separate
+    /// `max_new_tokens` field so the two copies cannot drift.)
+    pub params: &'a ChatParams,
     /// Delta-continuation flag: the qwen3.5 compiled init consults it for
     /// the saved M-RoPE offset decisions
     /// ([`crate::engine::cache::should_reapply_rope_delta`] /
@@ -237,10 +485,6 @@ pub(crate) struct WholeTurnArgs<'a> {
 /// generalizes; S7+ migrations implement this trait on the family
 /// `*Inner` structs and delete the per-family copies.
 pub(crate) trait ChatBackend {
-    /// The family's per-layer cache collection (e.g.
-    /// `Vec<Qwen3_5LayerCache>`, `Vec<Lfm2LayerCache>`, `Vec<KVCache>`).
-    type Caches;
-
     /// Cloned tokenizer handle, or the family's "Tokenizer not loaded"
     /// error. == the `self.tokenizer.as_ref().ok_or_else(..)?.clone()`
     /// prologue on every chat entry point.
@@ -255,6 +499,12 @@ pub(crate) trait ChatBackend {
     /// `chat_session_start_sync` / `chat_tokens_delta_sync`
     /// (`tokenizer.im_end_id().ok_or(..)`) for the ChatML families;
     /// Gemma4 resolves `<end_of_turn>` instead.
+    ///
+    /// Documented accepted drift: this hook cannot know the entry point,
+    /// so the streaming-start twins lose the per-entry wording
+    /// (lfm2/qwen3/qwen3_5 today: "chat_stream_session_start requires a
+    /// tokenizer with an <|im_end|> special token") in favor of the
+    /// impl's single message. Error-path only; no TS code matches on it.
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32>;
 
     /// Resolve the turn's thinking-mode state from config. == the
@@ -262,6 +512,52 @@ pub(crate) trait ChatBackend {
     /// `default_thinking_budget_for_effort` inlines (see
     /// [`ThinkingSetup`] field docs for the family-specific rules).
     fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup;
+
+    /// Resolve the turn's [`ChatParams`] — sampling configuration,
+    /// penalties, budgets, reporting flags — from the request config
+    /// (S5/S6 panel fix — BLOCKING "sampling resolution").
+    ///
+    /// Default = [`crate::engine::params::extract_chat_params`], the
+    /// config-only extraction every ChatML family uses today (unset
+    /// `temperature` flows through as `None` → `sampling::sample`'s
+    /// T=1.0 default).
+    ///
+    /// Gemma4's S7 override folds its MODEL-config defaults into the
+    /// resolution instead: `default_temperature` / `default_top_k` /
+    /// `default_top_p` with unset → 0.0 greedy argmax (the family's
+    /// `sample_next_token` short-circuit), neutralizes the penalty
+    /// fields (Gemma4 documents penalties as silent no-ops), and forces
+    /// `report_performance = true` (Gemma4 ALWAYS returns
+    /// `Some(PerformanceMetrics)` — the engine's `report_perf` gate
+    /// honors whatever this hook resolves, so the always-on behavior is
+    /// expressed here rather than via a separate hook).
+    fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
+        extract_chat_params(config)
+    }
+
+    /// Render + tokenize the fresh-turn prompt from the request
+    /// messages (S5/S6 panel fix — ADAPTABLE "fresh-prompt render").
+    ///
+    /// Default = the jinja chat-template path every ChatML family uses
+    /// (`apply_chat_template_sync` with `add_generation_prompt = true`,
+    /// the request tools, and `resolve_enable_thinking`). Gemma4's S7
+    /// override adds its manual `<|turn>` wire-format fallback for
+    /// template-less checkpoints plus the
+    /// `enable_thinking=true`-without-template error; template-bearing
+    /// checkpoints take the same default path.
+    fn render_prompt(
+        &self,
+        tok: &Qwen3Tokenizer,
+        messages: &[ChatMessage],
+        config: &ChatConfig,
+    ) -> Result<Vec<u32>> {
+        tok.apply_chat_template_sync(
+            messages,
+            Some(true),
+            config.tools.as_deref(),
+            resolve_enable_thinking(config),
+        )
+    }
 
     /// Render + tokenize the ChatML continue-delta for a session user
     /// turn. == the `chat_session_continue_sync` pipeline: sanitize via
@@ -303,11 +599,22 @@ pub(crate) trait ChatBackend {
     /// `cached_token_history` field on every family `*Inner`.
     fn cached_token_history(&self) -> &[u32];
 
-    /// Reset all caches + cached session state. == the per-family
-    /// `reset_caches_sync`. Returns `Result` because the Qwen3.5
-    /// implementation is fallible (the plan sketch's infallible
-    /// signature would force a panic path there).
-    fn reset_caches(&mut self) -> Result<()>;
+    /// Reset all caches + cached session state. Returns `Result` because
+    /// the Qwen3.5 implementation is fallible (the plan sketch's
+    /// infallible signature would force a panic path there).
+    ///
+    /// `scope` distinguishes the two reset reasons (S5/S6 panel fix —
+    /// "reset scope distinction"): [`ResetScope::Command`] == the
+    /// per-family `reset_caches_sync` (full clear including reuse
+    /// state); [`ResetScope::PrefixMiss`] == the turn-internal
+    /// miss-branch reset. qwen3_5 dense/MoE diverge between the two
+    /// (the miss reset rebuilds the layer-cache vec but PRESERVES
+    /// `cached_rope_deltas` / `cached_image_key`, keeping the eager-path
+    /// rope-delta lifecycle intact; the command reset clears everything
+    /// including GDN prefix checkpoints). Every other family implements
+    /// both scopes identically — the default expectation is "ignore the
+    /// parameter".
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()>;
 
     /// Match `tokens` against the cached session history and return the
     /// reusable prefix length.
@@ -326,6 +633,20 @@ pub(crate) trait ChatBackend {
     /// canonical implementation every family delegates to — for the full
     /// invariant and the conditions under which it could ever be
     /// relaxed.
+    ///
+    /// ## Sanctioned exception: qwen3 flat exact-match rewind (pure-KV)
+    ///
+    /// Qwen3's FLAT path is a pure standard-KV stack (no recurrent
+    /// state), and its legacy cores handle the exact-match corner
+    /// (`tokens == cached history`) by rewinding ONE position and
+    /// re-forwarding the last token ("Zero delta — re-run last token",
+    /// `models/qwen3/model.rs` `cache_idx -= 1` blocks). The qwen3 S7
+    /// impl MAY express this by returning
+    /// `cached_token_history().len() - 1` on an exact match: the
+    /// session core then prefills exactly the final token on top of the
+    /// (impl-rewound) caches. This is safe ONLY because a standard KV
+    /// cache can overwrite its last slot; GDN/conv-state families MUST
+    /// keep the all-or-nothing contract (exact-match-as-miss).
     fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize;
 
     /// Persist post-turn session state. Dispatches on
@@ -335,8 +656,12 @@ pub(crate) trait ChatBackend {
     /// family's own equivalent, e.g. `Lfm2Inner::save_cache_state`).
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>);
 
-    /// Force-materialize all live caches (post-prefill). == the
-    /// per-family `eval_layer_caches` / `eval_lfm2_caches` helpers.
+    /// Force-materialize all live caches (post-prefill). == lfm2's
+    /// `eval_lfm2_caches` at its post-prefill call site. Families whose
+    /// reference cores add NO post-prefill cache sync (qwen3_5
+    /// dense/MoE schedule async evals instead) MUST implement this as a
+    /// no-op `Ok(())` — adding a blocking sync here would introduce a
+    /// stall their current paths do not pay.
     fn eval_caches(&self) -> Result<()>;
 
     /// Run the (chunked) prefill forward over `prompt_tokens` on top of
@@ -369,9 +694,46 @@ pub(crate) trait ChatBackend {
     /// the compiled path — `models/lfm2/model.rs` ~873-1100,
     /// `models/qwen3_5/model.rs` compiled-init branches — or the
     /// `DecodeOps` closure construction on the eager path). Turn-constant
-    /// captures (embedding weight, stream handles) move into the
-    /// returned impl.
-    fn begin_decode(&mut self, turn: &TurnSetup) -> Result<Self::Decode<'_>>;
+    /// captures (embedding weight, stream handles, the
+    /// `turn.params.reuse_cache` gate for [`DecodeStep::end_decode`])
+    /// move into the returned impl.
+    ///
+    /// lfm2 migration trap (panel "paged/eager delta" finding): the
+    /// lfm2 impl must branch on `turn.is_delta` and return the EAGER
+    /// stepper for delta turns — its delta decode loop is always eager
+    /// today, unlike the fresh flat path's compiled dispatch.
+    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>>;
+
+    /// Decode the generated tokens and assemble the turn's
+    /// [`ChatResult`] (S5/S6 panel fix — BLOCKING "finalize/output
+    /// parsing").
+    ///
+    /// Default = [`crate::engine::finalize::finalize_chat_result`]: the
+    /// ChatML finalization (decode with `skip_special_tokens = true`,
+    /// Hermes `<tool_call>` / `<think>` parsing via
+    /// `tools::parse_tool_calls`). A family override owns the WHOLE
+    /// pipeline including the raw-text decode's skip-special flag — see
+    /// [`FinalizeArgs`] for the Gemma4 mapping (raw decode_sync(..,
+    /// false) → `output_parser::parse_gemma4_output` +
+    /// `promote_channel_only_output`).
+    ///
+    /// The session core overwrites `result.cached_tokens` AFTER this
+    /// hook returns (fresh-hit / delta prior-len accounting), so
+    /// overrides need not (and must not) fill it.
+    fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+        finalize_chat_result(
+            args.tokenizer,
+            args.generated_tokens,
+            args.finish_reason,
+            args.think_end_id,
+            args.think_end_str,
+            args.performance,
+            args.include_reasoning,
+            args.thinking_enabled,
+            args.prompt_tokens,
+            args.reasoning_tokens,
+        )
+    }
 
     // ---- optional capability probes ----
 
@@ -388,13 +750,179 @@ pub(crate) trait ChatBackend {
         false
     }
 
-    /// Byte budget for the turn's `WiredLimitContext`.
+    /// Additional stop-token ids honored ALONGSIDE the session EOS id
+    /// (S5/S6 panel fix — BLOCKING "EOS set").
     ///
-    /// S6 trait extension — the two reference skeletons genuinely
-    /// differ: lfm2 wires `usize::MAX` (the default here), qwen3.5
-    /// wires `config.estimate_memory_bytes()` (override in S8).
-    fn wired_limit_bytes(&self) -> usize {
-        usize::MAX
+    /// `run_decode_loop` stops with `finish_reason = "stop"` when a
+    /// committed token equals the session `eos_id` OR appears in this
+    /// set; the check covers every committed token including the first
+    /// prefill-sampled one (the loop's step-0 commit — there is no
+    /// separate first-token check in the engine). Default empty =
+    /// byte-identical to the single-`eos_id` ChatML behavior.
+    ///
+    /// Gemma4's S7 override returns its MODEL-config eos list
+    /// (`Gemma4Config::eos_token_ids` — `<eos>` / `<end_of_turn>`),
+    /// reproducing `is_eos_token(token, &config.eos_token_ids,
+    /// turn_end_id)` with `turn_end_id` as the engine's session
+    /// `eos_id`. Without this the intrinsic-EOS stops are lost and the
+    /// session runs on.
+    fn extra_eos_ids(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Whether the streaming incremental detokenizer (and the matching
+    /// post-loop residual `decode_sync`) skips special tokens (S5/S6
+    /// panel fix — BLOCKING "streaming pipeline").
+    ///
+    /// Default `true` == the ChatML cores' `decode_stream(true)`.
+    /// Gemma4 overrides to `false` so its stream parser sees the
+    /// `<|channel>` / `<|tool_call>` markers; its residual flush then
+    /// decodes with the same flag, keeping `streamed_text_len`
+    /// accounting consistent (the `step_decode_stream` error-recovery
+    /// path's internal `decode_stream(true)` is shared, pre-existing
+    /// behavior on every family today — not changed here).
+    fn stream_skip_special_tokens(&self) -> bool {
+        true
+    }
+
+    /// Build the turn's [`StreamEmitter`] (S5/S6 panel fix — BLOCKING
+    /// "streaming pipeline"). Called once per streaming turn, before
+    /// [`ChatBackend::begin_decode`]. Default = the raw ChatML
+    /// per-token emission ([`DefaultStreamEmitter`]); Gemma4 returns a
+    /// `Gemma4StreamParser`-backed emitter (see the trait docs for the
+    /// full mapping).
+    fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
+        Box::new(DefaultStreamEmitter)
+    }
+
+    /// Text-delta-on-image-session guard policy (S5/S6 panel fix —
+    /// BLOCKING "delta guard on image sessions"). `Some(message)`
+    /// rejects the delta turn with that error; `None` lets it proceed.
+    ///
+    /// `entry_fn` is the entry point's wire name (S5/S6 panel fix —
+    /// "guard-string parametrization"): `"chat_tokens_delta_sync"` on
+    /// the sync twin, `"chat_stream_tokens_delta"` on the streaming
+    /// twin — matching the per-family guard strings byte-for-byte.
+    ///
+    /// Default reproduces the lfm2-style text-only defensive guard:
+    /// reject only when the family does NOT support images but the
+    /// session somehow holds image state. Image-capable families that
+    /// accept text deltas on image sessions (qwen3.5's sticky-image-key
+    /// contract) keep the default and return `None` via
+    /// `supports_images() == true`.
+    ///
+    /// Gemma4's S7 override REJECTS despite `supports_images() == true`
+    /// whenever `cached_image_key.is_some()`, with the typed prefix the
+    /// TS `ChatSession` restart routing matches on:
+    /// `format!("{IMAGE_CHANGE_RESTART_PREFIX}{entry_fn} is text-only;
+    /// session currently holds image state")`.
+    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
+        if !self.supports_images() && self.session_holds_images() {
+            Some(format!(
+                "{entry_fn} is text-only; session currently holds image state"
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
+    /// context at all.
+    ///
+    /// S6.5 trait extension (panel fix — "wired_limit Option"): the
+    /// reference skeletons genuinely differ three ways: lfm2 and gemma4
+    /// wire `usize::MAX` (the default here), qwen3.5 dense/MoE wire
+    /// `config.estimate_memory_bytes()` (override in S8), and qwen3
+    /// creates no `WiredLimitContext` anywhere — its S7 override returns
+    /// `None`, which must skip the context entirely (constructing one
+    /// always mutates the device wired limit regardless of the byte
+    /// argument, and `usize::MAX` trips the >90% warning every turn —
+    /// per-turn allocator state + log noise qwen3 never had).
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        Some(usize::MAX)
+    }
+
+    /// Streaming-loop ordering knob (S5/S6 panel fix — "streaming EOS
+    /// order"): when `true`, [`crate::engine::decode::run_decode_loop`]
+    /// checks the stop set (session EOS + [`ChatBackend::extra_eos_ids`])
+    /// — and breaks with `finish_reason = "stop"` — BEFORE the
+    /// cancellation check and BEFORE the token's text is detokenized /
+    /// emitted.
+    ///
+    /// Default `false` == the ChatML/qwen ordering (cancel → emit → EOS
+    /// check), where an EOS-terminated turn emits one final `done:
+    /// false` chunk for the EOS token (empty text when the EOS is a
+    /// special token the detokenizer skips).
+    ///
+    /// LFM2's S7 override returns `true`: BOTH its streaming loops check
+    /// EOS first ("Check stop condition before streaming to avoid
+    /// leaking EOS text", `models/lfm2/model.rs`), which also resolves
+    /// the EOS+cancel race as "stop" (EOS is checked before the
+    /// cancellation flag). Affects only the streaming chunk sequence and
+    /// that race — token bytes and concatenated text are identical.
+    fn eos_before_emit(&self) -> bool {
+        false
+    }
+
+    /// Turn-level profiler label (S5/S6 panel fix — "profiler labels").
+    /// Feeds `DecodeProfiler::new(label, family_name())`; the
+    /// decode-path relabel (compiled/eager) is
+    /// [`DecodeStep::profiler_relabel`].
+    ///
+    /// Default == the qwen3_5 dense labels (the de-facto engine
+    /// reference): `"chat"` / `"chat_delta"` / `"chat_stream"` /
+    /// `"chat_stream_delta"`. Overrides: MoE prefixes `"moe_"`
+    /// (`"moe_chat"`, `"moe_chat_stream_delta"`, …); qwen3's streaming
+    /// cores use `"qwen3_chat_stream"` / `"qwen3_chat_stream_delta"`
+    /// (its sync cores have no profiler today — labels there are new,
+    /// gated on profiling enablement). lfm2/gemma4 had no profiler in
+    /// their loops; the defaults only surface when profiling is enabled.
+    fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
+        match (is_streaming, is_delta) {
+            (false, false) => "chat",
+            (false, true) => "chat_delta",
+            (true, false) => "chat_stream",
+            (true, true) => "chat_stream_delta",
+        }
+    }
+
+    /// Post-compute augmentation of the turn's [`PerformanceMetrics`]
+    /// (S5/S6 panel fix — "perf augment"). Called by the session core
+    /// right after `compute_performance_metrics` returns `Some`, before
+    /// finalize — so the augmented metrics reach both the sync
+    /// `ChatResult` and the streaming terminal chunk. Infallible: the
+    /// real per-family augmentation (`fill_mtp_acceptance`) cannot fail.
+    ///
+    /// Default == the qwen3_5 dense/MoE wrap
+    /// (`profiler.fill_mtp_acceptance(&mut m)`), which fills the MTP
+    /// acceptance fields after MTP runs AND copies `profile_phases`
+    /// whenever profiling is enabled (AR runs included). For families
+    /// without MTP/profiler history this is a no-op when profiling is
+    /// off — keeping the default everywhere preserves today's payloads.
+    ///
+    /// Gemma4's always-`Some(PerformanceMetrics)` policy is NOT
+    /// expressed here — it lives in [`ChatBackend::resolve_params`]
+    /// (`report_performance = true`); the session core honors the
+    /// resolved flag.
+    fn augment_performance(&self, profiler: &DecodeProfiler, metrics: &mut PerformanceMetrics) {
+        profiler.fill_mtp_acceptance(metrics);
+    }
+
+    /// `prompt_tokens` value reported on a STREAMING delta turn's
+    /// terminal chunk (S5/S6 panel fix — "streaming-delta
+    /// prompt_tokens").
+    ///
+    /// Today's families genuinely disagree: qwen3_5 dense/MoE streaming
+    /// deltas report the DELTA token count (`delta_tokens.len()`,
+    /// `models/qwen3_5/model.rs` streaming-delta done chunk) while
+    /// their own sync deltas — and lfm2/qwen3 on BOTH paths — report
+    /// the full history+delta. Default == the qwen3_5 reference
+    /// (delta count); lfm2's and qwen3's S7 overrides return
+    /// `full_len`. Sync delta results always report the full length
+    /// (not hook-controlled — no family diverges there).
+    fn stream_delta_prompt_tokens(&self, full_len: usize, delta_len: usize) -> u32 {
+        let _ = full_len;
+        delta_len as u32
     }
 
     /// Whether a live session exists for the delta-continuation guard
@@ -403,7 +931,12 @@ pub(crate) trait ChatBackend {
     ///
     /// S6 trait extension — the families check different state: lfm2
     /// tests `!cached_token_history.is_empty()` (the default here);
-    /// qwen3.5 tests `self.caches.is_some()` (override in S8).
+    /// qwen3.5 tests `self.caches.is_some()` (override in S8). Gemma4's
+    /// S7 override folds BOTH of its delta guards (empty history AND
+    /// `caches.is_none()`) into one check; the engine then emits a
+    /// single guard message naming `chatSessionStart` — the minor
+    /// message drift vs gemma4's two distinct messages (one of which
+    /// names `chatStreamSessionStart`) is a documented accepted change.
     fn has_live_session(&self) -> bool {
         !self.cached_token_history().is_empty()
     }
@@ -411,13 +944,12 @@ pub(crate) trait ChatBackend {
     /// Whether the live session currently holds image state
     /// (`cached_image_key.is_some()` on the families that track it).
     ///
-    /// S6 trait extension — feeds the delta-turn guard on TEXT-ONLY
-    /// families ("chat_tokens_delta_sync is text-only; session
-    /// currently holds image state", `models/lfm2/model.rs`). Families
-    /// with `supports_images() == true` accept text deltas on image
-    /// sessions (qwen3.5's documented sticky-image-key behavior), so
-    /// the session core only consults this when `supports_images()` is
-    /// `false`. Default covers families that never track image state.
+    /// S6 trait extension — feeds the DEFAULT
+    /// [`ChatBackend::text_delta_image_guard`] policy (reject text
+    /// deltas on image-holding sessions only for text-only families).
+    /// Families that need a different policy override the guard hook
+    /// itself, not this probe. Default covers families that never track
+    /// image state.
     fn session_holds_images(&self) -> bool {
         false
     }
