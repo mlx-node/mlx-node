@@ -1683,7 +1683,7 @@ impl Gemma4Model {
                     (model_id, has_vision, cache_limit_guard, paged_active),
                 ))
             },
-            super::model::handle_gemma4_cmd,
+            crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
         let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx

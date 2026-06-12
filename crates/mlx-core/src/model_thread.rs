@@ -14,8 +14,9 @@ pub type StreamTx<T> = tokio::sync::mpsc::UnboundedSender<napi::Result<T>>;
 
 /// A dedicated OS thread that owns model state and processes commands.
 ///
-/// Generic over `Cmd` so each model defines its own command enum
-/// (e.g. `Gemma4Cmd`, `Qwen3Cmd`).
+/// Generic over `Cmd` so each model picks its command enum: the shared
+/// `engine::cmd::ChatCmd` for chat-only families (gemma4), or a
+/// per-family enum carrying extra variants (e.g. `Qwen3Cmd`).
 pub struct ModelThread<Cmd: Send + 'static> {
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<Cmd>>,
     _handle: Option<std::thread::JoinHandle<()>>,
