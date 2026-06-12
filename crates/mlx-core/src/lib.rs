@@ -11,6 +11,7 @@ pub mod cache_limit;
 pub mod convert;
 pub mod dataset;
 pub mod decode_profiler;
+pub mod engine;
 pub mod gradients;
 pub mod grpo;
 pub(crate) mod inference_trace;
