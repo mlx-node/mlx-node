@@ -12,6 +12,18 @@
 //! All tests are gated on env vars — skipped silently when unset so plain
 //! `cargo test` (CI) is unaffected.
 //!
+//! ## Digest fields (S0 review fix, Finding 2)
+//!
+//! Option (c) was chosen: no new model accessor needed. `include_reasoning`
+//! is set to `true` so `raw_text` contains the full decoded output including
+//! thinking tokens. We also capture `thinking`, `prompt_tokens`,
+//! `reasoning_tokens`, and `tool_calls` from `ChatResult` — together these
+//! cover every distinct token-stream outcome. Token identity is implied by
+//! `raw_text` (T=0 → same token IDs ↔ same decoded bytes) and `num_tokens`.
+//! No option (a)/(b) accessor was added because no existing public API
+//! returns the raw generated token ID vector, and the existing parity tests
+//! likewise compare `text`/`raw_text` rather than token IDs.
+//!
 //! Run a single family manually with e.g.:
 //! ```shell
 //! MLX_SMOKE_QWEN3_MODEL_PATH=/Volumes/P4510/models/qwen3-0.6b-mlx-bf16 \
@@ -48,7 +60,11 @@ fn smoke_chat_config() -> ChatConfig {
         tools: None,
         reasoning_effort: None,
         thinking_token_budget: Some(32),
-        include_reasoning: Some(false),
+        // S0 review fix (Finding 2): include_reasoning=true so raw_text carries
+        // the full decoded output including thinking tokens. Together with the
+        // thinking/prompt_tokens/reasoning_tokens fields in result_digest this
+        // ensures that any token-stream divergence will appear in the digest.
+        include_reasoning: Some(true),
         report_performance: Some(false),
         reuse_cache: Some(true),
         enable_mtp: Some(false),
@@ -70,16 +86,30 @@ fn user_message(content: &str) -> ChatMessage {
 }
 
 /// Collect the stable fields from a ChatResult into a sorted BTreeMap.
+///
+/// S0 review fix (Finding 2, option c): added thinking, prompt_tokens,
+/// reasoning_tokens, tool_calls. include_reasoning is now Some(true) so
+/// raw_text carries the full decoded output (reasoning included). Any
+/// token-stream divergence surfaces in raw_text (T=0 ↔ same IDs ↔ same bytes)
+/// and the extra fields catch reasoning/tool divergence independently.
 fn result_digest(r: &ChatResult) -> BTreeMap<&'static str, String> {
     let mut m = BTreeMap::new();
     m.insert("cached_tokens", r.cached_tokens.to_string());
     m.insert("finish_reason", r.finish_reason.clone());
     m.insert("num_tokens", r.num_tokens.to_string());
-    // Use raw_text as the primary text field: it includes reasoning/thinking tokens
-    // and special tokens, giving a fuller picture for byte-equivalence comparison.
-    // text (stripped) is empty when all tokens are special/reasoning tokens.
+    m.insert("prompt_tokens", r.prompt_tokens.to_string());
+    m.insert("reasoning_tokens", r.reasoning_tokens.to_string());
+    // raw_text: full decoded output (includes thinking tokens when
+    // include_reasoning=true). Primary token-identity signal.
     m.insert("raw_text", r.raw_text.clone());
     m.insert("text", r.text.clone());
+    m.insert(
+        "thinking",
+        r.thinking.clone().unwrap_or_default(),
+    );
+    // Render tool_calls as a stable JSON string (BTreeMap keys → sorted).
+    let tool_calls_json = serde_json::to_string(&r.tool_calls).unwrap_or_default();
+    m.insert("tool_calls", tool_calls_json);
     m
 }
 

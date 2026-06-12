@@ -11,6 +11,11 @@
 #
 # GPU contention: families are run SERIALLY (never in parallel).
 # Cold USB mmap: lfm2 prewarms the page cache during load; allow up to 15 minutes.
+#
+# S0 review fix (Finding 1): all 5 families are REQUIRED in both capture and
+# compare. Missing model path, missing/empty digest, or missing baseline all
+# produce loud errors and nonzero exit. Optional escape hatch:
+#   MLX_SMOKE_ALLOW_SKIP="fam1 fam2"  — exempts listed families (prints WARNING).
 
 set -euo pipefail
 
@@ -34,6 +39,36 @@ CURRENT_DIR="$REPO_ROOT/.t0-smoke/current"
 
 log() { echo "[t0-smoke] $*"; }
 log_err() { echo "[t0-smoke] ERROR: $*" >&2; }
+
+# Return 0 if the given family name is listed in MLX_SMOKE_ALLOW_SKIP.
+is_skip_allowed() {
+    local family="$1"
+    local skip_list="${MLX_SMOKE_ALLOW_SKIP:-}"
+    for s in $skip_list; do
+        [[ "$s" == "$family" ]] && return 0
+    done
+    return 1
+}
+
+# Assert that a digest file exists, is non-empty, and is valid JSON.
+# Exits with error if any check fails.
+assert_digest_valid() {
+    local family="$1"
+    local path="$2"
+
+    if [[ ! -f "$path" ]]; then
+        log_err "FATAL: expected digest file not produced for $family: $path"
+        exit 1
+    fi
+    if [[ ! -s "$path" ]]; then
+        log_err "FATAL: digest file for $family is empty: $path"
+        exit 1
+    fi
+    if ! python3 -m json.tool "$path" > /dev/null 2>&1; then
+        log_err "FATAL: digest file for $family is not valid JSON: $path"
+        exit 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Metallib canary guard — run before capture OR compare.
@@ -80,7 +115,13 @@ check_metallib_canaries() {
 }
 
 # Run a single family's cargo test, writing the digest to $out_dir/<family>.json.
-# Returns 0 on success, 1 on SKIPPED (model path missing), 2 on failure.
+# S0 review fix (Finding 1):
+#   - Missing model dir is an ERROR (not a soft skip) unless the family is in
+#     MLX_SMOKE_ALLOW_SKIP.
+#   - After a successful cargo run, assert the expected digest file exists,
+#     is non-empty, and is valid JSON.
+# Returns 0 on success. Exits with nonzero on any hard error.
+# Returns 1 only when the family is in MLX_SMOKE_ALLOW_SKIP and the model is absent.
 run_family() {
     local family="$1"        # e.g. qwen3
     local test_name="$2"     # e.g. qwen3_smoke
@@ -89,8 +130,19 @@ run_family() {
     local out_dir="$5"       # where to write <family>.json
 
     if [[ ! -d "$model_path" ]]; then
-        log "SKIPPED $family: model path not found: $model_path"
-        return 1
+        if is_skip_allowed "$family"; then
+            echo "" >&2
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+            echo "  WARNING: $family skipped via MLX_SMOKE_ALLOW_SKIP" >&2
+            echo "  Model path not found: $model_path" >&2
+            echo "  This family will NOT be checked — gate is weakened." >&2
+            echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+            echo "" >&2
+            return 1
+        fi
+        log_err "FATAL: model path for $family not found: $model_path"
+        log_err "  Set SMOKE_${family^^}_PATH or add $family to MLX_SMOKE_ALLOW_SKIP to skip."
+        exit 1
     fi
 
     log "Running $family (model=$model_path) ..."
@@ -104,11 +156,13 @@ run_family() {
 
     if "${cargo_env[@]}" cargo test -p mlx-core --test t0_smoke "$test_name" \
             -- --exact --nocapture --ignored 2>&1; then
+        # Assert that the digest file was actually produced and is valid.
+        assert_digest_valid "$family" "${out_dir}/${family}.json"
         log "OK $family"
         return 0
     else
         log_err "FAILED $family — cargo test exited non-zero"
-        return 2
+        exit 1
     fi
 }
 
@@ -124,34 +178,39 @@ do_capture() {
 
     # --- qwen3 ---
     run_family qwen3 qwen3_smoke "$SMOKE_QWEN3_PATH" MLX_SMOKE_QWEN3_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3]=CAPTURED || { [[ $? -eq 1 ]] && results[qwen3]=SKIPPED || results[qwen3]=FAILED; }
+        && results[qwen3]=CAPTURED || results[qwen3]=SKIPPED
 
     # --- qwen3_5 ---
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3_5]=CAPTURED || { [[ $? -eq 1 ]] && results[qwen3_5]=SKIPPED || results[qwen3_5]=FAILED; }
+        && results[qwen3_5]=CAPTURED || results[qwen3_5]=SKIPPED
 
     # --- gemma4 ---
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$BASELINE_DIR" \
-        && results[gemma4]=CAPTURED || { [[ $? -eq 1 ]] && results[gemma4]=SKIPPED || results[gemma4]=FAILED; }
+        && results[gemma4]=CAPTURED || results[gemma4]=SKIPPED
 
     # --- lfm2 (allow up to 15 minutes for cold USB mmap) ---
     run_family lfm2 lfm2_smoke "$SMOKE_LFM2_PATH" MLX_SMOKE_LFM2_MODEL_PATH "$BASELINE_DIR" \
-        && results[lfm2]=CAPTURED || { [[ $? -eq 1 ]] && results[lfm2]=SKIPPED || results[lfm2]=FAILED; }
+        && results[lfm2]=CAPTURED || results[lfm2]=SKIPPED
 
     # --- qwen3_5_moe (may be slow on cold USB) ---
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$BASELINE_DIR" \
-        && results[qwen3_5_moe]=CAPTURED || { [[ $? -eq 1 ]] && results[qwen3_5_moe]=SKIPPED || results[qwen3_5_moe]=FAILED; }
+        && results[qwen3_5_moe]=CAPTURED || results[qwen3_5_moe]=SKIPPED
 
     echo ""
     echo "=== capture summary ==="
-    local any_failed=0
+    local any_skipped=0
     for family in qwen3 qwen3_5 gemma4 lfm2 qwen3_5_moe; do
         echo "  ${results[$family]:-UNKNOWN}  $family"
-        [[ "${results[$family]:-UNKNOWN}" == "FAILED" ]] && any_failed=1
+        [[ "${results[$family]:-UNKNOWN}" == "SKIPPED" ]] && any_skipped=1
     done
     echo ""
     echo "Baseline written to $BASELINE_DIR"
-    [[ $any_failed -eq 0 ]] && return 0 || return 1
+    if [[ $any_skipped -ne 0 ]]; then
+        echo ""
+        echo "WARNING: one or more families were SKIPPED (MLX_SMOKE_ALLOW_SKIP in effect)."
+        echo "         The gate is weakened — missing families will not be checked in compare."
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -164,26 +223,33 @@ do_compare() {
         exit 1
     fi
 
+    # S0 review fix (Finding 1): wipe the current-run dir before every compare
+    # so stale digests from a previous (possibly partial) run cannot satisfy checks.
+    if [[ -d "$CURRENT_DIR" ]]; then
+        log "Wiping stale current-run dir: $CURRENT_DIR"
+        rm -rf "$CURRENT_DIR"
+    fi
     mkdir -p "$CURRENT_DIR"
     log "Comparing against baseline in $BASELINE_DIR"
 
     declare -A run_results=()
 
-    # Run all families into current/
+    # Run all families into current/. run_family exits on hard errors;
+    # return 1 only on MLX_SMOKE_ALLOW_SKIP soft-skip.
     run_family qwen3 qwen3_smoke "$SMOKE_QWEN3_PATH" MLX_SMOKE_QWEN3_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3]=RAN || { [[ $? -eq 1 ]] && run_results[qwen3]=SKIPPED || run_results[qwen3]=EXEC_FAILED; }
+        && run_results[qwen3]=RAN || run_results[qwen3]=SKIPPED
 
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3_5]=RAN || { [[ $? -eq 1 ]] && run_results[qwen3_5]=SKIPPED || run_results[qwen3_5]=EXEC_FAILED; }
+        && run_results[qwen3_5]=RAN || run_results[qwen3_5]=SKIPPED
 
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[gemma4]=RAN || { [[ $? -eq 1 ]] && run_results[gemma4]=SKIPPED || run_results[gemma4]=EXEC_FAILED; }
+        && run_results[gemma4]=RAN || run_results[gemma4]=SKIPPED
 
     run_family lfm2 lfm2_smoke "$SMOKE_LFM2_PATH" MLX_SMOKE_LFM2_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[lfm2]=RAN || { [[ $? -eq 1 ]] && run_results[lfm2]=SKIPPED || run_results[lfm2]=EXEC_FAILED; }
+        && run_results[lfm2]=RAN || run_results[lfm2]=SKIPPED
 
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$CURRENT_DIR" \
-        && run_results[qwen3_5_moe]=RAN || { [[ $? -eq 1 ]] && run_results[qwen3_5_moe]=SKIPPED || run_results[qwen3_5_moe]=EXEC_FAILED; }
+        && run_results[qwen3_5_moe]=RAN || run_results[qwen3_5_moe]=SKIPPED
 
     echo ""
     echo "=== compare summary ==="
@@ -192,26 +258,34 @@ do_compare() {
         local run_status="${run_results[$family]:-UNKNOWN}"
 
         if [[ "$run_status" == "SKIPPED" ]]; then
-            echo "  SKIPPED  $family (model not found)"
-            continue
-        fi
-
-        if [[ "$run_status" == "EXEC_FAILED" ]]; then
-            echo "  FAIL     $family (cargo test failed)"
-            any_failed=1
+            # Skipped families must also be absent from baseline to be consistent.
+            # A family that was captured but then skipped in compare is a gate hole.
+            local baseline="$BASELINE_DIR/${family}.json"
+            if [[ -f "$baseline" ]]; then
+                log_err "FATAL: $family has a baseline digest but was SKIPPED in compare."
+                log_err "  Either provide the model or remove the baseline and re-capture."
+                any_failed=1
+            else
+                echo "  SKIPPED  $family (in MLX_SMOKE_ALLOW_SKIP, no baseline — consistent)"
+            fi
             continue
         fi
 
         local baseline="$BASELINE_DIR/${family}.json"
         local current="$CURRENT_DIR/${family}.json"
 
+        # S0 review fix (Finding 1): missing baseline is now a hard error.
         if [[ ! -f "$baseline" ]]; then
-            echo "  SKIPPED  $family (no baseline digest — was this family skipped during capture?)"
+            log_err "FATAL: no baseline digest for $family at $baseline"
+            log_err "  Run 'capture' first to record a baseline."
+            any_failed=1
             continue
         fi
 
+        # current digest must exist (assert_digest_valid already checked this
+        # inside run_family on success, but guard again for clarity).
         if [[ ! -f "$current" ]]; then
-            echo "  FAIL     $family (no current digest produced)"
+            log_err "FAIL: no current digest for $family (cargo test ran but produced no file)"
             any_failed=1
             continue
         fi
@@ -227,10 +301,10 @@ do_compare() {
 
     echo ""
     if [[ $any_failed -eq 0 ]]; then
-        echo "All captured families PASSED."
+        echo "All required families PASSED."
         return 0
     else
-        echo "One or more families FAILED — see diff above."
+        echo "One or more families FAILED — see output above."
         return 1
     fi
 }
