@@ -14,9 +14,6 @@
 //! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`
 //! today; the trait collapses that to a single `send`.
 
-// consumed from S7 family migrations; remove in S12
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -34,7 +31,9 @@ use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
 /// Per-step decode operations for one generation turn.
 ///
-/// Generalizes the [`crate::engine::decode::DecodeOps`] closure pair:
+/// Generalizes the legacy `DecodeOps` closure pair (now
+/// [`crate::models::qwen3_5::mtp_decode::DecodeOps`], retained only by
+/// the MTP/vision whole-turn cores):
 /// implementations capture every turn-constant the closures captured —
 /// including the embedding weight that `DecodeOps::forward` used to take
 /// as a second parameter (it never changes within a turn, so it moves
@@ -316,7 +315,7 @@ pub(crate) struct ThinkingSetup {
     /// template injects `<think>\n` unless `resolve_enable_thinking`
     /// returns `Some(false)`. LFM2: always `true` — its template ignores
     /// `enable_thinking` and the model always emits a think block
-    /// (`models/lfm2/model.rs::chat_sync_core` "thinking_enabled" note).
+    /// ("thinking_enabled" note on the deleted lfm2 flat core).
     pub enabled: bool,
     /// Thinking-token budget before `</think>` is forced. Qwen3.5: the
     /// explicit `ChatConfig::thinking_token_budget` only. LFM2: explicit
@@ -439,9 +438,9 @@ pub(crate) struct TurnSetup<'a> {
 ///
 /// Mirrors the two return shapes of the real per-family whole-turn
 /// functions: the sync cores return `Result<ChatResult>`
-/// (`chat_sync_core_paged`) while the streaming cores deliver everything
+/// (`paged_turn_sync_core`) while the streaming cores deliver everything
 /// through the sink and return `Result<()>`
-/// (`chat_stream_sync_core_paged`).
+/// (`paged_turn_stream_core`).
 ///
 /// # Streaming contract (load-bearing)
 ///
@@ -474,8 +473,8 @@ pub(crate) enum TurnOutput {
 /// Inputs to the whole-turn overrides.
 ///
 /// Field set derived from the real call-site signatures
-/// (`Qwen35Inner::chat_sync_core_paged(tokens, tokenizer, eos_token_id,
-/// p, report_perf)` and `chat_stream_sync_core_paged(.., cb, cancelled)`;
+/// (`Qwen35Inner::paged_turn_sync_core(tokens, tokenizer, eos_token_id,
+/// p, report_perf)` and `paged_turn_stream_core(.., cb, cancelled)`;
 /// VLM entry points additionally carry the raw image bytes). S6/S7
 /// extend this struct as the session cores grow — do not add fields no
 /// real call site needs.
@@ -490,7 +489,7 @@ pub(crate) struct WholeTurnArgs<'a> {
     /// top of live caches) rather than a fresh prefill.
     pub is_delta: bool,
     /// Streaming sink; `None` on the sync core (`cb` at the
-    /// `chat_stream_sync_core_paged` call sites).
+    /// `paged_turn_stream_core` call sites).
     pub sink: Option<&'a dyn ChunkSink>,
     /// Cooperative-cancel flag; `None` on the sync core.
     pub cancelled: Option<&'a AtomicBool>,
@@ -936,24 +935,25 @@ pub(crate) trait ChatBackend {
     /// terminal chunk (S5/S6 panel fix — "streaming-delta
     /// prompt_tokens").
     ///
-    /// The legacy qwen3_5 dense/MoE streaming deltas reported the DELTA
-    /// token count (`delta_tokens.len()`) while their own sync deltas —
-    /// and lfm2/qwen3 on BOTH paths, and qwen3_5's own paged streaming
-    /// core — report the full history+delta. The delta count was an
-    /// internal inconsistency that the env-gated parity tests
+    /// Default `full_len` (the full history+delta length) — what every
+    /// migrated family reports, matching the sync delta results (not
+    /// hook-controlled — no family diverges there) and the paged
+    /// streaming cores.
+    ///
+    /// History: the legacy qwen3_5 dense/MoE streaming deltas reported
+    /// the DELTA token count (`delta_tokens.len()`) since PR #48 — an
+    /// internal inconsistency the env-gated parity tests
     /// `qwen3_5_delta_chat::stream_session_path_keeps_ttft_flat_across_turns`
     /// and `qwen3_5_moe_session::moe_stream_session_path_keeps_ttft_flat_across_turns`
     /// reject (they assert cumulative growth and fail identically on
-    /// pre-migration legacy code). qwen3_5 dense overrides this to
-    /// `full_len` since the S8 migration (gate round 1), MoE since S9,
-    /// and qwen3's S7 override also returns `full_len`. The default
-    /// stays the legacy delta count until the gemma4/lfm2 migrations
-    /// (S10/S11) decide for the remaining families. Sync delta results
-    /// always report the full length (not hook-controlled — no family
-    /// diverges there).
+    /// pre-migration legacy code). The S7–S11 migrations all settled on
+    /// `full_len`, so S12 folded it into the default and deleted the
+    /// five identical per-family overrides. `delta_len` stays in the
+    /// signature for any future family that genuinely needs the delta
+    /// count.
     fn stream_delta_prompt_tokens(&self, full_len: usize, delta_len: usize) -> u32 {
-        let _ = full_len;
-        delta_len as u32
+        let _ = delta_len;
+        full_len as u32
     }
 
     /// Whether a live session exists for the delta-continuation guard
@@ -997,8 +997,8 @@ pub(crate) trait ChatBackend {
     // `TurnOutput::Streamed`; `Complete` under streaming is rejected
     // loudly by the session core.
 
-    /// Block-paged whole-turn path. == `chat_sync_core_paged` /
-    /// `chat_stream_sync_core_paged` on Qwen3.5 dense/MoE.
+    /// Block-paged whole-turn path. == `paged_turn_sync_core` /
+    /// `paged_turn_stream_core` on Qwen3.5 dense/MoE.
     ///
     /// Streaming contract: see [`TurnOutput`] — with `args.sink`
     /// attached, stream everything through the sink and return

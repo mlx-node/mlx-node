@@ -35,7 +35,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
-use crate::models::qwen3_5::chat_common::{
+use crate::engine::{
     self, IMAGE_CHANGE_RESTART_PREFIX, build_chatml_continue_delta_text,
     build_chatml_tool_delta_text, build_synthetic_user_message,
 };
@@ -483,7 +483,7 @@ impl Qwen3Inner {
         // Drop any live paged-adapter request so the next session starts
         // from a fully cold state. Without this, a finalize_turn_keep_live
         // call from a prior session would leave block_table populated and
-        // a subsequent `chat_sync_core_paged` could mistakenly take the
+        // a subsequent `paged_turn_sync_core` could mistakenly take the
         // warm-continue path against stale tokens.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
@@ -543,7 +543,7 @@ impl Qwen3Inner {
     /// Note: tests assert non-empty / valid-token output via shape checks,
     /// not exact-token equivalence to the flat path.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged(
+    fn paged_turn_sync_core(
         &mut self,
         token_ids_vec: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
@@ -615,7 +615,7 @@ impl Qwen3Inner {
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
-                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -699,7 +699,7 @@ impl Qwen3Inner {
         // `release_request` on either path. Rust doesn't have try{}, so we
         // emulate with a helper closure returning Result and call
         // release_request after.
-        let forward_result = self.chat_sync_core_paged_inner(
+        let forward_result = self.paged_turn_sync_core_inner(
             &token_ids_vec,
             cached_prefix_len,
             num_layers,
@@ -789,8 +789,8 @@ impl Qwen3Inner {
 
         // Decode text + tool/thinking parsing (mirrors chat_sync_core).
         let raw_text_full = tokenizer.decode_sync(&generated_tokens, true)?;
-        let include_reasoning = chat_common::resolve_include_reasoning(&config);
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let include_reasoning = engine::resolve_include_reasoning(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
         let thinking_enabled = enable_thinking.unwrap_or(true);
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str();
@@ -798,7 +798,7 @@ impl Qwen3Inner {
         // true thinking span, THEN apply the include_reasoning suppression
         // contract to `thinking` and `raw_text` (matches finalize_chat_result /
         // the streaming paths).
-        let (cleaned_text, tool_calls, thinking_full) = chat_common::parse_thinking_and_tools(
+        let (cleaned_text, tool_calls, thinking_full) = engine::parse_thinking_and_tools(
             &raw_text_full,
             &generated_tokens,
             thinking_enabled,
@@ -813,7 +813,7 @@ impl Qwen3Inner {
         } else {
             None
         };
-        let raw_text = chat_common::raw_text_with_reasoning_suppressed(
+        let raw_text = engine::raw_text_with_reasoning_suppressed(
             &raw_text_full,
             &generated_tokens,
             thinking_enabled,
@@ -879,12 +879,12 @@ impl Qwen3Inner {
         })
     }
 
-    /// Inner forward + decode loop for `chat_sync_core_paged`. Split out so
+    /// Inner forward + decode loop for `paged_turn_sync_core`. Split out so
     /// the caller can wrap it with `release_request` in a try-style flow.
     /// Returns `(generated_tokens, generated_logprobs, finish_reason,
     /// first_token_elapsed_ms)`.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged_inner(
+    fn paged_turn_sync_core_inner(
         &mut self,
         token_ids_vec: &[u32],
         cached_prefix_len: u32,
@@ -909,7 +909,7 @@ impl Qwen3Inner {
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
                 napi::Error::from_reason(
-                    "chat_sync_core_paged_inner: cached_prefix_len > total_prompt_tokens",
+                    "paged_turn_sync_core_inner: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
 
@@ -941,7 +941,7 @@ impl Qwen3Inner {
         // always non-empty for any prompt of length >= 1.
         debug_assert!(
             suffix_len > 0,
-            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
         let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
         let last_logits =
@@ -991,9 +991,9 @@ impl Qwen3Inner {
 
         // === DECODE LOOP ===
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -1400,7 +1400,7 @@ impl Qwen3Inner {
     /// render performed) and streams through the engine's [`ChunkSink`]
     /// instead of the deleted `StreamSender` wrapper.
     ///
-    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and forward
+    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and forward
     /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
     /// via `run_paged_prefill_chunk` → decode loop via
     /// `run_paged_decode_step`) but emits each generated token through
@@ -1415,12 +1415,12 @@ impl Qwen3Inner {
     ///    the matched cached-prefix length.
     ///
     /// Applies the same vLLM-style `max_cache_hit_tokens = prompt.len() - 1`
-    /// cap as `chat_sync_core_paged` so zero-delta prompts (every prompt
+    /// cap as `paged_turn_sync_core` so zero-delta prompts (every prompt
     /// token already cached, e.g. retries of an earlier timed-out turn)
     /// still produce at least one suffix token to prefill. Numerical
     /// equivalence to the flat path is not asserted here (validated
     /// separately via random-init smoke tests).
-    fn chat_stream_sync_core_paged(
+    fn paged_turn_stream_core(
         &mut self,
         token_ids_vec: Vec<u32>,
         config: ChatConfig,
@@ -1438,8 +1438,8 @@ impl Qwen3Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
-        let p = chat_common::extract_chat_params(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
+        let p = engine::extract_chat_params(&config);
         let reuse_cache = p.reuse_cache;
         let report_perf = p.report_performance;
 
@@ -1455,19 +1455,19 @@ impl Qwen3Inner {
         let seq_id: u32 = 0;
 
         // === Adapter lifecycle: warm continuation OR cold start. ===
-        // See the equivalent block in `chat_sync_core_paged` for full
+        // See the equivalent block in `paged_turn_sync_core` for full
         // discussion of why warm continuation preserves the partial
         // trailing block's K/V across turns.
         // Lazy decode allocation: pass the prompt length only. Decode
         // blocks grow on-demand via `record_tokens` (no pre-reserve of
         // `p.max_new_tokens`).
         let total_budget = token_ids_vec.len() as u32;
-        // See `chat_sync_core_paged` for the vLLM-style cap rationale.
+        // See `paged_turn_sync_core` for the vLLM-style cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 napi::Error::from_reason(
-                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -1527,7 +1527,7 @@ impl Qwen3Inner {
 
         // Run the forward + decode under a try-style block so we can
         // always release the request afterwards.
-        let result = self.chat_stream_sync_core_paged_inner(
+        let result = self.paged_turn_stream_core_inner(
             &token_ids_vec,
             cached_prefix_len,
             num_layers,
@@ -1570,15 +1570,15 @@ impl Qwen3Inner {
     }
 
     /// Inner forward + streaming decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
+    /// [`Self::paged_turn_stream_core`]. Split out so the caller can
     /// wrap with `release_request` in a try-style flow.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner(
+    fn paged_turn_stream_core_inner(
         &mut self,
         token_ids_vec: &[u32],
         cached_prefix_len: u32,
         num_layers: usize,
-        p: &chat_common::ChatParams,
+        p: &engine::ChatParams,
         eos_token_id: u32,
         think_end_id: Option<u32>,
         think_end_str: Option<&str>,
@@ -1596,7 +1596,7 @@ impl Qwen3Inner {
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
                 napi::Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: cached_prefix_len > total_prompt_tokens",
+                    "paged_turn_stream_core_inner: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
 
@@ -1609,7 +1609,7 @@ impl Qwen3Inner {
         // length >= 1.
         debug_assert!(
             suffix_len > 0,
-            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_stream_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         let positions_dummy = MxArray::from_int32(&[0], &[1])?;
@@ -1620,12 +1620,12 @@ impl Qwen3Inner {
             self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
 
         // Apply prompt-level penalties on prefill logits before the first sample.
-        let last_logits = chat_common::apply_all_penalties(last_logits, token_ids_vec, p)?;
+        let last_logits = engine::apply_all_penalties(last_logits, token_ids_vec, p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
         // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        // starts allocating (see paged_turn_sync_core_inner for rationale).
         synchronize_and_clear_cache();
 
         // Streaming state.
@@ -1637,7 +1637,7 @@ impl Qwen3Inner {
 
         let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+        let mut reasoning_tracker = engine::ReasoningTracker::new(
             starts_in_thinking,
             p.thinking_token_budget,
             think_end_id,
@@ -1727,7 +1727,7 @@ impl Qwen3Inner {
             // [1, 1, vocab] → [vocab].
             let next_logits = next_logits.squeeze(Some(&[0, 1]))?;
 
-            let next_logits = chat_common::apply_all_penalties(next_logits, &token_history, p)?;
+            let next_logits = engine::apply_all_penalties(next_logits, &token_history, p)?;
             let next_y = sample(&next_logits, p.sampling_config)?;
             MxArray::async_eval_arrays(&[&next_y]);
             y = next_y;
@@ -1741,7 +1741,7 @@ impl Qwen3Inner {
         // and to build the right delta on top of the prior conversation.
         // Mirrors the flat path's "save cache state" block in
         // `chat_stream_sync_core` — register-for-reuse / release-request
-        // are still owned by the caller (`chat_stream_sync_core_paged`).
+        // are still owned by the caller (`paged_turn_stream_core`).
         if reuse_cache {
             let mut full_history = token_ids_vec.to_vec();
             // When the loop exited via stop / cancellation / repetition,
@@ -1794,7 +1794,7 @@ impl Qwen3Inner {
 
         let num_tokens = generated_tokens.len() as u32;
         let thinking_enabled = enable_thinking.unwrap_or(true);
-        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &full_text,
             &generated_tokens,
             thinking_enabled,
@@ -1809,7 +1809,7 @@ impl Qwen3Inner {
             finish_reason
         };
 
-        let perf_metrics = chat_common::compute_performance_metrics(
+        let perf_metrics = engine::compute_performance_metrics(
             generation_start,
             *first_token_instant,
             token_ids_vec.len() - (cached_prefix_len as usize),
@@ -1826,7 +1826,7 @@ impl Qwen3Inner {
             num_tokens: Some(num_tokens),
             prompt_tokens: Some(prompt_token_count),
             reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-            raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+            raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                 &full_text,
                 &generated_tokens,
                 thinking_enabled,
@@ -1913,9 +1913,9 @@ impl Qwen3Inner {
         let input_tokens = input_ids.to_uint32()?;
         let current_ids = input_ids;
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -2621,9 +2621,9 @@ impl Qwen3Inner {
         // yields nothing for a nonpositive budget, so this only prevents the
         // abort without changing behavior for valid budgets.
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -3728,7 +3728,7 @@ impl Qwen3Inner {
         let config = args.config.clone();
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
-                self.chat_stream_sync_core_paged(
+                self.paged_turn_stream_core(
                     args.tokens.to_vec(),
                     config,
                     args.eos_id,
@@ -3756,7 +3756,7 @@ impl Qwen3Inner {
                     config.reuse_cache.unwrap_or(true)
                 };
                 let tokenizer = args.tokenizer.clone();
-                let result = self.chat_sync_core_paged(
+                let result = self.paged_turn_sync_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     config,
@@ -3975,7 +3975,7 @@ impl ChatBackend for Qwen3Inner {
         // Legacy: `starts_in_thinking = enable_thinking.unwrap_or(true)`
         // (template-honoring) + the explicit config budget only.
         ThinkingSetup {
-            enabled: chat_common::resolve_enable_thinking(config).unwrap_or(true),
+            enabled: engine::resolve_enable_thinking(config).unwrap_or(true),
             budget: config.thinking_token_budget,
         }
     }
@@ -3994,7 +3994,7 @@ impl ChatBackend for Qwen3Inner {
         // Qwen3's chat template DOES inject `<think>\n` after the
         // assistant opener by default — use `None`/`Some(true)` path to
         // keep the delta template-equivalent.
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
         tok.encode_sync(&delta_text, Some(false))
     }
@@ -4007,7 +4007,7 @@ impl ChatBackend for Qwen3Inner {
         is_error: Option<bool>,
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text =
             build_chatml_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
         tok.encode_sync(&delta_text, Some(false))
@@ -4163,13 +4163,6 @@ impl ChatBackend for Qwen3Inner {
             (false, false) => "chat",
             (false, true) => "chat_delta",
         }
-    }
-
-    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
-        // qwen3's streaming delta terminal chunk reports the FULL
-        // history+delta length (unlike the qwen3_5 default of the delta
-        // count) — legacy `prompt_tokens: Some(prompt_token_count)`.
-        full_len as u32
     }
 
     fn session_holds_images(&self) -> bool {
@@ -5135,7 +5128,7 @@ mod tests {
         }
     }
 
-    /// **Smoke test for `chat_sync_core_paged`**. Without real weights /
+    /// **Smoke test for `paged_turn_sync_core`**. Without real weights /
     /// tokenizer we cannot drive the full chat path, but we CAN drive the
     /// underlying `run_paged_prefill_chunk` + `run_paged_decode_step`
     /// helpers that the chat path delegates to. This validates the
@@ -5161,7 +5154,7 @@ mod tests {
     /// check (existing pattern from
     /// `test_qwen3_inner_constructs_paged_adapter_when_flag_is_true`).
     #[test]
-    fn test_chat_sync_core_paged_smoke_via_helpers() {
+    fn test_paged_turn_sync_core_smoke_via_helpers() {
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -5169,7 +5162,7 @@ mod tests {
                 let msg = err.reason.to_string();
                 if msg.contains("No Metal device found") {
                     eprintln!(
-                        "skipping test_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                        "skipping test_paged_turn_sync_core_smoke_via_helpers (no Metal): {msg}"
                     );
                     return;
                 }
@@ -5239,7 +5232,7 @@ mod tests {
             layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
         }
 
-        // Drive the adapter lifecycle the same way `chat_sync_core_paged`
+        // Drive the adapter lifecycle the same way `paged_turn_sync_core`
         // does. seq_id is arbitrary (per-request scoping).
         let prompt: Vec<u32> = vec![10, 20, 30, 40];
         let max_decode: u32 = 2;
@@ -5271,7 +5264,7 @@ mod tests {
             Err(e) => {
                 let msg = e.reason.to_string();
                 if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers: {msg}");
+                    eprintln!("skipping test_paged_turn_sync_core_smoke_via_helpers: {msg}");
                     return;
                 }
                 panic!("unexpected run_paged_prefill_chunk failure: {msg}");
@@ -5312,7 +5305,7 @@ mod tests {
                 Err(e) => {
                     let msg = e.reason.to_string();
                     if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                        eprintln!("skipping test_chat_sync_core_paged_smoke_via_helpers: {msg}");
+                        eprintln!("skipping test_paged_turn_sync_core_smoke_via_helpers: {msg}");
                         return;
                     }
                     panic!("unexpected run_paged_decode_step failure on step {i}: {msg}");
@@ -5345,7 +5338,7 @@ mod tests {
             );
         }
 
-        // Cleanup mirrors the chat_sync_core_paged success path.
+        // Cleanup mirrors the paged_turn_sync_core success path.
         {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
@@ -5381,7 +5374,7 @@ mod tests {
     }
 
     /// **Streaming smoke test for the paged path**, structurally analogous
-    /// to [`test_chat_sync_core_paged_smoke_via_helpers`]. Drives the
+    /// to [`test_paged_turn_sync_core_smoke_via_helpers`]. Drives the
     /// same `run_paged_prefill_chunk` + `run_paged_decode_step` helpers
     /// the streaming variant delegates to (the streaming entry just adds
     /// per-token emit + cancellation), so the helper-level coverage
@@ -5396,7 +5389,7 @@ mod tests {
     ///
     /// Skips on no-Metal hosts.
     #[test]
-    fn test_chat_stream_sync_core_paged_smoke_via_helpers() {
+    fn test_paged_turn_stream_core_smoke_via_helpers() {
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -5404,7 +5397,7 @@ mod tests {
                 let msg = err.reason.to_string();
                 if msg.contains("No Metal device found") {
                     eprintln!(
-                        "skipping test_chat_stream_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                        "skipping test_paged_turn_stream_core_smoke_via_helpers (no Metal): {msg}"
                     );
                     return;
                 }
@@ -5417,7 +5410,7 @@ mod tests {
         );
 
         // Cast all model weights to BFloat16 (paged pool dtype). Same
-        // rationale as `test_chat_sync_core_paged_smoke_via_helpers`.
+        // rationale as `test_paged_turn_sync_core_smoke_via_helpers`.
         use crate::array::DType;
         let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
         let w = inner.embedding.get_weight();
@@ -5467,7 +5460,7 @@ mod tests {
         }
 
         // Drive the adapter lifecycle the same way
-        // `chat_stream_sync_core_paged` does.
+        // `paged_turn_stream_core` does.
         let prompt: Vec<u32> = vec![10, 20, 30, 40];
         let max_decode: u32 = 2;
         {
@@ -5496,7 +5489,7 @@ mod tests {
             Err(e) => {
                 let msg = e.reason.to_string();
                 if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!("skipping test_chat_stream_sync_core_paged_smoke_via_helpers: {msg}");
+                    eprintln!("skipping test_paged_turn_stream_core_smoke_via_helpers: {msg}");
                     return;
                 }
                 panic!("unexpected run_paged_prefill_chunk failure: {msg}");
@@ -5533,9 +5526,7 @@ mod tests {
                 Err(e) => {
                     let msg = e.reason.to_string();
                     if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                        eprintln!(
-                            "skipping test_chat_stream_sync_core_paged_smoke_via_helpers: {msg}"
-                        );
+                        eprintln!("skipping test_paged_turn_stream_core_smoke_via_helpers: {msg}");
                         return;
                     }
                     panic!("unexpected run_paged_decode_step failure on step {i}: {msg}");
@@ -5566,7 +5557,7 @@ mod tests {
             );
         }
 
-        // Cleanup mirrors the chat_stream_sync_core_paged success path.
+        // Cleanup mirrors the paged_turn_stream_core success path.
         {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
@@ -5576,7 +5567,7 @@ mod tests {
 
     /// Helper used by the chunked-prefill tests below: cast every weight in
     /// `inner` to BFloat16 so the K/V the layers compute matches the
-    /// paged-pool dtype (mirrors the `test_chat_sync_core_paged_smoke_via_helpers`
+    /// paged-pool dtype (mirrors the `test_paged_turn_sync_core_smoke_via_helpers`
     /// pattern). Without this `update_keys_values` rejects the F32 K/V the
     /// random-init weights would otherwise produce.
     #[cfg(test)]

@@ -366,7 +366,7 @@ impl QianfanOCRInner {
     ///
     /// Only called from [`Self::chat_session_start_sync`]; there is no
     /// longer a non-session entry point.
-    fn chat_sync_core(
+    fn chat_turn_sync_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
@@ -389,8 +389,7 @@ impl QianfanOCRInner {
         let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
         let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
         let ngram_size = config.ngram_size.unwrap_or(64);
-        let enable_thinking =
-            crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config).unwrap_or(false);
+        let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
 
@@ -578,9 +577,8 @@ impl QianfanOCRInner {
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
         let prefill_token_count = token_ids.len();
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
-            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-        );
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = "length".to_string();
 
         // --- Step 8: Decode loop ---
@@ -674,7 +672,7 @@ impl QianfanOCRInner {
             self.cached_image_key = if image_bytes.is_empty() {
                 None
             } else {
-                Some(crate::models::qwen3_5::chat_common::compute_image_cache_key(&image_bytes))
+                Some(crate::engine::compute_image_cache_key(&image_bytes))
             };
         } else {
             // Not reusing — clear metadata to prevent stale prefix matches
@@ -748,16 +746,16 @@ impl QianfanOCRInner {
 
     /// Streaming chat generation.
     ///
-    /// Mirrors [`chat_sync_core`] but emits per-token deltas through
+    /// Mirrors [`chat_turn_sync_core`] but emits per-token deltas through
     /// `stream_tx` and checks `cancelled` on every decode iteration.
     /// Drives the same hoisted cache state so prefix matching and
     /// repetition penalties behave identically to the non-streaming path.
     ///
     /// `eos_token_id` threads through exactly as in
-    /// [`chat_sync_core`](Self::chat_sync_core): session-start callers
+    /// [`chat_turn_sync_core`](Self::chat_turn_sync_core): session-start callers
     /// supply `<|im_end|>` via
     /// [`chat_stream_session_start_sync`](Self::chat_stream_session_start_sync).
-    fn chat_stream_sync_core(
+    fn chat_turn_stream_core(
         &mut self,
         messages: Vec<ChatMessage>,
         config: ChatConfig,
@@ -789,9 +787,7 @@ impl QianfanOCRInner {
             let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
             let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
             let ngram_size = config.ngram_size.unwrap_or(64);
-            let enable_thinking =
-                crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config)
-                    .unwrap_or(false);
+            let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
             let reuse_cache = config.reuse_cache.unwrap_or(true);
             let report_perf = config.report_performance.unwrap_or(false);
 
@@ -955,9 +951,8 @@ impl QianfanOCRInner {
             let first_token_instant = generation_start.map(|_| std::time::Instant::now());
             let prefill_token_count = all_tokens.len();
 
-            let mut generated_tokens: Vec<u32> = Vec::with_capacity(
-                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-            );
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
             let mut finish_reason = "length".to_string();
 
             // Stateful decoder for correct multi-byte/CJK streaming
@@ -1080,7 +1075,7 @@ impl QianfanOCRInner {
                 self.cached_image_key = if image_bytes.is_empty() {
                     None
                 } else {
-                    Some(crate::models::qwen3_5::chat_common::compute_image_cache_key(&image_bytes))
+                    Some(crate::engine::compute_image_cache_key(&image_bytes))
                 };
             } else {
                 self.cached_token_history.clear();
@@ -1183,7 +1178,7 @@ impl QianfanOCRInner {
 
     /// Start a new chat session.
     ///
-    /// Fully resets the caches and delegates to [`Self::chat_sync_core`]
+    /// Fully resets the caches and delegates to [`Self::chat_turn_sync_core`]
     /// with `<|im_end|>` as the stop token so the decode loop leaves the
     /// caches on a clean ChatML boundary that subsequent
     /// [`Self::chat_session_continue_sync`] /
@@ -1191,7 +1186,7 @@ impl QianfanOCRInner {
     /// delta on top of.
     ///
     /// Vision-capable: `messages` may carry images (they will be decoded
-    /// through the InternViT → bridge pipeline inside `chat_sync_core`,
+    /// through the InternViT → bridge pipeline inside `chat_turn_sync_core`,
     /// same as the legacy chat path).
     pub(crate) fn chat_session_start_sync(
         &mut self,
@@ -1220,7 +1215,7 @@ impl QianfanOCRInner {
         // intentionally invalidates any prior cache.
         self.reset_caches_sync();
 
-        self.chat_sync_core(messages, config, im_end_id)
+        self.chat_turn_sync_core(messages, config, im_end_id)
     }
 
     /// Continue an existing chat session with a user turn.
@@ -1246,7 +1241,7 @@ impl QianfanOCRInner {
         if images.as_ref().is_some_and(|v| !v.is_empty()) {
             return Err(Error::from_reason(format!(
                 "{}chat_session_continue is text-only; start a new session with chat_session_start to change the image",
-                crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                crate::engine::IMAGE_CHANGE_RESTART_PREFIX
             )));
         }
 
@@ -1255,16 +1250,13 @@ impl QianfanOCRInner {
         // Subject the session path to the same role/content injection
         // sanitization as the legacy chat path so all entry points stay
         // uniform.
-        let synthetic =
-            crate::models::qwen3_5::chat_common::build_synthetic_user_message(&user_message);
+        let synthetic = crate::engine::build_synthetic_user_message(&user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
-        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
-        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_continue_delta_text(
-            sanitized_user,
-            enable_thinking,
-        );
+        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
+        let delta_text =
+            crate::engine::build_chatml_continue_delta_text(sanitized_user, enable_thinking);
         let delta_tokens = tokenizer.encode_sync(&delta_text, Some(false))?;
 
         self.chat_tokens_delta_sync(delta_tokens, config)
@@ -1283,7 +1275,7 @@ impl QianfanOCRInner {
     /// session currently holds image state).
     ///
     /// `is_error` is forwarded verbatim to
-    /// [`crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text`]:
+    /// [`crate::engine::build_chatml_tool_delta_text`]:
     /// `Some(true)` injects the shared
     /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
     /// `<tool_response>` wrapper; `None` / `Some(false)` keep the
@@ -1297,8 +1289,8 @@ impl QianfanOCRInner {
     ) -> Result<ChatResult> {
         let tokenizer = self.tokenizer.clone();
 
-        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
-        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text(
+        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
+        let delta_text = crate::engine::build_chatml_tool_delta_text(
             &tool_call_id,
             &content,
             enable_thinking,
@@ -1347,7 +1339,7 @@ impl QianfanOCRInner {
         if self.cached_image_key.is_some() {
             return Err(Error::from_reason(format!(
                 "{}chat_tokens_delta_sync cannot be called while image state is cached; call chatSessionStart with the new images instead",
-                crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                crate::engine::IMAGE_CHANGE_RESTART_PREFIX
             )));
         }
         if self.kv_caches.is_none() {
@@ -1469,9 +1461,8 @@ impl QianfanOCRInner {
 
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
-            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-        );
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = "length".to_string();
 
         for step in 0..max_new_tokens {
@@ -1539,7 +1530,7 @@ impl QianfanOCRInner {
         }
 
         // Sync token history with cache state (same drop-last idiom as
-        // `chat_sync_core`: terminal stop/repetition tokens were sampled
+        // `chat_turn_sync_core`: terminal stop/repetition tokens were sampled
         // but never forwarded into the cache).
         let forwarded = if finish_reason == "stop" || finish_reason == "repetition" {
             generated_tokens.len().saturating_sub(1)
@@ -1633,7 +1624,7 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
     ) {
         if cancelled.load(Ordering::Relaxed) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_session_start cancelled before start",
             );
@@ -1641,7 +1632,7 @@ impl QianfanOCRInner {
         }
 
         if config.reuse_cache == Some(false) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_session_start requires reuse_cache=true (leave as None or set to true). The session API only makes sense with cache reuse enabled.",
             );
@@ -1659,7 +1650,7 @@ impl QianfanOCRInner {
         // Full reset: the session always starts clean.
         self.reset_caches_sync();
 
-        self.chat_stream_sync_core(messages, config, stream_tx, cancelled, im_end_id);
+        self.chat_turn_stream_core(messages, config, stream_tx, cancelled, im_end_id);
     }
 
     /// Streaming variant of [`Self::chat_session_continue_sync`].
@@ -1672,7 +1663,7 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
     ) {
         if cancelled.load(Ordering::Relaxed) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_session_continue cancelled before start",
             );
@@ -1680,11 +1671,11 @@ impl QianfanOCRInner {
         }
 
         if images.as_ref().is_some_and(|v| !v.is_empty()) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 &format!(
                     "{}chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
-                    crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                    crate::engine::IMAGE_CHANGE_RESTART_PREFIX
                 ),
             );
             return;
@@ -1692,16 +1683,13 @@ impl QianfanOCRInner {
 
         let tokenizer = self.tokenizer.clone();
 
-        let synthetic =
-            crate::models::qwen3_5::chat_common::build_synthetic_user_message(&user_message);
+        let synthetic = crate::engine::build_synthetic_user_message(&user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
-        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
-        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_continue_delta_text(
-            sanitized_user,
-            enable_thinking,
-        );
+        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
+        let delta_text =
+            crate::engine::build_chatml_continue_delta_text(sanitized_user, enable_thinking);
 
         let delta_tokens = match tokenizer.encode_sync(&delta_text, Some(false)) {
             Ok(t) => t,
@@ -1727,7 +1715,7 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
     ) {
         if cancelled.load(Ordering::Relaxed) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_session_continue_tool cancelled before start",
             );
@@ -1736,8 +1724,8 @@ impl QianfanOCRInner {
 
         let tokenizer = self.tokenizer.clone();
 
-        let enable_thinking = crate::models::qwen3_5::chat_common::resolve_enable_thinking(&config);
-        let delta_text = crate::models::qwen3_5::chat_common::build_chatml_tool_delta_text(
+        let enable_thinking = crate::engine::resolve_enable_thinking(&config);
+        let delta_text = crate::engine::build_chatml_tool_delta_text(
             &tool_call_id,
             &content,
             enable_thinking,
@@ -1771,7 +1759,7 @@ impl QianfanOCRInner {
         cancelled: Arc<AtomicBool>,
     ) {
         if cancelled.load(Ordering::Relaxed) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_tokens_delta cancelled before start",
             );
@@ -1779,7 +1767,7 @@ impl QianfanOCRInner {
         }
 
         if config.reuse_cache == Some(false) {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_tokens_delta_sync requires reuse_cache to be enabled; \
                  the delta path operates on session state by construction",
@@ -1787,31 +1775,31 @@ impl QianfanOCRInner {
             return;
         }
         if self.cached_token_history.is_empty() {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_tokens_delta requires an initialized session (call chatStreamSessionStart first)",
             );
             return;
         }
         if delta_tokens.is_empty() {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_tokens_delta requires at least one delta token",
             );
             return;
         }
         if self.cached_image_key.is_some() {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 &format!(
                     "{}chat_stream_tokens_delta cannot be called while image state is cached; call chatStreamSessionStart with the new images instead",
-                    crate::models::qwen3_5::chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                    crate::engine::IMAGE_CHANGE_RESTART_PREFIX
                 ),
             );
             return;
         }
         if self.kv_caches.is_none() {
-            crate::models::qwen3_5::chat_common::send_stream_error(
+            crate::engine::send_stream_error(
                 &stream_tx,
                 "chat_stream_tokens_delta requires live KV caches; call chatStreamSessionStart first",
             );
@@ -1942,9 +1930,8 @@ impl QianfanOCRInner {
 
         let first_token_instant = generation_start.map(|_| std::time::Instant::now());
 
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
-            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-        );
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = "length".to_string();
 
         // Stateful decoder for correct multi-byte/CJK streaming.
@@ -2176,9 +2163,8 @@ impl QianfanOCRInner {
         let mut token = sample(&last_logits, Some(sampling_config))?;
 
         let eos_token_id = self.config.eos_token_id;
-        let mut generated: Vec<u32> = Vec::with_capacity(
-            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-        );
+        let mut generated: Vec<u32> =
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
 
         for step in 0..max_new_tokens {
             token.eval();

@@ -371,7 +371,7 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     // Compare `raw_text` (the verbatim decoded token stream) rather than
     // the post-processed `text`. The two paths route through different
     // text post-processors (`tools::parse_generation_output` on the
-    // paged path vs. `chat_common::parse_thinking_and_tools` on the
+    // paged path vs. `engine::parse_thinking_and_tools` on the
     // flat-path `chat_tokens_delta_sync`) — when generation is truncated
     // mid-`<think>` block by `max_new_tokens=32`, the latter returns
     // `text=""` (entire output classified as reasoning) while the former

@@ -479,13 +479,10 @@ impl VLModelInner {
         token.eval();
 
         // Track generated tokens
-        let mut generated_tokens: Vec<u32> = Vec::with_capacity(
-            crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-        );
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(
-                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens),
-            )
+            Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -1037,12 +1034,11 @@ impl VLModelInner {
         clear_cache();
 
         // === STEP 3: Batched decode loop ===
-        let mut generated_tokens: Vec<Vec<u32>> = vec![
-            Vec::with_capacity(
-                crate::models::qwen3_5::chat_common::generated_capacity_hint(max_new_tokens)
-            );
-            batch_size
-        ];
+        let mut generated_tokens: Vec<Vec<u32>> =
+            vec![
+                Vec::with_capacity(crate::engine::generated_capacity_hint(max_new_tokens));
+                batch_size
+            ];
         let mut generated_logprobs: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
         let mut finish_reasons: Vec<Option<String>> = vec![None; batch_size];
 

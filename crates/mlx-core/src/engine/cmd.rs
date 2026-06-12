@@ -17,9 +17,6 @@
 //! 7 chat arms straight to `handle_chat_cmd::<FamilyInner>` — only lfm2
 //! (and gemma4's chat-only thread) swap the thread type itself.
 
-// consumed from S7 family migrations; remove in S12
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -1122,14 +1119,12 @@ mod mock_backend_tests {
     }
 
     /// D11 — a STREAMING delta turn's terminal chunk reports the
-    /// family's `stream_delta_prompt_tokens` choice (default: the DELTA
-    /// token count — legacy qwen3_5 dense/MoE behavior; both now
-    /// override to the full length since S8/S9, the default stays until
-    /// the gemma4/lfm2 migrations decide), while the sync delta result
-    /// keeps the full history+delta length (asserted in the lifecycle
-    /// test above).
+    /// family's `stream_delta_prompt_tokens` choice (default since S12:
+    /// the FULL history+delta length, matching the sync delta result —
+    /// every migrated family settled on full, so the five identical
+    /// per-family overrides were folded into the default and deleted).
     #[test]
-    fn streaming_delta_terminal_chunk_reports_delta_prompt_tokens() {
+    fn streaming_delta_terminal_chunk_reports_full_prompt_tokens() {
         let mut backend = MockBackend::new(vec![
             vec![TOK_HELLO, TOK_IM_END],
             vec![TOK_WORLD, TOK_IM_END],
@@ -1170,10 +1165,9 @@ mod mock_backend_tests {
         assert!(delta_len > 0 && delta_len < h1_len + delta_len);
         assert_eq!(
             last.prompt_tokens,
-            Some(delta_len as u32),
-            "streaming delta terminal chunk must report the DELTA count \
-             (full would be {})",
-            h1_len + delta_len,
+            Some((h1_len + delta_len) as u32),
+            "streaming delta terminal chunk must report the FULL \
+             history+delta length (delta alone would be {delta_len})",
         );
         // cached_tokens still reports the full prior history.
         assert_eq!(last.cached_tokens, Some(h1_len as u32));

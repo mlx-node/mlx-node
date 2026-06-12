@@ -21,9 +21,6 @@
 //! S7+ migrations replace each family's copy with
 //! [`start_chat_stream`] + one `thread.send(ChatCmd::Stream…)` call.
 
-// consumed from S7 family migrations; remove in S12
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 

@@ -14,13 +14,13 @@ use crate::engine::backend::{
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
-use crate::models::qwen3_5::arrays_cache::ArraysCache;
-use crate::models::qwen3_5::chat_common::{
+use crate::engine::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
     default_thinking_budget_for_effort, finalize_chat_result, generated_capacity_hint,
     kv_capacity_round_up,
 };
+use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
@@ -153,8 +153,9 @@ impl StreamSender<'_> {
 /// [`Lfm2Inner::verify_cache_prefix`] return value plus the incoming
 /// token count.
 ///
-/// Test-only mirror of the inlined branch at the top of
-/// [`Lfm2Inner::chat_sync_core`] / [`Lfm2Inner::chat_stream_sync_core`]
+/// Test-only mirror of the inlined branch at the top of the deleted
+/// flat `chat_sync_core` / `chat_stream_sync_core` (now the engine
+/// session core's verify-prefix split)
 /// — separating the decision logic from the native state mutation so
 /// the "exact-match routes to miss" invariant can be pinned by pure-
 /// logic unit tests that do not require a loaded LFM2 model.
@@ -187,8 +188,9 @@ pub(crate) enum PrefixCacheDecision {
 /// tokens_len`) and zero-length prefix both route to
 /// [`PrefixCacheDecision::Miss`].
 ///
-/// Mirrors the inlined branch at the top of
-/// [`Lfm2Inner::chat_sync_core`] / [`Lfm2Inner::chat_stream_sync_core`];
+/// Mirrors the inlined branch at the top of the deleted flat
+/// `chat_sync_core` / `chat_stream_sync_core` (now the engine session
+/// core's verify-prefix split);
 /// lifting it out keeps the invariant pinnable without loading a real
 /// LFM2 model.
 #[cfg(test)]
@@ -280,9 +282,9 @@ impl Lfm2Inner {
         // Block-paged KV adapter — default ON.
         //
         // Chat dispatch is wired through this adapter at every chat-entry
-        // site (see the `self.paged_adapter.is_some()` early-returns in
-        // `chat_sync_core` / `chat_stream_sync_core` that hand off to
-        // `chat_sync_core_paged` / `chat_stream_sync_core_paged`).
+        // site: the engine session core's `ChatBackend::paged_turn` probe
+        // hands whole turns to `paged_turn_sync_core` /
+        // `paged_turn_stream_core` whenever the adapter is live.
         //
         // KV-pool sizing: ONLY full_attention layers participate. LFM2's
         // hybrid layer mix is parsed from `config.layer_types`; conv
@@ -436,7 +438,8 @@ impl Lfm2Inner {
     /// surface change.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
         // PREFILL stays native. The compiled C++ decode path is wired ONLY into
-        // the single-token decode loop in `chat_sync_core` (it seeds the
+        // the single-token decode stepper (`Lfm2Decode`, built by
+        // `ChatBackend::begin_decode`; it seeds the
         // compiled graph from the post-prefill caches this native forward
         // builds, then drives `mlx_lfm2_moe_forward` per step). `forward()`
         // never calls the compiled path.
@@ -507,7 +510,7 @@ impl Lfm2Inner {
         // Drop any live paged-adapter request so the next session starts
         // from a fully cold state. Without this, a finalize_turn_keep_live
         // call from a prior session would leave block_table populated and
-        // a subsequent `chat_sync_core_paged` could mistakenly take the
+        // a subsequent `paged_turn_sync_core` could mistakenly take the
         // warm-continue path against stale tokens.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
@@ -670,14 +673,14 @@ impl Lfm2Inner {
     /// - Pure-cache prompt (every prompt token already in the paged pool)
     ///   is rejected — same caveat as Qwen3's paged path.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged(
+    fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         think_end_id: Option<u32>,
         think_end_str: Option<String>,
         include_reasoning: bool,
-        p: &crate::models::qwen3_5::chat_common::ChatParams,
+        p: &crate::engine::ChatParams,
         reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
@@ -714,7 +717,7 @@ impl Lfm2Inner {
         // `max_new_tokens`). The inner decode loop reads `p.max_new_tokens`
         // directly when it needs the budget bound.
         let total_budget = tokens.len() as u32;
-        // vLLM-style exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged
+        // vLLM-style exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core
         // for the full rationale. Forces the cache lookup (and the live-prefix
         // continue check) to leave at least one suffix token for the prefill
         // chunk, so retries of an earlier identical turn never produce a
@@ -723,7 +726,7 @@ impl Lfm2Inner {
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -791,7 +794,7 @@ impl Lfm2Inner {
         let suffix_len = total_prompt_tokens
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
+                Error::from_reason("paged_turn_sync_core: cached_prefix_len > total_prompt_tokens")
             })?;
 
         // Conv layers always need to rebuild from token 0; if the paged
@@ -805,7 +808,7 @@ impl Lfm2Inner {
 
         // Wrap forward / decode in a closure-like pattern so we can
         // release the paged request on either success or error.
-        let forward_result = self.chat_sync_core_paged_inner(
+        let forward_result = self.paged_turn_sync_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -889,8 +892,8 @@ impl Lfm2Inner {
     }
 
     /// Set up the compiled-PAGED decode session for one decode turn (shared by
-    /// the non-streaming `chat_sync_core_paged_inner` and the streaming
-    /// `chat_stream_sync_core_paged_inner`).
+    /// the non-streaming `paged_turn_sync_core_inner` and the streaming
+    /// `paged_turn_stream_core_inner`).
     ///
     /// Acquires the cross-family compiled lifecycle lock + weight read lock,
     /// re-checks ownership, gates on block_size + bf16 weights, seeds the C++
@@ -904,7 +907,8 @@ impl Lfm2Inner {
     fn paged_compiled_decode_setup(&mut self) -> Result<Lfm2PagedCompiledState> {
         // ===== Compiled C++ PAGED decode-path dispatch =====
         //
-        // Mirrors the FLAT path's lock contract (`chat_sync_core`) and qwen3.5's
+        // Mirrors the FLAT path's lock contract (`Lfm2Decode` via
+        // `ChatBackend::begin_decode`) and qwen3.5's
         // paged `cpp_session_ready` gate. The compiled-PAGED decode runs only
         // when ALL of:
         //   1. `compiled_path_active()` — weights registered for our model_id.
@@ -939,7 +943,7 @@ impl Lfm2Inner {
         //
         // CONV STATE: unlike qwen's GDN linear caches, lfm2 needs NO cross-turn
         // conv export — the eager paged path reprefills conv from token 0 each
-        // turn (see `chat_sync_core_paged`'s per-turn `self.caches =
+        // turn (see `paged_turn_sync_core`'s per-turn `self.caches =
         // init_caches(..)`), so the compiled-paged graph threads conv state
         // WITHIN a turn only (in the C++ paged globals) and there is no
         // post-loop export step.
@@ -1138,7 +1142,7 @@ impl Lfm2Inner {
                     Ok(logits)
                 }
                 Err(e) => {
-                    if crate::models::qwen3_5::chat_common::should_propagate_compiled_paged_error(
+                    if crate::engine::should_propagate_compiled_paged_error(
                         st.cpp_compiled_step_completed,
                     ) {
                         warn!(
@@ -1190,15 +1194,15 @@ impl Lfm2Inner {
         }
     }
 
-    /// Inner forward + decode loop for `chat_sync_core_paged`. Split out
+    /// Inner forward + decode loop for `paged_turn_sync_core`. Split out
     /// so the caller can wrap it with `release_request` on either path.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged_inner(
+    fn paged_turn_sync_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &crate::models::qwen3_5::chat_common::ChatParams,
+        p: &crate::engine::ChatParams,
         eos_token_id: u32,
         sampling_config: &Option<crate::sampling::SamplingConfig>,
         reasoning_tracker: &mut ReasoningTracker,
@@ -1208,7 +1212,7 @@ impl Lfm2Inner {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         // === PREFILL ===
@@ -1240,7 +1244,7 @@ impl Lfm2Inner {
         // turn. The returned state holds the RAII guards (compiled lifecycle
         // mutex, weight read lock, paged reset guard) that span the whole decode
         // loop; the same setup + per-step dispatch is shared with the streaming
-        // path (`chat_stream_sync_core_paged_inner`). See
+        // path (`paged_turn_stream_core_inner`). See
         // `paged_compiled_decode_setup` / `paged_compiled_decode_step`.
         let mut paged_st = self.paged_compiled_decode_setup()?;
 
@@ -1607,9 +1611,10 @@ impl Lfm2Inner {
         compute_layer_kinds_for(&self.config, self.layers.len())
     }
 
-    /// Block-paged streaming variant of [`Self::chat_stream_sync_core`].
+    /// Block-paged streaming variant of the deleted flat
+    /// `chat_stream_sync_core`.
     ///
-    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and forward
+    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and forward
     /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
     /// via `run_paged_prefill_chunk` → decode loop via
     /// `run_paged_decode_step`) but emits each generated token through
@@ -1624,18 +1629,18 @@ impl Lfm2Inner {
     ///   the matched cached-prefix length.
     ///
     /// Applies the same vLLM `max_cache_hit_tokens = prompt.len() - 1`
-    /// cap as `chat_sync_core_paged` so zero-delta prompts still produce
+    /// cap as `paged_turn_sync_core` so zero-delta prompts still produce
     /// at least one suffix token to prefill. Numerical equivalence to the
     /// flat path is not asserted here.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged(
+    fn paged_turn_stream_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         think_end_id: Option<u32>,
         think_end_str: Option<String>,
         include_reasoning: bool,
-        p: &crate::models::qwen3_5::chat_common::ChatParams,
+        p: &crate::engine::ChatParams,
         reasoning_effort: Option<String>,
         report_perf: bool,
         eos_token_id: u32,
@@ -1668,17 +1673,17 @@ impl Lfm2Inner {
         let mut last_is_reasoning = thinking_enabled;
 
         // === Adapter lifecycle: warm continuation OR cold start. ===
-        // See the equivalent block in `chat_sync_core_paged` for full
+        // See the equivalent block in `paged_turn_sync_core` for full
         // discussion.
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // See `chat_sync_core_paged` for the vLLM-style cap rationale.
+        // See `paged_turn_sync_core` for the vLLM-style cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let cached_prefix_len = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -1735,7 +1740,7 @@ impl Lfm2Inner {
             }
         };
 
-        // Reset conv-layer state for this turn (see chat_sync_core_paged
+        // Reset conv-layer state for this turn (see paged_turn_sync_core
         // doc comment).
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
@@ -1746,7 +1751,7 @@ impl Lfm2Inner {
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                    "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
 
@@ -1760,7 +1765,7 @@ impl Lfm2Inner {
 
         // Run the forward + decode under a try-style block so we can
         // always release the request afterwards.
-        let result = self.chat_stream_sync_core_paged_inner(
+        let result = self.paged_turn_stream_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -1783,7 +1788,7 @@ impl Lfm2Inner {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     // Keep request live across turns. See
                     // `finalize_turn_keep_live` doc + the non-streaming
-                    // `chat_sync_core_paged`'s terminal block.
+                    // `paged_turn_sync_core`'s terminal block.
                     let _ = adapter.finalize_turn_keep_live(&[], 0);
                 }
                 t
@@ -1800,7 +1805,7 @@ impl Lfm2Inner {
         // `chat_session_continue` (which dispatches to
         // `chat_tokens_delta_sync`) finds an initialized session and
         // can build its delta on top of the prior prompt + reply.
-        // See the non-streaming `chat_sync_core_paged` for the rationale
+        // See the non-streaming `paged_turn_sync_core` for the rationale
         // on `last_token_in_cache = false`.
         let last_token_in_cache = false;
         self.save_cache_state_internal(true, &tokens, &generated_tokens, last_token_in_cache);
@@ -1896,15 +1901,15 @@ impl Lfm2Inner {
     }
 
     /// Inner forward + streaming decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Split out so the caller can
+    /// [`Self::paged_turn_stream_core`]. Split out so the caller can
     /// wrap with `release_request` in a try-style flow.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner<'a>(
+    fn paged_turn_stream_core_inner<'a>(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &crate::models::qwen3_5::chat_common::ChatParams,
+        p: &crate::engine::ChatParams,
         sampling_config: Option<crate::sampling::SamplingConfig>,
         eos_token_id: u32,
         reasoning_tracker: &mut ReasoningTracker,
@@ -1927,7 +1932,7 @@ impl Lfm2Inner {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_stream_sync_core_paged: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_stream_core: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         // === PREFILL ===
@@ -1941,7 +1946,7 @@ impl Lfm2Inner {
         y.eval();
 
         // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        // starts allocating (see paged_turn_sync_core_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
         if report_perf {
@@ -2050,8 +2055,8 @@ impl Lfm2Inner {
     /// [`ChatBackend::paged_turn`] probe (S11).
     ///
     /// Routes the two FRESH turn shapes onto the kept paged cores
-    /// verbatim: sync → [`Self::chat_sync_core_paged`], streaming →
-    /// [`Self::chat_stream_sync_core_paged`]. Delta turns never reach
+    /// verbatim: sync → [`Self::paged_turn_sync_core`], streaming →
+    /// [`Self::paged_turn_stream_core`]. Delta turns never reach
     /// this helper — [`ChatBackend::paged_turn`] declines them (legacy
     /// lfm2 delta paths run the flat eager prefill+decode over
     /// `self.caches` even when `paged_adapter` is `Some`).
@@ -2070,7 +2075,7 @@ impl Lfm2Inner {
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                self.chat_stream_sync_core_paged(
+                self.paged_turn_stream_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     think_end_id,
@@ -2086,7 +2091,7 @@ impl Lfm2Inner {
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = self.chat_sync_core_paged(
+                let result = self.paged_turn_sync_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     think_end_id,
@@ -2627,14 +2632,6 @@ impl ChatBackend for Lfm2Inner {
         // profiling-gated extras. Keep the payload byte-stable.
     }
 
-    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
-        // Legacy lfm2 streaming deltas report the FULL history+delta
-        // length (`prompt_tokens: Some(prompt_token_count)` where
-        // `prompt_token_count = full_token_history.len()`), like
-        // qwen3/gemma4 — not the legacy qwen3_5 delta count.
-        full_len as u32
-    }
-
     fn session_holds_images(&self) -> bool {
         // Always `None` for text-only LFM2 in practice; feeds the
         // DEFAULT `text_delta_image_guard` policy.
@@ -2687,7 +2684,7 @@ impl Drop for Lfm2CompiledResetGuard {
 /// loop returns early via `?`, so the next generation never seeds against stale
 /// paged pools.
 ///
-/// Armed by `chat_sync_core_paged_inner` when the compiled-paged seed succeeds.
+/// Armed by `paged_turn_sync_core_inner` when the compiled-paged seed succeeds.
 struct Lfm2PagedResetGuard;
 
 impl Drop for Lfm2PagedResetGuard {
@@ -3404,8 +3401,8 @@ mod prefix_cache_decision_tests {
     //! Pure-logic coverage of the prefix-cache decision tree — no model
     //! load required. The verifier `Lfm2Inner::verify_cache_prefix`
     //! returns either `0` (miss) or `cached_token_history.len()` (exact
-    //! prefix relation). The call sites in `chat_sync_core` /
-    //! `chat_stream_sync_core` then classify that value plus the
+    //! prefix relation). The engine session core (and the paged turn
+    //! cores) then classify that value plus the
     //! incoming prompt length into
     //! [`PrefixCacheDecision::StrictExtendHit`] (warm-reuse, skip the
     //! cached prefix, prefill only the tail) vs
@@ -3732,7 +3729,7 @@ mod paged_adapter_construction_tests {
         }
     }
 
-    /// **Smoke test for `chat_sync_core_paged` helpers**. Without real
+    /// **Smoke test for `paged_turn_sync_core` helpers**. Without real
     /// weights / tokenizer we cannot drive the full chat path, but we
     /// CAN drive the underlying `run_paged_prefill_chunk` +
     /// `run_paged_decode_step` helpers that the chat path delegates to.
@@ -3756,7 +3753,7 @@ mod paged_adapter_construction_tests {
     ///
     /// Skips on no-Metal hosts.
     #[test]
-    fn test_lfm2_chat_sync_core_paged_smoke_via_helpers() {
+    fn test_lfm2_paged_turn_sync_core_smoke_via_helpers() {
         use crate::array::{DType, MxArray};
 
         let cfg = paged_tiny_config(Some(true));
@@ -3766,7 +3763,7 @@ mod paged_adapter_construction_tests {
                 let msg = err.reason.to_string();
                 if msg.contains("No Metal device found") {
                     eprintln!(
-                        "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers (no Metal): {msg}"
+                        "skipping test_lfm2_paged_turn_sync_core_smoke_via_helpers (no Metal): {msg}"
                     );
                     return;
                 }
@@ -3847,7 +3844,7 @@ mod paged_adapter_construction_tests {
             mlp.set_down_proj_weight(&cast(&w)).expect("set down");
         }
 
-        // Drive the adapter lifecycle the same way `chat_sync_core_paged`
+        // Drive the adapter lifecycle the same way `paged_turn_sync_core`
         // does. seq_id is arbitrary (per-request scoping).
         let prompt: Vec<u32> = vec![10, 20, 30, 40];
         let max_decode: u32 = 2;
@@ -3875,7 +3872,7 @@ mod paged_adapter_construction_tests {
             Err(e) => {
                 let msg = e.reason.to_string();
                 if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
-                    eprintln!("skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}");
+                    eprintln!("skipping test_lfm2_paged_turn_sync_core_smoke_via_helpers: {msg}");
                     return;
                 }
                 panic!("unexpected run_paged_prefill_chunk failure: {msg}");
@@ -3910,7 +3907,7 @@ mod paged_adapter_construction_tests {
                     let msg = e.reason.to_string();
                     if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
                         eprintln!(
-                            "skipping test_lfm2_chat_sync_core_paged_smoke_via_helpers: {msg}"
+                            "skipping test_lfm2_paged_turn_sync_core_smoke_via_helpers: {msg}"
                         );
                         return;
                     }

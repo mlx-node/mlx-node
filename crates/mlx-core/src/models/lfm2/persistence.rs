@@ -8,13 +8,13 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::engine::persistence::{
+    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+};
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
     ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8, has_sym8_mode,
     load_quant_settings_from_disk, resolve_default_mode,
-};
-use crate::models::qwen3_5::persistence_common::{
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
@@ -1530,8 +1530,9 @@ impl Lfm2Inner {
         // `init_lfm2_paged_compiled_session` → `mlx_lfm2_moe_init_paged`) can read
         // weights via `get_weight`. The same single weight map and `model_id` serve
         // BOTH the flat (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`)
-        // compiled graphs; the per-step dispatcher (`chat_sync_core` flat vs
-        // `chat_sync_core_paged_inner` paged) picks the right graph. The
+        // compiled graphs; the per-step dispatcher (the engine `Lfm2Decode`
+        // stepper flat vs `paged_turn_sync_core_inner` paged) picks the
+        // right graph. The
         // single-owner `g_weights`/`model_id` clobber contract:
         // `register_weights_with_cpp` clears the map, stores, bumps the compile
         // epoch, then publishes `model_id` LAST under `COMPILED_WEIGHTS_RWLOCK.write()`.
@@ -3096,9 +3097,8 @@ mod tests {
             prefill_len, prefill_p as i32,
             "prefill KV offset must equal the prefill token count"
         );
-        let max_kv_len =
-            crate::models::qwen3_5::chat_common::kv_capacity_round_up(prefill_len, total_t as i32)
-                .expect("kv capacity round-up in test");
+        let max_kv_len = crate::engine::kv_capacity_round_up(prefill_len, total_t as i32)
+            .expect("kv capacity round-up in test");
 
         let is_attn: Vec<i32> = (0..num_layers)
             .map(|i| i32::from(config.is_attention_layer(i)))

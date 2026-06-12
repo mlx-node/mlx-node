@@ -1,10 +1,10 @@
 //! Gated integration test for the Qwen3.5 MoE session-based chat delta path.
 //!
 //! Mirrors `qwen3_5_delta_chat.rs` but exercises the MoE surface. The MoE
-//! implementation reuses the shared `chat_common` helpers (ChatML delta
+//! implementation reuses the shared `crate::engine` helpers (ChatML delta
 //! construction, cache prefix verification, decode loop) and threads the
 //! MoE-specific compiled forward path through the decode loop, so both
-//! legacy-compatible `chat_sync_core` AND the new session API must stay
+//! legacy-compatible `vision_mtp_whole_turn_core` (ex-`chat_sync_core`) AND the new session API must stay
 //! byte-for-byte consistent.
 //!
 //! The test is gated because it needs a real Qwen3.5 MoE checkpoint on

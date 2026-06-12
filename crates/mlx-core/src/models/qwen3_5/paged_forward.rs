@@ -337,7 +337,7 @@ fn run_paged_prefill_single_shot(
 /// `[1, prompt_len, hidden]`.
 ///
 /// Mirror of `chunked_prefill_with_hidden` (dense / flat path). The
-/// paged-MTP gate inside `chat_sync_core_paged_inner` consumes this so
+/// paged-MTP gate inside `paged_turn_sync_core_inner` consumes this so
 /// `prefill_mtp_commit` can seed `g_mtp_committed_len = N` before the
 /// first MTP cycle — without it the MTP draft attends over a
 /// prompt-less context and parity vs the AR run breaks.

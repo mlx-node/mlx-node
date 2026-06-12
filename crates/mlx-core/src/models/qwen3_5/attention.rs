@@ -319,7 +319,7 @@ impl Qwen3_5Attention {
 
         // Standard scalar-offset partial RoPE. Paged path is text-only;
         // image-bearing turns are rejected at the chat-entry sites
-        // (`chat_sync_core` / `chat_stream_sync_inner` and the MoE
+        // (`vision_mtp_whole_turn_core` / `chat_stream_sync_inner` and the MoE
         // counterparts) before reaching this forward.
         let rope_offset = first_logical_position as i32;
         let queries = self.rope.forward(&queries, Some(rope_offset))?;

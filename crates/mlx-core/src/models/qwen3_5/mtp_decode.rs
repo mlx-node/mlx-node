@@ -760,6 +760,267 @@ fn trace_acceptance_dense(
 }
 
 // =============================================================================
+// Legacy AR decode loop (`DecodeOps` + `decode_loop!`) — retained for the
+// MTP/vision whole-turn cores only.
+//
+// S12 note (why this still exists): every family's standard chat flow now
+// drives the engine's generic `run_decode_loop` (`crate::engine::decode`),
+// but the qwen3_5 dense/MoE WHOLE-TURN cores behind the engine's
+// `mtp_turn` / `vision_turn` probes (`vision_mtp_whole_turn_core` and the
+// delta/streaming twins in `models/qwen3_5/model.rs` and
+// `models/qwen3_5_moe/model.rs`) still invoke `decode_loop!` for their AR
+// fallback arms (MTP compiled-init failure → AR decode; vision turns; the
+// MTP-ineligible delta shapes). Those cores interleave with
+// `decode_loop_mtp!` and the MTP cache-rollback machinery, so the macro
+// lives HERE, next to its sister macro, until Phase 7 genericizes MTP
+// (engine-owned propose/verify trait) and deletes both.
+// =============================================================================
+
+/// Closures for model-specific operations in the legacy decode loop.
+///
+/// `F`: forward pass — takes (input_ids [1,1], embedding_weight) → Result<(logits, needs_squeeze)>.
+/// `E`: eval step — takes (next_token, logits, budget_forced) → schedules async eval.
+///
+/// Superseded by [`crate::engine::backend::DecodeStep`] for the engine's
+/// generic flow; only the `decode_loop!` call sites below still build it.
+pub(crate) struct DecodeOps<F, E>
+where
+    F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, bool)>,
+    E: Fn(&MxArray, &MxArray, bool),
+{
+    pub forward: F,
+    pub eval_step: E,
+}
+
+/// Pipelined LEGACY decode loop — qwen3_5 dense/MoE MTP/vision
+/// whole-turn cores only (see the retention note above; the engine's
+/// generic flow uses [`crate::engine::decode::run_decode_loop`]).
+///
+/// Generates the token-by-token decode loop with:
+/// - Pipelining: builds step N+1's graph before blocking on step N
+/// - Budget enforcement via ReasoningTracker
+/// - Penalty application via apply_all_penalties
+/// - Stop conditions: EOS, repetition cutoff
+/// - Every-256-step synchronize_and_clear_cache
+/// - Profiler instrumentation
+///
+/// The optional `streaming:` block adds callback emission, cancellation,
+/// incremental detokenization, and is_reasoning tagging.
+macro_rules! decode_loop {
+    (
+        ops: $ops:expr,
+        y: $y:expr,
+        embedding_weight: $emb:expr,
+        params: $p:expr,
+        reasoning_tracker: $tracker:expr,
+        profiler: $profiler:expr,
+        max_new_tokens: $max:expr,
+        eos_id: $eos:expr,
+        generated_tokens: $gen:expr,
+        token_history: $hist:expr,
+        finish_reason: $reason:expr,
+        first_token_instant: $first_tok:expr,
+        report_perf: $report:expr,
+        generation_stream: $stream:expr
+        $(, streaming: {
+            callback: $cb:expr,
+            cancelled: $cancelled:expr,
+            decode_stream: $ds:expr,
+            tokenizer: $tok:expr,
+            streamed_text_len: $slen:expr,
+            last_is_reasoning: $last_r:expr
+        })?
+    ) => {{
+        for step in 0..$max {
+            let next_y = if step + 1 < $max {
+                let _stream_ctx = $crate::stream::StreamContext::new($stream);
+
+                $profiler.begin("forward");
+                let next_ids = $y.reshape(&[1, 1])?;
+                let (mut logits, needs_squeeze) = ($ops.forward)(&next_ids, &$emb)?;
+                if needs_squeeze {
+                    logits = logits.squeeze(Some(&[1]))?;
+                }
+                $profiler.end();
+
+                let (next_token, budget_forced) =
+                    if $tracker.should_force_think_end() {
+                        let forced_id = $tracker.forced_token_id()? as i32;
+                        ($crate::array::MxArray::from_int32(&[forced_id], &[1])?, true)
+                    } else {
+                        $profiler.begin("rep_penalty");
+                        logits = $crate::engine::penalties::apply_all_penalties(
+                            logits, &$hist, &$p,
+                        )?;
+                        $profiler.end();
+
+                        $profiler.begin("sample");
+                        let t = $crate::sampling::sample(&logits, $p.sampling_config)?;
+                        $profiler.end();
+                        (t, false)
+                    };
+
+                $profiler.begin("eval_caches");
+                ($ops.eval_step)(&next_token, &logits, budget_forced);
+                $profiler.end();
+
+                // Diagnostic — `MLX_MTP_TRACE_LOGITS=1` per-token AR
+                // top-2 logit trace. `logits` is the post-penalty
+                // single-token decode forward that PREDICTS the token
+                // at position `$hist.len() + 1` (the current `$y` sits
+                // at `$hist.len()`). `budget_forced` skips the real
+                // logits, so only trace the sampled path.
+                if !budget_forced
+                    && $crate::engine::decode::mtp_trace_logits()
+                {
+                    let logits_1d = if logits.ndim()? == 2 {
+                        logits.squeeze(Some(&[0]))?
+                    } else {
+                        logits.clone()
+                    };
+                    let vocab = logits_1d.shape_at(0)?;
+                    match $crate::engine::decode::trace_top2(
+                        &logits_1d, vocab,
+                    ) {
+                        Ok(t2) => {
+                            next_token.eval();
+                            let predicted = next_token.item_at_int32(0)?;
+                            eprintln!(
+                                "MTP_TRACE_LOGITS source=AR pos={} token_id={} \
+                                 top1_id={} top1_logit={:.6} top2_id={} \
+                                 top2_logit={:.6} gap={:.6}",
+                                $hist.len() + 1,
+                                predicted,
+                                t2.top1_id,
+                                t2.top1_logit,
+                                t2.top2_id,
+                                t2.top2_logit,
+                                t2.top1_logit - t2.top2_logit,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "MTP_TRACE_LOGITS source=AR pos={} ERROR {}",
+                                $hist.len() + 1,
+                                e.reason,
+                            );
+                        }
+                    }
+                }
+
+                Some(next_token)
+            } else {
+                None
+            };
+
+            $profiler.begin("eval_token");
+            $y.eval();
+            $profiler.end();
+
+            $profiler.begin("extract");
+            let token_id = $y.item_at_int32(0)? as u32;
+            $profiler.end();
+            $profiler.mark_first_token();
+            if $report && $first_tok.is_none() {
+                $first_tok = Some(std::time::Instant::now());
+            }
+
+            $gen.push(token_id);
+            $hist.push(token_id);
+            let _is_reasoning = $tracker.observe_token(token_id);
+
+            // Throttled per-step decode trace (AR / single-token loop).
+            // Logs every 32 steps so long decode runs leave a sparse
+            // breadcrumb trail (step idx, sampled token, cache offset
+            // from the dense compiled global — MoE callers can ignore
+            // the offset field).
+            if step % 32 == 0 {
+                let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
+                tracing::info!(
+                    "Qwen3.5 decode AR step={} sampled_token_id={} cache_offset={} gen_len={}",
+                    step,
+                    token_id,
+                    cache_offset,
+                    $gen.len(),
+                );
+            }
+
+            // Streaming-only block (conditionally compiled via macro repetition)
+            $(
+                $last_r = _is_reasoning;
+
+                if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    $reason = String::from("cancelled");
+                    break;
+                }
+
+                let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    &mut $ds,
+                    $tok.inner(),
+                    token_id,
+                    &$gen,
+                    $slen,
+                );
+                $slen += token_text.len();
+                // Suppress reasoning (<think>…</think>) deltas from the stream
+                // when include_reasoning == false. Detokenize + length-advance
+                // above stay OUTSIDE this gate so DecodeStream sees every token.
+                if $p.include_reasoning || !_is_reasoning {
+                    $cb.call(
+                        Ok($crate::engine::types::ChatStreamChunk {
+                            text: token_text,
+                            done: false,
+                            finish_reason: None,
+                            tool_calls: None,
+                            thinking: None,
+                            num_tokens: None,
+                            prompt_tokens: None,
+                            reasoning_tokens: None,
+                            raw_text: None,
+                            cached_tokens: None,
+                            performance: None,
+                            is_reasoning: Some(_is_reasoning),
+                        }),
+                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+            )?
+
+            if token_id == $eos {
+                $reason = String::from("stop");
+                break;
+            }
+
+            if let Some(reason) = $crate::sampling::check_repetition_cutoff(
+                &$gen,
+                $p.max_consecutive_tokens,
+                $p.max_ngram_repeats,
+                $p.ngram_size,
+            ) {
+                $reason = reason.to_string();
+                break;
+            }
+
+            match next_y {
+                Some(next) => $y = next,
+                None => break,
+            }
+
+            $profiler.step();
+
+            if (step + 1) % 256 == 0 {
+                $crate::array::synchronize_and_clear_cache();
+            }
+        }
+
+        $profiler.snapshot_memory_after();
+        $profiler.report();
+    }};
+}
+
+pub(crate) use decode_loop;
+
+// =============================================================================
 // MTP speculative decode loop (dense compiled path only).
 //
 // Sister to `decode_loop!` above; preserves every behavior of the
@@ -2847,13 +3108,11 @@ mod mtp_cycle_tests {
 
     use std::cell::RefCell;
 
+    use super::{MtpCommitAnchor, MtpCycleOutcome, MtpOps, MtpVerifyOutput, run_mtp_cycle_inner};
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
+    use crate::engine::params::extract_chat_params;
     use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
-    use crate::models::qwen3_5::chat_common::{
-        MtpCommitAnchor, MtpCycleOutcome, MtpOps, MtpVerifyOutput, extract_chat_params,
-        run_mtp_cycle_inner,
-    };
     use crate::models::qwen3_5::model::ChatConfig;
     use crate::sampling::{SamplingConfig, SparseDistributionRows};
 

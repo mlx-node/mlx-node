@@ -14,7 +14,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::MxArray;
-use crate::models::qwen3_5::persistence_common::prewarm_checkpoint_pages;
+use crate::engine::persistence::prewarm_checkpoint_pages;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::utils::safetensors::load_safetensors_lazy;
 

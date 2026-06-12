@@ -1,10 +1,10 @@
 //! Generic session-turn cores driving [`ChatBackend`].
 //!
 //! One private [`chat_turn_core`] reproduces the exact per-family
-//! session skeleton (reference implementations:
-//! `models/lfm2/model.rs::chat_sync_core` / `chat_stream_sync_core` /
-//! `chat_tokens_delta_sync` and the qwen3.5 equivalents in
-//! `models/qwen3_5/model.rs`):
+//! session skeleton (reference implementations — since deleted by the
+//! S7–S11 migrations: the lfm2 flat `chat_sync_core` /
+//! `chat_stream_sync_core` / `chat_tokens_delta_sync` cores and the
+//! qwen3.5 equivalents in `models/qwen3_5/model.rs`):
 //!
 //! ```text
 //! reuse_cache guard → tokenizer → resolve_params
@@ -21,9 +21,6 @@
 //! family. The 8 public entry points (4 sync + 4 streaming twins) are
 //! thin guard wrappers around the core, mirroring the per-family
 //! `chat_session_*_sync` / `chat_stream_session_*_sync` entry points.
-
-// consumed from S7 family migrations; remove in S12
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -57,8 +54,8 @@ enum TurnInput {
 
 /// Streaming context handed to [`chat_turn_core`] by the streaming
 /// twins. Mirrors the `(cb, cancelled)` pair the per-family streaming
-/// cores take (`chat_stream_sync_core(.., cb: &StreamSender, cancelled:
-/// &Arc<AtomicBool>)` — only `.load(Relaxed)` is used, so a plain
+/// cores took (`chat_stream_sync_core(.., cb: &StreamSender, cancelled:
+/// &Arc<AtomicBool>)`) — only `.load(Relaxed)` is used, so a plain
 /// `&AtomicBool` suffices; `Arc` derefs at the call sites).
 struct StreamingHooks<'a> {
     sink: &'a dyn ChunkSink,

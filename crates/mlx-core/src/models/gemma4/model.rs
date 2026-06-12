@@ -106,7 +106,7 @@ fn escape_gemma4_content(s: &str) -> String {
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
-use crate::models::qwen3_5::chat_common;
+use crate::engine;
 use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use tracing::{debug, info};
 
@@ -1601,7 +1601,7 @@ impl Gemma4Inner {
         // Session callers inspect this field to decide whether a
         // session-continue delta is allowed (text-only) or requires
         // a fresh `chat_session_start`.
-        let new_image_key = Some(chat_common::compute_image_cache_key(raw_images));
+        let new_image_key = Some(engine::compute_image_cache_key(raw_images));
 
         // Expand image tokens. Gemma4 uses: <|image>  (BOI) +
         // <|image|> × num_soft_tokens + <image|> (EOI). The chat template
@@ -1630,7 +1630,7 @@ impl Gemma4Inner {
     /// `verify_cache_prefix(.., has_images = true)` forced a miss
     /// whenever images were involved on either side, so the reset + full
     /// prefill here is unconditional and `cached_tokens` reports 0.
-    fn vision_chat_sync_core(
+    fn vision_whole_turn_sync_core(
         &mut self,
         rendered_tokens: &[u32],
         raw_images: &[Vec<u8>],
@@ -1837,7 +1837,7 @@ impl Gemma4Inner {
                 };
 
                 // Force `current_y` to evaluate before reading its host value.
-                // See `chat_sync_core_paged_inner` for the full rationale
+                // See `paged_turn_sync_core_inner` for the full rationale
                 // (`item_at_int32` reads CPU memory without an implicit eval).
                 current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
@@ -1947,10 +1947,10 @@ impl Gemma4Inner {
 
     /// Vision (VLM) whole-turn core, streaming (S10): the legacy flat
     /// `chat_stream_sync_core` VISION flow over a pre-rendered prompt.
-    /// Same cold-start semantics as [`Self::vision_chat_sync_core`];
+    /// Same cold-start semantics as [`Self::vision_whole_turn_sync_core`];
     /// streams parser segments and emits the terminal chunk itself.
     #[allow(clippy::too_many_arguments)]
-    fn vision_chat_stream_core(
+    fn vision_whole_turn_stream_core(
         &mut self,
         rendered_tokens: &[u32],
         raw_images: &[Vec<u8>],
@@ -2134,7 +2134,7 @@ impl Gemma4Inner {
                     None
                 };
 
-                // See `chat_sync_core_paged_inner` for the rationale.
+                // See `paged_turn_sync_core_inner` for the rationale.
                 current_y.eval();
                 let token_id = current_y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
@@ -2273,9 +2273,9 @@ impl Gemma4Inner {
     }
 
     // =================================================================
-    // Block-paged dispatch (chat_sync_core_paged + helpers).
+    // Block-paged dispatch (paged_turn_sync_core + helpers).
     //
-    // Mirrors Qwen3's `chat_sync_core_paged` and LFM2's `forward_paged_or_flat`
+    // Mirrors Qwen3's `paged_turn_sync_core` and LFM2's `forward_paged_or_flat`
     // pattern — sliding layers continue to use the existing flat
     // `Gemma4LayerCache::Sliding` path while global layers route through
     // `PagedKVCacheAdapter`. KV-shared layers are routed through their
@@ -2482,14 +2482,15 @@ impl Gemma4Inner {
         })
     }
 
-    /// Block-paged variant of [`Self::chat_sync_core`].
+    /// Block-paged sync whole-turn core (paged variant of the deleted
+    /// flat `chat_sync_core`).
     ///
     /// Reached when `paged_adapter.is_some()` AND the prompt has no
     /// images. The caller has already done image processing /
     /// expansion / template rendering, so this method receives a
     /// fully-baked `tokens` vector and dispatches the paged forward.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged(
+    fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
@@ -2539,11 +2540,11 @@ impl Gemma4Inner {
         // guaranteed > 0 for any non-empty prompt.
         debug_assert!(
             paged_turn.suffix_len > 0,
-            "gemma4 chat_sync_core_paged: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
+            "gemma4 paged_turn_sync_core: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
         );
 
         // Wrap forward in a try-style flow for proper adapter cleanup.
-        let forward_result = self.chat_sync_core_paged_inner(
+        let forward_result = self.paged_turn_sync_core_inner(
             &tokens,
             cached_prefix_len,
             paged_turn.sliding_primed_prefix_len,
@@ -2666,10 +2667,10 @@ impl Gemma4Inner {
         })
     }
 
-    /// Inner forward + decode loop for [`Self::chat_sync_core_paged`].
+    /// Inner forward + decode loop for [`Self::paged_turn_sync_core`].
     /// Split out so the outer can wrap with adapter `release_request`
     /// on either path.
-    fn chat_sync_core_paged_inner(
+    fn paged_turn_sync_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -2712,7 +2713,7 @@ impl Gemma4Inner {
 
         // === DECODE LOOP ===
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         for step in 0..max_new_tokens {
@@ -2761,9 +2762,9 @@ impl Gemma4Inner {
         Ok((generated_tokens, finish_reason, first_token_instant))
     }
 
-    /// Streaming variant of [`Self::chat_sync_core_paged`].
+    /// Streaming variant of [`Self::paged_turn_sync_core`].
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged(
+    fn paged_turn_stream_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
@@ -2822,7 +2823,7 @@ impl Gemma4Inner {
         // `max_cache_hit_tokens = total_budget - 1` cap, so `suffix_len > 0`.
         debug_assert!(
             suffix_len > 0,
-            "gemma4 chat_stream_sync_core_paged: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
+            "gemma4 paged_turn_stream_core: prepare_gemma4_paged_turn must enforce max_cache_hit_tokens cap"
         );
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -2831,7 +2832,7 @@ impl Gemma4Inner {
             ));
         }
 
-        let stream_result = self.chat_stream_sync_core_paged_inner(
+        let stream_result = self.paged_turn_stream_core_inner(
             &tokens,
             cached_prefix_len,
             paged_turn.sliding_primed_prefix_len,
@@ -2982,10 +2983,10 @@ impl Gemma4Inner {
     }
 
     /// Inner streaming forward + decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Emits text deltas via the
+    /// [`Self::paged_turn_stream_core`]. Emits text deltas via the
     /// stream callback as tokens are produced.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner(
+    fn paged_turn_stream_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -3020,7 +3021,7 @@ impl Gemma4Inner {
         y.eval();
 
         // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        // starts allocating (see paged_turn_sync_core_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
         let first_token_instant = Some(std::time::Instant::now());
@@ -3039,7 +3040,7 @@ impl Gemma4Inner {
         let mut stream_dispatch = Gemma4StreamDispatchState::default();
 
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
         let decode_trace_start = trace_enabled.then(std::time::Instant::now);
 
@@ -3058,7 +3059,7 @@ impl Gemma4Inner {
             }
             // Force `y` to evaluate before reading via `item_at_int32`
             // — async_eval kicked from the previous iteration does not
-            // implicitly sync. Same rationale as `chat_sync_core_paged_inner`.
+            // implicitly sync. Same rationale as `paged_turn_sync_core_inner`.
             y.eval();
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
@@ -4387,7 +4388,7 @@ impl Gemma4Inner {
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                self.chat_stream_sync_core_paged(
+                self.paged_turn_stream_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     config,
@@ -4400,7 +4401,7 @@ impl Gemma4Inner {
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = self.chat_sync_core_paged(
+                let result = self.paged_turn_sync_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     config,
@@ -4423,7 +4424,7 @@ impl Gemma4Inner {
         let tokenizer = args.tokenizer.clone();
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
-                self.vision_chat_stream_core(
+                self.vision_whole_turn_stream_core(
                     args.tokens,
                     args.images,
                     &tokenizer,
@@ -4435,7 +4436,7 @@ impl Gemma4Inner {
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = self.vision_chat_sync_core(
+                let result = self.vision_whole_turn_sync_core(
                     args.tokens,
                     args.images,
                     &tokenizer,
@@ -4525,7 +4526,7 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
-        let mut p = chat_common::extract_chat_params(config);
+        let mut p = engine::extract_chat_params(config);
         // Fold the MODEL-config sampling defaults in; unset → T=0 greedy
         // (the legacy `make_sampling_config` short-circuit; the engine's
         // `sampling::sample` argmax fast path at T=0 is byte-equivalent
@@ -4559,7 +4560,7 @@ impl ChatBackend for Gemma4Inner {
         messages: &[ChatMessage],
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         // Try the tokenizer's chat template if available (handles role
         // mapping, special tokens, and variant-specific formatting
         // automatically). Fall back to manual Gemma4 format if no
@@ -4625,11 +4626,11 @@ impl ChatBackend for Gemma4Inner {
         // Subject the session path to the same sanitization as the
         // session start path so role/content injection guards stay
         // uniform across all entry points.
-        let synthetic = chat_common::build_synthetic_user_message(user_message);
+        let synthetic = engine::build_synthetic_user_message(user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
 
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text = build_gemma4_continue_delta_text(sanitized_user, enable_thinking);
         tok.encode_sync(&delta_text, Some(false))
     }
@@ -4642,7 +4643,7 @@ impl ChatBackend for Gemma4Inner {
         is_error: Option<bool>,
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text =
             build_gemma4_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
         tok.encode_sync(&delta_text, Some(false))
@@ -4916,7 +4917,7 @@ impl ChatBackend for Gemma4Inner {
         if self.cached_image_key.is_some() {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds image state",
-                chat_common::IMAGE_CHANGE_RESTART_PREFIX
+                engine::IMAGE_CHANGE_RESTART_PREFIX
             ))
         } else {
             None
@@ -4928,14 +4929,6 @@ impl ChatBackend for Gemma4Inner {
         // and its legacy metrics never carried `profile_phases`. The
         // default would only add profiling-gated extras; keeping the
         // payload byte-stable instead.
-    }
-
-    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
-        // Legacy gemma4 streaming deltas report the FULL history+delta
-        // length (`prompt_tokens: Some(prompt_token_count)` where
-        // `prompt_token_count = save_history.len()`), like lfm2/qwen3 —
-        // not the qwen3_5 delta count.
-        full_len as u32
     }
 
     fn has_live_session(&self) -> bool {
@@ -5428,8 +5421,8 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
 ///
 /// The config-level `eos_token_ids` are always honored. The caller-supplied
 /// `eos_token_id` is treated as an additional stop token — it does NOT
-/// replace the config list. This matches the dense model's
-/// `chat_sync_core` semantics: session-start callers get their clean
+/// replace the config list. This matches the deleted dense core's
+/// (`chat_sync_core`) semantics: session-start callers get their clean
 /// boundary token (for Gemma4 that is `<turn|>`) while still respecting
 /// the underlying model's intrinsic eos set.
 #[inline]
@@ -7596,7 +7589,7 @@ mod tests {
         }
     }
 
-    /// Smoke test for `chat_sync_core_paged` via direct helper drives.
+    /// Smoke test for `paged_turn_sync_core` via direct helper drives.
     ///
     /// Random-init weights cast to BF16 (the paged pool's expected
     /// dtype). Validates the adapter lifecycle (reset →

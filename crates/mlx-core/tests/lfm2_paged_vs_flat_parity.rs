@@ -394,7 +394,7 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
     // `cached_tokens` covers ~the whole prompt while the new attention suffix is
     // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
     // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
-    // This exercises the `chat_sync_core_paged` START path that the telemetry fix
+    // This exercises the `paged_turn_sync_core` START path that the telemetry fix
     // touches, NOT the `chat_session_continue` delta path (which legitimately
     // forwards only the delta via `chat_tokens_delta_sync` and is left unchanged).
     let r2 = paged_model

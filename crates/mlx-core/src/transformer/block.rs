@@ -185,7 +185,8 @@ impl TransformerBlock {
     /// when `Qwen3Config::use_block_paged_cache` is opt-in true. It is
     /// intentionally separate from `forward_paged_metal` (which talks to the
     /// older `PagedKVCache` + `ContinuousBatchingScheduler` path); this entry
-    /// point is the one we plan to wire `chat_sync_core` through, and it
+    /// point is the one the qwen3 paged turn cores
+    /// (`paged_turn_sync_core` / `paged_turn_stream_core`) drive, and it
     /// tracks per-request block-table semantics rather than batched
     /// continuous-batching semantics.
     ///

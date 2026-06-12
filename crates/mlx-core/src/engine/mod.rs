@@ -19,9 +19,9 @@ pub(crate) mod persistence;
 pub(crate) mod session;
 pub mod types;
 
-// Flat re-exports of the focused submodules' items so the transitional
-// `models::qwen3_5::chat_common` shim (and engine-internal callers) can
-// keep importing everything through a single `crate::engine::*` path.
+// Flat re-exports of the focused submodules' items so family code and
+// engine-internal callers can import everything through a single
+// `crate::engine::<item>` path.
 pub(crate) use cache::*;
 pub(crate) use decode::*;
 pub(crate) use finalize::*;

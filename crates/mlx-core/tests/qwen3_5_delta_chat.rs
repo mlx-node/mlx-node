@@ -695,7 +695,7 @@ async fn session_start_accepts_images_for_vlm() {
 // on the MTP decode path, matching the AR `decode_loop!` semantics.
 // ---------------------------------------------------------------------
 //
-// The MTP decode macro (`decode_loop_mtp!` in `chat_common.rs`) used to
+// The MTP decode macro (`decode_loop_mtp!` in `mtp_decode.rs`) used to
 // UNCONDITIONALLY push the prefill-seed token before its loop's length
 // check, so `maxNewTokens == 0` emitted ONE token where AR's
 // `for step in 0..max` emits ZERO. A NEGATIVE budget additionally wrapped

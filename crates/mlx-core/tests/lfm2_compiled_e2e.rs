@@ -2244,10 +2244,10 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
 // =============================================================================
 // P4 (STREAMING): COMPILED-PAGED engagement + non-stream parity (DENSE 1.2B).
 //
-// The non-streaming paged decode loop (`chat_sync_core_paged_inner`) was already
+// The non-streaming paged decode loop (`paged_turn_sync_core_inner`) was already
 // proven to engage the compiled-paged C++ graph by
 // `lfm2_compiled_paged_engagement_dense` / `lfm2_compiled_paged_vs_eager_paged`.
-// The STREAMING paged decode loop (`chat_stream_sync_core_paged_inner`) was JUST
+// The STREAMING paged decode loop (`paged_turn_stream_core_inner`) was JUST
 // wired into the SAME shared compiled-paged helpers
 // (`Lfm2Inner::paged_compiled_decode_setup` + `paged_compiled_decode_step`); this
 // test is its dedicated regression gate. It proves two things on the real 1.2B
@@ -2394,7 +2394,7 @@ async fn lfm2_compiled_paged_streaming_engagement_and_parity_dense() {
     assert!(
         stream_call_delta >= MIN_COMPILED_CALL_DELTA,
         "STREAMING compiled-paged path did not engage (call_delta={stream_call_delta}) — \
-         chat_stream_sync_core_paged_inner is not wired to compiled-paged. Expected ~N-1 \
+         paged_turn_stream_core_inner is not wired to compiled-paged. Expected ~N-1 \
          compiled-paged forward calls (>= {MIN_COMPILED_CALL_DELTA}); a 0/low delta means the \
          streaming decode silently fell back to the eager pure-Rust paged decode."
     );

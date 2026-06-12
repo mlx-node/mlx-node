@@ -1,7 +1,6 @@
 pub(crate) mod adaptive_depth;
 pub mod arrays_cache;
 pub mod attention;
-pub(crate) mod chat_common;
 pub mod config;
 pub mod decoder_layer;
 pub mod gated_delta;
@@ -13,7 +12,6 @@ pub mod mtp;
 pub(crate) mod mtp_decode;
 pub(crate) mod paged_forward;
 pub mod persistence;
-pub(crate) mod persistence_common;
 pub mod processing;
 pub mod quantized_linear;
 pub mod rms_norm_gated;

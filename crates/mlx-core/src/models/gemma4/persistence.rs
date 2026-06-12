@@ -8,13 +8,13 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::engine::persistence::{
+    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
+    prewarm_checkpoint_pages,
+};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     load_quant_settings_from_disk, merge_per_layer, resolve_default_mode,
-};
-use crate::models::qwen3_5::persistence_common::{
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
 };
 use crate::tokenizer::Qwen3Tokenizer;
 

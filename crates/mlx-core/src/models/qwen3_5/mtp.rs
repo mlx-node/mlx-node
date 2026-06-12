@@ -1291,7 +1291,7 @@ mod compiled_ffi_tests {
     }
 
     /// Pool-seeding regression. The paged-MTP gate inside
-    /// `chat_sync_core_paged_inner` depends on the paged linear-cache pool
+    /// `paged_turn_sync_core_inner` depends on the paged linear-cache pool
     /// being populated by paged prefill before the first MTP cycle. If the
     /// pool is empty / un-snapshotted at cycle-1 entry the snapshot FFI
     /// silently no-ops and `restore_and_replay_main` would leave stale

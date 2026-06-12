@@ -25,19 +25,20 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
-use super::chat_common;
-use super::chat_common::{
-    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
-    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
-    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
-};
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
+use super::mtp_decode;
 use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
+use crate::engine;
+use crate::engine::{
+    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
+    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
+};
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 
 /// Maximum number of entries in the vision encoder cache before LRU eviction.
@@ -531,7 +532,7 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
 ///
 /// Packs every value the shared post-prefill pipeline needs into a single
 /// named struct so callers don't have to thread 20+ positional arguments.
-/// Constructed by the prefill-side of [`Qwen35Inner::chat_sync_core`] and
+/// Constructed by the prefill-side of [`Qwen35Inner::vision_mtp_whole_turn_core`] and
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
@@ -589,7 +590,7 @@ pub(crate) struct ChatDecodeInputs {
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
     pub enable_thinking: Option<bool>,
-    /// End-of-sequence token id for the decode loop. For `chat_sync_core` this
+    /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
@@ -616,7 +617,7 @@ pub(crate) struct ChatDecodeInputs {
     pub embedding_weight: MxArray,
     pub embedding_weight_t: MxArray,
     pub generation_stream: Stream,
-    pub params: super::chat_common::ChatParams,
+    pub params: crate::engine::ChatParams,
 
     // --- prompt-prefix MTP prefill --------------------------------------
     /// Post-final-norm hidden state for every prefilled prompt token,
@@ -1375,7 +1376,7 @@ impl Qwen35Inner {
     /// the paged dispatch. The actual incompatibility is the
     /// M-RoPE / vision-feature plumbing on the paged forward path,
     /// which only fires when an input message carries images. The
-    /// chat-entry sites (`chat_sync_core`, `chat_stream_sync_inner`,
+    /// chat-entry sites (`vision_mtp_whole_turn_core`, `chat_stream_sync_inner`,
     /// and the MoE counterparts) reject `has_images && paged_adapter`
     /// before dispatching, so text-only paged turns proceed normally
     /// while image turns surface a clear runtime error.
@@ -1433,7 +1434,7 @@ impl Qwen35Inner {
     /// caller-supplied stop-on token id (`<|im_end|>` for ChatML
     /// boundaries) so the cached history ends on a clean delimiter that
     /// subsequent session-delta turns can append to.
-    fn chat_sync_core(
+    fn vision_mtp_whole_turn_core(
         &mut self,
         tokens: Vec<u32>,
         images: &[Vec<u8>],
@@ -1454,7 +1455,7 @@ impl Qwen35Inner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let p = extract_chat_params(&config);
         let max_new_tokens = p.max_new_tokens;
@@ -1469,7 +1470,7 @@ impl Qwen35Inner {
         let model_id = self.model_id;
 
         // Paged dispatch with native MTP support; the paged path self-handles
-        // MTP via the gate inside `chat_sync_core_paged_inner`.
+        // MTP via the gate inside `paged_turn_sync_core_inner`.
         if self.paged_adapter.is_some() {
             if has_images {
                 return Err(Error::from_reason(
@@ -1477,7 +1478,7 @@ impl Qwen35Inner {
                      use_block_paged_cache=false (text-only turns continue to work).",
                 ));
             }
-            return self.chat_sync_core_paged(tokens, tokenizer, eos_token_id, p, report_perf);
+            return self.paged_turn_sync_core(tokens, tokenizer, eos_token_id, p, report_perf);
         }
 
         // Check if compiled path will be used
@@ -1659,9 +1660,9 @@ impl Qwen35Inner {
         // (it starts empty and builds from decode tokens — correct).
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
-            && !chat_common::mtp_no_prompt_prefill()
+            && !mtp_decode::mtp_no_prompt_prefill()
             && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(prefill_tokens.len());
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
 
         // === VLM or text prefill branching ===
         profiler.begin_prefill();
@@ -1808,7 +1809,7 @@ impl Qwen35Inner {
     ///   of `config.eos_token_id`, yielding clean cache boundaries for the next
     ///   turn's delta,
     /// - resolves `enable_thinking` from `config.reasoning_effort` via
-    ///   `chat_common::resolve_enable_thinking`,
+    ///   `engine::resolve_enable_thinking`,
     /// - is text-only: errors if the session has images.
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
@@ -1877,7 +1878,7 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1889,9 +1890,9 @@ impl Qwen35Inner {
         let model_id = self.model_id;
 
         // Paged dispatch with native MTP support inside
-        // `chat_sync_core_paged_inner`.
+        // `paged_turn_sync_core_inner`.
         if self.paged_adapter.is_some() {
-            return self.chat_sync_core_paged(
+            return self.paged_turn_sync_core(
                 full_token_history.clone(),
                 tokenizer.clone(),
                 eos_id,
@@ -1900,7 +1901,7 @@ impl Qwen35Inner {
             );
         }
 
-        // Check compiled path availability (same contract as chat_sync_core).
+        // Check compiled path availability (same contract as vision_mtp_whole_turn_core).
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _compiled_lock = if use_compiled {
             Some(
@@ -2011,9 +2012,9 @@ impl Qwen35Inner {
     /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
     /// → decode loop → cache export → save cache state → finalize result.
     ///
-    /// Extracted from `chat_sync_core` so it can also be driven by the text-only
+    /// Extracted from `vision_mtp_whole_turn_core` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `chat_sync_core` for the existing caller — `token_history_init` is the
+    /// of `vision_mtp_whole_turn_core` for the existing caller — `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
@@ -2069,7 +2070,7 @@ impl Qwen35Inner {
         {
             let prefill_len = seq_len as i32;
             let max_kv_len_estimate =
-                chat_common::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
+                engine::kv_capacity_round_up_saturating(prefill_len, max_new_tokens);
             let has_mtp = self.has_mtp_weights();
             let branch = if p.enable_mtp && has_mtp && use_compiled {
                 "MTP (will attempt init)"
@@ -2110,7 +2111,7 @@ impl Qwen35Inner {
 
         let mut token_history: Vec<u32> = token_history_init;
 
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+        let mut reasoning_tracker = engine::ReasoningTracker::new(
             enable_thinking.unwrap_or(true),
             p.thinking_token_budget,
             think_end_id,
@@ -2122,7 +2123,7 @@ impl Qwen35Inner {
             } else {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, max_new_tokens)?;
+                let max_kv_len = engine::kv_capacity_round_up(prefill_len, max_new_tokens)?;
                 let num_layers = self.config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -2164,9 +2165,9 @@ impl Qwen35Inner {
                 // Re-apply the saved M-RoPE offset when the compiled
                 // state is being (re)initialized from a KV cache that
                 // encodes image attention — see
-                // `chat_common::should_reapply_rope_delta`.
+                // `engine::should_reapply_rope_delta`.
                 if let Some(delta) = self.cached_rope_deltas
-                    && chat_common::should_reapply_rope_delta(
+                    && engine::should_reapply_rope_delta(
                         true,
                         is_delta,
                         has_images,
@@ -2180,8 +2181,8 @@ impl Qwen35Inner {
             }
 
             // Clear stale rope deltas only on fresh text-only prefills —
-            // see `chat_common::should_clear_rope_delta`.
-            if chat_common::should_clear_rope_delta(is_delta, has_images) {
+            // see `engine::should_clear_rope_delta`.
+            if engine::should_clear_rope_delta(is_delta, has_images) {
                 self.cached_rope_deltas = None;
             }
 
@@ -2198,7 +2199,7 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
+                match engine::kv_capacity_round_up(prefill_len, max_new_tokens) {
                     Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
                         Ok(()) => {
                             cond_init_ok = Some(true);
@@ -2284,7 +2285,7 @@ impl Qwen35Inner {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
+                let mut mtp_ops = mtp_decode::MtpOps {
                     forward_with_hidden: |ids: &MxArray,
                                           emb: &MxArray|
                      -> Result<(MxArray, MxArray, bool)> {
@@ -2299,7 +2300,7 @@ impl Qwen35Inner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
+                     -> Result<mtp_decode::MtpVerifyOutput> {
                         // Return (logits, verify-final hidden) so the cycle
                         // macro can chain into the next cycle's first MTP draft
                         // and skip Step A's ~150 ms main-model forward.
@@ -2309,7 +2310,7 @@ impl Qwen35Inner {
                         |ids: &MxArray,
                          emb: &MxArray,
                          depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_argmax_only(
                                 ids,
                                 emb,
@@ -2322,7 +2323,7 @@ impl Qwen35Inner {
                          emb: &MxArray,
                          depth: usize,
                          sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_sparse_target(
                                 ids,
                                 emb,
@@ -2353,7 +2354,7 @@ impl Qwen35Inner {
                         // accepted prefix from the tape so the next Step A sees
                         // the same cache state as serial decode. `_tape_replay`
                         // disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                        if accepted_drafts == depth && mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
                         }
                     },
@@ -2411,7 +2412,7 @@ impl Qwen35Inner {
                     // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
@@ -2430,7 +2431,7 @@ impl Qwen35Inner {
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             let steps = accepted_drafts.len() as i32;
                             unsafe {
                                 mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
@@ -2455,7 +2456,7 @@ impl Qwen35Inner {
                     // persistent MTP cache so the next cycle's drafts attend
                     // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
+                    commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
                                  verify_hiddens: &MxArray,
                                  committed_ids: &[u32],
@@ -2463,14 +2464,14 @@ impl Qwen35Inner {
                                  emb: &MxArray|
                      -> Result<()> {
                         match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
+                            mtp_decode::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
                                 seed_hidden,
                                 verify_hiddens,
                                 committed_ids,
                                 k_accepted,
                                 emb,
                             ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
                                 commit_mtp_compiled_from_verify_prefix(
                                     verify_hiddens,
                                     committed_ids,
@@ -2485,7 +2486,7 @@ impl Qwen35Inner {
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
-                chat_common::decode_loop_mtp!(
+                mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
                     mtp_depth: p.mtp_depth,
                     mtp_rng: rng,
@@ -2507,7 +2508,7 @@ impl Qwen35Inner {
                     mlx_sys::mlx_qwen35_mtp_compiled_reset();
                 }
             } else {
-                let mut ops = chat_common::DecodeOps {
+                let mut ops = mtp_decode::DecodeOps {
                     forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                         Ok((forward_compiled(ids, emb)?, false))
                     },
@@ -2518,7 +2519,7 @@ impl Qwen35Inner {
                         }
                     },
                 };
-                chat_common::decode_loop!(
+                mtp_decode::decode_loop!(
                     ops: ops,
                     y: y,
                     embedding_weight: embedding_weight,
@@ -2580,7 +2581,7 @@ impl Qwen35Inner {
 
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -2597,7 +2598,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -2621,7 +2622,7 @@ impl Qwen35Inner {
         // text-only. Prefill paths (re)set the key based on the fresh
         // turn's `has_images`.
         if is_delta {
-            chat_common::save_cache_state_after_delta(
+            engine::save_cache_state_after_delta(
                 p.reuse_cache,
                 &generated_tokens,
                 &finish_reason,
@@ -2687,7 +2688,7 @@ impl Qwen35Inner {
         Ok(result)
     }
 
-    /// Block-paged variant of [`Self::chat_sync_core`].
+    /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
     ///
     /// Mirrors the flat path's control flow (penalty stack, decode
     /// loop, EOS / repetition cutoff, performance timing, output
@@ -2719,12 +2720,12 @@ impl Qwen35Inner {
     ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
     /// * The compiled C++ forward path is bypassed — paged turns run
     ///   the pure-Rust `DecoderLayer::forward_paged_or_flat`.
-    fn chat_sync_core_paged(
+    fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: chat_common::ChatParams,
+        p: engine::ChatParams,
         report_perf: bool,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
@@ -2744,11 +2745,8 @@ impl Qwen35Inner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -2802,12 +2800,12 @@ impl Qwen35Inner {
             let adapter = self
                 .paged_adapter
                 .as_ref()
-                .ok_or_else(|| Error::from_reason("chat_sync_core_paged: paged_adapter is None"))?;
+                .ok_or_else(|| Error::from_reason("paged_turn_sync_core: paged_adapter is None"))?;
             adapter.block_size()
         };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
-        // vLLM exact-prefix cap — see qwen3/model.rs:chat_sync_core_paged.
+        // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
         // Ensures every paged turn has at least one suffix token to prefill,
         // even when the live cache (or a prior request's residue) already
         // covers the entire new prompt.
@@ -2819,7 +2817,7 @@ impl Qwen35Inner {
         let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -2914,10 +2912,10 @@ impl Qwen35Inner {
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged: cached_prefix_len > total_prompt_tokens")
+                Error::from_reason("paged_turn_sync_core: cached_prefix_len > total_prompt_tokens")
             })?;
 
-        let forward_result = self.chat_sync_core_paged_inner(
+        let forward_result = self.paged_turn_sync_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -2940,7 +2938,7 @@ impl Qwen35Inner {
                     // uniform `&[]` finalize.
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
                     let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
@@ -3018,7 +3016,7 @@ impl Qwen35Inner {
         Ok(result)
     }
 
-    /// Inner forward + decode loop for `chat_sync_core_paged`. Split
+    /// Inner forward + decode loop for `paged_turn_sync_core`. Split
     /// out so the caller can wrap it with `release_request` on either
     /// path.
     ///
@@ -3029,15 +3027,15 @@ impl Qwen35Inner {
     /// `paged_forward::run_paged_decode_step` (fallback) based on adapter block
     /// size and `init_paged_dense_compiled_session` success.
     #[allow(clippy::too_many_arguments)]
-    fn chat_sync_core_paged_inner(
+    fn paged_turn_sync_core_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &chat_common::ChatParams,
+        p: &engine::ChatParams,
         eos_token_id: u32,
         sampling_config: &Option<crate::sampling::SamplingConfig>,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        reasoning_tracker: &mut engine::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         use_cpp_paged: bool,
@@ -3050,7 +3048,7 @@ impl Qwen35Inner {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
@@ -3069,10 +3067,10 @@ impl Qwen35Inner {
         // tensor.
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
-            && chat_common::mtp_verify_paged_attn_enabled()
-            && !chat_common::mtp_no_prompt_prefill()
+            && mtp_decode::mtp_verify_paged_attn_enabled()
+            && !mtp_decode::mtp_no_prompt_prefill()
             && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(tokens.len());
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
 
         // === PREFILL ===
         let mut prompt_hidden: Option<MxArray> = None;
@@ -3080,10 +3078,10 @@ impl Qwen35Inner {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches not initialized")
+                Error::from_reason("paged_turn_sync_core_inner: caches not initialized")
             })?;
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped")
+                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped")
             })?;
             if want_prompt_hidden {
                 let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
@@ -3154,10 +3152,10 @@ impl Qwen35Inner {
         // C++ globals.
         let mut cpp_session_ready = if use_cpp_paged {
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: caches dropped post-prefill")
+                Error::from_reason("paged_turn_sync_core_inner: caches dropped post-prefill")
             })?;
             let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped post-prefill")
+                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped post-prefill")
             })?;
             if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
                 eprintln!(
@@ -3207,7 +3205,7 @@ impl Qwen35Inner {
         // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         // Compile-cached `max_blocks_per_seq` shape — picking the
@@ -3215,13 +3213,13 @@ impl Qwen35Inner {
         // key stable across all decode steps within one turn.
         let max_blocks_per_seq: u32 = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_sync_core_paged_inner: paged_adapter dropped pre-decode")
+                Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped pre-decode")
             })?;
             let max_seq = self.config.max_position_embeddings as u32;
             max_seq.div_ceil(adapter.block_size())
         };
 
-        // Paged-MTP gate. Mirrors the dense MTP gate at `chat_sync_core`.
+        // Paged-MTP gate. Mirrors the dense MTP gate at `vision_mtp_whole_turn_core`.
         // Default ON; opt out with `MLX_MTP_VERIFY_PAGED_ATTN=0` to fall back
         // to AR paged decode.
         //
@@ -3232,11 +3230,11 @@ impl Qwen35Inner {
         // operate on `g_dense_paged_linear_caches[]`.
         let mtp_paged_active = p.enable_mtp
             && self.has_mtp_weights()
-            && chat_common::mtp_verify_paged_attn_enabled()
+            && mtp_decode::mtp_verify_paged_attn_enabled()
             && cpp_session_ready
             && {
                 let prefill_len = token_history.len() as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, max_new_tokens) {
+                match engine::kv_capacity_round_up(prefill_len, max_new_tokens) {
                     Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
                         Ok(()) => true,
                         Err(e) => {
@@ -3264,7 +3262,7 @@ impl Qwen35Inner {
              cpp_session_ready={} -> mtp_paged_active={}",
             p.enable_mtp,
             self.has_mtp_weights(),
-            chat_common::mtp_verify_paged_attn_enabled(),
+            mtp_decode::mtp_verify_paged_attn_enabled(),
             cpp_session_ready,
             mtp_paged_active
         );
@@ -3340,7 +3338,7 @@ impl Qwen35Inner {
             let adapter_cell = std::rc::Rc::new(std::cell::RefCell::new(
                 self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped before MTP gate",
+                        "paged_turn_sync_core_inner: paged_adapter dropped before MTP gate",
                     )
                 })?,
             ));
@@ -3352,7 +3350,7 @@ impl Qwen35Inner {
             let adapter_rollback = std::rc::Rc::clone(&adapter_cell);
             let adapter_rollback_unemitted = std::rc::Rc::clone(&adapter_cell);
 
-            let mut mtp_ops = chat_common::MtpOps {
+            let mut mtp_ops = mtp_decode::MtpOps {
                 forward_with_hidden: |ids: &MxArray,
                                       emb: &MxArray|
                  -> Result<(MxArray, MxArray, bool)> {
@@ -3391,7 +3389,7 @@ impl Qwen35Inner {
                 verify_step: |ids: &MxArray,
                               emb: &MxArray,
                               depth: usize|
-                 -> Result<chat_common::MtpVerifyOutput> {
+                 -> Result<mtp_decode::MtpVerifyOutput> {
                     let id_window = ids.to_int32().map_err(|e| {
                         Error::from_reason(format!(
                             "MTP-paged verify_step: ids to_int32: {}",
@@ -3436,7 +3434,7 @@ impl Qwen35Inner {
                         );
                     }
                     unsafe {
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                        if accepted_drafts == depth && mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay_paged((depth + 1) as i32);
                         }
                     }
@@ -3468,13 +3466,13 @@ impl Qwen35Inner {
                 },
                 snapshot_main_linear: || unsafe {
                     mlx_sys::mlx_qwen35_compiled_snapshot_paged_linear_caches();
-                    if chat_common::mtp_use_tape_replay() {
+                    if mtp_decode::mtp_use_tape_replay() {
                         mlx_sys::mlx_qwen35_compiled_tape_arm_paged();
                     }
                 },
                 restore_and_replay_main: |accepted_drafts: &[u32], _emb: &MxArray| -> Result<()> {
                     let steps = accepted_drafts.len() as i32;
-                    if chat_common::mtp_use_tape_replay() {
+                    if mtp_decode::mtp_use_tape_replay() {
                         unsafe {
                             mlx_sys::mlx_qwen35_compiled_tape_replay_paged(steps);
                         }
@@ -3485,7 +3483,7 @@ impl Qwen35Inner {
                     }
                     Ok(())
                 },
-                commit_mtp: |anchor: chat_common::MtpCommitAnchor,
+                commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
                              seed_hidden: &MxArray,
                              verify_hiddens: &MxArray,
                              committed_ids: &[u32],
@@ -3493,14 +3491,14 @@ impl Qwen35Inner {
                              emb: &MxArray|
                  -> Result<()> {
                     match anchor {
-                        chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
+                        mtp_decode::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
                             seed_hidden,
                             verify_hiddens,
                             committed_ids,
                             k_accepted,
                             emb,
                         ),
-                        chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                        mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
                             commit_mtp_compiled_from_verify_prefix(
                                 verify_hiddens,
                                 committed_ids,
@@ -3522,7 +3520,7 @@ impl Qwen35Inner {
                 },
             };
 
-            chat_common::decode_loop_mtp!(
+            mtp_decode::decode_loop_mtp!(
                 mtp_ops: mtp_ops,
                 mtp_depth: p.mtp_depth,
                 mtp_rng: rng,
@@ -3612,7 +3610,7 @@ impl Qwen35Inner {
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                        "paged_turn_sync_core_inner: paged_adapter dropped mid-decode (cpp)",
                     )
                 })?;
                 adapter
@@ -3628,7 +3626,7 @@ impl Qwen35Inner {
                         logits
                     }
                     Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
+                        if engine::should_propagate_compiled_paged_error(
                             cpp_compiled_step_completed,
                         ) {
                             eprintln!(
@@ -3659,12 +3657,12 @@ impl Qwen35Inner {
                         let embedding_weight_pure = embed.get_weight();
                         let caches_ref = self.caches.as_mut().ok_or_else(|| {
                             Error::from_reason(
-                                "chat_sync_core_paged_inner: caches dropped during cpp fallback",
+                                "paged_turn_sync_core_inner: caches dropped during cpp fallback",
                             )
                         })?;
                         let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
                             Error::from_reason(
-                                "chat_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
+                                "paged_turn_sync_core_inner: paged_adapter dropped during cpp fallback",
                             )
                         })?;
                         let logits = super::paged_forward::run_paged_decode_step(
@@ -3686,11 +3684,11 @@ impl Qwen35Inner {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("chat_sync_core_paged_inner: caches dropped mid-decode")
+                    Error::from_reason("paged_turn_sync_core_inner: caches dropped mid-decode")
                 })?;
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                        "paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
                 let logits = super::paged_forward::run_paged_decode_step(
@@ -3752,16 +3750,16 @@ impl Qwen35Inner {
 
     /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
     ///
-    /// Mirrors `chat_sync_core_paged`'s adapter lifecycle and
+    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and
     /// per-layer dispatch but emits each generated token through the
     /// streaming callback as it is produced.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged(
+    fn paged_turn_stream_core(
         &mut self,
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: chat_common::ChatParams,
+        p: engine::ChatParams,
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
@@ -3783,11 +3781,8 @@ impl Qwen35Inner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = true;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
-            thinking_enabled,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker =
+            engine::ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -3803,7 +3798,7 @@ impl Qwen35Inner {
         let mut last_is_reasoning = thinking_enabled;
 
         // C++ paged-decode availability + compile-lifecycle locks. See
-        // `chat_sync_core_paged` for the full rationale; this is the
+        // `paged_turn_sync_core` for the full rationale; this is the
         // streaming twin.
         let model_id = self.model_id;
         let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
@@ -3834,16 +3829,16 @@ impl Qwen35Inner {
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
         // Per-block extra_keys for prefix-cache lookup. See the matching
-        // comment in `chat_sync_core_paged`.
+        // comment in `paged_turn_sync_core`.
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged: paged_adapter is None")
+                Error::from_reason("paged_turn_stream_core: paged_adapter is None")
             })?;
             adapter.block_size()
         };
-        let lookup_extra_keys = chat_common::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let lookup_extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
         let cache_salt = 0;
-        // See `chat_sync_core_paged` for the vLLM exact-prefix cap rationale.
+        // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
@@ -3852,7 +3847,7 @@ impl Qwen35Inner {
         let (cached_prefix_len, continued_live_prefix) = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: paged_adapter is None — caller must check \
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
@@ -3949,7 +3944,7 @@ impl Qwen35Inner {
             .checked_sub(cached_prefix_len)
             .ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged: cached_prefix_len > total_prompt_tokens",
+                    "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
 
@@ -3971,7 +3966,7 @@ impl Qwen35Inner {
             ));
         }
 
-        let result = self.chat_stream_sync_core_paged_inner(
+        let result = self.paged_turn_stream_core_inner(
             &tokens,
             cached_prefix_len,
             suffix_len,
@@ -3996,7 +3991,7 @@ impl Qwen35Inner {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let total_for_finalize = adapter.request_tokens().len();
                     let finalize_extra_keys =
-                        chat_common::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                        engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
                     let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
                 }
                 t
@@ -4118,23 +4113,23 @@ impl Qwen35Inner {
     }
 
     /// Inner forward + streaming decode loop for
-    /// [`Self::chat_stream_sync_core_paged`]. Mirrors LFM2's
-    /// `chat_stream_sync_core_paged_inner`.
+    /// [`Self::paged_turn_stream_core`]. Mirrors LFM2's
+    /// `paged_turn_stream_core_inner`.
     ///
     /// Uses a C++ compiled paged decode dispatcher when
     /// `use_cpp_paged` is true. See the sync sibling
-    /// `chat_sync_core_paged_inner` for the cpp_session_ready gate
+    /// `paged_turn_sync_core_inner` for the cpp_session_ready gate
     /// rationale.
     #[allow(clippy::too_many_arguments)]
-    fn chat_stream_sync_core_paged_inner<'a>(
+    fn paged_turn_stream_core_inner<'a>(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
         suffix_len: u32,
-        p: &chat_common::ChatParams,
+        p: &engine::ChatParams,
         sampling_config: Option<crate::sampling::SamplingConfig>,
         eos_token_id: u32,
-        reasoning_tracker: &mut chat_common::ReasoningTracker,
+        reasoning_tracker: &mut engine::ReasoningTracker,
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         tokenizer: &'a Arc<Qwen3Tokenizer>,
@@ -4156,7 +4151,7 @@ impl Qwen35Inner {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
-            "chat_stream_sync_core_paged_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
+            "paged_turn_stream_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
         let suffix = &tokens[(cached_prefix_len as usize)..];
@@ -4169,10 +4164,10 @@ impl Qwen35Inner {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches not initialized")
+                Error::from_reason("paged_turn_stream_core_inner: caches not initialized")
             })?;
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: paged_adapter dropped")
+                Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped")
             })?;
             super::paged_forward::run_paged_prefill_chunk(
                 tokens,
@@ -4196,7 +4191,7 @@ impl Qwen35Inner {
         y.eval();
 
         // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see chat_sync_core_paged_inner for rationale).
+        // starts allocating (see paged_turn_sync_core_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
         if report_perf {
@@ -4204,15 +4199,15 @@ impl Qwen35Inner {
         }
 
         // Decide between C++ compiled paged decode (fast) and pure-Rust
-        // paged decode (fallback). See `chat_sync_core_paged_inner` for
+        // paged decode (fallback). See `paged_turn_sync_core_inner` for
         // the cpp_session_ready gate rationale.
         let mut cpp_session_ready = if use_cpp_paged {
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("chat_stream_sync_core_paged_inner: caches dropped post-prefill")
+                Error::from_reason("paged_turn_stream_core_inner: caches dropped post-prefill")
             })?;
             let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped post-prefill",
+                    "paged_turn_stream_core_inner: paged_adapter dropped post-prefill",
                 )
             })?;
             if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
@@ -4250,19 +4245,17 @@ impl Qwen35Inner {
         // pure-Rust fallback would read stale pre-step state. The
         // mid-turn fallback below is therefore only safe BEFORE the
         // first successful compiled step. See sync sibling
-        // `chat_sync_core_paged_inner` for the full rationale.
+        // `paged_turn_sync_core_inner` for the full rationale.
         let mut cpp_compiled_step_completed = false;
 
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
 
         let max_blocks_per_seq: u32 = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason(
-                    "chat_stream_sync_core_paged_inner: paged_adapter dropped pre-decode",
-                )
+                Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped pre-decode")
             })?;
             let max_seq = self.config.max_position_embeddings as u32;
             max_seq.div_ceil(adapter.block_size())
@@ -4329,14 +4322,14 @@ impl Qwen35Inner {
             }
 
             // Decode forward. Defense-in-depth fallback: see
-            // `chat_sync_core_paged_inner` for the rollback rationale —
+            // `paged_turn_sync_core_inner` for the rollback rationale —
             // mid-turn fallback only safe BEFORE the first successful
             // compiled step.
             let next_logits = if cpp_session_ready {
                 let embedding_weight = self.embedding.get_weight();
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode (cpp)",
+                        "paged_turn_stream_core_inner: paged_adapter dropped mid-decode (cpp)",
                     )
                 })?;
                 adapter
@@ -4352,7 +4345,7 @@ impl Qwen35Inner {
                         logits
                     }
                     Err(e) => {
-                        if chat_common::should_propagate_compiled_paged_error(
+                        if engine::should_propagate_compiled_paged_error(
                             cpp_compiled_step_completed,
                         ) {
                             eprintln!(
@@ -4383,12 +4376,12 @@ impl Qwen35Inner {
                         let embedding_weight_pure = embed.get_weight();
                         let caches_ref = self.caches.as_mut().ok_or_else(|| {
                             Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: caches dropped during cpp fallback",
+                                "paged_turn_stream_core_inner: caches dropped during cpp fallback",
                             )
                         })?;
                         let adapter_mut = self.paged_adapter.as_mut().ok_or_else(|| {
                             Error::from_reason(
-                                "chat_stream_sync_core_paged_inner: paged_adapter dropped during cpp fallback",
+                                "paged_turn_stream_core_inner: paged_adapter dropped during cpp fallback",
                             )
                         })?;
                         let logits = super::paged_forward::run_paged_decode_step(
@@ -4409,13 +4402,11 @@ impl Qwen35Inner {
                 let embed = self.embedding.clone();
                 let embedding_weight = embed.get_weight();
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: caches dropped mid-decode",
-                    )
+                    Error::from_reason("paged_turn_stream_core_inner: caches dropped mid-decode")
                 })?;
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason(
-                        "chat_stream_sync_core_paged_inner: paged_adapter dropped mid-decode",
+                        "paged_turn_stream_core_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
                 let logits = super::paged_forward::run_paged_decode_step(
@@ -4520,7 +4511,7 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -4547,7 +4538,7 @@ impl Qwen35Inner {
             );
         }
         if self.paged_adapter.is_some() && !mtp_takes_dense_path {
-            return self.chat_stream_sync_core_paged(
+            return self.paged_turn_stream_core(
                 full_token_history.clone(),
                 tokenizer_for_decode,
                 eos_id,
@@ -4606,7 +4597,7 @@ impl Qwen35Inner {
         // paged adapter's `LayerKVPool`, NOT in the flat `self.caches`
         // (which only ever received GDN linear conv/recurrent state). A
         // prior NON-streaming paged turn (`send()` → `chat_tokens_delta_sync`
-        // → `chat_sync_core_paged`) therefore leaves `self.caches`'
+        // → `paged_turn_sync_core`) therefore leaves `self.caches`'
         // full-attention slots EMPTY/STALE for the prior turn's tokens.
         // Delta-prefilling only `delta_tokens` on top of that and exporting
         // `self.caches` into the compiled/MTP graph would decode from an
@@ -4705,7 +4696,7 @@ impl Qwen35Inner {
 
         let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+        let mut reasoning_tracker = engine::ReasoningTracker::new(
             starts_in_thinking,
             p.thinking_token_budget,
             think_end_id,
@@ -4716,7 +4707,7 @@ impl Qwen35Inner {
             // VLM adjustments.
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
-            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
+            let max_kv_len = engine::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -4776,7 +4767,7 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
+                match engine::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
                     Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
                         Ok(()) => {
                             cond_init_ok = Some(true);
@@ -4820,7 +4811,7 @@ impl Qwen35Inner {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
+                let mut mtp_ops = mtp_decode::MtpOps {
                     forward_with_hidden: |ids: &MxArray,
                                           emb: &MxArray|
                      -> Result<(MxArray, MxArray, bool)> {
@@ -4835,7 +4826,7 @@ impl Qwen35Inner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
+                     -> Result<mtp_decode::MtpVerifyOutput> {
                         // Return (logits, verify-final hidden) so the cycle
                         // macro can chain into the next cycle's first MTP draft
                         // and skip Step A's ~150 ms main-model forward.
@@ -4845,7 +4836,7 @@ impl Qwen35Inner {
                         |ids: &MxArray,
                          emb: &MxArray,
                          depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_argmax_only(
                                 ids,
                                 emb,
@@ -4858,7 +4849,7 @@ impl Qwen35Inner {
                          emb: &MxArray,
                          depth: usize,
                          sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_sparse_target(
                                 ids,
                                 emb,
@@ -4884,7 +4875,7 @@ impl Qwen35Inner {
                         // surviving main-cache steps. Replay that full prefix
                         // from the GDN tape rather than keeping the raw batched
                         // recurrent state. `_tape_replay` disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                        if accepted_drafts == depth && mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
                         }
                     },
@@ -4942,7 +4933,7 @@ impl Qwen35Inner {
                     // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
@@ -4961,7 +4952,7 @@ impl Qwen35Inner {
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             let steps = accepted_drafts.len() as i32;
                             unsafe {
                                 mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
@@ -4986,7 +4977,7 @@ impl Qwen35Inner {
                     // persistent MTP cache so the next cycle's drafts attend
                     // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
+                    commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
                                  verify_hiddens: &MxArray,
                                  committed_ids: &[u32],
@@ -4994,14 +4985,14 @@ impl Qwen35Inner {
                                  emb: &MxArray|
                      -> Result<()> {
                         match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
+                            mtp_decode::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
                                 seed_hidden,
                                 verify_hiddens,
                                 committed_ids,
                                 k_accepted,
                                 emb,
                             ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
                                 commit_mtp_compiled_from_verify_prefix(
                                     verify_hiddens,
                                     committed_ids,
@@ -5016,7 +5007,7 @@ impl Qwen35Inner {
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
-                chat_common::decode_loop_mtp!(
+                mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
                     mtp_depth: p.mtp_depth,
                     mtp_rng: rng,
@@ -5046,7 +5037,7 @@ impl Qwen35Inner {
                     mlx_sys::mlx_qwen35_mtp_compiled_reset();
                 }
             } else {
-                let mut ops = chat_common::DecodeOps {
+                let mut ops = mtp_decode::DecodeOps {
                     forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                         Ok((forward_compiled(ids, emb)?, false))
                     },
@@ -5057,7 +5048,7 @@ impl Qwen35Inner {
                         }
                     },
                 };
-                chat_common::decode_loop!(
+                mtp_decode::decode_loop!(
                     ops: ops,
                     y: y,
                     embedding_weight: embedding_weight,
@@ -5119,7 +5110,7 @@ impl Qwen35Inner {
         } else {
             profiler.set_label("chat_stream_delta_rust");
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -5136,7 +5127,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -5167,7 +5158,7 @@ impl Qwen35Inner {
         // consistent for the next turn. Delta continuations preserve
         // `cached_image_key` so the next turn's cache-prefix verify
         // still sees the prior prefill's image state.
-        chat_common::save_cache_state_after_delta(
+        engine::save_cache_state_after_delta(
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
@@ -5221,7 +5212,7 @@ impl Qwen35Inner {
         let num_tokens = generated_tokens.len() as u32;
         let prompt_token_count = delta_tokens.len() as u32;
 
-        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
             enable_thinking.unwrap_or(true),
@@ -5257,7 +5248,7 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
                     enable_thinking.unwrap_or(true),
@@ -5309,9 +5300,9 @@ impl Qwen35Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let enable_thinking = chat_common::resolve_enable_thinking(&config);
+        let enable_thinking = engine::resolve_enable_thinking(&config);
 
-        let p = chat_common::extract_chat_params(&config);
+        let p = engine::extract_chat_params(&config);
         let model_id = self.model_id;
 
         let generation_start = if report_perf {
@@ -5343,7 +5334,7 @@ impl Qwen35Inner {
                      use_block_paged_cache=false (text-only turns continue to work).",
                 ));
             }
-            return self.chat_stream_sync_core_paged(
+            return self.paged_turn_stream_core(
                 tokens,
                 tokenizer_for_decode,
                 eos_token_id,
@@ -5489,7 +5480,7 @@ impl Qwen35Inner {
             tokens.clone()
         };
 
-        // Zero-delta guard. See the matching `chat_sync_core` comment for
+        // Zero-delta guard. See the matching `vision_mtp_whole_turn_core` comment for
         // the design rationale — rewinding a GDN recurrent cache by one
         // token is not possible, so the only safe response to an exact-
         // match prompt is a full reset + re-prefill.
@@ -5547,9 +5538,9 @@ impl Qwen35Inner {
         // `MLX_MTP_NO_PROMPT_PREFILL=1` opts out.
         let want_prompt_hidden = p.enable_mtp
             && self.has_mtp_weights()
-            && !chat_common::mtp_no_prompt_prefill()
+            && !mtp_decode::mtp_no_prompt_prefill()
             && cached_prefix_len == 0;
-        let mtp_prompt_history = chat_common::mtp_prompt_history_selection(prefill_tokens.len());
+        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
         let mut prompt_hidden: Option<MxArray> = None;
 
         // VLM or text prefill
@@ -5669,7 +5660,7 @@ impl Qwen35Inner {
 
         let starts_in_thinking = enable_thinking.unwrap_or(true);
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = chat_common::ReasoningTracker::new(
+        let mut reasoning_tracker = engine::ReasoningTracker::new(
             starts_in_thinking,
             p.thinking_token_budget,
             think_end_id,
@@ -5681,7 +5672,7 @@ impl Qwen35Inner {
             } else {
                 use mlx_sys as sys;
                 let prefill_len = seq_len as i32;
-                let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
+                let max_kv_len = engine::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
                 let num_layers = self.config.num_layers as usize;
                 let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                     vec![std::ptr::null_mut(); num_layers * 2];
@@ -5741,7 +5732,7 @@ impl Qwen35Inner {
             let mut cond_init_ok: Option<bool> = None;
             let mtp_active = cond_enable_mtp && cond_has_mtp_weights && {
                 let prefill_len = seq_len as i32;
-                match chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
+                match engine::kv_capacity_round_up(prefill_len, p.max_new_tokens) {
                     Ok(max_kv_len) => match init_mtp_compiled_from_main(&self.config, max_kv_len) {
                         Ok(()) => {
                             cond_init_ok = Some(true);
@@ -5822,7 +5813,7 @@ impl Qwen35Inner {
                 // Thread-local CSPRNG; one `random::<f64>()` draw per
                 // emitted token via `accept_with_residual`.
                 let mut rng = rand::rng();
-                let mut mtp_ops = chat_common::MtpOps {
+                let mut mtp_ops = mtp_decode::MtpOps {
                     forward_with_hidden: |ids: &MxArray,
                                           emb: &MxArray|
                      -> Result<(MxArray, MxArray, bool)> {
@@ -5837,7 +5828,7 @@ impl Qwen35Inner {
                     verify_step: |ids: &MxArray,
                                   emb: &MxArray,
                                   depth: usize|
-                     -> Result<chat_common::MtpVerifyOutput> {
+                     -> Result<mtp_decode::MtpVerifyOutput> {
                         // Return (logits, verify-final hidden) so the cycle
                         // macro can chain into the next cycle's first MTP draft
                         // and skip Step A's ~150 ms main-model forward.
@@ -5847,7 +5838,7 @@ impl Qwen35Inner {
                         |ids: &MxArray,
                          emb: &MxArray,
                          depth: usize|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_argmax_only(
                                 ids,
                                 emb,
@@ -5860,7 +5851,7 @@ impl Qwen35Inner {
                          emb: &MxArray,
                          depth: usize,
                          sampling_cfg: &SamplingConfig|
-                         -> Result<chat_common::MtpVerifyOutput> {
+                         -> Result<mtp_decode::MtpVerifyOutput> {
                             forward_mtp_verify_compiled_with_hidden_and_sparse_target(
                                 ids,
                                 emb,
@@ -5886,7 +5877,7 @@ impl Qwen35Inner {
                         // surviving main-cache steps. Replay that full prefix
                         // from the GDN tape rather than keeping the raw batched
                         // recurrent state. `_tape_replay` disarms internally.
-                        if accepted_drafts == depth && chat_common::mtp_use_tape_replay() {
+                        if accepted_drafts == depth && mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_replay((depth + 1) as i32);
                         }
                     },
@@ -5944,7 +5935,7 @@ impl Qwen35Inner {
                     // state.
                     snapshot_main_linear: || unsafe {
                         mlx_sys::mlx_qwen35_compiled_snapshot_linear_caches();
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             mlx_sys::mlx_qwen35_compiled_tape_arm();
                         }
                     },
@@ -5963,7 +5954,7 @@ impl Qwen35Inner {
                     restore_and_replay_main: |accepted_drafts: &[u32],
                                               emb: &MxArray|
                      -> Result<()> {
-                        if chat_common::mtp_use_tape_replay() {
+                        if mtp_decode::mtp_use_tape_replay() {
                             let steps = accepted_drafts.len() as i32;
                             unsafe {
                                 mlx_sys::mlx_qwen35_compiled_tape_replay(steps);
@@ -5988,7 +5979,7 @@ impl Qwen35Inner {
                     // persistent MTP cache so the next cycle's drafts attend
                     // the full committed prefix. Runs unconditionally (full
                     // accept + reject) — see `run_mtp_cycle_inner`.
-                    commit_mtp: |anchor: chat_common::MtpCommitAnchor,
+                    commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
                                  seed_hidden: &MxArray,
                                  verify_hiddens: &MxArray,
                                  committed_ids: &[u32],
@@ -5996,14 +5987,14 @@ impl Qwen35Inner {
                                  emb: &MxArray|
                      -> Result<()> {
                         match anchor {
-                            chat_common::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
+                            mtp_decode::MtpCommitAnchor::IncludeAnchor => commit_mtp_compiled(
                                 seed_hidden,
                                 verify_hiddens,
                                 committed_ids,
                                 k_accepted,
                                 emb,
                             ),
-                            chat_common::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
+                            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
                                 commit_mtp_compiled_from_verify_prefix(
                                     verify_hiddens,
                                     committed_ids,
@@ -6018,7 +6009,7 @@ impl Qwen35Inner {
                     committed_history_active: true,
                     rollback_unemitted: |_: usize| {},
                 };
-                chat_common::decode_loop_mtp!(
+                mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
                     mtp_depth: p.mtp_depth,
                     mtp_rng: rng,
@@ -6048,7 +6039,7 @@ impl Qwen35Inner {
                     mlx_sys::mlx_qwen35_mtp_compiled_reset();
                 }
             } else {
-                let mut ops = chat_common::DecodeOps {
+                let mut ops = mtp_decode::DecodeOps {
                     forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                         Ok((forward_compiled(ids, emb)?, false))
                     },
@@ -6059,7 +6050,7 @@ impl Qwen35Inner {
                         }
                     },
                 };
-                chat_common::decode_loop!(
+                mtp_decode::decode_loop!(
                     ops: ops,
                     y: y,
                     embedding_weight: embedding_weight,
@@ -6120,7 +6111,7 @@ impl Qwen35Inner {
         } else {
             profiler.set_label("chat_stream_rust");
 
-            let mut ops = chat_common::DecodeOps {
+            let mut ops = mtp_decode::DecodeOps {
                 forward: |ids: &MxArray, emb: &MxArray| -> Result<(MxArray, bool)> {
                     let logits = forward_inner(
                         ids,
@@ -6137,7 +6128,7 @@ impl Qwen35Inner {
                     MxArray::async_eval_arrays(&[token, logits]);
                 },
             };
-            chat_common::decode_loop!(
+            mtp_decode::decode_loop!(
                 ops: ops,
                 y: y,
                 embedding_weight: embedding_weight,
@@ -6227,7 +6218,7 @@ impl Qwen35Inner {
             tokens.len() as u32
         };
 
-        let (clean_text, tool_calls, thinking) = chat_common::parse_thinking_and_tools(
+        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
             enable_thinking.unwrap_or(true),
@@ -6264,7 +6255,7 @@ impl Qwen35Inner {
                 num_tokens: Some(num_tokens),
                 prompt_tokens: Some(prompt_token_count),
                 reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-                raw_text: Some(chat_common::raw_text_with_reasoning_suppressed(
+                raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
                     enable_thinking.unwrap_or(true),
@@ -6600,9 +6591,9 @@ impl Qwen35Inner {
         // changing behavior for valid budgets — the buffer still grows to hold
         // every generated token.
         let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens));
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(chat_common::generated_capacity_hint(max_new_tokens))
+            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
         } else {
             Vec::new()
         };
@@ -7707,7 +7698,7 @@ impl Qwen35Inner {
     /// `mtp_turn` probes (S8).
     ///
     /// Routes the four turn shapes onto the kept legacy cores VERBATIM:
-    /// fresh sync → [`Self::chat_sync_core`], delta sync →
+    /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
     /// [`Self::chat_tokens_delta_sync`], fresh streaming →
     /// [`Self::chat_stream_sync_inner`], delta streaming →
     /// [`Self::chat_stream_tokens_delta_sync_inner`]. The kept cores own
@@ -7746,7 +7737,12 @@ impl Qwen35Inner {
                     let delta_tokens = args.tokens[delta_start..].to_vec();
                     self.chat_tokens_delta_sync(delta_tokens, config)?
                 } else {
-                    self.chat_sync_core(args.tokens.to_vec(), args.images, config, args.eos_id)?
+                    self.vision_mtp_whole_turn_core(
+                        args.tokens.to_vec(),
+                        args.images,
+                        config,
+                        args.eos_id,
+                    )?
                 };
                 Ok(TurnOutput::Complete(Box::new(result)))
             }
@@ -7755,9 +7751,9 @@ impl Qwen35Inner {
 
     /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`]
     /// (S8). Preserves the legacy dispatch sites verbatim: fresh sync /
-    /// delta sync (`chat_sync_core_paged` — image turns never reach here,
+    /// delta sync (`paged_turn_sync_core` — image turns never reach here,
     /// the vision probe owns them), fresh + delta streaming
-    /// (`chat_stream_sync_core_paged`).
+    /// (`paged_turn_stream_core`).
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The legacy entry points re-derived `p` from config at each
         // dispatch site (`extract_chat_params`); the engine's default
@@ -7769,7 +7765,7 @@ impl Qwen35Inner {
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                self.chat_stream_sync_core_paged(
+                self.paged_turn_stream_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     args.eos_id,
@@ -7781,7 +7777,7 @@ impl Qwen35Inner {
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = self.chat_sync_core_paged(
+                let result = self.paged_turn_sync_core(
                     args.tokens.to_vec(),
                     tokenizer,
                     args.eos_id,
@@ -7942,7 +7938,7 @@ impl ChatBackend for Qwen35Inner {
         // Legacy: `starts_in_thinking = enable_thinking.unwrap_or(true)`
         // (template-honoring) + the explicit config budget only.
         ThinkingSetup {
-            enabled: chat_common::resolve_enable_thinking(config).unwrap_or(true),
+            enabled: engine::resolve_enable_thinking(config).unwrap_or(true),
             budget: config.thinking_token_budget,
         }
     }
@@ -7953,16 +7949,16 @@ impl ChatBackend for Qwen35Inner {
         user_message: &str,
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        // Match `chat_sync_core`'s sanitization so the session path is
+        // Match `vision_mtp_whole_turn_core`'s sanitization so the session path is
         // subject to the same role/content injection protection as the
         // fresh-prompt path.
         let synthetic = build_synthetic_user_message(user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
         // Build the delta in ChatML wire format. See
-        // `chat_common::build_chatml_continue_delta_text` for the exact
+        // `engine::build_chatml_continue_delta_text` for the exact
         // wire format and thinking-prefix semantics.
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
+        let enable_thinking = engine::resolve_enable_thinking(config);
         let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
         // `add_special_tokens: Some(false)` — we do NOT want the
         // tokenizer auto-prepending BOS. The delta is already a raw
@@ -7978,13 +7974,9 @@ impl ChatBackend for Qwen35Inner {
         is_error: Option<bool>,
         config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        let enable_thinking = chat_common::resolve_enable_thinking(config);
-        let delta_text = chat_common::build_chatml_tool_delta_text(
-            tool_call_id,
-            content,
-            enable_thinking,
-            is_error,
-        );
+        let enable_thinking = engine::resolve_enable_thinking(config);
+        let delta_text =
+            engine::build_chatml_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
         tok.encode_sync(&delta_text, Some(false))
     }
 
@@ -8041,7 +8033,7 @@ impl ChatBackend for Qwen35Inner {
         // though this turn was text-only. Fresh turns (re)set the key
         // from the turn's (always-false here) `has_images`.
         if args.is_delta {
-            chat_common::save_cache_state_after_delta(
+            engine::save_cache_state_after_delta(
                 args.reuse_cache,
                 args.generated_tokens,
                 args.finish_reason,
@@ -8145,7 +8137,7 @@ impl ChatBackend for Qwen35Inner {
         if !is_streaming {
             let prefill_len = turn.total_seq_len as i32;
             let max_kv_len_estimate =
-                chat_common::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
+                engine::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
             let has_mtp = self.has_mtp_weights();
             let branch = if p.enable_mtp && has_mtp && use_compiled {
                 "MTP (will attempt init)"
@@ -8192,7 +8184,7 @@ impl ChatBackend for Qwen35Inner {
             // `vlm_compiled_init_done` short-circuit does not apply).
             use mlx_sys as sys;
             let prefill_len = turn.total_seq_len as i32;
-            let max_kv_len = chat_common::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
+            let max_kv_len = engine::kv_capacity_round_up(prefill_len, p.max_new_tokens)?;
             let num_layers = self.config.num_layers as usize;
             let mut cache_ptrs: Vec<*mut sys::mlx_array> =
                 vec![std::ptr::null_mut(); num_layers * 2];
@@ -8234,9 +8226,9 @@ impl ChatBackend for Qwen35Inner {
             // Re-apply the saved M-RoPE offset when the compiled state
             // is being (re)initialized from a KV cache that encodes
             // image attention (text deltas chained on an image session)
-            // — see `chat_common::should_reapply_rope_delta`.
+            // — see `engine::should_reapply_rope_delta`.
             if let Some(delta) = self.cached_rope_deltas
-                && chat_common::should_reapply_rope_delta(
+                && engine::should_reapply_rope_delta(
                     true,
                     turn.is_delta,
                     turn.has_images,
@@ -8249,10 +8241,10 @@ impl ChatBackend for Qwen35Inner {
             }
 
             // Clear stale rope deltas only on fresh text-only prefills —
-            // see `chat_common::should_clear_rope_delta`. Legacy keeps
+            // see `engine::should_clear_rope_delta`. Legacy keeps
             // this INSIDE the compiled branch (the eager arm never
             // cleared; the end-of-turn save rewrites the field anyway).
-            if chat_common::should_clear_rope_delta(turn.is_delta, turn.has_images) {
+            if engine::should_clear_rope_delta(turn.is_delta, turn.has_images) {
                 self.cached_rope_deltas = None;
             }
 
@@ -8319,25 +8311,6 @@ impl ChatBackend for Qwen35Inner {
         }
     }
 
-    fn stream_delta_prompt_tokens(&self, full_len: usize, _delta_len: usize) -> u32 {
-        // Contract fix (S8 gate round 1): report the FULL history+delta
-        // length on the streaming delta terminal chunk, matching the
-        // sync delta result, the qwen3_5 paged streaming core, and every
-        // other family (lfm2/qwen3 legacy + overrides).
-        //
-        // The legacy dense streaming-delta path reported the DELTA token
-        // count (`delta_tokens.len()`) since PR #48 — an internal
-        // inconsistency that was never exercised: the env-gated parity
-        // test `qwen3_5_delta_chat::stream_session_path_keeps_ttft_flat_
-        // across_turns` asserts cumulative growth and fails IDENTICALLY
-        // (17 -> 16) on pre-S8 e4eee4aa~1 (verified empirically). This
-        // override is therefore a deliberate, test-mandated divergence
-        // from the legacy dense stream-delta payload, NOT an engine
-        // regression. MoE keeps the engine default (delta count) until
-        // its S9 migration decides.
-        full_len as u32
-    }
-
     fn has_live_session(&self) -> bool {
         // Legacy delta guard: `self.caches.is_none()` → "requires an
         // initialized session".
@@ -8355,7 +8328,7 @@ impl ChatBackend for Qwen35Inner {
         // request, and run the protective flat-cache rebuild, exactly
         // like the legacy dispatch. SYNC turns always take the paged
         // core (it self-handles MTP via the gate inside
-        // `chat_sync_core_paged_inner`).
+        // `paged_turn_sync_core_inner`).
         if args.sink.is_some() && args.params.enable_mtp && self.has_mtp_weights() {
             return None;
         }
@@ -9953,7 +9926,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
     depth: i32,
-) -> Result<chat_common::MtpVerifyOutput> {
+) -> Result<mtp_decode::MtpVerifyOutput> {
     use mlx_sys as sys;
 
     if !(1..=5).contains(&depth) {
@@ -10000,7 +9973,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden(
     let logits = MxArray::from_handle(out_logits, "mtp_verify_logits")?;
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
+    Ok(mtp_decode::MtpVerifyOutput::logits_with_argmax(
         logits,
         hiddens,
         target_argmax,
@@ -10011,7 +9984,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_argmax_only(
     input_ids: &MxArray,
     embedding_weight: &MxArray,
     depth: i32,
-) -> Result<chat_common::MtpVerifyOutput> {
+) -> Result<mtp_decode::MtpVerifyOutput> {
     use mlx_sys as sys;
 
     if !(1..=5).contains(&depth) {
@@ -10055,7 +10028,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_argmax_only(
 
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_argmax_only_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_argmax_only_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::argmax_only(
+    Ok(mtp_decode::MtpVerifyOutput::argmax_only(
         hiddens,
         target_argmax,
     ))
@@ -10066,7 +10039,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
     embedding_weight: &MxArray,
     depth: i32,
     sampling_cfg: &SamplingConfig,
-) -> Result<chat_common::MtpVerifyOutput> {
+) -> Result<mtp_decode::MtpVerifyOutput> {
     use mlx_sys as sys;
 
     if !(1..=5).contains(&depth) {
@@ -10155,7 +10128,7 @@ pub(super) fn forward_mtp_verify_compiled_with_hidden_and_sparse_target(
         "forward_mtp_verify_compiled_with_hidden_and_sparse_target",
     )?;
 
-    Ok(chat_common::MtpVerifyOutput::sparse(hiddens, target_sparse))
+    Ok(mtp_decode::MtpVerifyOutput::sparse(hiddens, target_sparse))
 }
 
 /// Paged-pool sibling of
@@ -10198,7 +10171,7 @@ pub(super) fn forward_mtp_verify_paged(
     depth: i32,
     inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
     cu_seqlens_q: &MxArray,
-) -> Result<chat_common::MtpVerifyOutput> {
+) -> Result<mtp_decode::MtpVerifyOutput> {
     use mlx_sys as sys;
 
     if !(1..=5).contains(&depth) {
@@ -10219,7 +10192,7 @@ pub(super) fn forward_mtp_verify_paged(
         })?;
 
     // Locking contract: production callers run inside
-    // `chat_sync_core_paged{,_inner}` which holds `DENSE_COMPILED_MUTEX`
+    // `paged_turn_sync_core{,_inner}` which holds `DENSE_COMPILED_MUTEX`
     // + `COMPILED_WEIGHTS_RWLOCK` across the entire turn. Taking the
     // locks again here would deadlock the non-reentrant mutex on the
     // paged-MTP gate's `verify_step` invocation. The smoke tests in
@@ -10278,7 +10251,7 @@ pub(super) fn forward_mtp_verify_paged(
     let logits = MxArray::from_handle(out_logits, "mtp_verify_paged_logits")?;
     let hiddens = MxArray::from_handle(out_hiddens, "mtp_verify_paged_hiddens")?;
     let target_argmax = MxArray::from_handle(out_argmax, "mtp_verify_paged_argmax")?;
-    Ok(chat_common::MtpVerifyOutput::logits_with_argmax(
+    Ok(mtp_decode::MtpVerifyOutput::logits_with_argmax(
         logits,
         hiddens,
         target_argmax,
@@ -11014,7 +10987,7 @@ fn vlm_prefill(
         use mlx_sys as sys;
 
         let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
-        let max_kv_len = chat_common::kv_capacity_round_up(seq_len_i32, max_new_tokens)?;
+        let max_kv_len = engine::kv_capacity_round_up(seq_len_i32, max_new_tokens)?;
         let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
 
         let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
@@ -11662,8 +11635,8 @@ mod prefix_cache_reuse_integration_tests {
 #[cfg(test)]
 mod paged_construction_tests {
     //! Smoke tests for the block-paged adapter construction on Qwen3.5
-    //! dense. The forward dispatch lives in `chat_sync_core_paged`
-    //! / `chat_stream_sync_core_paged`; these tests cover the
+    //! dense. The forward dispatch lives in `paged_turn_sync_core`
+    //! / `paged_turn_stream_core`; these tests cover the
     //! Inner-construction surface in isolation.
     //!
     //! Tests that allocate a `LayerKVPool` require Metal. Construction-only
@@ -12499,7 +12472,7 @@ mod paged_construction_tests {
             adapter.block_size(),
             CPP_PAGED_REQUIRED_BLOCK_SIZE,
             "block_size=8 adapter must not match the compiled graph's hard-coded 16; \
-             the dispatcher gate at chat_sync_core_paged_inner / chat_stream_sync_core_paged_inner \
+             the dispatcher gate at paged_turn_sync_core_inner / paged_turn_stream_core_inner \
              relies on this inequality to fall back to the pure-Rust paged path"
         );
     }

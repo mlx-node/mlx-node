@@ -21,7 +21,7 @@ use crate::utils::safetensors::load_safetensors_lazy;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
 
-use super::persistence_common::{
+use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
     prewarm_checkpoint_pages_with,
 };
