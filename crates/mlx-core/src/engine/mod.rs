@@ -7,4 +7,6 @@
 //! model family only implements its forward pass.
 
 pub(crate) mod chat_common;
+pub(crate) mod compiled_lock;
+pub(crate) mod persistence;
 pub mod types;
