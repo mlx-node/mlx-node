@@ -3170,6 +3170,42 @@ impl PagedKVCacheAdapter {
         Ok(count)
     }
 
+    /// Hard reset for an EXPLICIT session reset
+    /// (`engine::backend::ResetScope::Command`).
+    ///
+    /// [`Self::release_request`] alone is NOT a cold reset: full blocks the
+    /// request registered stay content-addressed in the shared
+    /// [`BlockAllocator`]'s prefix cache, so the next same-prompt turn
+    /// takes the prefix-hit suffix-prefill path instead of a cold
+    /// full-prompt prefill. The two paths reduce bf16 in different orders,
+    /// which can flip a greedy near-tie — making reset-then-rerun diverge
+    /// from a fresh session even though the reset's contract promises a
+    /// fully cold state (codex finding on the S11 lfm2 migration; observed
+    /// flip: "says," vs "said" at token ~6 on the lfm2.5-1.2b checkpoint).
+    ///
+    /// Releases the live request (idempotent — a prior `release_request`
+    /// makes that half a no-op) AND purges every prefix-cache entry from
+    /// the allocator via [`BlockAllocator::purge_prefix_cache`]. Returns
+    /// the number of blocks the release freed.
+    ///
+    /// NOTE: the allocator may be shared by multiple adapters; purged
+    /// entries vanish for every tenant (blocks still referenced by another
+    /// live request stay allocated but lose their cache registration).
+    /// Every current integration constructs a dedicated allocator per
+    /// model instance, so this is theoretical today. Turn-internal resets
+    /// (`ResetScope::PrefixMiss`) must keep calling `release_request` only
+    /// — cross-request block reuse after a history miss is the paged
+    /// design's entire point.
+    pub fn release_request_and_purge_prefix_cache(&mut self) -> Result<u32, String> {
+        let released = self.release_request()?;
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        guard.purge_prefix_cache();
+        Ok(released)
+    }
+
     /// Finish the current turn but keep the request's live state in the
     /// adapter so the next turn can build directly on top of it (without
     /// going through the prefix-cache lookup, which only registers FULL

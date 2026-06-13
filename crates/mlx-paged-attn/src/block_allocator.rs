@@ -302,6 +302,38 @@ impl BlockAllocator {
         }
     }
 
+    /// Evict EVERY prefix-cache entry, releasing the cache's logical
+    /// reference on each block (the same per-entry cleanup the capacity
+    /// eviction loop in [`Self::register_prefix`] performs). Blocks whose
+    /// `ref_count` drops to 0 are removed from `allocated` and returned to
+    /// the free pool; blocks still held by a live request stay allocated
+    /// but are no longer discoverable via `lookup_prefix` /
+    /// `find_longest_cache_hit`.
+    ///
+    /// This is the hard-reset primitive behind an EXPLICIT session reset
+    /// (`ResetScope::Command` in mlx-core): [`Self::free`] /
+    /// `release_request` deliberately keep content-addressed full blocks
+    /// registered for cross-request reuse, so a reset-then-rerun of the
+    /// same prompt would otherwise take the prefix-hit suffix-prefill path
+    /// — which reduces bf16 in a different order than a cold full prefill
+    /// and can flip a greedy near-tie (observed on LFM2). Purging restores
+    /// the documented "fully cold state" contract.
+    pub fn purge_prefix_cache(&mut self) {
+        self.lru_order.clear();
+        self.prefix_cache_identities.clear();
+        // `block_hashes` only carries reverse mappings for live
+        // prefix-cache entries (the register/free invariants), so it
+        // empties exactly when the cache does.
+        self.block_hashes.clear();
+        for (_hash, block) in self.prefix_cache.drain() {
+            if block.decref() {
+                let block_id = block.block_id;
+                self.allocated.remove(&block_id);
+                self.free_blocks.push_back(block_id);
+            }
+        }
+    }
+
     /// Register a block in the prefix cache
     ///
     /// The block will be reused when a sequence has matching prefix tokens.
@@ -1144,6 +1176,46 @@ mod tests {
         allocator.free(cached);
         assert!(allocator.lookup_prefix(hash).is_some());
         assert_eq!(allocator.num_free_blocks(), 9);
+    }
+
+    #[test]
+    fn test_purge_prefix_cache() {
+        let mut allocator = BlockAllocator::new(10, 32);
+
+        // Cache-only entry: external handle freed, only the cache's
+        // logical ref keeps it alive (the post-`release_request` state).
+        let cache_only = allocator.allocate().unwrap();
+        let hash_cache_only = hash_tokens(&[1, 2, 3], 0, &[]);
+        allocator.register_prefix(Arc::clone(&cache_only), hash_cache_only);
+        allocator.free(cache_only);
+        assert_eq!(allocator.num_free_blocks(), 9);
+
+        // Live entry: a request still holds an external handle.
+        let live = allocator.allocate().unwrap();
+        let hash_live = hash_tokens(&[4, 5, 6], 0, &[]);
+        allocator.register_prefix(Arc::clone(&live), hash_live);
+        assert_eq!(allocator.num_free_blocks(), 8);
+
+        allocator.purge_prefix_cache();
+
+        // Both entries are gone from the cache.
+        assert!(allocator.lookup_prefix(hash_cache_only).is_none());
+        assert!(allocator.lookup_prefix(hash_live).is_none());
+
+        // The cache-only block returned to the free pool; the live block
+        // stays allocated for its holder (9 free, 1 still out).
+        assert_eq!(allocator.num_free_blocks(), 9);
+        assert_eq!(live.get_ref_count(), 1, "only the external ref remains");
+
+        // The surviving handle frees cleanly afterwards.
+        allocator.free(live);
+        assert_eq!(allocator.num_free_blocks(), 10);
+
+        // A purged-then-reallocated pool keeps working: re-register and
+        // hit the same hash again.
+        let again = allocator.allocate().unwrap();
+        assert!(allocator.register_prefix(Arc::clone(&again), hash_cache_only));
+        assert!(allocator.lookup_prefix(hash_cache_only).is_some());
     }
 
     #[test]

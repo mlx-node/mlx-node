@@ -480,11 +480,14 @@ impl Qwen3Inner {
         self.turn_kv_values.clear();
         self.turn_cache_idx = 0;
         self.pending_exact_match_rewind.set(false);
-        // Drop any live paged-adapter request so the next session starts
-        // from a fully cold state. Without this, a finalize_turn_keep_live
-        // call from a prior session would leave block_table populated and
-        // a subsequent `paged_turn_sync_core` could mistakenly take the
-        // warm-continue path against stale tokens.
+        // Drop any live paged-adapter request. Without this, a
+        // finalize_turn_keep_live call from a prior session would leave
+        // block_table populated and a subsequent `paged_turn_sync_core`
+        // could mistakenly take the warm-continue path against stale
+        // tokens. NOTE: this alone is NOT a fully cold reset — released
+        // full blocks stay content-addressed in the allocator's prefix
+        // cache; the EXPLICIT command reset purges them on top of this
+        // (`ResetScope::Command` branch of `ChatBackend::reset_caches`).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -4017,12 +4020,34 @@ impl ChatBackend for Qwen3Inner {
         &self.cached_token_history
     }
 
-    fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
-        // qwen3 has no scope-dependent reset state (no rope deltas / GDN
-        // checkpoints): both the turn-internal prefix-miss reset and the
-        // explicit command reset run the full legacy clear, exactly like
-        // the deleted cores (both invoked `reset_kv_caches_sync`).
-        self.reset_kv_caches_sync()
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        // qwen3 has no scope-dependent FLAT reset state (no rope deltas /
+        // GDN checkpoints): both the turn-internal prefix-miss reset and
+        // the explicit command reset run the full legacy clear, exactly
+        // like the deleted cores (both invoked `reset_kv_caches_sync`).
+        self.reset_kv_caches_sync()?;
+        // The EXPLICIT command reset must restore the fully cold state
+        // the legacy doc promised: `release_request` (inside
+        // `reset_kv_caches_sync`) leaves the request's full blocks
+        // content-addressed in the allocator's prefix cache, so a
+        // reset-then-rerun of the same prompt would take the prefix-hit
+        // suffix-prefill path — a different bf16 reduction order than
+        // the cold full prefill, enough to flip a greedy near-tie
+        // (codex S12 finding, observed on the lfm2 sibling; qwen3's
+        // paged path shares the identical adapter lifecycle). The
+        // turn-internal `PrefixMiss` reset keeps the prefix cache.
+        if scope == ResetScope::Command
+            && let Some(adapter) = self.paged_adapter.as_mut()
+        {
+            adapter
+                .release_request_and_purge_prefix_cache()
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "qwen3 reset_caches: paged prefix-cache purge failed: {e}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// All-or-nothing prefix match, PLUS the sanctioned qwen3 pure-KV

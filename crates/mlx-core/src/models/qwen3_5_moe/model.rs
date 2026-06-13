@@ -266,7 +266,7 @@ fn export_paged_moe_linear_caches(
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::models::qwen3_5::model::{COMPILED_WEIGHTS_RWLOCK, QWEN35_MODEL_ID_COUNTER};
+use crate::models::qwen3_5::model::{QWEN35_MODEL_ID_COUNTER, compiled_weights_read};
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle across
 /// model instances. Within a single model instance, the dedicated model thread
@@ -1213,7 +1213,7 @@ impl Qwen35MoeInner {
         // Re-validate compiled path under weight lock
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -1906,7 +1906,7 @@ impl Qwen35MoeInner {
         };
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -2514,7 +2514,7 @@ impl Qwen35MoeInner {
         };
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -3388,7 +3388,7 @@ impl Qwen35MoeInner {
 
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -4180,7 +4180,7 @@ impl Qwen35MoeInner {
 
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -4701,7 +4701,7 @@ impl Qwen35MoeInner {
 
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -7349,7 +7349,7 @@ impl ChatBackend for Qwen35MoeInner {
         };
         let mut weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 weight_guard = Some(guard);
                 true

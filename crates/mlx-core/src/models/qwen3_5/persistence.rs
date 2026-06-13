@@ -1874,7 +1874,10 @@ fn register_weights_with_cpp(
     // Write-lock the weight RwLock for the entire registration.
     // This blocks any in-flight compiled inference from reading weights
     // until registration is complete and model_id is set.
-    let _guard = super::model::COMPILED_WEIGHTS_RWLOCK.write().unwrap();
+    // Poison-recovered: a torn prior registration must not brick every
+    // later load (see `engine::compiled_lock::compiled_weights_write`) —
+    // we re-run the FULL clear → store → publish-id-last sequence below.
+    let _guard = super::model::compiled_weights_write();
 
     // `mlx_clear_weights` also clears the per-projection quant-info
     // registry, so we re-populate both below.

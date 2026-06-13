@@ -501,17 +501,21 @@ impl Lfm2Inner {
     /// Renamed from the pre-S11 inherent `reset_caches` so the
     /// [`ChatBackend::reset_caches`] trait method (which takes a
     /// [`ResetScope`]) cannot shadow it at concrete-typed call sites.
-    /// Both engine scopes dispatch here — lfm2 treats the turn-internal
-    /// prefix-miss reset and the explicit command reset identically.
+    /// Both engine scopes dispatch here for the SHARED clear; the
+    /// explicit command reset additionally purges the paged prefix
+    /// cache in the trait impl (see [`ChatBackend::reset_caches`]).
     fn reset_caches_internal(&mut self) {
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        // Drop any live paged-adapter request so the next session starts
-        // from a fully cold state. Without this, a finalize_turn_keep_live
-        // call from a prior session would leave block_table populated and
-        // a subsequent `paged_turn_sync_core` could mistakenly take the
-        // warm-continue path against stale tokens.
+        // Drop any live paged-adapter request. Without this, a
+        // finalize_turn_keep_live call from a prior session would leave
+        // block_table populated and a subsequent `paged_turn_sync_core`
+        // could mistakenly take the warm-continue path against stale
+        // tokens. NOTE: this alone is NOT a fully cold reset — released
+        // full blocks stay content-addressed in the allocator's prefix
+        // cache; the EXPLICIT command reset purges them on top of this
+        // (`ResetScope::Command` branch of the trait impl).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -2285,12 +2289,33 @@ impl ChatBackend for Lfm2Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        // Both scopes identical for lfm2: the legacy miss-branch reset
-        // and the explicit `ResetCaches` command both called the same
-        // inherent reset (wipe caches + token history + image key and
-        // release any live paged request).
-        let _ = scope;
+        // Shared clear for BOTH scopes (== the legacy inherent reset):
+        // wipe flat caches + token history + image key and release any
+        // live paged request.
         self.reset_caches_internal();
+        // The EXPLICIT command reset must restore a fully cold state:
+        // `release_request` alone leaves the request's full blocks
+        // content-addressed in the allocator's prefix cache, so a
+        // reset-then-rerun of the same prompt would take the prefix-hit
+        // 1-token-suffix prefill path — whose bf16 reduction order
+        // differs from the cold full prefill, enough to flip a greedy
+        // near-tie (codex S12 finding; observed "says," vs "said" at
+        // token ~6 on the 1.2b checkpoint). Purge the prefix cache so
+        // the next turn replays the cold prefill byte-for-byte.
+        // `PrefixMiss` (turn-internal) keeps the prefix cache:
+        // cross-request block reuse after a history miss is the paged
+        // design's entire point.
+        if scope == ResetScope::Command
+            && let Some(adapter) = self.paged_adapter.as_mut()
+        {
+            adapter
+                .release_request_and_purge_prefix_cache()
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "lfm2 reset_caches: paged prefix-cache purge failed: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 

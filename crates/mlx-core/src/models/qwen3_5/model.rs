@@ -61,7 +61,10 @@ pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 =
 // The process-wide compiled-path locks moved to `crate::engine::compiled_lock`;
 // re-exported here so existing `qwen3_5::model::…` imports (lfm2, gemma4,
 // qwen3_5_moe, tests) keep working unchanged.
-pub(crate) use crate::engine::compiled_lock::{COMPILED_LIFECYCLE_MUTEX, COMPILED_WEIGHTS_RWLOCK};
+pub(crate) use crate::engine::compiled_lock::{
+    COMPILED_LIFECYCLE_MUTEX, COMPILED_WEIGHTS_RWLOCK, compiled_weights_read,
+    compiled_weights_write,
+};
 
 fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -1498,7 +1501,7 @@ impl Qwen35Inner {
         // Re-validate compiled path under weight lock
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -1915,7 +1918,7 @@ impl Qwen35Inner {
 
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -2776,7 +2779,7 @@ impl Qwen35Inner {
         };
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -3813,7 +3816,7 @@ impl Qwen35Inner {
         };
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -4563,7 +4566,7 @@ impl Qwen35Inner {
 
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -5365,7 +5368,7 @@ impl Qwen35Inner {
 
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 _weight_guard = Some(guard);
                 true
@@ -8116,7 +8119,7 @@ impl ChatBackend for Qwen35Inner {
         };
         let mut weight_guard = None;
         let use_compiled = if use_compiled {
-            let guard = COMPILED_WEIGHTS_RWLOCK.read().unwrap();
+            let guard = compiled_weights_read();
             if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
                 weight_guard = Some(guard);
                 true

@@ -624,10 +624,17 @@ async fn lfm2_session_start_rejects_reuse_cache_false() {
 // ---------------------------------------------------------------------
 
 /// After `reset_caches`, re-running the same turn-0 prompt at
-/// temperature=0 reproduces the previous `text` and `num_tokens`
-/// byte-for-byte. This proves the session-start path starts from a
-/// clean slate on reset and nothing from the previous turn leaks into
-/// the new one.
+/// temperature=0 reproduces the previous `raw_text` / `text` /
+/// `num_tokens` byte-for-byte WITHOUT any priming turn. This proves the
+/// session-start path starts from a fully cold slate on reset and
+/// nothing from the previous turn leaks into the new one — including
+/// the paged adapter's content-addressed prefix blocks: an explicit
+/// `reset_caches` purges them (`ResetScope::Command` hard reset), so
+/// the second run replays the COLD full-prompt prefill instead of a
+/// prefix-hit 1-token-suffix prefill whose different bf16 reduction
+/// order can flip a greedy near-tie (the codex S12 finding; previously
+/// masked because `text` is empty on all-thinking trajectories —
+/// `raw_text` is the assert that actually bites).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
@@ -669,6 +676,15 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
         .await
         .expect("second chat_session_start after reset_caches failed");
 
+    // raw_text is the load-bearing assert: lfm2 spends small budgets
+    // inside `<think>`, so `text` is often empty for BOTH runs and
+    // would mask a cold-vs-prefix-hit prefill divergence.
+    assert_eq!(
+        r1.raw_text, r2.raw_text,
+        "reset_caches did not reproduce turn-0 raw_text byte-for-byte \
+         (cold prefill vs post-reset prefill diverged): before={:?} after={:?}",
+        r1.raw_text, r2.raw_text
+    );
     assert_eq!(
         r1.text, r2.text,
         "reset_caches did not reproduce turn-0 text byte-for-byte: \
@@ -686,8 +702,11 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
 /// `chat_stream_session_start_for_test` matches the `ChatResult.raw_text`
 /// from `chat_session_start` byte-for-byte (the deltas are the verbatim
 /// stream under include_reasoning=true), and the terminal chunk's parsed
-/// `text` matches the non-stream `text`. A prime turn + `reset_caches`
-/// before each run pins both to an identical post-reset session state.
+/// `text` matches the non-stream `text`. The `reset_caches` between the
+/// two runs is a HARD reset (paged prefix blocks purged), so the
+/// streaming run replays the non-streaming run's cold prefill exactly —
+/// no priming turn needed (the S12 prime-turn workaround is gone with
+/// the `ResetScope::Command` prefix-cache purge).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_LFM2_MODEL_PATH pointing to a real LFM2 checkpoint"]
 async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
@@ -708,24 +727,6 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
 
     let prompt_text = "Say hi in one short word.";
 
-    // Prime the paged prefix pool with one throwaway turn, then reset.
-    // The pool's content-addressed prefix blocks intentionally SURVIVE
-    // `reset_caches` (only the live request is released), and a
-    // prefix-HIT prefill (1-token suffix) rounds bf16 differently than
-    // the cold full-prompt prefill — enough to flip a greedy near-tie
-    // (observed: "says," vs "said" at token ~6 on this checkpoint).
-    // Priming pins BOTH compared runs to the same (prefix-hit) cache
-    // state so byte-for-byte parity is well-defined.
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    let _prime = model
-        .chat_session_start(
-            vec![user_message(prompt_text)],
-            Some(chat_config_default(32)),
-        )
-        .await
-        .expect("prime chat_session_start failed");
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
-
     // Non-streaming: capture the full reply text. `ChatMessage` is not
     // `Clone`, so we reconstruct the identical prompt for both calls.
     let cfg_ns = chat_config_default(32);
@@ -734,8 +735,9 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
         .await
         .expect("non-streaming chat_session_start failed");
 
-    // Reset so the streaming run starts from the same (post-reset,
-    // prefix-warm) state as the non-streaming run above.
+    // Hard reset so the streaming run starts from the same fully cold
+    // state as the non-streaming run above (prefix-cache purged).
+    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
     tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
