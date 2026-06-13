@@ -164,7 +164,19 @@ async fn qwen3_5_session_reset_purges_prefix_cache_cold_prefill() {
          use_block_paged_cache=true, but has_block_paged_cache()==false"
     );
 
-    let prompt = "Say hi in one short word.";
+    // The prompt MUST render to MORE than one paged block
+    // (paged_block_size=16 above) for this assertion to bite: the prefix
+    // lookup is capped at `max_cache_hit_tokens = total_budget - 1 =
+    // prompt_len - 1` (model.rs:2812) and `find_longest_cache_hit` only
+    // matches COMPLETE blocks, so a single-block (<=16-token) prompt
+    // always reports `cached_tokens == 0` on turn 2 regardless of the
+    // purge. This multi-sentence prompt is comfortably >= 33 tokens
+    // (>= 2 full blocks), so WITHOUT the purge turn 2 takes a >= 16-token
+    // prefix hit (`cached_tokens > 0`) and WITH the purge cold-prefills
+    // (`cached_tokens == 0`).
+    let prompt = "Please explain, in a few clear sentences, why the sky \
+                  appears blue during the day and turns orange and red near \
+                  sunset. Keep the explanation simple and friendly.";
 
     // Turn 1: cold session start. Primes the prefix cache.
     let r1 = model
