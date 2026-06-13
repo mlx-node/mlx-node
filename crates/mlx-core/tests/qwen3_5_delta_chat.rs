@@ -20,7 +20,8 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
+use mlx_core::engine::types::ChatConfig;
+use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
@@ -257,13 +258,9 @@ async fn session_path_keeps_ttft_flat_across_turns() {
 /// invariants expected by subsequent turns.
 async fn drain_stream_turn(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<
-        napi::Result<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
+        napi::Result<mlx_core::engine::types::ChatStreamChunk>,
     >,
-) -> (
-    Vec<mlx_core::models::qwen3_5::model::ChatStreamChunk>,
-    f64,
-    bool,
-) {
+) -> (Vec<mlx_core::engine::types::ChatStreamChunk>, f64, bool) {
     let start = Instant::now();
     let mut chunks = Vec::new();
     let mut ttft_ms: Option<f64> = None;

@@ -2229,7 +2229,7 @@ mod tests {
 
         // Exclusive ownership of the shared compiled registry for the whole
         // check (poison-recovered, matching the registration/decode lock usage).
-        let _w = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _w = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 

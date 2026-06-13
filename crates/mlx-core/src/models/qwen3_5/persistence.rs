@@ -1877,7 +1877,7 @@ fn register_weights_with_cpp(
     // Poison-recovered: a torn prior registration must not brick every
     // later load (see `engine::compiled_lock::compiled_weights_write`) —
     // we re-run the FULL clear → store → publish-id-last sequence below.
-    let _guard = super::model::compiled_weights_write();
+    let _guard = crate::engine::compiled_lock::compiled_weights_write();
 
     // `mlx_clear_weights` also clears the per-projection quant-info
     // registry, so we re-populate both below.

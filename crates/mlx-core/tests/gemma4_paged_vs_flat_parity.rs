@@ -36,7 +36,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mlx_core::models::qwen3_5::model::ChatConfig;
+use mlx_core::engine::types::ChatConfig;
 use mlx_core::tokenizer::ChatMessage;
 
 // ---------------------------------------------------------------------------

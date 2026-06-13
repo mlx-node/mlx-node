@@ -20,7 +20,8 @@
 
 use std::path::Path;
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
+use mlx_core::engine::types::ChatConfig;
+use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

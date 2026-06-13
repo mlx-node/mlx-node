@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, ChatResult};
+use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::tokenizer::ChatMessage;
 
 // ---------------------------------------------------------------------------

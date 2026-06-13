@@ -14,6 +14,7 @@ use crate::engine::backend::{
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
@@ -21,7 +22,6 @@ use crate::engine::{
     kv_capacity_round_up,
 };
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
-use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::sampling::sample;
@@ -990,7 +990,7 @@ impl Lfm2Inner {
         }
         let mut _compiled_lock = if use_cpp_pre {
             Some(
-                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
+                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -999,7 +999,7 @@ impl Lfm2Inner {
         };
         let mut _weight_guard = None;
         let cpp_session_ready = if use_cpp_pre {
-            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             // Re-check ownership under the read lock — a concurrent load of a
@@ -2428,7 +2428,7 @@ impl ChatBackend for Lfm2Inner {
         let use_compiled_pre = self.compiled_path_active();
         let compiled_lock = if use_compiled_pre {
             Some(
-                crate::models::qwen3_5::model::COMPILED_LIFECYCLE_MUTEX
+                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             )
@@ -2438,7 +2438,7 @@ impl ChatBackend for Lfm2Inner {
         let mut weight_guard = None;
         // `mut` so the seed step below can drop back to native on any failure.
         let mut use_compiled = if use_compiled_pre {
-            let guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             // Re-check ownership under the read lock — a concurrent load of a

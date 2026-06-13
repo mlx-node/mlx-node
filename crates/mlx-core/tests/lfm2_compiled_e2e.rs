@@ -80,8 +80,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use mlx_core::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use mlx_core::models::lfm2::model::Lfm2Model;
-use mlx_core::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk};
 use mlx_core::tokenizer::ChatMessage;
 
 /// New tokens decoded per run for the short-prompt tests. Spec requires N >= 48;

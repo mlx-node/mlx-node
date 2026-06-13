@@ -34,7 +34,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, Qwen3_5Model};
+use mlx_core::engine::types::ChatConfig;
+use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 
 fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<PathBuf, String> {

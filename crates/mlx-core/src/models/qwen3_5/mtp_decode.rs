@@ -3112,8 +3112,8 @@ mod mtp_cycle_tests {
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::params::extract_chat_params;
+    use crate::engine::types::ChatConfig;
     use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
-    use crate::models::qwen3_5::model::ChatConfig;
     use crate::sampling::{SamplingConfig, SparseDistributionRows};
 
     use rand::SeedableRng;

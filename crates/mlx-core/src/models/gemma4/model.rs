@@ -107,7 +107,7 @@ use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
-use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use tracing::{debug, info};
 
 /// PLE (Per-Layer Embeddings) model-level components.

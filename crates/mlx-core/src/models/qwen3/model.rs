@@ -35,11 +35,11 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
     self, IMAGE_CHANGE_RESTART_PREFIX, build_chatml_continue_delta_text,
     build_chatml_tool_delta_text, build_synthetic_user_message,
 };
-use crate::models::qwen3_5::model::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///

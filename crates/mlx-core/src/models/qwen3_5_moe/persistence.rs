@@ -1500,7 +1500,7 @@ fn register_moe_weights_with_cpp(
     use std::ffi::CString;
 
     // Write-lock the weight RwLock for the entire registration.
-    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+    let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
         .write()
         .unwrap();
 

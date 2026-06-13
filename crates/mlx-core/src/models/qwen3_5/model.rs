@@ -58,13 +58,10 @@ pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 /// so IDs must be globally unique across all Qwen3.5 model variants.
 pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
 
-// The process-wide compiled-path locks moved to `crate::engine::compiled_lock`;
-// re-exported here so existing `qwen3_5::model::…` imports (lfm2, gemma4,
-// qwen3_5_moe, tests) keep working unchanged.
-pub(crate) use crate::engine::compiled_lock::{
-    COMPILED_LIFECYCLE_MUTEX, COMPILED_WEIGHTS_RWLOCK, compiled_weights_read,
-    compiled_weights_write,
-};
+// The process-wide compiled-path locks live in `crate::engine::compiled_lock`;
+// imported here for unqualified internal use (no re-export — external consumers
+// import them from `crate::engine::compiled_lock`).
+use crate::engine::compiled_lock::{COMPILED_LIFECYCLE_MUTEX, compiled_weights_read};
 
 fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -8383,11 +8380,9 @@ pub struct Qwen3_5GenerationResult {
     pub finish_reason: String,
 }
 
-// Shared chat types (`ChatConfig`, `ChatResult`, `ChatStreamChunk`,
-// `ChatStreamHandle`) moved to the model-neutral engine module. This
-// re-export is PERMANENT: integration tests and the other model families
-// import them via `crate::models::qwen3_5::model::…`.
-pub use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+// Shared chat types live in the model-neutral engine module; import them for
+// internal use (no re-export — consumers import from `crate::engine::types`).
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 
 /// Qwen3.5 Model -- hybrid linear/full attention with optional MoE.
 ///

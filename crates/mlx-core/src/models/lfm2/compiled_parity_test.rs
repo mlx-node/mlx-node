@@ -10,7 +10,7 @@
 //! That shared map is process-global and is the SAME registry the production
 //! compiled paths (qwen3.5 / qwen3.5-MoE / gemma4, and eventually lfm2) own
 //! during registration + inference, serialized by
-//! [`COMPILED_WEIGHTS_RWLOCK`](crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK).
+//! [`COMPILED_WEIGHTS_RWLOCK`](crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK).
 //! A probe's clear→store→run→clear (which also resets the active model id) would
 //! corrupt a concurrent compiled registration/inference — and qwen compiled-path
 //! tests live in this very `--lib` binary. So each probe test holds that SAME
@@ -21,7 +21,7 @@
 #![cfg(test)]
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK;
+use crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK;
 use crate::transformer::{KVCache, MLP};
 
 use super::attention::Lfm2Attention;

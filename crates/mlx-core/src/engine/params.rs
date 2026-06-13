@@ -297,7 +297,7 @@ mod mtp_params_tests {
     //! required; purely tests the `ChatConfig → ChatParams` extraction.
 
     use super::extract_chat_params;
-    use crate::models::qwen3_5::model::ChatConfig;
+    use crate::engine::types::ChatConfig;
 
     fn base_config() -> ChatConfig {
         ChatConfig {

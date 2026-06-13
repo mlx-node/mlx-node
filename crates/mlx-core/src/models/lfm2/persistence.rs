@@ -1845,7 +1845,7 @@ fn register_weights_with_cpp(
     // already holds the write lock must call `_locked` directly, NOT this
     // wrapper — taking the non-reentrant `std::sync::RwLock` twice on one thread
     // would deadlock).
-    let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+    let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
         .write()
         .unwrap_or_else(|e| e.into_inner());
     register_weights_with_cpp_locked(
@@ -2514,7 +2514,7 @@ mod tests {
     /// `g_weights()` map; clears the map at the end so no stale id leaks.
     #[test]
     fn register_synthesizes_zero_expert_bias_when_absent() {
-        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -2588,7 +2588,7 @@ mod tests {
     /// non-reentrant RwLock).
     #[test]
     fn register_sym8_stores_weight_nk_sidecar_and_sym8_quant_info() {
-        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -2646,7 +2646,7 @@ mod tests {
     /// model id (`compiled_path_active()` stays false → eager decode).
     #[test]
     fn broken_sym8_registration_aborts_to_eager_without_failing_load() {
-        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -2692,7 +2692,7 @@ mod tests {
     /// never from an operand-build failure.
     #[test]
     fn checkpoint_supplied_weight_nk_aborts_registration() {
-        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 
@@ -2977,7 +2977,7 @@ mod tests {
     /// serial tests (the suite runs `--test-threads=1`).
     #[test]
     fn production_compiled_decode_matches_native_with_conv_bias() {
-        let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK
+        let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
             .write()
             .unwrap_or_else(|e| e.into_inner());
 

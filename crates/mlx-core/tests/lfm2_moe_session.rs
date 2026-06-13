@@ -20,8 +20,8 @@
 
 use std::path::Path;
 
+use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::lfm2::model::Lfm2Model;
-use mlx_core::models::qwen3_5::model::ChatConfig;
 use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {

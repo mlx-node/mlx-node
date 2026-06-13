@@ -14,15 +14,15 @@ use crate::engine::backend::{
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
 use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
-    ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle, VisionCache, VisionCacheInner,
-    compute_image_token_counts_per_image, eval_layer_caches, inject_image_placeholders,
-    vlm_prepare_vision_features,
+    VisionCache, VisionCacheInner, compute_image_token_counts_per_image, eval_layer_caches,
+    inject_image_placeholders, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -266,7 +266,8 @@ fn export_paged_moe_linear_caches(
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::models::qwen3_5::model::{QWEN35_MODEL_ID_COUNTER, compiled_weights_read};
+use crate::engine::compiled_lock::compiled_weights_read;
+use crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER;
 
 /// Process-wide mutex serializing the MoE compiled forward lifecycle across
 /// model instances. Within a single model instance, the dedicated model thread

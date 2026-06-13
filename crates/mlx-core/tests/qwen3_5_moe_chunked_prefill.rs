@@ -38,7 +38,7 @@
 
 use std::path::Path;
 
-use mlx_core::models::qwen3_5::model::ChatConfig;
+use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use mlx_core::tokenizer::ChatMessage;
 

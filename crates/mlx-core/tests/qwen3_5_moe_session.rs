@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use mlx_core::models::qwen3_5::model::{ChatConfig, ChatStreamChunk};
+use mlx_core::engine::types::{ChatConfig, ChatStreamChunk};
 use mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use mlx_core::tokenizer::ChatMessage;
 
