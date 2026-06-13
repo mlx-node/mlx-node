@@ -3,8 +3,6 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
-
 /// Load-bearing typed error prefix used when `chat_session_continue_sync`
 /// rejects an image parameter because images are changing mid-session.
 ///
@@ -131,7 +129,7 @@ pub(crate) fn should_clear_rope_delta(is_delta: bool, has_images: bool) -> bool 
 ///
 /// Takes `&mut` refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
 /// its dedicated model thread.
-pub(crate) fn save_cache_state_direct(
+pub(crate) fn save_cache_state_direct<C>(
     reuse_cache: bool,
     has_images: bool,
     generated_tokens: &[u32],
@@ -142,7 +140,7 @@ pub(crate) fn save_cache_state_direct(
     cached_token_history: &mut Vec<u32>,
     cached_image_key: &mut Option<u64>,
     cached_rope_deltas: &mut Option<i32>,
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    caches: &mut Option<Vec<C>>,
 ) {
     if reuse_cache {
         let mut full_history = if has_images {
@@ -188,7 +186,7 @@ pub(crate) fn save_cache_state_direct(
 /// The full-reset `reuse_cache=false` branch still clears everything —
 /// same invariant as the prefill helper.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn save_cache_state_after_delta(
+pub(crate) fn save_cache_state_after_delta<C>(
     reuse_cache: bool,
     generated_tokens: &[u32],
     finish_reason: &str,
@@ -196,7 +194,7 @@ pub(crate) fn save_cache_state_after_delta(
     cached_token_history: &mut Vec<u32>,
     cached_image_key: &mut Option<u64>,
     cached_rope_deltas: &mut Option<i32>,
-    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    caches: &mut Option<Vec<C>>,
 ) {
     if reuse_cache {
         let mut full_history = save_tokens.to_vec();
@@ -309,13 +307,20 @@ mod save_cache_state_after_delta_tests {
     //! currently holds image state" on the very next turn.
     use super::save_cache_state_after_delta;
 
+    /// Stand-in cache element. The helper's reuse_cache=false branch only
+    /// does `*caches = None;` and never inspects the element, so a
+    /// zero-sized dummy reproduces the exact `is_some()`/`is_none()`
+    /// behavior these tests assert without binding the engine to a
+    /// concrete model cache type.
+    #[derive(Clone)]
+    struct DummyCache;
+
     #[test]
     fn delta_preserves_cached_image_key_on_reuse_cache_true() {
         let mut cached_history: Vec<u32> = vec![1, 2, 3];
         let mut cached_image_key: Option<u64> = Some(0xdeadbeef);
         let mut cached_rope_deltas: Option<i32> = Some(5);
-        let mut caches: Option<Vec<super::Qwen3_5LayerCache>> =
-            Some(vec![super::Qwen3_5LayerCache::new_full_attention()]);
+        let mut caches: Option<Vec<DummyCache>> = Some(vec![DummyCache]);
 
         save_cache_state_after_delta(
             /* reuse_cache */ true,
@@ -345,7 +350,7 @@ mod save_cache_state_after_delta_tests {
         let mut cached_history: Vec<u32> = vec![];
         let mut cached_image_key: Option<u64> = Some(42);
         let mut cached_rope_deltas: Option<i32> = None;
-        let mut caches: Option<Vec<super::Qwen3_5LayerCache>> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
 
         save_cache_state_after_delta(
             true,
@@ -371,8 +376,7 @@ mod save_cache_state_after_delta_tests {
         let mut cached_history: Vec<u32> = vec![1, 2, 3];
         let mut cached_image_key: Option<u64> = Some(0xabc);
         let mut cached_rope_deltas: Option<i32> = Some(7);
-        let mut caches: Option<Vec<super::Qwen3_5LayerCache>> =
-            Some(vec![super::Qwen3_5LayerCache::new_linear()]);
+        let mut caches: Option<Vec<DummyCache>> = Some(vec![DummyCache]);
 
         save_cache_state_after_delta(
             false,
@@ -398,7 +402,7 @@ mod save_cache_state_after_delta_tests {
         let mut cached_history: Vec<u32> = vec![];
         let mut cached_image_key: Option<u64> = None;
         let mut cached_rope_deltas: Option<i32> = None;
-        let mut caches: Option<Vec<super::Qwen3_5LayerCache>> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
 
         save_cache_state_after_delta(
             true,

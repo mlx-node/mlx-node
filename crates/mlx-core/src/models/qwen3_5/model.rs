@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::MxArray;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -35,8 +35,7 @@ use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
 use crate::engine;
 use crate::engine::{
-    apply_all_penalties, build_chatml_continue_delta_text, build_synthetic_user_message,
-    compute_image_cache_key, compute_performance_metrics, extract_chat_params,
+    apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
     finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::paddleocr_vl::processing::ProcessedImages;
@@ -7934,51 +7933,10 @@ impl ChatBackend for Qwen35Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
     }
 
-    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
-        // Legacy: `starts_in_thinking = enable_thinking.unwrap_or(true)`
-        // (template-honoring) + the explicit config budget only.
-        ThinkingSetup {
-            enabled: engine::resolve_enable_thinking(config).unwrap_or(true),
-            budget: config.thinking_token_budget,
-        }
-    }
-
-    fn render_continue_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        user_message: &str,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        // Match `vision_mtp_whole_turn_core`'s sanitization so the session path is
-        // subject to the same role/content injection protection as the
-        // fresh-prompt path.
-        let synthetic = build_synthetic_user_message(user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-        // Build the delta in ChatML wire format. See
-        // `engine::build_chatml_continue_delta_text` for the exact
-        // wire format and thinking-prefix semantics.
-        let enable_thinking = engine::resolve_enable_thinking(config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-        // `add_special_tokens: Some(false)` — we do NOT want the
-        // tokenizer auto-prepending BOS. The delta is already a raw
-        // ChatML snippet.
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
-    fn render_tool_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        tool_call_id: &str,
-        content: &str,
-        is_error: Option<bool>,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let enable_thinking = engine::resolve_enable_thinking(config);
-        let delta_text =
-            engine::build_chatml_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
-        tok.encode_sync(&delta_text, Some(false))
-    }
+    // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
+    // → `thinking_setup` resolves to the legacy
+    // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
+    //   budget: config.thinking_token_budget}`.
 
     fn cached_token_history(&self) -> &[u32] {
         &self.cached_token_history

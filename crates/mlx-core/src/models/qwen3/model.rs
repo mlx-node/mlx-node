@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -36,10 +36,7 @@ use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
-use crate::engine::{
-    self, IMAGE_CHANGE_RESTART_PREFIX, build_chatml_continue_delta_text,
-    build_chatml_tool_delta_text, build_synthetic_user_message,
-};
+use crate::engine::{self, IMAGE_CHANGE_RESTART_PREFIX};
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -3974,47 +3971,10 @@ impl ChatBackend for Qwen3Inner {
             .ok_or_else(|| napi::Error::from_reason("Tokenizer missing <|im_end|> special token"))
     }
 
-    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
-        // Legacy: `starts_in_thinking = enable_thinking.unwrap_or(true)`
-        // (template-honoring) + the explicit config budget only.
-        ThinkingSetup {
-            enabled: engine::resolve_enable_thinking(config).unwrap_or(true),
-            budget: config.thinking_token_budget,
-        }
-    }
-
-    fn render_continue_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        user_message: &str,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        // Subject the session path to the same sanitization as the
-        // legacy chat path.
-        let synthetic = build_synthetic_user_message(user_message);
-        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
-        let sanitized_user = &sanitized[0].content;
-        // Qwen3's chat template DOES inject `<think>\n` after the
-        // assistant opener by default — use `None`/`Some(true)` path to
-        // keep the delta template-equivalent.
-        let enable_thinking = engine::resolve_enable_thinking(config);
-        let delta_text = build_chatml_continue_delta_text(sanitized_user, enable_thinking);
-        tok.encode_sync(&delta_text, Some(false))
-    }
-
-    fn render_tool_delta(
-        &self,
-        tok: &Qwen3Tokenizer,
-        tool_call_id: &str,
-        content: &str,
-        is_error: Option<bool>,
-        config: &ChatConfig,
-    ) -> Result<Vec<u32>> {
-        let enable_thinking = engine::resolve_enable_thinking(config);
-        let delta_text =
-            build_chatml_tool_delta_text(tool_call_id, content, enable_thinking, is_error);
-        tok.encode_sync(&delta_text, Some(false))
-    }
+    // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
+    // → `thinking_setup` resolves to the legacy
+    // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
+    //   budget: config.thinking_token_budget}`.
 
     fn cached_token_history(&self) -> &[u32] {
         &self.cached_token_history

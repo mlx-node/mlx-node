@@ -9,14 +9,14 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
-    IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, apply_all_penalties,
+    IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, ThinkingPolicy, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
     default_thinking_budget_for_effort, finalize_chat_result, generated_capacity_hint,
     kv_capacity_round_up,
@@ -2224,18 +2224,17 @@ impl ChatBackend for Lfm2Inner {
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
     }
 
-    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
+    fn policy(&self) -> ThinkingPolicy {
         // LFM2's chat template ignores enable_thinking; the model ALWAYS
         // emits a <think>…</think> block, so reasoning is always tracked
         // AND parsed. reasoningEffort controls the thinking BUDGET, not
-        // whether. Explicit thinkingTokenBudget WINS; otherwise derive
-        // from reasoningEffort (== the deleted cores' `effective_budget`).
-        ThinkingSetup {
-            enabled: true,
-            budget: config
-                .thinking_token_budget
-                .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
-        }
+        // whether. `AlwaysOnBudgetFromEffort` resolves to
+        // `{enabled:true, budget: thinking_token_budget.or_else(||
+        //   default_thinking_budget_for_effort(reasoning_effort))}` —
+        // explicit thinkingTokenBudget WINS, else derive from
+        // reasoningEffort (footgun preserved: effort:"low" caps to 256
+        // but does NOT disable thinking).
+        ThinkingPolicy::AlwaysOnBudgetFromEffort
     }
 
     // `resolve_params`: engine default (`extract_chat_params`) == the

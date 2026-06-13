@@ -10,7 +10,7 @@ use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, StreamEmitter,
-    ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
@@ -4510,19 +4510,16 @@ impl ChatBackend for Gemma4Inner {
         self.turn_end_id()
     }
 
-    fn thinking_setup(&self, _config: &ChatConfig) -> ThinkingSetup {
+    fn policy(&self) -> engine::ThinkingPolicy {
         // Legacy gemma4 had NO think-budget machinery: its decode loops
         // never tracked reasoning tokens (`reasoning_tokens: 0` on every
-        // result) and never forced `</think>`. `enabled: false` keeps
-        // the engine's `ReasoningTracker` permanently outside a think
-        // block (0 reasoning tokens, never forces) — the reasoning
-        // SEGMENTATION still happens downstream in `parse_gemma4_output`
-        // / `Gemma4StreamParser`, which key on `<|channel>` markers, not
-        // the tracker.
-        ThinkingSetup {
-            enabled: false,
-            budget: None,
-        }
+        // result) and never forced `</think>`. `ThinkingPolicy::None`
+        // resolves to `{enabled:false, budget:None}`, keeping the
+        // engine's `ReasoningTracker` permanently outside a think block —
+        // the reasoning SEGMENTATION still happens downstream in
+        // `parse_gemma4_output` / `Gemma4StreamParser`, which key on
+        // `<|channel>` markers, not the tracker.
+        engine::ThinkingPolicy::None
     }
 
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {

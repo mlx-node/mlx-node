@@ -23,7 +23,9 @@ use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::finalize::finalize_chat_result;
-use crate::engine::params::{ChatParams, extract_chat_params, resolve_enable_thinking};
+use crate::engine::params::{
+    ChatParams, ThinkingPolicy, extract_chat_params, resolve_enable_thinking,
+};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::Stream;
@@ -66,6 +68,23 @@ pub(crate) trait DecodeStep {
     /// which skips the `tracing::info!` line entirely.
     fn trace_offset(&self) -> Option<i64> {
         None
+    }
+
+    /// Display label prefixing the throttled every-32-step decode trace
+    /// line (`"<name> decode AR step=..."`).
+    ///
+    /// De-leaks the literal the `decode_loop!` macro hardcoded as
+    /// `"Qwen3.5"`. The default keeps that exact string, so the trace
+    /// stays byte-identical for the only two steppers that emit it today
+    /// (qwen3_5 dense + qwen3_5_moe both return `Some` from
+    /// [`DecodeStep::trace_offset`] and inherit this default). Every
+    /// other family returns `None` from `trace_offset`, so the line
+    /// never fires and this value is never read. A future non-Qwen3.5
+    /// stepper that opts into the trace (returns `Some` offset) overrides
+    /// this to label its own lines. Diagnostics only — not a parity
+    /// surface.
+    fn trace_name(&self) -> &'static str {
+        "Qwen3.5"
     }
 
     /// Profiler relabel for the decode path actually taken (S5/S6 panel
@@ -502,6 +521,43 @@ pub(crate) struct WholeTurnArgs<'a> {
 /// Each method documents the existing per-family function it
 /// generalizes; S7+ migrations implement this trait on the family
 /// `*Inner` structs and delete the per-family copies.
+///
+/// # Implementer checklist (new family)
+///
+/// REQUIRED — no default body; a new family MUST implement all 13
+/// methods + the `Decode` associated type:
+///   * `tokenizer` — cloned handle or "not loaded" error
+///   * `family_name` — stable tag for profiler/errors (e.g. `"lfm2"`)
+///   * `session_eos_id` — session stop-token id
+///   * `thinking_setup` — resolve thinking-mode state from config
+///   * `render_continue_delta` — ChatML user continue-delta
+///   * `render_tool_delta` — tool-result delta
+///   * `cached_token_history` — committed session history slice
+///   * `reset_caches` — clear caches + session state (by `ResetScope`)
+///   * `verify_cache_prefix` — all-or-nothing reusable-prefix length
+///   * `save_cache_state` — persist post-turn state
+///   * `eval_caches` — force-materialize live caches (no-op if N/A)
+///   * `prefill` — chunked prefill → sampling-ready last-token logits
+///   * `begin_decode` — set up the turn's `Decode` stepper
+///   * `type Decode<'a>: DecodeStep` — the per-turn stepper type
+///
+/// OPTIONAL — defaulted hooks (override only to diverge from the
+/// qwen3_5/ChatML reference):
+///   - render/finalize: `render_prompt`, `resolve_params`,
+///     `finalize_turn`
+///   - capability probes: `has_paged_adapter`, `supports_images`,
+///     `has_live_session`, `session_holds_images`
+///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,
+///     `wired_limit_bytes`
+///   - streaming: `stream_skip_special_tokens`, `stream_emitter`,
+///     `stream_delta_prompt_tokens`, `text_delta_image_guard`
+///   - profiling/perf: `profiler_label`, `augment_performance`
+///   - whole-turn overrides (return `None` = run generic flow):
+///     `paged_turn`, `mtp_turn`, `vision_turn`
+///
+/// (The per-step `DecodeStep` seam — `forward`/`eval_step` required,
+/// `trace_offset`/`trace_name`/`profiler_relabel`/`end_decode`
+/// defaulted — is documented on that trait.)
 pub(crate) trait ChatBackend {
     /// Cloned tokenizer handle, or the family's "Tokenizer not loaded"
     /// error. == the `self.tokenizer.as_ref().ok_or_else(..)?.clone()`
@@ -525,11 +581,21 @@ pub(crate) trait ChatBackend {
     /// impl's single message. Error-path only; no TS code matches on it.
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32>;
 
-    /// Resolve the turn's thinking-mode state from config. == the
-    /// per-family `resolve_enable_thinking` /
-    /// `default_thinking_budget_for_effort` inlines (see
+    /// The family's declarative [`ThinkingPolicy`] (P1 3.1). Default =
+    /// [`ThinkingPolicy::TemplateHonoring`] (qwen3 / qwen3_5 /
+    /// qwen3_5_moe). gemma4 overrides to `None`; lfm2 to
+    /// `AlwaysOnBudgetFromEffort`.
+    fn policy(&self) -> ThinkingPolicy {
+        ThinkingPolicy::TemplateHonoring
+    }
+
+    /// Resolve the turn's thinking-mode state from config. Default =
+    /// [`crate::engine::params::resolve`] of [`Self::policy`]; this is the
+    /// byte-identical replacement for the pre-P1 per-family inlines (see
     /// [`ThinkingSetup`] field docs for the family-specific rules).
-    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup;
+    fn thinking_setup(&self, config: &ChatConfig) -> ThinkingSetup {
+        crate::engine::params::resolve(self.policy(), config)
+    }
 
     /// Resolve the turn's [`ChatParams`] — sampling configuration,
     /// penalties, budgets, reporting flags — from the request config
@@ -589,12 +655,29 @@ pub(crate) trait ChatBackend {
     /// `resolve_enable_thinking(&config)` (`chat_session_continue_sync`),
     /// which the S5 signature could not express. lfm2 ignores it (its
     /// template never injects the prefix).
+    ///
+    /// Default body == the ChatML pipeline the qwen3 / qwen3.5 /
+    /// qwen3.5-moe cores used verbatim: sanitize the synthetic user turn,
+    /// render via [`crate::engine::params::build_chatml_continue_delta_text`]
+    /// with the template-resolved thinking prefix, then `encode_sync`
+    /// without auto-prepending BOS. Families whose wire delta differs
+    /// (gemma4 turn-format; lfm2's hardcoded no-`<think>` prefix) override.
     fn render_continue_delta(
         &self,
         tok: &Qwen3Tokenizer,
         user_message: &str,
         config: &ChatConfig,
-    ) -> Result<Vec<u32>>;
+    ) -> Result<Vec<u32>> {
+        let synthetic = crate::engine::params::build_synthetic_user_message(user_message);
+        let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
+        let sanitized_user = &sanitized[0].content;
+        let enable_thinking = resolve_enable_thinking(config);
+        let delta_text = crate::engine::params::build_chatml_continue_delta_text(
+            sanitized_user,
+            enable_thinking,
+        );
+        tok.encode_sync(&delta_text, Some(false))
+    }
 
     /// Render + tokenize the tool-result delta. ==
     /// [`crate::engine::params::build_chatml_tool_delta_text`] +
@@ -604,6 +687,12 @@ pub(crate) trait ChatBackend {
     /// S6 trait fix: gained the `config` parameter for the same
     /// `resolve_enable_thinking` reason as
     /// [`ChatBackend::render_continue_delta`].
+    ///
+    /// Default body == the ChatML tool-delta pipeline the qwen3 / qwen3.5 /
+    /// qwen3.5-moe cores used verbatim:
+    /// [`crate::engine::params::build_chatml_tool_delta_text`] +
+    /// `encode_sync`. lfm2 overrides with its plain (no-`<tool_response>`)
+    /// delta; gemma4 with its turn-format delta.
     fn render_tool_delta(
         &self,
         tok: &Qwen3Tokenizer,
@@ -611,7 +700,16 @@ pub(crate) trait ChatBackend {
         content: &str,
         is_error: Option<bool>,
         config: &ChatConfig,
-    ) -> Result<Vec<u32>>;
+    ) -> Result<Vec<u32>> {
+        let enable_thinking = resolve_enable_thinking(config);
+        let delta_text = crate::engine::params::build_chatml_tool_delta_text(
+            tool_call_id,
+            content,
+            enable_thinking,
+            is_error,
+        );
+        tok.encode_sync(&delta_text, Some(false))
+    }
 
     /// The session's committed token history. == the
     /// `cached_token_history` field on every family `*Inner`.

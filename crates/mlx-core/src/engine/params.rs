@@ -185,6 +185,54 @@ pub(crate) fn default_thinking_budget_for_effort(reasoning_effort: Option<&str>)
     }
 }
 
+/// Declarative thinking-mode policy for one family (P1 3.1 "easy thinking
+/// budget"). [`resolve`] turns this + the request `ChatConfig` into the
+/// concrete [`crate::engine::backend::ThinkingSetup`] the engine feeds
+/// `ReasoningTracker::new`. Each variant is a 1:1 transcription of a
+/// pre-P1 per-family `thinking_setup()` body.
+pub(crate) enum ThinkingPolicy {
+    /// No think-budget machinery: tracker permanently outside a think
+    /// block (`enabled:false, budget:None`). == legacy gemma4.
+    None,
+    /// Honor the chat template's `enable_thinking` (default-on when
+    /// unset); budget = the explicit `thinking_token_budget` only. ==
+    /// legacy qwen3 / qwen3_5 / qwen3_5_moe. This is the DEFAULT policy.
+    TemplateHonoring,
+    /// Always inside a think block; explicit `thinking_token_budget`
+    /// wins, else derive from `reasoning_effort` via
+    /// [`default_thinking_budget_for_effort`]. == legacy lfm2 (whose
+    /// template ignores `enable_thinking`). Footgun preserved verbatim:
+    /// `reasoning_effort:"low"` caps the budget to 256 but does NOT
+    /// disable thinking (`enabled` stays `true`).
+    AlwaysOnBudgetFromEffort,
+}
+
+/// Resolve a [`ThinkingPolicy`] + request config into the concrete
+/// per-turn [`crate::engine::backend::ThinkingSetup`]. The bodies are
+/// byte-for-byte the pre-P1 per-family `thinking_setup()` impls.
+pub(crate) fn resolve(
+    policy: ThinkingPolicy,
+    config: &ChatConfig,
+) -> crate::engine::backend::ThinkingSetup {
+    use crate::engine::backend::ThinkingSetup;
+    match policy {
+        ThinkingPolicy::None => ThinkingSetup {
+            enabled: false,
+            budget: None,
+        },
+        ThinkingPolicy::TemplateHonoring => ThinkingSetup {
+            enabled: resolve_enable_thinking(config).unwrap_or(true),
+            budget: config.thinking_token_budget,
+        },
+        ThinkingPolicy::AlwaysOnBudgetFromEffort => ThinkingSetup {
+            enabled: true,
+            budget: config
+                .thinking_token_budget
+                .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
+        },
+    }
+}
+
 /// Resolve `include_reasoning` from config, with `reasoning_effort: "none"` default.
 pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
     config
