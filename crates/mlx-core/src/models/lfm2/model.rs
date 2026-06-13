@@ -9,8 +9,8 @@ use tracing::{info, warn};
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
@@ -18,8 +18,7 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHa
 use crate::engine::{
     IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, ThinkingPolicy, apply_all_penalties,
     build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
-    default_thinking_budget_for_effort, finalize_chat_result, generated_capacity_hint,
-    kv_capacity_round_up,
+    finalize_chat_result, generated_capacity_hint, kv_capacity_round_up,
 };
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -685,7 +684,7 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: &crate::engine::ChatParams,
-        reasoning_effort: Option<String>,
+        thinking: ThinkingSetup,
         report_perf: bool,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
@@ -699,15 +698,14 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // LFM2's chat template ignores enable_thinking; the model ALWAYS
         // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
+        // parsed. reasoningEffort controls the thinking BUDGET, not whether.
+        // The (enabled, budget) pair is resolved ONCE at turn entry from
+        // the family policy (AlwaysOnBudgetFromEffort) and threaded in as
+        // `thinking`; this core no longer recomputes it.
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
 
         // === Adapter lifecycle: warm continuation OR cold start. ===
         // See `PagedKVCacheAdapter::finalize_turn_keep_live` for why the
@@ -1645,7 +1643,7 @@ impl Lfm2Inner {
         think_end_str: Option<String>,
         include_reasoning: bool,
         p: &crate::engine::ChatParams,
-        reasoning_effort: Option<String>,
+        thinking: ThinkingSetup,
         report_perf: bool,
         eos_token_id: u32,
         cb: &StreamSender<'_>,
@@ -1661,15 +1659,14 @@ impl Lfm2Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        let thinking_enabled = true; // LFM2's chat template ignores enable_thinking; the model ALWAYS
+        // LFM2's chat template ignores enable_thinking; the model ALWAYS
         // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET (below), not whether.
-        // Explicit thinkingTokenBudget WINS; otherwise derive from reasoningEffort.
-        let effective_budget = p
-            .thinking_token_budget
-            .or_else(|| default_thinking_budget_for_effort(reasoning_effort.as_deref()));
-        let mut reasoning_tracker =
-            ReasoningTracker::new(thinking_enabled, effective_budget, think_end_id);
+        // parsed. reasoningEffort controls the thinking BUDGET, not whether.
+        // The (enabled, budget) pair is resolved ONCE at turn entry from
+        // the family policy (AlwaysOnBudgetFromEffort) and threaded in as
+        // `thinking`; this core no longer recomputes it.
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
 
         // Streaming decode state
         let mut decode_stream = tokenizer.inner().decode_stream(true);
@@ -2070,12 +2067,16 @@ impl Lfm2Inner {
     /// `include_reasoning`/`report_perf` from the resolved params
     /// (`extract_chat_params` resolves `include_reasoning` via the same
     /// `resolve_include_reasoning` the legacy dispatch called), and the
-    /// raw `config.reasoning_effort` for the thinking-budget derivation.
+    /// the resolved per-turn [`ThinkingSetup`] (`args.thinking`) for the
+    /// reasoning tracker.
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|st| st.to_string());
-        let reasoning_effort = args.config.reasoning_effort.clone();
+        // Resolved ONCE at turn entry (resolve(AlwaysOnBudgetFromEffort,
+        // config)); `ThinkingSetup` is `Copy` so it moves into whichever
+        // core arm fires without re-borrowing `args`.
+        let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
@@ -2086,7 +2087,7 @@ impl Lfm2Inner {
                     think_end_str,
                     args.params.include_reasoning,
                     args.params,
-                    reasoning_effort,
+                    thinking,
                     args.params.report_performance,
                     args.eos_id,
                     &cb,
@@ -2102,7 +2103,7 @@ impl Lfm2Inner {
                     think_end_str,
                     args.params.include_reasoning,
                     args.params,
-                    reasoning_effort,
+                    thinking,
                     args.params.report_performance,
                     args.eos_id,
                 )?;

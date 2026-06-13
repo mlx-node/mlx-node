@@ -515,6 +515,7 @@ fn chat_turn_core<B: ChatBackend>(
             eos_id,
             config: &config,
             params: &p,
+            thinking,
             is_delta,
             sink: streaming.as_ref().map(|s| s.sink),
             cancelled: streaming.as_ref().map(|s| s.cancelled),
@@ -640,8 +641,7 @@ fn chat_turn_core<B: ChatBackend>(
     profiler.set_prompt_tokens(prefill_tokens.len() as u32);
     profiler.snapshot_memory_before();
 
-    let mut reasoning_tracker =
-        ReasoningTracker::new(thinking.enabled, thinking.budget, think_end_id);
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
 
     // Stop set + streaming-order knob, resolved ONCE per turn (S5/S6
     // panel fixes — BLOCKING "EOS set" / "streaming EOS order").

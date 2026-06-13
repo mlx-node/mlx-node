@@ -131,7 +131,6 @@ pub(crate) struct ChatParams {
     pub sampling_config: Option<SamplingConfig>,
     pub report_performance: bool,
     pub reuse_cache: bool,
-    pub thinking_token_budget: Option<i32>,
     pub include_reasoning: bool,
     /// MTP: opt-in flag enabling the Multi-Token Prediction speculative
     /// decode loop. Effective only on the dense compiled path AND when
@@ -266,7 +265,6 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         }),
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
-        thinking_token_budget: config.thinking_token_budget,
         include_reasoning: resolve_include_reasoning(config),
         // MTP defaults OFF. When MTP is enabled and the caller does not
         // choose a depth, pin depth 1: current M5 Max measurements show

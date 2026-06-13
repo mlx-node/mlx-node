@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::MxArray;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -588,7 +588,10 @@ pub(crate) struct ChatDecodeInputs {
     pub tokenizer: Arc<Qwen3Tokenizer>,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
-    pub enable_thinking: Option<bool>,
+    /// Resolved thinking-mode state for the turn (P2 single source of
+    /// truth). Threaded from `WholeTurnArgs::thinking`; replaces the
+    /// inline `resolve_enable_thinking` the cores recomputed.
+    pub thinking: ThinkingSetup,
     /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
     /// is `config.eos_token_id`; for the session delta path it's
     /// `<|im_end|>` so cache boundaries stay clean.
@@ -1439,6 +1442,7 @@ impl Qwen35Inner {
         images: &[Vec<u8>],
         config: ChatConfig,
         eos_token_id: u32,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -1453,8 +1457,6 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-
-        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let p = extract_chat_params(&config);
         let max_new_tokens = p.max_new_tokens;
@@ -1477,7 +1479,14 @@ impl Qwen35Inner {
                      use_block_paged_cache=false (text-only turns continue to work).",
                 ));
             }
-            return self.paged_turn_sync_core(tokens, tokenizer, eos_token_id, p, report_perf);
+            return self.paged_turn_sync_core(
+                tokens,
+                tokenizer,
+                eos_token_id,
+                p,
+                report_perf,
+                thinking,
+            );
         }
 
         // Check if compiled path will be used
@@ -1769,7 +1778,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             profiler,
             generation_start,
@@ -1819,6 +1828,7 @@ impl Qwen35Inner {
         &mut self,
         delta_tokens: Vec<u32>,
         config: ChatConfig,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         // The delta path is a session-reuse operation by construction: it
         // prefills on top of the existing caches. `reuse_cache = Some(false)`
@@ -1877,7 +1887,6 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1897,6 +1906,7 @@ impl Qwen35Inner {
                 eos_id,
                 p,
                 report_perf,
+                thinking,
             );
         }
 
@@ -1986,7 +1996,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             profiler,
             generation_start,
@@ -2042,7 +2052,7 @@ impl Qwen35Inner {
             tokenizer,
             think_end_id,
             think_end_str,
-            enable_thinking,
+            thinking,
             eos_id,
             mut profiler,
             generation_start,
@@ -2110,11 +2120,7 @@ impl Qwen35Inner {
 
         let mut token_history: Vec<u32> = token_history_init;
 
-        let mut reasoning_tracker = engine::ReasoningTracker::new(
-            enable_thinking.unwrap_or(true),
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_compiled {
             if vlm_compiled_init_done {
@@ -2674,7 +2680,7 @@ impl Qwen35Inner {
             think_end_str.as_deref(),
             performance,
             p.include_reasoning,
-            enable_thinking.unwrap_or(true),
+            thinking.enabled,
             prompt_tokens_for_result,
             reasoning_tracker.reasoning_token_count(),
         )?;
@@ -2726,6 +2732,7 @@ impl Qwen35Inner {
         eos_token_id: u32,
         p: engine::ChatParams,
         report_perf: bool,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -2743,9 +2750,10 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker =
-            engine::ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+        // P2: thinking resolved ONCE at turn entry (was a hardcoded
+        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -3762,6 +3770,7 @@ impl Qwen35Inner {
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -3779,9 +3788,10 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let thinking_enabled = true;
-        let mut reasoning_tracker =
-            engine::ReasoningTracker::new(thinking_enabled, p.thinking_token_budget, think_end_id);
+        // P2: thinking resolved ONCE at turn entry (was a hardcoded
+        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -4481,6 +4491,7 @@ impl Qwen35Inner {
         config: ChatConfig,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -4510,7 +4521,6 @@ impl Qwen35Inner {
         full_token_history.extend(delta_tokens.iter().copied());
 
         let p = extract_chat_params(&config);
-        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -4545,6 +4555,7 @@ impl Qwen35Inner {
                 report_perf,
                 cb,
                 cancelled,
+                thinking,
             );
         }
 
@@ -4693,13 +4704,9 @@ impl Qwen35Inner {
             None
         };
 
-        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        let starts_in_thinking = thinking.enabled;
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::new(
-            starts_in_thinking,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_compiled {
             // Initialize compiled state from prefill — text-only path, no
@@ -5214,7 +5221,7 @@ impl Qwen35Inner {
         let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            enable_thinking.unwrap_or(true),
+            starts_in_thinking,
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -5250,7 +5257,7 @@ impl Qwen35Inner {
                 raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
-                    enable_thinking.unwrap_or(true),
+                    starts_in_thinking,
                     think_end_id,
                     think_end_str.as_deref(),
                     p.include_reasoning,
@@ -5283,6 +5290,7 @@ impl Qwen35Inner {
         eos_token_id: u32,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -5298,8 +5306,6 @@ impl Qwen35Inner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
-
-        let enable_thinking = engine::resolve_enable_thinking(&config);
 
         let p = engine::extract_chat_params(&config);
         let model_id = self.model_id;
@@ -5341,6 +5347,7 @@ impl Qwen35Inner {
                 report_perf,
                 cb,
                 cancelled,
+                thinking,
             );
         }
         if mtp_takes_dense_path && has_images {
@@ -5657,13 +5664,9 @@ impl Qwen35Inner {
             None
         };
 
-        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        let starts_in_thinking = thinking.enabled;
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::new(
-            starts_in_thinking,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_compiled {
             if vlm_compiled_init_done {
@@ -6220,7 +6223,7 @@ impl Qwen35Inner {
         let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &text,
             &generated_tokens,
-            enable_thinking.unwrap_or(true),
+            starts_in_thinking,
             think_end_id,
             think_end_str.as_deref(),
             p.include_reasoning,
@@ -6257,7 +6260,7 @@ impl Qwen35Inner {
                 raw_text: Some(engine::raw_text_with_reasoning_suppressed(
                     &text,
                     &generated_tokens,
-                    enable_thinking.unwrap_or(true),
+                    starts_in_thinking,
                     think_end_id,
                     think_end_str.as_deref(),
                     p.include_reasoning,
@@ -7711,13 +7714,20 @@ impl Qwen35Inner {
     /// probes run before any state mutation).
     fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let config = args.config.clone();
+        let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
                 if args.is_delta {
                     let delta_start = self.cached_token_history.len().min(args.tokens.len());
                     let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_stream_tokens_delta_sync_inner(delta_tokens, config, &cb, cancelled)?;
+                    self.chat_stream_tokens_delta_sync_inner(
+                        delta_tokens,
+                        config,
+                        &cb,
+                        cancelled,
+                        thinking,
+                    )?;
                 } else {
                     self.chat_stream_sync_inner(
                         args.tokens.to_vec(),
@@ -7726,6 +7736,7 @@ impl Qwen35Inner {
                         args.eos_id,
                         &cb,
                         cancelled,
+                        thinking,
                     )?;
                 }
                 Ok(TurnOutput::Streamed)
@@ -7734,13 +7745,14 @@ impl Qwen35Inner {
                 let result = if args.is_delta {
                     let delta_start = self.cached_token_history.len().min(args.tokens.len());
                     let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_tokens_delta_sync(delta_tokens, config)?
+                    self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
                 } else {
                     self.vision_mtp_whole_turn_core(
                         args.tokens.to_vec(),
                         args.images,
                         config,
                         args.eos_id,
+                        thinking,
                     )?
                 };
                 Ok(TurnOutput::Complete(Box::new(result)))
@@ -7761,6 +7773,7 @@ impl Qwen35Inner {
         let p = extract_chat_params(args.config);
         let report_perf = args.config.report_performance.unwrap_or(false);
         let tokenizer = args.tokenizer.clone();
+        let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
@@ -7772,6 +7785,7 @@ impl Qwen35Inner {
                     report_perf,
                     &cb,
                     cancelled,
+                    thinking,
                 )?;
                 Ok(TurnOutput::Streamed)
             }
@@ -7782,6 +7796,7 @@ impl Qwen35Inner {
                     args.eos_id,
                     p,
                     report_perf,
+                    thinking,
                 )?;
                 Ok(TurnOutput::Complete(Box::new(result)))
             }

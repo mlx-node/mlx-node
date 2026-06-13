@@ -16,8 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -553,6 +553,7 @@ impl Qwen3Inner {
         gen_start: Option<std::time::Instant>,
         report_perf: bool,
         reuse_cache: bool,
+        thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         let prompt_token_count = token_ids_vec.len() as f64;
         let max_new_tokens: i32 = gen_config.max_new_tokens.unwrap_or(2048);
@@ -790,8 +791,10 @@ impl Qwen3Inner {
         // Decode text + tool/thinking parsing (mirrors chat_sync_core).
         let raw_text_full = tokenizer.decode_sync(&generated_tokens, true)?;
         let include_reasoning = engine::resolve_include_reasoning(&config);
-        let enable_thinking = engine::resolve_enable_thinking(&config);
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        // P2 SSOT: use the engine-threaded ThinkingSetup (TemplateHonoring for
+        // qwen3 ⇒ byte-identical to the old `resolve_enable_thinking(&config)
+        // .unwrap_or(true)`).
+        let thinking_enabled = thinking.enabled;
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str();
         // Parse with reasoning INCLUDED so the reasoning-token count reflects the
@@ -1427,6 +1430,7 @@ impl Qwen3Inner {
         eos_token_id: u32,
         cb: &dyn ChunkSink,
         cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
     ) -> Result<()> {
         let tokenizer = self
             .tokenizer
@@ -1438,7 +1442,6 @@ impl Qwen3Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let enable_thinking = engine::resolve_enable_thinking(&config);
         let p = engine::extract_chat_params(&config);
         let reuse_cache = p.reuse_cache;
         let report_perf = p.report_performance;
@@ -1535,7 +1538,7 @@ impl Qwen3Inner {
             eos_token_id,
             think_end_id,
             think_end_str.as_deref(),
-            enable_thinking,
+            thinking,
             tokenizer_for_decode,
             cb,
             cancelled,
@@ -1582,7 +1585,7 @@ impl Qwen3Inner {
         eos_token_id: u32,
         think_end_id: Option<u32>,
         think_end_str: Option<&str>,
-        enable_thinking: Option<bool>,
+        thinking: ThinkingSetup,
         tokenizer_for_decode: Arc<Qwen3Tokenizer>,
         cb: &dyn ChunkSink,
         cancelled: &AtomicBool,
@@ -1635,13 +1638,13 @@ impl Qwen3Inner {
         let mut streamed_text_len: usize = 0;
         let mut token_history: Vec<u32> = token_ids_vec.to_vec();
 
-        let starts_in_thinking = enable_thinking.unwrap_or(true);
+        // P2 SSOT: build the tracker from the engine-threaded ThinkingSetup.
+        // `from_setup(&s, id) == new(s.enabled, s.budget, id)`, and for qwen3's
+        // TemplateHonoring policy `s.budget == p.thinking_token_budget` and
+        // `s.enabled == enable_thinking.unwrap_or(true)` ⇒ byte-identical.
+        let starts_in_thinking = thinking.enabled;
         let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::new(
-            starts_in_thinking,
-            p.thinking_token_budget,
-            think_end_id,
-        );
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         let max_new_tokens = p.max_new_tokens;
 
@@ -1793,7 +1796,10 @@ impl Qwen3Inner {
         }
 
         let num_tokens = generated_tokens.len() as u32;
-        let thinking_enabled = enable_thinking.unwrap_or(true);
+        // Read the param BEFORE `parse_thinking_and_tools` shadows `thinking`
+        // below. `thinking.enabled == enable_thinking.unwrap_or(true)` for
+        // qwen3's TemplateHonoring policy ⇒ byte-identical.
+        let thinking_enabled = thinking.enabled;
         let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
             &full_text,
             &generated_tokens,
@@ -3726,6 +3732,12 @@ impl Qwen3Inner {
     /// by construction.
     fn paged_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let config = args.config.clone();
+        // P2 SSOT: forward the engine-resolved ThinkingSetup into the paged
+        // cores instead of re-resolving `enable_thinking` inline (matches the
+        // qwen3_5 / qwen3_5_moe / lfm2 paged paths). For qwen3's default
+        // TemplateHonoring policy this is byte-identical to the old inline
+        // `resolve_enable_thinking(config).unwrap_or(true)`.
+        let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 self.paged_turn_stream_core(
@@ -3734,6 +3746,7 @@ impl Qwen3Inner {
                     args.eos_id,
                     sink,
                     cancelled,
+                    thinking,
                 )?;
                 Ok(TurnOutput::Streamed)
             }
@@ -3765,6 +3778,7 @@ impl Qwen3Inner {
                     gen_start,
                     report_perf,
                     reuse_cache,
+                    thinking,
                 )?;
                 Ok(TurnOutput::Complete(Box::new(result)))
             }

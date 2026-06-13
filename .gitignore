@@ -191,6 +191,8 @@ mlx-rs
 outputs
 test-output
 test-integration-output
+# T=0 byte-equivalence smoke capture artifacts (host-specific digests)
+/.t0-smoke
 Cargo.lock
 *.node
 /docs/superpowers/plans/*.md

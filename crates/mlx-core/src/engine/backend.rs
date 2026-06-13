@@ -327,8 +327,11 @@ pub(crate) struct FinalizeArgs<'a> {
 /// Resolved thinking-mode state for one turn.
 ///
 /// Produced by [`ChatBackend::thinking_setup`]; feeds
-/// `ReasoningTracker::new(enabled, budget, think_end_id)` at the call
-/// sites that currently inline the per-family resolution.
+/// `ReasoningTracker::from_setup(&setup, think_end_id)` at the call
+/// sites that currently inline the per-family resolution. `Copy` so it
+/// threads by value into [`WholeTurnArgs`] and the per-family
+/// whole-turn cores without clone churn.
+#[derive(Clone, Copy)]
 pub(crate) struct ThinkingSetup {
     /// Whether the turn starts inside a `<think>` block. Qwen3.5: the
     /// template injects `<think>\n` unless `resolve_enable_thinking`
@@ -504,6 +507,12 @@ pub(crate) struct WholeTurnArgs<'a> {
     pub eos_id: u32,
     pub config: &'a ChatConfig,
     pub params: &'a ChatParams,
+    /// Turn's resolved thinking-mode state (P2 single-source-of-truth):
+    /// `backend.thinking_setup(&config)` computed ONCE at turn entry. The
+    /// whole-turn overrides (paged/mtp/vision) build their
+    /// `ReasoningTracker` from this via `ReasoningTracker::from_setup`
+    /// instead of recomputing `resolve_enable_thinking` inline.
+    pub thinking: ThinkingSetup,
     /// Whether this is a session-delta continuation (text appended on
     /// top of live caches) rather than a fresh prefill.
     pub is_delta: bool,

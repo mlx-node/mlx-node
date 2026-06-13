@@ -77,6 +77,19 @@ impl ReasoningTracker {
         }
     }
 
+    /// Build a tracker from an already-resolved
+    /// [`crate::engine::backend::ThinkingSetup`] (P2 single source of
+    /// truth). Byte-identical to
+    /// `Self::new(setup.enabled, setup.budget, think_end_id)`; this is the
+    /// ONE construction point the whole-turn cores call so the per-family
+    /// inline `resolve_enable_thinking` sites disappear.
+    pub fn from_setup(
+        setup: &crate::engine::backend::ThinkingSetup,
+        think_end_id: Option<u32>,
+    ) -> Self {
+        Self::new(setup.enabled, setup.budget, think_end_id)
+    }
+
     /// Process a generated token. Returns whether this token is reasoning content.
     ///
     /// Call AFTER extracting the token ID from the GPU each decode step.
