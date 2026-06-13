@@ -4662,6 +4662,32 @@ impl ChatBackend for Gemma4Inner {
         if scope == ResetScope::PrefixMiss {
             self.init_caches_sync()?;
         }
+        // The EXPLICIT command reset must restore a fully cold state.
+        // gemma4's flat reset path (`reset_caches_sync`) never touches the
+        // paged adapter, so a prior turn's request stays live AND its full
+        // blocks stay content-addressed in the per-instance BlockAllocator's
+        // prefix cache. A reset-then-rerun of the same prompt would then take
+        // the prefix-hit suffix-prefill path (via `find_longest_cache_hit`
+        // inside `prepare_gemma4_paged_turn`) — a different bf16 reduction
+        // order than the cold full prefill, enough to flip a greedy near-tie
+        // (codex S12 finding on the lfm2 sibling; gemma4 shares the identical
+        // adapter lifecycle and ships paged ON by default).
+        // `release_request_and_purge_prefix_cache` releases the live request
+        // (the release gemma4's reset otherwise skips) AND purges every
+        // prefix-cache entry. The turn-internal `PrefixMiss` reset keeps the
+        // prefix cache (cross-request block reuse after a history miss is the
+        // paged design's entire point).
+        if scope == ResetScope::Command
+            && let Some(adapter) = self.paged_adapter.as_mut()
+        {
+            adapter
+                .release_request_and_purge_prefix_cache()
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "gemma4 reset_caches: paged prefix-cache purge failed: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 

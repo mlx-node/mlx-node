@@ -7232,7 +7232,36 @@ impl ChatBackend for Qwen35MoeInner {
             }
             // == the legacy `reset_caches_sync` (full clear including
             // history, image key, rope deltas, GDN checkpoints).
-            ResetScope::Command => self.reset_caches_sync(),
+            //
+            // The EXPLICIT command reset must additionally restore a
+            // fully COLD paged state. `reset_caches_sync` does not touch
+            // the paged adapter at all (it only clears the flat caches +
+            // reuse state), so the prior turn's full blocks stay
+            // content-addressed in the per-instance BlockAllocator's
+            // prefix cache. A reset-then-rerun of the same prompt would
+            // then take the prefix-hit 1-token-suffix prefill
+            // (`find_cached_prefix_per_block_with_max_tokens` ->
+            // `find_longest_cache_hit`) instead of the cold full prefill,
+            // a different bf16 reduction order that can flip a greedy
+            // near-tie (codex S12 finding on the lfm2 sibling;
+            // qwen3_5_moe shares the identical adapter lifecycle). One
+            // call both releases the live request and purges every
+            // prefix-cache entry. `ResetScope::PrefixMiss` (turn-internal)
+            // keeps the prefix cache: cross-request block reuse after a
+            // history miss is the paged design's entire point.
+            ResetScope::Command => {
+                self.reset_caches_sync()?;
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    adapter
+                        .release_request_and_purge_prefix_cache()
+                        .map_err(|e| {
+                            Error::from_reason(format!(
+                                "qwen3.5-moe reset_caches: paged prefix-cache purge failed: {e}"
+                            ))
+                        })?;
+                }
+                Ok(())
+            }
         }
     }
 

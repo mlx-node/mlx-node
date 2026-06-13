@@ -203,3 +203,88 @@ async fn gemma4_session_start_prefix_reuse_divergence_miss() {
         r2
     );
 }
+
+/// Explicit `reset_caches` (`ResetScope::Command`) must purge the paged
+/// adapter's content-addressed prefix cache, so a same-prompt rerun
+/// replays a COLD full-prompt prefill (`cached_tokens == 0`) rather than
+/// the prefix-hit 1-token-suffix prefill — whose different bf16 reduction
+/// order can flip a greedy near-tie. gemma4 ships paged ON by default
+/// (`use_block_paged_cache` defaults true), so the stock e2b checkpoint
+/// already exercises the paged path with no config forcing. WITHOUT the
+/// purge, turn 1's full blocks survive content-addressed and turn 2
+/// reports `cached_tokens > 0` (deterministic failure); WITH the purge
+/// they are gone and turn 2 cold-prefills (`cached_tokens == 0`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH pointing to a real Gemma4 checkpoint"]
+async fn gemma4_session_reset_purges_prefix_cache_cold_prefill() {
+    let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_GEMMA4_MODEL_PATH unset");
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_GEMMA4_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Gemma4Model::load(model_path.clone())
+        .await
+        .expect("failed to load Gemma4 model");
+
+    let prompt = "Say hi in one short word.";
+
+    // Turn 1: cold session start. Primes the prefix cache with this
+    // prompt's full blocks.
+    let r1 = model
+        .chat_session_start(vec![user_message(prompt)], Some(chat_config_default(32)))
+        .await
+        .expect("turn 1 chat_session_start failed");
+    assert_eq!(
+        r1.cached_tokens, 0,
+        "turn 1 should cold-start: cached_tokens={}",
+        r1.cached_tokens
+    );
+
+    // Explicit Command reset via the sync NAPI method. block_in_place:
+    // reset_caches blocks on blocking_recv, which panics on a tokio
+    // worker thread (see lfm2_session.rs + 8d5283a7 precedent).
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+
+    // Turn 2: rerun the IDENTICAL prompt as a fresh session start. The
+    // only way cached_tokens could be > 0 is a surviving prefix entry —
+    // exactly what the Command reset purges.
+    let r2 = model
+        .chat_session_start(vec![user_message(prompt)], Some(chat_config_default(32)))
+        .await
+        .expect("turn 2 chat_session_start after reset_caches failed");
+
+    // PRIMARY deterministic gate (independent of any bf16 near-tie).
+    assert_eq!(
+        r2.cached_tokens, 0,
+        "post-Command-reset same-prompt turn must cold-prefill (prefix cache \
+         purged), but cached_tokens={} (turn1 prompt_tokens={}, turn2 \
+         prompt_tokens={})",
+        r2.cached_tokens, r1.prompt_tokens, r2.prompt_tokens
+    );
+
+    // SECONDARY byte-equality proof that the cold output is reproduced
+    // (catches the actual greedy flip the divergence would cause).
+    assert_eq!(
+        r1.raw_text, r2.raw_text,
+        "reset+rerun did not reproduce turn-1 raw_text byte-for-byte: \
+         before={:?} after={:?}",
+        r1.raw_text, r2.raw_text
+    );
+    assert_eq!(
+        r1.text, r2.text,
+        "reset+rerun did not reproduce turn-1 text byte-for-byte: \
+         before={:?} after={:?}",
+        r1.text, r2.text
+    );
+    assert_eq!(
+        r1.num_tokens, r2.num_tokens,
+        "reset+rerun did not reproduce turn-1 num_tokens: before={} after={}",
+        r1.num_tokens, r2.num_tokens
+    );
+}

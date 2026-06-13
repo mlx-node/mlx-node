@@ -8003,7 +8003,32 @@ impl ChatBackend for Qwen35Inner {
             }
             // == the legacy `reset_caches_sync` (full clear including
             // history, image key, rope deltas, GDN checkpoints).
-            ResetScope::Command => self.reset_caches_sync(),
+            ResetScope::Command => {
+                self.reset_caches_sync()?;
+                // The EXPLICIT command reset must restore a fully cold
+                // state. `reset_caches_sync` clears the flat caches +
+                // reuse/GDN state but leaves the paged request's FULL
+                // blocks content-addressed in the per-instance
+                // BlockAllocator's prefix cache, so a reset-then-rerun of
+                // the same prompt would take the prefix-hit suffix-prefill
+                // path (`verify_cache_prefix_direct` > 0) — a different
+                // bf16 reduction order than the cold full prefill, enough
+                // to flip a greedy near-tie (codex S12 finding, observed
+                // on the lfm2 sibling: "says," vs "said" at token ~6;
+                // qwen3.5 shares the identical adapter lifecycle).
+                // Releasing the live request AND purging the prefix cache
+                // makes the next turn replay the cold prefill byte-for-byte.
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    adapter
+                        .release_request_and_purge_prefix_cache()
+                        .map_err(|e| {
+                            Error::from_reason(format!(
+                                "qwen3_5 reset_caches: paged prefix-cache purge failed: {e}"
+                            ))
+                        })?;
+                }
+                Ok(())
+            }
         }
     }
 
