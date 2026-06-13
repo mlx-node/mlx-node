@@ -178,6 +178,7 @@ do_capture() {
 
     # Bash-3.2 compatible: per-family scalar variables instead of associative array.
     local res_qwen3=UNKNOWN res_qwen3_5=UNKNOWN res_gemma4=UNKNOWN res_lfm2=UNKNOWN res_qwen3_5_moe=UNKNOWN
+    local res_qwen3_5_paged=UNKNOWN res_qwen3_5_moe_paged=UNKNOWN
 
     # --- qwen3 ---
     run_family qwen3 qwen3_smoke "$SMOKE_QWEN3_PATH" MLX_SMOKE_QWEN3_MODEL_PATH "$BASELINE_DIR" \
@@ -186,6 +187,10 @@ do_capture() {
     # --- qwen3_5 ---
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$BASELINE_DIR" \
         && res_qwen3_5=CAPTURED || res_qwen3_5=SKIPPED
+
+    # --- qwen3_5_paged (G1 byte gate: same checkpoint, paged forced) ---
+    run_family qwen3_5_paged qwen3_5_paged_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$BASELINE_DIR" \
+        && res_qwen3_5_paged=CAPTURED || res_qwen3_5_paged=SKIPPED
 
     # --- gemma4 ---
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$BASELINE_DIR" \
@@ -199,18 +204,24 @@ do_capture() {
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$BASELINE_DIR" \
         && res_qwen3_5_moe=CAPTURED || res_qwen3_5_moe=SKIPPED
 
+    # --- qwen3_5_moe_paged (G1 byte gate: same checkpoint, paged forced) ---
+    run_family qwen3_5_moe_paged qwen3_5_moe_paged_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$BASELINE_DIR" \
+        && res_qwen3_5_moe_paged=CAPTURED || res_qwen3_5_moe_paged=SKIPPED
+
     echo ""
     echo "=== capture summary ==="
     local any_skipped=0
-    for family in qwen3 qwen3_5 gemma4 lfm2 qwen3_5_moe; do
+    for family in qwen3 qwen3_5 qwen3_5_paged gemma4 lfm2 qwen3_5_moe qwen3_5_moe_paged; do
         local fam_status
         case "$family" in
-            qwen3)       fam_status="$res_qwen3" ;;
-            qwen3_5)     fam_status="$res_qwen3_5" ;;
-            gemma4)      fam_status="$res_gemma4" ;;
-            lfm2)        fam_status="$res_lfm2" ;;
-            qwen3_5_moe) fam_status="$res_qwen3_5_moe" ;;
-            *)           fam_status=UNKNOWN ;;
+            qwen3)              fam_status="$res_qwen3" ;;
+            qwen3_5)            fam_status="$res_qwen3_5" ;;
+            qwen3_5_paged)      fam_status="$res_qwen3_5_paged" ;;
+            gemma4)             fam_status="$res_gemma4" ;;
+            lfm2)               fam_status="$res_lfm2" ;;
+            qwen3_5_moe)        fam_status="$res_qwen3_5_moe" ;;
+            qwen3_5_moe_paged)  fam_status="$res_qwen3_5_moe_paged" ;;
+            *)                  fam_status=UNKNOWN ;;
         esac
         echo "  $fam_status  $family"
         [[ "$fam_status" == "SKIPPED" ]] && any_skipped=1
@@ -246,6 +257,7 @@ do_compare() {
 
     # Bash-3.2 compatible: per-family scalar variables instead of associative array.
     local rr_qwen3=UNKNOWN rr_qwen3_5=UNKNOWN rr_gemma4=UNKNOWN rr_lfm2=UNKNOWN rr_qwen3_5_moe=UNKNOWN
+    local rr_qwen3_5_paged=UNKNOWN rr_qwen3_5_moe_paged=UNKNOWN
 
     # Run all families into current/. run_family exits on hard errors;
     # return 1 only on MLX_SMOKE_ALLOW_SKIP soft-skip.
@@ -254,6 +266,9 @@ do_compare() {
 
     run_family qwen3_5 qwen3_5_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$CURRENT_DIR" \
         && rr_qwen3_5=RAN || rr_qwen3_5=SKIPPED
+
+    run_family qwen3_5_paged qwen3_5_paged_smoke "$SMOKE_QWEN35_PATH" MLX_SMOKE_QWEN35_MODEL_PATH "$CURRENT_DIR" \
+        && rr_qwen3_5_paged=RAN || rr_qwen3_5_paged=SKIPPED
 
     run_family gemma4 gemma4_smoke "$SMOKE_GEMMA4_PATH" MLX_SMOKE_GEMMA4_MODEL_PATH "$CURRENT_DIR" \
         && rr_gemma4=RAN || rr_gemma4=SKIPPED
@@ -264,18 +279,23 @@ do_compare() {
     run_family qwen3_5_moe qwen3_5_moe_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$CURRENT_DIR" \
         && rr_qwen3_5_moe=RAN || rr_qwen3_5_moe=SKIPPED
 
+    run_family qwen3_5_moe_paged qwen3_5_moe_paged_smoke "$SMOKE_QWEN35MOE_PATH" MLX_SMOKE_QWEN35MOE_MODEL_PATH "$CURRENT_DIR" \
+        && rr_qwen3_5_moe_paged=RAN || rr_qwen3_5_moe_paged=SKIPPED
+
     echo ""
     echo "=== compare summary ==="
     local any_failed=0
-    for family in qwen3 qwen3_5 gemma4 lfm2 qwen3_5_moe; do
+    for family in qwen3 qwen3_5 qwen3_5_paged gemma4 lfm2 qwen3_5_moe qwen3_5_moe_paged; do
         local run_status
         case "$family" in
-            qwen3)       run_status="$rr_qwen3" ;;
-            qwen3_5)     run_status="$rr_qwen3_5" ;;
-            gemma4)      run_status="$rr_gemma4" ;;
-            lfm2)        run_status="$rr_lfm2" ;;
-            qwen3_5_moe) run_status="$rr_qwen3_5_moe" ;;
-            *)           run_status=UNKNOWN ;;
+            qwen3)              run_status="$rr_qwen3" ;;
+            qwen3_5)            run_status="$rr_qwen3_5" ;;
+            qwen3_5_paged)      run_status="$rr_qwen3_5_paged" ;;
+            gemma4)             run_status="$rr_gemma4" ;;
+            lfm2)               run_status="$rr_lfm2" ;;
+            qwen3_5_moe)        run_status="$rr_qwen3_5_moe" ;;
+            qwen3_5_moe_paged)  run_status="$rr_qwen3_5_moe_paged" ;;
+            *)                  run_status=UNKNOWN ;;
         esac
 
         if [[ "$run_status" == "SKIPPED" ]]; then

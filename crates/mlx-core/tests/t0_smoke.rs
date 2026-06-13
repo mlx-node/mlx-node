@@ -32,7 +32,8 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::tokenizer::ChatMessage;
@@ -139,6 +140,67 @@ fn emit_digest(family: &str, turns: &[(usize, BTreeMap<&'static str, String>)]) 
             }
         }
     }
+}
+
+/// Clone a model dir with `use_block_paged_cache=true` patched into config.json
+/// so the default-FLAT families (qwen3_5, qwen3_5_moe) can be smoke-captured on
+/// their PAGED path. Weight files are symlinked (no disk blow-up); only
+/// config.json is copied + mutated. Returns the cloned dir under `target/`.
+///
+/// G1 (P4 paging-inversion byte gate): qwen3_5 + qwen3_5_moe default to FLAT
+/// (`use_block_paged_cache.unwrap_or(false)`), so the plain smoke gives the
+/// paged path P4 rewrites ZERO byte coverage. This forces the paged path so its
+/// T=0 digest can be captured pre-migration and diffed byte-for-byte after each
+/// inversion step. Mirrors the clone helper in `qwen3_5_paged_vs_flat_parity.rs`.
+fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let manifest = std::env::var("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
+            let mut p = PathBuf::from(manifest);
+            p.pop();
+            p.pop();
+            p.join("target")
+        });
+    let dst = workspace_target.join(format!("t0-smoke-paged-{pid}-{suffix}"));
+    if dst.exists() {
+        let _ = fs::remove_dir_all(&dst);
+    }
+    fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
+
+    // Symlink weight files; only config.json is copied + mutated. Avoids disk-OOM.
+    let read_dir = fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_file() {
+            if entry.file_name() == "config.json" {
+                fs::copy(&from, &to)
+                    .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+            } else {
+                std::os::unix::fs::symlink(&from, &to)
+                    .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
+            }
+        }
+    }
+
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path)
+        .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
+    cfg["paged_cache_memory_mb"] = serde_json::Value::from(512u32);
+    cfg["paged_block_size"] = serde_json::Value::from(16u32);
+    let pretty =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
+    fs::write(&cfg_path, pretty)
+        .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
+
+    Ok(dst)
 }
 
 // ---------------------------------------------------------------------------
@@ -464,4 +526,150 @@ async fn lfm2_smoke() {
         (3, result_digest(&r3)),
     ];
     emit_digest("lfm2", &turns);
+}
+
+// ---------------------------------------------------------------------------
+// qwen3_5 PAGED-FORCED (G1 byte gate)
+//
+// qwen3_5 defaults to FLAT, so `qwen3_5_smoke` above does NOT exercise the
+// paged whole-turn core that P4 inverts. This variant clones the checkpoint
+// with `use_block_paged_cache=true` and runs the SAME 3-turn T=0 session, so
+// its digest is a byte-for-byte baseline of today's paged output. After each
+// P4 inversion step the digest must reproduce byte-identical, AND it must equal
+// the flat `qwen3_5` digest (paged≡flat at T=0). Reuses MLX_SMOKE_QWEN35_MODEL_PATH.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_SMOKE_QWEN35_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
+async fn qwen3_5_paged_smoke() {
+    let Ok(model_path) = std::env::var("MLX_SMOKE_QWEN35_MODEL_PATH") else {
+        eprintln!(
+            "skipping qwen3_5_paged_smoke: MLX_SMOKE_QWEN35_MODEL_PATH unset \
+             (e.g. /Volumes/P4510/models/qwen3.5-0.8b-mlx-bf16)"
+        );
+        return;
+    };
+    let src = Path::new(&model_path);
+    if !src.exists() {
+        eprintln!("skipping qwen3_5_paged_smoke: {model_path} does not exist");
+        return;
+    }
+    let paged_dir = clone_model_dir_paged(src, "qwen35")
+        .unwrap_or_else(|e| panic!("clone_model_dir_paged failed: {e}"));
+
+    let model = mlx_core::models::qwen3_5::model::Qwen3_5Model::load(
+        paged_dir.to_string_lossy().to_string(),
+    )
+    .await
+    .expect("failed to load paged-forced Qwen3.5 model");
+
+    // Turn 1: session start
+    let r1 = model
+        .chat_session_start(
+            vec![user_message("What is the capital of France? One word.")],
+            Some(smoke_chat_config()),
+        )
+        .await
+        .expect("qwen3_5_paged turn 1 chat_session_start failed");
+    eprintln!("qwen3_5_paged turn1 text={:?}", r1.text);
+
+    // Turn 2: session continue
+    let r2 = model
+        .chat_session_continue(
+            "Name another European capital. One word.".to_string(),
+            None,
+            Some(smoke_chat_config()),
+        )
+        .await
+        .expect("qwen3_5_paged turn 2 chat_session_continue failed");
+    eprintln!("qwen3_5_paged turn2 text={:?}", r2.text);
+
+    // Turn 3: tool-result turn
+    let r3 = model
+        .chat_session_continue_tool(
+            "call_abc123".to_string(),
+            "The result of the lookup is: Rome".to_string(),
+            Some(smoke_chat_config()),
+            None,
+        )
+        .await
+        .expect("qwen3_5_paged turn 3 chat_session_continue_tool failed");
+    eprintln!("qwen3_5_paged turn3 text={:?}", r3.text);
+
+    let turns = vec![
+        (1, result_digest(&r1)),
+        (2, result_digest(&r2)),
+        (3, result_digest(&r3)),
+    ];
+    emit_digest("qwen3_5_paged", &turns);
+}
+
+// ---------------------------------------------------------------------------
+// qwen3_5_moe PAGED-FORCED (G1 byte gate) — see qwen3_5_paged_smoke rationale.
+// Reuses MLX_SMOKE_QWEN35MOE_MODEL_PATH.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_SMOKE_QWEN35MOE_MODEL_PATH pointing to a real Qwen3.5 MoE checkpoint"]
+async fn qwen3_5_moe_paged_smoke() {
+    let Ok(model_path) = std::env::var("MLX_SMOKE_QWEN35MOE_MODEL_PATH") else {
+        eprintln!(
+            "skipping qwen3_5_moe_paged_smoke: MLX_SMOKE_QWEN35MOE_MODEL_PATH unset \
+             (e.g. /Volumes/P4510/models/Qwen3.6-35b-a3b-UD-Q4_K_XL-mlx)"
+        );
+        return;
+    };
+    let src = Path::new(&model_path);
+    if !src.exists() {
+        eprintln!("skipping qwen3_5_moe_paged_smoke: {model_path} does not exist");
+        return;
+    }
+    let paged_dir = clone_model_dir_paged(src, "qwen35moe")
+        .unwrap_or_else(|e| panic!("clone_model_dir_paged failed: {e}"));
+
+    let model = mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel::load(
+        paged_dir.to_string_lossy().to_string(),
+    )
+    .await
+    .expect("failed to load paged-forced Qwen3.5 MoE model");
+
+    // Turn 1: session start
+    let r1 = model
+        .chat_session_start(
+            vec![user_message("What is the capital of France? One word.")],
+            Some(smoke_chat_config()),
+        )
+        .await
+        .expect("qwen3_5_moe_paged turn 1 chat_session_start failed");
+    eprintln!("qwen3_5_moe_paged turn1 text={:?}", r1.text);
+
+    // Turn 2: session continue
+    let r2 = model
+        .chat_session_continue(
+            "Name another European capital. One word.".to_string(),
+            None,
+            Some(smoke_chat_config()),
+        )
+        .await
+        .expect("qwen3_5_moe_paged turn 2 chat_session_continue failed");
+    eprintln!("qwen3_5_moe_paged turn2 text={:?}", r2.text);
+
+    // Turn 3: tool-result turn
+    let r3 = model
+        .chat_session_continue_tool(
+            "call_abc123".to_string(),
+            "The result of the lookup is: Rome".to_string(),
+            Some(smoke_chat_config()),
+            None,
+        )
+        .await
+        .expect("qwen3_5_moe_paged turn 3 chat_session_continue_tool failed");
+    eprintln!("qwen3_5_moe_paged turn3 text={:?}", r3.text);
+
+    let turns = vec![
+        (1, result_digest(&r1)),
+        (2, result_digest(&r2)),
+        (3, result_digest(&r3)),
+    ];
+    emit_digest("qwen3_5_moe_paged", &turns);
 }
