@@ -2821,14 +2821,22 @@ impl Qwen35Inner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // reads the PRE-turn live state, so probe the adapter immutably FIRST
+        // (prepare_turn mutates request_tokens via continue_turn/reset). The
+        // adapter re-reads the same state internally, so live_* matches what
+        // prepare_turn decides. extra_keys=&[] (uniform API) is bit-equal to the
+        // old per-block `&lookup_extra_keys` for text-only dispatch (all-empty
+        // per-block vec → identical hashes; see the block_size comment above).
+        // reuse_cache=true: the hand-rolled can_continue had no reuse term.
+        // Suffix blocks are allocated inside prepare_turn.
+        {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
                     "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
-
             live_ready = adapter.is_live_for_continue();
             let live_tokens = adapter.request_tokens();
             live_tokens_len = live_tokens.len();
@@ -2836,56 +2844,29 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
+        }
+        let plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "paged_turn_sync_core: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = plan.cached_prefix_len;
+        let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
@@ -3853,14 +3834,17 @@ impl Qwen35Inner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        let (cached_prefix_len, continued_live_prefix) = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // P3: adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
+        // the full byte-identity rationale: pre-turn immutable probe for the
+        // trace, extra_keys=&[] bit-equal to per-block for text-only,
+        // reuse_cache=true, suffix blocks allocated internally).
+        {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
                     "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
             })?;
-
             live_ready = adapter.is_live_for_continue();
             let live_tokens = adapter.request_tokens();
             live_tokens_len = live_tokens.len();
@@ -3868,56 +3852,29 @@ impl Qwen35Inner {
             if trace_enabled && live_ready && !live_prefix_match {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
-            let can_continue =
-                live_ready && live_prefix_match && live_tokens_len <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => (prior_token_count, true),
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_per_block_with_max_tokens(
-                                &tokens,
-                                &lookup_extra_keys,
-                                cache_salt,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        (cached, false)
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_per_block_with_max_tokens(
-                        &tokens,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                (cached, false)
-            }
-        };
+        }
+        let plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "paged_turn_stream_core: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = plan.cached_prefix_len;
+        let continued_live_prefix = plan.continued_live_prefix;
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \

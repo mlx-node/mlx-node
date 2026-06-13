@@ -725,65 +725,33 @@ impl Lfm2Inner {
         // chunk, so retries of an earlier identical turn never produce a
         // zero-delta prompt.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let cached_prefix_len = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // P3: adapter-owned warm-continue/cold-start lifecycle (gemma4 ships
+        // this exact call; byte-identical). NOTE: lfm2's hand-rolled
+        // `can_continue` had NO reuse_cache term, so pass LITERAL `true` —
+        // the adapter ANDs reuse_cache into its can_continue, and `true`
+        // preserves the original always-eligible warm predicate. Suffix
+        // blocks are allocated inside prepare_turn; do not re-allocate.
+        let cached_prefix_len = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
                 Error::from_reason(
                     "paged_turn_sync_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
-            })?;
-
-            let can_continue = adapter.is_live_for_continue()
-                && tokens.starts_with(adapter.request_tokens())
-                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_with_max_tokens(
-                                &tokens,
-                                &[],
-                                0,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        cached
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_with_max_tokens(
-                        &tokens,
-                        &[],
-                        0,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                cached
-            }
-        };
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                0,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?
+            .cached_prefix_len;
 
         // Reset conv-layer state for this turn. The paged path does not
         // carry conv prefix state across turns; each turn reprefills from
@@ -1681,65 +1649,30 @@ impl Lfm2Inner {
         let total_budget = tokens.len() as u32;
         // See `paged_turn_sync_core` for the vLLM-style cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let cached_prefix_len = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+        // P3: adapter-owned lifecycle (see paged_turn_sync_core). LITERAL
+        // `true` for reuse_cache — lfm2's hand-rolled can_continue had no
+        // reuse term; the adapter ANDs reuse_cache, so true preserves it.
+        let cached_prefix_len = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
                 Error::from_reason(
                     "paged_turn_stream_core: paged_adapter is None — caller must check \
                      use_block_paged_cache before dispatch",
                 )
-            })?;
-
-            let can_continue = adapter.is_live_for_continue()
-                && tokens.starts_with(adapter.request_tokens())
-                && adapter.request_tokens().len() <= max_cache_hit_tokens as usize;
-
-            if can_continue {
-                match adapter.continue_turn(&tokens, total_budget) {
-                    Ok((prior_token_count, _newly_alloc)) => prior_token_count,
-                    Err(_drift) => {
-                        let _ = adapter.release_request();
-                        adapter
-                            .reset_for_new_request(seq_id)
-                            .map_err(Error::from_reason)?;
-                        let prefix = adapter
-                            .find_cached_prefix_with_max_tokens(
-                                &tokens,
-                                &[],
-                                0,
-                                false,
-                                max_cache_hit_tokens,
-                            )
-                            .map_err(Error::from_reason)?;
-                        let cached = prefix.cached_token_count;
-                        adapter
-                            .allocate_suffix_blocks(total_budget)
-                            .map_err(Error::from_reason)?;
-                        cached
-                    }
-                }
-            } else {
-                if adapter.block_table().is_some() {
-                    let _ = adapter.release_request();
-                }
-                adapter
-                    .reset_for_new_request(seq_id)
-                    .map_err(Error::from_reason)?;
-                let prefix = adapter
-                    .find_cached_prefix_with_max_tokens(
-                        &tokens,
-                        &[],
-                        0,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)?;
-                let cached = prefix.cached_token_count;
-                adapter
-                    .allocate_suffix_blocks(total_budget)
-                    .map_err(Error::from_reason)?;
-                cached
-            }
-        };
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                &tokens,
+                total_budget,
+                true,
+                &[],
+                0,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?
+            .cached_prefix_len;
 
         // Reset conv-layer state for this turn (see paged_turn_sync_core
         // doc comment).
