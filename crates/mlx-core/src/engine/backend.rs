@@ -135,6 +135,84 @@ pub(crate) trait DecodeStep {
     fn end_decode(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Cache-maintenance cadence for one committed decode step (S6.5
+    /// paged seam). Called once per step at the END of the loop body,
+    /// replacing the hardcoded FLAT `(step+1)%256` clear so the paged
+    /// steppers can run their own cadence without forking the loop.
+    ///
+    /// Default == the FLAT every-256-step `synchronize_and_clear_cache`
+    /// (the body lifted verbatim from the
+    /// [`crate::engine::decode::run_decode_loop`] tail), so every
+    /// existing FLAT stepper is byte-identical. Paged steppers override
+    /// to `crate::array::maybe_clear_cache_for_paged_step(step)`.
+    fn maintain_cache(&mut self, step: i32) {
+        if (step + 1) % 256 == 0 {
+            crate::array::synchronize_and_clear_cache();
+        }
+    }
+
+    /// Whether ANY compiled C++ paged step has succeeded earlier in this
+    /// turn — the silent-eager-fallback latch consumed by
+    /// [`crate::engine::decode::should_propagate_compiled_paged_error`].
+    ///
+    /// Default `None`: the stepper has no compiled paged path (every
+    /// FLAT stepper, and pure-eager paged steppers like qwen3).
+    /// `Some(bool)` generalizes the per-family `cpp_compiled_step_completed`
+    /// struct field (lfm2/qwen3_5/qwen3_5_moe) so a compiled-paged
+    /// stepper's `forward` / `end_decode` can gate its
+    /// fall-back-vs-propagate decision through the shared helper.
+    ///
+    /// `#[allow(dead_code)]`: the trait-level seam ships in P4-1 (the
+    /// only `PagedBackend` impl so far, qwen3, is pure-eager and keeps
+    /// the `None` default); the consumption point is the compiled-paged
+    /// family migration (P4-2), which routes its `should_propagate_…`
+    /// decision through this hook instead of the per-family struct field.
+    #[allow(dead_code)]
+    fn compiled_step_completed(&self) -> Option<bool> {
+        None
+    }
+
+    /// Materialize the final committed token's K/V into the decode cache
+    /// on a LENGTH-budget exit (PAGED steppers only; default no-op).
+    ///
+    /// The shared [`crate::engine::decode::run_decode_loop`] gate
+    /// (`step_idx + 1 < max_new_tokens && !is_terminal`) skips the LAST
+    /// committed token's forward — the pipelined loop never needs that
+    /// token's logits (there is no next token to sample). On a FLAT
+    /// stepper the per-token KV write happens inside the SAME forward, so
+    /// skipping it costs nothing the next turn re-derives. But a PAGED
+    /// stepper records the token's K/V into its adapter at the TOP of
+    /// `forward` (`record_tokens` BEFORE the attention), so when that
+    /// final forward is skipped the adapter ends one token SHORTER than
+    /// the saved history — a warm-continue next turn would then have to
+    /// re-prefill that tail.
+    ///
+    /// On a length exit `run_paged_turn` calls this with
+    /// `generated_tokens.last()` to run exactly ONE more decode step that
+    /// RECORDS the final token's K/V and DISCARDS the produced logits (no
+    /// sample, no commit, no chunk). The adapter's `request_tokens()` /
+    /// cursor then equals the saved history, restoring exact
+    /// `cached_tokens` parity and exact-KV warm continuation.
+    ///
+    /// Research rationale (vLLM vs mlx-lm vs mlx-vlm): mlx-lm, mlx-vlm,
+    /// and origin/main `fba240b8` ALL run this extra forward on the final
+    /// token (discarding its output) so the last token's K/V is in the
+    /// cache; only vLLM leaves it one-short, a batched-throughput
+    /// optimization not adopted for this single-stream engine. So this
+    /// hook MATERIALIZES, matching the three MLX references.
+    ///
+    /// LENGTH exits ONLY: an EOS / cancel / repetition stop's final
+    /// committed token is a boundary marker the next delta re-renders
+    /// (`save_paged_history` drops it), and `fba240b8` broke before its
+    /// forward on those too — so the engine never calls this for them.
+    ///
+    /// Default no-op (`Ok(())`): FLAT steppers (whose KV write rides the
+    /// in-forward path) and any future paged stepper that materializes
+    /// the tail inline. Only `Qwen3PagedDecode` overrides it today.
+    fn materialize_final(&mut self, _token_id: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Streaming-chunk sink driven by the generic decode loop.
@@ -453,6 +531,51 @@ pub(crate) struct TurnSetup<'a> {
     /// compiled decode position from the LIVE attention KV offset"
     /// comment in `models/lfm2/model.rs`).
     pub total_seq_len: usize,
+}
+
+/// Turn-constant inputs for [`PagedBackend::begin_paged_decode`].
+///
+/// The paged analog of [`TurnSetup`]. The paged decode stepper reaches
+/// its per-token logical-position cursor source through `&mut self`; the
+/// effective cached-prefix / suffix lengths come from
+/// [`PagedBackend::PrefixState`], NOT from here.
+///
+/// `#[allow(dead_code)]`: qwen3 (the only `PagedBackend` impl in P4-1)
+/// is pure-eager and ignores every field — its decode cursor comes from
+/// the adapter. The compiled-paged families read `params` /
+/// `cached_prefix_len` for their C++ KV-budget init at the P4-2
+/// migration (mirroring how [`TurnSetup`]'s fields are read only by the
+/// compiled families today).
+#[allow(dead_code)]
+pub(crate) struct PagedTurnSetup<'a> {
+    /// The turn's resolved [`ChatParams`] — `params.max_new_tokens` is
+    /// the decode budget (the paged path grows blocks lazily via
+    /// per-token `record_tokens`, so this is informational for eager
+    /// families and the compiled-init KV budget for hybrid ones).
+    pub params: &'a ChatParams,
+    /// Session-delta continuation flag (M-RoPE / saved-offset decisions
+    /// on the hybrid families; ignored by pure-KV qwen3).
+    pub is_delta: bool,
+    /// Effective cached-prefix length the prefix prime resolved (block-
+    /// granular). Hybrid compiled-init reads it; qwen3 ignores it (its
+    /// decode cursor comes from `adapter.current_token_count()`).
+    pub cached_prefix_len: usize,
+}
+
+/// Effective prefix/suffix split a [`PagedBackend::prime_prefix_state`]
+/// resolved for one turn.
+///
+/// The engine reads the EFFECTIVE lengths from this trait — NEVER the
+/// input plan's `cached_prefix_len`, because a family (gemma4) may zero
+/// the plan's cached_len mid-prepare. qwen3 is the trivial case but the
+/// contract must hold from P4-1.
+pub(crate) trait PagedPrefix {
+    /// Effective cached-prefix length (block-granular). The fresh suffix
+    /// the engine prefills is `tokens[effective_cached_prefix_len..]`.
+    fn effective_cached_prefix_len(&self) -> usize;
+    /// Length of the fresh suffix prefilled this turn (the vLLM cap
+    /// guarantees `>= 1`).
+    fn suffix_len(&self) -> usize;
 }
 
 /// Outcome of a whole-turn override ([`ChatBackend::paged_turn`] /
@@ -1135,4 +1258,196 @@ pub(crate) trait ChatBackend {
     fn vision_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         None
     }
+}
+
+/// Sub-trait of [`ChatBackend`] for families whose PAGED whole-turn
+/// flows through the generic
+/// [`crate::engine::paged_turn::run_paged_turn`] instead of a forked
+/// per-family core.
+///
+/// Split out of [`ChatBackend`] deliberately: the GAT
+/// (`type PagedDecode<'a>`) and the [`Self::PrefixState`] assoc type
+/// have no stable trait-level default, so folding them into the base
+/// trait would force every family to migrate in one commit. A family
+/// opts in by implementing this trait and rewriting its
+/// `ChatBackend::paged_turn` body to `Some(run_paged_turn(self, args))`;
+/// unmigrated families keep their forked core untouched.
+///
+/// `run_paged_turn` MIRRORS the FLAT engine tail
+/// ([`crate::engine::session`] `chat_turn_core`) and reuses the shared
+/// [`crate::engine::decode::run_decode_loop`] — the GAT stepper owning
+/// `&mut self` dissolves the `&mut paged_adapter` + `&layers`
+/// double-borrow that forced the per-family inlined paged loops.
+pub(crate) trait PagedBackend: ChatBackend {
+    /// Per-step paged decode stepper. Borrows `&mut self` for the whole
+    /// decode loop (the analog of [`ChatBackend::Decode`]). For compiled-
+    /// paged families the lifecycle guards (lifecycle mutex, weight-read
+    /// guard, reset guard) live as STRUCT FIELDS of the concrete stepper
+    /// — declaration order == teardown order — and
+    /// [`DecodeStep::compiled_step_completed`] returns the
+    /// silent-eager-fallback latch. Pure-eager families (qwen3) carry
+    /// only borrowed refs.
+    type PagedDecode<'a>: DecodeStep
+    where
+        Self: 'a;
+
+    /// Per-turn prefix-priming state, returned by
+    /// [`Self::prime_prefix_state`] and read back by
+    /// [`Self::paged_prefill`]. Carries the EFFECTIVE cached-prefix /
+    /// suffix lengths the adapter resolved — the engine reads these via
+    /// the [`PagedPrefix`] bound, NEVER the input plan's
+    /// `cached_prefix_len`.
+    type PrefixState: PagedPrefix;
+
+    /// Prime the paged KV-cache adapter for this turn and return the
+    /// effective prefix/suffix split.
+    ///
+    /// == the `prepare_turn_with_max_cache_hit_tokens` block at the head
+    /// of every forked paged core. This is the side-effecting step that
+    /// runs the adapter's warm-continue / cold-reset arms and allocates
+    /// suffix blocks. The implementation MUST derive
+    /// `total_budget`/`max_cache_hit_tokens` itself (`plan.len()` and
+    /// `len()-1`) and surface the resolved lengths in [`Self::PrefixState`].
+    ///
+    /// `reuse_cache` is the engine's delta-forced reuse flag (`true` on
+    /// delta turns, else `params.reuse_cache`) — threaded into the
+    /// adapter prepare call. `block_size` / `extra_keys` / `cache_salt`
+    /// thread the VLM per-block image keys (qwen3 ignores `block_size`,
+    /// passes `&[]`, `0`).
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        reuse_cache: bool,
+        block_size: usize,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState>;
+
+    /// Prefill the fresh suffix and return the last-token logits
+    /// `[vocab]`.
+    ///
+    /// == the forked cores' `run_paged_prefill_chunk(suffix, prefix_len,
+    /// ..)` + last-token projection. MAY eval its input (compiled-paged
+    /// needs the concrete suffix); eager qwen3 does not. The engine fires
+    /// the post-prefill `synchronize_and_clear_cache` AFTER this returns
+    /// (it is NOT this method's job).
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        stream: Stream,
+    ) -> Result<MxArray>;
+
+    /// Build the per-step paged decode stepper (the analog of
+    /// [`ChatBackend::begin_decode`]). Captures the turn constants
+    /// (`num_layers`, the dummy positions array, the compiled-paged
+    /// guards) into the returned stepper, which then drives
+    /// [`crate::engine::decode::run_decode_loop`].
+    fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>>;
+
+    /// Post-turn adapter lifecycle, run by the engine AFTER the decode
+    /// scope drops the stepper and BEFORE [`Self::save_paged_history`].
+    ///
+    /// == the `match forward_result { Ok => finalize_keep_live |
+    /// register+release, Err => release }` block in the forked cores. The
+    /// engine passes the turn's (delta-forced) `reuse_cache`; the impl
+    /// owns the `(extra_keys, cache_salt)` it registers with (qwen3:
+    /// `(&[], 0)`). Infallible — the forked cores `let _ =` every
+    /// lifecycle call (a teardown failure must not mask the turn result).
+    fn finalize_paged_turn(&mut self, reuse_cache: bool);
+
+    /// Persist the session's token history for the next turn's delta
+    /// (paged analog of [`ChatBackend::save_cache_state`]).
+    ///
+    /// The paged adapter's pool owns the K/V across turns, so this writes
+    /// ONLY the token history (+ image key reset) — NEVER the FLAT
+    /// `cached_kv_keys`/`cached_kv_values`/`cached_cache_idx`, which the
+    /// paged path never fills.
+    ///
+    /// `keep_all` is the load-bearing alignment signal, computed by the
+    /// engine IDENTICALLY to the FLAT `save_cache_state`: KEEP-ALL iff the
+    /// turn hit the length budget (`finish_reason == "length"`),
+    /// DROP-LAST on any other stop. In every non-length case the final
+    /// committed token IS the boundary marker (`<|im_end|>` / cutoff) the
+    /// next delta re-renders itself, so dropping it keeps the persisted
+    /// history equal to what the FLAT path would persist. The engine
+    /// reconciles the adapter's `request_tokens()` to this same trimmed
+    /// history via [`Self::reconcile_paged_request_tokens`] BEFORE the
+    /// finalize, so the saved history and the live KV stay aligned for the
+    /// next turn's warm-continue.
+    ///
+    /// When `reuse_cache` is false the impl clears the history (+ image
+    /// key); the forked cores' `else { clear }` arm.
+    fn save_paged_history(
+        &mut self,
+        save_tokens: &[u32],
+        generated: &[u32],
+        keep_all: bool,
+        reuse_cache: bool,
+    );
+
+    /// Perf-parity warm-continue reconcile (default no-op).
+    ///
+    /// Roll the paged adapter's recorded `request_tokens()` back to match
+    /// the to-be-saved history length, so the next turn's warm-continue
+    /// gate (`prompt.starts_with(request_tokens())`) is not defeated by a
+    /// trailing stop token. The generic [`crate::engine::decode::run_decode_loop`]
+    /// forwards the just-committed token at the loop TOP — and the paged
+    /// decode step records it into the adapter BEFORE that forward — so on
+    /// an early stop below budget the adapter holds the stop token even
+    /// though the saved history (DROP-LAST) does not. The legacy forked
+    /// paged cores recorded at the loop BOTTOM (after the stop-check) and
+    /// so never recorded the stop token; this hook restores that adapter
+    /// state for the pipelined loop.
+    ///
+    /// Called by the engine ONLY on the `reuse_cache` path and BEFORE
+    /// [`Self::finalize_paged_turn`] (registration must see the corrected
+    /// token set). The impl computes the to-be-saved history length from
+    /// `(prompt_len, generated, keep_all)` — the SAME trim
+    /// [`Self::save_paged_history`] applies — and rolls the adapter back by
+    /// `request_tokens().len() - (prompt_len + history_len)` when that is
+    /// positive (no-op otherwise: on a length exit
+    /// [`DecodeStep::materialize_final`] already recorded the final
+    /// token's K/V, so the adapter EQUALS the kept history — no surplus —
+    /// and on a stop that landed at the final step the stop token's
+    /// forward never ran, so nothing was over-recorded).
+    ///
+    /// # Return — reconcile success (Codex #3 contract fix)
+    ///
+    /// `true` = reconciled (or a no-op — surplus was 0, nothing to roll
+    /// back); `false` = the rollback FAILED and the adapter is left
+    /// OVER-RECORDED relative to the to-be-saved history. The engine
+    /// finalizes a `false` turn with `reuse_cache = false`
+    /// (`release_request`, NOT `finalize_turn_keep_live`) so it never
+    /// keeps-live an unreconciled / over-recorded request — only the
+    /// next turn's warm-continue is forfeited (a cold prefill), the turn
+    /// result is never masked. The default (no-op) and the surplus-0
+    /// no-op both return `true`.
+    ///
+    /// NOTE: the `false` path is UNREACHABLE in practice — `surplus =
+    /// request_tokens().len().saturating_sub(prompt_len + history_len)`
+    /// is `<= request_tokens().len()`, so the underlying
+    /// `rollback_last_tokens(surplus)` can never get `n > len` (its only
+    /// `Err`). This is therefore a DEFENSIVE contract: the bool makes a
+    /// future rollback failure release-not-keep-live instead of silently
+    /// keeping an over-recorded request live.
+    ///
+    /// Default: no-op returning `true` (the family pays a cold prefill
+    /// after an early stop until it opts in). qwen3 overrides it.
+    fn reconcile_paged_request_tokens(
+        &mut self,
+        _prompt_len: usize,
+        _generated: &[u32],
+        _keep_all: bool,
+    ) -> bool {
+        true
+    }
+
+    /// Error-path teardown — releases the live paged request when a turn aborts
+    /// mid-prefill/decode. == the legacy forked cores' `Err(e) => release_request()` arm
+    /// ("release fully — partial block_table state is unsafe to keep"). Infallible
+    /// (`let _ =` the result; a teardown failure must not mask the turn's real error).
+    /// Distinct from finalize_paged_turn (the SUCCESS lifecycle): abort does ONLY the
+    /// release — never register_full_blocks_for_reuse / finalize_turn_keep_live.
+    fn abort_paged_turn(&mut self);
 }

@@ -196,12 +196,17 @@ pub(crate) struct StreamingCtx<'s, 't> {
 ///
 /// Everything else is preserved: pipelined next-graph build, budget
 /// forcing via [`ReasoningTracker`], [`apply_all_penalties`],
-/// `sampling::sample`, EOS + `check_repetition_cutoff` stops,
-/// every-256-step `synchronize_and_clear_cache`, profiler
+/// `sampling::sample`, EOS + `check_repetition_cutoff` stops, profiler
 /// begin/end/mark/step calls, the `MLX_MTP_TRACE_LOGITS` diagnostic
 /// block, and the streaming sub-block (cancellation,
 /// `step_decode_stream` incremental detokenization with error recovery,
 /// `is_reasoning` tagging).
+///
+///   * (d) the per-step cache-maintenance cadence is routed through
+///     [`DecodeStep::maintain_cache`] — the default reproduces the
+///     macro's every-256-step `synchronize_and_clear_cache`
+///     byte-for-byte; paged steppers override to their own cadence
+///     (`maybe_clear_cache_for_paged_step`).
 pub(crate) fn run_decode_loop<S: DecodeStep>(
     step: &mut S,
     args: DecodeLoopArgs<'_>,
@@ -225,7 +230,101 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
     } = args;
 
     for step_idx in 0..max_new_tokens {
-        let next_y = if step_idx + 1 < max_new_tokens {
+        // vLLM-aligned penalty context (Codex HIGH #1). Materialize and
+        // extract the CURRENT token, then push it to `token_history`
+        // HERE — at the loop TOP, BEFORE the next_y block samples the
+        // next token. vLLM appends each sampled token to the live output
+        // list AFTER that step's sample but BEFORE the next step's
+        // penalty (gpu_model_runner.py:3691 -> sampler.py:408 ->
+        // model_executor/layers/utils.py apply_penalties), so a token is
+        // never in its OWN penalty but always in the NEXT one. The
+        // S-migration ported origin/main FLAT verbatim, which pushed at
+        // the loop BOTTOM — leaving the just-emitted token OUT of the
+        // penalty context for the next sample (a 1-token lag). Pushing
+        // here closes that lag (identity at default penalties:
+        // repetition=1.0/presence=0.0/frequency=0.0, so every existing
+        // parity/default test stays byte-identical).
+        profiler.begin("eval_token");
+        y.eval();
+        profiler.end();
+
+        profiler.begin("extract");
+        let token_id = y.item_at_int32(0)? as u32;
+        profiler.end();
+        token_history.push(token_id);
+        // `generated_tokens` (the OUTPUT stream) is pushed HERE too — at
+        // the loop TOP, before the terminal checks — so the
+        // repetition-cutoff check below sees the CURRENT token BEFORE the
+        // forward decides whether to run. The forward block does NOT read
+        // `generated_tokens`, so moving this up is safe. (Matches the
+        // legacy paged loop, which pushed both histories at the top.)
+        generated_tokens.push(token_id);
+
+        // Cache-maintenance cadence runs EVERY committed step, here at the
+        // loop TOP — including terminal/length-exit steps that break
+        // before the forward. This restores the legacy paged loop's
+        // top-of-iteration clear (the prior bottom-of-loop placement
+        // SKIPPED the clear on the terminal/final step). The default
+        // `maintain_cache` is the FLAT every-256-step
+        // `synchronize_and_clear_cache` (byte-identical for every FLAT
+        // stepper — a cache clear changes timing, not values, and the
+        // 256-cadence keys off `step_idx`, unchanged); paged steppers
+        // override to their own cadence (`maybe_clear_cache_for_paged_step`).
+        step.maintain_cache(step_idx);
+
+        // Compute the terminal flags BEFORE the forward (restores the
+        // legacy paged "terminal-before-forward" ordering). A terminal
+        // current token must NOT trigger the next (fallible) paged decode
+        // forward: under pool pressure that forward can return Err and
+        // abort a turn the legacy loop cleanly stopped, and it
+        // over-records the stop token into the paged adapter.
+        //
+        // Stop-set membership: session EOS or any extra family stop id
+        // (S5/S6 panel fix — BLOCKING "EOS set"; the set is computed
+        // once per turn by the caller, not per step).
+        let stops_at_eos = token_id == eos_id || extra_eos_ids.contains(&token_id);
+        // Cancellation snapshot read ONCE at the iteration top and used
+        // BOTH to gate the forward (feeds `is_terminal` below) AND for the
+        // streaming emit-block cancel-break further down. This matches
+        // origin/main's legacy paged loop, which took a single cancel check
+        // at the iteration top — before its emit and before its
+        // bottom-of-loop forward. Reusing the same snapshot for the emit
+        // break (rather than re-reading fresh after this loop's forward)
+        // keeps the break on the SAME iteration as origin/main; see the
+        // emit block for the one-token-divergence proof.
+        let cancelled = streaming
+            .as_ref()
+            .map(|s| s.cancelled.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        // Repetition-cutoff result computed once (same args as the legacy
+        // check); the returned reason is reused by the break below.
+        let repetition = crate::sampling::check_repetition_cutoff(
+            generated_tokens,
+            p.max_consecutive_tokens,
+            p.max_ngram_repeats,
+            p.ngram_size,
+        );
+        let is_terminal = stops_at_eos || cancelled || repetition.is_some();
+
+        // Finding 2 (accepted, NO code change): this loop builds the next
+        // forward HERE — before the streaming emit block further down —
+        // whereas origin/main `fba240b8`'s paged loop emitted the current
+        // token THEN ran its forward at the loop bottom. The divergence is
+        // accepted on two grounds. (1) Correctness: on a forward `Err` the
+        // current token's chunk is dropped instead of emitted — but a
+        // paged-decode forward only fails OOM-class, on a turn that is
+        // already aborting (the error propagates and `run_paged_turn`
+        // releases the request), so the dropped chunk belongs to a turn no
+        // consumer completes. (2) No added latency: the forward is
+        // async-scheduled (non-blocking — `eval_step` schedules, the next
+        // iteration's loop-top `y.eval()` forces it), and the emit only
+        // detokenizes the ALREADY-known current token, so emitting after
+        // the scheduling call adds no wall time. This ordering is what
+        // encodes the vLLM-aligned penalty context (current token pushed
+        // before the next sample) and the cancel-snapshot parity (the
+        // pre-forward `cancelled` read reused by the emit break) — see the
+        // emit block's one-token-divergence proof.
+        let next_y = if step_idx + 1 < max_new_tokens && !is_terminal {
             let _stream_ctx = StreamContext::new(generation_stream);
 
             profiler.begin("forward");
@@ -257,9 +356,10 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             // Diagnostic — `MLX_MTP_TRACE_LOGITS=1` per-token AR top-2
             // logit trace. `logits` is the post-penalty single-token
             // decode forward that PREDICTS the token at position
-            // `token_history.len() + 1` (the current `y` sits at
-            // `token_history.len()`). `budget_forced` skips the real
-            // logits, so only trace the sampled path.
+            // `token_history.len()` (the current `y` was pushed at the
+            // loop top for the vLLM-aligned penalty context, so it now
+            // sits at `token_history.len() - 1`). `budget_forced` skips
+            // the real logits, so only trace the sampled path.
             if !budget_forced && mtp_trace_logits() {
                 let logits_1d = if logits.ndim()? == 2 {
                     logits.squeeze(Some(&[0]))?
@@ -275,7 +375,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                             "MTP_TRACE_LOGITS source=AR pos={} token_id={} \
                              top1_id={} top1_logit={:.6} top2_id={} \
                              top2_logit={:.6} gap={:.6}",
-                            token_history.len() + 1,
+                            token_history.len(),
                             predicted,
                             t2.top1_id,
                             t2.top1_logit,
@@ -287,7 +387,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                     Err(e) => {
                         eprintln!(
                             "MTP_TRACE_LOGITS source=AR pos={} ERROR {}",
-                            token_history.len() + 1,
+                            token_history.len(),
                             e.reason,
                         );
                     }
@@ -299,20 +399,22 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             None
         };
 
-        profiler.begin("eval_token");
-        y.eval();
-        profiler.end();
-
-        profiler.begin("extract");
-        let token_id = y.item_at_int32(0)? as u32;
-        profiler.end();
+        // TTFT marker stays at its ORIGINAL position (it does not use
+        // `token_id`): the current token's `y.eval()` + extract +
+        // `token_history.push` moved to the loop TOP (vLLM penalty
+        // alignment, see the comment there), but the first-token timing
+        // must remain byte-identical, so it is NOT moved.
         profiler.mark_first_token();
         if report_perf && first_token_instant.is_none() {
             *first_token_instant = Some(Instant::now());
         }
 
-        generated_tokens.push(token_id);
-        token_history.push(token_id);
+        // `token_history.push` / `generated_tokens.push` already happened
+        // at the loop TOP. The reasoning observation stays HERE — it must
+        // still run AFTER the next_y block's `should_force_think_end()`
+        // check (goal-3.1 budget-forcing timing); `should_force_think_end`
+        // is a non-consuming peek, so skipping it on a terminal step (no
+        // forward) is safe.
         let is_reasoning = reasoning_tracker.observe_token(token_id);
 
         // Throttled per-step decode trace (AR / single-token loop).
@@ -333,12 +435,9 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             );
         }
 
-        // Stop-set membership: session EOS or any extra family stop id
-        // (S5/S6 panel fix — BLOCKING "EOS set"; the set is computed
-        // once per turn by the caller, not per step).
-        let stops_at_eos = token_id == eos_id || extra_eos_ids.contains(&token_id);
-
         // Streaming-only block (the macro's optional repetition group).
+        // Uses the PRECOMPUTED terminal flags so the emit ordering and
+        // finish_reason strings are byte-identical to before.
         if let Some(s) = streaming.as_mut() {
             *s.last_is_reasoning = is_reasoning;
 
@@ -351,7 +450,21 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 break;
             }
 
-            if s.cancelled.load(Ordering::Relaxed) {
+            // Reuse the pre-forward `cancelled` snapshot here — do NOT
+            // re-read fresh. origin/main's legacy paged streaming pushes the
+            // token to `generated_tokens`, checks cancellation at the
+            // iteration TOP, emits, and runs its decode forward LAST; the
+            // post-loop residual flush then re-streams
+            // `decode(generated_tokens)[streamed_text_len..]`, so the TOTAL
+            // streamed text equals `decode(generated_tokens)`. A fresh
+            // re-read here (after this loop's forward, which is gated to run
+            // BEFORE the emit) would break one iteration EARLIER than
+            // origin/main, dropping the post-forward token from
+            // `generated_tokens` — diverging by exactly one token in BOTH the
+            // streamed text and (on a `reuse_cache` cancelled turn) the saved
+            // history. Reusing the snapshot keeps the break on the same
+            // iteration as origin/main.
+            if cancelled {
                 *finish_reason = String::from("cancelled");
                 break;
             }
@@ -378,12 +491,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             break;
         }
 
-        if let Some(reason) = crate::sampling::check_repetition_cutoff(
-            generated_tokens,
-            p.max_consecutive_tokens,
-            p.max_ngram_repeats,
-            p.ngram_size,
-        ) {
+        if let Some(reason) = repetition {
             *finish_reason = reason.to_string();
             break;
         }
@@ -394,10 +502,6 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         }
 
         profiler.step();
-
-        if (step_idx + 1) % 256 == 0 {
-            crate::array::synchronize_and_clear_cache();
-        }
     }
 
     profiler.snapshot_memory_after();
@@ -497,6 +601,38 @@ mod run_decode_loop_tests {
                 logits.eval();
             }
             self.eval_calls += 1;
+        }
+    }
+
+    /// Tie stepper for the vLLM-penalty-alignment regression. Every
+    /// `forward` returns the SAME `[1, vocab]` logits with two near-tied
+    /// entries: `high_id` slightly above `low_id` (everything else 0).
+    /// Pre-penalty the argmax is `high_id`; once `high_id` is in the
+    /// repetition-penalty context its positive logit is divided down
+    /// below `low_id`, flipping the argmax to `low_id`. Whether that flip
+    /// happens at the FIRST decode sample is exactly the loop-order
+    /// question the test pins.
+    struct TieStep {
+        vocab: i64,
+        high_id: u32,
+        high_logit: f32,
+        low_id: u32,
+        low_logit: f32,
+    }
+
+    impl DecodeStep for TieStep {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            let mut v = vec![0.0f32; self.vocab as usize];
+            v[self.high_id as usize] = self.high_logit;
+            v[self.low_id as usize] = self.low_logit;
+            Ok((MxArray::from_float32(&v, &[1, self.vocab])?, false))
+        }
+
+        fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+            MxArray::async_eval_arrays(&[next_token]);
+            if budget_forced {
+                logits.eval();
+            }
         }
     }
 
@@ -855,6 +991,181 @@ mod run_decode_loop_tests {
         assert_eq!(sent_len, streamed_text_len);
     }
 
+    /// Stepper that flips a shared cancellation flag DURING a forward —
+    /// i.e. AFTER the loop's pre-forward cancellation snapshot is taken
+    /// (decode.rs ~:290) but BEFORE the streaming emit-check runs. Used to
+    /// pin origin/main streaming-cancel parity: the emit block must REUSE
+    /// the pre-forward snapshot (NOT re-read fresh), so a cancel that lands
+    /// during this iteration's forward is acted on at the NEXT iteration's
+    /// top — exactly like origin/main's legacy paged loop, whose single
+    /// cancel check ran at the iteration top with its forward LAST.
+    ///
+    /// `forward` argmax-scripts like `MockStep`; on the
+    /// `flip_on_forward`-th forward call (1-indexed) it stores `true`
+    /// into `cancel` BEFORE returning the logits, so the cancel becomes
+    /// visible only after that step's forward — exactly the
+    /// "cancel arrives during the forward" race.
+    struct CancelDuringForwardStep<'a> {
+        script: Vec<u32>,
+        vocab: i64,
+        forward_calls: usize,
+        cancel: &'a AtomicBool,
+        flip_on_forward: usize,
+    }
+
+    impl DecodeStep for CancelDuringForwardStep<'_> {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            let idx = self.forward_calls.min(self.script.len().saturating_sub(1));
+            self.forward_calls += 1;
+            // Flip the shared cancel flag mid-forward (after the loop's
+            // pre-forward snapshot, before the emit-check). The
+            // 1-indexed Nth forward corresponds to step_idx N-1.
+            if self.forward_calls == self.flip_on_forward {
+                self.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let target = self.script[idx] as usize;
+            let mut v = vec![0.0f32; self.vocab as usize];
+            v[target] = 10.0;
+            Ok((MxArray::from_float32(&v, &[1, self.vocab])?, false))
+        }
+
+        fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+            MxArray::async_eval_arrays(&[next_token]);
+            if budget_forced {
+                logits.eval();
+            }
+        }
+    }
+
+    /// Streaming-cancellation origin/main-parity lock — PASSES ONLY WITH
+    /// THE SNAPSHOT-REUSE FIX, FAILS on a fresh re-read. The emit block
+    /// reuses the pre-forward `cancelled` snapshot, so a cancel arriving
+    /// DURING a forward suppresses the NEXT step's emit (this step's token
+    /// was already committed and is still streamed), matching origin/main's
+    /// legacy paged loop, whose single cancel check ran at the iteration
+    /// top with its forward LAST and whose post-loop residual re-streams
+    /// `decode(generated_tokens)`.
+    ///
+    /// Timeline (prefill seed id 1; script 3,4; eos id 5 never hit;
+    /// `flip_on_forward = 2` → cancel flips during step_idx 1's forward).
+    /// step_idx 0 commits 1, snapshot=false → forward #1 (→ 3), emits
+    /// "t1". step_idx 1 commits 3, snapshot=false (cancel not yet set) →
+    /// forward #2 flips cancel=true (→ 4); the emit-check reuses that
+    /// false snapshot → emits " c3" and continues. step_idx 2 commits 4,
+    /// its snapshot now reads true → `is_terminal` skips the forward and
+    /// the emit-check breaks "cancelled" WITHOUT emitting token 4
+    /// per-token. Emitted == ["t1", " c3"]; `generated_tokens` == [1,3,4]
+    /// (token 4 IS committed — origin/main's residual would re-stream it).
+    ///
+    /// A FRESH re-read (the reverted bug) would instead read true inside
+    /// step_idx 1's emit-check, breaking there with emitted == ["t1"] and
+    /// `generated_tokens` == [1,3] — one token short of origin/main in
+    /// BOTH the stream and the committed set. Both variants finish
+    /// "cancelled". Deterministic (T=0 argmax, no early EOS/repetition,
+    /// thinking disabled so no suppression).
+    #[test]
+    fn streaming_cancel_during_forward_emits_current_token_then_breaks_next_step_matching_main() {
+        const EOS: u32 = 5; // not in the committed sequence
+        let params = greedy_params(|_| {});
+        // Thinking disabled: every emitted token flows through (no
+        // reasoning suppression confounds the emitted set).
+        let mut tracker = ReasoningTracker::new(false, None, None);
+
+        // ONE atomic, shared by both the stepper (which flips it) and the
+        // StreamingCtx (which the loop reads). Two shared &AtomicBool
+        // borrows of the same atomic are fine; store-through-& is allowed.
+        let cancelled = AtomicBool::new(false);
+        let mut step = CancelDuringForwardStep {
+            script: vec![3, 4],
+            vocab: 7,
+            forward_calls: 0,
+            cancel: &cancelled,
+            // Flip during the 2nd forward == step_idx 1's forward.
+            flip_on_forward: 2,
+        };
+
+        let tokenizer = tiny_tokenizer();
+        let mut decode_stream = tokenizer.decode_stream(true);
+        let sink = RecSink {
+            chunks: Mutex::new(Vec::new()),
+        };
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = false;
+        let mut emitter = DefaultStreamEmitter;
+
+        // Prefill seed id 1 ("t1").
+        let y = MxArray::from_int32(&[1], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
+        let mut profiler = DecodeProfiler::new("test", "mock");
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        run_decode_loop(
+            &mut step,
+            DecodeLoopArgs {
+                y,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 10,
+                eos_id: EOS,
+                extra_eos_ids: &[],
+                eos_before_emit: false,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream,
+            },
+            Some(StreamingCtx {
+                callback: &sink,
+                cancelled: &cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: &tokenizer,
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(finish_reason, "cancelled");
+
+        let chunks = sink
+            .chunks
+            .lock()
+            .unwrap_or_else(|e| panic!("sink poisoned: {e}"));
+        let sent: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        // FIXED behavior (snapshot reuse): step_idx 1's token (" c3") is
+        // committed BEFORE its forward and emitted because the pre-forward
+        // snapshot was still false; the loop then breaks at step_idx 2
+        // (whose snapshot reads true) so token 4 is NOT emitted per-token.
+        // A fresh re-read (the reverted bug) would break inside step_idx 1
+        // with emitted == ["t1"] — one token short of origin/main.
+        assert_eq!(
+            sent,
+            vec!["t1", " c3"],
+            "snapshot reuse must keep the cancel break on the SAME iteration as \
+             origin/main: the step_idx 1 token (committed pre-forward) is still \
+             streamed; a fresh re-read would drop it"
+        );
+        drop(chunks);
+        // origin/main token count: token 4 (the post-forward commit the
+        // fresh re-read would have dropped) IS in `generated_tokens`, so the
+        // post-loop residual flush would re-stream it — the observable
+        // total-streamed-text contract.
+        assert_eq!(
+            generated_tokens,
+            vec![1, 3, 4],
+            "the post-forward token (4) must be committed (origin/main count); the \
+             fresh re-read would have produced [1, 3]"
+        );
+    }
+
     // ---- S6.5 panel-fix seams ----
 
     /// Drive `run_decode_loop` in streaming mode with a caller-supplied
@@ -1111,6 +1422,94 @@ mod run_decode_loop_tests {
         // session core's post-loop responsibilities).
         assert!(emitter.residuals.is_empty());
         assert_eq!(emitter.finished, 0);
+    }
+
+    /// vLLM penalty-alignment regression (Codex HIGH #1) — PASSES ONLY
+    /// WITH THE FIX. The just-emitted token must be in the penalty
+    /// context when sampling the NEXT token (vLLM appends each sampled
+    /// token to the live output list BEFORE the next step's penalty:
+    /// gpu_model_runner.py:3691 -> sampler.py:408 -> apply_penalties).
+    ///
+    /// Setup: the prefill seed `y == HIGH` (HIGH is NOT in the prompt —
+    /// the `drive` helper starts with an EMPTY token_history). Every
+    /// decode `forward` returns a near-tie `HIGH=10.0`, `LOW=8.0`. With
+    /// `repetition_penalty = 2.0`, the FIXED loop pushes HIGH into
+    /// token_history at the loop TOP, so the step-0 `apply_all_penalties`
+    /// divides HIGH's logit (10.0 -> 5.0) and LOW (8.0, un-penalized)
+    /// wins -> the 2nd committed token is LOW.
+    ///
+    /// The PRE-FIX (lagged) loop pushed at the loop BOTTOM, so at the
+    /// step-0 sample token_history was still EMPTY -> no penalty applied
+    /// -> HIGH (10.0 > 8.0) wins -> the 2nd token would be HIGH. The
+    /// single assertion (`generated[1] == LOW`) therefore distinguishes
+    /// the two loop orderings. Deterministic (T=0 argmax).
+    #[test]
+    fn just_emitted_token_is_in_next_penalty_context_vllm_aligned() {
+        const HIGH: u32 = 4; // prefill seed + pre-penalty argmax
+        const LOW: u32 = 9; // wins once HIGH is penalized
+        const EOS: u32 = 1; // distinct from HIGH/LOW; never sampled
+
+        // repetition_penalty 2.0 (the only non-default penalty); cutoffs
+        // OFF so the constant near-tie can't trip them. budget 2 so the
+        // loop commits exactly [HIGH, LOW] then stops on the pipelined
+        // None.
+        let params = greedy_params(|cfg| {
+            cfg.repetition_penalty = Some(2.0);
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = TieStep {
+            vocab: 16,
+            high_id: HIGH,
+            high_logit: 10.0,
+            low_id: LOW,
+            low_logit: 8.0,
+        };
+
+        let y =
+            MxArray::from_int32(&[HIGH as i32], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
+        let mut profiler = DecodeProfiler::new("test", "mock");
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        run_decode_loop(
+            &mut step,
+            DecodeLoopArgs {
+                y,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 2,
+                eos_id: EOS,
+                extra_eos_ids: &[],
+                eos_before_emit: false,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream,
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        // Step 0 commits the prefill seed HIGH; the THE FIX makes step 1
+        // commit LOW (HIGH penalized out of the running). Pre-fix this
+        // would be [HIGH, HIGH].
+        assert_eq!(
+            generated_tokens,
+            vec![HIGH, LOW],
+            "the just-emitted HIGH must be in the next sample's penalty context \
+             (vLLM-aligned): with repetition_penalty it is divided down and LOW wins; \
+             the pre-fix lagged loop left HIGH out of context, so HIGH would repeat"
+        );
+        // token_history stays in lockstep with the output stream.
+        assert_eq!(token_history, generated_tokens);
     }
 }
 

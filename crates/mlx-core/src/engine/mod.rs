@@ -13,6 +13,7 @@ pub(crate) mod compiled_lock;
 pub(crate) mod decode;
 pub(crate) mod finalize;
 pub(crate) mod napi_glue;
+pub(crate) mod paged_turn;
 pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;

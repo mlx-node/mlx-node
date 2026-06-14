@@ -7,7 +7,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
@@ -16,8 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -29,7 +28,6 @@ use crate::sampling::{
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::tools;
 use crate::training_model::ModelType;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{KVCache, TransformerBlock};
@@ -491,554 +489,6 @@ impl Qwen3Inner {
         Ok(())
     }
 
-    /// Block-paged sync whole-turn core, reached via the engine's
-    /// [`ChatBackend::paged_turn`] probe whenever the `paged_adapter` is
-    /// configured (qwen3's default). Body unchanged from the pre-S7
-    /// `chat_sync_core` paged dispatch.
-    ///
-    /// Mirrors the legacy flat core's control flow (penalty stack, decode loop,
-    /// EOS / repetition cutoff, performance timing, generation-output
-    /// post-processing) but threads through `forward_paged_adapter` instead
-    /// of `forward_fused`. The flat-path `cached_*` history fields are NOT
-    /// touched — the adapter owns its own block-paged prefix cache via
-    /// `BlockAllocator::register_prefix` / `find_longest_cache_hit`.
-    ///
-    /// Per-turn lifecycle:
-    ///
-    /// 1. Choose between **cold start** and **warm continuation**:
-    ///    - Cold start (first turn, or after reset_caches /
-    ///      image-change): `reset_for_new_request(seq_id)` →
-    ///      `find_cached_prefix(prompt_tokens, &[], 0, false)` →
-    ///      `allocate_suffix_blocks(total_tokens)`. The first looks up
-    ///      the longest matching prefix in the shared `BlockAllocator`'s
-    ///      prefix cache and pre-populates the block_table; the second
-    ///      allocates fresh blocks for the suffix beyond the cached
-    ///      prefix.
-    ///    - Warm continuation (turn 2+ within the same session, when the
-    ///      prior turn ended via `finalize_turn_keep_live`):
-    ///      `continue_turn(prompt_tokens, total_budget)`. Validates the
-    ///      new prompt extends the live recorded tokens, allocates any
-    ///      additional blocks, and clears the registration flag so the
-    ///      end-of-turn finalize runs. CRITICAL: this path keeps the
-    ///      partial trailing block from the prior turn LIVE in the pool
-    ///      so the new turn does NOT re-prefill it — the BF16 reduction
-    ///      order in parallel prefill differs from sequential decode and
-    ///      re-prefilling that span flips the argmax. See
-    ///      `PagedKVCacheAdapter::finalize_turn_keep_live` for full
-    ///      discussion.
-    /// 2. Prefill: for each layer, run `forward_paged_adapter` with
-    ///    `is_prefill = true` and `cached_prefix_len`. The forward writes
-    ///    the suffix K/V through `update_keys_values` and runs causal
-    ///    SDPA over (read_kv_range cached prefix + new suffix).
-    /// 3. Decode loop: per generated token, run `forward_paged_adapter`
-    ///    with `is_prefill = false`. The adapter's `gather_kv_for_decode`
-    ///    pulls historical K/V via the block table.
-    /// 4. End of turn (success): `finalize_turn_keep_live` publishes the
-    ///    request's full blocks to the prefix cache for cross-session
-    ///    reuse and KEEPS the request live so the next turn's
-    ///    `continue_turn` can resume on top of it.
-    /// 5. Session end / explicit reset / error: `release_request`
-    ///    decrefs every block in the table.
-    ///
-    /// Note: tests assert non-empty / valid-token output via shape checks,
-    /// not exact-token equivalence to the flat path.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_sync_core(
-        &mut self,
-        token_ids_vec: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        config: ChatConfig,
-        eos_token_id: u32,
-        gen_config: GenerationConfig,
-        gen_start: Option<std::time::Instant>,
-        report_perf: bool,
-        reuse_cache: bool,
-        thinking: ThinkingSetup,
-    ) -> Result<ChatResult> {
-        let prompt_token_count = token_ids_vec.len() as f64;
-        let max_new_tokens: i32 = gen_config.max_new_tokens.unwrap_or(2048);
-        let temperature: f64 = gen_config.temperature.unwrap_or(0.7);
-        let top_k: i32 = gen_config.top_k.unwrap_or(0);
-        let top_p: f64 = gen_config.top_p.unwrap_or(0.9);
-        let min_p: f64 = gen_config.min_p.unwrap_or(0.0);
-        let repetition_penalty: f64 = gen_config.repetition_penalty.unwrap_or(1.0);
-        let repetition_context_size: i32 = gen_config.repetition_context_size.unwrap_or(256);
-        let presence_penalty: f64 = gen_config.presence_penalty.unwrap_or(0.0);
-        let presence_context_size: i32 = gen_config.presence_context_size.unwrap_or(20);
-        let frequency_penalty: f64 = gen_config.frequency_penalty.unwrap_or(0.0);
-        let frequency_context_size: i32 = gen_config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens: i32 = gen_config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats: i32 = gen_config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size: i32 = gen_config.ngram_size.unwrap_or(64);
-        let return_logprobs = gen_config.return_logprobs.unwrap_or(false);
-
-        let sampling_config = SamplingConfig {
-            temperature: Some(temperature),
-            top_k: Some(top_k),
-            top_p: Some(top_p),
-            min_p: Some(min_p),
-        };
-
-        // Per-turn seq_id: a monotonic counter would be safer, but the
-        // adapter is single-request and `reset_for_new_request` makes the
-        // previous seq_id irrelevant. Reuse 0 — caller-supplied seq_ids
-        // are NOT exposed at the chat API level.
-        let seq_id: u32 = 0;
-
-        let num_layers = self.layers.len();
-
-        // === Adapter lifecycle: warm continuation OR cold start. ===
-        //
-        // When the adapter holds a live, finalized turn whose recorded
-        // tokens are a strict prefix of the new prompt, take the warm
-        // `continue_turn` path. This preserves the partial trailing
-        // block's K/V across turns, eliminating the cross-turn BF16
-        // re-prefill divergence (see `finalize_turn_keep_live` doc).
-        //
-        // Otherwise (cold start, prompt drift, or first turn) fall back
-        // to the original `reset → find_cached_prefix → allocate` flow.
-        //
-        // Lazy decode allocation: pass the prompt length only. The decode
-        // loop's per-token `record_tokens` calls grow the block table on
-        // demand, so we no longer pre-reserve `max_new_tokens` blocks
-        // (which used to blow out the pool when callers passed
-        // max_tokens=128000 even though actual generation rarely
-        // exceeded ~10K tokens).
-        let total_budget = token_ids_vec.len() as u32;
-        // vLLM-style exact-prefix cap: leave at least one prompt token to
-        // prefill so the decoder always has something to consume. Without
-        // this cap the live cache or the shared block cache can cover every
-        // prompt token (e.g. a client retrying the same turn after an
-        // earlier 600 s timeout), and the prefill chunk runs with zero
-        // tokens — which the paged forward cannot handle. See vLLM
-        // `vllm/v1/core/kv_cache_manager.py:202-208` for the same fix.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // P3: the hand-rolled warm-continue/cold-start lifecycle is now the
-        // adapter's `prepare_turn_with_max_cache_hit_tokens` (gemma4 already
-        // ships this exact call). Byte-identical: the adapter's prepare_turn
-        // runs the same warm `continue_turn` / cold `release → reset →
-        // find_cached_prefix → allocate_suffix_blocks` arms, and
-        // `find_cached_prefix_with_max_tokens` was a pure pass-through to the
-        // same `find_cached_prefix_inner`. The adapter allocates suffix blocks
-        // internally — do NOT call `allocate_suffix_blocks` again here.
-        let cached_prefix_len = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "paged_turn_sync_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                &token_ids_vec,
-                total_budget,
-                reuse_cache,
-                &[],
-                0,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(napi::Error::from_reason)?
-            .cached_prefix_len;
-
-        // Run forward / decode under a try-style closure so we can
-        // `release_request` on either path. Rust doesn't have try{}, so we
-        // emulate with a helper closure returning Result and call
-        // release_request after.
-        let forward_result = self.paged_turn_sync_core_inner(
-            &token_ids_vec,
-            cached_prefix_len,
-            num_layers,
-            sampling_config,
-            max_new_tokens,
-            repetition_penalty,
-            repetition_context_size,
-            presence_penalty,
-            presence_context_size,
-            frequency_penalty,
-            frequency_context_size,
-            max_consecutive_tokens,
-            max_ngram_repeats,
-            ngram_size,
-            return_logprobs,
-            eos_token_id,
-            report_perf,
-        );
-
-        // Success: finalize the turn but KEEP the request live so the
-        // next session turn's `continue_turn` can build on top of the
-        // partial trailing block's live K/V. Releasing here would drop
-        // that K/V (the prefix cache only stores FULL blocks) and force
-        // the next turn to re-prefill the partial-block span via
-        // parallel SDPA, whose BF16 reduction order differs from
-        // sequential decode and flips the argmax → cross-turn token
-        // divergence vs. the flat path.
-        //
-        // Error: release fully — partial state is not safe to keep
-        // around (the block_table may be in any state).
-        let (generated_tokens, generated_logprobs, finish_reason, first_token_elapsed_ms) =
-            match forward_result {
-                Ok(t) => {
-                    if let Some(adapter) = self.paged_adapter.as_mut() {
-                        if reuse_cache {
-                            let _ = adapter.finalize_turn_keep_live(&[], 0);
-                        } else {
-                            let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-                            let _ = adapter.release_request();
-                        }
-                    }
-                    t
-                }
-                Err(e) => {
-                    if let Some(adapter) = self.paged_adapter.as_mut() {
-                        let _ = adapter.release_request();
-                    }
-                    return Err(e);
-                }
-            };
-
-        // Persist the session's token history so the subsequent
-        // `chat_session_continue` (which dispatches to
-        // `chat_tokens_delta_sync`) finds an initialized session and
-        // can build its delta on top of the prior prompt + reply.
-        // Mirrors the flat path's "save cache state" block (around
-        // `chat_sync_core`'s `if reuse_cache { ... }` branch). The
-        // paged path does not use `cached_kv_keys` / `cached_kv_values`
-        // — the adapter's pool owns the K/V — but the token history is
-        // still required for the delta-path guard to pass and for
-        // `verify_cache_prefix`-style prefix lookups on the next turn.
-        if reuse_cache {
-            let mut full_history = token_ids_vec.clone();
-            // Mirror the flat path's last-token bookkeeping: when the
-            // loop exited via stop / repetition (i.e. before the last
-            // generated token's decode forward ran), that token is NOT
-            // recorded in the adapter, so drop it from the saved
-            // history to keep history aligned with the live cache.
-            // When `finish_reason == "length"` the loop completed
-            // normally and all generated tokens are recorded.
-            let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                &generated_tokens[..]
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-            // Qwen3 has no vision path — keep the image cache key None
-            // for uniformity with the VLM-capable siblings' branch.
-            self.cached_image_key = None;
-        } else {
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-        }
-
-        let gen_elapsed = gen_start.map(|s| s.elapsed());
-
-        // Decode text + tool/thinking parsing (mirrors chat_sync_core).
-        let raw_text_full = tokenizer.decode_sync(&generated_tokens, true)?;
-        let include_reasoning = engine::resolve_include_reasoning(&config);
-        // P2 SSOT: use the engine-threaded ThinkingSetup (TemplateHonoring for
-        // qwen3 ⇒ byte-identical to the old `resolve_enable_thinking(&config)
-        // .unwrap_or(true)`).
-        let thinking_enabled = thinking.enabled;
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str();
-        // Parse with reasoning INCLUDED so the reasoning-token count reflects the
-        // true thinking span, THEN apply the include_reasoning suppression
-        // contract to `thinking` and `raw_text` (matches finalize_chat_result /
-        // the streaming paths).
-        let (cleaned_text, tool_calls, thinking_full) = engine::parse_thinking_and_tools(
-            &raw_text_full,
-            &generated_tokens,
-            thinking_enabled,
-            think_end_id,
-            think_end_str,
-            true,
-        );
-        let reasoning_tokens =
-            tools::count_reasoning_tokens(&thinking_full, &generated_tokens, think_end_id);
-        let thinking = if include_reasoning {
-            thinking_full
-        } else {
-            None
-        };
-        let raw_text = engine::raw_text_with_reasoning_suppressed(
-            &raw_text_full,
-            &generated_tokens,
-            thinking_enabled,
-            think_end_id,
-            think_end_str,
-            include_reasoning,
-        );
-        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        let performance = if let (Some(gen_elapsed), Some(first_tok_ms)) =
-            (gen_elapsed, first_token_elapsed_ms)
-        {
-            let total_ms = gen_elapsed.as_secs_f64() * 1000.0;
-            let gen_toks = generated_tokens.len() as f64;
-            let ttft_ms = first_tok_ms;
-            let decode_ms = total_ms - ttft_ms;
-            let actual_prefill_count = (token_ids_vec.len() as f64) - cached_prefix_len as f64;
-            Some(crate::profiling::PerformanceMetrics {
-                ttft_ms,
-                prefill_tokens_per_second: if ttft_ms > 0.0 {
-                    actual_prefill_count.max(1.0) / (ttft_ms / 1000.0)
-                } else {
-                    0.0
-                },
-                decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                    (gen_toks - 1.0) / (decode_ms / 1000.0)
-                } else {
-                    0.0
-                },
-                // Qwen3 has no MTP heads — acceptance fields stay None.
-                mtp_mean_accepted_tokens: None,
-                mtp_mean_accepted_tokens_total: None,
-                mtp_acceptance_by_position: None,
-                mtp_cycles: None,
-                mtp_mean_depth: None,
-                profile_phases: None,
-            })
-        } else {
-            None
-        };
-
-        // generated_logprobs intentionally dropped here — the flat path
-        // (chat_sync_core) also collects them but does not surface them
-        // through ChatResult; keep parity until/unless the field is
-        // added to the public type.
-        let _ = generated_logprobs;
-
-        Ok(ChatResult {
-            text: cleaned_text,
-            tool_calls,
-            thinking,
-            num_tokens: generated_tokens.len() as u32,
-            prompt_tokens: prompt_token_count as u32,
-            reasoning_tokens,
-            finish_reason,
-            raw_text,
-            performance,
-            cached_tokens: cached_prefix_len,
-        })
-    }
-
-    /// Inner forward + decode loop for `paged_turn_sync_core`. Split out so
-    /// the caller can wrap it with `release_request` in a try-style flow.
-    /// Returns `(generated_tokens, generated_logprobs, finish_reason,
-    /// first_token_elapsed_ms)`.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_sync_core_inner(
-        &mut self,
-        token_ids_vec: &[u32],
-        cached_prefix_len: u32,
-        num_layers: usize,
-        sampling_config: SamplingConfig,
-        max_new_tokens: i32,
-        repetition_penalty: f64,
-        repetition_context_size: i32,
-        presence_penalty: f64,
-        presence_context_size: i32,
-        frequency_penalty: f64,
-        frequency_context_size: i32,
-        max_consecutive_tokens: i32,
-        max_ngram_repeats: i32,
-        ngram_size: i32,
-        return_logprobs: bool,
-        eos_token_id: u32,
-        report_perf: bool,
-    ) -> Result<(Vec<u32>, Vec<f32>, String, Option<f64>)> {
-        let total_prompt_tokens = token_ids_vec.len() as u32;
-        let suffix_len = total_prompt_tokens
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "paged_turn_sync_core_inner: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
-
-        if total_prompt_tokens == 0 {
-            return Err(napi::Error::from_reason("Empty prompt"));
-        }
-
-        // Borrow embedding / final_norm / lm_head out of `self` for the
-        // forward pass. Layers are borrowed separately because the
-        // forward_paged_adapter call needs `&self.layers` while the
-        // adapter is borrowed as `&mut self.paged_adapter`.
-        let embedding_weight = self.embedding.get_weight();
-        let _ = embedding_weight; // not directly used; forward path uses self.embedding.forward
-        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
-
-        // === PREFILL ===
-
-        let mut first_token_elapsed_ms: Option<f64> = None;
-        let prefill_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
-        // Invariant: caller applies the vLLM-style `max_cache_hit_tokens =
-        // total_budget - 1` cap to both the warm-continue precondition and
-        // the cold-start `find_cached_prefix*` lookup, so `cached_prefix_len`
-        // is bounded above by `total_prompt_tokens - 1` and the suffix is
-        // always non-empty for any prompt of length >= 1.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-        let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
-        let last_logits =
-            self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
-
-        let mut last_logits = last_logits;
-
-        // Apply prompt-level penalties on the prefill logits before the
-        // first sample. Mirrors chat_sync_core.
-        if repetition_penalty != 1.0 && !token_ids_vec.is_empty() {
-            last_logits = apply_repetition_penalty(
-                &last_logits,
-                token_ids_vec,
-                repetition_penalty,
-                Some(repetition_context_size),
-            )?;
-        }
-        if presence_penalty != 0.0 {
-            last_logits = apply_presence_penalty(
-                &last_logits,
-                token_ids_vec,
-                presence_penalty,
-                Some(presence_context_size),
-            )?;
-        }
-        if frequency_penalty != 0.0 {
-            last_logits = apply_frequency_penalty(
-                &last_logits,
-                token_ids_vec,
-                frequency_penalty,
-                Some(frequency_context_size),
-            )?;
-        }
-
-        let (mut token, mut logprobs_arr) = if return_logprobs {
-            let (tok, lp) = sample_and_logprobs(&last_logits, Some(sampling_config))?;
-            (tok, Some(lp))
-        } else {
-            (sample(&last_logits, Some(sampling_config))?, None)
-        };
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating. Prefill builds a massive MLX subgraph; once
-        // we have the last logits, those intermediates are dead but
-        // MLX's caching allocator holds them.
-        synchronize_and_clear_cache();
-
-        // === DECODE LOOP ===
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
-        let mut generated_logprobs: Vec<f32> = if return_logprobs {
-            Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens))
-        } else {
-            Vec::new()
-        };
-        let mut finish_reason = "length";
-
-        for step in 0..max_new_tokens {
-            token.eval();
-            crate::array::maybe_clear_cache_for_paged_step(step);
-            let token_value = token.item_at_int32(0)? as u32;
-            if let Some(ps) = prefill_start
-                && first_token_elapsed_ms.is_none()
-            {
-                first_token_elapsed_ms = Some(ps.elapsed().as_secs_f64() * 1000.0);
-            }
-            generated_tokens.push(token_value);
-            if return_logprobs && let Some(ref lp) = logprobs_arr {
-                lp.eval();
-                let token_logprob = lp.item_at_float32(token_value as usize)?;
-                generated_logprobs.push(token_logprob);
-            }
-
-            if let Some(reason) = check_repetition_cutoff(
-                &generated_tokens,
-                max_consecutive_tokens,
-                max_ngram_repeats,
-                ngram_size,
-            ) {
-                finish_reason = reason;
-                break;
-            }
-            if token_value == eos_token_id {
-                finish_reason = "stop";
-                break;
-            }
-
-            // Decode step: feed `[token_value]` through the paged forward
-            // with `is_prefill = false`. The adapter must be at the right
-            // logical position — it was advanced by `record_tokens` during
-            // prefill / previous decode step. We record and forward now.
-            let next_logits =
-                self.run_paged_decode_step(token_value, num_layers, &positions_dummy)?;
-
-            let last_logits_dec = next_logits.squeeze(Some(&[0, 1]))?;
-            let mut next_logits = last_logits_dec;
-
-            if repetition_penalty != 1.0 || presence_penalty != 0.0 || frequency_penalty != 0.0 {
-                let context_tokens: Vec<u32> = token_ids_vec
-                    .iter()
-                    .copied()
-                    .chain(generated_tokens.iter().copied())
-                    .collect();
-                if repetition_penalty != 1.0 {
-                    next_logits = apply_repetition_penalty(
-                        &next_logits,
-                        &context_tokens,
-                        repetition_penalty,
-                        Some(repetition_context_size),
-                    )?;
-                }
-                if presence_penalty != 0.0 {
-                    next_logits = apply_presence_penalty(
-                        &next_logits,
-                        &context_tokens,
-                        presence_penalty,
-                        Some(presence_context_size),
-                    )?;
-                }
-                if frequency_penalty != 0.0 {
-                    next_logits = apply_frequency_penalty(
-                        &next_logits,
-                        &context_tokens,
-                        frequency_penalty,
-                        Some(frequency_context_size),
-                    )?;
-                }
-            }
-
-            let (next_tok, next_lp) = if return_logprobs {
-                let (tok, lp) = sample_and_logprobs(&next_logits, Some(sampling_config))?;
-                (tok, Some(lp))
-            } else {
-                (sample(&next_logits, Some(sampling_config))?, None)
-            };
-            token = next_tok;
-            logprobs_arr = next_lp;
-        }
-
-        Ok((
-            generated_tokens,
-            generated_logprobs,
-            finish_reason.to_string(),
-            first_token_elapsed_ms,
-        ))
-    }
-
     /// Run a paged-attention prefill chunk over the layer stack.
     ///
     /// `suffix_tokens` is the chunk of NEW tokens (already excluded from
@@ -1339,424 +789,6 @@ impl Qwen3Inner {
             self.lm_head.forward(&hidden_states)?
         };
         Ok(logits)
-    }
-
-    /// Block-paged streaming whole-turn core, reached via the engine's
-    /// [`ChatBackend::paged_turn`] probe (sink-bearing turns). Body
-    /// unchanged from the pre-S7 streaming paged dispatch except for the
-    /// S7 mechanical refactor: it now receives the already-rendered
-    /// `token_ids_vec` from the session core (the engine's
-    /// `render_prompt` runs the identical jinja call the deleted inline
-    /// render performed) and streams through the engine's [`ChunkSink`]
-    /// instead of the deleted `StreamSender` wrapper.
-    ///
-    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and forward
-    /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
-    /// via `run_paged_prefill_chunk` → decode loop via
-    /// `run_paged_decode_step`) but emits each generated token through
-    /// the streaming callback as it is produced.
-    ///
-    /// Mirrors the flat streaming path's terminal contract:
-    ///  * Streams text chunks for every decoded token.
-    ///  * Sends a residual chunk for any tokens whose detokenized text
-    ///    has not yet been flushed.
-    ///  * Sends a terminal `done: true` chunk with `finish_reason`,
-    ///    aggregated `tool_calls`, `thinking`, performance metrics, and
-    ///    the matched cached-prefix length.
-    ///
-    /// Applies the same vLLM-style `max_cache_hit_tokens = prompt.len() - 1`
-    /// cap as `paged_turn_sync_core` so zero-delta prompts (every prompt
-    /// token already cached, e.g. retries of an earlier timed-out turn)
-    /// still produce at least one suffix token to prefill. Numerical
-    /// equivalence to the flat path is not asserted here (validated
-    /// separately via random-init smoke tests).
-    fn paged_turn_stream_core(
-        &mut self,
-        token_ids_vec: Vec<u32>,
-        config: ChatConfig,
-        eos_token_id: u32,
-        cb: &dyn ChunkSink,
-        cancelled: &AtomicBool,
-        thinking: ThinkingSetup,
-    ) -> Result<()> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
-            .clone();
-
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        let tokenizer_for_decode = tokenizer.clone();
-
-        let p = engine::extract_chat_params(&config);
-        let reuse_cache = p.reuse_cache;
-        let report_perf = p.report_performance;
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        let prompt_token_count = token_ids_vec.len() as u32;
-        let num_layers = self.layers.len();
-        let seq_id: u32 = 0;
-
-        // === Adapter lifecycle: warm continuation OR cold start. ===
-        // See the equivalent block in `paged_turn_sync_core` for full
-        // discussion of why warm continuation preserves the partial
-        // trailing block's K/V across turns.
-        // Lazy decode allocation: pass the prompt length only. Decode
-        // blocks grow on-demand via `record_tokens` (no pre-reserve of
-        // `p.max_new_tokens`).
-        let total_budget = token_ids_vec.len() as u32;
-        // See `paged_turn_sync_core` for the vLLM-style cap rationale.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // P3: adapter-owned lifecycle (see paged_turn_sync_core for the full
-        // byte-identity rationale). Suffix blocks are allocated inside
-        // prepare_turn — do NOT call allocate_suffix_blocks again.
-        let cached_prefix_len = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "paged_turn_stream_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                &token_ids_vec,
-                total_budget,
-                reuse_cache,
-                &[],
-                0,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(napi::Error::from_reason)?
-            .cached_prefix_len;
-
-        // Run the forward + decode under a try-style block so we can
-        // always release the request afterwards.
-        let result = self.paged_turn_stream_core_inner(
-            &token_ids_vec,
-            cached_prefix_len,
-            num_layers,
-            &p,
-            eos_token_id,
-            think_end_id,
-            think_end_str.as_deref(),
-            thinking,
-            tokenizer_for_decode,
-            cb,
-            cancelled,
-            generation_start,
-            &mut first_token_instant,
-            prompt_token_count,
-            reuse_cache,
-        );
-
-        // Success: keep the request live across turns when reuse is on.
-        // Error: release fully. See the non-streaming variant's terminal
-        // block for the full rationale.
-        match result {
-            Ok(()) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    if reuse_cache {
-                        let _ = adapter.finalize_turn_keep_live(&[], 0);
-                    } else {
-                        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
-                        let _ = adapter.release_request();
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Inner forward + streaming decode loop for
-    /// [`Self::paged_turn_stream_core`]. Split out so the caller can
-    /// wrap with `release_request` in a try-style flow.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core_inner(
-        &mut self,
-        token_ids_vec: &[u32],
-        cached_prefix_len: u32,
-        num_layers: usize,
-        p: &engine::ChatParams,
-        eos_token_id: u32,
-        think_end_id: Option<u32>,
-        think_end_str: Option<&str>,
-        thinking: ThinkingSetup,
-        tokenizer_for_decode: Arc<Qwen3Tokenizer>,
-        cb: &dyn ChunkSink,
-        cancelled: &AtomicBool,
-        generation_start: Option<std::time::Instant>,
-        first_token_instant: &mut Option<std::time::Instant>,
-        prompt_token_count: u32,
-        reuse_cache: bool,
-    ) -> Result<()> {
-        let total_prompt_tokens = token_ids_vec.len() as u32;
-        let suffix_len = total_prompt_tokens
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "paged_turn_stream_core_inner: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
-
-        if total_prompt_tokens == 0 {
-            return Err(napi::Error::from_reason("Empty prompt"));
-        }
-
-        // Invariant: see the non-streaming sibling. Caller-applied vLLM
-        // exact-prefix cap guarantees `suffix_len > 0` for any prompt of
-        // length >= 1.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_stream_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
-
-        // === PREFILL ===
-        let suffix = &token_ids_vec[(cached_prefix_len as usize)..];
-        let last_logits =
-            self.run_paged_prefill_chunk(suffix, cached_prefix_len, num_layers, &positions_dummy)?;
-
-        // Apply prompt-level penalties on prefill logits before the first sample.
-        let last_logits = engine::apply_all_penalties(last_logits, token_ids_vec, p)?;
-        let mut y = sample(&last_logits, p.sampling_config)?;
-        MxArray::async_eval_arrays(&[&y]);
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see paged_turn_sync_core_inner for rationale).
-        synchronize_and_clear_cache();
-
-        // Streaming state.
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = String::from("length");
-        let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);
-        let mut streamed_text_len: usize = 0;
-        let mut token_history: Vec<u32> = token_ids_vec.to_vec();
-
-        // P2 SSOT: build the tracker from the engine-threaded ThinkingSetup.
-        // `from_setup(&s, id) == new(s.enabled, s.budget, id)`, and for qwen3's
-        // TemplateHonoring policy `s.budget == p.thinking_token_budget` and
-        // `s.enabled == enable_thinking.unwrap_or(true)` ⇒ byte-identical.
-        let starts_in_thinking = thinking.enabled;
-        let mut last_is_reasoning = starts_in_thinking;
-        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        let max_new_tokens = p.max_new_tokens;
-
-        // Decode loop: pipeline-aware via run_paged_decode_step. We can't
-        // use the shared `decode_loop!` macro directly because it's
-        // hard-coded to a closure-based forward (which would require
-        // mutably borrowing `self.paged_adapter` inside the closure while
-        // ALSO borrowing `self.layers`). Inlining the loop avoids the
-        // double-borrow without sacrificing the streaming + reasoning
-        // tracking + cancellation semantics that `decode_loop!` provides.
-        for step in 0..max_new_tokens {
-            y.eval();
-            crate::array::maybe_clear_cache_for_paged_step(step);
-
-            let token_value = y.item_at_int32(0)? as u32;
-
-            if let Some(start) = generation_start
-                && first_token_instant.is_none()
-            {
-                let _ = start; // start time relative to outer `generation_start`
-                *first_token_instant = Some(std::time::Instant::now());
-            }
-
-            generated_tokens.push(token_value);
-            token_history.push(token_value);
-            let is_reasoning = reasoning_tracker.observe_token(token_value);
-            last_is_reasoning = is_reasoning;
-
-            // Cancellation check BEFORE emitting. Mirrors the shared macro.
-            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
-            }
-
-            // Incremental detokenization + emit.
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                &mut decode_stream,
-                tokenizer_for_decode.inner(),
-                token_value,
-                &generated_tokens,
-                streamed_text_len,
-            );
-            streamed_text_len += token_text.len();
-            // Suppress reasoning deltas when include_reasoning == false.
-            // Detokenize + length-advance above stay OUTSIDE this gate.
-            if p.include_reasoning || !is_reasoning {
-                cb.send(Ok(ChatStreamChunk {
-                    text: token_text,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(is_reasoning),
-                }));
-            }
-
-            // EOS check.
-            if token_value == eos_token_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-
-            // Repetition cutoff.
-            if let Some(reason) = check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-
-            // Compute next logits via paged decode.
-            let next_logits =
-                self.run_paged_decode_step(token_value, num_layers, &positions_dummy)?;
-            // [1, 1, vocab] → [vocab].
-            let next_logits = next_logits.squeeze(Some(&[0, 1]))?;
-
-            let next_logits = engine::apply_all_penalties(next_logits, &token_history, p)?;
-            let next_y = sample(&next_logits, p.sampling_config)?;
-            MxArray::async_eval_arrays(&[&next_y]);
-            y = next_y;
-        }
-
-        // === Save token history for the next turn's `chat_session_continue`. ===
-        //
-        // The paged adapter's pool owns the K/V across turns, but the
-        // `chat_tokens_delta_sync` flat-path delta still needs a non-empty
-        // `cached_token_history` to pass its initialized-session guard
-        // and to build the right delta on top of the prior conversation.
-        // Mirrors the flat path's "save cache state" block in
-        // `chat_stream_sync_core` — register-for-reuse / release-request
-        // are still owned by the caller (`paged_turn_stream_core`).
-        if reuse_cache {
-            let mut full_history = token_ids_vec.to_vec();
-            // When the loop exited via stop / cancellation / repetition,
-            // the just-pushed last token was NOT recorded into the
-            // adapter (the `run_paged_decode_step` call that would have
-            // written it never ran). Drop it from the saved history to
-            // keep the history aligned with the live cache. A normal
-            // length-budget exit (no early break) records every token.
-            let history_tokens = if finish_reason != "length" && !generated_tokens.is_empty() {
-                &generated_tokens[..generated_tokens.len() - 1]
-            } else {
-                &generated_tokens[..]
-            };
-            full_history.extend_from_slice(history_tokens);
-            self.cached_token_history = full_history;
-            self.cached_image_key = None;
-        } else {
-            self.cached_token_history.clear();
-            self.cached_image_key = None;
-        }
-
-        // Decode generated text for parsing + flush residual.
-        let full_text = tokenizer_for_decode
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if p.include_reasoning || !last_is_reasoning {
-                cb.send(Ok(ChatStreamChunk {
-                    text: residual,
-                    done: false,
-                    finish_reason: None,
-                    tool_calls: None,
-                    thinking: None,
-                    num_tokens: None,
-                    prompt_tokens: None,
-                    reasoning_tokens: None,
-                    raw_text: None,
-                    cached_tokens: None,
-                    performance: None,
-                    is_reasoning: Some(last_is_reasoning),
-                }));
-            }
-        }
-
-        let num_tokens = generated_tokens.len() as u32;
-        // Read the param BEFORE `parse_thinking_and_tools` shadows `thinking`
-        // below. `thinking.enabled == enable_thinking.unwrap_or(true)` for
-        // qwen3's TemplateHonoring policy ⇒ byte-identical.
-        let thinking_enabled = thinking.enabled;
-        let (clean_text, tool_calls, thinking) = engine::parse_thinking_and_tools(
-            &full_text,
-            &generated_tokens,
-            thinking_enabled,
-            think_end_id,
-            think_end_str,
-            p.include_reasoning,
-        );
-
-        let finish_reason = if tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        let perf_metrics = engine::compute_performance_metrics(
-            generation_start,
-            *first_token_instant,
-            token_ids_vec.len() - (cached_prefix_len as usize),
-            generated_tokens.len(),
-        );
-
-        // Terminal done chunk.
-        cb.send(Ok(ChatStreamChunk {
-            text: clean_text,
-            done: true,
-            finish_reason: Some(finish_reason),
-            tool_calls: Some(tool_calls),
-            thinking,
-            num_tokens: Some(num_tokens),
-            prompt_tokens: Some(prompt_token_count),
-            reasoning_tokens: Some(reasoning_tracker.reasoning_token_count()),
-            raw_text: Some(engine::raw_text_with_reasoning_suppressed(
-                &full_text,
-                &generated_tokens,
-                thinking_enabled,
-                think_end_id,
-                think_end_str,
-                p.include_reasoning,
-            )),
-            cached_tokens: Some(cached_prefix_len),
-            performance: perf_metrics,
-            is_reasoning: None,
-        }));
-
-        Ok(())
     }
 
     /// Generate synchronous (runs on model thread).
@@ -3592,110 +2624,7 @@ impl Qwen3Inner {
 // / `begin_decode`.
 // =====================================================================
 
-/// Build the legacy `GenerationConfig` the paged SYNC turn core
-/// consumes, applying qwen3's historical sync-path defaults
-/// (`temperature` 0.7 / `top_p` 0.9 / `max_new_tokens` 2048) to unset
-/// fields. Byte-identical to the inline builds the deleted
-/// `chat_sync_core` / `chat_tokens_delta_sync` performed. (The
-/// STREAMING paged core resolves via `extract_chat_params` instead —
-/// sampler passthrough — exactly as it always did.)
-fn paged_gen_config(config: &ChatConfig) -> GenerationConfig {
-    GenerationConfig {
-        max_new_tokens: config.max_new_tokens.or(Some(2048)),
-        temperature: config.temperature.or(Some(0.7)),
-        top_k: config.top_k,
-        top_p: config.top_p.or(Some(0.9)),
-        min_p: config.min_p,
-        repetition_penalty: config.repetition_penalty,
-        repetition_context_size: config.repetition_context_size,
-        presence_penalty: config.presence_penalty,
-        presence_context_size: config.presence_context_size,
-        frequency_penalty: config.frequency_penalty,
-        frequency_context_size: config.frequency_context_size,
-        max_consecutive_tokens: config.max_consecutive_tokens,
-        max_ngram_repeats: config.max_ngram_repeats,
-        ngram_size: config.ngram_size,
-        eos_token_id: None,
-        return_logprobs: None,
-        prefill_step_size: None,
-        report_performance: config.report_performance,
-    }
-}
-
 impl Qwen3Inner {
-    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`].
-    ///
-    /// Preserves the legacy dispatch sites verbatim: fresh sync (the old
-    /// `chat_sync_core` paged dispatch), delta sync (the old
-    /// `chat_tokens_delta_sync` paged dispatch with its hardcoded
-    /// `reuse_cache = true`), fresh streaming (the old
-    /// `chat_stream_sync_core` paged dispatch) — plus streaming deltas,
-    /// see below.
-    ///
-    /// DELIBERATE FIX (the one sanctioned S7 behavior change): the
-    /// engine probes `paged_turn` for STREAMING delta turns too. Legacy
-    /// qwen3 had NO paged dispatch on `chat_stream_tokens_delta_sync` —
-    /// with the paged adapter ON (qwen3's DEFAULT) its flat inner cloned
-    /// the never-populated flat KV vectors (the paged save blocks write
-    /// only token history) and `forward_fused` read `num_layers` KV
-    /// pointers from a ZERO-length vec: latent out-of-bounds UB.
-    /// Streaming deltas now run the same paged pipeline as sync deltas
-    /// by construction.
-    fn paged_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let config = args.config.clone();
-        // P2 SSOT: forward the engine-resolved ThinkingSetup into the paged
-        // cores instead of re-resolving `enable_thinking` inline (matches the
-        // qwen3_5 / qwen3_5_moe / lfm2 paged paths). For qwen3's default
-        // TemplateHonoring policy this is byte-identical to the old inline
-        // `resolve_enable_thinking(config).unwrap_or(true)`.
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                self.paged_turn_stream_core(
-                    args.tokens.to_vec(),
-                    config,
-                    args.eos_id,
-                    sink,
-                    cancelled,
-                    thinking,
-                )?;
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let gen_config = paged_gen_config(&config);
-                let report_perf = config.report_performance.unwrap_or(false);
-                let gen_start = if report_perf {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
-                // The legacy sync delta dispatch hardcoded
-                // `reuse_cache = true` (the engine's delta guards have
-                // already rejected an explicit `Some(false)`); the
-                // legacy fresh dispatch resolved from config. Both
-                // preserved verbatim.
-                let reuse_cache = if args.is_delta {
-                    true
-                } else {
-                    config.reuse_cache.unwrap_or(true)
-                };
-                let tokenizer = args.tokenizer.clone();
-                let result = self.paged_turn_sync_core(
-                    args.tokens.to_vec(),
-                    tokenizer,
-                    config,
-                    args.eos_id,
-                    gen_config,
-                    gen_start,
-                    report_perf,
-                    reuse_cache,
-                    thinking,
-                )?;
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
-        }
-    }
-
     /// Flat chunked prefill for the engine's generic flow
     /// ([`ChatBackend::prefill`]). Byte-identical port of the deleted
     /// flat cores' prefill blocks (2048-token chunks, per-chunk KV evals
@@ -3829,6 +2758,285 @@ impl Qwen3Inner {
     }
 }
 
+/// Paged decode stepper for qwen3 (pure-eager — no compiled path, so no
+/// lifecycle/reset guard fields). The paged analog of [`Qwen3Decode`]:
+/// drives [`crate::engine::decode::run_decode_loop`] through the
+/// `forward_paged_adapter` path via [`Qwen3Inner::run_paged_decode_step`].
+pub(crate) struct Qwen3PagedDecode<'a> {
+    inner: &'a mut Qwen3Inner,
+    num_layers: usize,
+    /// Fixed `[0]` positions array threaded into `forward_paged_adapter`
+    /// (the paged forward derives real positions from the adapter
+    /// cursor; this is the legacy `positions_dummy =
+    /// from_int32(&[0], &[1])`).
+    positions_dummy: MxArray,
+}
+
+impl DecodeStep for Qwen3PagedDecode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        // The paged forward needs the concrete token id (record_tokens +
+        // re-embed as [1, 1]); recover it from the [1, 1] input the loop
+        // reshaped. `item_at_int32` forces the eval of `y` — idempotent
+        // with the loop-top `y.eval()` (the legacy paged loops did the
+        // same `token.eval()` + `item_at_int32`).
+        let token_value = input_ids.item_at_int32(0)? as u32;
+        let logits = self.inner.run_paged_decode_step(
+            token_value,
+            self.num_layers,
+            &self.positions_dummy,
+        )?;
+        // `run_paged_decode_step` returns `[1, 1, vocab]`; the engine
+        // squeezes axis 1 → `[1, vocab]` (the FLAT contract — `sample` /
+        // `apply_all_penalties` accept the leading batch axis). The
+        // legacy paged loop squeezed `[0, 1]` → `[vocab]` then sampled;
+        // both feed the same sampler.
+        Ok((logits, true))
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
+        // The legacy paged stream loop did `async_eval_arrays(&[&next_y])`
+        // on the sampled token; scheduling next_token (+ logits, matching
+        // the flat `Qwen3Decode`) here is equivalent — the loop-top
+        // `y.eval()` forces materialization next iteration.
+        MxArray::async_eval_arrays(&[next_token, logits]);
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        // Paged cadence — the legacy paged loops' per-step
+        // `maybe_clear_cache_for_paged_step(step)`.
+        crate::array::maybe_clear_cache_for_paged_step(step);
+    }
+
+    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+        // LENGTH-exit only (the engine gates the call): run ONE more
+        // `run_paged_decode_step` for the final committed token so its
+        // K/V lands in the paged adapter, then DISCARD the logits. This
+        // is the SAME `record_tokens(&[token]) + forward_paged_adapter`
+        // the skipped final loop forward would have run, so the adapter's
+        // `request_tokens()` / cursor advances by exactly 1 to equal the
+        // saved keep-all history — byte-for-byte the state fba240b8 had
+        // after its unconditional bottom-of-loop forward (which also
+        // produced, then dropped, a next token off this same step).
+        //
+        // No sample / no `generated_tokens` push / no chunk / no
+        // finish_reason change: the produced logits are simply dropped.
+        let _logits =
+            self.inner
+                .run_paged_decode_step(token_id, self.num_layers, &self.positions_dummy)?;
+        Ok(())
+    }
+    // compiled_step_completed → default None; end_decode → default Ok(()).
+}
+
+/// qwen3 paged prefix state — the effective prefix/suffix split from
+/// `prepare_turn_with_max_cache_hit_tokens`. Identity-style (no held
+/// cache handles); the adapter mutated its own internal state during the
+/// prime.
+pub(crate) struct Qwen3PrefixState {
+    effective_cached_prefix_len: usize,
+    suffix_len: usize,
+}
+
+impl PagedPrefix for Qwen3PrefixState {
+    fn effective_cached_prefix_len(&self) -> usize {
+        self.effective_cached_prefix_len
+    }
+    fn suffix_len(&self) -> usize {
+        self.suffix_len
+    }
+}
+
+impl PagedBackend for Qwen3Inner {
+    type PagedDecode<'a>
+        = Qwen3PagedDecode<'a>
+    where
+        Self: 'a;
+    type PrefixState = Qwen3PrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        reuse_cache: bool,
+        _block_size: usize,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        // Lazy decode allocation: pass the prompt length only (decode
+        // blocks grow on-demand via `record_tokens`). vLLM-style
+        // exact-prefix cap: leave at least one prompt token to prefill so
+        // the decoder always has something to consume.
+        let total_budget = plan.len() as u32;
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        // Per-turn seq_id: the adapter is single-request and
+        // `reset_for_new_request` makes the previous seq_id irrelevant.
+        let seq_id: u32 = 0;
+        // P3: adapter-owned warm-continue / cold-start lifecycle (suffix
+        // blocks are allocated inside prepare_turn — do NOT call
+        // `allocate_suffix_blocks` again).
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                napi::Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                reuse_cache,
+                extra_keys,
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(napi::Error::from_reason)?;
+        Ok(Qwen3PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+        })
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
+        self.run_paged_prefill_chunk(
+            suffix_tokens,
+            prefix.effective_cached_prefix_len as u32,
+            self.layers.len(),
+            &positions_dummy,
+        )
+    }
+
+    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+        let positions_dummy = MxArray::from_int32(&[0], &[1])?;
+        let num_layers = self.layers.len();
+        Ok(Qwen3PagedDecode {
+            inner: self,
+            num_layers,
+            positions_dummy,
+        })
+    }
+
+    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+        // == the legacy paged cores' terminal lifecycle block. Success:
+        // keep the request live across turns when reuse is on so the next
+        // turn's `continue_turn` builds on the partial trailing block's
+        // live K/V; otherwise register full blocks for reuse + release.
+        // Infallible (`let _ =` every call — a teardown failure must not
+        // mask the turn result).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            if reuse_cache {
+                let _ = adapter.finalize_turn_keep_live(&[], 0);
+            } else {
+                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.release_request();
+            }
+        }
+    }
+
+    fn abort_paged_turn(&mut self) {
+        // Error-path teardown == the legacy paged cores' `Err(e) =>
+        // release_request()` arm: release fully, partial block_table state
+        // is unsafe to keep around. Release ONLY — never register / keep
+        // live. Infallible (`let _ =` — must not mask the turn's error).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+    }
+
+    fn save_paged_history(
+        &mut self,
+        save_tokens: &[u32],
+        generated: &[u32],
+        keep_all: bool,
+        reuse_cache: bool,
+    ) {
+        // Port of the legacy paged save block (token history ONLY — the
+        // adapter's pool owns the K/V; never touch
+        // `cached_kv_keys`/`cached_kv_values`/`cached_cache_idx`). `keep_all`
+        // is the FLAT rule (engine: `finish_reason == "length"`), so the
+        // DROP-LAST trim below is IDENTICAL to `save_cache_state`'s
+        // (`finish_reason != "length"` => drop the boundary token). The
+        // engine reconciles `request_tokens()` to this same trimmed history
+        // via `reconcile_paged_request_tokens` before finalize.
+        if reuse_cache {
+            let mut full_history = save_tokens.to_vec();
+            let history_tokens = if keep_all || generated.is_empty() {
+                generated
+            } else {
+                &generated[..generated.len() - 1]
+            };
+            full_history.extend_from_slice(history_tokens);
+            self.cached_token_history = full_history;
+            // Qwen3 has no vision path — keep the image cache key None
+            // for uniformity with the VLM-capable siblings' branch.
+            self.cached_image_key = None;
+        } else {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+        }
+    }
+
+    fn reconcile_paged_request_tokens(
+        &mut self,
+        prompt_len: usize,
+        generated: &[u32],
+        keep_all: bool,
+    ) -> bool {
+        // Perf-parity warm-continue restore (see the trait doc). The
+        // pipelined decode loop records the stop token into the adapter
+        // (its forward ran at the loop top BEFORE the stop-check), but the
+        // saved history DROPS it on a non-length exit. Roll the adapter
+        // back to the to-be-saved history length so `request_tokens()`
+        // matches the persisted history and the next turn warm-continues.
+        //
+        // `history_len` uses the EXACT same trim as `save_paged_history`
+        // above (same `keep_all`), so the two never disagree. The rollback
+        // count is the adapter's surplus over that history; `saturating_sub`
+        // makes it a no-op when the adapter is already <= the history
+        // (length exit: the engine's `materialize_final` already recorded
+        // the final token's K/V, so the adapter EQUALS the kept history —
+        // surplus 0; final-step stop: forward never ran, nothing
+        // over-recorded).
+        //
+        // Return (Codex #3 contract): `true` on reconcile/no-op,
+        // `false` ONLY when the rollback itself returned `Err` (then the
+        // adapter is over-recorded vs the saved history, so the engine
+        // finalizes with reuse=false = release_request, not keep-live).
+        // surplus <= request_tokens().len(), so rollback's `n > len`
+        // `Err` cannot fire — the `false` arm is a defensive contract,
+        // unreachable in practice.
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return true;
+        };
+        let history_len = if keep_all || generated.is_empty() {
+            generated.len()
+        } else {
+            generated.len() - 1
+        };
+        let target_len = prompt_len + history_len;
+        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
+        if surplus > 0
+            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3::paged",
+                "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \
+                 (finalize releases the request; next turn cold-prefills): {e}",
+            );
+            return false;
+        }
+        true
+    }
+}
+
 /// Eager flat decode stepper for one qwen3 turn (S7,
 /// [`ChatBackend::begin_decode`]). Owns the turn-constant arrays the
 /// deleted `DecodeOps` closures captured (embedding weight, RoPE offset
@@ -3894,6 +3102,22 @@ impl ChatBackend for Qwen3Inner {
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| napi::Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn resolve_params(&self, config: &ChatConfig) -> engine::ChatParams {
+        // Uniform sampling defaults across ALL qwen3 paths (paged sync,
+        // paged streaming, flat) — same as every sibling ChatML family
+        // (`extract_chat_params`): unset temperature/top_p flow through as
+        // `None` → the sampler's 1.0/1.0 passthrough. origin/main applied
+        // 0.7/0.9 ONLY in the now-deleted non-streaming paged sync core
+        // (`paged_gen_config`); streaming-paged and flat used
+        // `extract_chat_params`. Folding 0.7/0.9 onto every path here would
+        // shift default streaming/flat callers 1.0→0.7 (a behavior + perf
+        // divergence: top_p<1.0 adds a per-step nucleus sort). vLLM's
+        // canonical behavior is one uniform default; honoring the model's
+        // generation_config.json (qwen3 ships 0.6/0.95/20) is the deeper
+        // vLLM alignment, deferred to a separate engine-wide change.
+        engine::extract_chat_params(config)
     }
 
     // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
@@ -4085,9 +3309,13 @@ impl ChatBackend for Qwen3Inner {
     fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         // The probe is gated on `has_paged_adapter()`; with the adapter
         // configured EVERY turn (fresh + delta, sync + streaming) takes
-        // the paged pipeline — see `paged_chat_turn` for the dispatch
-        // mapping and the sanctioned streaming-delta fix.
-        Some(self.paged_chat_turn(args))
+        // the generic paged engine. The legacy sync/stream forked cores +
+        // dispatch were deleted in P4-1 — `run_paged_turn` drives the
+        // adapter lifecycle via [`PagedBackend`], reusing the shared
+        // `run_decode_loop`. The sanctioned streaming-delta fix (probe
+        // runs for delta streaming turns too) is preserved by the
+        // engine's session-core dispatch.
+        Some(crate::engine::paged_turn::run_paged_turn(self, args))
     }
 }
 
