@@ -149,6 +149,35 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+fn assistant_message(content: &str) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: None,
+        images: None,
+    }
+}
+
+/// Budget-FORCE config used to leave a LIVE partial-block prefix `prompt+[g_0]`
+/// for the warm-continue parity test: `thinking_token_budget = Some(0)` arms the
+/// `ReasoningTracker` to force `</think>` on the first decode step, and
+/// `max_new_tokens = 2` makes that forced token the FINAL token (a 2-token
+/// LENGTH exit). `reuse_cache = Some(true)` makes the turn finalize KEEP-LIVE so
+/// the partial block survives into turn 2; `include_reasoning = Some(true)`
+/// keeps `raw_text` the verbatim decode so echoing it back round-trips
+/// token-exact (turn-2's prompt strict-extends the persisted history).
+fn budget_force_chat_config(max_new_tokens: i32) -> ChatConfig {
+    ChatConfig {
+        thinking_token_budget: Some(0),
+        include_reasoning: Some(true),
+        reuse_cache: Some(true),
+        ..parity_chat_config(max_new_tokens)
+    }
+}
+
 fn parity_prompts() -> [&'static str; 4] {
     [
         "Say hi in one short word.",
@@ -257,6 +286,356 @@ async fn lfm2_paged_vs_flat_greedy_token_parity() {
     }
 
     eprintln!("LFM2 greedy parity: all {} prompts matched", prompts.len());
+}
+
+// ---------------------------------------------------------------------------
+// Test (a2 / G1): forced-LENGTH-exit parity.
+//
+// Tests (a) and (c) above NEVER drive a LENGTH exit through the paged path —
+// (a) prompts all early-stop under max_new=32, and (c)'s turn-2 is a delta
+// (`is_delta` → lfm2 `paged_turn` returns None → eager-flat). That leaves the
+// migrated lfm2 paged `save_paged_history` DROP-ON-LENGTH branch (Case A of
+// the token-accounting proof) UNTESTED. A FRESH turn-1 with a small `max_new`
+// on a verbose prompt GUARANTEES a length exit with NO EOS — lfm2 always emits
+// a `<think>` block (AlwaysOnBudgetFromEffort), so an 8-token budget cuts off
+// mid-reasoning, well before any `</think>` or `<|im_end|>`. Assert the paged
+// generated tokens == flat generated tokens (text + count + finish_reason).
+// Without this, a regression in the drop-on-length rule ships green.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_paged_vs_flat_length_exit_parity() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    let flat_dir = match clone_model_dir(&src, "lfm2-flat-len", false) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for flat path: {e}"),
+    };
+    let paged_dir = match clone_model_dir(&src, "lfm2-paged-len", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for paged path: {e}"),
+    };
+
+    let flat_model = Lfm2Model::load_from_dir(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat-path LFM2 model");
+    let paged_model = Lfm2Model::load_from_dir(&paged_dir.to_string_lossy())
+        .await
+        .expect("failed to load paged-path LFM2 model");
+
+    // Verbose prompt + tiny budget → the model is still generating (reasoning)
+    // at the budget, so the turn exits by LENGTH with no EOS / no `</think>`.
+    const MAX_NEW: i32 = 8;
+    let prompt = "Count slowly from one to one hundred, one number per line.";
+
+    let r_flat = flat_model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(parity_chat_config(MAX_NEW)),
+        )
+        .await
+        .expect("flat chat_session_start (length-exit) failed");
+    let r_paged = paged_model
+        .chat_session_start(
+            vec![user_message(prompt)],
+            Some(parity_chat_config(MAX_NEW)),
+        )
+        .await
+        .expect("paged chat_session_start (length-exit) failed");
+
+    eprintln!(
+        "length-exit parity: flat num_tokens={} finish={} | paged num_tokens={} finish={}",
+        r_flat.num_tokens, r_flat.finish_reason, r_paged.num_tokens, r_paged.finish_reason,
+    );
+
+    // The whole point: the turn must have hit the LENGTH budget (NOT stopped
+    // early on EOS) so the drop-on-length save branch is actually exercised.
+    assert_eq!(
+        r_flat.finish_reason, "length",
+        "test precondition: flat turn must exit by LENGTH (got {}); raise the prompt verbosity \
+         or lower MAX_NEW",
+        r_flat.finish_reason,
+    );
+    assert_eq!(
+        r_paged.finish_reason, "length",
+        "test precondition: paged turn must exit by LENGTH (got {}); the migrated paged path \
+         diverged from flat on the stop condition",
+        r_paged.finish_reason,
+    );
+    assert_eq!(
+        r_flat.num_tokens, MAX_NEW as u32,
+        "a length exit must commit exactly MAX_NEW tokens (flat got {})",
+        r_flat.num_tokens,
+    );
+
+    // PARITY: paged generated tokens == flat generated tokens on a LENGTH exit.
+    if r_flat.text != r_paged.text {
+        let first_diff = r_flat
+            .text
+            .as_bytes()
+            .iter()
+            .zip(r_paged.text.as_bytes().iter())
+            .position(|(a, b)| a != b);
+        panic!(
+            "LENGTH-EXIT TEXT MISMATCH. first_diff_byte={first_diff:?}\n\
+             FLAT  ({} tokens) text={:?}\n\
+             PAGED ({} tokens) text={:?}",
+            r_flat.num_tokens, r_flat.text, r_paged.num_tokens, r_paged.text,
+        );
+    }
+    assert_eq!(
+        r_flat.num_tokens, r_paged.num_tokens,
+        "length-exit num_tokens mismatch: flat={} paged={}",
+        r_flat.num_tokens, r_paged.num_tokens,
+    );
+
+    eprintln!("LFM2 length-exit parity: paged == flat at MAX_NEW={MAX_NEW}");
+}
+
+// ---------------------------------------------------------------------------
+// Test (b2): paged WARM-CONTINUE conv-state parity after a budget-forced
+// LENGTH exit. Proves paged-continue == flat (and == cold paged full-prefill)
+// across a turn boundary whose turn-1 ended by LENGTH with a live partial block.
+//
+// THE BUG (logical; reproduces BYTE-IDENTICAL under eager AND compiled — it is
+// NOT a lazy-eval/compiled-K/V issue):
+//   lfm2 PAGED reprefills conv state from token 0 every turn. On a warm
+//   continue (cached_prefix_len>0) `run_paged_prefill_chunk` calls
+//   `run_conv_only_prefill` over the cached prefix to rebuild conv state. That
+//   pass USED TO SKIP attention layers with a shape-preserving identity
+//   passthrough (self-documented "approximate ... Known issue for follow-up").
+//   So every conv layer DOWNSTREAM of an attention layer saw a residual stream
+//   MISSING the attention out_proj+residual+FFN contribution → its conv state
+//   DRIFTED vs the exact path → a turn-2 argmax flips ~14 tokens in.
+//   The cold full-prefill (cached_prefix_len==0) SKIPS that pass entirely and
+//   runs full conv+attention in one shot → correct. FLAT carries conv exactly
+//   across turns → correct. So warm-continue was the lone wrong path.
+//   (PRE-EXISTING since the original paged PR; main has it too. The earlier
+//   codex "budget-forced lazy-K/V hole" diagnosis + the logits.eval() fix were
+//   REFUTED — see eval_step.) FIX: run_conv_only_prefill now runs attention as
+//   a flat causal self-prefill so the residual stream is exact.
+//
+// REPRO SHAPE: a budget-forced 2-token length exit (thinking_budget=0,
+// max_new=2) is the deterministic minimal way to leave a LIVE partial-block
+// prefix `prompt+[g_0]` (save drops the forced </think>; the kept g_0 was
+// forwarded so its K/V is genuinely in the pool — NOT the bug). Turn 2 is a
+// FRESH `chat_session_start` echoing turn-1's `raw_text`, so its prompt
+// strict-extends `prompt+[g_0]` → the adapter takes `ContinuedLivePrefix` and
+// rebuilds conv over the 23-token prefix via run_conv_only_prefill (the fixed
+// path).
+//
+// TWO independent hole-free ORACLES, cross-checked (assert flat==cold):
+//   * FLAT two-turn — carries conv across turns.
+//   * COLD paged self-reference — cached_prefix_len==0, never runs Pass-1.
+// Compare `raw_text` NOT `text`: the divergent tokens live inside the reasoning
+// span, which `text` strips (comparing `text` could match two empties + MASK).
+// Reachability gate: `cached_tokens>0` proves turn 2 took the live-continue
+// path (a full re-prefill would recompute the prefix and mask the bug).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_paged_budget_forced_warm_continue_parity() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    // Same model object across both turns so the live partial prefix survives
+    // into turn 2 (finalize_turn_keep_live + ContinuedLivePrefix).
+    let warm_dir = match clone_model_dir(&src, "lfm2-paged-warmcont-warm", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone paged warm dir: {e}"),
+    };
+    let warm_model = Lfm2Model::load_from_dir(&warm_dir.to_string_lossy())
+        .await
+        .expect("failed to load paged warm LFM2 model");
+
+    let user1 = "Count slowly from one to one hundred, one number per line.";
+    let user2 = "Now keep going from where you left off.";
+    const MAX_NEW_TURN1: i32 = 2;
+    const MAX_NEW_TURN2: i32 = 32;
+
+    // ---- Turn 1: budget-forced length exit on the PAGED (compiled) path ----
+    let compiled_before = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let r1 = warm_model
+        .chat_session_start(
+            vec![user_message(user1)],
+            Some(budget_force_chat_config(MAX_NEW_TURN1)),
+        )
+        .await
+        .expect("turn 1 (budget-forced) paged chat_session_start failed");
+    let compiled_after = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    let compiled_delta = compiled_after.saturating_sub(compiled_before);
+
+    eprintln!(
+        "[warm-cont] turn1: num_tokens={} finish={} compiled_paged_delta={compiled_delta} raw_text={:?}",
+        r1.num_tokens, r1.finish_reason, r1.raw_text,
+    );
+
+    // Compiled-paged engagement gate: a 0 delta means the eager paged fallback
+    // ran (it evals K/V eagerly and has NO lazy hole) → nothing to bite, skip.
+    // INFO only — the bug (conv Pass-1 attention-skip in run_conv_only_prefill)
+    // is LOGICAL and reproduces byte-identically under BOTH compiled
+    // (compiled_paged_delta>0) and eager (MLX_NO_COMPILE=1, delta==0), so the
+    // assertion below holds regardless of which backend ran. The counter is
+    // printed purely to record which path the run exercised.
+    eprintln!("[warm-cont] turn1 compiled_paged_delta={compiled_delta} (0 ⇒ eager path ran)");
+
+    // Preconditions that pin the EXACT shape the bug needs: a LENGTH exit (the
+    // forced </think> is the FINAL committed token, no next forward) committing
+    // exactly MAX_NEW_TURN1 tokens (so request_tokens() ends at prompt+[g_0]).
+    assert_eq!(
+        r1.finish_reason, "length",
+        "turn-1 must exit by LENGTH so the budget-forced token is final (got {}); \
+         the model stopped early (EOS) — raise prompt verbosity or check budget wiring",
+        r1.finish_reason,
+    );
+    assert_eq!(
+        r1.num_tokens, MAX_NEW_TURN1 as u32,
+        "turn-1 must commit exactly MAX_NEW_TURN1={MAX_NEW_TURN1} tokens (got {}); the \
+         partial g_0 block accounting (prompt+[g_0]) assumes a 2-token forced length exit",
+        r1.num_tokens,
+    );
+
+    // ---- Turn 2 (WARM): fresh start that strict-extends prompt+[g_0] ----
+    // Echo r1.raw_text VERBATIM (not r1.text) so the re-rendered prompt is a
+    // token-exact strict extension of the persisted history → ContinuedLivePrefix
+    // fires and turn-2's suffix prefill RE-READS g_0's live partial-block slot.
+    let r2_warm = warm_model
+        .chat_session_start(
+            vec![
+                user_message(user1),
+                assistant_message(&r1.raw_text),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(MAX_NEW_TURN2)),
+        )
+        .await
+        .expect("turn 2 (warm live-continue) paged chat_session_start failed");
+
+    eprintln!(
+        "[warm-cont] turn2 WARM: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
+        r2_warm.num_tokens, r2_warm.cached_tokens, r2_warm.finish_reason, r2_warm.raw_text,
+    );
+
+    // DECISIVE reachability gate: turn-2 MUST have reused the live prefix
+    // (cached_tokens>0 ⇒ ContinuedLivePrefix reused the live prefix incl. g_0's
+    // partial slot). A full re-prefill (cached_tokens==0) would recompute g_0
+    // fresh and MASK the bug — so a masked run fails loudly, never passes.
+    assert!(
+        r2_warm.cached_tokens > 0,
+        "turn-2 did NOT reuse the live prefix (cached_tokens=0 ⇒ full re-prefill, which \
+         recomputes the prefix and MASKS the bug). ContinuedLivePrefix was not exercised; \
+         the test cannot bite. Check finalize_turn_keep_live / raw_text echo round-trip.",
+    );
+    assert!(
+        !r2_warm.raw_text.trim().is_empty(),
+        "turn-2 warm produced empty output — the live-continue round-trip is broken",
+    );
+
+    drop(warm_model);
+
+    // ---- DIAGNOSTIC ORACLE A: FLAT two-turn (the real P4-2 bar) ----
+    let flat_dir = match clone_model_dir(&src, "lfm2-flat-warmcont", false) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone flat-oracle dir: {e}"),
+    };
+    let flat_model = Lfm2Model::load_from_dir(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat-oracle LFM2 model");
+    let f1 = flat_model
+        .chat_session_start(
+            vec![user_message(user1)],
+            Some(budget_force_chat_config(MAX_NEW_TURN1)),
+        )
+        .await
+        .expect("flat turn 1 failed");
+    eprintln!(
+        "[warm-cont] FLAT turn1: num_tokens={} finish={} raw_text={:?}",
+        f1.num_tokens, f1.finish_reason, f1.raw_text,
+    );
+    let r2_flat = flat_model
+        .chat_session_start(
+            vec![
+                user_message(user1),
+                assistant_message(&f1.raw_text),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(MAX_NEW_TURN2)),
+        )
+        .await
+        .expect("flat turn 2 failed");
+    eprintln!(
+        "[warm-cont] turn2 FLAT oracle: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
+        r2_flat.num_tokens, r2_flat.cached_tokens, r2_flat.finish_reason, r2_flat.raw_text,
+    );
+    drop(flat_model);
+
+    // ---- DIAGNOSTIC ORACLE B: COLD paged self-reference (re-prefill) ----
+    let cold_dir = match clone_model_dir(&src, "lfm2-paged-warmcont-cold", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone paged cold-oracle dir: {e}"),
+    };
+    let cold_model = Lfm2Model::load_from_dir(&cold_dir.to_string_lossy())
+        .await
+        .expect("failed to load paged cold-oracle LFM2 model");
+    let r2_cold = cold_model
+        .chat_session_start(
+            vec![
+                user_message(user1),
+                assistant_message(&r1.raw_text),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(MAX_NEW_TURN2)),
+        )
+        .await
+        .expect("cold-oracle turn 2 paged chat_session_start failed");
+    eprintln!(
+        "[warm-cont] turn2 COLD oracle: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
+        r2_cold.num_tokens, r2_cold.cached_tokens, r2_cold.finish_reason, r2_cold.raw_text,
+    );
+    drop(cold_model);
+
+    // Oracle sanity: the two INDEPENDENT hole-free oracles must agree
+    // (flat carries conv across turns; cold paged re-prefills from scratch).
+    // If they disagree the test scaffold itself is broken, not the fix.
+    assert_eq!(
+        r2_flat.raw_text, r2_cold.raw_text,
+        "oracle disagreement: FLAT two-turn != COLD paged full-prefill — the test's \
+         reference is unsound, fix the harness before trusting the bite below",
+    );
+
+    // THE BITE: warm paged-CONTINUE must equal the hole-free oracle.
+    //   - PRE-fix (conv Pass-1 identity-passthrough of attention layers):
+    //     downstream conv state drifts → warm diverges from flat/cold (~14 tokens
+    //     into turn 2) → this assertion FAILS.
+    //   - POST-fix (run_conv_only_prefill runs attention as a flat causal
+    //     self-prefill): warm == flat == cold byte-for-byte → PASSES.
+    if r2_warm.raw_text != r2_flat.raw_text {
+        let first_diff = r2_warm
+            .raw_text
+            .as_bytes()
+            .iter()
+            .zip(r2_flat.raw_text.as_bytes().iter())
+            .position(|(a, b)| a != b);
+        panic!(
+            "PAGED-CONTINUE BOUNDARY DIVERGENCE: warm paged-continue turn-2 != flat oracle \
+             (conv Pass-1 attention-skip drifted downstream conv state). \
+             first_diff_byte={first_diff:?}\n\
+             WARM (cached={}) raw_text={:?}\n\
+             FLAT (cached={}) raw_text={:?}",
+            r2_warm.cached_tokens, r2_warm.raw_text, r2_flat.cached_tokens, r2_flat.raw_text,
+        );
+    }
+
+    eprintln!(
+        "[PASS] paged-continue == flat == cold on the budget-forced length-exit boundary \
+         (warm cached={})",
+        r2_warm.cached_tokens,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -394,9 +773,10 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
     // `cached_tokens` covers ~the whole prompt while the new attention suffix is
     // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
     // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
-    // This exercises the `paged_turn_sync_core` START path that the telemetry fix
-    // touches, NOT the `chat_session_continue` delta path (which legitimately
-    // forwards only the delta via `chat_tokens_delta_sync` and is left unchanged).
+    // This exercises the fresh-turn paged START path (`run_paged_turn` →
+    // `paged_prefill`) that the telemetry fix touches, NOT the
+    // `chat_session_continue` delta path (which legitimately forwards only the
+    // delta via the eager-flat path and is left unchanged).
     let r2 = paged_model
         .chat_session_start(vec![user_message(prompt1)], Some(perf_chat_config(32)))
         .await

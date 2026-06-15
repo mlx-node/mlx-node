@@ -2,28 +2,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::napi_glue::start_chat_stream;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
-    IMAGE_CHANGE_RESTART_PREFIX, ReasoningTracker, ThinkingPolicy, apply_all_penalties,
-    build_chatml_continue_delta_text, build_synthetic_user_message, compute_performance_metrics,
-    finalize_chat_result, generated_capacity_hint, kv_capacity_round_up,
+    IMAGE_CHANGE_RESTART_PREFIX, ThinkingPolicy, build_chatml_continue_delta_text,
+    build_synthetic_user_message, kv_capacity_round_up,
 };
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
-use crate::sampling::sample;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 use crate::transformer::KVCache;
@@ -101,8 +99,8 @@ pub(crate) struct Lfm2Inner {
     /// intentional exception of `*.expert_bias`, kept F32 on MoE checkpoints).
     /// Computed once at load time over the full registered param map (see
     /// `all_registered_float_weights_are_bf16` in `persistence.rs`) and consulted
-    /// by [`Lfm2Inner::paged_compiled_decode_setup`] to gate compiled-PAGED
-    /// decode: the compiled-paged graph + paged KV pools are bf16-only
+    /// by `<Lfm2Inner as PagedBackend>::begin_paged_decode` to gate
+    /// compiled-PAGED decode: the compiled-paged graph + paged KV pools are bf16-only
     /// (`KvDtype::Bf16`, bf16 static mask), and the paged graph consumes far more
     /// than q/k/v — operator/FFN/final norms, q/k norms, out_proj, conv
     /// weights/biases, dense-MLP or MoE router/expert weights, and (untied)
@@ -117,7 +115,7 @@ pub(crate) struct Lfm2Inner {
     /// Computed once at load time (`persistence.rs`: `params.keys().any(.scales)`)
     /// and set unconditionally after construction, so it is authoritative for ALL
     /// checkpoints (independent of whether the compiled path registered).
-    /// `paged_compiled_decode_setup` consults it to switch the compiled-paged
+    /// `begin_paged_decode` consults it to switch the compiled-paged
     /// bf16-only gate over to the `non_quant_floats_bf16` invariant — quantized
     /// `.weight` tensors are uint32-packed, not bf16, so the all-float scan is
     /// meaningless for them.
@@ -130,22 +128,6 @@ pub(crate) struct Lfm2Inner {
     /// feeding the bf16-only `paged_kv_write`/`paged_attention` stays bf16.
     /// `false` until a quantized checkpoint registers; only meaningful then.
     pub(crate) non_quant_floats_bf16: bool,
-}
-
-/// Adapter giving the kept paged streaming cores their legacy
-/// `cb.call(result, mode)` shape over the engine's [`ChunkSink`].
-///
-/// Pre-S11 this wrapped the raw `StreamTx`; the engine now owns the
-/// channel and hands the paged probe a `&dyn ChunkSink`, so the wrapper
-/// forwards `.call()` to [`ChunkSink::send`] (the call mode is
-/// meaningless on the mpsc path and is dropped, exactly like the old
-/// `StreamTx` wrapper did).
-struct StreamSender<'a>(&'a dyn ChunkSink);
-
-impl StreamSender<'_> {
-    fn call(&self, result: napi::Result<ChatStreamChunk>, _mode: ThreadsafeFunctionCallMode) {
-        self.0.send(result);
-    }
 }
 
 /// Classification of the prefix-cache decision made from a
@@ -230,12 +212,16 @@ pub(crate) fn build_lfm2_tool_delta_text(content: &str, is_error: Option<bool>) 
     format!("\n<|im_start|>tool\n{rendered_content}<|im_end|>\n<|im_start|>assistant\n")
 }
 
-/// Holds the compiled-paged decode session state + RAII guards for one
-/// paged decode turn. All guards are over GLOBAL statics / unit, so this
-/// struct does NOT borrow `self`. Created by `paged_compiled_decode_setup`,
-/// consumed across the whole decode loop, dropped at loop exit (the
+/// Paged decode stepper for lfm2 / lfm2_moe (compiled-paged hybrid — the
+/// paged analog of the FLAT [`Lfm2Decode`]). Drives
+/// [`crate::engine::decode::run_decode_loop`] through the generic
+/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
+/// compiled C++ paged step when seeded, else the pure-Rust eager paged
+/// step. Created by `<Lfm2Inner as PagedBackend>::begin_paged_decode`
+/// (which armed the guards + seeded the C++ paged session), consumed
+/// across the whole decode loop, dropped at loop exit (the
 /// `Lfm2PagedResetGuard` resets the C++ paged globals on EVERY exit path).
-struct Lfm2PagedCompiledState {
+pub(crate) struct Lfm2PagedDecode<'a> {
     // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION order, so
     // these three guards MUST be listed reset-guard → weight-guard → lock so
     // that `Lfm2PagedResetGuard::drop()` (→ `mlx_lfm2_paged_reset()`) runs
@@ -246,12 +232,22 @@ struct Lfm2PagedCompiledState {
     // the mutex and seed/use the shared process-global paged state in the
     // window before this request's delayed reset cleared it → cross-request
     // null forwards / decode corruption. Do NOT reorder these three fields.
+    //
+    // F1 DROP-ORDER TRAP: `inner: &'a mut` is declared AFTER the three guards.
+    // Fields drop in declaration order, so the guards drop (reset fires under
+    // the still-held locks) BEFORE the `&mut` borrow is conceptually released —
+    // correct. Do NOT move `inner` above the guards.
     _paged_reset_guard: Option<Lfm2PagedResetGuard>,
     _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
     _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    inner: &'a mut Lfm2Inner,
     cpp_session_ready: bool,
     cpp_compiled_step_completed: bool,
     max_blocks_per_seq: u32,
+    /// Supplies the `step` arg the compiled-step body logs; the engine's
+    /// loop owns the real step index, this is a faithful local mirror that
+    /// `forward` bumps each call (only consulted in fall-back warn logs).
+    step_counter: i32,
 }
 
 impl Lfm2Inner {
@@ -282,8 +278,8 @@ impl Lfm2Inner {
         //
         // Chat dispatch is wired through this adapter at every chat-entry
         // site: the engine session core's `ChatBackend::paged_turn` probe
-        // hands whole turns to `paged_turn_sync_core` /
-        // `paged_turn_stream_core` whenever the adapter is live.
+        // hands whole (fresh) turns to the generic `run_paged_turn` driving
+        // `<Lfm2Inner as PagedBackend>` whenever the adapter is live.
         //
         // KV-pool sizing: ONLY full_attention layers participate. LFM2's
         // hybrid layer mix is parsed from `config.layer_types`; conv
@@ -509,9 +505,10 @@ impl Lfm2Inner {
         self.cached_image_key = None;
         // Drop any live paged-adapter request. Without this, a
         // finalize_turn_keep_live call from a prior session would leave
-        // block_table populated and a subsequent `paged_turn_sync_core`
-        // could mistakenly take the warm-continue path against stale
-        // tokens. NOTE: this alone is NOT a fully cold reset — released
+        // block_table populated and a subsequent paged turn (`run_paged_turn`
+        // → `prime_prefix_state`) could mistakenly take the warm-continue
+        // path against stale tokens. NOTE: this alone is NOT a fully cold
+        // reset — released
         // full blocks stay content-addressed in the allocator's prefix
         // cache; the EXPLICIT command reset purges them on top of this
         // (`ResetScope::Command` branch of the trait impl).
@@ -631,642 +628,6 @@ impl Lfm2Inner {
         } else {
             self.reset_caches_internal();
         }
-    }
-
-    /// Block-paged whole-turn core (kept behind the engine's
-    /// [`ChatBackend::paged_turn`] probe since S11; pre-S11 this was the
-    /// block-paged variant of the deleted flat `chat_sync_core`).
-    ///
-    /// Mirrors the flat path's control flow (penalty stack, decode loop,
-    /// EOS / repetition cutoff, performance timing, output post-processing)
-    /// but routes attention layers through `forward_paged_or_flat` instead
-    /// of the flat `forward()` path. Conv layers continue to use their
-    /// existing `Lfm2LayerCache::Conv(ArraysCache)` storage.
-    ///
-    /// Per-turn lifecycle (mirrors the Qwen3 paged path):
-    ///
-    /// 1. Choose between **cold start** and **warm continuation**:
-    ///    - Cold start: `paged_adapter.reset_for_new_request(seq_id)` →
-    ///      `find_cached_prefix` → `allocate_suffix_blocks`.
-    ///    - Warm continuation (turn 2+ within the same session, when the
-    ///      prior turn ended via `finalize_turn_keep_live`):
-    ///      `continue_turn(prompt, total_budget)` instead of the
-    ///      reset/find/allocate triple. Keeps the partial trailing block's
-    ///      K/V live across turns, eliminating the cross-turn BF16
-    ///      re-prefill divergence (see
-    ///      `PagedKVCacheAdapter::finalize_turn_keep_live`). Conv layers
-    ///      still rebuild from token 0 each turn — the partial-block
-    ///      carry only applies to the attention layer K/V state.
-    /// 2. Conv-layer cache reset: every paged turn does a fresh prefill
-    ///    on conv layers (no in-turn warm-reuse on the paged path). Conv
-    ///    layers don't participate in the cross-request prefix cache;
-    ///    their state is rebuilt over the entire prompt each turn.
-    /// 3. Prefill via `run_paged_prefill_chunk` over the suffix tokens.
-    /// 4. Decode loop via `run_paged_decode_step` — single-token forward
-    ///    with `gather_kv_for_decode` on attention layers and the conv
-    ///    operator's incremental step on conv layers.
-    /// 5. End-of-turn (success): `finalize_turn_keep_live` publishes
-    ///    full blocks AND keeps the request live for the next turn's
-    ///    warm `continue_turn`.
-    /// 6. Session end / explicit reset / error: `release_request`.
-    ///
-    /// Limitations:
-    /// - Conv-layer prefix reuse is NOT carried across paged turns; each
-    ///   paged turn reprefills conv state from the start of the prompt.
-    /// - Pure-cache prompt (every prompt token already in the paged pool)
-    ///   is rejected — same caveat as Qwen3's paged path.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_sync_core(
-        &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        think_end_id: Option<u32>,
-        think_end_str: Option<String>,
-        include_reasoning: bool,
-        p: &crate::engine::ChatParams,
-        thinking: ThinkingSetup,
-        report_perf: bool,
-        eos_token_id: u32,
-    ) -> Result<ChatResult> {
-        let prompt_token_count = tokens.len();
-        let sampling_config = p.sampling_config;
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET, not whether.
-        // The (enabled, budget) pair is resolved ONCE at turn entry from
-        // the family policy (AlwaysOnBudgetFromEffort) and threaded in as
-        // `thinking`; this core no longer recomputes it.
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        // === Adapter lifecycle: warm continuation OR cold start. ===
-        // See `PagedKVCacheAdapter::finalize_turn_keep_live` for why the
-        // warm-continue path preserves the partial trailing block's K/V
-        // across turns. Conv layers always reset and re-prefill the
-        // cached prefix in `run_paged_prefill_chunk`'s "Pass 1" so the
-        // partial-block carry only affects attention layers.
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only. Decode
-        // blocks grow on-demand via `record_tokens` (no pre-reserve of
-        // `max_new_tokens`). The inner decode loop reads `p.max_new_tokens`
-        // directly when it needs the budget bound.
-        let total_budget = tokens.len() as u32;
-        // vLLM-style exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core
-        // for the full rationale. Forces the cache lookup (and the live-prefix
-        // continue check) to leave at least one suffix token for the prefill
-        // chunk, so retries of an earlier identical turn never produce a
-        // zero-delta prompt.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // P3: adapter-owned warm-continue/cold-start lifecycle (gemma4 ships
-        // this exact call; byte-identical). NOTE: lfm2's hand-rolled
-        // `can_continue` had NO reuse_cache term, so pass LITERAL `true` —
-        // the adapter ANDs reuse_cache into its can_continue, and `true`
-        // preserves the original always-eligible warm predicate. Suffix
-        // blocks are allocated inside prepare_turn; do not re-allocate.
-        let cached_prefix_len = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_sync_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &[],
-                0,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?
-            .cached_prefix_len;
-
-        // Reset conv-layer state for this turn. The paged path does not
-        // carry conv prefix state across turns; each turn reprefills from
-        // the start of the prompt over conv layers (see method docstring).
-        self.caches = init_caches(&self.config);
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-
-        let total_prompt_tokens = tokens.len() as u32;
-        let suffix_len = total_prompt_tokens
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason("paged_turn_sync_core: cached_prefix_len > total_prompt_tokens")
-            })?;
-
-        // Conv layers always need to rebuild from token 0; if the paged
-        // adapter reports a cached prefix from a previous turn we still
-        // need to prefill conv state over [0, total) tokens. Keep `tokens`
-        // intact for conv prefill; the paged adapter records only the
-        // suffix tokens via `record_tokens`.
-        if total_prompt_tokens == 0 {
-            return Err(Error::from_reason("Empty prompt"));
-        }
-
-        // Wrap forward / decode in a closure-like pattern so we can
-        // release the paged request on either success or error.
-        let forward_result = self.paged_turn_sync_core_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            p,
-            eos_token_id,
-            &sampling_config,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-        );
-
-        let (generated_tokens, finish_reason) = match forward_result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    // Keep the request live across turns so the next
-                    // turn's `continue_turn` can pick up the partial
-                    // trailing block's K/V. See
-                    // `finalize_turn_keep_live` doc for rationale.
-                    let _ = adapter.finalize_turn_keep_live(&[], 0);
-                }
-                t
-            }
-            Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                return Err(e);
-            }
-        };
-
-        // Persist the session's token history so the subsequent
-        // `chat_session_continue` (which dispatches to
-        // `chat_tokens_delta_sync`) finds an initialized session and
-        // can build its delta on top of the prior prompt + reply.
-        //
-        // The paged decode loop never feeds the LAST sampled token
-        // through `run_paged_decode_step`, so the last entry in
-        // `generated_tokens` is NOT recorded in the adapter / conv
-        // caches — drop it from the saved history to keep the live
-        // cache state aligned with what the next turn replays.
-        // Mirrors `save_cache_state(reuse_cache=true, ..., last_token_in_cache=false)`
-        // on the flat path.
-        let last_token_in_cache = false;
-        self.save_cache_state_internal(true, &tokens, &generated_tokens, last_token_in_cache);
-
-        // Performance metrics.
-        // Paged prefill reprocesses the FULL prompt through conv layers
-        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
-        // cached prefix. ttft measures full-prompt work, so the throughput
-        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
-        // (If a future LFM2 paged variant carries conv state across turns and
-        // truly forwards only the delta during prefill, revert this to the
-        // delta count.)
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len(),
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count as u32,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len;
-        Ok(result)
-    }
-
-    /// Set up the compiled-PAGED decode session for one decode turn (shared by
-    /// the non-streaming `paged_turn_sync_core_inner` and the streaming
-    /// `paged_turn_stream_core_inner`).
-    ///
-    /// Acquires the cross-family compiled lifecycle lock + weight read lock,
-    /// re-checks ownership, gates on block_size + bf16 weights, seeds the C++
-    /// paged graph once from the live post-prefill adapter pools + conv state,
-    /// and arms the RAII reset guard. Returns the populated
-    /// [`Lfm2PagedCompiledState`], which the caller threads into
-    /// `paged_compiled_decode_step` for every step and drops at loop exit.
-    ///
-    /// MUST be called AFTER prefill (the adapter pools + conv caches are read
-    /// here) and BEFORE the decode loop.
-    fn paged_compiled_decode_setup(&mut self) -> Result<Lfm2PagedCompiledState> {
-        // ===== Compiled C++ PAGED decode-path dispatch =====
-        //
-        // Mirrors the FLAT path's lock contract (`Lfm2Decode` via
-        // `ChatBackend::begin_decode`) and qwen3.5's
-        // paged `cpp_session_ready` gate. The compiled-PAGED decode runs only
-        // when ALL of:
-        //   1. `compiled_path_active()` — weights registered for our model_id.
-        //      (The registration gate publishes the id for ANY non-quantized
-        //      bf16/f16 checkpoint, FLAT or PAGED, so this is the bf16/f16 +
-        //      non-quant condition; a quantized checkpoint never registers and is
-        //      structurally `false` here.)
-        //   1b. The model weights are bf16. The paged adapter's `LayerKVPool` is
-        //      always BFloat16 and the C++ paged graph hard-codes `KvDtype::Bf16`
-        //      (its static attn mask + pool/scale dtype probes are bf16/f32), so
-        //      an f16 checkpoint would be REJECTED by the first compiled-paged
-        //      forward and silently fall back at step 0. Gate it OUT here so an
-        //      f16 paged checkpoint takes the correct pure-Rust eager paged path
-        //      with no wasted seed and no lying engagement signal.
-        //   2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE` (16): the
-        //      compiled-paged graph hard-codes block_size=16 in its
-        //      `paged_kv_write` / `paged_attention` calls.
-        //   3. `init_lfm2_paged_compiled_session` succeeds (every attn layer has
-        //      a usable `LayerKVPool` slot; every conv layer's
-        //      `Lfm2LayerCache::Conv` state is populated by the eager paged
-        //      prefill above; the C++ `g_lfm2_paged_inited` is set after init
-        //      catches no exception).
-        //
-        // LOCK CONTRACT (same as the flat path): registration is the WRITER
-        // (`register_weights_with_cpp` holds `COMPILED_WEIGHTS_RWLOCK.write()`,
-        // clears + stores, bumps the compile epoch, publishes model_id LAST).
-        // Decode is the READER: the `_weight_guard` (`.read()`, poison-recovered)
-        // spans the `mlx_lfm2_get_model_id()` re-check, the seed
-        // (`init_lfm2_paged_compiled_session` → `mlx_lfm2_moe_init_paged`), and
-        // EVERY `forward_lfm2_cpp_paged` step, so the (epoch, id) pair validated
-        // is exactly the one the compiled-paged graph executes against.
-        //
-        // CONV STATE: unlike qwen's GDN linear caches, lfm2 needs NO cross-turn
-        // conv export — the eager paged path reprefills conv from token 0 each
-        // turn (see `paged_turn_sync_core`'s per-turn `self.caches =
-        // init_caches(..)`), so the compiled-paged graph threads conv state
-        // WITHIN a turn only (in the C++ paged globals) and there is no
-        // post-loop export step.
-        use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
-        let mut use_cpp_pre = self.compiled_path_active();
-        // bf16-activation gate (1b): the compiled-PAGED graph + paged KV pools are
-        // bf16-only (KvDtype::Bf16, bf16 static mask), so the hidden state feeding
-        // `paged_kv_write`/`paged_attention` must be bf16. The gate MUST match what
-        // the graph consumes, not a hand-picked subset: `lfm2_decode_fn_paged` reads
-        // operator/FFN/final norms, q/k norms, attention out_proj, conv
-        // weights/biases, dense-MLP or MoE router/expert weights, and the (untied)
-        // lm_head in addition to q/k/v.
-        //
-        //  - bf16 checkpoint: EVERY float weight must be bf16
-        //    (`all_float_weights_bf16`).
-        //  - QUANTIZED checkpoint: the packed `.weight` tensors are uint32 (NOT part
-        //    of the activation dtype); the invariant is that the NON-quantized floats
-        //    (norms, conv biases, untied lm_head, dense bf16 embedding) plus the quant
-        //    float companions are bf16 (`non_quant_floats_bf16`), AND the
-        //    `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch is not set. Packed-quant
-        //    INPUT embeddings are already barred at registration (the C++ does a dense
-        //    `take` over the embedding), so a registered quantized checkpoint reaching
-        //    here has a usable dense embedding.
-        //
-        // `*.expert_bias` (intentional F32 on MoE) is the one allowed exception,
-        // handled in the load-time scans.
-        let activations_bf16 = if self.is_quantized {
-            quant_compiled_enabled() && self.non_quant_floats_bf16
-        } else {
-            self.all_float_weights_bf16
-        };
-        if use_cpp_pre && !activations_bf16 {
-            warn!(
-                "lfm2 compiled paged decode: activation-dtype invariant unmet (a non-bf16 float \
-                 weight — embedding, norm, projection, conv, FFN/MoE, or lm_head — or quantized \
-                 compiled decode disabled); the compiled-PAGED graph + paged KV pools are \
-                 bf16-only, so using the pure-Rust eager paged decode path for this request."
-            );
-            use_cpp_pre = false;
-        }
-        let mut _compiled_lock = if use_cpp_pre {
-            Some(
-                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut _weight_guard = None;
-        let cpp_session_ready = if use_cpp_pre {
-            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
-                _weight_guard = Some(guard);
-                // Seed the compiled-paged graph ONCE from the live post-prefill
-                // adapter pools + conv state. On any failure drop back to the
-                // pure-Rust paged decode for the whole turn.
-                let caches_ref = &self.caches;
-                let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                    Error::from_reason(
-                        "paged_compiled_decode_setup: paged_adapter dropped post-prefill",
-                    )
-                })?;
-                if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                    warn!(
-                        "lfm2 compiled paged decode: adapter block_size={} but compiled graph \
-                         requires {}; falling back to pure-Rust paged decode",
-                        adapter_ref.block_size(),
-                        CPP_PAGED_REQUIRED_BLOCK_SIZE
-                    );
-                    false
-                } else {
-                    let prefill_offset = adapter_ref.current_token_count() as i32;
-                    match init_lfm2_paged_compiled_session(
-                        &self.config,
-                        caches_ref,
-                        adapter_ref,
-                        prefill_offset,
-                    ) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!(
-                                "lfm2 compiled paged decode: seed failed ({e}); falling back to \
-                                 pure-Rust paged decode"
-                            );
-                            false
-                        }
-                    }
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // When the compiled-paged session did NOT come up (model_id eviction,
-        // block_size mismatch, or seed failure), the decode loop runs the pure-Rust
-        // eager paged path, which touches none of the C++ compiled globals. Holding
-        // the cross-family lifecycle mutex / weight read lock across that whole loop
-        // is needless and blocks weight registration (.write()) and other compiled
-        // startups (.lock()) for the entire generation. Drop them now. Safe because
-        // cpp_session_ready==false here implies _paged_reset_guard is None (no seed
-        // ran), so the reset-while-locks-held drop-order invariant is vacuous.
-        if !cpp_session_ready {
-            _weight_guard = None;
-            _compiled_lock = None;
-        }
-
-        // RAII guard: resets the compiled-PAGED C++ globals
-        // (`mlx_lfm2_paged_reset`) on EVERY exit path — including a `?`
-        // early-return or a first-step fallback that flips `cpp_session_ready`
-        // off — so the next request never seeds against stale paged pools.
-        // Armed iff the seed succeeded.
-        let _paged_reset_guard = cpp_session_ready.then_some(Lfm2PagedResetGuard);
-
-        // Compile-cached `max_blocks_per_seq` shape — `max_position_embeddings`
-        // div_ceil block_size keeps the compile-cache key stable across every
-        // decode step within one turn (matches qwen's paged decode loop).
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("paged_compiled_decode_setup: paged_adapter dropped pre-decode")
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
-
-        Ok(Lfm2PagedCompiledState {
-            cpp_session_ready,
-            // Tracks whether ANY compiled-paged step has completed this turn.
-            // After a successful compiled step the C++ side has advanced its
-            // per-conv-layer state global (and the adapter's paged pool via
-            // `paged_kv_write`), but the conv state is NOT imported back into
-            // `self.caches`. Falling back to the pure-Rust decode after that
-            // point would run conv from stale pre-step state while
-            // `paged_adapter` + `token_history` have advanced — silently
-            // corrupting the response. So a mid-turn failure (after the first
-            // successful compiled step) PROPAGATES; only a first-step failure
-            // falls back (mirrors qwen's `should_propagate_compiled_paged_error`).
-            cpp_compiled_step_completed: false,
-            max_blocks_per_seq,
-            _compiled_lock,
-            _weight_guard,
-            _paged_reset_guard,
-        })
-    }
-
-    /// Run one compiled-PAGED decode step (shared by both paged decode loops).
-    ///
-    /// Dispatches to the compiled C++ paged forward when `st.cpp_session_ready`,
-    /// else the pure-Rust paged decode. Returns the `[1, vocab]` logits (both
-    /// branches produce the same 2D shape). On a FIRST-step compiled failure it
-    /// rolls back the token cursor, flips `st.cpp_session_ready = false`, and
-    /// re-runs the token through the pure-Rust path. After ANY compiled step has
-    /// succeeded a mid-decode failure PROPAGATES as fatal (the C++ conv state has
-    /// advanced but is never imported back into `self.caches`).
-    fn paged_compiled_decode_step(
-        &mut self,
-        st: &mut Lfm2PagedCompiledState,
-        token_id: u32,
-        step: i32,
-    ) -> Result<MxArray> {
-        // Decode forward. Compiled-paged when `cpp_session_ready`, else the
-        // pure-Rust paged decode.
-        //
-        // Defense-in-depth: if the C++ compiled-paged forward returns null on
-        // the FIRST step, roll back the `record_tokens` cursor advance, flip
-        // `cpp_session_ready = false`, and re-run this token through
-        // `run_paged_decode_step` (which re-calls `record_tokens` on the
-        // now-rolled-back cursor). After ANY compiled step has succeeded the
-        // C++ conv state has advanced but is never imported back into
-        // `self.caches`, so a Rust fallback would read stale state —
-        // propagate the error as fatal instead of silently corrupting.
-        if st.cpp_session_ready {
-            let embedding_weight = self.embed_tokens.get_weight();
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "paged_compiled_decode_step: paged_adapter dropped mid-decode (cpp)",
-                )
-            })?;
-            adapter
-                .record_tokens(&[token_id])
-                .map_err(Error::from_reason)?;
-            let inputs = adapter
-                .build_paged_attention_inputs(1, 1, st.max_blocks_per_seq)
-                .map_err(Error::from_reason)?;
-            let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-            match forward_lfm2_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                Ok(logits) => {
-                    st.cpp_compiled_step_completed = true;
-                    // Compiled-paged logits are [B, vocab] (already 2D).
-                    Ok(logits)
-                }
-                Err(e) => {
-                    if crate::engine::should_propagate_compiled_paged_error(
-                        st.cpp_compiled_step_completed,
-                    ) {
-                        warn!(
-                            "lfm2 compiled paged forward failed mid-decode (step={step}) AFTER \
-                             an earlier compiled step succeeded. The C++ conv state has \
-                             advanced but is not imported back into self.caches, so a \
-                             pure-Rust fallback would run from stale state and silently \
-                             corrupt the response. Propagating as fatal. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        return Err(e);
-                    }
-                    warn!(
-                        "lfm2 compiled paged forward failed on first decode step \
-                         (step={step}); rolling back token cursor and falling back to \
-                         pure-Rust paged decode for the rest of this request. cause: {e}"
-                    );
-                    adapter
-                        .rollback_last_tokens(1)
-                        .map_err(Error::from_reason)?;
-                    st.cpp_session_ready = false;
-                    // The rest of this turn runs pure-Rust eager paged decode
-                    // (`run_paged_decode_step` touches none of the C++ compiled
-                    // paged globals), so the seeded compiled-paged session is now
-                    // dead. Tear it down and release the process-wide locks NOW
-                    // instead of pinning them for the whole generation (they
-                    // otherwise block weight registration `.write()` / other
-                    // compiled startups `.lock()`).
-                    //
-                    // ORDER IS LOAD-BEARING (mirrors the struct field drop order,
-                    // see `Lfm2PagedCompiledState`): drop the reset guard FIRST so
-                    // `mlx_lfm2_paged_reset()` runs WHILE the lifecycle mutex +
-                    // weight read lock are STILL held; only THEN release the locks.
-                    // After this all three guards are None, so the struct's
-                    // eventual drop is a no-op (no double reset / double release).
-                    drop(st._paged_reset_guard.take());
-                    st._weight_guard = None;
-                    st._compiled_lock = None;
-                    // Re-run this token through the pure-Rust paged decode
-                    // (re-records the token on the rolled-back cursor).
-                    self.run_paged_decode_step(token_id)?.squeeze(Some(&[1]))
-                }
-            }
-        } else {
-            // Pure-Rust paged decode fallback.
-            self.run_paged_decode_step(token_id)?.squeeze(Some(&[1]))
-        }
-    }
-
-    /// Inner forward + decode loop for `paged_turn_sync_core`. Split out
-    /// so the caller can wrap it with `release_request` on either path.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_sync_core_inner(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &crate::engine::ChatParams,
-        eos_token_id: u32,
-        sampling_config: &Option<crate::sampling::SamplingConfig>,
-        reasoning_tracker: &mut ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-    ) -> Result<(Vec<u32>, String)> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        // === PREFILL ===
-        // Run conv prefill on the FULL prompt (since conv state must
-        // start from token 0). For attention layers the paged path only
-        // writes the suffix into the pool — the cached prefix already
-        // lives in the pool from a prior request that registered it.
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let last_logits = self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?;
-
-        // Apply penalties + sample first token
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, *sampling_config)?;
-        y.eval();
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating. Prefill builds a massive MLX subgraph; once
-        // we have the last logits, those intermediates are dead but
-        // MLX's caching allocator holds them.
-        crate::array::synchronize_and_clear_cache();
-
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // ===== Compiled C++ PAGED decode-path dispatch =====
-        // Acquire the locks, gate, and seed the compiled-paged session for this
-        // turn. The returned state holds the RAII guards (compiled lifecycle
-        // mutex, weight read lock, paged reset guard) that span the whole decode
-        // loop; the same setup + per-step dispatch is shared with the streaming
-        // path (`paged_turn_stream_core_inner`). See
-        // `paged_compiled_decode_setup` / `paged_compiled_decode_step`.
-        let mut paged_st = self.paged_compiled_decode_setup()?;
-
-        // === DECODE LOOP ===
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = String::from("length");
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            reasoning_tracker.observe_token(token_id);
-
-            if token_id == eos_token_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward (compiled-paged when seeded, else pure-Rust paged)
-            // via the shared per-step dispatcher (mirrored by the streaming path).
-            let next_logits = self.paged_compiled_decode_step(&mut paged_st, token_id, step)?;
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, *sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        Ok((generated_tokens, finish_reason))
     }
 
     /// Run a paged-attention prefill over the full prompt, dispatching
@@ -1530,10 +891,17 @@ impl Lfm2Inner {
         Ok(logits)
     }
 
-    /// Forward the cached prefix tokens through CONV layers ONLY,
-    /// updating their state in-place. Used to bring conv state up to the
-    /// paged cache's `cached_prefix_len` boundary before pass 2 of
-    /// `run_paged_prefill_chunk` continues with the suffix.
+    /// Forward the cached prefix tokens through ALL layers (conv state
+    /// updated in-place; attention run as a flat causal self-prefill whose
+    /// K/V are discarded — the prefix K/V already live in the paged pool).
+    /// Used to rebuild the EXACT inter-layer residual stream so conv state is
+    /// brought up to the paged cache's `cached_prefix_len` boundary before
+    /// pass 2 of `run_paged_prefill_chunk` continues with the suffix.
+    ///
+    /// (Name kept for history; this is no longer "conv only" — attention must
+    /// run to feed downstream conv layers the correct residual, otherwise their
+    /// state drifts and paged-CONTINUE diverges from flat. See
+    /// `tests/lfm2_paged_vs_flat_parity.rs::lfm2_paged_budget_forced_warm_continue_parity`.)
     fn run_conv_only_prefill(&mut self, prefix_tokens: &[u32]) -> Result<()> {
         if prefix_tokens.is_empty() {
             return Ok(());
@@ -1545,31 +913,49 @@ impl Lfm2Inner {
         for layer_idx in 0..num_layers {
             let layer = &self.layers[layer_idx];
             if layer.is_attention_layer() {
-                // Skip attention layers — they pull the prefix from the
-                // paged pool's prefix cache. The hidden_states we feed
-                // forward here will not pass through their projection,
-                // so we make a SHAPE-PRESERVING identity passthrough.
-                // This is safe because attention layers' contribution
-                // to subsequent conv layers' input depends on their
-                // residual + FFN, which is unrecoverable without a
-                // full attention pass. Specifically: this `pass 1`
-                // path only runs when cached_prefix_len > 0 i.e. we're
-                // re-using state from a previous turn that already
-                // computed exact conv state. In the smoke-test path
-                // (cached_prefix_len == 0) this method is never called.
+                // EXACT prefix reconstruction. This pass rebuilds the
+                // inter-layer residual stream so DOWNSTREAM conv layers see
+                // the same input the cold full-prefill (Pass-2) would. An
+                // attention layer's contribution to that stream (out_proj +
+                // residual + FFN) is NOT recoverable by an identity
+                // passthrough, so we must actually run attention here.
                 //
-                // **Limitation**: this is approximate — for exact
-                // numerical equivalence we'd need to re-run attention
-                // here too, which defeats the purpose of the prefix
-                // cache. Known issue for follow-up.
-                continue;
+                // Run it as a FLAT causal self-prefill: `cache=None` +
+                // `mask=None` + `seq_len>1` ⇒ `Lfm2Attention::forward` does
+                // internal causal SDPA at RoPE positions 0..prefix_len
+                // (attention.rs) with ZERO paged-pool I/O — so it does NOT
+                // call `update_keys_values` and cannot trip its
+                // already-recorded-suffix alignment check. The K/V computed
+                // here are intentionally DISCARDED: Pass-2's suffix attention
+                // reads the prefix K/V from the LIVE pool (written in the
+                // prior turn, reused verbatim by continue_turn), which this
+                // pass never touches. The result is byte-identical to
+                // cold/flat for every downstream conv layer's state.
+                //
+                // (WAS a shape-preserving identity passthrough — an
+                // explicitly-approximate reconstruction that dropped the
+                // attention contribution and drifted downstream conv state,
+                // causing paged-CONTINUE to diverge from flat on a warm turn.
+                // See tests/lfm2_paged_vs_flat_parity.rs
+                // `lfm2_paged_budget_forced_warm_continue_parity`.)
+                hidden_states = layer.forward(&hidden_states, None, None)?;
+            } else {
+                // Conv layer: forward through the operator + FFN tail.
+                let cache_slot = unsafe {
+                    let ptr = self.caches.as_mut_ptr().add(layer_idx);
+                    &mut *ptr
+                };
+                hidden_states = layer.forward(&hidden_states, None, Some(cache_slot))?;
             }
-            // Conv layer: forward through the operator + FFN tail.
-            let cache_slot = unsafe {
-                let ptr = self.caches.as_mut_ptr().add(layer_idx);
-                &mut *ptr
-            };
-            hidden_states = layer.forward(&hidden_states, None, Some(cache_slot))?;
+            // Bound the in-flight lazy graph, mirroring Pass-2 in
+            // `run_paged_prefill_chunk`. Now that this pass runs causal SDPA
+            // over the WHOLE cached prefix (not just conv), MLX would otherwise
+            // retain a monolithic prefix DAG until the post-prefill sync —
+            // risking a memory peak / OOM on long warm-continue prefixes. The
+            // helper eval+clears every `MLX_PAGED_PREFILL_EVAL_INTERVAL` layers;
+            // it is BYTE-NEUTRAL (an eval forces materialization, it does not
+            // change values), so parity is unaffected.
+            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
         Ok(())
     }
@@ -1579,470 +965,6 @@ impl Lfm2Inner {
     /// their original order) and `Conv` for conv layers.
     fn compute_layer_kinds(&self) -> Vec<Lfm2LayerKind> {
         compute_layer_kinds_for(&self.config, self.layers.len())
-    }
-
-    /// Block-paged streaming variant of the deleted flat
-    /// `chat_stream_sync_core`.
-    ///
-    /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and forward
-    /// dispatch (reset → find_cached_prefix → allocate_suffix → prefill
-    /// via `run_paged_prefill_chunk` → decode loop via
-    /// `run_paged_decode_step`) but emits each generated token through
-    /// the streaming callback as it is produced.
-    ///
-    /// Mirrors the flat streaming path's terminal contract:
-    /// * Streams text chunks for every decoded token.
-    /// * Sends a residual chunk for any tokens whose detokenized text
-    ///   has not yet been flushed.
-    /// * Sends a terminal `done: true` chunk with `finish_reason`,
-    ///   aggregated `tool_calls`, `thinking`, performance metrics, and
-    ///   the matched cached-prefix length.
-    ///
-    /// Applies the same vLLM `max_cache_hit_tokens = prompt.len() - 1`
-    /// cap as `paged_turn_sync_core` so zero-delta prompts still produce
-    /// at least one suffix token to prefill. Numerical equivalence to the
-    /// flat path is not asserted here.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core(
-        &mut self,
-        tokens: Vec<u32>,
-        tokenizer: Arc<Qwen3Tokenizer>,
-        think_end_id: Option<u32>,
-        think_end_str: Option<String>,
-        include_reasoning: bool,
-        p: &crate::engine::ChatParams,
-        thinking: ThinkingSetup,
-        report_perf: bool,
-        eos_token_id: u32,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-    ) -> Result<()> {
-        let prompt_token_count = tokens.len();
-        let sampling_config = p.sampling_config;
-
-        let generation_start = if report_perf {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut first_token_instant: Option<std::time::Instant> = None;
-
-        // LFM2's chat template ignores enable_thinking; the model ALWAYS
-        // emits a <think>…</think> block, so reasoning is always tracked AND
-        // parsed. reasoningEffort controls the thinking BUDGET, not whether.
-        // The (enabled, budget) pair is resolved ONCE at turn entry from
-        // the family policy (AlwaysOnBudgetFromEffort) and threaded in as
-        // `thinking`; this core no longer recomputes it.
-        let thinking_enabled = thinking.enabled;
-        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
-
-        // Streaming decode state
-        let mut decode_stream = tokenizer.inner().decode_stream(true);
-        let mut streamed_text_len = 0usize;
-        let mut last_is_reasoning = thinking_enabled;
-
-        // === Adapter lifecycle: warm continuation OR cold start. ===
-        // See the equivalent block in `paged_turn_sync_core` for full
-        // discussion.
-        let seq_id: u32 = 0;
-        // Lazy decode allocation: pass the prompt length only.
-        let total_budget = tokens.len() as u32;
-        // See `paged_turn_sync_core` for the vLLM-style cap rationale.
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // P3: adapter-owned lifecycle (see paged_turn_sync_core). LITERAL
-        // `true` for reuse_cache — lfm2's hand-rolled can_continue had no
-        // reuse term; the adapter ANDs reuse_cache, so true preserves it.
-        let cached_prefix_len = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_stream_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &[],
-                0,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?
-            .cached_prefix_len;
-
-        // Reset conv-layer state for this turn (see paged_turn_sync_core
-        // doc comment).
-        self.caches = init_caches(&self.config);
-        self.cached_token_history.clear();
-        self.cached_image_key = None;
-
-        let total_prompt_tokens = tokens.len() as u32;
-        let suffix_len = total_prompt_tokens
-            .checked_sub(cached_prefix_len)
-            .ok_or_else(|| {
-                Error::from_reason(
-                    "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
-                )
-            })?;
-
-        if total_prompt_tokens == 0 {
-            // Release before bailing.
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
-            return Err(Error::from_reason("Empty prompt"));
-        }
-
-        // Run the forward + decode under a try-style block so we can
-        // always release the request afterwards.
-        let result = self.paged_turn_stream_core_inner(
-            &tokens,
-            cached_prefix_len,
-            suffix_len,
-            p,
-            sampling_config,
-            eos_token_id,
-            &mut reasoning_tracker,
-            report_perf,
-            &mut first_token_instant,
-            &tokenizer,
-            &mut decode_stream,
-            &mut streamed_text_len,
-            &mut last_is_reasoning,
-            cb,
-            cancelled,
-        );
-
-        let (generated_tokens, finish_reason) = match result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    // Keep request live across turns. See
-                    // `finalize_turn_keep_live` doc + the non-streaming
-                    // `paged_turn_sync_core`'s terminal block.
-                    let _ = adapter.finalize_turn_keep_live(&[], 0);
-                }
-                t
-            }
-            Err(e) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                return Err(e);
-            }
-        };
-
-        // Persist the session's token history so the subsequent
-        // `chat_session_continue` (which dispatches to
-        // `chat_tokens_delta_sync`) finds an initialized session and
-        // can build its delta on top of the prior prompt + reply.
-        // See the non-streaming `paged_turn_sync_core` for the rationale
-        // on `last_token_in_cache = false`.
-        let last_token_in_cache = false;
-        self.save_cache_state_internal(true, &tokens, &generated_tokens, last_token_in_cache);
-
-        // Flush residual buffered bytes from decode_stream (mirrors flat
-        // streaming).
-        let full_text = tokenizer
-            .decode_sync(&generated_tokens, true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to decode generated tokens: {}", e);
-                String::new()
-            });
-        if full_text.len() > streamed_text_len {
-            let residual = full_text[streamed_text_len..].to_string();
-            // Suppress residual when it is reasoning text and
-            // include_reasoning == false.
-            if include_reasoning || !last_is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: residual,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(last_is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-        }
-
-        // Performance metrics.
-        // Paged prefill reprocesses the FULL prompt through conv layers
-        // (run_paged_prefill_chunk Pass 1); only the attention suffix skips the
-        // cached prefix. ttft measures full-prompt work, so the throughput
-        // numerator must be the full prompt, not tokens.len()-cached_prefix_len.
-        // (If a future LFM2 paged variant carries conv state across turns and
-        // truly forwards only the delta during prefill, revert this to the
-        // delta count.)
-        let performance = if report_perf {
-            compute_performance_metrics(
-                generation_start,
-                first_token_instant,
-                tokens.len(),
-                generated_tokens.len(),
-            )
-        } else {
-            None
-        };
-
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
-
-        let mut result = finalize_chat_result(
-            &tokenizer,
-            &generated_tokens,
-            finish_reason,
-            think_end_id,
-            think_end_str.as_deref(),
-            performance,
-            include_reasoning,
-            thinking_enabled,
-            prompt_token_count as u32,
-            reasoning_tokens,
-        )?;
-        result.cached_tokens = cached_prefix_len;
-
-        // Send terminal chunk
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: result.text.clone(),
-                done: true,
-                finish_reason: Some(result.finish_reason.clone()),
-                tool_calls: Some(result.tool_calls.clone()),
-                thinking: result.thinking.clone(),
-                num_tokens: Some(result.num_tokens),
-                prompt_tokens: Some(result.prompt_tokens),
-                reasoning_tokens: Some(result.reasoning_tokens),
-                raw_text: Some(result.raw_text.clone()),
-                cached_tokens: Some(cached_prefix_len),
-                performance: result.performance.clone(),
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
-        Ok(())
-    }
-
-    /// Inner forward + streaming decode loop for
-    /// [`Self::paged_turn_stream_core`]. Split out so the caller can
-    /// wrap with `release_request` in a try-style flow.
-    #[allow(clippy::too_many_arguments)]
-    fn paged_turn_stream_core_inner<'a>(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        suffix_len: u32,
-        p: &crate::engine::ChatParams,
-        sampling_config: Option<crate::sampling::SamplingConfig>,
-        eos_token_id: u32,
-        reasoning_tracker: &mut ReasoningTracker,
-        report_perf: bool,
-        first_token_instant: &mut Option<std::time::Instant>,
-        tokenizer: &'a Arc<Qwen3Tokenizer>,
-        decode_stream: &mut tokenizers::DecodeStream<
-            'a,
-            tokenizers::ModelWrapper,
-            tokenizers::NormalizerWrapper,
-            tokenizers::PreTokenizerWrapper,
-            tokenizers::PostProcessorWrapper,
-            tokenizers::DecoderWrapper,
-        >,
-        streamed_text_len: &mut usize,
-        last_is_reasoning: &mut bool,
-        cb: &StreamSender<'_>,
-        cancelled: &AtomicBool,
-    ) -> Result<(Vec<u32>, String)> {
-        // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
-        debug_assert!(
-            suffix_len > 0,
-            "paged_turn_stream_core: caller must cap max_cache_hit_tokens at prompt.len() - 1"
-        );
-
-        // === PREFILL ===
-        let suffix = &tokens[(cached_prefix_len as usize)..];
-        let last_logits = self.run_paged_prefill_chunk(tokens, suffix, cached_prefix_len)?;
-
-        // Apply penalties + sample first token
-        let mut token_history: Vec<u32> = tokens.to_vec();
-        let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
-        let mut y = sample(&last_logits, sampling_config)?;
-        y.eval();
-
-        // Smooth memory peak: drop transient prefill buffers before decode
-        // starts allocating (see paged_turn_sync_core_inner for rationale).
-        crate::array::synchronize_and_clear_cache();
-
-        if report_perf {
-            *first_token_instant = Some(std::time::Instant::now());
-        }
-
-        // ===== Compiled C++ PAGED decode-path dispatch =====
-        // Same setup the non-streaming path uses: acquire the compiled lifecycle
-        // + weight locks, gate, and seed the compiled-paged session for this
-        // turn. The returned state holds the RAII guards spanning the whole
-        // streaming decode loop. A fatal mid-turn compiled failure surfaced by
-        // `paged_compiled_decode_step` propagates out of this streaming function
-        // via `?` (correct — the C++ conv state has advanced and cannot be
-        // recovered into `self.caches`).
-        let mut paged_st = self.paged_compiled_decode_setup()?;
-
-        // === STREAMING DECODE LOOP ===
-        let max_new_tokens = p.max_new_tokens;
-        let mut generated_tokens: Vec<u32> =
-            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
-        let mut finish_reason = String::from("length");
-
-        for step in 0..max_new_tokens {
-            let token_id = y.item_at_int32(0)? as u32;
-            generated_tokens.push(token_id);
-            token_history.push(token_id);
-            let is_reasoning = reasoning_tracker.observe_token(token_id);
-            *last_is_reasoning = is_reasoning;
-
-            if token_id == eos_token_id {
-                finish_reason = String::from("stop");
-                break;
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                finish_reason = String::from("cancelled");
-                break;
-            }
-
-            // Stream delta chunk
-            let token_text = Qwen3Tokenizer::step_decode_stream(
-                decode_stream,
-                tokenizer.inner(),
-                token_id,
-                &generated_tokens,
-                *streamed_text_len,
-            );
-            *streamed_text_len += token_text.len();
-            // Suppress reasoning deltas when include_reasoning == false.
-            // Detokenize + length-advance above stay OUTSIDE this gate.
-            if p.include_reasoning || !is_reasoning {
-                cb.call(
-                    Ok(ChatStreamChunk {
-                        text: token_text,
-                        done: false,
-                        finish_reason: None,
-                        tool_calls: None,
-                        thinking: None,
-                        num_tokens: None,
-                        prompt_tokens: None,
-                        reasoning_tokens: None,
-                        raw_text: None,
-                        cached_tokens: None,
-                        performance: None,
-                        is_reasoning: Some(is_reasoning),
-                    }),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                );
-            }
-
-            if let Some(reason) = crate::sampling::check_repetition_cutoff(
-                &generated_tokens,
-                p.max_consecutive_tokens,
-                p.max_ngram_repeats,
-                p.ngram_size,
-            ) {
-                finish_reason = reason.to_string();
-                break;
-            }
-            if step + 1 >= max_new_tokens {
-                break;
-            }
-
-            // Decode forward (compiled-paged when seeded, else pure-Rust paged)
-            // via the shared per-step dispatcher (mirrors the non-streaming path).
-            let next_logits = self.paged_compiled_decode_step(&mut paged_st, token_id, step)?;
-
-            let next_logits = if reasoning_tracker.should_force_think_end() {
-                let forced_id = reasoning_tracker.forced_token_id()? as i32;
-                y = MxArray::from_int32(&[forced_id], &[1])?;
-                y.eval();
-                continue;
-            } else {
-                apply_all_penalties(next_logits, &token_history, p)?
-            };
-
-            y = sample(&next_logits, sampling_config)?;
-            y.eval();
-
-            crate::array::maybe_clear_cache_for_paged_step(step);
-        }
-
-        Ok((generated_tokens, finish_reason))
-    }
-
-    /// Block-paged whole-turn dispatch behind the engine's
-    /// [`ChatBackend::paged_turn`] probe (S11).
-    ///
-    /// Routes the two FRESH turn shapes onto the kept paged cores
-    /// verbatim: sync → [`Self::paged_turn_sync_core`], streaming →
-    /// [`Self::paged_turn_stream_core`]. Delta turns never reach
-    /// this helper — [`ChatBackend::paged_turn`] declines them (legacy
-    /// lfm2 delta paths run the flat eager prefill+decode over
-    /// `self.caches` even when `paged_adapter` is `Some`).
-    ///
-    /// Parameter mapping == the deleted flat-core dispatch:
-    /// `think_end_id`/`think_end_str` from the tokenizer,
-    /// `include_reasoning`/`report_perf` from the resolved params
-    /// (`extract_chat_params` resolves `include_reasoning` via the same
-    /// `resolve_include_reasoning` the legacy dispatch called), and the
-    /// the resolved per-turn [`ThinkingSetup`] (`args.thinking`) for the
-    /// reasoning tracker.
-    fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let tokenizer = args.tokenizer.clone();
-        let think_end_id = tokenizer.think_end_id();
-        let think_end_str = tokenizer.think_end_str().map(|st| st.to_string());
-        // Resolved ONCE at turn entry (resolve(AlwaysOnBudgetFromEffort,
-        // config)); `ThinkingSetup` is `Copy` so it moves into whichever
-        // core arm fires without re-borrowing `args`.
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                let cb = StreamSender(sink);
-                self.paged_turn_stream_core(
-                    args.tokens.to_vec(),
-                    tokenizer,
-                    think_end_id,
-                    think_end_str,
-                    args.params.include_reasoning,
-                    args.params,
-                    thinking,
-                    args.params.report_performance,
-                    args.eos_id,
-                    &cb,
-                    cancelled,
-                )?;
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let result = self.paged_turn_sync_core(
-                    args.tokens.to_vec(),
-                    tokenizer,
-                    think_end_id,
-                    think_end_str,
-                    args.params.include_reasoning,
-                    args.params,
-                    thinking,
-                    args.params.report_performance,
-                    args.eos_id,
-                )?;
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
-        }
     }
 }
 
@@ -2604,11 +1526,638 @@ impl ChatBackend for Lfm2Inner {
         // prefill+decode over `self.caches` even when `paged_adapter`
         // was `Some`. Decline delta turns so the generic flow (eager
         // flat delta) runs, exactly like legacy; fresh turns take the
-        // kept paged cores for both sync and streaming.
+        // generic paged engine for both sync and streaming.
+        //
+        // ⚠ OPPOSITE of qwen3 (which runs the engine UNCONDITIONALLY for
+        // fresh + delta): lfm2 keeps its `is_delta` decline. Consequence:
+        // `is_delta` is ALWAYS false inside lfm2's `run_paged_turn`, so the
+        // engine's `reuse_cache = if is_delta {true} else {p.reuse_cache}`
+        // collapses to `p.reuse_cache`.
         if args.is_delta {
             return None;
         }
-        Some(self.paged_whole_turn(args))
+        // P4-2: the forked `paged_turn_sync_core` / `paged_turn_stream_core`
+        // were deleted — the model-neutral `run_paged_turn` drives the whole
+        // turn through `<Lfm2Inner as PagedBackend>` (prime → prefill →
+        // begin_paged_decode → decode loop → save), mirroring qwen3 P4-1.
+        //
+        // DELIBERATE behavior convergence (think-budget force ordering):
+        // `run_decode_loop` forces `</think>` FORCE-before-OBSERVE — it peeks
+        // `should_force_think_end()` for the NEXT token before observing the
+        // current one, so a budget of N yields N+1 reasoning tokens. That is
+        // the engine's unit-test-locked contract (engine::decode
+        // `budget_forcing_injects_think_end_token`; the observe-after-force
+        // note at decode.rs ~412) and the ordering of lfm2 FLAT + qwen3.
+        // The DELETED lfm2 paged loops were OBSERVE-before-FORCE (budget N →
+        // N tokens) — the ONLY path on origin/main with that ordering, so
+        // main's own flat and paged already disagreed by one token whenever a
+        // think-budget force fired mid-`<think>`. P4-2 converges paged onto
+        // flat (backward-compat waived for this refactor); the only behavior
+        // delta vs legacy lfm2 paged is that one extra reasoning token under
+        // active budget forcing at T=0. `lfm2_paged_vs_flat_greedy_token_parity`
+        // (budget 32) now holds because both paths share this loop.
+        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    }
+}
+
+impl DecodeStep for Lfm2PagedDecode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        // NOT on the hot path — the engine drives decode via
+        // `forward_with_token` (which hands the scalar the loop already
+        // read). Kept only to satisfy the trait; extract then delegate.
+        let token_id = input_ids.item_at_int32(0)? as u32;
+        self.forward_with_token(input_ids, token_id)
+    }
+
+    fn forward_with_token(
+        &mut self,
+        _input_ids: &MxArray,
+        token_id: u32,
+    ) -> Result<(MxArray, bool)> {
+        // Runs the BODY of the deleted `paged_compiled_decode_step`,
+        // inlined against `self`'s fields (the compiled-paged session state
+        // now LIVES on the stepper, not a separate `&mut state` arg).
+        // Compiled-paged when `self.cpp_session_ready`, else the pure-Rust
+        // eager paged step.
+        //
+        // PERF: `token_id` is HANDED by the engine (already read once at the
+        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32`
+        // the fresh `_input_ids` reshape — that redundant second per-step
+        // eval/sync measurably regressed the fast compiled-paged decode
+        // (~5% on lfm2-1.2B; legacy `paged_compiled_decode_step` took the
+        // `u32` directly and never re-extracted). `record_tokens` + the
+        // `[1, 1]` re-embed below rebuild from the scalar via `from_uint32`,
+        // so `_input_ids` is unused (kept for signature parity).
+        let step = self.step_counter;
+        self.step_counter += 1;
+
+        // Defense-in-depth: if the C++ compiled-paged forward returns null
+        // on the FIRST step, roll back the `record_tokens` cursor advance,
+        // flip `cpp_session_ready = false`, and re-run this token through
+        // `run_paged_decode_step` (which re-calls `record_tokens` on the
+        // now-rolled-back cursor). After ANY compiled step has succeeded the
+        // C++ conv state has advanced but is never imported back into
+        // `self.inner.caches`, so a Rust fallback would read stale state —
+        // propagate the error as fatal instead of silently corrupting.
+        let logits = if self.cpp_session_ready {
+            let embedding_weight = self.inner.embed_tokens.get_weight();
+            let max_blocks_per_seq = self.max_blocks_per_seq;
+            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "Lfm2PagedDecode::forward: paged_adapter dropped mid-decode (cpp)",
+                )
+            })?;
+            adapter
+                .record_tokens(&[token_id])
+                .map_err(Error::from_reason)?;
+            let inputs = adapter
+                .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                .map_err(Error::from_reason)?;
+            let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+            match forward_lfm2_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                Ok(logits) => {
+                    self.cpp_compiled_step_completed = true;
+                    // Compiled-paged logits are [B, vocab] (already 2D).
+                    logits
+                }
+                Err(e) => {
+                    if crate::engine::should_propagate_compiled_paged_error(
+                        self.cpp_compiled_step_completed,
+                    ) {
+                        // PROPAGATE branch: an earlier compiled step already
+                        // ran. Roll back the cursor then `return Err(e)`
+                        // WITHOUT touching the three guards — the stepper's
+                        // field-drop (on the `run_paged_turn` decode-scope
+                        // close) fires the reset under the still-held locks,
+                        // in declaration order. Touching the guards here too
+                        // would double-reset.
+                        warn!(
+                            "lfm2 compiled paged forward failed mid-decode (step={step}) AFTER \
+                             an earlier compiled step succeeded. The C++ conv state has \
+                             advanced but is not imported back into self.caches, so a \
+                             pure-Rust fallback would run from stale state and silently \
+                             corrupt the response. Propagating as fatal. cause: {e}"
+                        );
+                        adapter
+                            .rollback_last_tokens(1)
+                            .map_err(Error::from_reason)?;
+                        return Err(e);
+                    }
+                    warn!(
+                        "lfm2 compiled paged forward failed on first decode step \
+                         (step={step}); rolling back token cursor and falling back to \
+                         pure-Rust paged decode for the rest of this request. cause: {e}"
+                    );
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                    self.cpp_session_ready = false;
+                    // SILENT-FALLBACK branch: the rest of this turn runs
+                    // pure-Rust eager paged decode (`run_paged_decode_step`
+                    // touches none of the C++ compiled paged globals), so the
+                    // seeded compiled-paged session is now dead. Tear it down
+                    // and release the process-wide locks NOW instead of
+                    // pinning them for the whole generation (they otherwise
+                    // block weight registration `.write()` / other compiled
+                    // startups `.lock()`).
+                    //
+                    // ORDER IS LOAD-BEARING (mirrors the struct field drop
+                    // order, see `Lfm2PagedDecode`): drop the reset guard
+                    // FIRST so `mlx_lfm2_paged_reset()` runs WHILE the
+                    // lifecycle mutex + weight read lock are STILL held; only
+                    // THEN release the locks. After this all three guards are
+                    // None, so the struct's eventual field-drop is a no-op (no
+                    // double reset / double release).
+                    //
+                    // BORROW DISCIPLINE (G4): the `adapter` borrow of
+                    // `self.inner.paged_adapter` ends after the rollback above;
+                    // we then mutate `self`'s OWN guard fields, and only THEN
+                    // re-borrow `self.inner` for `run_paged_decode_step`. The
+                    // guard-mutation and the `self.inner` call are SEQUENCED,
+                    // never interleaved — interleaving would be E0499.
+                    drop(self._paged_reset_guard.take());
+                    self._weight_guard = None;
+                    self._compiled_lock = None;
+                    // Re-run this token through the pure-Rust paged decode
+                    // (re-records the token on the rolled-back cursor).
+                    self.inner
+                        .run_paged_decode_step(token_id)?
+                        .squeeze(Some(&[1]))?
+                }
+            }
+        } else {
+            // Pure-Rust paged decode fallback.
+            self.inner
+                .run_paged_decode_step(token_id)?
+                .squeeze(Some(&[1]))?
+        };
+
+        // G7: BOTH branches already pre-squeeze to [1, vocab] — the compiled
+        // path returns native 2D [B, vocab]; the eager path runs
+        // `run_paged_decode_step` ([1, 1, vocab]) then `squeeze([1])`.
+        // `needs_squeeze = FALSE`. ⚠ POLARITY IS INVERTED vs qwen3 (whose
+        // `Qwen3PagedDecode::forward` returns `true` from a direct
+        // `run_paged_decode_step`) — lfm2's squeeze lives in this body, so
+        // returning `true` here would double-squeeze and break the sampler.
+        Ok((logits, false))
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
+        // Single SYNCHRONOUS eval of `next_token` pulls the logits AND the
+        // paged K/V writes through the dependency chain (== legacy
+        // `paged_turn_{sync,stream}_core_inner`'s `y.eval()`, one sync wait);
+        // the loop-top `y.eval()` then no-ops on the already-materialized token.
+        //
+        // NOT `async_eval_arrays([next_token, logits])` (the qwen3-style
+        // schedule): lfm2's compiled forward has negligible per-step CPU work
+        // (~110us issue vs ~5.4ms GPU/token, bandwidth-bound), so the async
+        // two-wait (bottom `async_eval` + loop-top `y.eval`) buys ZERO overlap
+        // and costs ~5% vs the single sync wait. Restores decode parity with
+        // fba240b8.
+        //
+        // `_budget_forced` is unused: the earlier "budget-forced K/V hole" (a
+        // forced final token leaving its compiled K/V co-output lazy) was
+        // REFUTED — the only real cross-turn divergence on a budget-forced
+        // length exit was the conv Pass-1 attention-skip in
+        // `run_conv_only_prefill` (a LOGICAL bug, reproduced byte-identical
+        // under eager AND compiled), now fixed there. See
+        // tests/lfm2_paged_vs_flat_parity.rs
+        // `lfm2_paged_budget_forced_warm_continue_parity`.
+        next_token.eval();
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        // Paged cadence — the legacy paged loops' per-step
+        // `maybe_clear_cache_for_paged_step(step)`.
+        crate::array::maybe_clear_cache_for_paged_step(step);
+    }
+
+    fn compiled_step_completed(&self) -> Option<bool> {
+        // Surface the silent-eager-fallback latch (contract-honest for a
+        // compiled-paged stepper). lfm2 already consumes it internally in
+        // `forward` via `should_propagate_compiled_paged_error`; returning
+        // `Some(..)` here is cheap and forward-compatible.
+        Some(self.cpp_compiled_step_completed)
+    }
+
+    // `materialize_final` — DO NOT override (default no-op). CRITICAL: lfm2
+    // PAGED must NOT re-run a decode step for the final length-exit token.
+    // The C++ compiled conv-state global only advanced for the tokens the
+    // loop actually forwarded; re-running `run_paged_decode_step` here would
+    // record a token the compiled conv state never advanced → conv desync.
+    // The drop-on-length `save_paged_history` already keeps history aligned
+    // with the adapter (see the token-accounting proof on
+    // `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra forward
+    // is needed.
+    //
+    // `end_decode` — DO NOT override (default Ok(())). lfm2 PAGED seeds conv
+    // from scratch each turn (no cross-turn conv export — the eager paged
+    // path reprefills conv from token 0 every turn), so there is nothing to
+    // export back into `self.caches`. (The FLAT `Lfm2Decode::end_decode`
+    // exports the compiled caches — that is the FLAT path ONLY.)
+}
+
+/// lfm2 paged prefix state — the effective prefix/suffix split from
+/// `prepare_turn_with_max_cache_hit_tokens`, PLUS the full prompt tokens.
+///
+/// `full_tokens` is the load-bearing gap vs qwen3's 2-usize
+/// `Qwen3PrefixState`: the engine hands `paged_prefill` ONLY the suffix
+/// (`tokens[effective_cached_prefix_len..]`), but lfm2's
+/// `run_paged_prefill_chunk` needs the FULL prompt for the conv-only Pass-1
+/// over `full_tokens[..cached_prefix_len]`. Stash `plan.to_vec()` during the
+/// prime so `paged_prefill` can recover it.
+pub(crate) struct Lfm2PrefixState {
+    effective_cached_prefix_len: usize,
+    suffix_len: usize,
+    full_tokens: Vec<u32>,
+}
+
+impl PagedPrefix for Lfm2PrefixState {
+    fn effective_cached_prefix_len(&self) -> usize {
+        self.effective_cached_prefix_len
+    }
+    fn suffix_len(&self) -> usize {
+        self.suffix_len
+    }
+}
+
+impl PagedBackend for Lfm2Inner {
+    type PagedDecode<'a>
+        = Lfm2PagedDecode<'a>
+    where
+        Self: 'a;
+    type PrefixState = Lfm2PrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        _reuse_cache: bool,
+        _block_size: usize,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        // Lazy decode allocation: pass the prompt length only (decode blocks
+        // grow on-demand via `record_tokens`). vLLM-style exact-prefix cap:
+        // leave at least one prompt token to prefill so the decoder always
+        // has something to consume.
+        let total_budget = plan.len() as u32;
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let seq_id: u32 = 0;
+        // P3: adapter-owned warm-continue/cold-start lifecycle. NOTE: lfm2's
+        // hand-rolled `can_continue` had NO reuse_cache term, so pass LITERAL
+        // `true` — the adapter ANDs reuse_cache into its own can_continue,
+        // and `true` preserves the original always-eligible warm predicate.
+        // ⚠ Do NOT thread the engine's `reuse_cache` here (qwen3 does); the
+        // engine's `reuse_cache` instead drives finalize/save (Decision 2).
+        // Suffix blocks are allocated inside prepare_turn; do not re-allocate.
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                true,
+                extra_keys,
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+
+        // Reset conv-layer state for this turn. The paged path does not carry
+        // conv prefix state across turns; each turn reprefills from the start
+        // of the prompt over conv layers. `run_paged_turn` is family-neutral
+        // and will NOT do this — forget it and conv state goes stale across
+        // turns (legacy `paged_turn_*_core`'s per-turn `self.caches =
+        // init_caches(..)`).
+        self.caches = init_caches(&self.config);
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+
+        Ok(Lfm2PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+            // Conv Pass-1 needs the FULL prompt (not just the suffix).
+            full_tokens: plan.to_vec(),
+        })
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        // `run_paged_prefill_chunk` records the suffix in the adapter, runs
+        // conv Pass-1 over the cached prefix from `full_tokens`, then the
+        // full forward over the suffix, and folds in the last-token slice
+        // (returns `[vocab]`). The engine fires the post-prefill
+        // `synchronize_and_clear_cache` AFTER this returns (NOT here) — same
+        // as the legacy core.
+        self.run_paged_prefill_chunk(
+            &prefix.full_tokens,
+            suffix_tokens,
+            prefix.effective_cached_prefix_len as u32,
+        )
+    }
+
+    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+        // Runs the BODY of the deleted `paged_compiled_decode_setup`,
+        // arming the compiled-paged guards as STRUCT FIELDS of the returned
+        // `Lfm2PagedDecode` (declaration order == drop order == teardown
+        // order). MUST run AFTER prefill (reads the adapter pools + conv
+        // caches) and the post-prefill cache clear, BEFORE the decode loop.
+        //
+        // ===== Compiled C++ PAGED decode-path dispatch =====
+        // Mirrors the FLAT path's lock contract (`Lfm2Decode` via
+        // `ChatBackend::begin_decode`) and qwen3.5's paged `cpp_session_ready`
+        // gate. The compiled-PAGED decode runs only when ALL of:
+        //   1. `compiled_path_active()` — weights registered for our model_id.
+        //   1b. The model weights are bf16 (the compiled-PAGED graph + paged
+        //      KV pools are bf16-only: `KvDtype::Bf16`, bf16 static mask).
+        //   2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE` (16).
+        //   3. `init_lfm2_paged_compiled_session` succeeds.
+        //
+        // LOCK CONTRACT (same as the flat path): registration is the WRITER;
+        // decode is the READER — the `_weight_guard` (`.read()`,
+        // poison-recovered) spans the `mlx_lfm2_get_model_id()` re-check, the
+        // seed, and (on the stepper) EVERY `forward_lfm2_cpp_paged` step.
+        //
+        // CONV STATE: unlike qwen's GDN linear caches, lfm2 needs NO
+        // cross-turn conv export — the eager paged path reprefills conv from
+        // token 0 each turn (`prime_prefix_state`'s `self.caches =
+        // init_caches(..)`), so the compiled-paged graph threads conv state
+        // WITHIN a turn only and there is no post-loop export step (hence
+        // `Lfm2PagedDecode::end_decode` is the default no-op).
+        use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
+        let mut use_cpp_pre = self.compiled_path_active();
+        // bf16-activation gate (1b): the gate MUST match what the graph
+        // consumes (operator/FFN/final norms, q/k norms, attention out_proj,
+        // conv weights/biases, dense-MLP or MoE router/expert weights, the
+        // untied lm_head, q/k/v) — not a hand-picked subset.
+        //  - bf16 checkpoint: EVERY float weight must be bf16
+        //    (`all_float_weights_bf16`).
+        //  - QUANTIZED checkpoint: the NON-quantized floats + quant float
+        //    companions are bf16 (`non_quant_floats_bf16`), AND the
+        //    `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch is not set.
+        // `*.expert_bias` (intentional F32 on MoE) is the one allowed
+        // exception, handled in the load-time scans.
+        let activations_bf16 = if self.is_quantized {
+            quant_compiled_enabled() && self.non_quant_floats_bf16
+        } else {
+            self.all_float_weights_bf16
+        };
+        if use_cpp_pre && !activations_bf16 {
+            warn!(
+                "lfm2 compiled paged decode: activation-dtype invariant unmet (a non-bf16 float \
+                 weight — embedding, norm, projection, conv, FFN/MoE, or lm_head — or quantized \
+                 compiled decode disabled); the compiled-PAGED graph + paged KV pools are \
+                 bf16-only, so using the pure-Rust eager paged decode path for this request."
+            );
+            use_cpp_pre = false;
+        }
+        let mut compiled_lock = if use_cpp_pre {
+            Some(
+                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut weight_guard = None;
+        let cpp_session_ready = if use_cpp_pre {
+            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            // Re-check ownership under the read lock — a concurrent load of a
+            // different model could have evicted us between the probe and here.
+            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+                weight_guard = Some(guard);
+                // Seed the compiled-paged graph ONCE from the live
+                // post-prefill adapter pools + conv state. On any failure drop
+                // back to the pure-Rust paged decode for the whole turn.
+                let caches_ref = &self.caches;
+                let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                    Error::from_reason("begin_paged_decode: paged_adapter dropped post-prefill")
+                })?;
+                if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                    warn!(
+                        "lfm2 compiled paged decode: adapter block_size={} but compiled graph \
+                         requires {}; falling back to pure-Rust paged decode",
+                        adapter_ref.block_size(),
+                        CPP_PAGED_REQUIRED_BLOCK_SIZE
+                    );
+                    false
+                } else {
+                    let prefill_offset = adapter_ref.current_token_count() as i32;
+                    match init_lfm2_paged_compiled_session(
+                        &self.config,
+                        caches_ref,
+                        adapter_ref,
+                        prefill_offset,
+                    ) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!(
+                                "lfm2 compiled paged decode: seed failed ({e}); falling back to \
+                                 pure-Rust paged decode"
+                            );
+                            false
+                        }
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // When the compiled-paged session did NOT come up (model_id eviction,
+        // block_size mismatch, or seed failure), the decode loop runs the
+        // pure-Rust eager paged path, which touches none of the C++ compiled
+        // globals. Holding the cross-family lifecycle mutex / weight read lock
+        // across that whole loop is needless and blocks weight registration
+        // (.write()) and other compiled startups (.lock()) for the entire
+        // generation. Drop them now. Safe because cpp_session_ready==false
+        // here implies the reset guard is None (no seed ran), so the
+        // reset-while-locks-held drop-order invariant is vacuous.
+        if !cpp_session_ready {
+            weight_guard = None;
+            compiled_lock = None;
+        }
+
+        // RAII guard: resets the compiled-PAGED C++ globals
+        // (`mlx_lfm2_paged_reset`) on EVERY exit path — including a `?`
+        // early-return or a first-step fallback that flips `cpp_session_ready`
+        // off — so the next request never seeds against stale paged pools.
+        // Armed iff the seed succeeded.
+        let paged_reset_guard = cpp_session_ready.then_some(Lfm2PagedResetGuard);
+
+        // Compile-cached `max_blocks_per_seq` shape — `max_position_embeddings`
+        // div_ceil block_size keeps the compile-cache key stable across every
+        // decode step within one turn (matches qwen's paged decode loop).
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("begin_paged_decode: paged_adapter dropped pre-decode")
+            })?;
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
+
+        Ok(Lfm2PagedDecode {
+            _paged_reset_guard: paged_reset_guard,
+            _weight_guard: weight_guard,
+            _compiled_lock: compiled_lock,
+            inner: self,
+            cpp_session_ready,
+            // Tracks whether ANY compiled-paged step has completed this turn.
+            // A mid-turn failure (after the first successful compiled step)
+            // PROPAGATES; only a first-step failure falls back (mirrors qwen's
+            // `should_propagate_compiled_paged_error`).
+            cpp_compiled_step_completed: false,
+            max_blocks_per_seq,
+            step_counter: 0,
+        })
+    }
+
+    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+        // == the legacy paged cores' terminal lifecycle block. Success: keep
+        // the request live across turns when reuse is on so the next turn's
+        // `continue_turn` builds on the partial trailing block's live K/V;
+        // otherwise register full blocks for reuse + release. Infallible
+        // (`let _ =` every call — a teardown failure must not mask the turn
+        // result).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            if reuse_cache {
+                let _ = adapter.finalize_turn_keep_live(&[], 0);
+            } else {
+                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.release_request();
+            }
+        }
+    }
+
+    fn abort_paged_turn(&mut self) {
+        // Error-path teardown == the legacy paged cores' `Err(e) =>
+        // release_request()` arm: release fully, partial block_table state is
+        // unsafe to keep around. Release ONLY — never register / keep live.
+        // Infallible (`let _ =` — must not mask the turn's error).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+    }
+
+    fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, _suffix_len: usize) -> usize {
+        // lfm2 reprefills the FULL prompt through conv layers EVERY turn
+        // (`run_paged_prefill_chunk` Pass-1) even on a warm attention-prefix
+        // hit, so ttft measures full-prompt work and the throughput numerator
+        // must be the FULL prompt — NOT the attention suffix. == the legacy
+        // `paged_turn_sync_core` perf call's `tokens.len()` (and the regression
+        // `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse` guard).
+        // The default (`suffix_len`) is the standard-KV qwen behavior, which
+        // would under-report lfm2's prefill tok/s by the cache-hit ratio.
+        prompt_token_count
+    }
+
+    fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
+        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT
+        // the per-turn `generation_stream`. lfm2's compiled forward holds
+        // persistent per-layer K/V pools; running it on a queue separate from
+        // the shared loop's top-of-iteration `y.eval()` (always on the default
+        // stream) forces a cross-queue completion-wait every token (~5% on
+        // bandwidth-bound decode). Legacy lfm2 paged decode ran on the default
+        // stream — only `chunked_prefill` used `generation_stream` — so this
+        // restores the legacy single-stream cadence. `paged_prefill` still runs
+        // on `generation_stream`. See the `PagedBackend::paged_decode_stream`
+        // doc for the full mechanism.
+        Stream::default(crate::stream::DeviceType::Gpu)
+    }
+
+    fn save_paged_history(
+        &mut self,
+        save_tokens: &[u32],
+        generated: &[u32],
+        _keep_all: bool,
+        reuse_cache: bool,
+    ) {
+        // lfm2 INVERSE convention vs qwen3 (Decision 1): lfm2 paged ALWAYS
+        // drops the last token, regardless of the engine's `keep_all`
+        // (length-exit) signal. The legacy lfm2 paged cores hardcoded
+        // `save_cache_state_internal(true, .., last_token_in_cache=false)`
+        // because the paged decode loop NEVER forwards the LAST sampled token
+        // through `run_paged_decode_step` — so the last `generated` entry is
+        // NOT in the adapter / conv caches and must be dropped to keep the
+        // saved history aligned with the live cache state.
+        //
+        // We pass `last_token_in_cache=false` UNCONDITIONALLY to the kept FLAT
+        // helper, which does the drop-last trim (model.rs `save_cache_state_internal`)
+        // AND the `!reuse_cache → reset_caches_internal()` branch (Decision 2:
+        // respect the engine's `reuse_cache`). This writes ONLY
+        // `cached_token_history` (+ image-key reset inside the helper's reset
+        // arm) — never the FLAT `cached_kv_*`, which the paged path never
+        // fills. `_keep_all` is intentionally ignored (it is the qwen3 signal).
+        //
+        // Token accounting (adapter cursor == saved history), records-at-top
+        // in run_paged_decode_step / forward; engine forward gate
+        // `step_idx+1 < N && !is_terminal`:
+        //  * LENGTH exit (k==N): adapter = prompt+(N-1) [last forward skipped];
+        //    drop-last → history = prompt+(N-1). MATCH.
+        //  * EARLY-STOP at g[k-1] (k<N): adapter = prompt+(k-1) [terminal
+        //    forward skipped]; drop-last → history = prompt+(k-1). MATCH
+        //    (== legacy lfm2 paged).
+        self.save_cache_state_internal(reuse_cache, save_tokens, generated, false);
+    }
+
+    fn reconcile_paged_request_tokens(
+        &mut self,
+        prompt_len: usize,
+        generated: &[u32],
+        _keep_all: bool,
+    ) -> bool {
+        // lfm2 ALWAYS drops the last token (see `save_paged_history`), so the
+        // to-be-saved history length is `prompt_len + (generated.len() - 1)`
+        // (or `prompt_len` when nothing was generated). Roll the adapter back
+        // to that length so the next turn's warm-continue gate
+        // (`prompt.starts_with(request_tokens())`) is not defeated by a
+        // trailing token the pipelined loop recorded at the loop top before
+        // the stop-check. `_keep_all` is intentionally ignored (qwen3 signal).
+        //
+        // Token accounting: on BOTH length and early-stop exits the to-be-saved
+        // history equals the adapter cursor (the final/terminal forward was
+        // skipped, see the proof in `save_paged_history`), so `surplus` is 0
+        // and this is a true no-op for lfm2 — but the rollback is kept as the
+        // defensive contract the trait mandates (and would fire if a future
+        // change made the adapter over-record).
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return true;
+        };
+        let history_len = if generated.is_empty() {
+            0
+        } else {
+            generated.len() - 1
+        };
+        let target_len = prompt_len + history_len;
+        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
+        if surplus > 0
+            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
+        {
+            tracing::warn!(
+                target: "mlx_core::lfm2::paged",
+                "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \
+                 (finalize releases the request; next turn cold-prefills): {e}",
+            );
+            return false;
+        }
+        true
     }
 }
 
@@ -2642,7 +2191,8 @@ impl Drop for Lfm2CompiledResetGuard {
 /// loop returns early via `?`, so the next generation never seeds against stale
 /// paged pools.
 ///
-/// Armed by `paged_turn_sync_core_inner` when the compiled-paged seed succeeds.
+/// Armed by `<Lfm2Inner as PagedBackend>::begin_paged_decode` (as a field of
+/// the returned `Lfm2PagedDecode`) when the compiled-paged seed succeeds.
 struct Lfm2PagedResetGuard;
 
 impl Drop for Lfm2PagedResetGuard {

@@ -174,6 +174,13 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // as a `Result<()>` returned from the block: the stepper drops at the
     // block's close (releasing the borrow), then the error is handled
     // below where `&mut backend` is free again.
+    // The stream the per-step DECODE forward runs on. lfm2 returns the DEFAULT
+    // stream (single-stream decode == legacy, no per-token cross-queue sync);
+    // qwen3/others return `generation_stream` (dedicated decode queue, == their
+    // legacy paged loop). `paged_prefill` above always used `generation_stream`.
+    // Computed HERE, before the closure borrows `&mut backend` via
+    // `begin_paged_decode` (this hook only needs `&self`).
+    let decode_generation_stream = backend.paged_decode_stream(generation_stream);
     let decode_result: Result<()> = (|| {
         let setup = PagedTurnSetup {
             params: p,
@@ -212,7 +219,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
                 finish_reason: &mut finish_reason,
                 first_token_instant: &mut first_token_instant,
                 report_perf,
-                generation_stream,
+                generation_stream: decode_generation_stream,
             },
             streaming_ctx,
         )?;
@@ -319,11 +326,16 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache);
 
     // ---- finalize (== chat_turn_core tail) ----
+    // The `prefill_tokens_per_second` numerator is family-controlled: standard-KV
+    // families (qwen3/qwen3_5) forward only the suffix on a warm hit (default ==
+    // `suffix_len`), but lfm2 reprefills the FULL prompt through conv layers every
+    // turn so its ttft is full-prompt scale (override → `prompt_token_count`).
+    let perf_prefill_tokens = backend.paged_perf_prefill_tokens(prompt_token_count, suffix_len);
     let performance = if report_perf {
         compute_performance_metrics(
             generation_start,
             first_token_instant,
-            suffix_len,
+            perf_prefill_tokens,
             generated_tokens.len(),
         )
         .map(|mut m| {

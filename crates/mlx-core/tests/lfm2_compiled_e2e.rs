@@ -2256,13 +2256,14 @@ async fn lfm2_moe_compiled_flat_vs_mlx_lm_golden() {
 // =============================================================================
 // P4 (STREAMING): COMPILED-PAGED engagement + non-stream parity (DENSE 1.2B).
 //
-// The non-streaming paged decode loop (`paged_turn_sync_core_inner`) was already
-// proven to engage the compiled-paged C++ graph by
-// `lfm2_compiled_paged_engagement_dense` / `lfm2_compiled_paged_vs_eager_paged`.
-// The STREAMING paged decode loop (`paged_turn_stream_core_inner`) was JUST
-// wired into the SAME shared compiled-paged helpers
-// (`Lfm2Inner::paged_compiled_decode_setup` + `paged_compiled_decode_step`); this
-// test is its dedicated regression gate. It proves two things on the real 1.2B
+// Since the P4-2 engine migration BOTH the streaming and non-streaming paged
+// turns flow through the SAME model-neutral `run_paged_turn` driving the single
+// `Lfm2PagedDecode` stepper (`<Lfm2Inner as PagedBackend>::begin_paged_decode`
+// seeds the compiled-paged session; `Lfm2PagedDecode::forward` runs each step) —
+// so streaming and non-streaming engage the compiled-paged C++ graph through
+// ONE code path. (Pre-migration these were two forked loops,
+// `paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`.) This test is
+// the streaming regression gate. It proves two things on the real 1.2B
 // dense checkpoint with `use_block_paged_cache:true` (the production default):
 //
 //   1. ENGAGEMENT — `mlx_lfm2_moe_compiled_paged_call_count` advances by ~N-1
@@ -2406,9 +2407,9 @@ async fn lfm2_compiled_paged_streaming_engagement_and_parity_dense() {
     assert!(
         stream_call_delta >= MIN_COMPILED_CALL_DELTA,
         "STREAMING compiled-paged path did not engage (call_delta={stream_call_delta}) — \
-         paged_turn_stream_core_inner is not wired to compiled-paged. Expected ~N-1 \
-         compiled-paged forward calls (>= {MIN_COMPILED_CALL_DELTA}); a 0/low delta means the \
-         streaming decode silently fell back to the eager pure-Rust paged decode."
+         the streaming run_paged_turn / Lfm2PagedDecode stepper is not engaging compiled-paged. \
+         Expected ~N-1 compiled-paged forward calls (>= {MIN_COMPILED_CALL_DELTA}); a 0/low delta \
+         means the streaming decode silently fell back to the eager pure-Rust paged decode."
     );
 
     // ---- ASSERT 2: STREAMING == NON-STREAMING reference -----------------

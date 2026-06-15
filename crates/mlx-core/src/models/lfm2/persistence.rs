@@ -1492,7 +1492,7 @@ impl Lfm2Inner {
         // Create inner model
         let mut inner = Lfm2Inner::new(config)?;
         // Authoritative for ALL checkpoints (set BEFORE the registration gate so
-        // `paged_compiled_decode_setup` switches its bf16 gate to the
+        // `begin_paged_decode` switches its bf16 gate to the
         // `non_quant_floats_bf16` invariant for quantized weights). The companion
         // `non_quant_floats_bf16` flag is set only when a quantized checkpoint
         // actually registers (in the gate block below).
@@ -1531,7 +1531,7 @@ impl Lfm2Inner {
         // weights via `get_weight`. The same single weight map and `model_id` serve
         // BOTH the flat (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`)
         // compiled graphs; the per-step dispatcher (the engine `Lfm2Decode`
-        // stepper flat vs `paged_turn_sync_core_inner` paged) picks the
+        // stepper flat vs the paged `Lfm2PagedDecode` stepper) picks the
         // right graph. The
         // single-owner `g_weights`/`model_id` clobber contract:
         // `register_weights_with_cpp` clears the map, stores, bumps the compile
@@ -1564,7 +1564,7 @@ impl Lfm2Inner {
         // whole-model bf16-clean invariant FIRST (read-only dtype scan over the
         // still-live `params`; `*.expert_bias` F32 on MoE is the one allowed
         // exception, handled inside the scan) so the registration decision and
-        // the `paged_compiled_decode_setup` gate share one authoritative flag.
+        // the `begin_paged_decode` gate share one authoritative flag.
         let all_float_weights_bf16 = if is_quantized {
             false
         } else {
@@ -1598,7 +1598,7 @@ impl Lfm2Inner {
         // load-time predictor of which decode loop this instance will run.
         let is_flat = inner.config.use_block_paged_cache == Some(false);
         // Compiled-PAGED ALSO hard-requires block_size == CPP_PAGED_REQUIRED_BLOCK_SIZE
-        // (16): `paged_compiled_decode_setup` falls back to eager when
+        // (16): `begin_paged_decode` falls back to eager when
         // `adapter.block_size() != 16`. The adapter's block size is fixed once at
         // `Lfm2Inner::new` as `config.paged_block_size.unwrap_or(16)` and is
         // immutable thereafter, so this load-time value authoritatively predicts
@@ -1639,7 +1639,7 @@ impl Lfm2Inner {
                 quant_group_size,
             )?;
             // Record the bf16-clean flag (only meaningful once registered) so
-            // `paged_compiled_decode_setup` can gate compiled-paged on this
+            // `begin_paged_decode` can gate compiled-paged on this
             // authoritative whole-model invariant rather than a hand-picked
             // tensor subset. The flat compiled path does not consult this flag; a
             // non-bf16 flat checkpoint still registers and runs flat.
@@ -1793,7 +1793,7 @@ fn non_quant_float_weights_are_bf16(params: &HashMap<String, MxArray>) -> Result
 ///   * paged (default) → register ONLY when block_size == 16 AND the
 ///     bf16-activation invariant holds: compiled-PAGED is bf16-only (the paged KV
 ///     pools and static mask hard-code `KvDtype::Bf16`) AND hard-codes block_size
-///     == 16, so `paged_compiled_decode_setup` forces a non-bf16 OR non-16-block
+///     == 16, so `begin_paged_decode` forces a non-bf16 OR non-16-block
 ///     paged checkpoint onto eager paged. Registering such a model would evict
 ///     another model's compiled path for ZERO benefit, so skip it. The bf16
 ///     invariant is `all_float_weights_bf16` for a bf16 checkpoint and

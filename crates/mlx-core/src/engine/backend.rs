@@ -52,6 +52,31 @@ pub(crate) trait DecodeStep {
     /// `embedding_weight` parameter (captured at construction).
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)>;
 
+    /// Like [`DecodeStep::forward`], but the engine ALSO hands the
+    /// already-extracted `token_id` — the scalar value of `input_ids`,
+    /// read ONCE at the loop top (`y.item_at_int32`).
+    ///
+    /// PERF SEAM: a paged stepper needs the concrete `u32` token (for
+    /// `record_tokens` + re-embed) but `input_ids` is a FRESH
+    /// `y.reshape([1, 1])` lazy node — calling `item_at_int32` on it
+    /// forces a second per-step eval/sync that the loop already paid at
+    /// the top. That extra synchronize is invisible on a slow eager
+    /// forward (qwen3 dense) but measurably regresses a FAST compiled-paged
+    /// decode (lfm2 / future qwen3_5* compiled paged) by several percent.
+    /// Such steppers override this to consume the handed `token_id`
+    /// directly. The default forwards to [`DecodeStep::forward`] (flat
+    /// steppers embed `input_ids` and never need the scalar; qwen3 paged
+    /// keeps its absorbed `item_at`), so the value is byte-identical — only
+    /// the source of the scalar changes.
+    fn forward_with_token(
+        &mut self,
+        input_ids: &MxArray,
+        token_id: u32,
+    ) -> Result<(MxArray, bool)> {
+        let _ = token_id;
+        self.forward(input_ids)
+    }
+
     /// Schedule async evaluation for this step's sampled token (and, on
     /// the budget-forced path, the untouched logits so the lazy graph
     /// stays bounded). == `DecodeOps::eval_step`.
@@ -122,8 +147,12 @@ pub(crate) trait DecodeStep {
     ///     `CompiledResetGuard` drops;
     ///   * qwen3_5_moe: the same against the MoE globals before
     ///     `MoeResetGuard` drops;
-    ///   * lfm2: `export_compiled_caches()` before
-    ///     `Lfm2CompiledResetGuard` drops.
+    ///   * lfm2 FLAT (`Lfm2Decode`): `export_compiled_caches()` before
+    ///     `Lfm2CompiledResetGuard` drops. NOTE this is the FLAT stepper
+    ///     ONLY — lfm2's PAGED stepper (`Lfm2PagedDecode`) keeps the
+    ///     default no-op: the eager paged path reprefills conv state from
+    ///     token 0 every turn, so there is no cross-turn compiled cache to
+    ///     export.
     ///
     /// The error-path equivalence is exact: today a decode error skips
     /// the export but still resets (guards drop), and an export/eval
@@ -1450,4 +1479,50 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// Distinct from finalize_paged_turn (the SUCCESS lifecycle): abort does ONLY the
     /// release — never register_full_blocks_for_reuse / finalize_turn_keep_live.
     fn abort_paged_turn(&mut self);
+
+    /// Token count used as the `prefill_tokens_per_second` NUMERATOR in the
+    /// turn's [`crate::profiling::PerformanceMetrics`] (telemetry only — does
+    /// NOT affect generated tokens).
+    ///
+    /// `run_paged_turn` measures `ttft` over the prefill it actually ran, so
+    /// the numerator must match that work:
+    ///   * Default `suffix_len` — the standard-KV families (qwen3 / qwen3_5 /
+    ///     qwen3_5_moe) forward ONLY the fresh suffix on a warm prefix-cache
+    ///     hit (the cached prefix is reused from the paged KV pool, never
+    ///     re-forwarded), so their forked cores report
+    ///     `tokens.len() - cached_prefix_len` (== `suffix_len`). Keeping the
+    ///     default leaves them byte-identical.
+    ///   * lfm2 overrides to `prompt_token_count` (the FULL prompt): its conv
+    ///     layers have no cross-turn prefix cache, so `run_paged_prefill_chunk`
+    ///     Pass-1 reprefills the FULL prompt through every conv layer EVERY
+    ///     turn even on a warm attention-prefix hit. `ttft` therefore measures
+    ///     full-prompt work, so the numerator must be the full prompt, not the
+    ///     suffix (else a warm reuse under-reports prefill tok/s by the
+    ///     cache-hit ratio — the regression `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse`
+    ///     guards).
+    fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
+        let _ = prompt_token_count;
+        suffix_len
+    }
+
+    /// The GPU [`Stream`] the per-step DECODE forward (and its `eval_step`)
+    /// runs on, given the dedicated `generation_stream` `run_paged_turn`
+    /// created for this turn.
+    ///
+    /// Default — the dedicated `generation_stream`: a fresh Metal command
+    /// queue that isolates decode work (what qwen3's legacy paged loop did, so
+    /// the standard-KV families stay byte/perf-identical to origin/main).
+    ///
+    /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its compiled-paged
+    /// forward holds persistent per-layer K/V pools across steps; running that
+    /// forward on a queue SEPARATE from the shared loop's top-of-iteration
+    /// `y.eval()` (which always runs on the default stream) forces a
+    /// cross-queue completion-wait EVERY token (~5% on bandwidth-bound decode).
+    /// Legacy lfm2 paged DECODE ran on the default stream — only
+    /// `chunked_prefill` used `generation_stream` — so returning the default
+    /// here restores that single-stream cadence. `paged_prefill` is still
+    /// handed `generation_stream` by `run_paged_turn` and is unaffected.
+    fn paged_decode_stream(&self, generation_stream: Stream) -> Stream {
+        generation_stream
+    }
 }

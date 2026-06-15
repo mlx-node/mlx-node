@@ -329,7 +329,12 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
 
             profiler.begin("forward");
             let next_ids = y.reshape(&[1, 1])?;
-            let (mut logits, needs_squeeze) = step.forward(&next_ids)?;
+            // `token_id` was already extracted from `y` at the loop top
+            // (`y.item_at_int32`); hand it down so a paged stepper need NOT
+            // re-`item_at` the fresh `next_ids` reshape (an extra per-step
+            // sync). Flat steppers ignore it via the default that delegates
+            // to `forward`. Byte-identical: same scalar, different source.
+            let (mut logits, needs_squeeze) = step.forward_with_token(&next_ids, token_id)?;
             if needs_squeeze {
                 logits = logits.squeeze(Some(&[1]))?;
             }
