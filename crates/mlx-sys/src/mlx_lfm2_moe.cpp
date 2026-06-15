@@ -19,7 +19,7 @@ using namespace lfm2_common;
 // shared `g_weights()` map before running the compiled pure-fns.
 extern "C" {
 void mlx_store_weight(const char* name, mlx_array* weight);
-void mlx_clear_weights();
+void mlx_clear_weights(uint64_t model_id);
 size_t mlx_weight_count();
 }
 
@@ -617,7 +617,7 @@ Lfm2SyntheticMoe lfm2_build_synthetic_moe(uint64_t seed, int well_separated) {
   const int moe_inter = 24;          // per-expert SwiGLU hidden
   const int dense_inter = 40;        // dense-layer SwiGLU hidden
 
-  mlx_clear_weights();
+  mlx_clear_weights(0);
 
   // ---- seeded xorshift -> [-1,1) ----
   uint64_t s = seed ? seed : 0x10F23C0Deull;
@@ -1512,7 +1512,7 @@ mlx_array* mlx_lfm2_probe_attn_seq(
     int num_heads, int num_kv_heads, int head_dim,
     float rope_theta, float norm_eps) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     mlx_store_weight("layers.0.self_attn.q_proj.weight", q_w);
     mlx_store_weight("layers.0.self_attn.k_proj.weight", k_w);
     mlx_store_weight("layers.0.self_attn.v_proj.weight", v_w);
@@ -1546,15 +1546,15 @@ mlx_array* mlx_lfm2_probe_attn_seq(
     }
     mlx::core::eval({last_out});
     auto* out = new array(last_out);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_attn_seq: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -1564,7 +1564,7 @@ mlx_array* mlx_lfm2_probe_attn_seq(
 mlx_array* mlx_lfm2_probe_dense_mlp(
     mlx_array* x_ptr, mlx_array* gate_w, mlx_array* up_w, mlx_array* down_w) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     mlx_store_weight("layers.0.feed_forward.gate_proj.weight", gate_w);
     mlx_store_weight("layers.0.feed_forward.up_proj.weight", up_w);
     mlx_store_weight("layers.0.feed_forward.down_proj.weight", down_w);
@@ -1573,15 +1573,15 @@ mlx_array* mlx_lfm2_probe_dense_mlp(
     auto res = lfm2_dense_mlp(x, 0);
     mlx::core::eval({res});
     auto* out = new array(res);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_dense_mlp: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -1607,7 +1607,7 @@ mlx_array* mlx_lfm2_probe_conv_seq(
     mlx_array* in_proj_b, mlx_array* conv_b, mlx_array* out_proj_b,
     int l_cache, int conv_bias) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     mlx_store_weight("layers.0.conv.in_proj.weight", in_proj_w);
     mlx_store_weight("layers.0.conv.out_proj.weight", out_proj_w);
     mlx_store_weight("layers.0.conv.conv.weight", conv_w);  // [hidden, l_cache, 1]
@@ -1634,15 +1634,15 @@ mlx_array* mlx_lfm2_probe_conv_seq(
     }
     mlx::core::eval({last_out});
     auto* out = new array(last_out);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_conv_seq: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -1665,7 +1665,7 @@ mlx_array* mlx_lfm2_probe_attn_arr_seq(
     int num_heads, int num_kv_heads, int head_dim,
     float rope_theta, float norm_eps) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     mlx_store_weight("layers.0.self_attn.q_proj.weight", q_w);
     mlx_store_weight("layers.0.self_attn.k_proj.weight", k_w);
     mlx_store_weight("layers.0.self_attn.v_proj.weight", v_w);
@@ -1705,15 +1705,15 @@ mlx_array* mlx_lfm2_probe_attn_arr_seq(
     }
     mlx::core::eval({last_out});
     auto* out = new array(last_out);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_attn_arr_seq: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -1751,7 +1751,7 @@ mlx_array* mlx_lfm2_probe_decode_seq(
     int conv_bias, mlx_array** in_proj_b_w, mlx_array** conv_b_w,
     mlx_array** out_proj_b_w) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     auto& embed_w = *reinterpret_cast<array*>(embed_w_ptr);
     // Tied head: linear_proj(h,"embed_tokens") -> get_weight_t("embed_tokens.weight").
     mlx_store_weight("embed_tokens.weight", embed_w_ptr);
@@ -1833,15 +1833,15 @@ mlx_array* mlx_lfm2_probe_decode_seq(
     }
     mlx::core::eval({last_logits});
     auto* out = new array(last_logits);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_decode_seq: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -1881,7 +1881,7 @@ mlx_array* mlx_lfm2_probe_moe_decode_seq(
     mlx_array** moe_router_w, mlx_array** moe_bias,
     mlx_array** moe_gate_proj, mlx_array** moe_up_proj, mlx_array** moe_down_proj) {
   try {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     auto& embed_w = *reinterpret_cast<array*>(embed_w_ptr);
     // Tied head: linear_proj(h,"embed_tokens") -> get_weight_t("embed_tokens.weight").
     mlx_store_weight("embed_tokens.weight", embed_w_ptr);
@@ -1976,15 +1976,15 @@ mlx_array* mlx_lfm2_probe_moe_decode_seq(
     }
     mlx::core::eval({last_logits});
     auto* out = new array(last_logits);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return reinterpret_cast<mlx_array*>(out);
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_moe_decode_seq: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return nullptr;
   }
 }
@@ -2033,15 +2033,15 @@ int mlx_lfm2_probe_moe_compiled_vs_eager(uint64_t seed, int well_separated,
     if (out_maxabs) {
       *out_maxabs = diff.item<float>();
     }
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_moe_compiled_vs_eager: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   }
 }
@@ -2072,15 +2072,15 @@ int mlx_lfm2_probe_warm_compiled_no_bump(uint64_t seed) {
     lfm2_reset_compiled_closure_same_epoch();
     auto comp = lfm2_run_synthetic_decode(m, /*compiled=*/true);
     mlx::core::eval({comp});
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_warm_compiled_no_bump: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   }
 }
@@ -2174,7 +2174,7 @@ int mlx_lfm2_probe_moe_ab_swap(uint64_t seed_a, uint64_t seed_b,
         store(name, mk(shape, 0.02f) + array(1.0f, mlx::core::bfloat16));
       };
 
-      mlx_clear_weights();
+      mlx_clear_weights(0);
       auto embed = mk({vocab, hidden}, 0.05f);
       store("embed_tokens.weight", embed);
       store_norm("embedding_norm.weight", {hidden});
@@ -2316,15 +2316,15 @@ int mlx_lfm2_probe_moe_ab_swap(uint64_t seed_a, uint64_t seed_b,
       *out_a_comp_vs_a_eager = maxabs(a_comp, a_eager);
     }
 
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "[MLX] mlx_lfm2_probe_moe_ab_swap: %s\n", e.what());
     fflush(stderr);
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   } catch (...) {
-    mlx_clear_weights();
+    mlx_clear_weights(0);
     return -1;
   }
 }

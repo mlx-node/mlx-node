@@ -100,11 +100,30 @@ inline std::shared_mutex& g_weights_mutex() {
   return instance;
 }
 
-// The slot the weight accessors currently resolve to. Initialised to a single
-// default slot; the per-model-id migration repoints it per model.
+// The per-model-id weight registry: each loaded compiled model owns a slot keyed
+// by its model_id (the value Rust assigns from QWEN35_MODEL_ID_COUNTER). Two
+// compiled models coexist by holding two slots. std::unordered_map guarantees
+// references/pointers to existing elements survive inserts and rehashes — only
+// erasing that element invalidates it — so a slot pointer stays valid while
+// another model registers.
+inline std::unordered_map<uint64_t, WeightSlot>& g_weight_slots() {
+  static std::unordered_map<uint64_t, WeightSlot> instance;
+  return instance;
+}
+
+// The slot used when no model is active (process start, or after the active
+// model is cleared). Empty — get_weight against it throws "not found", matching
+// the pre-registration state.
+inline WeightSlot& g_default_weight_slot() {
+  static WeightSlot empty;
+  return empty;
+}
+
+// The slot the weight accessors resolve to. Repointed at registration
+// (mlx_clear_weights selects the registering model's slot) and at activation
+// (mlx_set_model_id publishes a model's slot for the upcoming forward).
 inline WeightSlot*& g_active_weight_slot() {
-  static WeightSlot default_slot;
-  static WeightSlot* active = &default_slot;
+  static WeightSlot* active = &g_default_weight_slot();
   return active;
 }
 

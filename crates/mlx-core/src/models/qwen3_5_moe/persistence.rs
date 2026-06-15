@@ -1507,7 +1507,7 @@ fn register_moe_weights_with_cpp(
 
     // Clear weights (shared map). `mlx_clear_weights` also clears the
     // per-projection quant-info registry, so we re-populate both below.
-    unsafe { sys::mlx_clear_weights() };
+    unsafe { sys::mlx_clear_weights(model_id) };
 
     // Invalidate the compiled MTP-verify dispatch tables (shared with the
     // dense Qwen3.5 path) in the SAME write-lock critical section as the

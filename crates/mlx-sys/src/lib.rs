@@ -1675,8 +1675,11 @@ unsafe extern "C-unwind" {
         mode: *const std::os::raw::c_char,
     ) -> bool;
 
-    /// Clear all stored weights (called on model destruction)
-    pub fn mlx_clear_weights();
+    /// Clear (and select for registration) the weight slot keyed by `model_id`.
+    /// Empties that model's tensors and makes it the active slot; other models'
+    /// slots are untouched, so a co-resident model survives. Also the
+    /// model-destruction teardown.
+    pub fn mlx_clear_weights(model_id: u64);
 
     /// Get the number of stored weights (for debugging)
     pub fn mlx_weight_count() -> usize;

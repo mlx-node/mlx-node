@@ -53,14 +53,23 @@ bool mlx_quant_info_mode_matches(const char* prefix, const char* mode) {
   return it->second.mode == mode;
 }
 
-void mlx_clear_weights() {
+// Clear (and select for registration) the weight slot keyed by `model_id`.
+// Empties this model's three maps in place — its slot pointer stays valid for
+// any holder — and makes it the active slot so the subsequent store_weight /
+// store_quant_info writes land here and get_weight reads here. Closes the
+// compiled gate (active model id 0) until set_model_id republishes; this also
+// frees the prior tensors when called on model destruction. Other models'
+// slots are untouched, so a co-resident model survives this registration.
+void mlx_clear_weights(uint64_t model_id) {
   std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
-  g_weights().clear();
-  g_weight_transposes().clear();
+  WeightSlot& slot = g_weight_slots()[model_id];
+  slot.weights.clear();
+  slot.weight_transposes.clear();
   // Prevent cross-model contamination: stale quant overrides referring to
-  // the previous model's tensors would mis-dispatch dequant in the compiled
-  // forward path. Clear the sidecar in the same critical section.
-  g_quant_info().clear();
+  // the previous tensors would mis-dispatch dequant in the compiled forward
+  // path. Clear the sidecar in the same critical section.
+  slot.quant_info.clear();
+  g_active_weight_slot() = &slot;
   g_active_model_id().store(0, std::memory_order_release);
 }
 
@@ -70,7 +79,14 @@ size_t mlx_weight_count() {
 }
 
 void mlx_set_model_id(uint64_t id) {
+  std::unique_lock<std::shared_mutex> lock(g_weights_mutex());
   g_active_model_id().store(id, std::memory_order_release);
+  // Publish this model's slot as the active one for the upcoming forward. A
+  // missing id (e.g. the 0 sentinel, or a not-yet-registered model) resolves to
+  // the empty default slot so get_weight fails closed rather than aliasing.
+  auto it = g_weight_slots().find(id);
+  g_active_weight_slot() =
+      (it != g_weight_slots().end()) ? &it->second : &g_default_weight_slot();
 }
 
 }  // extern "C"

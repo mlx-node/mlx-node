@@ -149,7 +149,7 @@ unsafe extern "C" {
 
     // Used to drop registered weights between tests so the second test's
     // reset state is clean.
-    fn mlx_clear_weights();
+    fn mlx_clear_weights(model_id: u64);
 
     // Resets the dense compiled state, including the paged-path globals
     // (`g_dense_paged_inited`, `g_dense_k_pools`, `g_dense_v_pools`,
@@ -169,7 +169,7 @@ fn forward_paged_before_init_returns_null_no_crash() {
     // Reset any state from previous test runs.
     unsafe {
         mlx_qwen35_compiled_reset();
-        mlx_clear_weights();
+        mlx_clear_weights(0);
     }
 
     let mut logits: *mut mlx_sys::mlx_array = ptr::null_mut();
@@ -231,7 +231,7 @@ fn forward_paged_graph_builds_without_crash() {
     }
     unsafe {
         mlx_qwen35_compiled_reset();
-        mlx_clear_weights();
+        mlx_clear_weights(0);
     }
 
     // Per-layer pool / scale handles. Linear-layer slots are null
@@ -481,7 +481,7 @@ fn forward_paged_after_reset_returns_null() {
     }
     unsafe {
         mlx_qwen35_compiled_reset();
-        mlx_clear_weights();
+        mlx_clear_weights(0);
     }
 
     // Build minimal pool / scale handles so init succeeds.
@@ -642,7 +642,7 @@ fn forward_paged_rejects_multi_token_contract_violation() {
     }
     unsafe {
         mlx_qwen35_compiled_reset();
-        mlx_clear_weights();
+        mlx_clear_weights(0);
     }
 
     // Set up a minimal valid paged init so the contract guard (and not

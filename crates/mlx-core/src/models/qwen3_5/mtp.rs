@@ -942,7 +942,7 @@ mod compiled_ffi_tests {
     fn teardown() {
         unsafe {
             sys::mlx_qwen35_mtp_compiled_reset();
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
             sys::mlx_qwen35_compiled_test_force_inited(0);
         }
     }
@@ -965,7 +965,7 @@ mod compiled_ffi_tests {
         // the `has_weight` check rather than failing earlier on the
         // is_compile_inited precondition.
         unsafe {
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
             sys::mlx_qwen35_compiled_test_force_inited(1);
         }
         let cfg = tiny_cfg();
@@ -1078,7 +1078,7 @@ mod compiled_ffi_tests {
         // return nullptr.
         unsafe {
             sys::mlx_qwen35_compiled_reset();
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
             sys::mlx_qwen35_compiled_test_force_inited(0);
             let mut out: *mut sys::mlx_array = std::ptr::null_mut();
             sys::mlx_qwen35_export_last_hidden(&mut out);
@@ -1113,7 +1113,7 @@ mod compiled_ffi_tests {
 
         unsafe {
             sys::mlx_qwen35_compiled_reset();
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
             sys::mlx_qwen35_compiled_test_force_inited(0);
         }
 
@@ -1205,7 +1205,7 @@ mod compiled_ffi_tests {
 
         unsafe {
             sys::mlx_qwen35_compiled_reset();
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
         }
 
         let num_layers: i32 = 4;
@@ -1310,7 +1310,7 @@ mod compiled_ffi_tests {
 
         unsafe {
             sys::mlx_qwen35_compiled_reset();
-            sys::mlx_clear_weights();
+            sys::mlx_clear_weights(0);
         }
 
         let num_layers: i32 = 4;

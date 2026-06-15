@@ -1870,7 +1870,7 @@ fn register_weights_with_cpp_locked(
     quant_group_size: i32,
 ) -> Result<()> {
     // (3) Clear the shared map (also resets the active model id + quant-info).
-    unsafe { mlx_sys::mlx_clear_weights() };
+    unsafe { mlx_sys::mlx_clear_weights(model_id) };
 
     // sym8 checkpoints register too (compiled-FLAT port, mirroring qwen3.5's
     // `register_weights_with_cpp`). Layout contract (the C++ asserts it at
@@ -1924,7 +1924,7 @@ fn register_weights_with_cpp_locked(
             "lfm2 sym8 compiled registration ABORTED for model_id={model_id}: {reason} — \
              clearing C++ weights; model stays unregistered (eager Rust forward path)."
         );
-        unsafe { mlx_sys::mlx_clear_weights() };
+        unsafe { mlx_sys::mlx_clear_weights(model_id) };
         unsafe { mlx_sys::mlx_lfm2_invalidate_compiled() };
     };
 
@@ -2564,7 +2564,7 @@ mod tests {
         let count_without = unsafe { mlx_sys::mlx_weight_count() };
 
         // Clean up the shared map so this destructive test leaves no live id.
-        unsafe { mlx_sys::mlx_clear_weights() };
+        unsafe { mlx_sys::mlx_clear_weights(0) };
 
         assert_eq!(
             count_without, count_with,
@@ -2635,7 +2635,7 @@ mod tests {
         );
 
         // Clean up the shared map so this destructive test leaves no live id.
-        unsafe { mlx_sys::mlx_clear_weights() };
+        unsafe { mlx_sys::mlx_clear_weights(0) };
     }
 
     /// sym8 abort fail-safe: a deliberately-broken sym8 group (a `.scales`
@@ -3196,7 +3196,7 @@ mod tests {
         // the shared C++ state clean for co-running serial tests). ----
         unsafe {
             mlx_sys::mlx_lfm2_moe_reset();
-            mlx_sys::mlx_clear_weights();
+            mlx_sys::mlx_clear_weights(0);
         }
 
         // ---- ENGAGEMENT: the TRACED `compiled_lfm2_decode()` closure ran once per
