@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::array::MxArray;
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, ResetScope, SaveStateArgs, ThinkingSetup, TurnOutput,
-    TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope,
+    SaveStateArgs, ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::napi_glue::start_chat_stream;
@@ -7652,6 +7652,745 @@ impl Drop for MtpCompiledResetGuard {
     }
 }
 
+/// Paged decode stepper for qwen3_5 dense (compiled-paged hybrid — the paged
+/// analog of the FLAT [`Qwen35Decode`]). Drives
+/// [`crate::engine::decode::run_decode_loop`] through the generic
+/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
+/// compiled C++ paged step when seeded, else the pure-Rust eager paged step.
+/// Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode` (which armed
+/// the guards + seeded the C++ paged session), consumed across the whole decode
+/// loop, dropped at loop exit (the `CompiledResetGuard` resets the C++ paged
+/// globals on EVERY exit path).
+pub(crate) struct Qwen35PagedDecode<'a> {
+    // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION order, so
+    // these three guards MUST be listed reset-guard → weight-guard → lock so
+    // that `CompiledResetGuard::drop()` (→ `mlx_qwen35_compiled_reset()`) runs
+    // WHILE the lifecycle mutex (`COMPILED_LIFECYCLE_MUTEX`) + weight read lock
+    // are STILL held. This matches the original local-variable reverse-drop
+    // order (legacy `paged_turn_sync_core` declared lock→weight, the inner's
+    // reset guard last; locals drop in reverse, so reset→weight→lock). If the
+    // reset ran AFTER the lifecycle mutex released, another compiled request
+    // could acquire the mutex and seed/use the shared process-global paged
+    // state in the window before this request's delayed reset cleared it →
+    // cross-request null forwards / decode corruption. Do NOT reorder these
+    // three fields.
+    //
+    // F1 DROP-ORDER TRAP: `inner: &'a mut` is declared AFTER the three guards.
+    // Fields drop in declaration order, so the guards drop (reset fires under
+    // the still-held locks) BEFORE the `&mut` borrow is conceptually released —
+    // correct. Do NOT move `inner` above the guards.
+    _paged_reset_guard: Option<CompiledResetGuard>,
+    _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
+    _lifecycle_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    inner: &'a mut Qwen35Inner,
+    cpp_session_ready: bool,
+    cpp_compiled_step_completed: bool,
+    max_blocks_per_seq: u32,
+    /// Supplies the `step` arg the compiled-step fall-back warns log; the
+    /// engine's loop owns the real step index, this is a faithful local mirror
+    /// that `forward` bumps each call (only consulted in fall-back warn logs).
+    step_counter: i32,
+}
+
+impl DecodeStep for Qwen35PagedDecode<'_> {
+    fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        // NOT on the hot path — the engine drives decode via
+        // `forward_with_token` (which hands the scalar the loop already read).
+        // Kept only to satisfy the trait; extract then delegate.
+        let token_id = input_ids.item_at_int32(0)? as u32;
+        self.forward_with_token(input_ids, token_id)
+    }
+
+    fn forward_with_token(
+        &mut self,
+        _input_ids: &MxArray,
+        token_id: u32,
+    ) -> Result<(MxArray, bool)> {
+        // Runs the per-step BODY of the legacy `paged_turn_sync_core_inner`
+        // decode loop, inlined against `self`'s fields (the compiled-paged
+        // session state now LIVES on the stepper). Compiled-paged when
+        // `self.cpp_session_ready`, else the pure-Rust eager paged step.
+        //
+        // PERF: `token_id` is HANDED by the engine (already read once at the
+        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32` the
+        // fresh `_input_ids` reshape — that redundant second per-step eval/sync
+        // measurably regressed the fast compiled-paged decode (lfm2 measured
+        // ~5%). `record_tokens` + the `[1, 1]` re-embed below rebuild from the
+        // scalar via `from_uint32`, so `_input_ids` is unused (kept for
+        // signature parity).
+        let step = self.step_counter;
+        self.step_counter += 1;
+
+        // Defense-in-depth: if the C++ compiled-paged forward returns null on
+        // the FIRST step, roll back the `record_tokens` cursor advance, flip
+        // `cpp_session_ready = false`, and re-run this token through
+        // `run_paged_decode_step` (which re-calls `record_tokens` on the
+        // now-rolled-back cursor). After ANY compiled step has succeeded the
+        // C++ GDN linear-cache globals have advanced but are never imported
+        // back into `self.inner.caches`, so a Rust fallback would read stale
+        // state — propagate the error as fatal instead of silently corrupting.
+        let logits = if self.cpp_session_ready {
+            let embedding_weight = self.inner.embedding.get_weight();
+            let max_blocks_per_seq = self.max_blocks_per_seq;
+            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "Qwen35PagedDecode::forward: paged_adapter dropped mid-decode (cpp)",
+                )
+            })?;
+            adapter
+                .record_tokens(&[token_id])
+                .map_err(Error::from_reason)?;
+            let inputs = adapter
+                .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
+                .map_err(Error::from_reason)?;
+            let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+            match forward_dense_cpp_paged(&input_ids, &embedding_weight, &inputs) {
+                Ok(logits) => {
+                    self.cpp_compiled_step_completed = true;
+                    // Compiled-paged logits are [B, vocab] (already 2D).
+                    logits
+                }
+                Err(e) => {
+                    if engine::should_propagate_compiled_paged_error(
+                        self.cpp_compiled_step_completed,
+                    ) {
+                        // PROPAGATE branch: an earlier compiled step already
+                        // ran. Roll back the cursor then `return Err(e)`
+                        // WITHOUT touching the three guards — the stepper's
+                        // field-drop (on the `run_paged_turn` decode-scope
+                        // close) fires the reset under the still-held locks, in
+                        // declaration order. Touching the guards here too would
+                        // double-reset.
+                        eprintln!(
+                            "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed mid-decode \
+                             (step={step}) AFTER an earlier compiled step succeeded. The C++ GDN \
+                             linear-cache globals have advanced but are not imported back into \
+                             self.caches, so a pure-Rust fallback would run from stale pre-step \
+                             state and silently corrupt the response. Propagating as fatal. \
+                             cause: {e}"
+                        );
+                        adapter
+                            .rollback_last_tokens(1)
+                            .map_err(Error::from_reason)?;
+                        return Err(e);
+                    }
+                    eprintln!(
+                        "[MLX] Qwen3.5 Dense: C++ compiled paged forward failed on first decode \
+                         step (step={step}); rolling back token cursor and falling back to \
+                         pure-Rust paged decode for the rest of this request. cause: {e}"
+                    );
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                    self.cpp_session_ready = false;
+                    // SILENT-FALLBACK branch: the rest of this turn runs
+                    // pure-Rust eager paged decode (`run_paged_decode_step`
+                    // touches none of the C++ compiled paged globals), so the
+                    // seeded compiled-paged session is now dead. Tear it down
+                    // and release the process-wide locks NOW instead of pinning
+                    // them for the whole generation (they otherwise block weight
+                    // registration `.write()` / other compiled startups
+                    // `.lock()`).
+                    //
+                    // ORDER IS LOAD-BEARING (mirrors the struct field drop
+                    // order, see `Qwen35PagedDecode`): drop the reset guard
+                    // FIRST so `mlx_qwen35_compiled_reset()` runs WHILE the
+                    // lifecycle mutex + weight read lock are STILL held; only
+                    // THEN release the locks. After this all three guards are
+                    // None, so the struct's eventual field-drop is a no-op (no
+                    // double reset / double release).
+                    //
+                    // BORROW DISCIPLINE: the `adapter` borrow of
+                    // `self.inner.paged_adapter` ends after the rollback above;
+                    // we then mutate `self`'s OWN guard fields, and only THEN
+                    // re-borrow `self.inner` for the pure-Rust decode. The
+                    // guard-mutation and the `self.inner` call are SEQUENCED,
+                    // never interleaved.
+                    drop(self._paged_reset_guard.take());
+                    self._weight_guard = None;
+                    self._lifecycle_lock = None;
+                    // Re-run this token through the pure-Rust paged decode
+                    // (re-records the token on the rolled-back cursor).
+                    let embed = self.inner.embedding.clone();
+                    let embedding_weight_pure = embed.get_weight();
+                    let layer_kinds = super::decoder_layer::compute_layer_kinds(
+                        self.inner.config.num_layers as usize,
+                        |i| self.inner.config.is_linear_layer(i),
+                    );
+                    let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "Qwen35PagedDecode::forward: caches dropped during cpp fallback",
+                        )
+                    })?;
+                    let adapter_mut = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "Qwen35PagedDecode::forward: paged_adapter dropped during cpp fallback",
+                        )
+                    })?;
+                    super::paged_forward::run_paged_decode_step(
+                        token_id,
+                        &embed,
+                        &mut self.inner.layers,
+                        caches_ref,
+                        &self.inner.final_norm,
+                        &self.inner.lm_head,
+                        &embedding_weight_pure,
+                        &layer_kinds,
+                        adapter_mut,
+                    )?
+                    .squeeze(Some(&[1]))?
+                }
+            }
+        } else {
+            // Pure-Rust paged decode fallback.
+            let embed = self.inner.embedding.clone();
+            let embedding_weight = embed.get_weight();
+            let layer_kinds = super::decoder_layer::compute_layer_kinds(
+                self.inner.config.num_layers as usize,
+                |i| self.inner.config.is_linear_layer(i),
+            );
+            let caches_ref = self.inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen35PagedDecode::forward: caches dropped mid-decode")
+            })?;
+            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen35PagedDecode::forward: paged_adapter dropped mid-decode")
+            })?;
+            super::paged_forward::run_paged_decode_step(
+                token_id,
+                &embed,
+                &mut self.inner.layers,
+                caches_ref,
+                &self.inner.final_norm,
+                &self.inner.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+            )?
+            .squeeze(Some(&[1]))?
+        };
+
+        // BOTH branches already pre-squeeze to [1, vocab] — the compiled path
+        // returns native 2D [B, vocab]; the eager path runs
+        // `run_paged_decode_step` ([1, 1, vocab]) then `squeeze([1])`.
+        // `needs_squeeze = FALSE`. ⚠ POLARITY IS INVERTED vs qwen3 (whose
+        // `Qwen3PagedDecode::forward` returns `true` from a direct
+        // `run_paged_decode_step`) — dense's squeeze lives in this body, so
+        // returning `true` here would double-squeeze and break the sampler.
+        Ok((logits, false))
+    }
+
+    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
+        // Single SYNCHRONOUS eval of `next_token` (== legacy
+        // `paged_turn_sync_core_inner`'s `y.eval()`): the compiled-paged forward
+        // is bandwidth-bound, so the async two-wait (bottom `async_eval` +
+        // loop-top `y.eval`) buys ZERO overlap. Restores decode parity with the
+        // legacy core (which also `y.eval()`'d after each sample).
+        next_token.eval();
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        // Paged cadence — the legacy paged loops' per-step
+        // `maybe_clear_cache_for_paged_step(step)`.
+        crate::array::maybe_clear_cache_for_paged_step(step);
+    }
+
+    fn compiled_step_completed(&self) -> Option<bool> {
+        // Surface the silent-eager-fallback latch (contract-honest for a
+        // compiled-paged stepper). dense consumes it internally in `forward`
+        // via `should_propagate_compiled_paged_error`; returning `Some(..)`
+        // here is cheap and forward-compatible.
+        Some(self.cpp_compiled_step_completed)
+    }
+
+    // `materialize_final` — DO NOT override (default no-op). CRITICAL: dense
+    // paged drops the last token UNCONDITIONALLY (see `save_paged_history`).
+    // The C++ compiled GDN linear-cache globals / adapter only advanced for the
+    // tokens the loop actually forwarded; re-running a decode step here for the
+    // final length-exit token would record a token the GDN/adapter state never
+    // advanced → recurrent-state desync vs the saved drop-last history.
+
+    fn end_decode(&mut self) -> Result<()> {
+        // THE NOVEL surface (neither qwen3 nor lfm2 paged has this). dense's GDN
+        // recurrent state warm-continues across turns, so after the decode loop
+        // we MUST export the C++ GDN linear caches back into `self.inner.caches`
+        // — gated on `cpp_compiled_step_completed` (no compiled step ran => the
+        // pure-Rust eager path already wrote `self.caches` in place, nothing to
+        // import). Verbatim port of the legacy `paged_turn_sync_core_inner`
+        // tail. Runs while the three guards are STILL alive (the engine calls
+        // `end_decode` before the stepper drops), so the export reads the live
+        // C++ globals before `CompiledResetGuard` tears them down. Result-typed
+        // so an export/eval failure aborts the turn (a Drop-based export could
+        // not propagate the abort).
+        if self.cpp_compiled_step_completed {
+            match export_paged_dense_linear_caches(&self.inner.config) {
+                Ok(Some(new_caches)) => {
+                    self.inner.caches = Some(new_caches);
+                    eval_layer_caches(&self.inner.caches)?;
+                }
+                Ok(None) => {
+                    self.inner.caches = None;
+                }
+                Err(err) => {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-dense paged_linear_cache_export_error error={}",
+                        err
+                    ));
+                    self.inner.caches = None;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// qwen3_5 dense paged prefix state — the effective prefix/suffix split from
+/// `prepare_turn_with_max_cache_hit_tokens`, PLUS the full prompt tokens and
+/// the GDN-prime flag.
+///
+/// `full_tokens` is needed because the engine hands `paged_prefill` ONLY the
+/// suffix (`tokens[effective_cached_prefix_len..]`), but
+/// `run_paged_prefill_chunk` needs the FULL prompt for the GDN pre-pass over
+/// the cached prefix. `gdn_prefix_already_primed` is the dense-specific bit the
+/// prime resolves (the GDN recurrent state was already populated live / from a
+/// checkpoint / via replay) and `paged_prefill` threads into
+/// `run_paged_prefill_chunk` so the prefill skips re-priming the GDN prefix.
+pub(crate) struct Qwen35PrefixState {
+    effective_cached_prefix_len: usize,
+    suffix_len: usize,
+    full_tokens: Vec<u32>,
+    gdn_prefix_already_primed: bool,
+}
+
+impl PagedPrefix for Qwen35PrefixState {
+    fn effective_cached_prefix_len(&self) -> usize {
+        self.effective_cached_prefix_len
+    }
+    fn suffix_len(&self) -> usize {
+        self.suffix_len
+    }
+}
+
+impl PagedBackend for Qwen35Inner {
+    type PagedDecode<'a>
+        = Qwen35PagedDecode<'a>
+    where
+        Self: 'a;
+    type PrefixState = Qwen35PrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        _reuse_cache: bool,
+        _block_size: usize,
+        _extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        // == the `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block at
+        // the head of the legacy `paged_turn_sync_core`.
+        let trace_enabled = inference_trace_enabled();
+        let total_budget = plan.len() as u32;
+        // vLLM exact-prefix cap: leave at least one prompt token to prefill so
+        // the decoder always has something to consume.
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let seq_id: u32 = 0;
+        let block_size = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?;
+            adapter.block_size()
+        };
+        // Per-block extra_keys for the GDN prefix-checkpoint lookup. text-only
+        // paged dispatch builds an all-empty per-block vec which is bit-equal to
+        // passing `&[]` to the adapter's uniform `prepare_turn` API; VLM-paged
+        // would replace the empty positions with real (token_pos, image_hash).
+        let lookup_extra_keys = engine::build_paged_extra_keys(plan.len(), block_size, &[]);
+
+        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // reads the PRE-turn live state, so probe the adapter immutably FIRST
+        // (prepare_turn mutates request_tokens via continue_turn/reset). The
+        // adapter re-reads the same state internally, so live_* is identical to
+        // what prepare_turn decides on. reuse_cache=true literal: the legacy
+        // hand-rolled `can_continue` had no reuse term (the engine's reuse_cache
+        // drives finalize/save instead). Suffix blocks are allocated inside
+        // prepare_turn.
+        let live_ready;
+        let live_prefix_match;
+        let live_tokens_len;
+        let mut live_mismatch = TokenPrefixMismatchTrace::default();
+        {
+            let adapter = self
+                .paged_adapter
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
+            live_ready = adapter.is_live_for_continue();
+            let live_tokens = adapter.request_tokens();
+            live_tokens_len = live_tokens.len();
+            live_prefix_match = plan.starts_with(live_tokens);
+            if trace_enabled && live_ready && !live_prefix_match {
+                live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
+            }
+        }
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                true,
+                &[],
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        let cached_prefix_len = turn_plan.cached_prefix_len;
+        let continued_live_prefix = turn_plan.continued_live_prefix;
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense paged_prefix_lookup prompt_tokens={} \
+                 cached_prefix_tokens={} continued_live_prefix={} live_ready={} \
+                 live_match={} live_tokens={} live_mismatch_at={} prompt_token={} live_token={}",
+                plan.len(),
+                cached_prefix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens_len,
+                live_mismatch.index,
+                live_mismatch.prompt_token,
+                live_mismatch.cached_token
+            ));
+        }
+
+        // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
+        // analog — dense carries GDN recurrent state across turns.
+        let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
+            plan,
+            cached_prefix_len,
+            block_size,
+            &lookup_extra_keys,
+            cache_salt,
+            continued_live_prefix,
+        )?;
+        let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
+        // Clear the per-turn session state the legacy core cleared here (history
+        // is re-set in `save_paged_history`; rope deltas + image key are reset
+        // because the paged path does not carry them across turns).
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
+            Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")
+        })? as usize;
+
+        Ok(Qwen35PrefixState {
+            effective_cached_prefix_len: cached_prefix_len as usize,
+            suffix_len,
+            full_tokens: plan.to_vec(),
+            gdn_prefix_already_primed,
+        })
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        // == the NON-hidden prefill block of the legacy
+        // `paged_turn_sync_core_inner`. `run_paged_prefill_chunk` writes K/V
+        // into the adapter pool, populates the GDN linear caches, runs the GDN
+        // pre-pass over the cached prefix from `full_tokens` (skipped when
+        // `gdn_prefix_already_primed`), then the full forward over the suffix,
+        // folding in the last-token slice (returns `[vocab]`). The engine fires
+        // the post-prefill `synchronize_and_clear_cache` AFTER this returns
+        // (NOT here). The MTP `_with_hidden` variant is NOT used here — MTP
+        // turns route through the kept `paged_turn_sync_core`, not the engine.
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let caches_ref = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
+        super::paged_forward::run_paged_prefill_chunk(
+            &prefix.full_tokens,
+            suffix_tokens,
+            prefix.effective_cached_prefix_len as u32,
+            prefix.gdn_prefix_already_primed,
+            &embed,
+            &mut self.layers,
+            caches_ref,
+            &self.final_norm,
+            &self.lm_head,
+            &embedding_weight,
+            &layer_kinds,
+            adapter,
+        )
+    }
+
+    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+        // == the compiled-paged dispatch block of the legacy
+        // `paged_turn_sync_core` (lock acquire) + the seed block of
+        // `paged_turn_sync_core_inner`. Arms the compiled-paged guards as
+        // STRUCT FIELDS of the returned `Qwen35PagedDecode` (declaration order
+        // == drop order == teardown order). MUST run AFTER prefill (reads the
+        // adapter pools + GDN caches) and the post-prefill cache clear, BEFORE
+        // the decode loop.
+        //
+        // LOCK CONTRACT: registration is the WRITER; decode is the READER. We
+        // acquire the SHARED `COMPILED_LIFECYCLE_MUTEX` (dense shares it with
+        // the flat compiled path) to serialize the compiled lifecycle across
+        // model instances, then re-validate the model id under the weights read
+        // lock (TOCTOU) before seeding.
+        let model_id = self.model_id;
+        let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let mut compiled_lock = if use_cpp_pre {
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
+        } else {
+            None
+        };
+        let mut weight_guard = None;
+        let cpp_session_ready = if use_cpp_pre {
+            let guard = compiled_weights_read();
+            // Re-check ownership under the read lock — a concurrent load of a
+            // different model could have evicted us between the probe and here.
+            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+                weight_guard = Some(guard);
+                // Seed the compiled-paged graph ONCE from the live post-prefill
+                // adapter pools + GDN state. On any failure drop back to the
+                // pure-Rust paged decode for the whole turn.
+                let caches_ref = self.caches.as_ref().ok_or_else(|| {
+                    Error::from_reason("begin_paged_decode: caches dropped post-prefill")
+                })?;
+                let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
+                    Error::from_reason("begin_paged_decode: paged_adapter dropped post-prefill")
+                })?;
+                if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
+                    eprintln!(
+                        "[MLX] Qwen3.5 Dense: skipping C++ compiled paged decode — adapter \
+                         block_size={} but compiled graph requires {}; falling back to pure-Rust \
+                         paged decode",
+                        adapter_ref.block_size(),
+                        CPP_PAGED_REQUIRED_BLOCK_SIZE
+                    );
+                    false
+                } else {
+                    let prefill_offset = adapter_ref.current_token_count() as i32;
+                    init_paged_dense_compiled_session(
+                        &self.config,
+                        caches_ref,
+                        adapter_ref,
+                        prefill_offset,
+                    )
+                    .is_ok()
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // When the compiled-paged session did NOT come up (model_id eviction,
+        // block_size mismatch, or seed failure), the decode loop runs the
+        // pure-Rust eager paged path, which touches none of the C++ compiled
+        // globals. Holding the lifecycle mutex / weight read lock across that
+        // whole loop is needless and blocks weight registration / other
+        // compiled startups for the entire generation. Drop them now. Safe at
+        // T=0: cpp_session_ready==false implies no seed ran, so the reset guard
+        // is None and the reset-while-locks-held invariant is vacuous.
+        if !cpp_session_ready {
+            weight_guard = None;
+            compiled_lock = None;
+        }
+
+        // RAII guard: resets BOTH g_compiled_* and g_dense_paged_* globals
+        // (single `mlx_qwen35_compiled_reset` symbol clears both) on EVERY exit
+        // path (including a `?` early-return or a first-step fallback that flips
+        // `cpp_session_ready` off). Armed iff the seed succeeded.
+        let paged_reset_guard = cpp_session_ready.then_some(CompiledResetGuard);
+
+        // Compile-cached `max_blocks_per_seq` shape — `max_position_embeddings`
+        // div_ceil block_size keeps the compile-cache key stable across every
+        // decode step within one turn (matches the legacy paged decode loop).
+        let max_blocks_per_seq: u32 = {
+            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+                Error::from_reason("begin_paged_decode: paged_adapter dropped pre-decode")
+            })?;
+            let max_seq = self.config.max_position_embeddings as u32;
+            max_seq.div_ceil(adapter.block_size())
+        };
+
+        Ok(Qwen35PagedDecode {
+            _paged_reset_guard: paged_reset_guard,
+            _weight_guard: weight_guard,
+            _lifecycle_lock: compiled_lock,
+            inner: self,
+            cpp_session_ready,
+            cpp_compiled_step_completed: false,
+            max_blocks_per_seq,
+            step_counter: 0,
+        })
+    }
+
+    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+        // == the legacy paged core's terminal lifecycle block. Success: keep
+        // the request live across turns when reuse is on, using PER-BLOCK extra
+        // keys (NOT qwen3's empty `&[]`), so the next turn's continue builds on
+        // the partial trailing block's live K/V; otherwise register full blocks
+        // for reuse + release. Infallible (`let _ =` every call — a teardown
+        // failure must not mask the turn result).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            if reuse_cache {
+                let total_for_finalize = adapter.request_tokens().len();
+                let block_size = adapter.block_size();
+                let finalize_extra_keys =
+                    engine::build_paged_extra_keys(total_for_finalize, block_size, &[]);
+                let _ = adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0);
+            } else {
+                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.release_request();
+            }
+        }
+    }
+
+    fn abort_paged_turn(&mut self) {
+        // Error-path teardown == the legacy paged core's `Err(e) =>
+        // release_request()` arm: release fully, partial block_table state is
+        // unsafe to keep. Release ONLY — never register / keep live. Infallible
+        // (`let _ =` — must not mask the turn's error).
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+    }
+
+    fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
+        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT the
+        // per-turn `generation_stream`. dense's compiled forward + every
+        // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
+        // queue separate from the shared loop's top-of-iteration `y.eval()`
+        // (always on the default stream) would force a cross-queue
+        // completion-wait every token (~5% on bandwidth-bound decode).
+        // `paged_prefill` still runs on `generation_stream`. See the
+        // `PagedBackend::paged_decode_stream` doc for the full mechanism.
+        Stream::default(crate::stream::DeviceType::Gpu)
+    }
+
+    fn save_paged_history(
+        &mut self,
+        save_tokens: &[u32],
+        generated: &[u32],
+        _keep_all: bool,
+        reuse_cache: bool,
+    ) -> Result<()> {
+        // dense paged ALWAYS drops the last token, regardless of the engine's
+        // `keep_all` (length-exit) signal — the paged decode loop NEVER forwards
+        // the LAST sampled token (the engine's forward gate skips it AND
+        // `materialize_final` is a no-op for dense), so the last `generated`
+        // entry is NOT in the adapter / GDN caches and must be dropped to keep
+        // the saved history aligned with the live cache state. This is the
+        // verbatim ordering of the legacy `paged_turn_sync_core` tail:
+        // finalize → set history (drop-last, last_token_in_cache=false) → GDN
+        // checkpoint → clear image key. PRESERVE THIS EXACT ORDER — it is the
+        // most delicate part for T=0 byte-equality.
+        if !reuse_cache {
+            self.cached_token_history.clear();
+            self.cached_image_key = None;
+            return Ok(());
+        }
+        let mut full_history = save_tokens.to_vec();
+        if !generated.is_empty() {
+            // last_token_in_cache == false → drop-last UNCONDITIONAL.
+            let upto = generated.len().saturating_sub(1);
+            full_history.extend_from_slice(&generated[..upto]);
+        }
+        self.cached_token_history = full_history;
+        // GDN history checkpoint — must run AFTER the history is set (it
+        // snapshots the live recurrent caches keyed on `cached_token_history`),
+        // BEFORE clearing the image key. A checkpoint/eval failure here
+        // PROPAGATES (`?`) to abort the turn, matching the legacy core: a
+        // half-snapshotted or failed-eval GDN state must NOT be published as a
+        // reusable warm-continue checkpoint, or the next turn reads corrupt
+        // recurrent state.
+        let store = self.remember_dense_gdn_history_checkpoint()?;
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
+                 eval_ms={:.1} clone_ms={:.1} token_clone_ms={:.1} update_ms={:.1} \
+                 total_ms={:.1}",
+                store.stored,
+                self.cached_token_history.len(),
+                store.eval_ms,
+                store.clone_ms,
+                store.token_clone_ms,
+                store.update_ms,
+                store.total_ms
+            ));
+        }
+        self.cached_image_key = None;
+        Ok(())
+    }
+
+    fn reconcile_paged_request_tokens(
+        &mut self,
+        prompt_len: usize,
+        generated: &[u32],
+        _keep_all: bool,
+    ) -> bool {
+        // dense ALWAYS drops the last token (see `save_paged_history`), so the
+        // to-be-saved history length is `prompt_len + (generated.len() - 1)` (or
+        // `prompt_len` when nothing was generated). Roll the adapter back to that
+        // length so the next turn's warm-continue gate
+        // (`prompt.starts_with(request_tokens())`) is not defeated by a trailing
+        // token the pipelined loop recorded at the loop top before the
+        // stop-check. `_keep_all` is intentionally ignored (qwen3 signal).
+        //
+        // Token accounting: on BOTH length and early-stop exits the to-be-saved
+        // history equals the adapter cursor (the final/terminal forward was
+        // skipped), so `surplus` is 0 and this is a true no-op for dense — but
+        // the rollback is kept as the defensive contract the trait mandates.
+        let Some(adapter) = self.paged_adapter.as_mut() else {
+            return true;
+        };
+        let history_len = if generated.is_empty() {
+            0
+        } else {
+            generated.len() - 1
+        };
+        let target_len = prompt_len + history_len;
+        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
+        if surplus > 0
+            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "reconcile_paged_request_tokens: rollback_last_tokens({surplus}) failed \
+                 (finalize releases the request; next turn cold-prefills): {e}",
+            );
+            return false;
+        }
+        true
+    }
+}
+
 impl Qwen35Inner {
     /// Whole-turn dense dispatch behind the engine's `vision_turn` and
     /// `mtp_turn` probes (S8).
@@ -7717,47 +8456,69 @@ impl Qwen35Inner {
         }
     }
 
-    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`]
-    /// (S8). Preserves the legacy dispatch sites verbatim: fresh sync /
-    /// delta sync (`paged_turn_sync_core` — image turns never reach here,
-    /// the vision probe owns them), fresh + delta streaming
-    /// (`paged_turn_stream_core`).
+    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`].
+    ///
+    /// Conditional router (dense differs from MoE here — `run_decode_loop` has
+    /// NO MTP gate, so MTP turns must NOT route through it):
+    ///   * MTP turns (`enable_mtp && has_mtp_weights`) keep the legacy native
+    ///     paged-MTP path UNCHANGED. The streaming-MTP probe declined earlier
+    ///     (routed to `mtp_turn` → `dense_whole_turn`), so only SYNC reaches
+    ///     here with MTP on; the kept `paged_turn_sync_core` self-handles the
+    ///     compiled-availability check + MTP gate + silent AR fallback. The
+    ///     `(sink, cancelled)` match is preserved so any future MTP-stream
+    ///     entry still finds its legacy dispatch target.
+    ///   * NON-MTP turns (sync or stream) → the new generic AR+paged path via
+    ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
+    ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The legacy entry points re-derived `p` from config at each
         // dispatch site (`extract_chat_params`); the engine's default
         // `resolve_params` is the same extraction, so re-extracting an
         // OWNED copy here is byte-identical.
         let p = extract_chat_params(args.config);
-        let report_perf = args.config.report_performance.unwrap_or(false);
-        let tokenizer = args.tokenizer.clone();
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                let cb = StreamSender(sink);
-                self.paged_turn_stream_core(
-                    args.tokens.to_vec(),
-                    tokenizer,
-                    args.eos_id,
-                    p,
-                    report_perf,
-                    &cb,
-                    cancelled,
-                    thinking,
-                )?;
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let result = self.paged_turn_sync_core(
-                    args.tokens.to_vec(),
-                    tokenizer,
-                    args.eos_id,
-                    p,
-                    report_perf,
-                    thinking,
-                )?;
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
+        if p.enable_mtp && self.has_mtp_weights() {
+            let report_perf = args.config.report_performance.unwrap_or(false);
+            let tokenizer = args.tokenizer.clone();
+            let thinking = args.thinking;
+            return match (args.sink, args.cancelled) {
+                (Some(sink), Some(cancelled)) => {
+                    let cb = StreamSender(sink);
+                    self.paged_turn_stream_core(
+                        args.tokens.to_vec(),
+                        tokenizer,
+                        args.eos_id,
+                        p,
+                        report_perf,
+                        &cb,
+                        cancelled,
+                        thinking,
+                    )?;
+                    Ok(TurnOutput::Streamed)
+                }
+                _ => {
+                    let result = self.paged_turn_sync_core(
+                        args.tokens.to_vec(),
+                        tokenizer,
+                        args.eos_id,
+                        p,
+                        report_perf,
+                        thinking,
+                    )?;
+                    Ok(TurnOutput::Complete(Box::new(result)))
+                }
+            };
         }
+
+        // NON-MTP (sync or stream) → the generic AR+paged engine path.
+        //
+        // This paged turn writes full-attention K/V into the paged adapter
+        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
+        // longer reflect the conversation. A later streaming dense-MTP fallback
+        // must rebuild the flat caches before decoding. The legacy paged cores
+        // set this at their core entry; this is the sole new set-site for the
+        // generic path. See `paged_full_attn_caches_dirty`.
+        self.paged_full_attn_caches_dirty = true;
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }
 
