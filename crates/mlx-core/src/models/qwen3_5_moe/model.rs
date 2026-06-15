@@ -265,14 +265,8 @@ fn export_paged_moe_linear_caches(
 
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
-use crate::engine::compiled_lock::compiled_weights_read;
+use crate::engine::compiled_lock::{COMPILED_LIFECYCLE_MUTEX, compiled_weights_read};
 use crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER;
-
-/// Process-wide mutex serializing the MoE compiled forward lifecycle across
-/// model instances. Within a single model instance, the dedicated model thread
-/// serializes calls. But with multiple model instances, compiled C++ forward
-/// calls from different model threads can collide on process-wide globals.
-static MOE_COMPILED_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII guard that calls `mlx_qwen35_moe_reset()` on drop.
 ///
@@ -1211,7 +1205,11 @@ impl Qwen35MoeInner {
 
         // Serialize MoE compiled lifecycle across model instances
         let _moe_lock = if use_cpp {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -1534,7 +1532,7 @@ impl Qwen35MoeInner {
             // `g_weights` store. Init failure (no MTP weights, mismatched
             // config) silently disables MTP for this turn — the regular
             // single-token loop continues to work. We already hold
-            // `MOE_COMPILED_MUTEX` + `COMPILED_WEIGHTS_RWLOCK` here so the
+            // `COMPILED_LIFECYCLE_MUTEX` + `COMPILED_WEIGHTS_RWLOCK` here so the
             // entire draft+verify cycle is safely serialised against any
             // other turn's main MoE forward.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
@@ -1891,7 +1889,7 @@ impl Qwen35MoeInner {
         // Detect availability of the C++ compiled paged decode path. The
         // gating is identical to the flat path: the weights for this
         // model must still be registered (no other model has overwritten
-        // `g_active_model_id`). We acquire `MOE_COMPILED_MUTEX` to
+        // `g_active_model_id`). We acquire `COMPILED_LIFECYCLE_MUTEX` to
         // serialize the compiled lifecycle across model instances —
         // both the legacy flat init/forward/reset AND the new paged
         // init/forward/reset share the same C++ `g_paged_*` /
@@ -1904,7 +1902,11 @@ impl Qwen35MoeInner {
         let model_id = self.model_id;
         let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _moe_lock = if use_cpp_paged {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -2492,7 +2494,11 @@ impl Qwen35MoeInner {
         let model_id = self.model_id;
         let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _moe_lock = if use_cpp_paged {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -3338,7 +3344,11 @@ impl Qwen35MoeInner {
         // Check compiled path
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _moe_lock = if use_cpp {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -3643,7 +3653,7 @@ impl Qwen35MoeInner {
             profiler.set_label("moe_chat_stream_compiled");
 
             // MoE MTP opt-in speculative decode. See sync sibling for
-            // rationale. We already hold MOE_COMPILED_MUTEX +
+            // rationale. We already hold COMPILED_LIFECYCLE_MUTEX +
             // COMPILED_WEIGHTS_RWLOCK.
             let mtp_active = p.enable_mtp && self.has_mtp_weights() && {
                 match init_moe_mtp_compiled_from_main(&self.config, max_kv_len) {
@@ -4127,7 +4137,11 @@ impl Qwen35MoeInner {
 
         // Serialize MoE compiled lifecycle across model instances
         let _moe_lock = if use_cpp {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -4645,7 +4659,11 @@ impl Qwen35MoeInner {
 
         let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let _moe_lock = if use_cpp {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -7075,7 +7093,7 @@ pub(crate) struct Qwen35MoePagedDecode<'a> {
     // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION order, so
     // these three guards MUST be listed reset-guard → weight-guard → lock so
     // that `MoeResetGuard::drop()` (→ `mlx_qwen35_moe_reset()`) runs WHILE the
-    // lifecycle mutex (`MOE_COMPILED_MUTEX`) + weight read lock are STILL held.
+    // lifecycle mutex (`COMPILED_LIFECYCLE_MUTEX`) + weight read lock are STILL held.
     // This matches the original local-variable reverse-drop order (legacy
     // `paged_turn_sync_core_inner` declared lock→weight→reset; locals drop in
     // reverse, so reset→weight→lock). If the reset ran AFTER the lifecycle
@@ -7562,14 +7580,19 @@ impl PagedBackend for Qwen35MoeInner {
         // cache clear, BEFORE the decode loop.
         //
         // LOCK CONTRACT: registration is the WRITER; decode is the READER. We
-        // acquire `MOE_COMPILED_MUTEX` (NOT the shared lifecycle mutex — moe
-        // keeps its private one) to serialize the compiled lifecycle across
-        // model instances, then re-validate the model id under the weights read
-        // lock (TOCTOU) before seeding.
+        // acquire the shared `COMPILED_LIFECYCLE_MUTEX` to serialize the
+        // compiled lifecycle across model instances AND families (dense, lfm2,
+        // moe all collide on the same process-global C++ state), then
+        // re-validate the model id under the weights read lock (TOCTOU) before
+        // seeding.
         let model_id = self.model_id;
         let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let mut compiled_lock = if use_cpp_pre {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -7980,7 +8003,11 @@ impl ChatBackend for Qwen35MoeInner {
         // Rust path.
         let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
         let lifecycle_lock = if use_compiled {
-            Some(MOE_COMPILED_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+            Some(
+                COMPILED_LIFECYCLE_MUTEX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()),
+            )
         } else {
             None
         };
@@ -8933,7 +8960,7 @@ fn eval_token_moe_caches_and_chained_hidden(next_token: &MxArray, chained_hidden
 /// expects, after a `reshape(&[1, 1, hidden])` to match the
 /// `[B, T, hidden]` MTP-draft contract.
 ///
-/// Caller MUST hold `MOE_COMPILED_MUTEX` and the
+/// Caller MUST hold `COMPILED_LIFECYCLE_MUTEX` and the
 /// `COMPILED_WEIGHTS_RWLOCK` read guard for the whole call — the
 /// hidden is stashed in a process-wide `g_moe_last_hidden` global on
 /// the C++ side and is only valid until the next main-path forward
@@ -8969,16 +8996,14 @@ fn forward_moe_compiled_with_hidden(
 // `g_weights()` with the main MoE path.
 //
 // Locking contract:
-//   - Production callers (chat-session loop) MUST hold
-//     `MOE_COMPILED_MUTEX` (NOT `DENSE_COMPILED_MUTEX`!) AND the
-//     `COMPILED_WEIGHTS_RWLOCK` read guard across the entire
-//     draft+verify cycle — the verify FFI loops the main MoE forward
-//     in a single critical section and mutates `g_moe_caches` /
-//     `g_moe_offset_int` in place.
-//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) cannot lock
-//     `MOE_COMPILED_MUTEX` directly because it is `static` (private)
-//     to this module. They instead serialise on `FFI_LOCK`, which is
-//     sufficient in the absence of concurrent main-path forward calls.
+//   - Production callers (chat-session loop) MUST hold the shared
+//     `COMPILED_LIFECYCLE_MUTEX` AND the `COMPILED_WEIGHTS_RWLOCK` read
+//     guard across the entire draft+verify cycle — the verify FFI loops
+//     the main MoE forward in a single critical section and mutates
+//     `g_moe_caches` / `g_moe_offset_int` in place.
+//   - Tests in `compiled_ffi_tests` (in `mtp.rs`) serialise on
+//     `FFI_LOCK` instead, which is sufficient in the absence of
+//     concurrent main-path forward calls.
 //
 // Integration contract:
 //   1. After `mlx_qwen35_moe_init_from_prefill(...)` succeeds for the
@@ -9233,7 +9258,7 @@ pub(super) fn forward_moe_mtp_draft_compiled(
 /// SIDE EFFECTS: advances the MAIN MoE compiled path's offset by
 /// `depth + 1` and writes K/V into the main MoE `g_moe_caches[]` at
 /// the corresponding positions. Production callers (chat-session loop)
-/// MUST already hold `MOE_COMPILED_MUTEX` and the `COMPILED_WEIGHTS_RWLOCK`
+/// MUST already hold `COMPILED_LIFECYCLE_MUTEX` and the `COMPILED_WEIGHTS_RWLOCK`
 /// read guard so no other turn can race the offset / cache state during the
 /// verify. Tests serialise via `FFI_LOCK` in the absence of concurrent
 /// main-path forward calls — see `compiled_ffi_tests` in `mtp.rs`.
@@ -9284,7 +9309,7 @@ pub(super) fn forward_moe_mtp_verify_compiled(
 /// slice-K semantics.
 ///
 /// Same locking contract as [`forward_moe_mtp_verify_compiled`]:
-/// callers MUST hold `MOE_COMPILED_MUTEX` (NOT the dense one) and a
+/// callers MUST hold the shared `COMPILED_LIFECYCLE_MUTEX` and a
 /// `COMPILED_WEIGHTS_RWLOCK` read guard for the entire cycle. Returns
 /// `(logits[1, depth+1, vocab], hiddens[1, depth+1, hidden_size])` on
 /// success.

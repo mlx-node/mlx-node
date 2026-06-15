@@ -1499,10 +1499,11 @@ fn register_moe_weights_with_cpp(
     use mlx_sys as sys;
     use std::ffi::CString;
 
-    // Write-lock the weight RwLock for the entire registration.
-    let _guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
-        .write()
-        .unwrap();
+    // Write-lock the weight RwLock for the entire registration. Use the
+    // poison-recovering helper so a panic during a prior torn registration
+    // does not wedge every subsequent model load (a recovered writer re-runs
+    // the full clear → store → publish-id sequence below).
+    let _guard = crate::engine::compiled_lock::compiled_weights_write();
 
     // Clear weights (shared map). `mlx_clear_weights` also clears the
     // per-projection quant-info registry, so we re-populate both below.
