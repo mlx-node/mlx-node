@@ -64,21 +64,56 @@ inline bool mtp_trace_enabled() {
 
 // =====================================================================
 // Global weight storage (shared between dense and MoE)
+//
+// All of a model's registered tensors live in a WeightSlot. The weight
+// accessors (g_weights / g_weight_transposes / g_quant_info and the get_weight*
+// readers) resolve the active slot through g_active_weight_slot(), so selecting
+// which model's weights the compiled forward bakes is a single pointer repoint
+// — no get_weight call site needs to change. Today there is one default slot
+// and the pointer always references it; the per-model-id slot map repoints it
+// per model at registration / turn entry.
 // =====================================================================
 
-inline std::unordered_map<std::string, array>& g_weights() {
-  static std::unordered_map<std::string, array> instance;
-  return instance;
-}
+// Per-projection quantization metadata: the authoritative (mode, bits,
+// group_size) Rust supplies at registration so the compiled forward dispatches
+// dequant correctly instead of inferring from companion-tensor presence (which
+// conflates MXFP4/MXFP8/NVFP4). Keyed by projection prefix (NO
+// `.weight`/`.scales`/`.biases` suffix), e.g.
+// "layers.3.mlp.switch_mlp.gate_proj".
+struct QuantInfo {
+  std::string mode;  // "affine" | "mxfp8" | "mxfp4" | "nvfp4" | "sym8"
+  int bits;
+  int group_size;
+};
+
+// One model's complete registered weight set: the raw tensors, their
+// pre-computed 2D transposes, and the per-prefix quant metadata. A single
+// g_weights_mutex() covers all three at registration.
+struct WeightSlot {
+  std::unordered_map<std::string, array> weights;
+  std::unordered_map<std::string, array> weight_transposes;
+  std::unordered_map<std::string, QuantInfo> quant_info;
+};
 
 inline std::shared_mutex& g_weights_mutex() {
   static std::shared_mutex instance;
   return instance;
 }
 
+// The slot the weight accessors currently resolve to. Initialised to a single
+// default slot; the per-model-id migration repoints it per model.
+inline WeightSlot*& g_active_weight_slot() {
+  static WeightSlot default_slot;
+  static WeightSlot* active = &default_slot;
+  return active;
+}
+
+inline std::unordered_map<std::string, array>& g_weights() {
+  return g_active_weight_slot()->weights;
+}
+
 inline std::unordered_map<std::string, array>& g_weight_transposes() {
-  static std::unordered_map<std::string, array> instance;
-  return instance;
+  return g_active_weight_slot()->weight_transposes;
 }
 
 // Model identity: atomic counter set after all weights are stored.
@@ -116,27 +151,11 @@ inline bool has_weight(const std::string& name) {
   return g_weights().count(name) > 0;
 }
 
-// =====================================================================
-// Quantization metadata registry
-//
-// Sidecar map keyed by projection prefix (NO `.weight`/`.scales`/`.biases`
-// suffix), e.g. "layers.3.mlp.switch_mlp.gate_proj". Holds the authoritative
-// per-layer (mode, bits, group_size) supplied by Rust at weight-registration
-// time so the compiled forward path can dispatch correctly without inferring
-// from companion-tensor presence (which conflates MXFP4/MXFP8/NVFP4).
-//
-// Shares g_weights_mutex() — a single lock at registration covers both maps.
-// =====================================================================
-
-struct QuantInfo {
-  std::string mode;  // "affine" | "mxfp8" | "mxfp4" | "nvfp4" | "sym8"
-  int bits;
-  int group_size;
-};
-
+// Quantization metadata registry (QuantInfo + the sidecar map are defined with
+// the WeightSlot above). Shares g_weights_mutex() — a single lock at
+// registration covers all three maps.
 inline std::unordered_map<std::string, QuantInfo>& g_quant_info() {
-  static std::unordered_map<std::string, QuantInfo> instance;
-  return instance;
+  return g_active_weight_slot()->quant_info;
 }
 
 inline std::optional<QuantInfo> lookup_quant_info(const std::string& prefix) {
