@@ -975,6 +975,118 @@ static void invalidate_verify_compiled_tables() {
   g_dense_decode_paged_compiled = BatchedVerifyFn{};
 }
 
+// Per-model dense compiled state. Every dense compiled global above is a
+// "working register": one model's state occupies it at a time. To let two dense
+// models coexist, each model owns a DenseSlot holding a private copy of all
+// those globals; `mlx_qwen35_activate_dense_model` swaps the chosen model's slot
+// into the working register once per turn (the turn runs under the Rust compiled
+// lifecycle lock, so no per-extern threading is needed). The graph-table fields
+// (std::function dispatch slots) carry each model's distinct compiled fun_ids,
+// so parking + swapping keeps each model's baked graphs isolated.
+struct DenseSlot {
+  // Flat-path compiled state.
+  CompileConfig compile_config{};
+  std::vector<array> compiled_caches;
+  std::optional<array> compiled_offset;
+  int offset_int = 0;
+  bool compile_inited = false;
+  std::optional<array> last_hidden;
+  std::optional<array> last_hidden_paged;
+  std::vector<array> compiled_linear_snapshot;
+  int linear_snapshot_offset = 0;
+  bool linear_snapshot_taken = false;
+  bool tape_recording_armed = false;
+  std::vector<std::optional<array>> gdn_tape_acc;
+  std::vector<std::optional<array>> gdn_k_tape_acc;
+  std::vector<std::optional<array>> gdn_g_tape_acc;
+  std::vector<std::optional<array>> gdn_qkv_tape_acc;
+
+  // Paged-path compiled state.
+  CompileConfig dense_paged_config{};
+  std::vector<array> dense_k_pools;
+  std::vector<array> dense_v_pools;
+  std::vector<array> dense_k_scales;
+  std::vector<array> dense_v_scales;
+  std::vector<array> dense_paged_linear_caches;
+  int dense_paged_offset_int = 0;
+  bool dense_paged_inited = false;
+  std::vector<array> dense_paged_linear_snapshot;
+  bool dense_paged_linear_snapshot_taken = false;
+
+  // Compiled-graph dispatch tables (the per-model baked graphs).
+  std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
+      verify_compiled_by_bucket{};
+  std::array<std::array<BatchedVerifyFn, 2>, kTotalBucketSlots>
+      verify_argmax_compiled_by_bucket{};
+  std::array<std::array<SparseVerifyFnSlot, 2>, kTotalBucketSlots>
+      verify_sparse_compiled_by_bucket{};
+  std::array<BatchedVerifyFn, 2> verify_compiled_paged{};
+  BatchedVerifyFn dense_decode_paged_compiled{};
+};
+
+// Exchange every dense compiled global with the matching DenseSlot field. After
+// the swap, `s` holds whatever previously occupied the working register and the
+// globals hold `s`'s prior contents.
+void swap_dense_globals(DenseSlot& s) {
+  std::swap(g_compile_config, s.compile_config);
+  std::swap(g_compiled_caches, s.compiled_caches);
+  std::swap(g_compiled_offset, s.compiled_offset);
+  std::swap(g_offset_int, s.offset_int);
+  std::swap(g_compile_inited, s.compile_inited);
+  std::swap(g_last_hidden, s.last_hidden);
+  std::swap(g_last_hidden_paged, s.last_hidden_paged);
+  std::swap(g_compiled_linear_snapshot, s.compiled_linear_snapshot);
+  std::swap(g_linear_snapshot_offset, s.linear_snapshot_offset);
+  std::swap(g_linear_snapshot_taken, s.linear_snapshot_taken);
+  std::swap(g_tape_recording_armed, s.tape_recording_armed);
+  std::swap(g_gdn_tape_acc, s.gdn_tape_acc);
+  std::swap(g_gdn_k_tape_acc, s.gdn_k_tape_acc);
+  std::swap(g_gdn_g_tape_acc, s.gdn_g_tape_acc);
+  std::swap(g_gdn_qkv_tape_acc, s.gdn_qkv_tape_acc);
+  std::swap(g_dense_paged_config, s.dense_paged_config);
+  std::swap(g_dense_k_pools, s.dense_k_pools);
+  std::swap(g_dense_v_pools, s.dense_v_pools);
+  std::swap(g_dense_k_scales, s.dense_k_scales);
+  std::swap(g_dense_v_scales, s.dense_v_scales);
+  std::swap(g_dense_paged_linear_caches, s.dense_paged_linear_caches);
+  std::swap(g_dense_paged_offset_int, s.dense_paged_offset_int);
+  std::swap(g_dense_paged_inited, s.dense_paged_inited);
+  std::swap(g_dense_paged_linear_snapshot, s.dense_paged_linear_snapshot);
+  std::swap(g_dense_paged_linear_snapshot_taken,
+            s.dense_paged_linear_snapshot_taken);
+  std::swap(g_verify_compiled_by_bucket, s.verify_compiled_by_bucket);
+  std::swap(g_verify_argmax_compiled_by_bucket,
+            s.verify_argmax_compiled_by_bucket);
+  std::swap(g_verify_sparse_compiled_by_bucket,
+            s.verify_sparse_compiled_by_bucket);
+  std::swap(g_verify_compiled_paged, s.verify_compiled_paged);
+  std::swap(g_dense_decode_paged_compiled, s.dense_decode_paged_compiled);
+}
+
+// The per-model dense slot registry, keyed by model_id, plus the id of the model
+// whose slot currently occupies the working-register globals (0 = none).
+//
+// Intentionally leaked (heap-allocated, never destructed): a model thread drops
+// its Qwen35Inner — which erases its entry here — during process teardown, which
+// can run AFTER a function-local static map would already have been destroyed
+// (erasing a destroyed map null-derefs the hash table). A never-destructed map
+// keeps that late erase valid; the leaked graph handles are reclaimed by the OS
+// on exit anyway.
+std::unordered_map<uint64_t, DenseSlot>& g_dense_slots() {
+  static auto* instance = new std::unordered_map<uint64_t, DenseSlot>();
+  return *instance;
+}
+uint64_t g_active_dense_id = 0;
+
+// Move the currently-active model's state out of the working register and back
+// into its slot, leaving the working register empty (default-constructed).
+void park_active_dense_model() {
+  if (g_active_dense_id != 0) {
+    swap_dense_globals(g_dense_slots()[g_active_dense_id]);
+    g_active_dense_id = 0;
+  }
+}
+
 }  // namespace
 
 // =====================================================================
@@ -1144,6 +1256,10 @@ extern "C" {
 // Weight storage FFI (mlx_store_weight, mlx_clear_weights,
 // mlx_weight_count, mlx_set_model_id) moved to
 // mlx_common_weights.cpp — shared by all compiled model forward passes.
+//
+// Forward-declared here because the dense activate helper republishes the
+// active model's weight slot when it swaps the compiled register.
+void mlx_set_model_id(uint64_t id);
 
 uint64_t mlx_qwen35_get_model_id() {
   return g_active_model_id().load(std::memory_order_acquire);
@@ -2665,18 +2781,72 @@ void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
   mlx_qwen35_compiled_tape_disarm();
 }
 
-// Invalidate ALL compiled MTP-verify dispatch tables so the next
-// `get_or_compile_verify_*` re-traces against the CURRENT weight registry.
+// Select model_id's dense compiled state for the upcoming turn: park the
+// previously active model back into its slot, swap this model's slot into the
+// working-register globals, and publish its weight slot. Idempotent for the
+// model already active within the turn. MUST be called under the Rust compiled
+// lifecycle lock (the turn is the serialization unit), so no internal locking is
+// needed for the slot map / working register.
+void mlx_qwen35_activate_dense_model(uint64_t model_id) {
+  if (g_active_dense_id == model_id) {
+    mlx_set_model_id(model_id);
+    return;
+  }
+  park_active_dense_model();
+  // operator[] default-constructs an empty slot on first use for this model.
+  swap_dense_globals(g_dense_slots()[model_id]);
+  g_active_dense_id = model_id;
+  mlx_set_model_id(model_id);
+}
+
+// Per-model compiled-capability gate: true iff model_id has registered
+// (non-empty) weights. Replaces the old single-active-model-id compare so a
+// model stays compiled-eligible even after a SIBLING model loads — that is the
+// coexistence fix. Takes the weights read lock so it races safely against a
+// concurrent registration clearing/populating another model's slot.
+int mlx_qwen35_model_has_weights(uint64_t model_id) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+  auto it = g_weight_slots().find(model_id);
+  return (it != g_weight_slots().end() && !it->second.weights.empty()) ? 1 : 0;
+}
+
+// Free model_id's dense compiled slot on model destruction, dropping its
+// std::function graph tables so MLX reclaims the baked tapes. If the model still
+// occupies the working register, clear it first so the globals end up empty.
+void mlx_qwen35_dense_slot_erase(uint64_t model_id) {
+  if (g_active_dense_id == model_id) {
+    DenseSlot empty;
+    swap_dense_globals(empty);
+    g_active_dense_id = 0;
+  }
+  g_dense_slots().erase(model_id);
+}
+
+// Invalidate the dense MTP-verify dispatch tables of the working register so the
+// next `get_or_compile_verify_*` re-traces against the CURRENT weight registry.
 //
 // Called by the Rust loaders (`register_weights_with_cpp` /
 // `register_moe_weights_with_cpp`) on EVERY model reload, immediately after
 // `mlx_clear_weights()` and INSIDE the `COMPILED_WEIGHTS_RWLOCK` write critical
 // section, so it is serialized against in-flight compiled reads. Unlike
 // `mlx_qwen35_compiled_reset()` (a PER-TURN reset that deliberately keeps the
-// verify tables for cross-turn reuse), this is a PER-RELOAD invalidation:
-// without it a second same-shape Qwen3.5/3.6 model loaded in the same process
-// would verify speculative tokens with the FIRST model's baked weights (silent
-// corruption).
+// verify tables for cross-turn reuse), this is a PER-RELOAD invalidation.
+//
+// Each dense model owns a private DenseSlot holding its compiled graph tables,
+// so one model's reload must not disturb another model's tables. We park the
+// active model back into its slot first, leaving the working register empty;
+// the null below then clears only that empty register (a no-op for real
+// per-model slots). The freshly-loading model gets its own empty slot lazily on
+// its first activate.
+//
+// SCOPE: this only clears the WORKING REGISTER — it does NOT reach the slot of
+// a model that is currently PARKED. It is therefore safe for sibling models
+// (their slots are preserved) but it does NOT, on its own, invalidate the
+// reloading model's OWN compiled graphs when that model is parked. The loader
+// closes that gap by calling `mlx_qwen35_dense_slot_erase(model_id)` for the
+// model being (re-)registered just before this, which drops the loading
+// model's slot (active → clears the register; parked → erases the slot) so a
+// same-model_id re-registration can never resurrect stale baked-weight graphs.
 //
 // See `invalidate_verify_compiled_tables()` for the slot-nulling →
 // lazy-re-trace mechanism and its thread-safety rationale. That helper also
@@ -2684,6 +2854,7 @@ void mlx_qwen35_compiled_tape_replay_paged(int accepted_steps) {
 // MTP draft/commit graphs (defined in `mlx_qwen35_mtp_compiled.cpp`) so EVERY
 // weight-baking graph re-traces against the reloaded registry.
 void mlx_qwen35_invalidate_compiled_graphs() {
+  park_active_dense_model();
   invalidate_verify_compiled_tables();
   mlx_qwen35_mtp_invalidate_compiled_graphs();
 }

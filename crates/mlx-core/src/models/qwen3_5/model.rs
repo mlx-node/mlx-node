@@ -342,6 +342,22 @@ pub(crate) struct Qwen35Inner {
     turn_is_streaming: Cell<bool>,
 }
 
+impl Drop for Qwen35Inner {
+    fn drop(&mut self) {
+        // Release this model's dense compiled slot so MLX reclaims the baked
+        // graph tapes its std::function tables hold. A no-op when this model
+        // never registered compiled weights (the slot was never created).
+        //
+        // Held under the compiled-weights write lock — the same lock model
+        // (re)registration takes — so erasing this entry is serialized against
+        // any concurrent turn on another model thread mutating the shared
+        // dense-slot map (std::unordered_map insert/erase are not concurrency
+        // safe even on distinct keys).
+        let _guard = crate::engine::compiled_lock::compiled_weights_write();
+        unsafe { mlx_sys::mlx_qwen35_dense_slot_erase(self.model_id) };
+    }
+}
+
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
     /// All chat-session traffic (sync + streaming starts/continues/tool
@@ -1490,7 +1506,7 @@ impl Qwen35Inner {
         }
 
         // Check if compiled path will be used
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
 
         // Serialize compiled lifecycle across model instances
         let _compiled_lock = if use_compiled {
@@ -1507,7 +1523,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -1911,7 +1927,7 @@ impl Qwen35Inner {
         }
 
         // Check compiled path availability (same contract as vision_mtp_whole_turn_core).
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let _compiled_lock = if use_compiled {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -1925,7 +1941,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -2111,6 +2127,14 @@ impl Qwen35Inner {
         let last_logits = apply_all_penalties(last_logits, &token_history_init, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
+
+        if use_compiled {
+            // Swap this model's compiled slot into the working register before
+            // arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(self.model_id) };
+        }
 
         let _compiled_guard = if use_compiled {
             Some(CompiledResetGuard)
@@ -2764,14 +2788,15 @@ impl Qwen35Inner {
         let trace_enabled = inference_trace_enabled();
 
         // Detect availability of the C++ compiled paged decode path.
-        // Mirrors the MoE paged path: if the weights for this model are
-        // still registered (no other model swapped `g_active_model_id`),
-        // we can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged`.
+        // The gate is this model's own weight presence, so a sibling model
+        // loading no longer disqualifies it; if its weights are registered we
+        // can run `mlx_qwen35_init_paged` + `mlx_qwen35_forward_paged` after
+        // activating its compiled slot for the turn.
         // Both the legacy flat compiled path and the new paged compiled
         // path share `COMPILED_LIFECYCLE_MUTEX`/`COMPILED_WEIGHTS_RWLOCK` for
         // process-wide serialization.
         let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let _dense_lock = if use_cpp_paged {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -2784,7 +2809,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -3139,6 +3164,10 @@ impl Qwen35Inner {
         // runs on any exit path so the next session starts with cleared
         // C++ globals.
         let mut cpp_session_ready = if use_cpp_paged {
+            // Swap this model's compiled slot into the working register before
+            // the first compiled FFI (the seed below + every later forward),
+            // parking any other model. Held under the caller's lifecycle lock.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(self.model_id) };
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
                 Error::from_reason("paged_turn_sync_core_inner: caches dropped post-prefill")
             })?;
@@ -3791,7 +3820,7 @@ impl Qwen35Inner {
         // `paged_turn_sync_core` for the full rationale; this is the
         // streaming twin.
         let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let _dense_lock = if use_cpp_paged {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -3804,7 +3833,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -4168,6 +4197,10 @@ impl Qwen35Inner {
         // paged decode (fallback). See `paged_turn_sync_core_inner` for
         // the cpp_session_ready gate rationale.
         let mut cpp_session_ready = if use_cpp_paged {
+            // Swap this model's compiled slot into the working register before
+            // the first compiled FFI (the seed below + every later forward),
+            // parking any other model. Held under the caller's lifecycle lock.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(self.model_id) };
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
                 Error::from_reason("paged_turn_stream_core_inner: caches dropped post-prefill")
             })?;
@@ -4517,7 +4550,7 @@ impl Qwen35Inner {
         }
 
         // Compiled path availability check, same pattern as chat_tokens_delta_sync.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let _compiled_lock = if use_compiled {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -4531,7 +4564,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -4654,6 +4687,14 @@ impl Qwen35Inner {
         last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
+
+        if use_compiled {
+            // Swap this model's compiled slot into the working register before
+            // arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(self.model_id) };
+        }
 
         let _compiled_guard = if use_compiled {
             Some(CompiledResetGuard)
@@ -5315,7 +5356,7 @@ impl Qwen35Inner {
         }
 
         // Check compiled path
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let _compiled_lock = if use_compiled {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -5329,7 +5370,7 @@ impl Qwen35Inner {
         let mut _weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -5614,6 +5655,14 @@ impl Qwen35Inner {
         last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
+
+        if use_compiled {
+            // Swap this model's compiled slot into the working register before
+            // arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(self.model_id) };
+        }
 
         let _compiled_guard = if use_compiled {
             Some(CompiledResetGuard)
@@ -8157,7 +8206,7 @@ impl PagedBackend for Qwen35Inner {
         // model instances, then re-validate the model id under the weights read
         // lock (TOCTOU) before seeding.
         let model_id = self.model_id;
-        let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let mut compiled_lock = if use_cpp_pre {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -8170,10 +8219,16 @@ impl PagedBackend for Qwen35Inner {
         let mut weight_guard = None;
         let cpp_session_ready = if use_cpp_pre {
             let guard = compiled_weights_read();
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            // Re-check this model's weight presence under the read lock — a
+            // concurrent reload/clear of THIS model could have dropped its
+            // weights between the probe and here (a sibling model loading does
+            // not, which is the coexistence fix).
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 weight_guard = Some(guard);
+                // Swap this model's compiled slot into the working register
+                // before the seed FFI and every later paged forward, parking
+                // any other model. Held under the lifecycle lock above.
+                unsafe { mlx_sys::mlx_qwen35_activate_dense_model(model_id) };
                 // Seed the compiled-paged graph ONCE from the live post-prefill
                 // adapter pools + GDN state. On any failure drop back to the
                 // pure-Rust paged decode for the whole turn.
@@ -8813,14 +8868,15 @@ impl ChatBackend for Qwen35Inner {
         let p = turn.params;
         let model_id = self.model_id;
 
-        // Compiled-path availability + process-wide serialization —
-        // VERBATIM move of the legacy lock acquisition from the deleted
-        // dense cores: lifecycle mutex first (when the cheap pre-check
-        // passes), then the weights read lock, then the model-id
-        // RE-check under the lock. Another model swapping
-        // `g_active_model_id` between the two checks silently demotes
-        // the turn to the eager Rust path.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        // Compiled-path availability + process-wide serialization: the gate is
+        // per-model weight presence, so a sibling model loading no longer
+        // demotes this model. Lifecycle mutex first (when the cheap presence
+        // pre-check passes), then the weights read lock, then a RE-check under
+        // the lock. The re-check guards against THIS model being
+        // dropped/cleared between the cheap check and the lock; if it still has
+        // weights, `mlx_qwen35_activate_dense_model` below selects its compiled
+        // slot for the turn.
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
         let lifecycle_lock = if use_compiled {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -8833,7 +8889,7 @@ impl ChatBackend for Qwen35Inner {
         let mut weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0 {
                 weight_guard = Some(guard);
                 true
             } else {
@@ -8888,6 +8944,11 @@ impl ChatBackend for Qwen35Inner {
         let mut compiled_guard = None;
         let relabel: &'static str;
         if use_compiled {
+            // Swap this model's compiled slot into the working register before
+            // arming the reset guard and the seed FFI, parking any other model.
+            // Held under the lifecycle lock acquired above.
+            unsafe { mlx_sys::mlx_qwen35_activate_dense_model(model_id) };
+
             // Arm the reset guard BEFORE the seeding block, mirroring
             // the legacy declaration order: an Err out of
             // `kv_capacity_round_up` must still tear the compiled state
@@ -11017,8 +11078,10 @@ pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
 ///
 /// 1. `caches` is fully populated by a prior pure-Rust paged prefill.
 /// 2. The C++ weights for this model are still registered (caller must
-///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
-///    holds the appropriate read locks).
+///    have verified `mlx_qwen35_model_has_weights(self.model_id)` and
+///    holds the appropriate read locks), and this model's dense compiled
+///    slot has been activated for the turn via
+///    `mlx_qwen35_activate_dense_model(self.model_id)`.
 ///
 /// `prefill_offset` is the global token cursor the compiled paged
 /// graph's `g_dense_paged_offset_int` will start incrementing from.
@@ -11694,9 +11757,14 @@ fn vlm_prefill(
     )?;
 
     // === STEP 4: Prefill with M-RoPE ===
-    let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+    let use_compiled = unsafe { mlx_sys::mlx_qwen35_model_has_weights(model_id) } != 0;
 
     let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
+        // Swap this model's compiled slot into the working register before the
+        // VLM prefill FFI + the init_from_prefill below, parking any other
+        // model. Held under the caller's lifecycle lock.
+        unsafe { mlx_sys::mlx_qwen35_activate_dense_model(model_id) };
+
         // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
         use mlx_sys as sys;
 

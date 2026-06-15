@@ -1872,6 +1872,20 @@ unsafe extern "C-unwind" {
     /// baked weights.
     pub fn mlx_qwen35_invalidate_compiled_graphs();
 
+    /// Select this model's dense compiled slot for the upcoming turn: parks the
+    /// previously active model, swaps this model's state into the working
+    /// register, and republishes its weight slot. MUST be called under the
+    /// compiled lifecycle lock, once per turn, before the first compiled FFI.
+    pub fn mlx_qwen35_activate_dense_model(model_id: u64);
+
+    /// Per-model compiled-capability gate (replaces the single-active-model-id
+    /// compare): returns non-zero iff this model has registered weights, which
+    /// stays true even after a sibling model loads.
+    pub fn mlx_qwen35_model_has_weights(model_id: u64) -> i32;
+
+    /// Free this model's dense compiled slot on model destruction.
+    pub fn mlx_qwen35_dense_slot_erase(model_id: u64);
+
     /// Invalidate the compiled MoE dispatch graphs (the MTP-verify graph
     /// plus the flat + paged AR-decode graphs) so the next call re-traces
     /// against the CURRENT weight registry. These graphs read
