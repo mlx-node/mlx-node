@@ -130,6 +130,23 @@ pub(crate) struct Lfm2Inner {
     pub(crate) non_quant_floats_bf16: bool,
 }
 
+impl Drop for Lfm2Inner {
+    fn drop(&mut self) {
+        // Release this model's lfm2 compiled slot so MLX reclaims the baked
+        // graph tapes its std::function tables hold (and `compile_erase`s the
+        // slot's per-epoch fun_ids). A no-op when this model never registered
+        // compiled weights (the slot was never created).
+        //
+        // Held under the compiled-weights write lock — the same lock model
+        // (re)registration takes — so erasing this entry is serialized against
+        // any concurrent turn on another model thread mutating the shared
+        // lfm2-slot map (std::unordered_map insert/erase are not concurrency
+        // safe even on distinct keys).
+        let _guard = crate::engine::compiled_lock::compiled_weights_write();
+        unsafe { mlx_sys::mlx_lfm2_slot_erase(self.model_id) };
+    }
+}
+
 /// Classification of the prefix-cache decision made from a
 /// [`Lfm2Inner::verify_cache_prefix`] return value plus the incoming
 /// token count.
@@ -401,23 +418,27 @@ impl Lfm2Inner {
     }
 
     /// Whether the compiled C++ forward path owns this model's weights and may
-    /// be taken for decode. Active only when the C++ side's active model id
-    /// (`mlx_lfm2_get_model_id()`, which reads the shared `g_active_model_id`
-    /// atom) equals this model's [`Lfm2Inner::model_id`].
+    /// be taken for decode. The gate is per-model weight presence
+    /// (`mlx_lfm2_model_has_weights(self.model_id)`, which checks the shared
+    /// weight registry), so a SIBLING model loading no longer demotes this model
+    /// to the eager path — that is the per-model-slot coexistence fix. Replaces
+    /// the old single-active-model-id compare (`mlx_lfm2_get_model_id() ==
+    /// model_id`).
     ///
-    /// The id is published ONLY by `register_weights_with_cpp` (load time), which
-    /// is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or PAGED —
-    /// AND for QUANTIZED checkpoints (authoritative per-projection quant-info is
-    /// published, so `linear_proj` / `lfm2_switch_linear` dispatch correctly),
-    /// gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense (non-packed)
-    /// input embedding; see `should_register_compiled`. The single registered
-    /// weight map + `model_id` serve BOTH the flat (`lfm2_decode_fn`) and paged
-    /// (`lfm2_decode_fn_paged`) compiled graphs; the per-step dispatcher picks the
-    /// right one. The gate is false until an lfm2 model has registered its weights
-    /// into the shared map (and false for an instance evicted by a later load).
+    /// Weights are registered ONLY by `register_weights_with_cpp` (load time),
+    /// which is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or
+    /// PAGED — AND for QUANTIZED checkpoints (authoritative per-projection
+    /// quant-info is published, so `linear_proj` / `lfm2_switch_linear` dispatch
+    /// correctly), gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense
+    /// (non-packed) input embedding; see `should_register_compiled`. The single
+    /// registered weight map + per-model compiled slot serve BOTH the flat
+    /// (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`) compiled graphs; the
+    /// per-step dispatcher picks the right one, after `mlx_lfm2_activate_model`
+    /// has swapped this model's slot into the working register for the turn. The
+    /// gate is false until an lfm2 model registers its weights (and false again
+    /// once its own weights are cleared — but NOT when a sibling loads).
     pub(crate) fn compiled_path_active(&self) -> bool {
-        let active = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
-        active != 0 && active == self.model_id
+        unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) != 0 }
     }
 
     /// Forward pass through the full model.
@@ -1271,9 +1292,10 @@ impl ChatBackend for Lfm2Inner {
         // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
         // (`mlx_set_model_id`). Decode is the READER — the weight read guard
         // (`.read()`, poison-recovered) below spans BOTH the
-        // `mlx_lfm2_get_model_id()` re-check AND every subsequent
-        // `mlx_lfm2_moe_*` invocation this turn (the stepper holds it until it
-        // drops, after the decode loop and the post-loop cache export). So the
+        // `mlx_lfm2_model_has_weights()` re-check (+ the `activate` that selects
+        // this model's compiled slot) AND every subsequent `mlx_lfm2_moe_*`
+        // invocation this turn (the stepper holds it until it drops, after the
+        // decode loop and the post-loop cache export). So the
         // (epoch, id) pair this read guard validates is exactly the one the
         // compiled graph executes against — a registration cannot interleave
         // between the re-check and the forwards. The C++ side additionally
@@ -1296,9 +1318,11 @@ impl ChatBackend for Lfm2Inner {
             let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+            // Re-check this model's weight presence under the read lock — a
+            // concurrent reload/clear of THIS model could have dropped its
+            // weights between the probe and here (a sibling model loading does
+            // not, which is the per-model-slot coexistence fix).
+            if unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) } != 0 {
                 weight_guard = Some(guard);
                 true
             } else {
@@ -1307,6 +1331,17 @@ impl ChatBackend for Lfm2Inner {
         } else {
             false
         };
+
+        if use_compiled {
+            // Swap this model's compiled slot into the working register before
+            // arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. The flat
+            // prefill above is eager pure-Rust (cache reads + the Rust-side
+            // embedding `get_weight`), so no C++ `get_weight` runs before this.
+            // Held under the caller's lifecycle lock for the lifetime of this
+            // call.
+            unsafe { mlx_sys::mlx_lfm2_activate_model(self.model_id) };
+        }
 
         // Seed the compiled decode graph ONCE from the post-prefill caches.
         // On any failure (init bailed, missing handle), drop back to native by
@@ -1887,8 +1922,9 @@ impl PagedBackend for Lfm2Inner {
         //
         // LOCK CONTRACT (same as the flat path): registration is the WRITER;
         // decode is the READER — the `_weight_guard` (`.read()`,
-        // poison-recovered) spans the `mlx_lfm2_get_model_id()` re-check, the
-        // seed, and (on the stepper) EVERY `forward_lfm2_cpp_paged` step.
+        // poison-recovered) spans the `mlx_lfm2_model_has_weights()` re-check (+
+        // the `activate` that selects this model's compiled slot), the seed, and
+        // (on the stepper) EVERY `forward_lfm2_cpp_paged` step.
         //
         // CONV STATE: unlike qwen's GDN linear caches, lfm2 needs NO
         // cross-turn conv export — the eager paged path reprefills conv from
@@ -1937,10 +1973,19 @@ impl PagedBackend for Lfm2Inner {
             let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_lfm2_get_model_id() } == self.model_id {
+            // Re-check this model's weight presence under the read lock — a
+            // concurrent reload/clear of THIS model could have dropped its
+            // weights between the probe and here (a sibling model loading does
+            // not, which is the per-model-slot coexistence fix).
+            if unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) } != 0 {
                 weight_guard = Some(guard);
+                // Swap this model's compiled slot into the working register
+                // before the seed FFI and every later paged forward, parking
+                // any other model. Held under the lifecycle lock above. (The
+                // paged prefill that populated `self.caches` / the adapter
+                // pools is eager pure-Rust, so no C++ `get_weight` ran before
+                // this activate.)
+                unsafe { mlx_sys::mlx_lfm2_activate_model(self.model_id) };
                 // Seed the compiled-paged graph ONCE from the live
                 // post-prefill adapter pools + conv state. On any failure drop
                 // back to the pure-Rust paged decode for the whole turn.
@@ -2239,7 +2284,9 @@ impl Drop for Lfm2PagedResetGuard {
 ///    paged graph hard-codes `block_size=16` into its `paged_kv_write` /
 ///    `paged_attention` calls. The caller MUST gate on this before invoking.
 /// 3. The C++ weights for this model are still registered (caller verified
-///    `mlx_lfm2_get_model_id() == self.model_id` and holds the read lock).
+///    `mlx_lfm2_model_has_weights(self.model_id)` and holds the read lock), and
+///    this model's compiled slot has been activated for the turn via
+///    `mlx_lfm2_activate_model(self.model_id)`.
 ///
 /// `prefill_offset` is the global token cursor the compiled paged graph's
 /// `g_lfm2_paged_offset_int` starts incrementing from; the caller passes

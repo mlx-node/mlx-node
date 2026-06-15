@@ -2915,6 +2915,43 @@ unsafe extern "C-unwind" {
     /// mutex, so the closure swap is thread-safe regardless of caller locking.
     pub fn mlx_lfm2_invalidate_compiled();
 
+    /// Select this model's lfm2 compiled slot for the upcoming turn: parks the
+    /// previously active model, swaps this model's flat + paged compiled state
+    /// (incl. the epoch-keyed compiled closures) into the working register, and
+    /// republishes its weight slot. MUST be called under the compiled lifecycle
+    /// lock, once per turn, before the first compiled FFI.
+    pub fn mlx_lfm2_activate_model(model_id: u64);
+
+    /// Per-model compiled-capability gate (replaces the single-active-model-id
+    /// compare): returns non-zero iff this model has registered weights in the
+    /// shared weight registry, which stays true even after a sibling model loads.
+    /// lfm2 and qwen3.5 model_ids share the registry, so this is functionally
+    /// identical to `mlx_qwen35_model_has_weights`.
+    pub fn mlx_lfm2_model_has_weights(model_id: u64) -> i32;
+
+    /// Free this model's lfm2 compiled slot on model destruction (also
+    /// `compile_erase`s the slot's per-epoch fun_ids so the thread-local MLX
+    /// compile cache does not leak).
+    pub fn mlx_lfm2_slot_erase(model_id: u64);
+
+    /// Test-only: populate the lfm2 dual-purpose `g_lfm2_paged_k_pools[]` with
+    /// scalar bf16 markers (one per layer) and set `g_lfm2_paged_inited = true`
+    /// so the lfm2 coexist smoke can stamp/read per-model sentinels in the
+    /// working register. PRODUCTION CODE MUST NOT CALL THIS — use
+    /// `mlx_lfm2_moe_init_paged`.
+    pub fn mlx_lfm2_compiled_test_force_paged_linear_caches(
+        num_layers: i32,
+        full_attention_interval: i32,
+    );
+
+    /// Test-only: read back the scalar bf16 value at slot `slot_idx` of the lfm2
+    /// `g_lfm2_paged_k_pools`. Returns NaN if out of range or not a scalar.
+    pub fn mlx_lfm2_compiled_test_read_paged_linear_slot(slot_idx: i32) -> f32;
+
+    /// Test-only: replace slot `slot_idx` of the lfm2 `g_lfm2_paged_k_pools`
+    /// with a fresh scalar bf16 of `value`.
+    pub fn mlx_lfm2_compiled_test_write_paged_linear_slot(slot_idx: i32, value: f32);
+
     // ============================================
     // Compiled-PAGED lfm2 decode forward FFI. Drives the compiled-paged
     // decode graph (`lfm2_decode_fn_paged` / `compiled_lfm2_decode_paged`)

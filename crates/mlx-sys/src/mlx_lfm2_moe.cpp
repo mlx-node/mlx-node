@@ -10,6 +10,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 using namespace lfm2_common;
@@ -573,6 +574,130 @@ std::function<std::vector<array>(const std::vector<array>&)> compiled_lfm2_decod
 }
 
 // =============================================================================
+// Per-model lfm2 compiled state. Every PER-MODEL lfm2 compiled global above is a
+// "working register": one model's state occupies it at a time. To let two lfm2
+// (dense or MoE) models coexist, each model owns an Lfm2Slot holding a private
+// copy of all those globals; `mlx_lfm2_activate_model` swaps the chosen model's
+// slot into the working register once per turn (the turn runs under the Rust
+// compiled lifecycle lock, so no per-extern threading is needed). Mirrors the
+// dense DenseSlot in mlx_qwen35.cpp / the MoeSlot in mlx_qwen35_moe.cpp.
+//
+// LFM2-SPECIFIC: the closure fields are slotted TOGETHER with their
+// `*_epoch_built` / `*_fun_id_built` / `*_has_*_fun_id` bookkeeping, so each
+// model's slotted closure self-invalidates against the SHARED
+// `g_lfm2_compile_epoch` (which is NOT slotted — see below). With a stable
+// shared epoch (both models loaded, then alternating), each slotted closure's
+// `epoch_built == g_lfm2_compile_epoch`, so activating it reuses its own baked
+// trace with NO rebuild => true coexistence. The MLX compile cache is
+// thread_local and every model instance runs on its own dedicated OS thread, so
+// two models' per-epoch fun_ids never collide in one cache even when they share
+// the same shared-epoch value.
+//
+// NOT SLOTTED (process-wide by design):
+//   * g_lfm2_compile_epoch — the SHARED monotonic epoch bumped by
+//     mlx_lfm2_invalidate_compiled() on EVERY registration. BOTH closures
+//     (flat + paged) must observe ONE epoch so a registration cross-invalidates
+//     every model's stale closure; the per-model *_epoch_built fields (which ARE
+//     slotted) are what make each slot self-invalidate after the shared epoch
+//     advances. Slotting it would break cross-model invalidation.
+//   * g_lfm2_compiled_mu / g_lfm2_compiled_paged_mu — sync primitives;
+//     std::swap of a std::mutex is UB.
+//   * the 4 call counters (g_lfm2_forward_calls / g_lfm2_compiled_decode_calls /
+//     g_lfm2_paged_forward_calls / g_lfm2_compiled_paged_decode_calls) —
+//     process-lifetime test/engagement signals, intentionally never reset.
+//   * function-local statics (lfm2_fun_id_base / lfm2_paged_fun_id_base anchors,
+//     the no_compile / eval_all env latches).
+struct Lfm2Slot {
+  // Flat decode state.
+  lfm2_common::Lfm2MoeConfig config{};
+  std::vector<int> is_attn;
+  std::vector<array> caches;
+  int offset_int = 0;
+  bool inited = false;
+
+  // Paged decode state. `paged_k_pools` is DUAL-PURPOSE by layer kind: attn
+  // layer i holds the paged K pool, conv layer i holds the ShortConv recurrent
+  // state (an ordinary array — swap-safe either way).
+  lfm2_common::Lfm2MoeConfig paged_config{};
+  std::vector<int> paged_is_attn;
+  std::vector<array> paged_k_pools;
+  std::vector<array> paged_v_pools;
+  std::vector<array> paged_k_scales;
+  std::vector<array> paged_v_scales;
+  int paged_offset_int = 0;
+  bool paged_inited = false;
+
+  // Flat compiled closure + its epoch/fun_id bookkeeping (slotted together so a
+  // park/activate keeps each model's baked trace and its registered fun_id
+  // coupled).
+  std::optional<std::function<std::vector<array>(const std::vector<array>&)>> compiled;
+  uint64_t compiled_epoch_built = 0;
+  std::uintptr_t compiled_fun_id_built = 0;
+  bool has_compiled_fun_id = false;
+
+  // Paged compiled closure + its epoch/fun_id bookkeeping.
+  std::optional<std::function<std::vector<array>(const std::vector<array>&)>> compiled_paged;
+  uint64_t compiled_paged_epoch_built = 0;
+  std::uintptr_t compiled_paged_fun_id_built = 0;
+  bool has_compiled_paged_fun_id = false;
+};
+
+// Exchange every PER-MODEL lfm2 compiled global with the matching Lfm2Slot
+// field. After the swap, `s` holds whatever previously occupied the working
+// register and the globals hold `s`'s prior contents. std::swap on
+// vector / optional<function> / POD config is an O(1) pointer/handle swap. The
+// shared epoch / the two mutexes / the 4 counters are deliberately NOT swapped.
+void swap_lfm2_globals(Lfm2Slot& s) {
+  std::swap(g_lfm2_config, s.config);
+  std::swap(g_lfm2_is_attn, s.is_attn);
+  std::swap(g_lfm2_caches, s.caches);
+  std::swap(g_lfm2_offset_int, s.offset_int);
+  std::swap(g_lfm2_inited, s.inited);
+  std::swap(g_lfm2_paged_config, s.paged_config);
+  std::swap(g_lfm2_paged_is_attn, s.paged_is_attn);
+  std::swap(g_lfm2_paged_k_pools, s.paged_k_pools);
+  std::swap(g_lfm2_paged_v_pools, s.paged_v_pools);
+  std::swap(g_lfm2_paged_k_scales, s.paged_k_scales);
+  std::swap(g_lfm2_paged_v_scales, s.paged_v_scales);
+  std::swap(g_lfm2_paged_offset_int, s.paged_offset_int);
+  std::swap(g_lfm2_paged_inited, s.paged_inited);
+  std::swap(g_lfm2_compiled, s.compiled);
+  std::swap(g_lfm2_compiled_epoch_built, s.compiled_epoch_built);
+  std::swap(g_lfm2_compiled_fun_id_built, s.compiled_fun_id_built);
+  std::swap(g_lfm2_has_compiled_fun_id, s.has_compiled_fun_id);
+  std::swap(g_lfm2_compiled_paged, s.compiled_paged);
+  std::swap(g_lfm2_compiled_paged_epoch_built, s.compiled_paged_epoch_built);
+  std::swap(g_lfm2_compiled_paged_fun_id_built, s.compiled_paged_fun_id_built);
+  std::swap(g_lfm2_has_compiled_paged_fun_id, s.has_compiled_paged_fun_id);
+}
+
+// The per-model lfm2 slot registry, keyed by model_id, plus the id of the model
+// whose slot currently occupies the working-register globals (0 = none).
+//
+// Intentionally leaked (heap-allocated, never destructed): a model thread drops
+// its Lfm2Inner — which erases its entry here — during process teardown, which
+// can run AFTER a function-local static map would already have been destroyed
+// (erasing a destroyed map null-derefs the hash table). A never-destructed map
+// keeps that late erase valid; the leaked graph handles are reclaimed by the OS
+// on exit anyway.
+std::unordered_map<uint64_t, Lfm2Slot>& g_lfm2_slots() {
+  static auto* instance = new std::unordered_map<uint64_t, Lfm2Slot>();
+  return *instance;
+}
+uint64_t g_active_lfm2_id = 0;
+
+// Move the currently-active model's state out of the working register and back
+// into its slot, leaving the working register empty (default-constructed). The
+// closure fields move WITH their epoch_built/fun_id bookkeeping, so a later
+// re-activate finds the closure exactly as the model left it.
+void park_active_lfm2_model() {
+  if (g_active_lfm2_id != 0) {
+    swap_lfm2_globals(g_lfm2_slots()[g_active_lfm2_id]);
+    g_active_lfm2_id = 0;
+  }
+}
+
+// =============================================================================
 // TEST-ONLY shared synthetic-MoE helpers (used by the compiled-vs-eager probe
 // AND the no-bump warm probe). Extracted from `mlx_lfm2_probe_moe_compiled_vs_eager`
 // so the warm probe can reuse the IDENTICAL build + decode without copy-paste.
@@ -777,6 +902,11 @@ array lfm2_run_synthetic_decode(const Lfm2SyntheticMoe& m, bool compiled) {
 
 extern "C" {
 
+// Forward-declared here because the lfm2 activate helper republishes the active
+// model's weight slot when it swaps the compiled register. Defined in
+// mlx_common_weights.cpp (shared across all compiled model forward passes).
+void mlx_set_model_id(uint64_t id);
+
 // GATE source: the shared active model id (0 when no model registered → compiled
 // path OFF).
 uint64_t mlx_lfm2_get_model_id() {
@@ -785,6 +915,80 @@ uint64_t mlx_lfm2_get_model_id() {
 
 // Shared weight count (the lfm2 compiled path owns the SAME g_weights() map).
 size_t mlx_lfm2_weight_count() { return mlx_weight_count(); }
+
+// Select model_id's lfm2 compiled state for the upcoming turn: park the
+// previously active model back into its slot, swap this model's slot into the
+// working-register globals, and publish its weight slot. Idempotent for the
+// model already active within the turn. MUST be called under the Rust compiled
+// lifecycle lock (the turn is the serialization unit), so no internal locking is
+// needed for the slot map / working register. Mirrors
+// `mlx_qwen35_activate_dense_model` / `mlx_qwen35_activate_moe_model`.
+//
+// The slotted closures carry each model's `*_epoch_built` / `*_fun_id_built`, so
+// after this swap the next `compiled_lfm2_decode()` / `compiled_lfm2_decode_paged()`
+// compares THIS model's epoch_built against the SHARED `g_lfm2_compile_epoch`:
+// equal (stable two-model setup) => reuse this model's baked trace, no rebuild;
+// stale (a sibling registered since) => rebuild against the now-active weights.
+void mlx_lfm2_activate_model(uint64_t model_id) {
+  if (g_active_lfm2_id == model_id) {
+    mlx_set_model_id(model_id);
+    return;
+  }
+  park_active_lfm2_model();
+  // operator[] default-constructs an empty slot on first use for this model.
+  swap_lfm2_globals(g_lfm2_slots()[model_id]);
+  g_active_lfm2_id = model_id;
+  mlx_set_model_id(model_id);
+}
+
+// Per-model compiled-capability gate: true iff model_id has registered
+// (non-empty) weights in the SHARED weight registry (lfm2 and qwen3.5 model_ids
+// share `g_weight_slots()`). Replaces the old single-active-model-id compare so a
+// model stays compiled-eligible even after a SIBLING model loads — the
+// coexistence fix. Takes the weights read lock so it races safely against a
+// concurrent registration clearing/populating another model's slot. Functionally
+// identical to `mlx_qwen35_model_has_weights`; kept as an lfm2-named entry so the
+// lfm2 Rust path and the lfm2 coexist smoke do not depend on the qwen symbol.
+int mlx_lfm2_model_has_weights(uint64_t model_id) {
+  std::shared_lock<std::shared_mutex> lock(qwen35_common::g_weights_mutex());
+  auto& slots = qwen35_common::g_weight_slots();
+  auto it = slots.find(model_id);
+  return (it != slots.end() && !it->second.weights.empty()) ? 1 : 0;
+}
+
+// Free model_id's lfm2 compiled slot on model destruction (or just before a
+// same-model_id re-registration). Drops the slot's std::function graph tables;
+// because lfm2 registers each compiled closure in MLX's (thread_local) compile
+// cache under a per-epoch fun_id, we ALSO `compile_erase` the slot's recorded
+// fun_ids so that cache entry does not leak. If the model still occupies the
+// working register, clear it first so the globals end up empty. Mirrors
+// `mlx_qwen35_dense_slot_erase` / `mlx_qwen35_moe_slot_erase`.
+void mlx_lfm2_slot_erase(uint64_t model_id) {
+  if (g_active_lfm2_id == model_id) {
+    Lfm2Slot empty;
+    swap_lfm2_globals(empty);
+    g_active_lfm2_id = 0;
+    // `empty` now holds the erased model's closure state; release its compile
+    // cache entries before it is destructed at scope end.
+    if (empty.has_compiled_fun_id) {
+      mlx::core::detail::compile_erase(empty.compiled_fun_id_built);
+    }
+    if (empty.has_compiled_paged_fun_id) {
+      mlx::core::detail::compile_erase(empty.compiled_paged_fun_id_built);
+    }
+  } else {
+    auto it = g_lfm2_slots().find(model_id);
+    if (it != g_lfm2_slots().end()) {
+      if (it->second.has_compiled_fun_id) {
+        mlx::core::detail::compile_erase(it->second.compiled_fun_id_built);
+      }
+      if (it->second.has_compiled_paged_fun_id) {
+        mlx::core::detail::compile_erase(it->second.compiled_paged_fun_id_built);
+      }
+    }
+  }
+  g_lfm2_slots().erase(model_id);
+}
 
 // Build + seed the compiled decode graph from post-prefill state.
 //
@@ -1043,6 +1247,57 @@ void mlx_lfm2_moe_reset() {
   g_lfm2_inited = false;
 }
 
+// Test-only helper. Stands up `g_lfm2_paged_k_pools[]` (size = num_layers)
+// populated with bf16 scalars, sets `g_lfm2_paged_inited = true` and a minimal
+// `g_lfm2_paged_config`, so the coexist smoke can stamp/read per-model sentinels
+// in the working register WITHOUT standing up a real paged init. The k_pools
+// vector is the dual-purpose per-layer slot vector (attn K pool / conv state),
+// so one bf16 scalar per layer suffices. Mirrors the dense/moe
+// `*_compiled_test_force_paged_linear_caches`. PRODUCTION CODE MUST NOT CALL
+// THIS — use `mlx_lfm2_moe_init_paged`.
+void mlx_lfm2_compiled_test_force_paged_linear_caches(int num_layers,
+                                                      int full_attention_interval) {
+  g_lfm2_paged_config = lfm2_common::Lfm2MoeConfig{};
+  g_lfm2_paged_config.num_layers = num_layers;
+  // full_attention_interval is unused by lfm2 (conv/attn interleave is explicit,
+  // not modulo); accepted for ABI symmetry with the dense/moe test helpers.
+  (void)full_attention_interval;
+  g_lfm2_paged_k_pools.clear();
+  g_lfm2_paged_k_pools.reserve(num_layers);
+  for (int layer = 0; layer < num_layers; layer++) {
+    float base = 0.125f * static_cast<float>(layer + 1);
+    g_lfm2_paged_k_pools.push_back(array(base + 0.0625f, mlx::core::bfloat16));
+  }
+  g_lfm2_paged_inited = true;
+}
+
+// Test-only inspector: read the scalar bf16 value at slot `slot_idx` of
+// `g_lfm2_paged_k_pools`. Returns NaN if the slot is out of range or the array
+// shape isn't a scalar. Mirrors the dense/moe
+// `*_compiled_test_read_paged_linear_slot`.
+float mlx_lfm2_compiled_test_read_paged_linear_slot(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= (int)g_lfm2_paged_k_pools.size()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  try {
+    auto& a = g_lfm2_paged_k_pools[slot_idx];
+    if (a.ndim() != 0) return std::numeric_limits<float>::quiet_NaN();
+    array a_f32 = mlx::core::astype(a, mlx::core::float32);
+    mlx::core::eval(a_f32);
+    return a_f32.item<float>();
+  } catch (...) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+}
+
+// Test-only mutator: replace slot `slot_idx` of `g_lfm2_paged_k_pools` with a
+// fresh scalar bf16 of `value`. Mirrors the dense/moe
+// `*_compiled_test_write_paged_linear_slot`.
+void mlx_lfm2_compiled_test_write_paged_linear_slot(int slot_idx, float value) {
+  if (slot_idx < 0 || slot_idx >= (int)g_lfm2_paged_k_pools.size()) return;
+  g_lfm2_paged_k_pools[slot_idx] = array(value, mlx::core::bfloat16);
+}
+
 // Invalidate the cached compiled-decode closure so the NEXT
 // `compiled_lfm2_decode()` recompiles `lfm2_decode_fn`, re-capturing the live
 // weight constants from `g_weights()`. Called by `register_weights_with_cpp`
@@ -1065,6 +1320,16 @@ void mlx_lfm2_moe_reset() {
 // live constants. The model-id gate is the primary defense; the epoch bump is
 // what makes a SAME-SHAPE A->B swap (which keeps passing the gate under B's id)
 // re-capture B's weights instead of reusing A's frozen graph.
+//
+// PER-MODEL SLOTS: unlike the dense/moe `*_invalidate_compiled_graphs` (which
+// NULL the working-register dispatch tables and so must park the active model
+// first to protect sibling slots), this invalidate is a single bump of the
+// SHARED `g_lfm2_compile_epoch` — it touches NO per-model slot. Every model's
+// slotted closure (active or parked) observes the bumped epoch and self-rebuilds
+// on its next activate, so there is nothing to park here. The loader closes the
+// same-model_id hazard separately via `mlx_lfm2_slot_erase(model_id)` (which
+// drops the reloading model's own slot before this bump). Sibling slots are
+// untouched.
 void mlx_lfm2_invalidate_compiled() {
   g_lfm2_compile_epoch.fetch_add(1, std::memory_order_acq_rel);
 }

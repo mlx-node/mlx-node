@@ -1872,6 +1872,27 @@ fn register_weights_with_cpp_locked(
     // (3) Clear the shared map (also resets the active model id + quant-info).
     unsafe { mlx_sys::mlx_clear_weights(model_id) };
 
+    // Drop THIS model's own lfm2 compiled slot before re-publishing its weights.
+    // For lfm2 the slotted closures self-invalidate against the SHARED compile
+    // epoch (`mlx_lfm2_invalidate_compiled` below bumps it on EVERY load), so the
+    // epoch alone already defeats the same-model_id "run new weights through an
+    // old closure" hazard: on the model's next activate its slotted epoch_built
+    // is stale → it rebuilds against the freshly-stored weights. We STILL erase
+    // here for two reasons the epoch does NOT cover, plus cross-family
+    // consistency with the dense/moe loaders:
+    //   1. NON-closure slotted state — a parked slot from a prior same-id
+    //      registration holds stale `caches` / paged pools / offset / `inited`
+    //      flags; erasing guarantees the reload re-seeds from scratch rather than
+    //      swapping a stale (possibly `inited=true`) register back in.
+    //   2. compile-cache hygiene — `mlx_lfm2_slot_erase` `compile_erase`s the
+    //      slot's recorded per-epoch fun_ids, so the thread-local MLX compile
+    //      cache does not leak an entry per reload.
+    // On the normal load path `model_id` is brand-new (freshly minted from the id
+    // counter and never activated), so this erase is a no-op (no slot exists).
+    // Active model → clears the working register; parked model → drops its slot;
+    // sibling slots are untouched. Mirrors the dense/moe loader fix.
+    unsafe { mlx_sys::mlx_lfm2_slot_erase(model_id) };
+
     // sym8 checkpoints register too (compiled-FLAT port, mirroring qwen3.5's
     // `register_weights_with_cpp`). Layout contract (the C++ asserts it at
     // dispatch — see `sym8_linear_proj` in mlx_qwen35_common.h): for a sym8
