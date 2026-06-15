@@ -639,6 +639,49 @@ static const CommitFn& get_or_make_commit_fn(int m) {
 }
 
 // =====================================================================
+// MTP draft/commit graph ownership.
+//
+// The draft graph (`g_mtp_draft_decode_compiled`) and the per-M commit
+// graphs (`g_commit_graph_by_m`) bake their model's MTP head weights into
+// the cached tape at trace time and are PROCESS-WIDE (they intentionally
+// survive the per-turn reset and the per-model dense slot swap). When two
+// MTP-enabled models alternate in one process, the second model's draft /
+// commit call would otherwise replay the FIRST model's baked tape and draft
+// against the wrong weights — output stays correct (the per-model verify
+// graph + accept test reject a bad draft) but speculative acceptance tanks.
+//
+// `g_qwen35_mtp_owner_id` records which model's weights are currently baked
+// into those process-wide graphs. `qwen35_mtp_ensure_owner()` is called at
+// the top of every baked-graph use (draft + commit FFI entries). When the
+// active model id differs from the owner, it nulls the baked graphs (the
+// lazy getters re-trace against the now-active weight registry) and adopts
+// the new owner.
+//
+// Single-MTP-model case is a NO-OP: the owner is set once on the first call
+// and never changes, so every later call takes the `cur == owner` early
+// return and the graphs are reused exactly as before — byte- and
+// perf-identical. The MTP cycle runs on the model's thread under the Rust
+// COMPILED_LIFECYCLE_MUTEX with a stable active model id for the whole turn,
+// so this access is serialized — no lock needed here.
+static uint64_t g_qwen35_mtp_owner_id = 0;
+
+static void qwen35_mtp_ensure_owner() {
+  uint64_t cur =
+      qwen35_common::g_active_model_id().load(std::memory_order_acquire);
+  if (g_qwen35_mtp_owner_id == cur) return;
+  // Model changed: drop the stale baked graphs so the lazy getters re-trace
+  // against the live (newly-activated) weight registry. Mirrors the nulling
+  // done by `mlx_qwen35_mtp_invalidate_compiled_graphs()`; kept inline so the
+  // helper does not depend on that later-defined extern (no recursion).
+  g_mtp_draft_decode_compiled =
+      std::function<std::vector<array>(const std::vector<array>&)>{};
+  for (auto& slot : g_commit_graph_by_m) {
+    slot = CommitFn{};
+  }
+  g_qwen35_mtp_owner_id = cur;
+}
+
+// =====================================================================
 // Verify graphs: per-depth dispatcher.
 //
 // One entry per depth ∈ {1..5}. The closure for depth D dispatches to
@@ -939,6 +982,10 @@ void mlx_qwen35_mtp_draft_compiled(
   if (out_logits) *out_logits = nullptr;
   if (!g_mtp_compile_inited) return;
   if (!prev_hidden_ptr || !prev_emb_ptr || !out_h_next || !out_logits) return;
+  // Drop stale baked draft/commit graphs if a different MTP model is now
+  // active (no-op for the single-model case). Must precede the lazy draft
+  // getter below so a wrong-weight tape is never replayed.
+  qwen35_mtp_ensure_owner();
 
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
@@ -1581,6 +1628,12 @@ int mlx_qwen35_mtp_compiled_commit(
 ) {
   if (!g_mtp_compile_inited) return 1;
   if (!hidden_seq_ptr || !gathered_embs_ptr) return 1;
+  // Drop stale baked draft/commit graphs if a different MTP model is now
+  // active (no-op for the single-model case). Must precede the commit-graph
+  // fetch below so a wrong-weight tape is never replayed — covers the
+  // pre-loop `prefill_mtp_commit` prologue, which commits without a preceding
+  // draft.
+  qwen35_mtp_ensure_owner();
   if (m < MIN_COMMIT_M || m > MAX_COMMIT_M) {
     fprintf(stderr,
             "[MLX] mlx_qwen35_mtp_compiled_commit: m %d outside [%d, %d]\n",
@@ -1723,6 +1776,48 @@ void mlx_qwen35_mtp_invalidate_compiled_graphs() {
   for (auto& slot : g_commit_graph_by_m) {
     slot = CommitFn{};
   }
+  // A reload re-bakes from scratch, so forget the ownership too: the next MTP
+  // draft/commit re-establishes the owner for whatever model just registered.
+  g_qwen35_mtp_owner_id = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Test-only inspectors / drivers for the MTP draft/commit ownership guard.
+// They exercise `qwen35_mtp_ensure_owner()` WITHOUT standing up a full MTP
+// init, so a unit test can drive the ownership LOGIC against the shared active
+// model id (set via `mlx_set_model_id`). PRODUCTION CODE MUST NOT CALL THESE.
+// -----------------------------------------------------------------------------
+
+// Read the current owner id (which model's weights are baked into the
+// process-wide draft/commit graphs).
+uint64_t mlx_qwen35_mtp_test_owner_id() { return g_qwen35_mtp_owner_id; }
+
+// Run the ownership guard directly (bypassing the `g_mtp_compile_inited` gate
+// that the real draft/commit entries check first).
+void mlx_qwen35_mtp_test_ensure_owner() { qwen35_mtp_ensure_owner(); }
+
+// Stamp a non-null sentinel into the draft graph + the per-M commit graphs so
+// a test can observe whether `ensure_owner` later NULLs them on a model swap.
+// The sentinel closures are never invoked.
+void mlx_qwen35_mtp_test_set_graph_sentinels() {
+  g_mtp_draft_decode_compiled =
+      [](const std::vector<array>& in) { return in; };
+  for (auto& slot : g_commit_graph_by_m) {
+    slot = [](const std::vector<array>& in) { return in; };
+  }
+}
+
+// 1 iff the draft graph is currently null (re-trace pending), else 0.
+int mlx_qwen35_mtp_test_draft_graph_is_null() {
+  return g_mtp_draft_decode_compiled ? 0 : 1;
+}
+
+// 1 iff every per-M commit graph slot is currently null, else 0.
+int mlx_qwen35_mtp_test_commit_graphs_all_null() {
+  for (const auto& slot : g_commit_graph_by_m) {
+    if (slot) return 0;
+  }
+  return 1;
 }
 
 }  // extern "C"

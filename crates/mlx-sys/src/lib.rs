@@ -1691,6 +1691,20 @@ unsafe extern "C-unwind" {
     /// Get the active model ID. Returns 0 if no model has registered weights.
     pub fn mlx_qwen35_get_model_id() -> u64;
 
+    // Test-only inspectors / drivers for the MTP draft/commit ownership guard.
+    // Drive `qwen35_mtp_ensure_owner` / `moe_mtp_ensure_owner` against the
+    // shared active model id WITHOUT a full MTP init. PRODUCTION CODE MUST NOT
+    // CALL THESE — see `mlx_qwen35_mtp_compiled.cpp`.
+    pub fn mlx_qwen35_mtp_test_owner_id() -> u64;
+    pub fn mlx_qwen35_mtp_test_ensure_owner();
+    pub fn mlx_qwen35_mtp_test_set_graph_sentinels();
+    pub fn mlx_qwen35_mtp_test_draft_graph_is_null() -> i32;
+    pub fn mlx_qwen35_mtp_test_commit_graphs_all_null() -> i32;
+    pub fn mlx_qwen35_moe_mtp_test_owner_id() -> u64;
+    pub fn mlx_qwen35_moe_mtp_test_ensure_owner();
+    pub fn mlx_qwen35_moe_mtp_test_set_graph_sentinel();
+    pub fn mlx_qwen35_moe_mtp_test_draft_graph_is_null() -> i32;
+
     /// Initialize compiled forward pass from post-prefill caches.
     /// Call once after prefill, before decode loop.
     /// cache_arrays: [num_layers * 2] non-null pointers to prefill cache arrays.

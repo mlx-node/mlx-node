@@ -611,6 +611,43 @@ compiled_moe_mtp_draft_decode() {
 }
 
 // =====================================================================
+// MoE MTP draft graph ownership.
+//
+// `g_moe_mtp_draft_decode_compiled` bakes its model's MoE MTP head weights
+// into the cached tape at trace time and is PROCESS-WIDE (it survives the
+// per-turn reset and the per-model MoE slot swap). When two MoE-MTP models
+// alternate in one process, the second model's draft call would otherwise
+// replay the FIRST model's baked tape and draft against the wrong weights —
+// output stays correct (the per-model verify graph + accept test reject a
+// bad draft) but speculative acceptance tanks. (MoE has no commit FFI; the
+// cycle rolls back by offset, so only the draft graph needs guarding.)
+//
+// `g_moe_mtp_owner_id` records which model's weights are baked into that
+// graph. `moe_mtp_ensure_owner()` runs at the top of the draft FFI entry and
+// nulls the graph (the lazy getter re-traces against the active registry)
+// only when the active model id differs from the owner.
+//
+// Single-MTP-model case is a NO-OP: owner set once on the first call, never
+// changes → every later call early-returns and the graph is reused exactly as
+// before (byte- and perf-identical). The MTP cycle runs on the model's thread
+// under the Rust COMPILED_LIFECYCLE_MUTEX with a stable active id for the
+// whole turn, so this access is serialized — no lock needed.
+static uint64_t g_moe_mtp_owner_id = 0;
+
+static void moe_mtp_ensure_owner() {
+  uint64_t cur =
+      qwen35_common::g_active_model_id().load(std::memory_order_acquire);
+  if (g_moe_mtp_owner_id == cur) return;
+  // Model changed: drop the stale baked draft graph so the lazy getter
+  // re-traces against the live (newly-activated) weight registry. Mirrors
+  // `mlx_qwen35_moe_mtp_invalidate_compiled_graphs()`; kept inline so the
+  // helper does not depend on that later-defined extern (no recursion).
+  g_moe_mtp_draft_decode_compiled =
+      std::function<std::vector<array>(const std::vector<array>&)>{};
+  g_moe_mtp_owner_id = cur;
+}
+
+// =====================================================================
 // Verify graphs — per-depth dispatcher (mirrors dense MTP file).
 // =====================================================================
 constexpr int MAX_VERIFY_DEPTH = 5;
@@ -824,6 +861,10 @@ void mlx_qwen35_moe_mtp_draft_compiled(
   if (out_logits) *out_logits = nullptr;
   if (!g_mtp_compile_inited) return;
   if (!prev_hidden_ptr || !prev_emb_ptr || !out_h_next || !out_logits) return;
+  // Drop the stale baked draft graph if a different MoE model is now active
+  // (no-op for the single-model case). Must precede the lazy draft getter
+  // below so a wrong-weight tape is never replayed.
+  moe_mtp_ensure_owner();
 
   if (qwen35_common::mtp_trace_enabled()) {
     fprintf(stderr,
@@ -1165,6 +1206,36 @@ int mlx_qwen35_moe_mtp_get_offset() {
 void mlx_qwen35_moe_mtp_invalidate_compiled_graphs() {
   g_moe_mtp_draft_decode_compiled =
       std::function<std::vector<array>(const std::vector<array>&)>{};
+  // A reload re-bakes from scratch, so forget the ownership too: the next MoE
+  // MTP draft re-establishes the owner for whatever model just registered.
+  g_moe_mtp_owner_id = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Test-only inspectors / drivers for the MoE MTP draft ownership guard.
+// They exercise `moe_mtp_ensure_owner()` WITHOUT standing up a full MTP init,
+// so a unit test can drive the ownership LOGIC against the shared active model
+// id (set via `mlx_set_model_id`). PRODUCTION CODE MUST NOT CALL THESE.
+// -----------------------------------------------------------------------------
+
+// Read the current owner id (which model's weights are baked into the
+// process-wide MoE MTP draft graph).
+uint64_t mlx_qwen35_moe_mtp_test_owner_id() { return g_moe_mtp_owner_id; }
+
+// Run the ownership guard directly (bypassing the `g_mtp_compile_inited` gate
+// that the real draft entry checks first).
+void mlx_qwen35_moe_mtp_test_ensure_owner() { moe_mtp_ensure_owner(); }
+
+// Stamp a non-null sentinel into the draft graph so a test can observe whether
+// `ensure_owner` later NULLs it on a model swap. The sentinel is never invoked.
+void mlx_qwen35_moe_mtp_test_set_graph_sentinel() {
+  g_moe_mtp_draft_decode_compiled =
+      [](const std::vector<array>& in) { return in; };
+}
+
+// 1 iff the draft graph is currently null (re-trace pending), else 0.
+int mlx_qwen35_moe_mtp_test_draft_graph_is_null() {
+  return g_moe_mtp_draft_decode_compiled ? 0 : 1;
 }
 
 }  // extern "C"
