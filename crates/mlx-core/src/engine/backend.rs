@@ -1407,13 +1407,21 @@ pub(crate) trait PagedBackend: ChatBackend {
     ///
     /// When `reuse_cache` is false the impl clears the history (+ image
     /// key); the forked cores' `else { clear }` arm.
+    ///
+    /// Returns `Err` to ABORT the turn when a family's post-history
+    /// bookkeeping fails — e.g. the MoE GDN warm-continue checkpoint,
+    /// which snapshots/evals the live recurrent caches keyed on the
+    /// freshly-set history. The legacy cores propagated that failure with
+    /// `?` so a checkpoint/eval error aborts rather than publishing
+    /// reusable state without a materialized checkpoint. Standard-KV
+    /// families never fail here and return `Ok(())`.
     fn save_paged_history(
         &mut self,
         save_tokens: &[u32],
         generated: &[u32],
         keep_all: bool,
         reuse_cache: bool,
-    );
+    ) -> Result<()>;
 
     /// Perf-parity warm-continue reconcile (default no-op).
     ///

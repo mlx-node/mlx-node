@@ -323,7 +323,11 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // set; token history + image key ONLY). Computed IDENTICALLY to the
     // FLAT save now (same keep_all rule), so the paged cached_token_history
     // matches what save_cache_state would persist. ----
-    backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache);
+    // Fallible: a family's post-history checkpoint (MoE GDN warm-continue)
+    // can fail; propagate so the turn aborts rather than returning a result
+    // backed by an un-checkpointed cache. The request is already finalized
+    // (kept-live) above, matching the legacy core's `?` after finalize.
+    backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache)?;
 
     // ---- finalize (== chat_turn_core tail) ----
     // The `prefill_tokens_per_second` numerator is family-controlled: standard-KV
@@ -581,6 +585,13 @@ mod tests {
         fail_prime: bool,
         fail_prefill: bool,
         fail_forward_on: Option<usize>,
+        /// Makes `save_paged_history` return `Err` AFTER recording the call,
+        /// modelling a post-decode bookkeeping failure (the real MoE GDN
+        /// warm-continue checkpoint). The save runs only after
+        /// `finalize_paged_turn` has already kept the request live, so this
+        /// drives the "Err after finalize → request stays kept-live, no
+        /// abort" lifecycle contract.
+        fail_save: bool,
         /// Simulated `paged_adapter.request_tokens().len()` cursor:
         /// `prime_prefix_state` seeds it (cold reset → 0), `paged_prefill`
         /// records the suffix, each decode `forward` records 1, and
@@ -786,11 +797,17 @@ mod tests {
             generated: &[u32],
             keep_all: bool,
             reuse_cache: bool,
-        ) {
+        ) -> Result<()> {
             self.ledger.push("save_paged_history");
+            if self.fail_save {
+                // Models the MoE GDN checkpoint failing after the history is
+                // staged: propagate so the turn aborts, leaving the request
+                // kept-live (finalize already ran) — exactly the legacy `?`.
+                return Err(Error::from_reason("mock save failure"));
+            }
             if !reuse_cache {
                 *self.saved.lock().expect("saved poisoned") = None;
-                return;
+                return Ok(());
             }
             // Byte-identical port of qwen3 `save_paged_history`'s trim:
             // KEEP-ALL iff length exit (`keep_all`), else DROP-LAST.
@@ -806,6 +823,7 @@ mod tests {
                 keep_all,
                 persisted_history: persisted,
             });
+            Ok(())
         }
     }
 
@@ -864,6 +882,7 @@ mod tests {
             fail_prime: false,
             fail_prefill: false,
             fail_forward_on: None,
+            fail_save: false,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
@@ -1010,6 +1029,7 @@ mod tests {
             fail_prime: false,
             fail_prefill: false,
             fail_forward_on: None,
+            fail_save: false,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: Some(cancelled.clone()),
@@ -1123,6 +1143,7 @@ mod tests {
         fail_prime: bool,
         fail_prefill: bool,
         fail_forward_on: Option<usize>,
+        fail_save: bool,
     ) -> (
         Result<crate::engine::backend::TurnOutput>,
         Vec<&'static str>,
@@ -1143,6 +1164,7 @@ mod tests {
             fail_prime,
             fail_prefill,
             fail_forward_on,
+            fail_save,
             adapter_cursor: Arc::new(AtomicUsize::new(0)),
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
@@ -1193,7 +1215,9 @@ mod tests {
     #[test]
     fn run_paged_turn_aborts_on_prime_error() {
         let ledger = Arc::new(Ledger::default());
-        let (out, seq) = run_failing_turn(ledger, /* fail_prime */ true, false, None);
+        let (out, seq) = run_failing_turn(
+            ledger, /* fail_prime */ true, false, None, /* fail_save */ false,
+        );
 
         assert!(out.is_err(), "prime failure must propagate as Err");
 
@@ -1235,6 +1259,7 @@ mod tests {
         let ledger = Arc::new(Ledger::default());
         let (out, seq) = run_failing_turn(
             ledger, /* fail_prime */ false, /* fail_prefill */ true, None,
+            /* fail_save */ false,
         );
 
         assert!(out.is_err(), "prefill failure must propagate as Err");
@@ -1272,6 +1297,7 @@ mod tests {
             /* fail_prime */ false,
             /* fail_prefill */ false,
             /* fail_forward_on */ Some(2),
+            /* fail_save */ false,
         );
 
         assert!(out.is_err(), "mid-decode failure must propagate as Err");
@@ -1298,6 +1324,53 @@ mod tests {
         assert!(
             !seq.contains(&"finalize_turn"),
             "finalize_turn must not run on the mid-decode abort path; got {seq:?}"
+        );
+    }
+
+    /// Abort path (c): `save_paged_history` returns `Err` AFTER the decode
+    /// loop succeeded and `finalize_paged_turn` already kept the request
+    /// LIVE (the real MoE GDN warm-continue checkpoint failing). Unlike the
+    /// prime/prefill/mid-decode aborts, the SUCCESS lifecycle (decode +
+    /// `finalize_paged_turn`) DID run, so the request is intentionally
+    /// retained — the save `Err` must NOT additionally call
+    /// `abort_paged_turn`. This is the exact legacy `paged_turn_sync_core`
+    /// teardown: `finalize_turn_keep_live_per_block` → set history →
+    /// `remember_moe_gdn_history_checkpoint()?` returned `Err` with the
+    /// request still kept-live, and the turn propagated. The error short-
+    /// circuits BEFORE the result-building `finalize_turn`.
+    #[test]
+    fn run_paged_turn_propagates_save_error_keeps_request_live() {
+        let ledger = Arc::new(Ledger::default());
+        let (out, seq) = run_failing_turn(
+            ledger, /* fail_prime */ false, /* fail_prefill */ false,
+            /* fail_forward_on */ None, /* fail_save */ true,
+        );
+
+        assert!(out.is_err(), "save failure must propagate as Err");
+
+        // The decode loop succeeded and finalize kept the request live — the
+        // success lifecycle DID run (this is what distinguishes a save-Err
+        // from the prime/prefill/decode aborts).
+        assert!(
+            seq.contains(&"finalize_paged_turn"),
+            "the success lifecycle (finalize_paged_turn) must run before save; got {seq:?}"
+        );
+        assert!(
+            seq.contains(&"save_paged_history"),
+            "save_paged_history must have been attempted; got {seq:?}"
+        );
+        // THE CONTRACT: a save-Err does NOT release the request. The request
+        // was finalized-keep-live; releasing it here would diverge from the
+        // legacy core (which propagated the checkpoint `?` with the request
+        // still live for the session caller to tear down).
+        assert!(
+            !seq.contains(&"abort_paged_turn"),
+            "save-Err after finalize must NOT release the kept-live request; got {seq:?}"
+        );
+        // The `?` short-circuits before the result-building finalize_turn.
+        assert!(
+            !seq.contains(&"finalize_turn"),
+            "finalize_turn must not run after a save failure; got {seq:?}"
         );
     }
 
@@ -1345,6 +1418,7 @@ mod tests {
             fail_prime: false,
             fail_prefill: false,
             fail_forward_on: None,
+            fail_save: false,
             adapter_cursor: adapter_cursor.clone(),
             saved: saved.clone(),
             cancel: None,

@@ -2088,7 +2088,7 @@ impl PagedBackend for Lfm2Inner {
         generated: &[u32],
         _keep_all: bool,
         reuse_cache: bool,
-    ) {
+    ) -> Result<()> {
         // lfm2 INVERSE convention vs qwen3 (Decision 1): lfm2 paged ALWAYS
         // drops the last token, regardless of the engine's `keep_all`
         // (length-exit) signal. The legacy lfm2 paged cores hardcoded
@@ -2115,6 +2115,9 @@ impl PagedBackend for Lfm2Inner {
         //    forward skipped]; drop-last → history = prompt+(k-1). MATCH
         //    (== legacy lfm2 paged).
         self.save_cache_state_internal(reuse_cache, save_tokens, generated, false);
+        // conv-state save is in-process and infallible (no recurrent-cache
+        // eval/clone that can fail like the MoE GDN checkpoint).
+        Ok(())
     }
 
     fn reconcile_paged_request_tokens(

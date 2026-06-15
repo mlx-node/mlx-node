@@ -2957,7 +2957,7 @@ impl PagedBackend for Qwen3Inner {
         generated: &[u32],
         keep_all: bool,
         reuse_cache: bool,
-    ) {
+    ) -> Result<()> {
         // Port of the legacy paged save block (token history ONLY — the
         // adapter's pool owns the K/V; never touch
         // `cached_kv_keys`/`cached_kv_values`/`cached_cache_idx`). `keep_all`
@@ -2982,6 +2982,9 @@ impl PagedBackend for Qwen3Inner {
             self.cached_token_history.clear();
             self.cached_image_key = None;
         }
+        // Standard-KV: token-history only, never fails (no GDN/recurrent
+        // checkpoint). `Ok` satisfies the fallible trait contract.
+        Ok(())
     }
 
     fn reconcile_paged_request_tokens(
