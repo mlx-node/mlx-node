@@ -602,6 +602,103 @@ static MoeCompiledFn g_moe_decode_compiled;
 static MoeCompiledFn g_moe_verify_batched_compiled;
 static MoeCompiledFn g_moe_decode_paged_compiled;
 
+// Per-model MoE compiled state. Every MoE compiled global above (flat + MTP +
+// paged state + the three lazily-built compiled-graph dispatch tables) is a
+// "working register": one model's state occupies it at a time. To let two MoE
+// models coexist, each model owns a MoeSlot holding a private copy of all those
+// globals; `mlx_qwen35_activate_moe_model` swaps the chosen model's slot into
+// the working register once per turn (the turn runs under the Rust compiled
+// lifecycle lock, so no per-extern threading is needed). The graph-table fields
+// (std::function dispatch slots) carry each model's distinct compiled fun_ids,
+// so parking + swapping keeps each model's baked graphs isolated. This mirrors
+// the dense DenseSlot in mlx_qwen35.cpp. NOTE: g_dense_quant here is this TU's
+// per-layer dense-MLP quant info (file-local to the MoE TU), unrelated to the
+// dense-model TU's globals.
+struct MoeSlot {
+  // Flat-path compiled state.
+  MoeConfig moe_config{};
+  std::vector<array> moe_caches;
+  int moe_offset_int = 0;
+  bool moe_inited = false;
+  std::vector<LayerQuantInfo> layer_quant;
+  std::vector<DenseMLPQuantInfo> dense_quant;
+
+  // MTP / flat-shared state.
+  std::optional<array> moe_last_hidden;
+  std::vector<array> moe_linear_snapshot;
+  int moe_linear_snapshot_offset = 0;
+  bool moe_linear_snapshot_taken = false;
+
+  // Paged-path compiled state.
+  MoeConfig paged_config{};
+  std::vector<array> k_pools;
+  std::vector<array> v_pools;
+  std::vector<array> k_scales;
+  std::vector<array> v_scales;
+  std::vector<array> paged_linear_caches;
+  int paged_offset_int = 0;
+  bool paged_inited = false;
+  std::unordered_map<std::string, array> weight_transposes_3d;
+
+  // Compiled-graph dispatch tables (the per-model baked graphs).
+  MoeCompiledFn moe_decode_compiled;
+  MoeCompiledFn moe_verify_batched_compiled;
+  MoeCompiledFn moe_decode_paged_compiled;
+};
+
+// Exchange every MoE compiled global with the matching MoeSlot field. After the
+// swap, `s` holds whatever previously occupied the working register and the
+// globals hold `s`'s prior contents. std::swap on vector / optional<array> /
+// unordered_map / std::function is an O(1) pointer/handle swap.
+void swap_moe_globals(MoeSlot& s) {
+  std::swap(g_moe_config, s.moe_config);
+  std::swap(g_moe_caches, s.moe_caches);
+  std::swap(g_moe_offset_int, s.moe_offset_int);
+  std::swap(g_moe_inited, s.moe_inited);
+  std::swap(g_layer_quant, s.layer_quant);
+  std::swap(g_dense_quant, s.dense_quant);
+  std::swap(g_moe_last_hidden, s.moe_last_hidden);
+  std::swap(g_moe_linear_snapshot, s.moe_linear_snapshot);
+  std::swap(g_moe_linear_snapshot_offset, s.moe_linear_snapshot_offset);
+  std::swap(g_moe_linear_snapshot_taken, s.moe_linear_snapshot_taken);
+  std::swap(g_paged_config, s.paged_config);
+  std::swap(g_k_pools, s.k_pools);
+  std::swap(g_v_pools, s.v_pools);
+  std::swap(g_k_scales, s.k_scales);
+  std::swap(g_v_scales, s.v_scales);
+  std::swap(g_paged_linear_caches, s.paged_linear_caches);
+  std::swap(g_paged_offset_int, s.paged_offset_int);
+  std::swap(g_paged_inited, s.paged_inited);
+  std::swap(g_weight_transposes_3d, s.weight_transposes_3d);
+  std::swap(g_moe_decode_compiled, s.moe_decode_compiled);
+  std::swap(g_moe_verify_batched_compiled, s.moe_verify_batched_compiled);
+  std::swap(g_moe_decode_paged_compiled, s.moe_decode_paged_compiled);
+}
+
+// The per-model MoE slot registry, keyed by model_id, plus the id of the model
+// whose slot currently occupies the working-register globals (0 = none).
+//
+// Intentionally leaked (heap-allocated, never destructed): a model thread drops
+// its Qwen35MoeInner — which erases its entry here — during process teardown,
+// which can run AFTER a function-local static map would already have been
+// destroyed (erasing a destroyed map null-derefs the hash table). A
+// never-destructed map keeps that late erase valid; the leaked graph handles are
+// reclaimed by the OS on exit anyway.
+std::unordered_map<uint64_t, MoeSlot>& g_moe_slots() {
+  static auto* instance = new std::unordered_map<uint64_t, MoeSlot>();
+  return *instance;
+}
+uint64_t g_active_moe_id = 0;
+
+// Move the currently-active model's state out of the working register and back
+// into its slot, leaving the working register empty (default-constructed).
+void park_active_moe_model() {
+  if (g_active_moe_id != 0) {
+    swap_moe_globals(g_moe_slots()[g_active_moe_id]);
+    g_active_moe_id = 0;
+  }
+}
+
 // Resettable global cleared by `mlx_qwen35_moe_invalidate_compiled_graphs()`
 // on reload — see the `g_moe_decode_compiled` declaration above. This is the
 // MoE AR-decode graph.
@@ -896,6 +993,11 @@ static MoeCompiledFn& compiled_moe_decode_paged() {
 // =============================================================================
 
 extern "C" {
+
+// Forward-declared here because the MoE activate helper republishes the active
+// model's weight slot when it swaps the compiled register. Defined in
+// mlx_common_weights.cpp (shared across all compiled model forward passes).
+void mlx_set_model_id(uint64_t id);
 
 // Initialize MoE forward pass from post-prefill caches.
 // moe_params: [num_experts, num_experts_per_tok, norm_topk_prob, decoder_sparse_step]
@@ -1462,6 +1564,55 @@ void mlx_qwen35_moe_reset() {
   g_paged_linear_caches.clear();
   g_paged_offset_int = 0;
   g_paged_inited = false;
+}
+
+// Test-only helper. Stands up `g_paged_linear_caches[]` (size = num_layers * 2)
+// populated with bf16 scalars, sets `g_paged_inited = true` and a minimal
+// `g_paged_config`, so the coexist smoke can stamp/read per-model sentinels in
+// the working register without standing up a real paged init. Mirrors the dense
+// `mlx_qwen35_compiled_test_force_paged_linear_caches`. PRODUCTION CODE MUST NOT
+// CALL THIS — use `mlx_qwen35_moe_init_paged`.
+void mlx_qwen35_moe_compiled_test_force_paged_linear_caches(
+    int num_layers, int full_attention_interval) {
+  g_paged_config = MoeConfig{};
+  g_paged_config.num_layers = num_layers;
+  g_paged_config.full_attention_interval = full_attention_interval;
+  g_paged_linear_caches.clear();
+  g_paged_linear_caches.reserve(num_layers * 2);
+  for (int layer = 0; layer < num_layers; layer++) {
+    float base = 0.125f * static_cast<float>(layer + 1);
+    g_paged_linear_caches.push_back(array(base + 0.0625f, mlx::core::bfloat16));
+    g_paged_linear_caches.push_back(array(base + 0.03125f, mlx::core::bfloat16));
+  }
+  g_paged_inited = true;
+}
+
+// Test-only inspector: read the scalar bf16 value at slot `slot_idx` of
+// `g_paged_linear_caches`. Returns NaN if the slot is out of range or the array
+// shape isn't a scalar. Mirrors the dense
+// `mlx_qwen35_compiled_test_read_paged_linear_slot`.
+float mlx_qwen35_moe_compiled_test_read_paged_linear_slot(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= (int)g_paged_linear_caches.size()) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  try {
+    auto& a = g_paged_linear_caches[slot_idx];
+    if (a.ndim() != 0) return std::numeric_limits<float>::quiet_NaN();
+    array a_f32 = mlx::core::astype(a, mlx::core::float32);
+    mlx::core::eval(a_f32);
+    return a_f32.item<float>();
+  } catch (...) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+}
+
+// Test-only mutator: replace slot `slot_idx` of `g_paged_linear_caches` with a
+// fresh scalar bf16 of `value`. Mirrors the dense
+// `mlx_qwen35_compiled_test_write_paged_linear_slot`.
+void mlx_qwen35_moe_compiled_test_write_paged_linear_slot(
+    int slot_idx, float value) {
+  if (slot_idx < 0 || slot_idx >= (int)g_paged_linear_caches.size()) return;
+  g_paged_linear_caches[slot_idx] = array(value, mlx::core::bfloat16);
 }
 
 // MTP — export a heap-allocated deep copy of the post-final-norm hidden
@@ -2269,11 +2420,71 @@ int mlx_qwen35_moe_trace_paged_attn_helper() {
 // `mlx_qwen35_invalidate_compiled_graphs()` (which nulls the dense bucket/paged
 // verify tables that the MoE path does not use). Also transitively invalidates
 // the MoE MTP draft graph in `mlx_qwen35_moe_mtp_compiled.cpp`.
+//
+// Each MoE model owns a private MoeSlot holding its compiled graph tables, so
+// one model's reload must not disturb another model's tables. We park the active
+// model back into its slot first, leaving the working register empty; the nulls
+// below then clear only that empty register (a no-op for real per-model slots).
+//
+// SCOPE: this only clears the WORKING REGISTER — it does NOT reach the slot of a
+// model that is currently PARKED. It is therefore safe for sibling models (their
+// slots are preserved) but it does NOT, on its own, invalidate the reloading
+// model's OWN compiled graphs when that model is parked. The loader closes that
+// gap by calling `mlx_qwen35_moe_slot_erase(model_id)` for the model being
+// (re-)registered just before this, which drops the loading model's slot so a
+// same-model_id re-registration can never resurrect stale baked-weight graphs.
 void mlx_qwen35_moe_invalidate_compiled_graphs() {
+  park_active_moe_model();
   g_moe_decode_compiled = MoeCompiledFn{};
   g_moe_verify_batched_compiled = MoeCompiledFn{};
   g_moe_decode_paged_compiled = MoeCompiledFn{};
   mlx_qwen35_moe_mtp_invalidate_compiled_graphs();
+}
+
+// Select model_id's MoE compiled state for the upcoming turn: park the
+// previously active model back into its slot, swap this model's slot into the
+// working-register globals, and publish its weight slot. Idempotent for the
+// model already active within the turn. MUST be called under the Rust compiled
+// lifecycle lock (the turn is the serialization unit), so no internal locking is
+// needed for the slot map / working register. Mirrors
+// `mlx_qwen35_activate_dense_model`.
+void mlx_qwen35_activate_moe_model(uint64_t model_id) {
+  if (g_active_moe_id == model_id) {
+    mlx_set_model_id(model_id);
+    return;
+  }
+  park_active_moe_model();
+  // operator[] default-constructs an empty slot on first use for this model.
+  swap_moe_globals(g_moe_slots()[model_id]);
+  g_active_moe_id = model_id;
+  mlx_set_model_id(model_id);
+}
+
+// Per-model compiled-capability gate: true iff model_id has registered
+// (non-empty) weights in the SHARED weight registry (MoE and dense model_ids
+// share `g_weight_slots()`). Replaces the old single-active-model-id compare so
+// a model stays compiled-eligible even after a SIBLING model loads — the
+// coexistence fix. Takes the weights read lock so it races safely against a
+// concurrent registration clearing/populating another model's slot. Functionally
+// identical to `mlx_qwen35_model_has_weights`; kept as a MoE-named entry so the
+// MoE Rust path and the MoE coexist smoke do not depend on the dense symbol.
+int mlx_qwen35_moe_model_has_weights(uint64_t model_id) {
+  std::shared_lock<std::shared_mutex> lock(g_weights_mutex());
+  auto it = g_weight_slots().find(model_id);
+  return (it != g_weight_slots().end() && !it->second.weights.empty()) ? 1 : 0;
+}
+
+// Free model_id's MoE compiled slot on model destruction, dropping its
+// std::function graph tables so MLX reclaims the baked tapes. If the model still
+// occupies the working register, clear it first so the globals end up empty.
+// Mirrors `mlx_qwen35_dense_slot_erase`.
+void mlx_qwen35_moe_slot_erase(uint64_t model_id) {
+  if (g_active_moe_id == model_id) {
+    MoeSlot empty;
+    swap_moe_globals(empty);
+    g_active_moe_id = 0;
+  }
+  g_moe_slots().erase(model_id);
 }
 
 }  // extern "C"

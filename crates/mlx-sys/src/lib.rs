@@ -1899,6 +1899,22 @@ unsafe extern "C-unwind" {
     /// with the first model's baked weights.
     pub fn mlx_qwen35_moe_invalidate_compiled_graphs();
 
+    /// Select this model's MoE compiled slot for the upcoming turn: parks the
+    /// previously active model, swaps this model's state into the working
+    /// register, and republishes its weight slot. MUST be called under the
+    /// compiled lifecycle lock, once per turn, before the first compiled FFI.
+    pub fn mlx_qwen35_activate_moe_model(model_id: u64);
+
+    /// Per-model compiled-capability gate (replaces the single-active-model-id
+    /// compare): returns non-zero iff this model has registered weights, which
+    /// stays true even after a sibling model loads. MoE and dense model_ids
+    /// share the weight registry, so this is functionally identical to
+    /// `mlx_qwen35_model_has_weights`.
+    pub fn mlx_qwen35_moe_model_has_weights(model_id: u64) -> i32;
+
+    /// Free this model's MoE compiled slot on model destruction.
+    pub fn mlx_qwen35_moe_slot_erase(model_id: u64);
+
     /// Export compiled caches for PromptCache reuse.
     pub fn mlx_qwen35_export_caches(out_ptrs: *mut *mut mlx_array, max_count: i32) -> i32;
 
@@ -1962,6 +1978,23 @@ unsafe extern "C-unwind" {
     /// `value`. Used to simulate the paged-verify FFI's in-place
     /// linear-cache mutation without a real verify forward.
     pub fn mlx_qwen35_compiled_test_write_paged_linear_slot(slot_idx: i32, value: f32);
+
+    /// Test-only: populate the MoE `g_paged_linear_caches[]` with scalar bf16
+    /// markers and set `g_paged_inited = true` so the MoE coexist smoke can
+    /// stamp/read per-model sentinels in the working register. PRODUCTION CODE
+    /// MUST NOT CALL THIS — use `mlx_qwen35_moe_init_paged`.
+    pub fn mlx_qwen35_moe_compiled_test_force_paged_linear_caches(
+        num_layers: i32,
+        full_attention_interval: i32,
+    );
+
+    /// Test-only: read back the scalar bf16 value at slot `slot_idx` of the MoE
+    /// `g_paged_linear_caches`. Returns NaN if out of range or not a scalar.
+    pub fn mlx_qwen35_moe_compiled_test_read_paged_linear_slot(slot_idx: i32) -> f32;
+
+    /// Test-only: replace slot `slot_idx` of the MoE `g_paged_linear_caches`
+    /// with a fresh scalar bf16 of `value`.
+    pub fn mlx_qwen35_moe_compiled_test_write_paged_linear_slot(slot_idx: i32, value: f32);
 
     /// Export paged dense linear-attention caches for live-session continuation.
     /// Full-attention K/V stays in the Rust paged adapter pools; this returns

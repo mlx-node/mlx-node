@@ -1509,6 +1509,19 @@ fn register_moe_weights_with_cpp(
     // per-projection quant-info registry, so we re-populate both below.
     unsafe { sys::mlx_clear_weights(model_id) };
 
+    // Drop THIS model's own MoE compiled slot before re-publishing its weights.
+    // `mlx_qwen35_moe_invalidate_compiled_graphs()` below only nulls the WORKING
+    // REGISTER (it parks whatever model is active first, to protect siblings),
+    // so it never reaches a model whose slot is currently PARKED. On the normal
+    // load path `model_id` is brand-new (freshly minted from the id counter and
+    // never activated), so this erase is a no-op. It exists so a *same-model_id*
+    // re-registration — a future in-place weight update, or a torn-load retry —
+    // can never leave stale baked-weight graphs in `g_moe_slots()[model_id]` for
+    // a later `activate(model_id)` to swap back in and run new weights through an
+    // old tape. Active model → clears the register; parked model → drops its
+    // slot; sibling slots are untouched. Mirrors the dense loader fix.
+    unsafe { sys::mlx_qwen35_moe_slot_erase(model_id) };
+
     // Invalidate the compiled MTP-verify dispatch tables (shared with the
     // dense Qwen3.5 path) in the SAME write-lock critical section as the
     // weight clear, so the next verify re-traces against the weights we store

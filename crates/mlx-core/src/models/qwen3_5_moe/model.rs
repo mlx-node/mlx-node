@@ -338,6 +338,22 @@ pub(crate) struct Qwen35MoeInner {
     turn_is_streaming: Cell<bool>,
 }
 
+impl Drop for Qwen35MoeInner {
+    fn drop(&mut self) {
+        // Release this model's MoE compiled slot so MLX reclaims the baked
+        // graph tapes its std::function tables hold. A no-op when this model
+        // never registered compiled weights (the slot was never created).
+        //
+        // Held under the compiled-weights write lock — the same lock model
+        // (re)registration takes — so erasing this entry is serialized against
+        // any concurrent turn on another model thread mutating the shared
+        // moe-slot map (std::unordered_map insert/erase are not concurrency
+        // safe even on distinct keys).
+        let _guard = crate::engine::compiled_lock::compiled_weights_write();
+        unsafe { mlx_sys::mlx_qwen35_moe_slot_erase(self.model_id) };
+    }
+}
+
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35MoeCmd {
     /// All chat-session traffic (sync + streaming starts/continues/tool
@@ -1201,7 +1217,7 @@ impl Qwen35MoeInner {
         }
 
         // Check if compiled path will be used
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
 
         // Serialize MoE compiled lifecycle across model instances
         let _moe_lock = if use_cpp {
@@ -1218,7 +1234,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -1453,6 +1469,12 @@ impl Qwen35MoeInner {
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_cpp {
+            // Swap this model's MoE compiled slot into the working register
+            // before arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
@@ -1848,13 +1870,14 @@ impl Qwen35MoeInner {
     /// Unlike the dense paged path, the MoE paged decode loop dispatches
     /// through the C++ compiled paged forward (`mlx_qwen35_moe_forward_paged`)
     /// when the C++ weights are still registered for this model
-    /// (`mlx_qwen35_get_model_id() == self.model_id`). The compiled graph
+    /// (`mlx_qwen35_moe_model_has_weights(self.model_id)`, true even after a
+    /// sibling model loads). The compiled graph
     /// reads K/V from the adapter pool via `paged_kv_write` /
     /// `paged_attention` and reads GDN linear caches from the per-layer
     /// `Qwen3_5LayerCache::Linear(ArraysCache)` via the
     /// `linear_cache_arrays` FFI parameter. Falls back to the pure-Rust
-    /// paged decode (`paged_forward::run_paged_decode_step`) when weights
-    /// have been swapped out by another model load.
+    /// paged decode (`paged_forward::run_paged_decode_step`) when this
+    /// model's own weights are no longer registered.
     fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
@@ -1900,7 +1923,7 @@ impl Qwen35MoeInner {
         // avoid a TOCTOU race where another model swapped weights
         // between the unlocked check and our compiled init.
         let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let _moe_lock = if use_cpp_paged {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -1913,7 +1936,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -2197,6 +2220,11 @@ impl Qwen35MoeInner {
         // any exit path so the next session starts with cleared
         // `g_paged_*` globals (`g_paged_inited == false`).
         let mut cpp_session_ready = if use_cpp_paged {
+            // Swap this model's MoE compiled slot into the working register
+            // before the seed FFI and every later paged forward, parking any
+            // other model. Held under the caller's lifecycle lock.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             // We need both immutable borrows for caches+adapter; this
             // closure scope is the simplest way to satisfy the borrow
             // checker without ferrying handles up through the function.
@@ -2492,7 +2520,7 @@ impl Qwen35MoeInner {
         // `paged_turn_sync_core` for the full rationale; this is the
         // streaming twin.
         let model_id = self.model_id;
-        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_paged = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let _moe_lock = if use_cpp_paged {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -2505,7 +2533,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp_paged = if use_cpp_paged {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -2888,6 +2916,11 @@ impl Qwen35MoeInner {
         // dispatchers behave identically when both paths are available.
         let decode_setup_trace_start = trace_enabled.then(std::time::Instant::now);
         let mut cpp_session_ready = if use_cpp_paged {
+            // Swap this model's MoE compiled slot into the working register
+            // before the seed FFI and every later paged forward, parking any
+            // other model. Held under the caller's lifecycle lock.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             let caches_ref = self.caches.as_ref().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_stream_core_inner: caches dropped post-prefill")
             })?;
@@ -3342,7 +3375,7 @@ impl Qwen35MoeInner {
         }
 
         // Check compiled path
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let _moe_lock = if use_cpp {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -3356,7 +3389,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -3582,6 +3615,12 @@ impl Qwen35MoeInner {
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_cpp {
+            // Swap this model's MoE compiled slot into the working register
+            // before arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
@@ -4133,7 +4172,7 @@ impl Qwen35MoeInner {
         }
 
         // Check compiled path availability
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
 
         // Serialize MoE compiled lifecycle across model instances
         let _moe_lock = if use_cpp {
@@ -4149,7 +4188,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -4216,6 +4255,12 @@ impl Qwen35MoeInner {
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_cpp {
+            // Swap this model's MoE compiled slot into the working register
+            // before arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
@@ -4657,7 +4702,7 @@ impl Qwen35MoeInner {
             );
         }
 
-        let use_cpp = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let _moe_lock = if use_cpp {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -4671,7 +4716,7 @@ impl Qwen35MoeInner {
         let mut _weight_guard = None;
         let use_cpp = if use_cpp {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 _weight_guard = Some(guard);
                 true
             } else {
@@ -4735,6 +4780,12 @@ impl Qwen35MoeInner {
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
         if use_cpp {
+            // Swap this model's MoE compiled slot into the working register
+            // before arming the reset guard and the first compiled FFI
+            // (init_from_prefill / forward), parking any other model. Held under
+            // the caller's lifecycle lock for the lifetime of this call.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(self.model_id) };
+
             let _moe_guard = MoeResetGuard;
             use mlx_sys as sys;
             let prefill_len = seq_len as i32;
@@ -7586,7 +7637,7 @@ impl PagedBackend for Qwen35MoeInner {
         // re-validate the model id under the weights read lock (TOCTOU) before
         // seeding.
         let model_id = self.model_id;
-        let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        let use_cpp_pre = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let mut compiled_lock = if use_cpp_pre {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -7599,10 +7650,16 @@ impl PagedBackend for Qwen35MoeInner {
         let mut weight_guard = None;
         let cpp_session_ready = if use_cpp_pre {
             let guard = compiled_weights_read();
-            // Re-check ownership under the read lock — a concurrent load of a
-            // different model could have evicted us between the probe and here.
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            // Re-check this model's weight presence under the read lock — a
+            // concurrent reload/clear of THIS model could have dropped its
+            // weights between the probe and here (a sibling model loading does
+            // not, which is the coexistence fix).
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 weight_guard = Some(guard);
+                // Swap this model's MoE compiled slot into the working register
+                // before the seed FFI and every later paged forward, parking
+                // any other model. Held under the lifecycle lock above.
+                unsafe { mlx_sys::mlx_qwen35_activate_moe_model(model_id) };
                 // Seed the compiled-paged graph ONCE from the live post-prefill
                 // adapter pools + GDN state. On any failure drop back to the
                 // pure-Rust paged decode for the whole turn.
@@ -7993,15 +8050,16 @@ impl ChatBackend for Qwen35MoeInner {
         let p = turn.params;
         let model_id = self.model_id;
 
-        // Compiled-path availability + process-wide serialization —
-        // VERBATIM move of the legacy lock acquisition from the deleted
-        // MoE cores: MoE lifecycle mutex first (when the cheap pre-check
-        // passes), then the weights read lock (shared with dense — both
-        // families share the C++ weight map), then the model-id RE-check
-        // under the lock. Another model swapping `g_active_model_id`
-        // between the two checks silently demotes the turn to the eager
-        // Rust path.
-        let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+        // Compiled-path availability + process-wide serialization: the gate is
+        // per-model weight presence (shared with dense — both families share the
+        // C++ weight map), so a sibling model loading no longer demotes this
+        // model. MoE lifecycle mutex first (when the cheap presence pre-check
+        // passes), then the weights read lock, then a RE-check under the lock.
+        // The re-check guards against THIS model being dropped/cleared between
+        // the cheap check and the lock; if it still has weights,
+        // `mlx_qwen35_activate_moe_model` below selects its compiled slot for the
+        // turn.
+        let use_compiled = unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0;
         let lifecycle_lock = if use_compiled {
             Some(
                 COMPILED_LIFECYCLE_MUTEX
@@ -8014,7 +8072,7 @@ impl ChatBackend for Qwen35MoeInner {
         let mut weight_guard = None;
         let use_compiled = if use_compiled {
             let guard = compiled_weights_read();
-            if unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id {
+            if unsafe { mlx_sys::mlx_qwen35_moe_model_has_weights(model_id) } != 0 {
                 weight_guard = Some(guard);
                 true
             } else {
@@ -8035,6 +8093,11 @@ impl ChatBackend for Qwen35MoeInner {
         let mut compiled_guard = None;
         let relabel: &'static str;
         if use_compiled {
+            // Swap this model's MoE compiled slot into the working register
+            // before arming the reset guard and the seed FFI, parking any other
+            // model. Held under the lifecycle lock acquired above.
+            unsafe { mlx_sys::mlx_qwen35_activate_moe_model(model_id) };
+
             // Arm the reset guard BEFORE the seeding block, mirroring
             // the legacy declaration order: an Err out of
             // `kv_capacity_round_up` must still tear the compiled state
@@ -9394,8 +9457,10 @@ pub(crate) const CPP_PAGED_REQUIRED_BLOCK_SIZE: u32 = 16;
 ///    `update_keys_values`; linear layers populated `ArraysCache` via
 ///    `GatedDeltaNet::forward`.
 /// 2. The C++ weights for this model are still registered (caller must
-///    have verified `mlx_qwen35_get_model_id() == self.model_id` and
-///    holds the appropriate read locks).
+///    have verified `mlx_qwen35_moe_model_has_weights(self.model_id)` and
+///    holds the appropriate read locks), and this model's MoE compiled
+///    slot has been activated for the turn via
+///    `mlx_qwen35_activate_moe_model(self.model_id)`.
 ///
 /// `prefill_offset` is the global token cursor the compiled paged
 /// graph's `g_paged_offset_int` will start incrementing from. After a
