@@ -6,6 +6,15 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::Arc;
 
+/// Whether MLX's Metal backend is available on this host (cached; constant per
+/// process). False on the CUDA/Linux build, which must use synchronous eval to
+/// avoid the async-eval cross-stream `cu::AtomicEvent::wait` segfault.
+fn metal_backend_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| unsafe { sys::mlx_metal_is_available() })
+}
+
 #[napi]
 impl MxArray {
     #[napi]
@@ -34,6 +43,19 @@ impl MxArray {
             return;
         }
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
+        // MLX-CUDA: async eval attaches a per-stream `Event` to each output
+        // (transforms.cpp, `async=true` branch). A later consumer hits the
+        // cross-stream `in.event().wait(stream)` path, which segfaults inside
+        // `cu::AtomicEvent::wait` on the CUDA backend. Synchronous eval takes the
+        // `async=false` branch and attaches no events, so it sidesteps the crash.
+        // Fall back to sync eval when the Metal backend is unavailable; macOS
+        // keeps the async overlap.
+        if !metal_backend_available() {
+            unsafe {
+                sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+            }
+            return;
+        }
         unsafe {
             sys::mlx_async_eval(handles.as_mut_ptr(), handles.len());
         }

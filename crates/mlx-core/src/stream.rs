@@ -6,6 +6,15 @@
  */
 use mlx_sys as sys;
 
+/// Whether MLX's Metal backend is available on this host (cached; constant per
+/// process). False on the CUDA/Linux build, where secondary GPU streams + the
+/// async-eval cross-stream event machinery (`cu::AtomicEvent::wait`) segfault.
+fn metal_backend_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| unsafe { sys::mlx_metal_is_available() })
+}
+
 /// Device type for MLX streams
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceType {
@@ -28,6 +37,14 @@ impl Stream {
 
     /// Create a new stream on the given device
     pub fn new(device: DeviceType) -> Self {
+        // MLX-CUDA: a secondary GPU stream made the default makes the eval graph
+        // span streams, and the resulting cross-stream synchronization in
+        // `cu::AtomicEvent::wait` segfaults. Single-stream eval is correct on
+        // CUDA, so collapse new GPU streams onto the default stream when the
+        // Metal backend is unavailable. macOS is unaffected.
+        if device == DeviceType::Gpu && !metal_backend_available() {
+            return Stream::default(device);
+        }
         let inner = unsafe { sys::mlx_new_stream(device as i32) };
         Stream { inner }
     }

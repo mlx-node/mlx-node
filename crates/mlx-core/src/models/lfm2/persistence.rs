@@ -14,7 +14,8 @@ use crate::models::quant_dispatch::{
     load_quant_settings_from_disk, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence_common::{
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    compiled_forward_backend_available, dequant_fp8_weights, load_all_safetensors,
+    prewarm_checkpoint_pages,
 };
 use crate::models::qwen3_5_moe::persistence::try_build_quantized_switch_linear;
 use crate::models::qwen3_5_moe::quantized_linear::{
@@ -1627,7 +1628,11 @@ impl Lfm2Inner {
             paged_block_size_ok,
             non_quant_floats_bf16,
             crate::models::lfm2::model::quant_compiled_enabled() && quant_embed_supported,
-        ) {
+        ) && compiled_forward_backend_available()
+        {
+            // The compiled C++ forward uses Metal-only kernels; skip registration
+            // on a non-Metal backend so the eager Rust forward runs instead (the
+            // model_id is never published). macOS keeps registering as before.
             register_weights_with_cpp(
                 &params,
                 inner.model_id,

@@ -14,6 +14,22 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::utils::safetensors::load_safetensors_lazy;
 
+/// Whether the compiled C++ forward path can run on this host.
+///
+/// The compiled Qwen3.5 dense/MoE forward uses `fast::metal_kernel` (the GDN
+/// gating/recurrence kernels) and the block-paged custom primitives. Both
+/// require MLX's Metal backend and throw at runtime without it. On the
+/// CUDA/Linux build (`mlx_metal_is_available()` is false) the loaders must
+/// skip compiled-forward weight registration so `model_id` stays unset and
+/// every forward falls back to the device-agnostic eager Rust path.
+///
+/// The probe is cached: `mlx_metal_is_available()` is a constant per process.
+pub(crate) fn compiled_forward_backend_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() })
+}
+
 /// Load all safetensors files from a directory (supports sharded checkpoints).
 /// Uses MLX's native mmap-backed lazy loader — arrays are backed by deferred disk
 /// reads and data is only materialized on eval. This makes loading near-instant

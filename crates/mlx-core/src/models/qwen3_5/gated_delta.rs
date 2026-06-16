@@ -3,6 +3,13 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
+/// Whether the GDN `fast::metal_kernel` kernels can run on this host. False on
+/// the CUDA/Linux build, where they throw — callers must use the ops path.
+/// Delegates to the shared, cached `mlx_metal_is_available()` probe.
+fn metal_kernel_backend_available() -> bool {
+    super::persistence_common::compiled_forward_backend_available()
+}
+
 /// Minimum sequence length for the chunked prefill kernel to even be *eligible*.
 /// Below this the per-step recurrence always wins, so chunked is never considered.
 /// (Chunked is opt-in only — see [`GdnKernel`] / [`should_use_chunked`].)
@@ -408,6 +415,13 @@ pub fn gated_delta_update(
     let num_v_heads = v.shape_at(2)?;
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
+
+    // The fused GDN gating + per-step/chunked recurrence are `fast::metal_kernel`
+    // kernels that throw without MLX's Metal backend. On the CUDA/Linux build
+    // (`mlx_metal_is_available()` is false) route straight to the
+    // device-agnostic ops path instead of paying a per-layer-per-token
+    // throw/catch (which would also contaminate decode-perf numbers).
+    let use_kernel = use_kernel && metal_kernel_backend_available();
 
     // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
     // compute_g builds a standard MLX expression graph via C++ (differentiable),

@@ -30,6 +30,14 @@
 #include <cstdint>
 
 #include "mlx/array.h"
+
+// These dispatch wrappers take MLX's Metal `CommandEncoder` / `Device` by
+// reference, so the whole declaration block is Metal-only. The two TUs that
+// include this header (`mlx_paged_dispatch.cpp`, `mlx_paged_ops.cpp`) are
+// excluded from the non-Apple build, but guard the include + decls anyway so
+// the header is safe to parse on any host.
+#if defined(__APPLE__)
+
 #include "mlx/backend/metal/device.h"
 
 namespace mlx::core::fast::paged {
@@ -157,3 +165,5 @@ void dispatch_paged_attention_varlen_auto(
     KvDtype kv_dtype);
 
 } // namespace mlx::core::fast::paged
+
+#endif // defined(__APPLE__)

@@ -22,8 +22,8 @@ use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
 
 use super::persistence_common::{
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages_with,
+    compiled_forward_backend_available, dequant_fp8_weights, get_config_bool, get_config_f64,
+    get_config_i32, load_all_safetensors, prewarm_checkpoint_pages_with,
 };
 
 use super::config::Qwen3_5Config;
@@ -1852,6 +1852,19 @@ fn register_weights_with_cpp(
     // weights + quant-info are cleared and model_id is NEVER set, so every
     // forward fail-safes onto the eager Rust path (correct, just slower).
     let sym8_checkpoint = has_sym8_mode(top_level_mode, per_layer_quant);
+
+    // No GPU Metal backend (e.g. the CUDA/Linux build): the compiled C++
+    // forward uses `fast::metal_kernel` (GDN) and the block-paged custom
+    // primitives, both of which throw without Metal. Skip registration so
+    // `model_id` stays unset → every forward takes the eager Rust path.
+    if !compiled_forward_backend_available() {
+        info!(
+            "no Metal backend → skipping C++ compiled-forward weight registration \
+             (model_id={} stays unregistered → eager Rust forward path)",
+            model_id
+        );
+        return;
+    }
 
     // MLX_QWEN35_FORCE_EAGER=1 (read ONCE per process) skips compiled C++
     // registration for ANY Qwen3.5 checkpoint — same dispatch consequence as

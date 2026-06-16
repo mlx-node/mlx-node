@@ -19,8 +19,8 @@ use crate::models::qwen3_5::persistence::{
     parse_vision_config,
 };
 use crate::models::qwen3_5::persistence_common::{
-    dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages,
+    compiled_forward_backend_available, dequant_fp8_weights, get_config_bool, get_config_f64,
+    get_config_i32, load_all_safetensors, prewarm_checkpoint_pages,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -1498,6 +1498,19 @@ fn register_moe_weights_with_cpp(
 ) {
     use mlx_sys as sys;
     use std::ffi::CString;
+
+    // No GPU Metal backend (e.g. the CUDA/Linux build): the compiled C++ MoE
+    // forward uses `fast::metal_kernel` (GDN) and the block-paged custom
+    // primitives, both of which throw without Metal. Skip registration so
+    // `model_id` stays unset → every forward takes the eager Rust path.
+    if !compiled_forward_backend_available() {
+        info!(
+            "no Metal backend → skipping C++ compiled-forward MoE weight registration \
+             (model_id={} stays unregistered → eager Rust forward path)",
+            model_id
+        );
+        return;
+    }
 
     // Write-lock the weight RwLock for the entire registration.
     let _guard = crate::models::qwen3_5::model::COMPILED_WEIGHTS_RWLOCK

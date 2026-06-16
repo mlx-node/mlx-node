@@ -29,6 +29,20 @@ pub mod profile;
 #[cfg(target_os = "macos")]
 pub mod metal;
 
+// On non-macOS hosts the full `metal` module (Apple `metal` crate bindings,
+// kernel dispatch, `MetalState`) is absent. But `MetalDtype` is a pure-data
+// enum that leaks into the cross-platform `LayerKVPool` / `profile` APIs and
+// into mlx-core's model bring-up. Expose just that type under the same
+// `metal::` path so cross-platform code (and `crate::metal::MetalDtype`)
+// resolves identically on Linux without pulling in any Metal dependency.
+#[cfg(not(target_os = "macos"))]
+pub mod metal {
+    pub use super::metal_dtype::MetalDtype;
+}
+
+#[cfg(not(target_os = "macos"))]
+mod metal_dtype;
+
 // Re-export the extern "C" shim symbols so the C++ Custom primitives
 // in `crates/mlx-sys/src/mlx_paged_ops.cpp` can link against them.
 #[cfg(target_os = "macos")]

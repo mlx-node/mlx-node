@@ -42,6 +42,14 @@ pub struct Qwen3_5Attention {
 }
 
 fn paged_prefill_paged_attention_enabled() -> bool {
+    // Without a Metal backend (CUDA/Linux build) the C++ paged-attention
+    // kernel throws, so a flat-path cache-hit prefill must NOT dispatch it.
+    // Hard-close the path here so reuse-turn prefills stay on the
+    // device-agnostic SDPA fallback. (Single-turn fresh prompts never reach
+    // this branch anyway, but this closes the multi-turn case too.)
+    if !super::persistence_common::compiled_forward_backend_available() {
+        return false;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         crate::inference_trace::env_flag_enabled_or_default(

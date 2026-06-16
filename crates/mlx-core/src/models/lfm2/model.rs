@@ -370,7 +370,15 @@ impl Lfm2Inner {
         // (greedy byte-equal + prefix-reuse byte-equal at BF16 against
         // real LFM2.5-1.2B weights). Callers can opt out with
         // `use_block_paged_cache: Some(false)`.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
+        // The block-paged KV cache and its compiled decode path rely on
+        // Metal-only kernels; on a non-Metal backend (the CUDA/Linux build) the
+        // paged writes/gathers hit throwing stubs. Force flat eager there by
+        // never building the adapter, mirroring how Qwen3.5 gates its compiled
+        // paths. macOS is unaffected — the backend probe is always true, so the
+        // `unwrap_or(true)` default still wins.
+        let want_paged = config.use_block_paged_cache.unwrap_or(true)
+            && crate::models::qwen3_5::persistence_common::compiled_forward_backend_available();
+        let paged_adapter = if want_paged {
             let attn_layer_count = config.full_attn_idxs().len() as u32;
             if attn_layer_count == 0 {
                 return Err(Error::from_reason(
