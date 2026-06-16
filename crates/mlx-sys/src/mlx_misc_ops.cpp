@@ -1,3 +1,5 @@
+#include <memory>
+
 #include "mlx_common.h"
 
 extern "C" {
@@ -152,7 +154,11 @@ static auto& compiled_min_p_fn() {
     mlx::core::Shape first_ends(shape.begin(), shape.end());
     first_ends[first_ends.size() - 1] = 1;
     auto keep_first = mlx::core::zeros_like(mlx::core::slice(tokens_to_remove, first_starts, first_ends));
-    auto keep_indices = mlx::core::arange(0, 1, mlx::core::int32);
+    // Force-keep the top token (sorted position 0). put_along_axis requires
+    // indices.ndim == array.ndim, so the index array must match the logits'
+    // rank: shape [batch..., 1] all-zeros (not a fixed 1-D [0], which throws
+    // on 2-D [batch, vocab] logits). For 1-D logits this is byte-identical.
+    auto keep_indices = mlx::core::zeros(keep_first.shape(), mlx::core::int32);
     tokens_to_remove = mlx::core::put_along_axis(tokens_to_remove, keep_indices, keep_first, -1);
 
     auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
@@ -261,6 +267,7 @@ mlx_array* mlx_compiled_sample_full(
     float min_p,
     int sampler_mode
 ) {
+  try {
   auto logits = *reinterpret_cast<array*>(logits_handle);
 
   // Fast path: tiny temperature means argmax (greedy). Treat the whole
@@ -285,6 +292,13 @@ mlx_array* mlx_compiled_sample_full(
   // Apply temperature and sample — uncompiled categorical.
   auto result = categorical_with_temp(sampler.filtered_logits, sampler.inv_temp);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    // A C++ exception here (e.g. an invalid sampler filter shape) must not
+    // unwind across the Rust FFI boundary — that aborts the process. Return
+    // null so the caller surfaces a recoverable Result error instead.
+    std::cerr << "mlx_compiled_sample_full error: " << e.what() << std::endl;
+    return nullptr;
+  }
 }
 
 // ============================================================================
@@ -315,6 +329,7 @@ mlx_array* mlx_compiled_sampling_distribution(
     float min_p,
     int sampler_mode
 ) {
+  try {
   auto logits = *reinterpret_cast<array*>(logits_handle);
 
   // Tiny T (greedy): argmax-only sampler. Return a one-hot distribution so a
@@ -355,6 +370,10 @@ mlx_array* mlx_compiled_sampling_distribution(
   auto scaled = mlx::core::multiply(sampler.filtered_logits, sampler.inv_temp);
   auto result = mlx::core::softmax(scaled, std::vector<int>{-1}, true);
   return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_compiled_sampling_distribution error: " << e.what() << std::endl;
+    return nullptr;
+  }
 }
 
 // ============================================================================
@@ -372,6 +391,7 @@ void mlx_compiled_sample_and_logprobs(
     mlx_array** out_token,
     mlx_array** out_logprobs
 ) {
+  try {
   auto logits = *reinterpret_cast<array*>(logits_handle);
 
   // Compute logprobs once
@@ -383,8 +403,14 @@ void mlx_compiled_sample_and_logprobs(
   // Rust accept gate (temperature <= 1e-6) at tiny T.
   if (temperature <= GREEDY_TEMPERATURE_EPS) {
     auto result = mlx::core::argmax(logits, -1);
-    *out_token = reinterpret_cast<mlx_array*>(new array(std::move(result)));
-    *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(logprobs)));
+    // Publish both out-handles only after BOTH allocations succeed: if the
+    // second `new array` threw, the first would leak (the catch below nulls
+    // the out-params). Holding them in unique_ptr until release() makes the
+    // pair atomic — a throw frees the first via RAII.
+    auto tok = std::make_unique<array>(std::move(result));
+    auto lp = std::make_unique<array>(std::move(logprobs));
+    *out_token = reinterpret_cast<mlx_array*>(tok.release());
+    *out_logprobs = reinterpret_cast<mlx_array*>(lp.release());
     return;
   }
 
@@ -400,8 +426,12 @@ void mlx_compiled_sample_and_logprobs(
     });
     auto temp_array = mlx::core::array(1.0f / temperature);
     auto results = compiled_sampler({logprobs, temp_array});
-    *out_token = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
-    *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(logprobs)));
+    // Atomic publish (see greedy path): both unique_ptrs release only after
+    // both allocations succeed, so a throw can't leak the token handle.
+    auto tok = std::make_unique<array>(std::move(results[0]));
+    auto lp = std::make_unique<array>(std::move(logprobs));
+    *out_token = reinterpret_cast<mlx_array*>(tok.release());
+    *out_logprobs = reinterpret_cast<mlx_array*>(lp.release());
     return;
   }
 
@@ -467,7 +497,11 @@ void mlx_compiled_sample_and_logprobs(
     mlx::core::Shape first_ends(shape.begin(), shape.end());
     first_ends[first_ends.size() - 1] = 1;
     auto keep_first = mlx::core::zeros_like(mlx::core::slice(tokens_to_remove, first_starts, first_ends));
-    auto keep_indices = mlx::core::arange(0, 1, mlx::core::int32);
+    // Force-keep the top token (sorted position 0). put_along_axis requires
+    // indices.ndim == array.ndim, so the index array must match the logits'
+    // rank: shape [batch..., 1] all-zeros (not a fixed 1-D [0], which throws
+    // on 2-D [batch, vocab] logits). For 1-D logits this is byte-identical.
+    auto keep_indices = mlx::core::zeros(keep_first.shape(), mlx::core::int32);
     tokens_to_remove = mlx::core::put_along_axis(tokens_to_remove, keep_indices, keep_first, -1);
     auto neg_inf = mlx::core::array(-std::numeric_limits<float>::infinity(), logprobs.dtype());
     auto selected_logprobs = mlx::core::where(tokens_to_remove, neg_inf, sorted_logprobs);
@@ -488,8 +522,19 @@ void mlx_compiled_sample_and_logprobs(
   auto temp_array = mlx::core::array(temperature_first ? 1.0f : (1.0f / temperature));
   auto results = compiled_sampler_filtered({logprobs, temp_array});
 
-  *out_token = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
-  *out_logprobs = reinterpret_cast<mlx_array*>(new array(std::move(original_logprobs)));
+  // Atomic publish (see greedy path): both unique_ptrs release only after
+  // both allocations succeed, so a throw can't leak the token handle.
+  auto tok = std::make_unique<array>(std::move(results[0]));
+  auto lp = std::make_unique<array>(std::move(original_logprobs));
+  *out_token = reinterpret_cast<mlx_array*>(tok.release());
+  *out_logprobs = reinterpret_cast<mlx_array*>(lp.release());
+  } catch (const std::exception& e) {
+    // Leave the out-handles null so the Rust caller's `from_handle` surfaces a
+    // recoverable error rather than letting the exception abort the process.
+    std::cerr << "mlx_compiled_sample_and_logprobs error: " << e.what() << std::endl;
+    *out_token = nullptr;
+    *out_logprobs = nullptr;
+  }
 }
 
 // Stop gradient: detach tensor from computation graph

@@ -2820,4 +2820,60 @@ mod accept_with_residual_tests {
             s[1]
         );
     }
+
+    /// REGRESSION (min_p on N-D logits): the compiled min_p filter force-keeps
+    /// the top token via `put_along_axis`, whose index array must match the
+    /// logits' rank. A fixed 1-D `[0]` index threw "[put_along_axis] Indices of
+    /// dimension 1 does not match array of dimension 2" on 2-D `[rows, vocab]`
+    /// logits — and that C++ exception unwound across the sampling FFI and
+    /// aborted the whole process ("Rust cannot catch foreign exceptions"). The
+    /// decode loop feeds 2-D logits, so min_p sampling MUST work on them. This
+    /// covers both filter copies: `sampling_distribution` (inline) and `sample`
+    /// (the compiled `compiled_min_p_fn`).
+    #[test]
+    fn min_p_filter_works_on_2d_logits() {
+        // Peaked row: token 0 dominates. min_p = 0.5 removes the sub-threshold
+        // tokens to EXACTLY zero (proving the filter ran, not just that nothing
+        // threw). temperature 1.0 keeps it off the greedy one-hot fast path.
+        let cfg = SamplingConfig {
+            temperature: Some(1.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.5),
+        };
+
+        // 2-D single row [1, 4] — the shape the engine actually passes.
+        let logits_2d =
+            MxArray::from_float32(&[8.0f32, 0.0, 0.0, 0.0], &[1, 4]).expect("2d logits");
+        let dist = dist_vec(&sampling_distribution(&logits_2d, Some(cfg)).expect("dist 2d min_p"));
+        assert_close(dist[0], 1.0, 1e-5);
+        assert_close(dist[1], 0.0, 1e-6);
+        assert_close(dist[2], 0.0, 1e-6);
+        assert_close(dist[3], 0.0, 1e-6);
+
+        // 1-D must match the 2-D row exactly (the fix is byte-identical for 1-D).
+        let logits_1d = MxArray::from_float32(&[8.0f32, 0.0, 0.0, 0.0], &[4]).expect("1d logits");
+        let dist_1d =
+            dist_vec(&sampling_distribution(&logits_1d, Some(cfg)).expect("dist 1d min_p"));
+        for i in 0..4 {
+            assert_close(dist_1d[i], dist[i], 1e-6);
+        }
+
+        // The compiled `sample` path (compiled_min_p_fn) must also accept 2-D
+        // logits and draw the only surviving token (0).
+        let tok = sample_compiled(&logits_2d, Some(cfg)).expect("sample 2d min_p");
+        let drawn: Vec<i32> = tok.to_int32().expect("to_int32").to_vec();
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0], 0, "min_p left only token 0 in support");
+
+        // Multi-row [2, 4]: rows filtered independently, no abort.
+        let logits_rows =
+            MxArray::from_float32(&[8.0f32, 0.0, 0.0, 0.0, 0.0, 8.0, 0.0, 0.0], &[2, 4])
+                .expect("2-row logits");
+        let rows =
+            dist_vec(&sampling_distribution(&logits_rows, Some(cfg)).expect("dist 2-row min_p"));
+        assert_eq!(rows.len(), 8);
+        assert_close(rows[0], 1.0, 1e-5); // row 0 → token 0
+        assert_close(rows[5], 1.0, 1e-5); // row 1 → token 1
+    }
 }
