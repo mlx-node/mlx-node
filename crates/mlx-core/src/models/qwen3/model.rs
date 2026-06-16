@@ -6779,6 +6779,12 @@ mod tests {
     /// no-Metal sandboxes by matching on the LayerKVPool error string.
     #[test]
     fn test_qwen3_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(None);
         match super::Qwen3Inner::new(cfg) {
             Ok(inner) => {
@@ -6805,6 +6811,12 @@ mod tests {
     /// (mirrors the pattern used in the `paged_kv_cache_adapter` test module).
     #[test]
     fn test_qwen3_inner_constructs_paged_adapter_when_flag_is_true() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         match super::Qwen3Inner::new(cfg) {
             Ok(inner) => {
@@ -6851,6 +6863,12 @@ mod tests {
     /// `test_qwen3_inner_constructs_paged_adapter_when_flag_is_true`).
     #[test]
     fn test_chat_sync_core_paged_smoke_via_helpers() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -7086,6 +7104,12 @@ mod tests {
     /// Skips on no-Metal hosts.
     #[test]
     fn test_chat_stream_sync_core_paged_smoke_via_helpers() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -7360,6 +7384,12 @@ mod tests {
     /// Skips on no-Metal hosts.
     #[test]
     fn test_chunked_prefill_matches_single_shot_logits() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -7514,6 +7544,12 @@ mod tests {
     /// the same per-chunk state-advancement code paths the driver runs.
     #[test]
     fn test_chunked_prefill_advances_adapter_state() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -7667,6 +7703,12 @@ mod tests {
     /// Skips on no-Metal hosts.
     #[test]
     fn test_chunked_prefill_uneven_tail_matches_single_shot() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -7820,6 +7862,12 @@ mod tests {
     /// Tolerance: same atol=rtol=5e-3 budget as the other parity tests.
     #[test]
     fn test_chunked_prefill_with_cached_prefix_matches_single_shot() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Qwen3Inner::new(cfg.clone()) {
             Ok(i) => i,
@@ -8037,6 +8085,12 @@ mod tests {
     /// signature stable.
     #[test]
     fn test_run_paged_prefill_chunk_default_matches_single_shot() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         // Skip when MLX_PAGED_PREFILL_CHUNK_SIZE is set in the env: the
         // OnceLock-cached `paged_prefill_chunk_size()` is process-global, and
         // a positive value smaller than the 8-token prompt would route the

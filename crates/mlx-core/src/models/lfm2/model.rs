@@ -4959,6 +4959,12 @@ mod paged_adapter_construction_tests {
     /// no-Metal sandboxes.
     #[test]
     fn test_lfm2_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(None);
         match Lfm2Inner::new(cfg) {
             Ok(inner) => {
@@ -4984,6 +4990,12 @@ mod paged_adapter_construction_tests {
     /// gracefully skips on no-Metal sandboxes.
     #[test]
     fn test_lfm2_inner_constructs_paged_adapter_when_flag_is_true() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         match Lfm2Inner::new(cfg) {
             Ok(inner) => {
@@ -5028,6 +5040,12 @@ mod paged_adapter_construction_tests {
     /// Skips on no-Metal hosts.
     #[test]
     fn test_lfm2_chat_sync_core_paged_smoke_via_helpers() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         use crate::array::{DType, MxArray};
 
         let cfg = paged_tiny_config(Some(true));
@@ -5220,6 +5238,12 @@ mod paged_adapter_construction_tests {
     /// `num_layers=0` would violate `LayerKVPool::new`'s invariant.
     #[test]
     fn test_lfm2_inner_rejects_all_conv_with_paged_flag() {
+        // The all-conv rejection is a paged-path guard; it only runs when the
+        // adapter is built, which needs the Metal backend. Skip elsewhere.
+        if !crate::models::qwen3_5::persistence_common::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let mut cfg = paged_tiny_config(Some(true));
         cfg.layer_types = vec!["conv".to_string(), "conv".to_string()];
         let result = Lfm2Inner::new(cfg);
