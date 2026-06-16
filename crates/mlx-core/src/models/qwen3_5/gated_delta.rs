@@ -40,6 +40,11 @@ enum GdnKernel {
     ForcePerStep,
     /// Force the chunked prefill kernel (A/B only — changes output by 1–2 bf16 ULP).
     ForceChunked,
+    /// Force the device-agnostic chunk-parallel ops path (`gated_delta_chunked_ops`).
+    /// This is the default on the CUDA ops path (where the Metal kernels are absent);
+    /// `MLX_GDN_KERNEL=perstep` reverts it for same-binary A/B. No effect on Metal,
+    /// whose production path takes the `use_kernel=true` per-step/chunked kernels.
+    ForceChunkedOps,
 }
 
 /// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked`); also honors the
@@ -58,6 +63,9 @@ fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>, legacy_force_perstep: Option<&
     if let Some(v) = mlx_gdn_kernel {
         match v.trim().to_ascii_lowercase().as_str() {
             "perstep" | "per_step" | "per-step" | "step" => return GdnKernel::ForcePerStep,
+            "chunked_ops" | "chunkedops" | "chunked-ops" | "ops" => {
+                return GdnKernel::ForceChunkedOps;
+            }
             "chunked" | "chunk" => return GdnKernel::ForceChunked,
             _ => {}
         }
@@ -84,7 +92,9 @@ fn should_use_chunked(seq_len: i64, mask_is_none: bool, _gpu_gen: i32, choice: G
     }
     match choice {
         GdnKernel::ForceChunked => true,
-        GdnKernel::Auto | GdnKernel::ForcePerStep => false,
+        // ChunkedOps is the CUDA ops-path selector, not the Metal chunked kernel this
+        // predicate guards — it never selects the Metal kernel here.
+        GdnKernel::Auto | GdnKernel::ForcePerStep | GdnKernel::ForceChunkedOps => false,
     }
 }
 
@@ -111,6 +121,19 @@ fn compute_g(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray>
         sys::mlx_fused_compute_g(a_log.as_raw_ptr(), a.as_raw_ptr(), dt_bias.as_raw_ptr())
     };
     MxArray::from_handle(handle, "fused_compute_g")
+}
+
+/// Log-space decay gate: `g_log = -exp(a_log) * softplus(a + dt_bias)` = `log(compute_g(...))`,
+/// computed DIRECTLY rather than as `compute_g(...).log()`. Strong decay drives the exp-space
+/// gate `compute_g` to underflow to 0, so `log(g)` is `-inf`; the chunked path then forms
+/// `gcum_i - gcum_j = (-inf) - (-inf) = NaN` and emits garbage. The log-space form stays finite
+/// (softplus is numerically stable). Mirrors the native `g_log` the fused Metal gating returns.
+fn compute_g_log(a_log: &MxArray, a: &MxArray, dt_bias: &MxArray) -> Result<MxArray> {
+    use crate::array::DType;
+    let f32 = DType::Float32;
+    let sp = Activations::softplus(&a.astype(f32)?.add(&dt_bias.astype(f32)?)?)?;
+    let scale = a_log.astype(f32)?.exp()?;
+    sp.mul(&scale)?.negative()
 }
 
 /// Fused gating: computes both beta and g in a single Metal kernel dispatch.
@@ -381,6 +404,187 @@ fn gated_delta_ops(
     Ok((output, current_state))
 }
 
+/// Stable `(I + A)^-1` for a batched strictly-lower-triangular `A` of size `l x l`
+/// (the matrix is the last two axes). `A` is nilpotent, so the inverse is the finite sum
+/// `sum_m (-A)^m`; but forming it by repeated squaring overflows f32 at `l = 64` (the
+/// intermediate powers reach ~1e57 before nilpotency zeros them) and loses precision
+/// whenever `||A||` is large. Instead we build `M` directly by row-wise forward
+/// substitution, which never forms a power of `A`:
+///   `(I + A) M = I`  =>  row i:  `M[i, :] = e_i - A[i, :] @ M`  (A[i, j] = 0 for j >= i,
+/// so this only uses rows `< i`, already finalized). This matches the FLA / vLLM
+/// `solve_tril` reference. The `l - 1` steps are sequential but batched over all chunks,
+/// so the depth is independent of sequence length.
+fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
+    use crate::array::DType;
+    let f32 = DType::Float32;
+    let eye = MxArray::eye(l as i32, None, None, Some(f32))?; // [L, L]
+    let zeros_col = MxArray::zeros(&[l, 1], Some(f32))?;
+    let ai = a.ndim()? as usize - 2; // row axis of the [.., L, L] matrix
+    let mut m = eye.clone(); // M starts as I; row 0 (= e_0) is already final.
+    for i in 1..l {
+        let a_row = a.slice_axis(ai, i, i + 1)?; // [.., 1, L] = A[i, :]
+        let am = a_row.matmul(&m)?; // [.., 1, L] = A[i, :] @ M  (uses rows < i)
+        let row_i = eye.slice_axis(0, i, i + 1)?.sub(&am)?; // e_i - A[i,:]@M -> [.., 1, L]
+        // Scatter row_i into row i of M: column i of the identity is the one-hot row mask.
+        let row_mask = eye.slice_axis(1, i, i + 1)?.greater(&zeros_col)?; // [L, 1] bool
+        m = row_mask.where_(&row_i, &m)?;
+    }
+    Ok(m)
+}
+
+/// Chunk-parallel port of the per-step recurrence (`gated_delta_ops`) for the CUDA
+/// prefill path. Collapses the O(T) token-serial recurrence into O(T/BT) chunk-serial
+/// steps of dense batched matmuls (cuBLAS / tensor cores), matching the in-tree Metal
+/// chunked kernel's math (`crates/mlx-sys/src/metal/gated_delta_chunked.metal.inc`).
+///
+/// Device-agnostic (portable MxArray ops) so it also runs on Metal, where the unit-test
+/// parity check against `gated_delta_ops` lives. `g_log` is the LOG-space decay gate
+/// (negative); `beta` has sigmoid applied; `state` is `[B, Hv, Dv, Dk]` (value-major).
+/// q,k,v are already GQA-expanded to Hv. All accumulation is f32; output and final state
+/// are cast back to the model dtype. Inputs are zero-padded to whole `BT`-token chunks
+/// (zero — not -inf — so padded tokens contribute nothing without `0*inf=NaN`).
+fn gated_delta_chunked_ops(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g_log: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    use crate::array::DType;
+    const BT: i64 = 64;
+
+    let b = q.shape_at(0)?;
+    let t = q.shape_at(1)?;
+    let hv = q.shape_at(2)?;
+    let dk = q.shape_at(3)?;
+    let dv = v.shape_at(3)?;
+    let c = (t + BT - 1) / BT;
+    let tpad = c * BT;
+    let pad_t = (tpad - t) as i32;
+
+    let out_dtype = v.dtype()?;
+    let state_dtype = state.dtype()?;
+    let f32 = DType::Float32;
+
+    // Promote to f32: state must not drift in bf16 across the chunk-carry.
+    let q = q.astype(f32)?;
+    let k = k.astype(f32)?;
+    let v = v.astype(f32)?;
+    let g_log = g_log.astype(f32)?;
+    let beta = beta.astype(f32)?;
+    let s0 = state.astype(f32)?; // [B, Hv, Dv, Dk]
+
+    // Zero-pad time to a whole number of chunks (padded tokens contribute nothing).
+    let (q, k, v, g_log, beta) = if pad_t > 0 {
+        (
+            q.pad(&[0, 0, 0, pad_t, 0, 0, 0, 0], 0.0)?,
+            k.pad(&[0, 0, 0, pad_t, 0, 0, 0, 0], 0.0)?,
+            v.pad(&[0, 0, 0, pad_t, 0, 0, 0, 0], 0.0)?,
+            g_log.pad(&[0, 0, 0, pad_t, 0, 0], 0.0)?,
+            beta.pad(&[0, 0, 0, pad_t, 0, 0], 0.0)?,
+        )
+    } else {
+        (q, k, v, g_log, beta)
+    };
+
+    // [B, Tpad, Hv, *] -> [B, C, BT, Hv, *] -> [B, C, Hv, BT, *] (batch matmul over B,C,Hv).
+    let q = q
+        .reshape(&[b, c, BT, hv, dk])?
+        .transpose(Some(&[0, 1, 3, 2, 4]))?;
+    let k = k
+        .reshape(&[b, c, BT, hv, dk])?
+        .transpose(Some(&[0, 1, 3, 2, 4]))?;
+    let v = v
+        .reshape(&[b, c, BT, hv, dv])?
+        .transpose(Some(&[0, 1, 3, 2, 4]))?;
+    let g_log = g_log
+        .reshape(&[b, c, BT, hv])?
+        .transpose(Some(&[0, 1, 3, 2]))?;
+    let beta = beta
+        .reshape(&[b, c, BT, hv])?
+        .transpose(Some(&[0, 1, 3, 2]))?;
+
+    // Cumulative decay within each chunk.
+    let gcum = g_log.cumsum(3)?; // inclusive prefix sum -> [B,C,Hv,BT]
+    let decay_self = gcum.exp()?; // exp(gcum[i])
+    // decay_mat[i,j] = exp(gcum[i]-gcum[j]); upper-tri may overflow but is always masked to 0.
+    let decay_mat = gcum.expand_dims(4)?.sub(&gcum.expand_dims(3)?)?.exp()?; // [B,C,Hv,BT,BT]
+
+    // Positional triangular masks (BT x BT).
+    let idx = MxArray::arange(0.0, BT as f64, None, Some(f32))?;
+    let idx_i = idx.reshape(&[BT, 1])?;
+    let idx_j = idx.reshape(&[1, BT])?;
+    let strict_lower = idx_j.less(&idx_i)?; // j < i
+    let incl_lower = idx_j.less_equal(&idx_i)?; // j <= i
+    let zeros_bb = MxArray::zeros(&[BT, BT], Some(f32))?;
+
+    // WY system matrix A[i,j] = (j<i) * beta_i * (k_i . k_j) * decay_mat[i,j].
+    let kk = k.matmul(&k.transpose(Some(&[0, 1, 2, 4, 3]))?)?;
+    let beta_col = beta.expand_dims(4)?; // [B,C,Hv,BT,1]
+    let a = strict_lower.where_(&kk.mul(&decay_mat)?.mul(&beta_col)?, &zeros_bb)?;
+
+    // M = (I + A)^-1. A is strictly-lower nilpotent, but plain repeated squaring overflows
+    // f32 at BT=64 (intermediate powers ~1e57); invert_i_plus_strict_lower splits into f32-safe
+    // 32-blocks. See that function for the stability bound.
+    let m = invert_i_plus_strict_lower(&a, BT)?;
+
+    // S_in-independent WY factors (parallel over all chunks).
+    let u = m.matmul(&v.mul(&beta_col)?)?; // M @ (beta*v) -> [B,C,Hv,BT,Dv]
+    let bdk = k.mul(&beta.mul(&decay_self)?.expand_dims(4)?)?; // (beta*decay_self)*k
+    let w = m.matmul(&bdk)?; // [B,C,Hv,BT,Dk]
+
+    // Serial carry over chunks: the ONLY sequential dependency (C = T/BT steps, not T).
+    let mut s_cur = s0; // [B,Hv,Dv,Dk]
+    let mut delta_chunks: Vec<MxArray> = Vec::with_capacity(c as usize);
+    let mut sin_chunks: Vec<MxArray> = Vec::with_capacity(c as usize);
+    for ci in 0..c {
+        let u_c = u.slice_axis(1, ci, ci + 1)?.squeeze(Some(&[1]))?; // [B,Hv,BT,Dv]
+        let w_c = w.slice_axis(1, ci, ci + 1)?.squeeze(Some(&[1]))?; // [B,Hv,BT,Dk]
+        let k_c = k.slice_axis(1, ci, ci + 1)?.squeeze(Some(&[1]))?; // [B,Hv,BT,Dk]
+        let dm_c = decay_mat.slice_axis(1, ci, ci + 1)?.squeeze(Some(&[1]))?; // [B,Hv,BT,BT]
+        let ds_c = decay_self.slice_axis(1, ci, ci + 1)?.squeeze(Some(&[1]))?; // [B,Hv,BT]
+
+        // delta_c = u_c - W_c @ S_in^T.
+        let sin_t = s_cur.transpose(Some(&[0, 1, 3, 2]))?; // [B,Hv,Dk,Dv]
+        let delta_c = u_c.sub(&w_c.matmul(&sin_t)?)?; // [B,Hv,BT,Dv]
+
+        // S_out = decay_total * S_in + delta_c^T @ (k_c * decay_to_end).
+        let dte = dm_c.slice_axis(2, BT - 1, BT)?.squeeze(Some(&[2]))?; // last row [B,Hv,BT]
+        let kd = k_c.mul(&dte.expand_dims(3)?)?; // [B,Hv,BT,Dk]
+        let decay_total = ds_c.slice_axis(2, BT - 1, BT)?.reshape(&[b, hv, 1, 1])?;
+        let upd = delta_c.transpose(Some(&[0, 1, 3, 2]))?.matmul(&kd)?; // [B,Hv,Dv,Dk]
+        let s_out = s_cur.mul(&decay_total)?.add(&upd)?;
+
+        sin_chunks.push(s_cur.clone());
+        delta_chunks.push(delta_c);
+        s_cur = s_out;
+    }
+
+    // Output (parallel over chunks once delta + S_in are known).
+    let delta_refs: Vec<&MxArray> = delta_chunks.iter().collect();
+    let sin_refs: Vec<&MxArray> = sin_chunks.iter().collect();
+    let delta_all = MxArray::stack(delta_refs, Some(1))?; // [B,C,Hv,BT,Dv]
+    let sin_all = MxArray::stack(sin_refs, Some(1))?; // [B,C,Hv,Dv,Dk]
+
+    // inter = decay_self * (q @ S_in^T).
+    let qs = q.matmul(&sin_all.transpose(Some(&[0, 1, 2, 4, 3]))?)?; // [B,C,Hv,BT,Dv]
+    let inter = qs.mul(&decay_self.expand_dims(4)?)?;
+    // intra = ((j<=i) * (q.k) * decay_mat) @ delta.
+    let qk = q.matmul(&k.transpose(Some(&[0, 1, 2, 4, 3]))?)?; // [B,C,Hv,BT,BT]
+    let aqk = incl_lower.where_(&qk.mul(&decay_mat)?, &zeros_bb)?;
+    let intra = aqk.matmul(&delta_all)?; // [B,C,Hv,BT,Dv]
+    let o = inter.add(&intra)?;
+
+    // [B,C,Hv,BT,Dv] -> [B,C,BT,Hv,Dv] -> [B,Tpad,Hv,Dv] -> slice to T.
+    let o = o
+        .transpose(Some(&[0, 1, 3, 2, 4]))?
+        .reshape(&[b, tpad, hv, dv])?;
+    let o = if pad_t > 0 { o.slice_axis(1, 0, t)? } else { o };
+
+    Ok((o.astype(out_dtype)?, s_cur.astype(state_dtype)?))
+}
+
 /// Gated delta recurrence update.
 ///
 /// Uses a custom Metal kernel when available (GPU, Metal, Dk divisible by 32),
@@ -456,6 +660,30 @@ pub fn gated_delta_update(
             Some(s) => s.clone(),
             None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(v.dtype()?))?,
         };
+
+        // CUDA prefill: collapse the O(T) per-step recurrence into O(T/BT) chunk-serial
+        // batched matmuls (cuBLAS / tensor cores). Default on the CUDA ops path; reverts
+        // to per-step under `MLX_GDN_KERNEL=perstep`. Gated to the genuine non-Metal
+        // backend so the Mac autograd/training ops path stays byte-identical. Decode
+        // (seq < CHUNK_THRESHOLD) and masked calls always take per-step.
+        let seq_len = q.shape_at(1)?;
+        let choice = gdn_kernel_override();
+        if !metal_kernel_backend_available()
+            && seq_len >= CHUNK_THRESHOLD
+            && mask.is_none()
+            && choice != GdnKernel::ForcePerStep
+        {
+            // Log-space gate computed directly (NOT g.log()): strong decay underflows the
+            // exp-space `g` to 0, and log(0) = -inf makes the chunked decay-diff inf-inf = NaN
+            // (observed as garbage on the MoE GDN layers, whose decay is stronger than dense).
+            let g_log = compute_g_log(a_log, a, dt_bias)?;
+            match gated_delta_chunked_ops(&q, &k, v, &g_log, &beta, &initial_state) {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    eprintln!("[mlx-gdn] chunked_ops failed ({e}); falling back to per-step ops");
+                }
+            }
+        }
 
         return gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask);
     }
@@ -621,6 +849,15 @@ mod tests {
             parse_gdn_kernel(Some("  CHUNK "), None),
             GdnKernel::ForceChunked
         );
+        // MLX_GDN_KERNEL=chunked_ops selects the device-agnostic ops path (CUDA default).
+        assert_eq!(
+            parse_gdn_kernel(Some("chunked_ops"), None),
+            GdnKernel::ForceChunkedOps
+        );
+        assert_eq!(
+            parse_gdn_kernel(Some("CHUNKED-OPS"), None),
+            GdnKernel::ForceChunkedOps
+        );
         assert_eq!(
             parse_gdn_kernel(Some("perstep"), None),
             GdnKernel::ForcePerStep
@@ -652,5 +889,152 @@ mod tests {
         assert_eq!(parse_gdn_kernel(None, Some("on")), GdnKernel::ForcePerStep);
         assert_eq!(parse_gdn_kernel(None, Some("0")), GdnKernel::Auto);
         assert_eq!(parse_gdn_kernel(None, Some("")), GdnKernel::Auto);
+    }
+
+    /// Parity: the chunk-parallel ops path must match the per-step recurrence (the oracle)
+    /// in f32 across chunk boundaries (T = 64, 65, 127, 128, 256). A mask off-by-one,
+    /// padding leak, or state-orientation bug shows up as an O(1) diff; a correct port
+    /// differs only by f32 reduction order (~1e-4). Device-agnostic, so this validates the
+    /// algorithm on Mac/Metal before any DGX time.
+    #[test]
+    fn chunked_ops_matches_per_step_ops_f32() -> Result<()> {
+        use crate::array::DType;
+        // Production dims (Dk=Dv=128 != BT=64 so a BT/Dk axis-swap can't hide).
+        let (b, hv, dk, dv) = (1i64, 4i64, 128i64, 128i64);
+        let f32 = DType::Float32;
+        // q,k carry the upstream RMS-norm + Dk^-0.5 scaling, so k.k ~ O(0.1) and the
+        // WY system (I+A) is well-conditioned (the per-step path is unconditionally
+        // stable; the chunked Neumann inverse needs ||A|| small, as in production).
+        let qk_std = 1.0 / (dk as f64).sqrt();
+        let randn = |shape: &[i64], std: f64| MxArray::random_normal(shape, 0.0, std, Some(f32));
+        let max_abs_diff = |a: &MxArray, x: &MxArray| -> Result<f32> {
+            let d = a
+                .sub(x)?
+                .abs()?
+                .reshape(&[-1])?
+                .max(Some(&[0]), Some(false))?;
+            d.eval();
+            d.item_at_float32(0)
+        };
+        for &t in &[64i64, 65, 127, 128, 256] {
+            let q = randn(&[b, t, hv, dk], qk_std)?;
+            let k = randn(&[b, t, hv, dk], qk_std)?;
+            let v = randn(&[b, t, hv, dv], 1.0)?;
+            // Decay gate g in (0,1) via sigmoid; chunked consumes g_log = log(g).
+            let g = Activations::sigmoid(&randn(&[b, t, hv], 1.0)?)?;
+            let g_log = g.log()?;
+            let beta = Activations::sigmoid(&randn(&[b, t, hv], 1.0)?)?;
+            let state = MxArray::zeros(&[b, hv, dv, dk], Some(f32))?;
+
+            let (o_ref, s_ref) = gated_delta_ops(&q, &k, &v, &g, &beta, &state, None)?;
+            let (o_chk, s_chk) = gated_delta_chunked_ops(&q, &k, &v, &g_log, &beta, &state)?;
+
+            let od = max_abs_diff(&o_ref, &o_chk)?;
+            let sd = max_abs_diff(&s_ref, &s_chk)?;
+            assert!(od < 1e-2, "T={t}: output max-abs-diff {od} exceeds tol");
+            assert!(sd < 1e-2, "T={t}: state max-abs-diff {sd} exceeds tol");
+        }
+        Ok(())
+    }
+
+    /// Reproduces the real-model condition that overflows a naive (I+A)^-1 by repeated
+    /// squaring: unit-norm but HIGHLY CORRELATED keys (k.k ~ 1, as conv1d produces) plus
+    /// near-1 decay (so decay_mat does not damp A). Then ||A||_inf ~ BT, and N^32 ~ 63^32
+    /// ~ 4e57 overflows f32 — the blocked inverse must stay finite and match per-step.
+    /// (The random-key test above keeps k.k ~ 0.1, which never triggers this.)
+    #[test]
+    fn chunked_ops_stable_with_correlated_unit_norm_keys() -> Result<()> {
+        use crate::array::DType;
+        let (b, hv, dk, dv) = (1i64, 4i64, 128i64, 128i64);
+        let f32 = DType::Float32;
+        let randn = |shape: &[i64], std: f64| MxArray::random_normal(shape, 0.0, std, Some(f32));
+        let max_abs_diff = |a: &MxArray, x: &MxArray| -> Result<f32> {
+            let d = a
+                .sub(x)?
+                .abs()?
+                .reshape(&[-1])?
+                .max(Some(&[0]), Some(false))?;
+            d.eval();
+            d.item_at_float32(0)
+        };
+        // L2-normalize over the last axis -> unit-norm keys, matching the upstream
+        // `k = Dk^-0.5 * rms_norm(k)` scaling (||k|| = 1, so |k_i . k_j| <= 1).
+        let l2norm = |x: &MxArray| -> Result<MxArray> {
+            let n = x.square()?.sum(Some(&[3]), Some(true))?.sqrt()?;
+            x.div(&n)
+        };
+        for &t in &[128i64, 256] {
+            // Shared base direction + small per-token noise -> rows are highly correlated,
+            // so k_i . k_j ~ 1 after normalization (the regime conv1d puts the model in).
+            let base = randn(&[b, 1, hv, dk], 1.0)?;
+            let k = l2norm(&base.add(&randn(&[b, t, hv, dk], 0.3)?)?)?;
+            let q = l2norm(&base.add(&randn(&[b, t, hv, dk], 0.3)?)?)?;
+            let v = randn(&[b, t, hv, dv], 1.0)?;
+            // Near-1 decay: g = sigmoid(+large) ~ 1, so g_log ~ 0 and A is undamped.
+            let g = Activations::sigmoid(&randn(&[b, t, hv], 0.1)?.add_scalar(6.0)?)?;
+            let g_log = g.log()?;
+            let beta = Activations::sigmoid(&randn(&[b, t, hv], 1.0)?)?;
+            let state = MxArray::zeros(&[b, hv, dv, dk], Some(f32))?;
+
+            let (o_ref, s_ref) = gated_delta_ops(&q, &k, &v, &g, &beta, &state, None)?;
+            let (o_chk, s_chk) = gated_delta_chunked_ops(&q, &k, &v, &g_log, &beta, &state)?;
+
+            // Looser tol than the realistic-scale test: this is a deliberately ill-conditioned
+            // stress case (the residual is f32 precision, ~0.02). The point is that the inverse
+            // stays FINITE and far from garbage — repeated squaring gives ~3e5 or Inf here.
+            let od = max_abs_diff(&o_ref, &o_chk)?;
+            let sd = max_abs_diff(&s_ref, &s_chk)?;
+            assert!(
+                od.is_finite() && od < 5e-2,
+                "T={t}: output max-abs-diff {od} (non-finite/large => inverse unstable)"
+            );
+            assert!(
+                sd.is_finite() && sd < 5e-2,
+                "T={t}: state max-abs-diff {sd} (non-finite/large => inverse unstable)"
+            );
+        }
+        Ok(())
+    }
+
+    /// `compute_g_log` must equal `log(compute_g)` on normal inputs AND stay finite under
+    /// strong decay, where the exp-space `compute_g` underflows to 0 and `log(0) = -inf`
+    /// (the MoE GDN garbage root cause). The chunked CUDA path uses this in place of `g.log()`.
+    #[test]
+    fn compute_g_log_finite_under_strong_decay() -> Result<()> {
+        use crate::array::DType;
+        let f32 = DType::Float32;
+        let (b, t, hv) = (1i64, 8i64, 4i64);
+        let max_abs = |x: &MxArray| -> Result<f32> {
+            let d = x.abs()?.reshape(&[-1])?.max(Some(&[0]), Some(false))?;
+            d.eval();
+            d.item_at_float32(0)
+        };
+        // Normal magnitude: no underflow, so compute_g_log ~ log(compute_g).
+        let a_log = MxArray::random_normal(&[hv], 0.0, 1.0, Some(f32))?;
+        let a = MxArray::random_normal(&[b, t, hv], 0.0, 1.0, Some(f32))?;
+        let dt_bias = MxArray::random_normal(&[hv], 0.0, 1.0, Some(f32))?;
+        let gl = compute_g_log(&a_log, &a, &dt_bias)?;
+        let gl_ref = compute_g(&a_log, &a, &dt_bias)?.log()?;
+        assert!(
+            max_abs(&gl.sub(&gl_ref)?)? < 1e-3,
+            "compute_g_log != log(compute_g) on normal inputs"
+        );
+
+        // Strong decay: exp(a_log)*softplus(a+dt_bias) ~ 20*53 ~ 1060 >> 88, so compute_g
+        // underflows to 0 -> log(0) = -inf. compute_g_log stays finite (~ -1060).
+        let a_big = MxArray::zeros(&[b, t, hv], Some(f32))?.add_scalar(50.0)?;
+        let alog_big = MxArray::zeros(&[hv], Some(f32))?.add_scalar(3.0)?;
+        let gl_strong = max_abs(&compute_g_log(&alog_big, &a_big, &dt_bias)?)?;
+        assert!(
+            gl_strong.is_finite(),
+            "compute_g_log went non-finite under strong decay: {gl_strong}"
+        );
+        // Confirm the OLD g.log() path really does blow up here (justifies the fix).
+        let old = max_abs(&compute_g(&alog_big, &a_big, &dt_bias)?.log()?)?;
+        assert!(
+            !old.is_finite(),
+            "expected log(compute_g) = -inf under strong decay, got {old}"
+        );
+        Ok(())
     }
 }
