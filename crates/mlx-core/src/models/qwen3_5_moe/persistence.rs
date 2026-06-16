@@ -1241,7 +1241,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // and `lookup_quant_info` on the C++ side. Affine and
                     // MXFP8 / MXFP4 / NVFP4 modes all flow through the same
                     // compiled path.
-                    register_moe_weights_with_cpp(
+                    // Arm the slot-erasing Drop ONLY when registration actually
+                    // published the model id (true return). Leaves no slot on a
+                    // non-publishing path, so Drop stays off the compiled-weights
+                    // write lock (the deadlock fix).
+                    inner.compiled_slot_registered = register_moe_weights_with_cpp(
                         &params,
                         inner.model_id,
                         top_level_mode,
@@ -1488,6 +1492,13 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
 /// directly on the loader-chosen `(mode, bits, group_size)` tuple instead
 /// of inferring a mode from companion-tensor presence. The registry is
 /// populated but not yet read by C++ — Tasks 3/4 wire the consumers.
+/// Returns `true` iff the model id was published to the shared C++ registry
+/// (`mlx_set_model_id`), making the model compiled-capable and eligible to
+/// create a `g_moe_slots()` entry on first activate. The load path threads this
+/// into `Qwen35MoeInner::compiled_slot_registered` to arm the slot-erasing
+/// Drop. This path has no abort-to-eager branch, so it always publishes and
+/// returns `true`; the return is kept for parity with the dense/lfm2 loaders
+/// (and so a future abort branch can correctly report `false`).
 fn register_moe_weights_with_cpp(
     params: &HashMap<String, MxArray>,
     model_id: u64,
@@ -1495,7 +1506,7 @@ fn register_moe_weights_with_cpp(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     quant_bits: i32,
     quant_group_size: i32,
-) {
+) -> bool {
     use mlx_sys as sys;
     use std::ffi::CString;
 
@@ -1606,6 +1617,7 @@ fn register_moe_weights_with_cpp(
 
     // Set model ID AFTER all weights are stored.
     unsafe { sys::mlx_set_model_id(model_id) };
+    true
 }
 
 /// Create a random-init Qwen3.5 MoE model and save it to disk.

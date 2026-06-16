@@ -128,22 +128,41 @@ pub(crate) struct Lfm2Inner {
     /// feeding the bf16-only `paged_kv_write`/`paged_attention` stays bf16.
     /// `false` until a quantized checkpoint registers; only meaningful then.
     pub(crate) non_quant_floats_bf16: bool,
+    /// True iff this model published its weights to the shared C++ registry
+    /// (`register_weights_with_cpp` reached `mlx_set_model_id`), making it
+    /// compiled-capable and therefore eligible to create an entry in
+    /// `g_lfm2_slots()` on its first `activate`. Gates the whole `Drop` body:
+    /// an unregistered (native/eager) Inner never owns a slot, so it must NOT
+    /// touch the compiled-weights write lock on drop — taking it is what
+    /// deadlocks when an Inner is dropped on a thread already holding that
+    /// non-reentrant `RwLock.write()` (e.g. the load path's same-thread
+    /// re-register, or a test that holds the write lock and constructs native
+    /// Inners). `false` until the load path sets it after a successful publish.
+    pub(crate) compiled_slot_registered: bool,
 }
 
 impl Drop for Lfm2Inner {
     fn drop(&mut self) {
         // Release this model's lfm2 compiled slot so MLX reclaims the baked
         // graph tapes its std::function tables hold (and `compile_erase`s the
-        // slot's per-epoch fun_ids). A no-op when this model never registered
-        // compiled weights (the slot was never created).
+        // slot's per-epoch fun_ids).
         //
-        // Held under the compiled-weights write lock — the same lock model
-        // (re)registration takes — so erasing this entry is serialized against
-        // any concurrent turn on another model thread mutating the shared
-        // lfm2-slot map (std::unordered_map insert/erase are not concurrency
-        // safe even on distinct keys).
-        let _guard = crate::engine::compiled_lock::compiled_weights_write();
-        unsafe { mlx_sys::mlx_lfm2_slot_erase(self.model_id) };
+        // Gated on `compiled_slot_registered`: only a model that published its
+        // weights can ever have created a slot, so a native/eager Inner skips
+        // BOTH the lock and the erase. Skipping the lock is the deadlock fix —
+        // dropping an Inner while THIS thread already holds the non-reentrant
+        // compiled-weights write lock (load-path re-register, or a test holding
+        // it) would re-enter `RwLock.write()` and hang forever.
+        //
+        // When it IS registered, the erase runs under the compiled-weights
+        // write lock — the same lock model (re)registration takes — so erasing
+        // this entry is serialized against any concurrent turn on another model
+        // thread mutating the shared lfm2-slot map (std::unordered_map
+        // insert/erase are not concurrency safe even on distinct keys).
+        if self.compiled_slot_registered {
+            let _guard = crate::engine::compiled_lock::compiled_weights_write();
+            unsafe { mlx_sys::mlx_lfm2_slot_erase(self.model_id) };
+        }
     }
 }
 
@@ -410,6 +429,9 @@ impl Lfm2Inner {
             // checkpoint registers. Defaults keep the quantized compiled path OFF.
             is_quantized: false,
             non_quant_floats_bf16: false,
+            // Not compiled-capable until the load path publishes weights and
+            // sets this true; keeps Drop off the write lock for native Inners.
+            compiled_slot_registered: false,
         })
     }
 

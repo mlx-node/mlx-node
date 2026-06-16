@@ -1629,7 +1629,11 @@ impl Lfm2Inner {
             non_quant_floats_bf16,
             crate::models::lfm2::model::quant_compiled_enabled() && quant_embed_supported,
         ) {
-            register_weights_with_cpp(
+            // Arm the slot-erasing Drop ONLY when registration actually
+            // published the model id (true return). An aborted-to-eager /
+            // empty registration leaves no slot, so its Drop must skip the
+            // compiled-weights write lock entirely (the deadlock fix).
+            inner.compiled_slot_registered = register_weights_with_cpp(
                 &params,
                 inner.model_id,
                 &inner.config,
@@ -1836,7 +1840,7 @@ fn register_weights_with_cpp(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     quant_bits: i32,
     quant_group_size: i32,
-) -> Result<()> {
+) -> Result<bool> {
     // (2) Write-lock the shared weight RwLock for the entire registration so
     // any in-flight compiled inference blocks until the new model_id is live.
     // Poison-recover (a panic in a prior holder must not wedge loads forever).
@@ -1868,7 +1872,7 @@ fn register_weights_with_cpp_locked(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     quant_bits: i32,
     quant_group_size: i32,
-) -> Result<()> {
+) -> Result<bool> {
     // (3) Clear the shared map (also resets the active model id + quant-info).
     unsafe { mlx_sys::mlx_clear_weights(model_id) };
 
@@ -1961,7 +1965,7 @@ fn register_weights_with_cpp_locked(
         abort_registration(&format!(
             "checkpoint key '{reserved}' uses the reserved sym8 sidecar suffix `.weight_nk`"
         ));
-        return Ok(());
+        return Ok(false);
     }
 
     let store = |name: &str, arr: &MxArray| -> Result<()> {
@@ -1999,7 +2003,7 @@ fn register_weights_with_cpp_locked(
                         "failed to build [K,N] kernel operand for '{}': {}",
                         name, e.reason
                     ));
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             // ALSO register the [N,K] CHECKPOINT tensor under
@@ -2061,7 +2065,7 @@ fn register_weights_with_cpp_locked(
                 abort_registration(&format!(
                     "quant-info mode for sym8 prefix '{prefix}' did not round-trip as \"sym8\""
                 ));
-                return Ok(());
+                return Ok(false);
             }
             sym8_info_count += 1;
         }
@@ -2088,7 +2092,7 @@ fn register_weights_with_cpp_locked(
         abort_registration(
             "checkpoint is sym8-default but no sym8 quant-info entries were registered",
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // (4b) Synthesize a ZERO expert_bias for any MoE layer that declares
@@ -2143,15 +2147,21 @@ fn register_weights_with_cpp_locked(
     unsafe { mlx_sys::mlx_lfm2_invalidate_compiled() };
 
     // (6) Publish the model id LAST — and only if weights actually landed.
+    // The returned bool reports whether the id was published: true makes the
+    // model compiled-capable (eligible to create a `g_lfm2_slots()` entry on
+    // first activate), so the load path sets `Lfm2Inner::compiled_slot_registered`
+    // from it to arm the slot-erasing Drop. A `false` (empty / aborted-to-eager)
+    // registration leaves the model on the eager path with no slot, so its Drop
+    // must stay off the compiled-weights write lock.
     if count > 0 {
         unsafe { mlx_sys::mlx_set_model_id(model_id) };
+        Ok(true)
     } else {
         tracing::warn!(
             "lfm2 register_weights_with_cpp: no weights stored; compiled path stays OFF"
         );
+        Ok(false)
     }
-
-    Ok(())
 }
 
 impl Lfm2Model {

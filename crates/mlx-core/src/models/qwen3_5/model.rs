@@ -340,21 +340,38 @@ pub(crate) struct Qwen35Inner {
     /// label family (`TurnSetup` does not carry streaming-ness).
     /// Whole-turn override paths (vision/paged/MTP) never consult it.
     turn_is_streaming: Cell<bool>,
+    /// True iff this model published its weights to the shared C++ registry
+    /// (`register_weights_with_cpp` reached `mlx_set_model_id`), making it
+    /// compiled-capable and therefore eligible to create an entry in
+    /// `g_dense_slots()` on its first `activate`. Gates the whole `Drop` body:
+    /// an unregistered (native/eager) Inner never owns a slot, so it must NOT
+    /// touch the compiled-weights write lock on drop — taking it deadlocks when
+    /// an Inner is dropped on a thread already holding that non-reentrant
+    /// `RwLock.write()` (load-path re-register, or a test holding it).
+    /// `false` until the load path sets it after a successful publish.
+    pub(crate) compiled_slot_registered: bool,
 }
 
 impl Drop for Qwen35Inner {
     fn drop(&mut self) {
         // Release this model's dense compiled slot so MLX reclaims the baked
-        // graph tapes its std::function tables hold. A no-op when this model
-        // never registered compiled weights (the slot was never created).
+        // graph tapes its std::function tables hold.
         //
-        // Held under the compiled-weights write lock — the same lock model
-        // (re)registration takes — so erasing this entry is serialized against
-        // any concurrent turn on another model thread mutating the shared
-        // dense-slot map (std::unordered_map insert/erase are not concurrency
-        // safe even on distinct keys).
-        let _guard = crate::engine::compiled_lock::compiled_weights_write();
-        unsafe { mlx_sys::mlx_qwen35_dense_slot_erase(self.model_id) };
+        // Gated on `compiled_slot_registered`: only a model that published its
+        // weights can ever have created a slot, so a native/eager Inner skips
+        // BOTH the lock and the erase. Skipping the lock is the deadlock fix —
+        // dropping an Inner while THIS thread already holds the non-reentrant
+        // compiled-weights write lock would re-enter `RwLock.write()` and hang.
+        //
+        // When it IS registered, the erase runs under the compiled-weights
+        // write lock — the same lock model (re)registration takes — so erasing
+        // this entry is serialized against any concurrent turn on another model
+        // thread mutating the shared dense-slot map (std::unordered_map
+        // insert/erase are not concurrency safe even on distinct keys).
+        if self.compiled_slot_registered {
+            let _guard = crate::engine::compiled_lock::compiled_weights_write();
+            unsafe { mlx_sys::mlx_qwen35_dense_slot_erase(self.model_id) };
+        }
     }
 }
 
@@ -798,6 +815,9 @@ impl Qwen35Inner {
             mtp,
             mtp_weights_loaded: false,
             turn_is_streaming: Cell::new(false),
+            // Not compiled-capable until the load path publishes weights and
+            // sets this true; keeps Drop off the write lock for native Inners.
+            compiled_slot_registered: false,
         })
     }
 

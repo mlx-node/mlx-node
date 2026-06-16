@@ -1675,7 +1675,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Rust forward-path fallback bypass. (sym8 prefixes store
                 // the [K,N] int8 kernel operand, not the checkpoint [N,K]
                 // tensor — see `register_weights_with_cpp`.)
-                register_weights_with_cpp(
+                // Arm the slot-erasing Drop ONLY when registration actually
+                // published the model id (true return). A FORCE_EAGER /
+                // sym8-abort registration leaves no slot, so its Drop must
+                // skip the compiled-weights write lock entirely (deadlock fix).
+                inner.compiled_slot_registered = register_weights_with_cpp(
                     &params,
                     inner.model_id,
                     top_level_mode,
@@ -1822,6 +1826,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
 /// `per_layer_quant`, `quant_bits`, and `quant_group_size` that
 /// `apply_weights_inner` consulted — any divergence here would corrupt
 /// the compiled forward path.
+/// Returns `true` iff the model id was published to the shared C++ registry
+/// (`mlx_set_model_id`), making the model compiled-capable and eligible to
+/// create a `g_dense_slots()` entry on first activate. The load path threads
+/// this into `Qwen35Inner::compiled_slot_registered` to arm the slot-erasing
+/// Drop; a `false` (FORCE_EAGER / sym8-abort) registration leaves no slot, so
+/// that Inner's Drop must stay off the compiled-weights write lock.
 fn register_weights_with_cpp(
     params: &HashMap<String, MxArray>,
     model_id: u64,
@@ -1829,7 +1839,7 @@ fn register_weights_with_cpp(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     quant_bits: i32,
     quant_group_size: i32,
-) {
+) -> bool {
     use mlx_sys as sys;
 
     // sym8 checkpoints DO register with the C++ compiled forward: the
@@ -1868,7 +1878,7 @@ fn register_weights_with_cpp(
              (model_id={} stays unregistered → eager Rust forward path)",
             model_id
         );
-        return;
+        return false;
     }
 
     // Write-lock the weight RwLock for the entire registration.
@@ -1934,7 +1944,7 @@ fn register_weights_with_cpp(
         abort_registration(&format!(
             "checkpoint key '{reserved}' uses the reserved sym8 sidecar suffix `.weight_nk`"
         ));
-        return;
+        return false;
     }
 
     // Resolve the default PLQ BEFORE the store loop: sym8 prefixes swap in
@@ -1986,7 +1996,7 @@ fn register_weights_with_cpp(
                  time on a sym8 checkpoint (sanitize should have merged it)",
                 name
             ));
-            return;
+            return false;
         }
         if name.ends_with(".linear_attn.in_proj_qkv.weight") {
             let prefix = name.strip_suffix(".in_proj_qkv.weight").unwrap();
@@ -2042,7 +2052,7 @@ fn register_weights_with_cpp(
                             "failed to build [K,N] kernel operand for '{}': {}",
                             name, e.reason
                         ));
-                        return;
+                        return false;
                     }
                 }
                 // ALSO register the [N,K] CHECKPOINT tensor under
@@ -2099,7 +2109,7 @@ fn register_weights_with_cpp(
                     "quant-info mode for sym8 prefix '{}' did not round-trip as \"sym8\"",
                     prefix
                 ));
-                return;
+                return false;
             }
             sym8_info_count += 1;
         }
@@ -2119,12 +2129,13 @@ fn register_weights_with_cpp(
         abort_registration(
             "checkpoint is sym8-default but no sym8 quant-info entries were registered",
         );
-        return;
+        return false;
     }
 
     // Set model ID AFTER all weights are stored. This ordering ensures no
     // inference sees a partially-populated map with the new model's ID.
     unsafe { sys::mlx_set_model_id(model_id) };
+    true
 }
 
 /// Parse Qwen3.5 dense config from JSON.
