@@ -20,7 +20,7 @@
 │  C++ bridge → Compiled forward paths                      │
 │  ~300 FFI declarations, compiled decode via mlx::compile  │
 ├──────────────────────────────────────────────────────────┤
-│  MLX → Metal / Accelerate GPU backend                     │
+│  MLX → Metal / CUDA / Accelerate GPUs                     │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -79,7 +79,7 @@ mlx-node/
 | Command                            | Output                                                                                         |
 | ---------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `yarn build`                       | `yarn build:native && yarn build:ts`                                                           |
-| `yarn build:native`                | `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib` |
+| `yarn build:native`                | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
 | `yarn build:ts`                    | `packages/*/dist/` via `tsc -b` (project references)                                           |
 | `yarn typecheck`                   | TypeScript type-check only                                                                     |
 | `cargo build --release -p mlx-tui` | `mlx-train` TUI binary                                                                         |

@@ -1,6 +1,6 @@
 # MLX-Node: High-Performance ML Framework for Node.js
 
-MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration through a Rust/NAPI/C++ bridge. It supports inference (Qwen3, Qwen3.5, Gemma4, LFM2.5), training (GRPO, SFT), vision-language models, document processing (PaddleOCR-VL, PP-\* pipelines), and embeddings (Harrier).
+MLX-Node brings Apple's MLX library to Node.js with Metal GPU acceleration (plus experimental NVIDIA CUDA inference) through a Rust/NAPI/C++ bridge. It supports inference (Qwen3, Qwen3.5, Gemma4, LFM2.5), training (GRPO, SFT), vision-language models, document processing (PaddleOCR-VL, PP-\* pipelines), and embeddings (Harrier).
 
 ## References
 
@@ -112,8 +112,8 @@ for await (const event of session.sendStream('Hello!')) {
 
 ## Known limitations
 
-- macOS only (Metal backend, Apple Silicon)
-- No CUDA support
+- Primary platform: macOS / Apple Silicon (Metal) — full inference + training + VLM
+- Experimental: Linux aarch64 (glibc) + NVIDIA CUDA — **inference-only preview**. Qwen3.6 dense/MoE validated on GB10 / DGX Spark (`sm_121`, CUDA 13.0) via device-agnostic eager fallbacks (no custom CUDA kernels; paged-attn forced off; perf below Apple Silicon). Training, other model families, and x86_64 Linux are untested. See README "Platform Support" + `docs/cuda-poc-benchmark.md`.
 - Compiled C++ forward paths use process-wide globals (serialized via `std::sync::Mutex` + `RwLock` in `crates/mlx-core/src/models/qwen3_5/model.rs`)
 
 ---

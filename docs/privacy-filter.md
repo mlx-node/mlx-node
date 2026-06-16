@@ -214,7 +214,7 @@ Quality on long-form text was validated only on a 5-fixture short-input parity s
 
 ## Limitations
 
-- macOS only / Apple Silicon (Metal backend). No CUDA.
+- macOS / Apple Silicon (Metal) only. The banded-attention kernel is Metal-specific with no CUDA port, so the privacy filter is **not** covered by the experimental CUDA backend (which targets Qwen3.6 dense/MoE inference — see the main README's Platform Support).
 - bf16 weights and forward by default. The Metal banded-attention kernel and the bf16 forward can produce small disagreements vs. Hugging Face's fp32 reference at low-confidence boundary tokens. See the parity test fixtures at [`packages/privacy/__test__/parity-fixtures.json`](../packages/privacy/__test__/parity-fixtures.json) for the tolerated budget.
 - Attention is bidirectional banded with attention sinks; `sliding_window = 128` on alternating layers per the gpt-oss config (band ±128 → 257-token effective window).
 - **Recall degrades sharply past ~2000 tokens of input.** The checkpoint is trained on short documents; long-context inputs (>~5000 chars) miss most entities, and >8000 chars typically returns nothing. When scanning long text, chunk the input — ~1500 chars (~500 tokens) per `classify` call is a reliable upper bound and stays well within the trained context window.
