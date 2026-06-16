@@ -1,4 +1,4 @@
-import { readFile, writeFile, copyFile, readdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, copyFile, readdir, stat, mkdir } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -98,6 +98,12 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   }
 
   const npmPlatformDir = join(__dirname, 'npm', triple);
+  // The darwin platform dir is committed (it carries the metallibs + a
+  // README). The linux dir is not: its only published artifact would be a
+  // .node that CI never builds, so we don't ship it as an optional package.
+  // A from-source linux build still needs somewhere to land the .node, so
+  // create the dir on demand (no-op when it already exists, e.g. darwin).
+  await mkdir(npmPlatformDir, { recursive: true });
   const dst = join(npmPlatformDir, expectedName);
   await copyFile(nodeOutput.path, dst);
   console.log(`Copied ${expectedName} -> ${dst}`);

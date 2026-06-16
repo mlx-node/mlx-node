@@ -36,8 +36,7 @@
     "vite-plus": "catalog:"
   },
   "optionalDependencies": {
-    "@mlx-node/core-darwin-arm64": "workspace:*",
-    "@mlx-node/core-linux-arm64-gnu": "workspace:*"
+    "@mlx-node/core-darwin-arm64": "workspace:*"
   },
   "napi": {
     "binaryName": "mlx-core",

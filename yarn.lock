@@ -713,25 +713,16 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@mlx-node/core-linux-arm64-gnu@workspace:*, @mlx-node/core-linux-arm64-gnu@workspace:packages/core/npm/linux-arm64-gnu":
-  version: 0.0.0-use.local
-  resolution: "@mlx-node/core-linux-arm64-gnu@workspace:packages/core/npm/linux-arm64-gnu"
-  languageName: unknown
-  linkType: soft
-
 "@mlx-node/core@workspace:*, @mlx-node/core@workspace:packages/core":
   version: 0.0.0-use.local
   resolution: "@mlx-node/core@workspace:packages/core"
   dependencies:
     "@mlx-node/core-darwin-arm64": "workspace:*"
-    "@mlx-node/core-linux-arm64-gnu": "workspace:*"
     "@napi-rs/cli": "npm:^3.6.2"
     "@oxc-node/cli": "npm:^0.1.0"
     vite-plus: "catalog:"
   dependenciesMeta:
     "@mlx-node/core-darwin-arm64":
-      optional: true
-    "@mlx-node/core-linux-arm64-gnu":
       optional: true
   languageName: unknown
   linkType: soft
