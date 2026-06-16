@@ -1510,6 +1510,25 @@ fn register_moe_weights_with_cpp(
     use mlx_sys as sys;
     use std::ffi::CString;
 
+    // MLX_QWEN35_MOE_FORCE_EAGER=1 (or the umbrella MLX_QWEN35_FORCE_EAGER=1),
+    // read ONCE per process, skips compiled C++ registration for ANY MoE
+    // checkpoint so `mlx_qwen35_moe_model_has_weights(model_id)` stays 0 and
+    // every forward takes the eager Rust path. Perf-isolation control mirroring
+    // the dense gate: lets a quantized MoE checkpoint run the eager forward so
+    // compiled-vs-eager overhead can be measured apart from kernel deltas.
+    static FORCE_EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_EAGER.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled("MLX_QWEN35_MOE_FORCE_EAGER")
+            || crate::inference_trace::env_flag_enabled("MLX_QWEN35_FORCE_EAGER")
+    }) {
+        info!(
+            "MLX_QWEN35_MOE_FORCE_EAGER: skipping MoE C++ compiled-forward weight \
+             registration (model_id={} stays unregistered → eager Rust forward path)",
+            model_id
+        );
+        return false;
+    }
+
     // Write-lock the weight RwLock for the entire registration. Use the
     // poison-recovering helper so a panic during a prior torn registration
     // does not wedge every subsequent model load (a recovered writer re-runs

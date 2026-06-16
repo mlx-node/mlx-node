@@ -1841,6 +1841,18 @@ fn register_weights_with_cpp(
     quant_bits: i32,
     quant_group_size: i32,
 ) -> Result<bool> {
+    // MLX_LFM2_FORCE_EAGER=1 (read ONCE per process) skips compiled C++ paged
+    // registration for ANY lfm2 checkpoint, so `mlx_lfm2_model_has_weights`
+    // stays 0 and every turn takes the pure-Rust eager paged decode path. A
+    // perf-isolation control (mirrors MLX_QWEN35_FORCE_EAGER): lets a bf16
+    // checkpoint run the eager forward so the compiled-paged graph can be A/B'd
+    // against the eager path apart from any kernel deltas.
+    static FORCE_EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_EAGER.get_or_init(|| crate::inference_trace::env_flag_enabled("MLX_LFM2_FORCE_EAGER"))
+    {
+        return Ok(false);
+    }
+
     // (2) Write-lock the shared weight RwLock for the entire registration so
     // any in-flight compiled inference blocks until the new model_id is live.
     // Poison-recover (a panic in a prior holder must not wedge loads forever).

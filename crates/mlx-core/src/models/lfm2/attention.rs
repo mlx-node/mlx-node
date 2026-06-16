@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::mask::create_causal_mask;
@@ -6,6 +8,32 @@ use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use napi::bindgen_prelude::*;
+
+/// When enabled (default), paged decode writes K/V into the pool with the
+/// graph-native, lazily-scheduled `update_keys_values_native` so the write
+/// feeds the same-step attention read through MLX graph dependencies — no
+/// per-layer host sync. When disabled, the synchronous `update_keys_values`
+/// (a raw Metal write outside the graph scheduler) is used instead. The sync
+/// path is also taken automatically when the native write fails.
+fn native_kv_write_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_NATIVE_KV_WRITE", true)
+    })
+}
+
+/// When enabled (default), paged decode gathers historical K/V with the
+/// graph-native `gather_kv_for_decode_graph`, which consumes the lazy pool
+/// arrays via graph dependencies (no per-layer host eval). When disabled, the
+/// synchronous `gather_kv_for_decode` (which forces a pending-write eval and
+/// reads the pool outside the graph) is used. The sync path is also taken
+/// automatically when the graph gather is unavailable for the inputs.
+fn graph_decode_gather_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_GRAPH_DECODE_GATHER", true)
+    })
+}
 
 /// LFM2 multi-head attention with QK RMSNorm and RoPE.
 ///
@@ -235,14 +263,30 @@ impl Lfm2Attention {
             self.head_dim as i64,
         ])?;
 
-        adapter
-            .update_keys_values(
-                attn_layer_idx,
-                &keys_paged,
-                &values_paged,
-                first_logical_position,
-            )
-            .map_err(napi::Error::from_reason)?;
+        // Prefer the graph-native lazy write so the same-step attention read
+        // depends on it through MLX's graph (no per-layer host sync). Fall
+        // back to the synchronous write if it is disabled or the native
+        // kernel could not place the K/V (a failed native write leaves the
+        // pool untouched, so the sync write below is not a double-write).
+        let native_written = native_kv_write_enabled()
+            && adapter
+                .update_keys_values_native(
+                    attn_layer_idx,
+                    &keys_paged,
+                    &values_paged,
+                    first_logical_position,
+                )
+                .is_ok();
+        if !native_written {
+            adapter
+                .update_keys_values(
+                    attn_layer_idx,
+                    &keys_paged,
+                    &values_paged,
+                    first_logical_position,
+                )
+                .map_err(napi::Error::from_reason)?;
+        }
 
         // 5. Compute attention output.
         let attn_bhtd = if is_prefill {
@@ -283,22 +327,45 @@ impl Lfm2Attention {
                 )?
             }
         } else {
-            // Decode: gather full historical K/V via paged kernel.
-            // `gather_kv_for_decode` expects `[1, num_query_heads,
-            // head_size]` queries, so reshape from [1, H, 1, D].
+            // Decode: gather full historical K/V via the paged kernel. Both
+            // gather variants expect `[1, num_query_heads, head_size]`
+            // queries, so reshape from [1, H, 1, D].
             let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
                 1,
                 self.num_heads as i64,
                 self.head_dim as i64,
             ])?;
-            let attn_3d = adapter
-                .gather_kv_for_decode(
+            // Prefer the graph-native gather (reads the lazy pool arrays
+            // through graph dependencies — no per-layer host eval). Fall back
+            // to the synchronous gather when it is disabled or unavailable for
+            // these inputs (e.g. a query/cache dtype it cannot serve).
+            let attn_3d = if graph_decode_gather_enabled() {
+                match adapter.gather_kv_for_decode_graph(
                     attn_layer_idx,
                     &queries_3d,
                     self.scale as f32,
                     /* softcap */ 1.0,
-                )
-                .map_err(napi::Error::from_reason)?;
+                ) {
+                    Ok(attn_3d) => attn_3d,
+                    Err(_) => adapter
+                        .gather_kv_for_decode(
+                            attn_layer_idx,
+                            &queries_3d,
+                            self.scale as f32,
+                            /* softcap */ 1.0,
+                        )
+                        .map_err(napi::Error::from_reason)?,
+                }
+            } else {
+                adapter
+                    .gather_kv_for_decode(
+                        attn_layer_idx,
+                        &queries_3d,
+                        self.scale as f32,
+                        /* softcap */ 1.0,
+                    )
+                    .map_err(napi::Error::from_reason)?
+            };
             // Cast back to x's dtype so the residual stays homogeneous.
             let target_dtype = x.dtype()?;
             let attn_3d = attn_3d.astype(target_dtype)?;
