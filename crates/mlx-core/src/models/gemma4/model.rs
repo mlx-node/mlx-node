@@ -746,7 +746,14 @@ impl Gemma4Inner {
         // Cache dtype: BFloat16 (Gemma4's production dtype). KV-shared layers
         // are aliases and do not consume physical pool slots; they resolve to
         // their anchor's group ordinal through `compute_layer_kinds`.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
+        // The block-paged KV path uses Metal-only kernels; on a non-Metal
+        // backend (the CUDA/Linux build) its write/gather methods are throwing
+        // stubs. Force flat eager there by leaving the adapter None, so the
+        // `paged_adapter.is_some()` routing falls through to the flat path.
+        // macOS is unaffected — the probe is always true, so the default wins.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true)
+            && crate::models::qwen3_5::persistence_common::compiled_forward_backend_available()
+        {
             let block_size = config.paged_block_size.unwrap_or(16);
             let kv_cache_specs =
                 compute_layer_kv_cache_specs(&config, block_size, KVCacheDType::BFloat16).map_err(

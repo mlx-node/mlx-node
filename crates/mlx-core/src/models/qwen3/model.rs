@@ -518,7 +518,14 @@ impl Qwen3Inner {
         // `qwen3_paged_vs_flat_parity` integration test (greedy byte-equal +
         // prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights).
         // Callers can still opt out with `use_block_paged_cache: Some(false)`.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
+        // The block-paged KV path uses Metal-only kernels; on a non-Metal
+        // backend (the CUDA/Linux build) its write/gather methods are throwing
+        // stubs. Force flat eager there by leaving the adapter None, so the
+        // `paged_adapter.is_some()` routing falls through to the flat path.
+        // macOS is unaffected — the probe is always true, so the default wins.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true)
+            && crate::models::qwen3_5::persistence_common::compiled_forward_backend_available()
+        {
             let block_size = config.paged_block_size.unwrap_or(16);
             let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
             let pa_config = mlx_paged_attn::PagedAttentionConfig {
