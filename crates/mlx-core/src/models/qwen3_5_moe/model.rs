@@ -721,7 +721,13 @@ impl Qwen35MoeInner {
         // Block-paged KV adapter — opt-in via `use_block_paged_cache`.
         // See `Qwen35Inner::new` (dense model) for the full architectural
         // discussion; this is the MoE-side mirror.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false) {
+        // Block-paged KV uses Metal-only kernels; when paged is forced on (config
+        // or `MLX_QWEN35_PAGED_OVERRIDE=1`) on a non-Metal backend, leave the
+        // adapter None so dispatch falls through to flat eager instead of hitting
+        // the throwing CUDA stubs. macOS keeps building it (probe always true).
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false)
+            && crate::models::qwen3_5::persistence_common::compiled_forward_backend_available()
+        {
             let attn_layer_count = config.full_attention_layer_count() as u32;
             if attn_layer_count == 0 {
                 return Err(Error::from_reason(

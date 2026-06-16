@@ -51,8 +51,16 @@ impl MxArray {
         // Fall back to sync eval when the Metal backend is unavailable; macOS
         // keeps the async overlap.
         if !metal_backend_available() {
-            unsafe {
-                sys::mlx_eval(handles.as_mut_ptr(), handles.len());
+            // Sync eval returns false if materialization threw. This path can't
+            // surface a Result (callers are fire-and-forget overlap evals), so
+            // record the failure in the inference trace like `eval_arrays` does
+            // rather than dropping it silently.
+            let ok = unsafe { sys::mlx_eval(handles.as_mut_ptr(), handles.len()) };
+            if !ok {
+                write_inference_trace(format_args!(
+                    "native_error context=async_eval_arrays count={}",
+                    handles.len()
+                ));
             }
             return;
         }
