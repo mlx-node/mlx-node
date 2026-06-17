@@ -175,12 +175,11 @@ pub(crate) struct StreamingCtx<'s, 't> {
 /// Behavior is byte-identical to the macro at the engine defaults, with
 /// these intended seams (each defaulting to the macro's behavior):
 ///   * (a) the throttled every-32-step trace reads
-///     `step.trace_offset()` instead of hardcoding
-///     `mlx_sys::mlx_qwen35_get_cache_offset()`; `None` skips the
-///     `tracing::info!` line entirely (non-qwen3.5-dense steppers).
-///     The line's family prefix comes from `step.trace_name()`
-///     (default `"Qwen3.5"`), parametrizing the former hardcoded
-///     literal — byte-identical for the only steppers that emit it.
+///     `step.trace_offset()`; `None` skips the `tracing::info!` line
+///     entirely. All steppers inherit the `None` default today (the
+///     eager forward mutates its Rust cache in place), so the line is
+///     dormant. The line's family prefix comes from `step.trace_name()`
+///     (default `"Qwen3.5"`).
 ///   * (b) the stop check matches `eos_id` OR any id in
 ///     `args.extra_eos_ids` (empty == the macro's single-id check;
 ///     Gemma4's config eos set in S7) and — gated on

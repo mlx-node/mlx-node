@@ -417,7 +417,7 @@ impl Lfm2Inner {
             // non-match is a clean ownership eviction, never a collision. Any
             // future compiled model sharing the registry MUST also draw from
             // this counter.
-            model_id: crate::models::qwen3_5::model::QWEN35_MODEL_ID_COUNTER
+            model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
                 .fetch_add(1, Ordering::Relaxed),
             // Safe default: not bf16-clean until the load path verifies the
             // registered weights (set in `persistence.rs` alongside the C++
@@ -1954,7 +1954,7 @@ impl PagedBackend for Lfm2Inner {
         // init_caches(..)`), so the compiled-paged graph threads conv state
         // WITHIN a turn only and there is no post-loop export step (hence
         // `Lfm2PagedDecode::end_decode` is the default no-op).
-        use crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
+        use crate::engine::compiled_lock::CPP_PAGED_REQUIRED_BLOCK_SIZE;
         let mut use_cpp_pre = self.compiled_path_active();
         // bf16-activation gate (1b): the gate MUST match what the graph
         // consumes (operator/FFN/final norms, q/k norms, attention out_proj,
@@ -2235,11 +2235,9 @@ impl PagedBackend for Lfm2Inner {
 /// RAII guard that calls `mlx_lfm2_moe_reset()` on drop, tearing down the
 /// compiled lfm2 decode globals (caches + offset + inited flag).
 ///
-/// DISTINCT from qwen3.5's `CompiledResetGuard` (which calls
-/// `mlx_qwen35_compiled_reset()`) — the two compiled families own separate
-/// C++ state and must each reset their own. Ensures the compiled state is
-/// always torn down even when the decode loop returns early via `?`, so the
-/// next generation never sees stale compiled caches.
+/// lfm2 owns its own compiled C++ state and resets it here. Ensures the
+/// compiled state is always torn down even when the decode loop returns early
+/// via `?`, so the next generation never sees stale compiled caches.
 struct Lfm2CompiledResetGuard;
 
 impl Drop for Lfm2CompiledResetGuard {
@@ -2454,7 +2452,7 @@ fn init_lfm2_paged_compiled_session(
             // meaningful sequence length rather than 0.
             prefill_offset,
             1, // batch_size
-            crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE as i32,
+            crate::engine::compiled_lock::CPP_PAGED_REQUIRED_BLOCK_SIZE as i32,
             is_attn.as_ptr(),
             k_pool_handles.as_mut_ptr(),
             v_pool_handles.as_mut_ptr(),

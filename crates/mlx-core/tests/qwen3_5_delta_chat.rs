@@ -910,3 +910,171 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         ar_zero.finish_reason, mtp_neg.finish_reason
     );
 }
+
+// ---------------------------------------------------------------------
+// Regression: cancel MID-MTP-CYCLE must not corrupt the next delta turn
+// ---------------------------------------------------------------------
+//
+// The eager-MTP decode commits a whole speculative cycle into the flat
+// trunk caches (`self.caches`) BEFORE the per-token emit loop streams the
+// accepted tokens out. A cancel BETWEEN those emits strands the committed-
+// but-unemitted tail in the cache: `self.caches` ends advanced past the
+// saved `cached_token_history`. The flat `rollback_unemitted` closure was a
+// no-op (model.rs), so the FOLLOWING delta turn prefilled on top of the
+// over-advanced caches → RoPE skew / orphaned K-V → corrupt reply. The fix
+// marks the flat caches desynced on a mid-cycle stop so the next turn
+// discards them and re-prefills the full history into fresh caches.
+//
+// ORACLE: the AR (`decode_loop!`) path emits exactly one token per forward,
+// so a cancel always lands on a clean cache boundary — AR can never desync
+// and is the ground truth. We run the SAME cancel->continue scenario with
+// MTP on and off and require the post-cancel follow-up reply to be byte-
+// identical. Under the bug the MTP follow-up diverges whenever the cancel
+// stranded >= 1 committed-but-unemitted token.
+//
+// Determinism note: whether a given cancel point strands u>0 depends on the
+// checkpoint's per-cycle acceptance, which the public API can't force. So
+// this is a GUARD: it never false-fails (u==0 -> both paths agree trivially)
+// and it catches the desync whenever the cancel lands mid-cycle. A counting
+// prompt (high, contiguous MTP acceptance) maximises that chance.
+//
+// Gated on an MTP-head checkpoint — the desync only exists on the eager-MTP
+// path; on a non-MTP checkpoint or if MTP did not actually run it skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint WITH an MTP head"]
+async fn cancel_midcycle_then_continue_mtp_matches_ar() {
+    let Ok(model_path) = std::env::var("MLX_TEST_MODEL_PATH") else {
+        eprintln!(
+            "skipping: MLX_TEST_MODEL_PATH unset (needs an MTP-head Qwen3.5 Dense checkpoint)"
+        );
+        return;
+    };
+    let model_dir = Path::new(&model_path);
+    assert!(
+        model_dir.exists(),
+        "MLX_TEST_MODEL_PATH does not exist: {}",
+        model_path
+    );
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5 model");
+
+    // MTP-active gate: the desync only exists on the eager-MTP path. If the
+    // checkpoint has no MTP head (or MTP does not actually run) the MTP run
+    // below would silently re-test the AR path and the comparison would be
+    // vacuous — skip instead of passing as a false positive. Mirrors the
+    // probe in `nonpositive_budget_emits_zero_tokens_mtp_matches_ar`.
+    if !model.has_mtp_weights() {
+        eprintln!("skipping: checkpoint has no MTP head (has_mtp_weights() == false)");
+        return;
+    }
+    let probe = model
+        .chat_session_start(
+            vec![user_message("Count from 1 to 12, space separated.")],
+            Some(ChatConfig {
+                enable_mtp: Some(true),
+                ..chat_config_default(16)
+            }),
+        )
+        .await
+        .expect("MTP probe chat_session_start failed");
+    let mtp_ran = probe
+        .performance
+        .as_ref()
+        .and_then(|p| p.mtp_mean_accepted_tokens)
+        .is_some();
+    if !mtp_ran {
+        eprintln!(
+            "skipping: MTP head present but decode_loop_mtp! did not run \
+             (mtp_mean_accepted_tokens absent)"
+        );
+        return;
+    }
+
+    // One cancel->continue scenario, parametrised by MTP on/off. Returns the
+    // (pre-cancel partial turn-1 reply, full turn-2 reply) streamed text.
+    async fn scenario(
+        model: &Qwen3_5Model,
+        enable_mtp: bool,
+        cancel_after_chunks: usize,
+    ) -> (String, String) {
+        // Turn 1: stream a counting reply, cancel after `cancel_after_chunks`
+        // streamed tokens. The streaming emit loop fires the callback once per
+        // accepted token on BOTH paths, so this caps turn-1's saved history at
+        // the same token count for MTP and AR.
+        let turn1_cfg = ChatConfig {
+            enable_mtp: Some(enable_mtp),
+            include_reasoning: Some(true),
+            ..chat_config_default(64)
+        };
+        let (handle, mut rx) = model
+            .chat_stream_session_start_for_test(
+                vec![user_message(
+                    "Count slowly upward, one number per step: 1 2 3 4 5 and keep going.",
+                )],
+                Some(turn1_cfg),
+            )
+            .expect("turn 1 stream dispatch failed");
+        let mut partial = String::new();
+        let mut collected = 0usize;
+        while let Some(result) = rx.recv().await {
+            let chunk = result.expect("turn 1 stream error");
+            if chunk.done {
+                break;
+            }
+            partial.push_str(&chunk.text);
+            collected += 1;
+            if collected == cancel_after_chunks {
+                handle.cancel();
+            }
+        }
+
+        // Turn 2: follow-up delta on top of the (possibly desynced) caches.
+        let turn2_cfg = ChatConfig {
+            enable_mtp: Some(enable_mtp),
+            include_reasoning: Some(true),
+            ..chat_config_default(24)
+        };
+        let (_h2, rx2) = model
+            .chat_stream_session_continue_for_test(
+                "Repeat back, in order, every number you listed so far.".to_string(),
+                None,
+                Some(turn2_cfg),
+            )
+            .expect("turn 2 continue dispatch failed");
+        let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
+        assert!(done2, "turn 2 (enable_mtp={enable_mtp}) didn't reach done");
+        let full2: String = chunks2.iter().map(|c| c.text.as_str()).collect();
+        (partial, full2)
+    }
+
+    let cancel_after = 3usize;
+    let (mtp_partial, mtp_turn2) = scenario(&model, true, cancel_after).await;
+    let (ar_partial, ar_turn2) = scenario(&model, false, cancel_after).await;
+
+    println!("MTP turn1 partial = {mtp_partial:?}");
+    println!("AR  turn1 partial = {ar_partial:?}");
+    println!("MTP turn2 = {mtp_turn2:?}");
+    println!("AR  turn2 = {ar_turn2:?}");
+
+    // Precondition: T=0 greedy -> MTP and AR emit the identical token
+    // sequence, and one chunk per token means the same `cancel_after` tokens
+    // were saved as turn-1 history. If this fails the two turn-2 prompts would
+    // build on different histories and the comparison below isn't
+    // apples-to-apples, so surface it explicitly rather than mis-attribute.
+    assert_eq!(
+        mtp_partial, ar_partial,
+        "precondition: MTP and AR must emit the same pre-cancel partial reply \
+         (T=0 byte-identity); got MTP={mtp_partial:?} AR={ar_partial:?}"
+    );
+
+    // KEY: with the desync healed, the follow-up reply is identical to the AR
+    // ground truth. Under the bug the MTP flat caches were advanced past the
+    // emitted history and this follow-up diverges.
+    assert_eq!(
+        mtp_turn2, ar_turn2,
+        "MTP follow-up after a mid-cycle cancel diverged from the AR ground \
+         truth — flat-cache desync not healed.\nMTP={mtp_turn2:?}\nAR={ar_turn2:?}"
+    );
+}

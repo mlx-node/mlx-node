@@ -2,11 +2,10 @@
 //! Qwen3.5 dense path.
 //!
 //! Loads a sym8-converted checkpoint through the production loader (which
-//! must build the int8 W8A8 `QuantizedLinear`s, skip the C++ compiled-forward
-//! registration, and run the EAGER Rust forward) and runs one short greedy
-//! turn. The gate is COHERENT text — a mis-dispatched sym8 layer (e.g. the
-//! compiled path's no-biases→MXFP8 heuristic) produces `!!!!`/garbage
-//! immediately.
+//! must build the int8 W8A8 `QuantizedLinear`s and run the eager Rust
+//! forward) and runs one short greedy turn. The gate is COHERENT text — a
+//! mis-dispatched sym8 layer (e.g. a no-biases→MXFP8 heuristic picking the
+//! wrong kernel) produces `!!!!`/garbage immediately.
 //!
 //! Run manually (needs an M5+ GPU — the loader fail-louds on gen < 17):
 //!

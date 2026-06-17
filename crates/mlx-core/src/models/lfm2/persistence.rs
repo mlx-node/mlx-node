@@ -1608,7 +1608,7 @@ impl Lfm2Inner {
         // no compiled path, so registering it would only evict another model's
         // compiled slot — same needless eviction the dtype gate closed for f16.
         let paged_block_size_ok = inner.config.paged_block_size.unwrap_or(16)
-            == crate::models::qwen3_5::model::CPP_PAGED_REQUIRED_BLOCK_SIZE;
+            == crate::engine::compiled_lock::CPP_PAGED_REQUIRED_BLOCK_SIZE;
         // sym8 compiled-FLAT port (mirrors qwen3.5's registration): a sym8
         // checkpoint registers like any other quantized checkpoint. The shared
         // compiled `linear_proj` dispatches registry mode "sym8" to
@@ -1844,9 +1844,9 @@ fn register_weights_with_cpp(
     // MLX_LFM2_FORCE_EAGER=1 (read ONCE per process) skips compiled C++ paged
     // registration for ANY lfm2 checkpoint, so `mlx_lfm2_model_has_weights`
     // stays 0 and every turn takes the pure-Rust eager paged decode path. A
-    // perf-isolation control (mirrors MLX_QWEN35_FORCE_EAGER): lets a bf16
-    // checkpoint run the eager forward so the compiled-paged graph can be A/B'd
-    // against the eager path apart from any kernel deltas.
+    // perf-isolation control: lets a bf16 checkpoint run the eager forward so
+    // the compiled-paged graph can be A/B'd against the eager path apart from
+    // any kernel deltas.
     static FORCE_EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *FORCE_EAGER.get_or_init(|| crate::inference_trace::env_flag_enabled("MLX_LFM2_FORCE_EAGER"))
     {
@@ -1909,9 +1909,8 @@ fn register_weights_with_cpp_locked(
     // sibling slots are untouched. Mirrors the dense/moe loader fix.
     unsafe { mlx_sys::mlx_lfm2_slot_erase(model_id) };
 
-    // sym8 checkpoints register too (compiled-FLAT port, mirroring qwen3.5's
-    // `register_weights_with_cpp`). Layout contract (the C++ asserts it at
-    // dispatch — see `sym8_linear_proj` in mlx_qwen35_common.h): for a sym8
+    // sym8 checkpoints register too. Layout contract expected by the sym8
+    // dispatch: for a sym8
     // prefix we store the CONTIGUOUS [K,N] int8 KERNEL OPERAND as
     // `{prefix}.weight` — NOT the checkpoint's [N,K] tensor — plus the [N,K]
     // CHECKPOINT tensor as `{prefix}.weight_nk` (the decode QMV's simd_sum

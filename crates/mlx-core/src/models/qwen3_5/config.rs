@@ -69,21 +69,19 @@ pub struct Qwen3_5Config {
     /// cross-request prefix reuse — vLLM's `MambaManager`-style "no
     /// prefix reuse for recurrent layers" stance.
     ///
-    /// **Compile lockout**: when this flag is `Some(true)` the dispatch
-    /// path skips the `mlx_qwen35_compiled_*` lifecycle entirely (no
-    /// mutex acquisition, no `compiled_init_from_prefill`, no compiled
-    /// decode). The compiled C++ forward path is incompatible with the
-    /// per-layer paged dispatch; flipping this flag at runtime trades
-    /// the compiled fast path for cross-request prefix reuse.
+    /// **Paged vs flat eager**: this flag selects the eager paged decode
+    /// over the eager flat decode. When `Some(true)`, full-attention
+    /// layers run through the paged adapter (cross-request prefix reuse);
+    /// when unset, they run the eager flat decode. Either way the forward
+    /// is pure-Rust eager.
     ///
     /// **VLM is rejected**: when both `vision_encoder.is_some()` and
     /// this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
     /// a descriptive error. Paged dispatch through M-RoPE / vision
     /// features is deferred.
     ///
-    /// Default: `None` / `false` (use the existing flat path with the
-    /// compiled C++ forward when available). Default-flip pending real-
-    /// weights parity verification.
+    /// Default: `None` / `false` (use the eager flat decode path).
+    /// Default-flip pending real-weights parity verification.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,

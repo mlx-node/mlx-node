@@ -10,7 +10,7 @@
  *   - aff8 : 8-bit affine baseline             (stock quantized_matmul path)
  *
  * Greedy T=0, reuseCache=false, ~120 new tokens per prompt. Each model loads in
- * its OWN process (compiled-path weight globals are process-wide). PASS = sym8
+ * its OWN process (the int8/quant weight registry is process-wide). PASS = sym8
  * coherent + its token agreement vs bf16 lands in the same band as aff8's.
  *
  * Usage:

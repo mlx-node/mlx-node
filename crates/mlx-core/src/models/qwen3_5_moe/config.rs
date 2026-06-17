@@ -76,12 +76,12 @@ pub struct Qwen3_5MoeConfig {
     /// Use the block-paged KV cache adapter for full-attention layers.
     ///
     /// **OPT-IN — experimental.** Same semantics as the dense
-    /// `Qwen3_5Config::use_block_paged_cache` field. Routes full-
-    /// attention layers through `PagedKVCacheAdapter`; GDN linear-
-    /// attention layers stay on `Qwen3_5LayerCache::Linear`. When
-    /// enabled, the compiled MoE C++ forward path
-    /// (`mlx_qwen35_moe_compiled_*`) is skipped — the paged adapter is
-    /// incompatible with the in-graph compile cache.
+    /// `Qwen3_5Config::use_block_paged_cache` field. Selects the eager
+    /// paged decode over the eager flat decode: routes full-attention
+    /// layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
+    /// GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
+    /// either way. When disabled, full-attention layers run the eager flat
+    /// decode instead.
     ///
     /// VLM (vision encoder present) is rejected with an error in
     /// `Qwen35MoeInner::new`.

@@ -382,7 +382,6 @@ mod mock_backend_tests {
     #[derive(Debug, PartialEq, Eq)]
     struct TurnSnapshot {
         is_delta: bool,
-        cached_prefix_len: usize,
         total_seq_len: usize,
         reuse_cache: bool,
     }
@@ -623,7 +622,6 @@ mod mock_backend_tests {
         fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
             self.begin_decode_turns.push(TurnSnapshot {
                 is_delta: turn.is_delta,
-                cached_prefix_len: turn.cached_prefix_len,
                 total_seq_len: turn.total_seq_len,
                 // `turn.params` is how the real steppers capture the
                 // end_decode reuse_cache gate.
@@ -721,7 +719,6 @@ mod mock_backend_tests {
             backend.begin_decode_turns[0],
             TurnSnapshot {
                 is_delta: false,
-                cached_prefix_len: 0,
                 total_seq_len: prompt1.len(),
                 reuse_cache: true,
             }
@@ -765,7 +762,6 @@ mod mock_backend_tests {
             backend.begin_decode_turns[1],
             TurnSnapshot {
                 is_delta: true,
-                cached_prefix_len: 0,
                 total_seq_len: h1_len + delta2.len(),
                 reuse_cache: true,
             }
@@ -983,7 +979,6 @@ mod mock_backend_tests {
             backend.begin_decode_turns[1],
             TurnSnapshot {
                 is_delta: false,
-                cached_prefix_len: seeded_prefix,
                 total_seq_len: probe.len(),
                 reuse_cache: true,
             }

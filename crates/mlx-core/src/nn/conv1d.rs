@@ -139,3 +139,87 @@ impl Clone for Conv1d {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::array::DType;
+
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        af.as_ref()
+            .iter()
+            .zip(bf.as_ref().iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// GDN-style depthwise conv: does a windowed conv over
+    /// `[conv_state(keep) ++ window(T)]` produce the SAME per-position output as
+    /// per-token convs with a rolling conv_state? This is the bit-exactness
+    /// assumption the eager-MTP GDN tape replay depends on.
+    #[test]
+    fn depthwise_conv_windowed_equals_per_token_rolling() {
+        let conv_dim = 64i64;
+        let kernel = 4i64;
+        let keep = kernel - 1;
+        let t = 5i64; // window length (> kernel)
+
+        // Depthwise conv weight [conv_dim, kernel, 1], bf16.
+        let w = MxArray::random_normal(&[conv_dim, kernel, 1], 0.0, 0.3, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let conv = Conv1d::from_weights(&w, None, Some(1), Some(0), Some(1), Some(conv_dim as u32))
+            .unwrap();
+
+        // Initial conv_state [1, keep, conv_dim] and the T-token window.
+        let conv_state0 =
+            MxArray::random_normal(&[1, keep, conv_dim], 0.0, 0.3, Some(DType::Float32))
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+        let window = MxArray::random_normal(&[1, t, conv_dim], 0.0, 0.3, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // (A) Windowed: conv over [conv_state0 ++ window] → take last T outputs.
+        let win_out = {
+            let inp = MxArray::concatenate(&conv_state0, &window, 1).unwrap();
+            let out = conv.forward(&inp).unwrap();
+            let out_len = out.shape_at(1).unwrap();
+            let sliced = out.slice_axis(1, out_len - t, out_len).unwrap();
+            sliced.eval();
+            sliced
+        };
+
+        // (B) Per-token rolling: for each token, conv over [rolling_state ++ tok].
+        let per_tok_out = {
+            let mut rolling = conv_state0.clone();
+            let mut outs: Vec<MxArray> = Vec::new();
+            for ti in 0..t {
+                let tok = window.slice_axis(1, ti, ti + 1).unwrap(); // [1,1,conv_dim]
+                let inp = MxArray::concatenate(&rolling, &tok, 1).unwrap(); // [1, keep+1, conv_dim]
+                let out = conv.forward(&inp).unwrap(); // [1, 1, conv_dim]
+                outs.push(out);
+                // roll: new state = last `keep` of [rolling ++ tok]
+                let total = inp.shape_at(1).unwrap();
+                rolling = inp.slice_axis(1, total - keep, total).unwrap();
+            }
+            let refs: Vec<&MxArray> = outs.iter().collect();
+            let cat = MxArray::concatenate_many(refs, Some(1)).unwrap();
+            cat.eval();
+            cat
+        };
+
+        let d = max_abs_diff(&win_out, &per_tok_out);
+        eprintln!("CONV_DIAG windowed_vs_pertoken_max_abs_diff={d:.6e}");
+        assert_eq!(
+            d, 0.0,
+            "windowed depthwise conv must equal per-token rolling conv bit-for-bit \
+             (got {d:.6e}) — otherwise GDN tape recorded q/k/v drift from AR per-token"
+        );
+    }
+}

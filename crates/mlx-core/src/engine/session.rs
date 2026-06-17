@@ -593,9 +593,21 @@ fn chat_turn_core<B: ChatBackend>(
     //
     // Delta turns: strict extension by construction — the live caches
     // already hold the prior history; prefill exactly the delta tail.
+    //
+    // A prior eager-MTP turn that stopped mid-cycle leaves the flat trunk
+    // advanced past `cached_token_history` (`flat_caches_desynced`). The
+    // GDN recurrent layers can't rewind, so neither a fresh prefix-reuse
+    // nor a delta-extend onto that trunk is safe — both heal by discarding
+    // the trunk and re-prefilling the whole conversation (`tokens` already
+    // == saved history ++ any delta).
+    let desynced = backend.flat_caches_desynced();
     let (prefill_tokens, cached_prefix_len) = match &input {
         TurnInput::Fresh { .. } => {
-            let hit = backend.verify_cache_prefix(&tokens, reuse_cache);
+            let hit = if desynced {
+                0
+            } else {
+                backend.verify_cache_prefix(&tokens, reuse_cache)
+            };
             if hit > 0 && hit < tokens.len() {
                 tracing::info!(
                     "Cache reuse: {} cached tokens, {} new tokens to prefill",
@@ -608,13 +620,22 @@ fn chat_turn_core<B: ChatBackend>(
                 (tokens.clone(), 0)
             }
         }
-        // `cached_prefix_len` stays 0 on the delta path (it feeds the
-        // VLM rope-delta decisions keyed on fresh-prefill reuse;
-        // `is_delta` drives the delta-side decisions). The REPORTED
-        // reuse is `prior_cached_len` — see `cached_tokens_for_result`.
-        TurnInput::Delta { delta_tokens } => (delta_tokens.clone(), 0usize),
+        // `cached_prefix_len` stays 0 on the delta path: the delta tail
+        // is the only freshly-prefilled span, so there is no separately
+        // reused prefix to report here. The REPORTED reuse is
+        // `prior_cached_len` — see `cached_tokens_for_result`.
+        TurnInput::Delta { delta_tokens } => {
+            if desynced {
+                backend.reset_caches(ResetScope::PrefixMiss)?;
+                (tokens.clone(), 0usize)
+            } else {
+                (delta_tokens.clone(), 0usize)
+            }
+        }
     };
-    let cached_tokens_for_result: u32 = if is_delta {
+    // A desynced delta turn re-prefilled the whole conversation, reusing
+    // nothing — report 0 cached, not the stale `prior_cached_len`.
+    let cached_tokens_for_result: u32 = if is_delta && !desynced {
         prior_cached_len as u32
     } else {
         cached_prefix_len as u32
@@ -690,7 +711,6 @@ fn chat_turn_core<B: ChatBackend>(
             // The generic flow is text-only; image turns routed through
             // `vision_turn` above.
             has_images: false,
-            cached_prefix_len,
             total_seq_len: tokens.len(),
         };
         let mut step = backend.begin_decode(&turn_setup)?;
@@ -760,6 +780,18 @@ fn chat_turn_core<B: ChatBackend>(
         image_cache_key: 0,
         last_token_in_cache,
     });
+
+    // Drop the desync flag only now that `save_cache_state` has committed
+    // `cached_token_history` to match the healed trunk. Clearing earlier
+    // (right after the heal prefill) would lose the flag if `begin_decode`,
+    // `run_decode_loop`, or `end_decode` returned `Err` — leaving the trunk
+    // holding the uncommitted healed prompt while history stayed stale, so
+    // the next delta would diverge again. Keeping it set across an abort
+    // lets the next turn re-heal. The generic flow is AR-only and never
+    // re-sets the flag, so this is the turn's single, final clear.
+    if desynced {
+        backend.clear_flat_caches_desynced();
+    }
 
     // --- finalize ---
     let performance = if report_perf {

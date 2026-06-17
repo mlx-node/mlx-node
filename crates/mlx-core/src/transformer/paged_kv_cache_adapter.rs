@@ -3697,9 +3697,10 @@ impl PagedKVCacheAdapter {
 
     /// Return a `[1]` fp32 K scale MxArray for `layer_idx`.
     ///
-    /// The compiled paged decode graphs (`mlx_qwen35_init_paged` and
-    /// `mlx_qwen35_moe_init_paged`) need a per-layer `k_scale` MxArray to
-    /// thread into `paged_kv_write` and `paged_attention`. The shape is
+    /// The eager paged forward threads a per-layer `k_scale` MxArray into
+    /// the `paged_kv_write` write (see `update_keys_values_native`) and the
+    /// `paged_attention` reads (see `gather_kv_for_decode_graph` /
+    /// `gather_kv_for_prefill_chunk`). The shape is
     /// always `[1]` and the dtype is always `Float32` — the C++ validator
     /// in `mlx_paged_ops.cpp` rejects anything else.
     ///

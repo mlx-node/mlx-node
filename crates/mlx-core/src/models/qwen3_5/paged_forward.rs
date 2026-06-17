@@ -739,3 +739,177 @@ pub(crate) fn run_paged_decode_step(
     };
     Ok(logits)
 }
+
+/// Eager paged MTP Step-A forward: a single `[1, 1]` paged forward returning
+/// both the verifier logits and the post-`final_norm` hidden.
+///
+/// Routes full-attention layers through the paged adapter (writing one new K/V
+/// slot into the pool, attending over `read_kv_range(0, total_ctx)`) and GDN
+/// layers through the flat `Qwen3_5LayerCache::Linear` slots in `caches`, the
+/// same split `run_paged_decode_step` uses. The eager analogue of the compiled
+/// `forward_with_hidden` closure that calls `forward_dense_cpp_paged` +
+/// `export_last_hidden_paged`.
+///
+/// Returns `(logits [1, 1, vocab], hidden [1, hidden])`. The hidden is squeezed
+/// on the time axis to match the eager-flat MTP `forward_with_hidden` contract
+/// (`needs_squeeze = true`); the caller reshapes it back to `[1, 1, hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_step_with_hidden(
+    token_id: u32,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    embedding_weight_t: Option<&MxArray>,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<(MxArray, MxArray)> {
+    let first_logical_position = paged_adapter.current_token_count();
+    paged_adapter
+        .record_tokens(&[token_id])
+        .map_err(Error::from_reason)?;
+
+    let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
+    let mut hidden_states = embed.forward(&input_ids)?;
+
+    let num_layers = layers.len();
+    #[allow(clippy::needless_range_loop)]
+    for layer_idx in 0..num_layers {
+        let kind = layer_kinds[layer_idx];
+        let layer = unsafe {
+            let ptr = layers.as_mut_ptr().add(layer_idx);
+            &mut *ptr
+        };
+        let cache_slot = unsafe {
+            let ptr = caches.as_mut_ptr().add(layer_idx);
+            &mut *ptr
+        };
+
+        hidden_states = layer.forward_paged_or_flat(
+            &hidden_states,
+            kind,
+            paged_adapter,
+            first_logical_position,
+            /* cached_prefix_len */ 0,
+            /* is_prefill */ false,
+            /* mask */ None,
+            Some(cache_slot),
+            /* position_ids */ None,
+            /* use_kernel */ true,
+        )?;
+    }
+
+    let h3 = final_norm.forward(&hidden_states)?;
+    let logits = match (lm_head, embedding_weight_t) {
+        (Some(head), _) => head.forward(&h3)?,
+        (None, Some(wt)) => h3.matmul(wt)?,
+        (None, None) => {
+            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+            h3.matmul(&wt)?
+        }
+    };
+    let hidden = h3.squeeze(Some(&[1]))?;
+    Ok((logits, hidden))
+}
+
+/// Eager paged MTP batched verify forward: a single `[1, K+1]` paged forward
+/// returning the verifier target distribution and the post-`final_norm` hidden
+/// at every verify position, recording the per-layer GDN tape for the rollback
+/// replay.
+///
+/// The eager analogue of the compiled `forward_mtp_verify_paged` FFI. The
+/// `verify_ids` (`[1, K+1]` int32) are recorded into the adapter in ONE
+/// `record_tokens` call (so the new K/V land at logical positions
+/// `[ctx, ctx+K]`), then run through every layer: full-attention via the paged
+/// adapter (with `is_prefill = true` so the internal causal mask covers all
+/// K+1 query positions over the full context), GDN via the flat `Linear`
+/// slots while recording a [`GdnLayerTape`] (the bit-exactness keystone the
+/// rollback replay consumes).
+///
+/// Returns `MtpVerifyOutput::logits_only(logits [1, K+1, vocab],
+/// hiddens [1, K+1, hidden])`. The `tape` is pre-sized / cleared by this
+/// function to `layers.len()` (`Some` for GDN layers, `None` for full-attn).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_verify_step(
+    verify_ids: &MxArray,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    embedding_weight_t: Option<&MxArray>,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+) -> Result<super::mtp_decode::MtpVerifyOutput> {
+    debug_assert_eq!(layers.len(), caches.len());
+    debug_assert_eq!(layers.len(), layer_kinds.len());
+
+    // Materialise the verify ids on host so the slot mapping records the exact
+    // K+1 tokens, then feed the same array back through the embedding graph.
+    let id_window = verify_ids.to_int32().map_err(|e| {
+        Error::from_reason(format!(
+            "run_paged_verify_step: verify_ids to_int32: {}",
+            e.reason
+        ))
+    })?;
+    let verify_len = id_window.len();
+    if verify_len == 0 {
+        return Err(Error::from_reason(
+            "run_paged_verify_step: verify_ids must have at least one token",
+        ));
+    }
+    let verify_u32: Vec<u32> = id_window.iter().map(|&v| v as u32).collect();
+
+    let chunk_first_position = paged_adapter.current_token_count();
+    paged_adapter
+        .record_tokens(&verify_u32)
+        .map_err(Error::from_reason)?;
+
+    let input_ids = MxArray::from_uint32(&verify_u32, &[1, verify_len as i64])?;
+    let mut hidden_states = embed.forward(&input_ids)?;
+
+    let num_layers = layers.len();
+    tape.clear();
+    tape.resize(num_layers, None);
+    #[allow(clippy::needless_range_loop)]
+    for layer_idx in 0..num_layers {
+        let kind = layer_kinds[layer_idx];
+        let layer = unsafe {
+            let ptr = layers.as_mut_ptr().add(layer_idx);
+            &mut *ptr
+        };
+        let cache_slot = unsafe {
+            let ptr = caches.as_mut_ptr().add(layer_idx);
+            &mut *ptr
+        };
+        let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
+        hidden_states = layer.forward_paged_or_flat_with_tape(
+            &hidden_states,
+            kind,
+            paged_adapter,
+            chunk_first_position,
+            chunk_first_position,
+            /* is_prefill */ true,
+            Some(cache_slot),
+            Some(&mut slot),
+        )?;
+        tape[layer_idx] = slot;
+    }
+
+    let hiddens = final_norm.forward(&hidden_states)?;
+    let logits = match (lm_head, embedding_weight_t) {
+        (Some(head), _) => head.forward(&hiddens)?,
+        (None, Some(wt)) => hiddens.matmul(wt)?,
+        (None, None) => {
+            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+            hiddens.matmul(&wt)?
+        }
+    };
+    Ok(super::mtp_decode::MtpVerifyOutput::logits_only(
+        logits, hiddens,
+    ))
+}

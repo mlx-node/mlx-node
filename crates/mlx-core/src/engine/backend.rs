@@ -84,13 +84,12 @@ pub(crate) trait DecodeStep {
 
     /// Cache offset for the throttled every-32-step decode trace.
     ///
-    /// Replaces the `mlx_sys::mlx_qwen35_get_cache_offset()` call the
-    /// `decode_loop!` macro hardcoded. The macro read the dense compiled
-    /// global on BOTH the compiled and eager qwen3_5 paths, so the
-    /// qwen3_5 dense steppers must return
-    /// `Some(mlx_qwen35_get_cache_offset())` from BOTH variants to keep
-    /// the trace line byte-identical; every other family returns `None`,
-    /// which skips the `tracing::info!` line entirely.
+    /// `Some(offset)` emits the throttled `tracing::info!` trace line with
+    /// that offset; `None` skips the line entirely. All families now run
+    /// the eager forward and inherit the `None` default, so the trace is
+    /// dormant — the hook is retained for a stepper that wants to surface
+    /// its decode cursor (from its own eager cache) without changing the
+    /// `decode_loop!` macro.
     fn trace_offset(&self) -> Option<i64> {
         None
     }
@@ -99,15 +98,12 @@ pub(crate) trait DecodeStep {
     /// line (`"<name> decode AR step=..."`).
     ///
     /// De-leaks the literal the `decode_loop!` macro hardcoded as
-    /// `"Qwen3.5"`. The default keeps that exact string, so the trace
-    /// stays byte-identical for the only two steppers that emit it today
-    /// (qwen3_5 dense + qwen3_5_moe both return `Some` from
-    /// [`DecodeStep::trace_offset`] and inherit this default). Every
-    /// other family returns `None` from `trace_offset`, so the line
-    /// never fires and this value is never read. A future non-Qwen3.5
-    /// stepper that opts into the trace (returns `Some` offset) overrides
-    /// this to label its own lines. Diagnostics only — not a parity
-    /// surface.
+    /// `"Qwen3.5"`. The default keeps that exact string. The trace line
+    /// only fires when a stepper returns `Some` from
+    /// [`DecodeStep::trace_offset`]; all families inherit the `None`
+    /// default today, so this value is currently never read. A stepper
+    /// that opts into the trace overrides this to label its own lines.
+    /// Diagnostics only — not a parity surface.
     fn trace_name(&self) -> &'static str {
         "Qwen3.5"
     }
@@ -118,11 +114,9 @@ pub(crate) trait DecodeStep {
     /// applied via `DecodeProfiler::set_label`, `None` keeps the
     /// turn-level label from [`ChatBackend::profiler_label`].
     ///
-    /// == the per-family `profiler.set_label(..)` calls inside the
-    /// compiled-vs-eager dispatch: qwen3_5 dense relabels to
-    /// `"chat_compiled"` / `"chat_rust"` (and the `_stream` /
-    /// `_stream_delta` variants), MoE to `"moe_chat_*_compiled"` /
-    /// `"moe_chat_*_rust"`, qwen3 streaming to
+    /// == the per-family `profiler.set_label(..)` calls: qwen3_5 dense
+    /// relabels to `"chat_rust"`, MoE to `"moe_chat_*_rust"` (and the
+    /// `_stream` / `_delta` variants), qwen3 streaming to
     /// `"qwen3_chat_stream[_delta]_rust"`. lfm2 / gemma4 never relabel
     /// (default).
     fn profiler_relabel(&self) -> Option<&'static str> {
@@ -138,29 +132,23 @@ pub(crate) trait DecodeStep {
     /// (firing its reset guards), and `save_cache_state` is never
     /// called.
     ///
-    /// This is where the compiled-path families export the C++ decode
-    /// caches back into their Rust caches, gated on the turn's
-    /// `reuse_cache` (available via [`TurnSetup::params`], captured at
-    /// `begin_decode` time):
-    ///   * qwen3_5 dense: `mlx_qwen35_export_caches` + `import_ptrs` +
-    ///     fallible `eval_layer_caches(&self.caches)?` before
-    ///     `CompiledResetGuard` drops;
-    ///   * qwen3_5_moe: the same against the MoE globals before
-    ///     `MoeResetGuard` drops;
-    ///   * lfm2 FLAT (`Lfm2Decode`): `export_compiled_caches()` before
-    ///     `Lfm2CompiledResetGuard` drops. NOTE this is the FLAT stepper
-    ///     ONLY — lfm2's PAGED stepper (`Lfm2PagedDecode`) keeps the
-    ///     default no-op: the eager paged path reprefills conv state from
-    ///     token 0 every turn, so there is no cross-turn compiled cache to
-    ///     export.
+    /// This is where a compiled-path family exports its C++ decode caches
+    /// back into its Rust caches, gated on the turn's `reuse_cache`
+    /// (available via [`TurnSetup::params`], captured at `begin_decode`
+    /// time). The only non-default user today is lfm2 FLAT (`Lfm2Decode`):
+    /// `export_compiled_caches()` before `Lfm2CompiledResetGuard` drops.
+    /// lfm2's PAGED stepper (`Lfm2PagedDecode`) keeps the default no-op:
+    /// the eager paged path reprefills conv state from token 0 every turn,
+    /// so there is no cross-turn compiled cache to export. The pure-eager
+    /// families (qwen3_5 dense/MoE, qwen3, gemma4) keep the default no-op —
+    /// their Rust caches are mutated in place during decode.
     ///
-    /// The error-path equivalence is exact: today a decode error skips
-    /// the export but still resets (guards drop), and an export/eval
-    /// error propagates as the turn's error before any session state is
-    /// saved — drop-without-`end_decode` reproduces reset-without-export
+    /// The error-path equivalence is exact: a decode error skips the
+    /// export but still resets (guards drop), and an export/eval error
+    /// propagates as the turn's error before any session state is saved —
+    /// drop-without-`end_decode` reproduces reset-without-export
     /// byte-for-byte. A `Drop`-based export could not express this
-    /// (`Drop` swallows the abort-the-turn error). Families without a
-    /// compiled path keep the default no-op.
+    /// (`Drop` swallows the abort-the-turn error).
     fn end_decode(&mut self) -> Result<()> {
         Ok(())
     }
@@ -537,16 +525,14 @@ pub(crate) struct TurnSetup<'a> {
     /// compiled init does the same. (There is deliberately no separate
     /// `max_new_tokens` field so the two copies cannot drift.)
     pub params: &'a ChatParams,
-    /// Delta-continuation flag: the qwen3.5 compiled init consults it for
-    /// the saved M-RoPE offset decisions
-    /// ([`crate::engine::cache::should_reapply_rope_delta`] /
-    /// [`crate::engine::cache::should_clear_rope_delta`]).
+    /// Delta-continuation flag (this turn appended a text delta on top of
+    /// the live KV caches rather than running a fresh prefill). Read by
+    /// the qwen3.5 dense/MoE, qwen3, and lfm2 decode-setup blocks for
+    /// their session-continuation bookkeeping and entry traces.
     pub is_delta: bool,
-    /// Second input of the M-RoPE offset decisions above.
+    /// Whether this turn carried image input. Read by the qwen3.5 dense
+    /// decode-entry `info!` trace.
     pub has_images: bool,
-    /// Third input of `should_reapply_rope_delta` (fresh VLM prefill
-    /// reusing a cached prefix).
-    pub cached_prefix_len: usize,
     /// Total post-prefill sequence length: cached prefix + freshly
     /// prefilled tokens (i.e. the full prompt; the session-delta paths
     /// pass `cached_history + delta`).
@@ -569,25 +555,22 @@ pub(crate) struct TurnSetup<'a> {
 /// effective cached-prefix / suffix lengths come from
 /// [`PagedBackend::PrefixState`], NOT from here.
 ///
-/// `#[allow(dead_code)]`: qwen3 (the only `PagedBackend` impl in P4-1)
-/// is pure-eager and ignores every field — its decode cursor comes from
-/// the adapter. The compiled-paged families read `params` /
-/// `cached_prefix_len` for their C++ KV-budget init at the P4-2
-/// migration (mirroring how [`TurnSetup`]'s fields are read only by the
-/// compiled families today).
+/// `#[allow(dead_code)]`: the paged `PagedBackend` impls are pure-eager
+/// and ignore every field — their decode cursor comes from the adapter.
+/// The fields are kept so the trait surface can carry turn-constant
+/// inputs without an ABI change if a future paged family needs them.
 #[allow(dead_code)]
 pub(crate) struct PagedTurnSetup<'a> {
     /// The turn's resolved [`ChatParams`] — `params.max_new_tokens` is
     /// the decode budget (the paged path grows blocks lazily via
-    /// per-token `record_tokens`, so this is informational for eager
-    /// families and the compiled-init KV budget for hybrid ones).
+    /// per-token `record_tokens`, so this is informational).
     pub params: &'a ChatParams,
-    /// Session-delta continuation flag (M-RoPE / saved-offset decisions
-    /// on the hybrid families; ignored by pure-KV qwen3).
+    /// Session-delta continuation flag (ignored by the eager paged
+    /// families; their cursor comes from the adapter).
     pub is_delta: bool,
     /// Effective cached-prefix length the prefix prime resolved (block-
-    /// granular). Hybrid compiled-init reads it; qwen3 ignores it (its
-    /// decode cursor comes from `adapter.current_token_count()`).
+    /// granular). The eager paged families ignore it — their decode
+    /// cursor comes from `adapter.current_token_count()`.
     pub cached_prefix_len: usize,
 }
 
@@ -925,6 +908,27 @@ pub(crate) trait ChatBackend {
     /// cache can overwrite its last slot; GDN/conv-state families MUST
     /// keep the all-or-nothing contract (exact-match-as-miss).
     fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize;
+
+    /// True when the flat trunk caches sit AHEAD of the saved
+    /// `cached_token_history`. An eager-MTP speculative cycle commits its
+    /// accepted tokens into the trunk before the per-token emit loop
+    /// streams them; if that loop stops mid-cycle (repetition cutoff /
+    /// cancel / EOS), the unemitted tokens leave the trunk advanced past
+    /// the history. The GDN recurrent layers cannot rewind, so the next
+    /// flat AR turn through the generic flow MUST discard the trunk and
+    /// re-prefill the full conversation instead of reusing/extending it.
+    ///
+    /// Default `false`: only qwen3.5 dense/MoE set it, and only on the
+    /// eager-MTP path. MTP follow-up turns route through the model cores
+    /// (which check/clear it themselves); this hook covers the AR
+    /// follow-up that reaches [`crate::engine::session`]'s generic flow.
+    fn flat_caches_desynced(&self) -> bool {
+        false
+    }
+
+    /// Clear [`Self::flat_caches_desynced`] after the engine healed the
+    /// trunk via a full re-prefill. Default no-op.
+    fn clear_flat_caches_desynced(&mut self) {}
 
     /// Persist post-turn session state. Dispatches on
     /// `args.is_delta` to the semantics of

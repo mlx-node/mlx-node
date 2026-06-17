@@ -160,14 +160,55 @@ impl DecoderLayer {
         use_kernel: bool,
         slice_to_last_before_mlp: bool,
     ) -> Result<MxArray> {
+        self.forward_inner_with_tape(
+            x,
+            mask,
+            cache,
+            position_ids,
+            use_kernel,
+            slice_to_last_before_mlp,
+            None,
+        )
+    }
+
+    /// Like [`DecoderLayer::forward`], but threads an eager-MTP tape sink into
+    /// the GDN (`Linear`) sublayer so the verify forward can record the
+    /// per-step recurrence inputs for the rollback replay. Full-attention
+    /// layers ignore the sink (it stays `None` for their tape slot). When
+    /// `tape_sink` is `None`, behavior is byte-identical to `forward`.
+    pub(crate) fn forward_with_tape(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        self.forward_inner_with_tape(x, mask, cache, position_ids, use_kernel, false, tape_sink)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner_with_tape(
+        &mut self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        use_kernel: bool,
+        slice_to_last_before_mlp: bool,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
         // Pre-norm + attention (always on full T for cache fidelity)
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                gdn.forward(&normed, mask, ac, use_kernel)?
+                gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
             }
             AttentionType::Full(attn) => {
+                // Full-attention layers do not record a GDN tape.
+                let _ = tape_sink;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
@@ -275,6 +316,75 @@ impl DecoderLayer {
                 // Residual.
                 let h = x.add(&attn_out)?;
                 // Pre-norm + MLP.
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = self.mlp.forward(&normed)?;
+                h.add(&mlp_out)
+            }
+        }
+    }
+
+    /// Tape-recording variant of [`Self::forward_paged_or_flat`] for the eager
+    /// paged MTP verify forward.
+    ///
+    /// Identical to `forward_paged_or_flat` except the `Linear` (GDN) branch
+    /// records a per-layer [`GdnLayerTape`] into `tape_sink` (the rollback
+    /// replay keystone), exactly like the flat
+    /// [`Self::forward_with_tape`]. The `FullAttentionPaged` branch never
+    /// records a tape (full-attention K/V lives in the paged pool and is
+    /// rewound by `PagedKVCacheAdapter::rollback_last_tokens`); it drains
+    /// `tape_sink` to `None` so the absolute-layer-indexed tape stays `None`
+    /// for full-attention slots, matching `forward_inner_with_tape`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_or_flat_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5DecoderLayer::forward_paged_or_flat_with_tape: kind=Linear applied \
+                         to a FullAttention operator",
+                    ));
+                }
+                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let _ = flat_cache; // adapter owns K/V for paged layers
+                // Full-attention layers do not record a GDN tape.
+                if let Some(slot) = tape_sink {
+                    *slot = None;
+                }
+                let attn = match &self.attn {
+                    AttentionType::Full(a) => a,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_or_flat_with_tape: \
+                             kind=FullAttentionPaged applied to a Linear (GDN) operator",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?;
+                let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)

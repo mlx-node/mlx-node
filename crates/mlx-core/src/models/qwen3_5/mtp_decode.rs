@@ -71,28 +71,6 @@ use crate::sampling::{self, SamplingConfig};
 //     accept loop's CPU-side graph construction; composes cleanly with
 //     all other flags.
 
-// Tape-replay rollback for GDN linear-attention.
-//
-// Replaces the K+1 main-model forwards on every partial-accept verify cycle.
-// When ON (default), the cycle arms tape recording on the dense compiled path
-// BEFORE verify; the per-step `(tape, k, g, qkv)` tensors are accumulated
-// during the D+1 verify forwards; on rejection a single Metal kernel replays
-// only the accepted prefix into the pre-verify snapshot state and the conv
-// state is rebuilt by slicing the recorded qkv. Saves ~30% of cycle wall-time.
-//
-// Opt-out: `MLX_MTP_USE_TAPE_REPLAY=0` (or `false`) falls back to the K+1
-// replay path. The env var is read once per process and cached.
-pub(crate) fn mtp_use_tape_replay() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_USE_TAPE_REPLAY") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true, // default ON
-    })
-}
-
 // Async verify-eval pipeline.
 //
 // Replaces the synchronous `verify_logits.eval()` at the end of
@@ -162,23 +140,6 @@ pub(crate) fn mtp_target_distribution_first_enabled() -> bool {
             Err(_) => false,
         },
     )
-}
-
-// Opt-OUT gate for the paged-pool MTP verify graph. Default ON. Set
-// `MLX_MTP_VERIFY_PAGED_ATTN` to `0` / `false` / `off` (case-insensitive,
-// surrounding whitespace ignored) to fall back to the dense BHTD verify
-// path. The Rust gate mirrors the C++ `mtp_verify_paged_attn_enabled()`
-// reader in `mlx_qwen35.cpp`; both must agree per process for the
-// dispatcher to route through the new graph.
-pub(crate) fn mtp_verify_paged_attn_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_PAGED_ATTN") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    })
 }
 
 /// Minimum GPU architecture generation for chained MTP cycles to default ON.
@@ -931,16 +892,12 @@ macro_rules! decode_loop {
 
             // Throttled per-step decode trace (AR / single-token loop).
             // Logs every 32 steps so long decode runs leave a sparse
-            // breadcrumb trail (step idx, sampled token, cache offset
-            // from the dense compiled global — MoE callers can ignore
-            // the offset field).
+            // breadcrumb trail (step idx, sampled token, gen length).
             if step % 32 == 0 {
-                let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
                 tracing::info!(
-                    "Qwen3.5 decode AR step={} sampled_token_id={} cache_offset={} gen_len={}",
+                    "Qwen3.5 decode AR step={} sampled_token_id={} gen_len={}",
                     step,
                     token_id,
-                    cache_offset,
                     $gen.len(),
                 );
             }
@@ -1021,45 +978,43 @@ macro_rules! decode_loop {
 pub(crate) use decode_loop;
 
 // =============================================================================
-// MTP speculative decode loop (dense compiled path only).
+// MTP speculative decode loop (eager Rust path).
 //
 // Sister to `decode_loop!` above; preserves every behavior of the
 // single-token loop (penalties, ReasoningTracker / budget, EOS,
 // repetition cutoff, every-256-step cache clear, streaming +
 // cancellation) while emitting up to `mtp_depth + 1` tokens per
-// outer iteration via the draft + verify FFI plus the
+// outer iteration via the eager draft + verify steps plus the
 // `accept_with_residual` sampler.
 //
-// Cache-rollback strategy (compiled path):
-//   - The verify FFI advances the MAIN compiled K/V offset by
-//     `depth + 1`. On any rejection we rewind the main offset by
-//     `accepted_count - (depth + 1)` (a negative delta) via
-//     `mlx_qwen35_compiled_adjust_offset`. We do NOT zero the K/V
-//     buffer entries at positions `[accepted .. depth+1]` — the
-//     next forward simply overwrites them.
-//   - The MTP draft FFI advances its OWN offset by 1 per draft
-//     step. On any rejection we rewind by `accepted_count - depth`
-//     via `mlx_qwen35_mtp_compiled_adjust_offset`. The MTP path is
-//     by design 1-token behind the main path's accepted prefix.
+// Cache-rollback strategy:
+//   - The verify step advances the MAIN attention K/V by `depth + 1`
+//     positions. On rejection we leave the over-written K/V entries
+//     at positions `[accepted .. depth+1]` in place — the next
+//     forward simply overwrites them — and rewind the logical offset
+//     instead (see `restore_and_replay_main`).
+//   - The MTP draft path runs one step per draft position and is by
+//     design 1 token behind the main path's accepted prefix; its
+//     state is re-anchored each cycle in `begin_cycle`.
 //   - `Qwen3_5LayerCache::snapshot_all` / `restore_all` is the
-//     EAGER-PATH rollback primitive. On the compiled path the live
-//     K/V lives in `g_compiled_caches` (C++), not `self.caches`, so
-//     the snapshot/restore is intentionally NOT used here.
+//     rollback primitive: the live K/V and GDN recurrent state live
+//     in `inner.caches` (Rust), so `snapshot_main_linear` captures
+//     them before verify and `restore_and_replay_main` rewinds them
+//     on rejection.
 //
 // Tracker / budget invariant:
 //   - `should_force_think_end()` is checked BEFORE starting each
-//     draft cycle. If forced, the macro emits ONE forced token via
+//     draft cycle. If forced, the loop emits ONE forced token via
 //     the normal main-path forward + sampler and skips the cycle.
 //   - It is also checked BEFORE accepting each individual verified
-//     token. If forced mid-cycle, the macro aborts the remaining
-//     accepted tokens, rewinds the offsets to (already-emitted + 1)
-//     committed positions on top of the forced token, and emits the
-//     forced token through the normal path.
+//     token. If forced mid-cycle, the loop aborts the remaining
+//     accepted tokens, rewinds to (already-emitted + 1) committed
+//     positions on top of the forced token, and emits the forced
+//     token through the normal path.
 // =============================================================================
 
-/// Closure bundle for the MTP cycle. Mirrors `DecodeOps` but adds
-/// draft / verify / rollback hooks that are only meaningful on the
-/// dense compiled path.
+/// Closure bundle for the MTP cycle. Mirrors `DecodeOps` but adds the
+/// eager draft / verify / rollback hooks the MTP loop drives.
 ///
 /// `F`  : single main-path forward step returning `(logits, hidden,
 ///        needs_squeeze)`. `hidden` is `[1, hidden_size]` bf16.
@@ -1069,58 +1024,50 @@ pub(crate) use decode_loop;
 /// `V`  : MTP verify step returning verify logits of shape
 ///        `[1, depth + 1, vocab]`.
 /// `R`  : rollback hook receiving `(accepted, depth)`. On rejection
-///        the implementor calls
-///        `mlx_qwen35_mtp_compiled_adjust_offset(accepted as i32 -
-///        depth as i32)` (MTP path only). The MAIN path's offset is
-///        rewound by `restore_and_replay_main` via the snapshot taken
-///        in `snapshot_main_linear` — DO NOT also call
-///        `mlx_qwen35_compiled_adjust_offset` here, or the main
-///        offset will double-rewind.
+///        the implementor rewinds the MTP draft state to the accepted
+///        prefix. The MAIN path's K/V is rewound by
+///        `restore_and_replay_main` via the snapshot taken in
+///        `snapshot_main_linear` — the two hooks must not both rewind
+///        the main offset, or it will double-rewind.
 /// `E`  : eval-step hook (same contract as `DecodeOps::eval_step`)
 ///        called after every emitted token to flush the lazy graph.
 /// `B`  : begin-cycle hook called once per outer iteration, BEFORE
 ///        the draft steps, AFTER Step A's main-path forward. The
-///        implementor reads the main path's current offset (via
-///        `mlx_qwen35_get_cache_offset` / `mlx_qwen35_moe_get_cache_offset`)
-///        and calls the corresponding `*_begin_cycle(main_offset)` FFI
-///        to zero the MTP K/V caches and re-anchor the MTP offset.
-///        Required for correctness: without the reset the MTP offset
-///        lags the main offset by 2 per cycle (mid-stream divergence).
-/// `S`  : snapshot hook for the main path's GDN linear-attention caches
-///        plus the main decode offset. Called once per cycle AFTER
-///        Step A and BEFORE verify. Implementor calls
-///        `mlx_qwen35_compiled_snapshot_linear_caches` (or the MoE
-///        equivalent). The snapshot is consumed by
-///        `restore_and_replay_main` on rejection — without it the
-///        GDN recurrent state stays polluted with rejected draft
-///        positions and the next Step A produces wrong logits.
+///        implementor re-anchors the MTP draft caches/offset to the
+///        main path's current position. Required for correctness:
+///        without the re-anchor the MTP offset lags the main offset
+///        by 2 per cycle (mid-stream divergence).
+/// `S`  : snapshot hook for the main path's K/V and GDN
+///        linear-attention caches plus the main decode offset. Called
+///        once per cycle AFTER Step A and BEFORE verify. Implementor
+///        calls `Qwen3_5LayerCache::snapshot_all` on `inner.caches`.
+///        The snapshot is consumed by `restore_and_replay_main` on
+///        rejection — without it the GDN recurrent state stays
+///        polluted with rejected draft positions and the next Step A
+///        produces wrong logits.
 /// `RR` : restore + replay hook called on rejection (any
 ///        `accepted_drafts < depth`) AFTER `rollback`. Receives the
 ///        list of accepted draft token IDs (NOT including the residual
 ///        sample, NOT including `last_committed`) and the embedding
 ///        weight. Implementor:
-///          1. Calls `mlx_qwen35_compiled_restore_linear_caches`
-///             (rewinds linear caches AND main offset to the
-///             snapshot point);
-///          2. For each accepted draft, runs ONE
-///             `mlx_qwen35_forward_compiled` (via
-///             `forward_with_hidden` to keep the implementation
-///             path-agnostic) so the main linear state catches up to
-///             "after Step A + K accepted drafts" and the main offset
-///             reaches `snapshot_offset + K`.
-///        On full-accept the macro skips this hook (verify already
+///          1. Restores the linear caches and main offset to the
+///             snapshot point (`Qwen3_5LayerCache::restore_all`);
+///          2. For each accepted draft, runs ONE eager main-path
+///             forward (via `forward_with_hidden`) so the main linear
+///             state catches up to "after Step A + K accepted drafts"
+///             and the main offset reaches `snapshot_offset + K`.
+///        On full-accept the loop skips this hook (verify already
 ///        left the linear state advanced through all D drafts).
 pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
     D: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray)>,
-    // verify returns logits, verify_hiddens, and optionally precomputed
-    // greedy target ids. Logits shape is `[1, depth+1, vocab]`; hiddens
-    // shape is `[1, depth+1, hidden]`; target_argmax shape is
-    // `[1, depth+1]` int32 when the backend can return it from the compiled
-    // verify graph. In the greedy argmax-only and stochastic native sparse-target
-    // paths, logits may be absent; those paths carry `target_argmax` or
-    // `target_sparse` respectively.
+    // verify returns logits and verify_hiddens. Logits shape is
+    // `[1, depth+1, vocab]`; hiddens shape is `[1, depth+1, hidden]`. The
+    // eager verify step always returns dense logits (`logits_only`); the
+    // per-position accept loop derives any argmax/sparse target from those
+    // logits. The optional `target_argmax` / `target_sparse` fields stay
+    // `None` on every eager path.
     //
     // The hiddens carry the post-final-norm output at EVERY verify position.
     // After `run_mtp_cycle_inner` computes the number of accepted drafts K,
@@ -1243,53 +1190,16 @@ pub(crate) struct MtpVerifyOutput {
 }
 
 impl MtpVerifyOutput {
-    /// Verify produced dense logits only, with no precomputed target — the
-    /// MoE compiled path and the dense chained-cycle path.
+    /// Verify produced dense logits only, with no precomputed target. The
+    /// eager dense and MoE verify paths build only this variant; the
+    /// per-position accept loop derives any argmax/sparse target from the
+    /// dense logits.
     pub(crate) fn logits_only(logits: MxArray, hiddens: MxArray) -> Self {
         Self {
             logits: Some(logits),
             hiddens,
             target_argmax: None,
             target_sparse: None,
-        }
-    }
-
-    /// Verify produced dense logits plus the precomputed greedy-argmax target.
-    pub(crate) fn logits_with_argmax(
-        logits: MxArray,
-        hiddens: MxArray,
-        target_argmax: MxArray,
-    ) -> Self {
-        Self {
-            logits: Some(logits),
-            hiddens,
-            target_argmax: Some(target_argmax),
-            target_sparse: None,
-        }
-    }
-
-    /// Verify produced only the greedy-argmax target (no dense logits) — the
-    /// `argmax_only` fast path.
-    pub(crate) fn argmax_only(hiddens: MxArray, target_argmax: MxArray) -> Self {
-        Self {
-            logits: None,
-            hiddens,
-            target_argmax: Some(target_argmax),
-            target_sparse: None,
-        }
-    }
-
-    /// Verify produced a precomputed sparse target distribution (no dense
-    /// logits) — the native sparse-verify fast path.
-    pub(crate) fn sparse(
-        hiddens: MxArray,
-        target_sparse: sampling::SparseDistributionRows,
-    ) -> Self {
-        Self {
-            logits: None,
-            hiddens,
-            target_argmax: None,
-            target_sparse: Some(target_sparse),
         }
     }
 }
@@ -2383,10 +2293,9 @@ macro_rules! decode_loop_mtp {
         //     by the NEXT iteration before its cycle runs.
         //
         // The hidden is a lazy MLX array referencing the verify's
-        // position-K `final_norm` graph node; it stays alive because
-        // `g_compiled_caches` (its upstream) is alive for the rest of
-        // the decode loop. See `mlx_qwen35_mtp_verify_compiled_with_hidden`
-        // for the C++ lifetime contract.
+        // position-K `final_norm` graph node; the eager verify step
+        // returns it alongside the verify logits, and it stays alive
+        // for the rest of the decode loop as long as the cycle holds it.
         let chained_cycles_enabled: bool =
             $crate::models::qwen3_5::mtp_decode::mtp_chained_cycles_enabled();
         let mut chained_hidden_opt: Option<$crate::array::MxArray> = None;
@@ -2400,9 +2309,9 @@ macro_rules! decode_loop_mtp {
         // call (no transitions ever fire because `record_cycle` is gated
         // below).
         //
-        // The compiled MTP verify graphs are pre-warmed at model load
-        // for every depth `D ∈ {1..=5}`, so swinging the depth freely
-        // between cycles is zero-cost from the compile side.
+        // The eager MTP verify forward builds its graph per cycle from
+        // the live depth, so swinging the depth freely between cycles
+        // carries no extra setup cost.
         let mut mtp_depth_policy =
             $crate::models::qwen3_5::adaptive_depth::AdaptiveDepthPolicy::new(
                 $depth.min(u8::MAX as usize) as u8,
@@ -2851,21 +2760,16 @@ macro_rules! decode_loop_mtp {
 
             // Throttled per-cycle MTP trace. Mirrors the AR loop's
             // every-32-steps cadence in token-count units so MTP and
-            // AR runs leave comparable breadcrumb density. Reports the
-            // dense compiled main-path cache offset; on the MoE path
-            // this is the dense global and will read 0 — verify MoE
-            // offsets via `mtp_chained_hidden_opt`-flavoured tooling.
+            // AR runs leave comparable breadcrumb density.
             if ($gen.len() / 32) != (($gen.len() + outcome.tokens.len()) / 32) {
-                let cache_offset = unsafe { mlx_sys::mlx_qwen35_get_cache_offset() };
                 let first_tok = outcome.tokens.first().copied().unwrap_or(0);
                 tracing::info!(
                     "Qwen3.5 decode MTP cycle gen_len={} depth={} committed={} \
-                     first_tok={} cache_offset={}",
+                     first_tok={}",
                     $gen.len(),
                     outcome.effective_depth,
                     outcome.tokens.len(),
                     first_tok,
-                    cache_offset,
                 );
             }
             // Feed observation to the policy AFTER the cycle's tokens
@@ -3114,7 +3018,6 @@ mod mtp_cycle_tests {
     use crate::engine::params::extract_chat_params;
     use crate::engine::types::ChatConfig;
     use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
-    use crate::sampling::{SamplingConfig, SparseDistributionRows};
 
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -3212,26 +3115,12 @@ mod mtp_cycle_tests {
                 MxArray::from_float32(&data, &[1, positions as i64, VOCAB]).expect("verify logits");
             // Per-position verify hiddens: [1, depth+1, hidden].
             // Mirrors the production stacked `[1, D+1, hidden_size]`
-            // contract `mlx_qwen35_mtp_verify_compiled_with_hidden`
-            // ships.
+            // contract the eager verify path exports (the post-final-norm
+            // hidden at every verify position).
             let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
             let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
                 .expect("verify hiddens stub");
             Ok(MtpVerifyOutput::logits_only(arr, hiddens))
-        }
-    }
-
-    fn make_sparse_verify<'a>(
-        target_sparse: SparseDistributionRows,
-        counter: &'a RefCell<usize>,
-    ) -> impl FnMut(&MxArray, &MxArray, usize) -> napi::Result<MtpVerifyOutput> + 'a {
-        move |_ids: &MxArray, _emb: &MxArray, depth: usize| {
-            *counter.borrow_mut() += 1;
-            let positions = depth + 1;
-            let zero_hiddens = vec![0.0f32; positions * HIDDEN as usize];
-            let hiddens = MxArray::from_float32(&zero_hiddens, &[1, positions as i64, HIDDEN])
-                .expect("verify hiddens stub");
-            Ok(MtpVerifyOutput::sparse(hiddens, target_sparse.clone()))
         }
     }
 
@@ -3587,94 +3476,6 @@ mod mtp_cycle_tests {
             Some((vec![0u32, 5, 7], 1)),
             "depth=1 full-accept commit payload must include last_committed, draft, and bonus"
         );
-    }
-
-    #[test]
-    fn sparse_stochastic_accept_uses_precomputed_target_rows_without_logits() {
-        let depth = 1usize;
-        let Some(emb) = fake_embedding() else { return };
-        let Some(prev_h) = fake_hidden() else { return };
-        let Some(prev_e) = fake_hidden() else { return };
-
-        let draft_ids = vec![1i32];
-        let target_sparse = SparseDistributionRows::from_precomputed(
-            vec![1, 0, 2, 0],
-            vec![1.0, 0.0, 1.0, 0.0],
-            2,
-            2,
-            VOCAB as usize,
-            "sparse_stochastic_accept_uses_precomputed_target_rows_without_logits",
-        )
-        .expect("target sparse rows");
-        let draft_ctr = RefCell::new(0usize);
-        let verify_ctr = RefCell::new(0usize);
-        let rollback_seen = RefCell::new(None::<(usize, usize)>);
-        let commit_seen = RefCell::new(None::<(Vec<u32>, usize)>);
-
-        let mut ops = MtpOps {
-            forward_with_hidden: |_ids: &MxArray,
-                                  _emb: &MxArray|
-             -> napi::Result<(MxArray, MxArray, bool)> {
-                unreachable!()
-            },
-            draft_step: make_draft(&draft_ids, &draft_ctr),
-            verify_step: make_sparse_verify(target_sparse, &verify_ctr),
-            verify_step_argmax_only: None,
-            verify_step_sparse: None,
-            rollback: |a: usize, d: usize| {
-                *rollback_seen.borrow_mut() = Some((a, d));
-            },
-            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
-            eval_step_with_chained_hidden: |_t: &MxArray, _h: &MxArray| {},
-            begin_cycle: |_| {},
-            snapshot_main_linear: || {},
-            restore_and_replay_main: |_: &[u32], _: &MxArray| Ok(()),
-            commit_mtp: |_: MtpCommitAnchor,
-                         _: &MxArray,
-                         _: &MxArray,
-                         committed_ids: &[u32],
-                         accepted_drafts: usize,
-                         _: &MxArray| {
-                *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
-                Ok(())
-            },
-            committed_history_active: false,
-            rollback_unemitted: |_: usize| {},
-        };
-        let mut params = default_params();
-        params.sampling_config = Some(SamplingConfig {
-            temperature: Some(1.0),
-            top_k: Some(2),
-            top_p: Some(1.0),
-            min_p: Some(0.0),
-        });
-        let mut rng = StdRng::seed_from_u64(0x5A57);
-        let mut profiler = DecodeProfiler::new("test", "test");
-
-        let res = run_mtp_cycle_inner(
-            &mut ops,
-            prev_h,
-            prev_e,
-            0u32,
-            &emb,
-            &[],
-            &params,
-            &mut rng,
-            &mut profiler,
-            depth,
-            None,
-            MtpCommitAnchor::IncludeAnchor,
-        );
-        let Some((outcome, _verify_hidden)) =
-            skip_if_metal_unavailable("sparse_precomputed_target", res)
-        else {
-            return;
-        };
-        assert_eq!(*draft_ctr.borrow(), 1);
-        assert_eq!(*verify_ctr.borrow(), 1);
-        assert_eq!(outcome.tokens, vec![1u32, 2u32]);
-        assert_eq!(*rollback_seen.borrow(), Some((1, 1)));
-        assert_eq!(*commit_seen.borrow(), Some((vec![0u32, 1, 2], 1)));
     }
 
     /// All-reject path: drafter and verifier argmaxes disagree on

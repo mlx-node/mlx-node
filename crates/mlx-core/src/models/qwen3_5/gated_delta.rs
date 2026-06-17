@@ -240,6 +240,69 @@ fn gated_delta_kernel(
     Ok((y, new_state))
 }
 
+/// Per-step GDN recurrence record for the eager MTP tape replay.
+///
+/// Captures the EXACT inputs passed to [`gated_delta_kernel`] for the whole
+/// `[B, T, ...]` verify window — `q`/`k` are already GQA-expanded and
+/// RMS-norm-scaled, `g` is the post-`exp` decay (`g_log.exp()`), and `beta`
+/// is post-sigmoid. All handles are lazy `MxArray` clones (no eval, no copy).
+///
+/// On accept the replay slices each window tensor to step `t` as `[B, 1, ...]`
+/// and re-runs [`gated_delta_kernel`] AT T=1 per accepted step, threading the
+/// bf16 recurrent state between calls. Re-running the SAME kernel AR uses at
+/// T=1 reproduces the per-token bf16 round-trip of true autoregressive decode
+/// by construction — the windowed verify kernel keeps state fp32 across the
+/// whole window, which is the divergence the replay corrects.
+#[derive(Clone)]
+pub(crate) struct GdnKernelTape {
+    /// Queries `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    pub q: MxArray,
+    /// Keys `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    pub k: MxArray,
+    /// Values `[B, T, Hv, Dv]`.
+    pub v: MxArray,
+    /// Decay gate `[B, T, Hv]` (post-`exp`, i.e. `g_log.exp()`).
+    pub g: MxArray,
+    /// Beta `[B, T, Hv]` (post-sigmoid).
+    pub beta: MxArray,
+}
+
+impl GdnKernelTape {
+    /// Number of recorded window steps (`T`, = `depth + 1`).
+    pub(crate) fn window_len(&self) -> Result<i64> {
+        self.q.shape_at(1)
+    }
+
+    /// Replay the first `accepted_steps` recorded steps at T=1, threading the
+    /// bf16 recurrent state between kernel calls. Starts from `start_state`
+    /// (the pre-verify snapshot's bf16 recurrent state) and returns the
+    /// AR-exact carried state after `accepted_steps` tokens.
+    ///
+    /// Each T=1 [`gated_delta_kernel`] call casts the recurrent state to bf16
+    /// at the end (matching the AR per-token decode), so threading the bf16
+    /// state across the loop reproduces autoregressive decode bit-for-bit.
+    pub(crate) fn replay_recurrent_state(
+        &self,
+        start_state: &MxArray,
+        accepted_steps: usize,
+    ) -> Result<MxArray> {
+        let mut state = start_state.clone();
+        for t in 0..accepted_steps as i64 {
+            let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hv, Dk]
+            let k_t = self.k.slice_axis(1, t, t + 1)?;
+            let v_t = self.v.slice_axis(1, t, t + 1)?;
+            let g_t = self.g.slice_axis(1, t, t + 1)?; // [B, 1, Hv]
+            let beta_t = self.beta.slice_axis(1, t, t + 1)?;
+            // mask=None: the verify forward runs unmasked (same as AR decode),
+            // so the replay must too.
+            let (_y, new_state) =
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?;
+            state = new_state;
+        }
+        Ok(state)
+    }
+}
+
 /// Single timestep of the gated delta recurrence (delta rule) — ops-based fallback.
 ///
 /// Shapes:
@@ -403,6 +466,32 @@ pub fn gated_delta_update(
     mask: Option<&MxArray>,
     use_kernel: bool,
 ) -> Result<(MxArray, MxArray)> {
+    gated_delta_update_with_tape(q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, None)
+}
+
+/// Tape-recording variant of [`gated_delta_update`].
+///
+/// Identical to [`gated_delta_update`] except that, when the per-step Metal
+/// kernel runs (`use_kernel`, `k_dim % 32 == 0`, not chunked), it records the
+/// exact `(q, k, v, g, beta)` window tensors into `tape_sink` for the eager
+/// MTP replay. The captured `q`/`k` are GQA-expanded + RMS-norm-scaled and `g`
+/// is `g_log.exp()` — i.e. EXACTLY the tensors handed to the kernel, by lazy
+/// `.clone()` (no eval). When `tape_sink` is `None` the behavior is
+/// byte-identical to [`gated_delta_update`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_with_tape(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state: Option<&MxArray>,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    mut tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
     let num_k_heads = q.shape_at(2)?;
     let num_v_heads = v.shape_at(2)?;
@@ -529,6 +618,19 @@ pub fn gated_delta_update(
         // Per-step kernel needs exponentiated decay factor
         let g = g_log.exp()?;
         if let Ok(result) = gated_delta_kernel(&q, &k, v, &g, &beta, &initial_state, mask) {
+            // Record the EXACT kernel inputs (lazy clones, no eval) for the
+            // eager MTP tape replay. Only the per-step kernel path is recorded —
+            // verify decode always lands here (seq < CHUNK_THRESHOLD, k_dim % 32
+            // == 0, mask=None), so a `None` sink on every other path is correct.
+            if let Some(sink) = tape_sink.take() {
+                *sink = Some(GdnKernelTape {
+                    q: q.clone(),
+                    k: k.clone(),
+                    v: v.clone(),
+                    g: g.clone(),
+                    beta: beta.clone(),
+                });
+            }
             return Ok(result);
         }
     }
@@ -638,5 +740,97 @@ mod tests {
         assert_eq!(parse_gdn_kernel(None, Some("on")), GdnKernel::ForcePerStep);
         assert_eq!(parse_gdn_kernel(None, Some("0")), GdnKernel::Auto);
         assert_eq!(parse_gdn_kernel(None, Some("")), GdnKernel::Auto);
+    }
+
+    use crate::array::DType;
+
+    fn rand_bf16(shape: &[i64]) -> MxArray {
+        MxArray::random_normal(shape, 0.0, 0.3, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        let af = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bf = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let av = af.as_ref();
+        let bv = bf.as_ref();
+        av.iter()
+            .zip(bv.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Diagnostic: does a per-step T=1 kernel loop (= AR decode) match
+    /// recording during a windowed kernel then replaying per-step?
+    #[test]
+    fn tape_replay_matches_per_step_ar_loop() {
+        let b = 1i64;
+        let hv = 4i64;
+        let dk = 32i64;
+        let dv = 32i64;
+        let t = 4i64;
+
+        let q = rand_bf16(&[b, t, hv, dk]);
+        let k = rand_bf16(&[b, t, hv, dk]);
+        let v = rand_bf16(&[b, t, hv, dv]);
+        // g in (0,1): sigmoid-ish decay.
+        let g = MxArray::random_normal(&[b, t, hv], 0.0, 0.3, Some(DType::Float32)).unwrap();
+        let g = Activations::sigmoid(&g).unwrap();
+        let beta = MxArray::random_normal(&[b, t, hv], 0.0, 0.3, Some(DType::Float32)).unwrap();
+        let beta = Activations::sigmoid(&beta).unwrap();
+
+        let state0 = rand_bf16(&[b, hv, dv, dk]);
+
+        // (A) Reference AR loop: per-step T=1 kernel from state0, threading bf16.
+        let ar_final = {
+            let mut s = state0.clone();
+            for ti in 0..t {
+                let q_t = q.slice_axis(1, ti, ti + 1).unwrap();
+                let k_t = k.slice_axis(1, ti, ti + 1).unwrap();
+                let v_t = v.slice_axis(1, ti, ti + 1).unwrap();
+                let g_t = g.slice_axis(1, ti, ti + 1).unwrap();
+                let beta_t = beta.slice_axis(1, ti, ti + 1).unwrap();
+                let (_y, ns) =
+                    gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &s, None).unwrap();
+                s = ns;
+            }
+            s.eval();
+            s
+        };
+
+        // (B) Windowed single call (the lossy verify-style fp32-carry path).
+        let win_final = {
+            let (_y, ns) = gated_delta_kernel(&q, &k, &v, &g, &beta, &state0, None).unwrap();
+            ns.eval();
+            ns
+        };
+
+        // (C) Replay via GdnKernelTape (records the same q,k,v,g,beta, replays
+        //     per-step T=1). This is exactly what the rollback does.
+        let tape = GdnKernelTape {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            g: g.clone(),
+            beta: beta.clone(),
+        };
+        let replay_final = tape.replay_recurrent_state(&state0, t as usize).unwrap();
+        let replay_final = {
+            replay_final.eval();
+            replay_final
+        };
+
+        let ar_vs_replay = max_abs_diff(&ar_final, &replay_final);
+        let ar_vs_win = max_abs_diff(&ar_final, &win_final);
+        eprintln!("TAPE_DIAG ar_vs_replay={ar_vs_replay:.6e} ar_vs_win={ar_vs_win:.6e}");
+
+        // The replay MUST be bit-exact to the AR per-step loop.
+        assert_eq!(
+            ar_vs_replay, 0.0,
+            "per-step tape replay must equal the AR per-step loop bit-for-bit \
+             (got max_abs_diff={ar_vs_replay:.6e})"
+        );
     }
 }

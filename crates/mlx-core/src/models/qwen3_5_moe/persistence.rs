@@ -423,11 +423,8 @@ pub(crate) fn try_build_quantized_switch_linear(
 }
 
 /// Compute the fallback PLQs that `effective_plq_for` consults when no per-layer
-/// override exists. Both `apply_weights_moe_inner` and
-/// `register_moe_weights_with_cpp` MUST agree on these defaults — the loader
-/// applies them when constructing quantized layers, and the C++ side receives
-/// them via `mlx_store_quant_info`. Any divergence would corrupt the compiled
-/// forward path.
+/// override exists. `apply_weights_moe_inner` applies these defaults when
+/// constructing quantized layers.
 ///
 /// Returns `(default_plq, default_gate_plq)`.
 ///
@@ -1181,10 +1178,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // flavor-derived from the SAME `mtp_mlp_variant` decision the
                     // load-completeness gate uses (a dense-flavored MoE MTP layer
                     // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
-                    // the dense suffix list). Injected BEFORE both
-                    // `apply_weights_moe_inner` (eager) and
-                    // `register_moe_weights_with_cpp` (compiled) so both MoE MTP
-                    // paths resolve the correct PLQ.
+                    // the dense suffix list). Injected BEFORE
+                    // `apply_weights_moe_inner` so the MoE MTP path resolves
+                    // the correct PLQ.
                     let mtp_linear_suffixes: &[&str] =
                         match super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config) {
                             DrafterBodyVariant::Moe => &MTP_MOE_LAYER_LINEAR_SUFFIXES,
@@ -1233,26 +1229,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         top_level_mode,
                         &per_layer_quant,
                     )?;
-
-                    // Register weights with the C++ MoE forward pass. The
-                    // compiled backend dispatches per-projection by (mode,
-                    // bits, group_size) via the quant-info registry
-                    // populated below — see `register_moe_weights_with_cpp`
-                    // and `lookup_quant_info` on the C++ side. Affine and
-                    // MXFP8 / MXFP4 / NVFP4 modes all flow through the same
-                    // compiled path.
-                    // Arm the slot-erasing Drop ONLY when registration actually
-                    // published the model id (true return). Leaves no slot on a
-                    // non-publishing path, so Drop stays off the compiled-weights
-                    // write lock (the deadlock fix).
-                    inner.compiled_slot_registered = register_moe_weights_with_cpp(
-                        &params,
-                        inner.model_id,
-                        top_level_mode,
-                        &per_layer_quant,
-                        quant_bits,
-                        quant_group_size,
-                    );
 
                     // Materialize mmap-backed weights
                     {
@@ -1481,162 +1457,6 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
-}
-
-/// Register all sanitized weights with the C++ MoE forward pass.
-/// Uses the same shared g_weights map as the dense path (mlx_store_weight).
-/// Sets model_id AFTER all weights are stored.
-///
-/// Also populates the per-projection quant-info registry
-/// (`mlx_store_quant_info`) so the compiled forward path can dispatch
-/// directly on the loader-chosen `(mode, bits, group_size)` tuple instead
-/// of inferring a mode from companion-tensor presence. The registry is
-/// populated but not yet read by C++ — Tasks 3/4 wire the consumers.
-/// Returns `true` iff the model id was published to the shared C++ registry
-/// (`mlx_set_model_id`), making the model compiled-capable and eligible to
-/// create a `g_moe_slots()` entry on first activate. The load path threads this
-/// into `Qwen35MoeInner::compiled_slot_registered` to arm the slot-erasing
-/// Drop. This path has no abort-to-eager branch, so it always publishes and
-/// returns `true`; the return is kept for parity with the dense/lfm2 loaders
-/// (and so a future abort branch can correctly report `false`).
-fn register_moe_weights_with_cpp(
-    params: &HashMap<String, MxArray>,
-    model_id: u64,
-    top_level_mode: Option<PerLayerMode>,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-    quant_bits: i32,
-    quant_group_size: i32,
-) -> bool {
-    use mlx_sys as sys;
-    use std::ffi::CString;
-
-    // MLX_QWEN35_MOE_FORCE_EAGER=1 (or the umbrella MLX_QWEN35_FORCE_EAGER=1),
-    // read ONCE per process, skips compiled C++ registration for ANY MoE
-    // checkpoint so `mlx_qwen35_moe_model_has_weights(model_id)` stays 0 and
-    // every forward takes the eager Rust path. Perf-isolation control mirroring
-    // the dense gate: lets a quantized MoE checkpoint run the eager forward so
-    // compiled-vs-eager overhead can be measured apart from kernel deltas.
-    static FORCE_EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FORCE_EAGER.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled("MLX_QWEN35_MOE_FORCE_EAGER")
-            || crate::inference_trace::env_flag_enabled("MLX_QWEN35_FORCE_EAGER")
-    }) {
-        info!(
-            "MLX_QWEN35_MOE_FORCE_EAGER: skipping MoE C++ compiled-forward weight \
-             registration (model_id={} stays unregistered → eager Rust forward path)",
-            model_id
-        );
-        return false;
-    }
-
-    // Write-lock the weight RwLock for the entire registration. Use the
-    // poison-recovering helper so a panic during a prior torn registration
-    // does not wedge every subsequent model load (a recovered writer re-runs
-    // the full clear → store → publish-id sequence below).
-    let _guard = crate::engine::compiled_lock::compiled_weights_write();
-
-    // Clear weights (shared map). `mlx_clear_weights` also clears the
-    // per-projection quant-info registry, so we re-populate both below.
-    unsafe { sys::mlx_clear_weights(model_id) };
-
-    // Drop THIS model's own MoE compiled slot before re-publishing its weights.
-    // `mlx_qwen35_moe_invalidate_compiled_graphs()` below only nulls the WORKING
-    // REGISTER (it parks whatever model is active first, to protect siblings),
-    // so it never reaches a model whose slot is currently PARKED. On the normal
-    // load path `model_id` is brand-new (freshly minted from the id counter and
-    // never activated), so this erase is a no-op. It exists so a *same-model_id*
-    // re-registration — a future in-place weight update, or a torn-load retry —
-    // can never leave stale baked-weight graphs in `g_moe_slots()[model_id]` for
-    // a later `activate(model_id)` to swap back in and run new weights through an
-    // old tape. Active model → clears the register; parked model → drops its
-    // slot; sibling slots are untouched. Mirrors the dense loader fix.
-    unsafe { sys::mlx_qwen35_moe_slot_erase(model_id) };
-
-    // Invalidate the compiled MTP-verify dispatch tables (shared with the
-    // dense Qwen3.5 path) in the SAME write-lock critical section as the
-    // weight clear, so the next verify re-traces against the weights we store
-    // just below instead of reusing the previous model's baked compile cache.
-    // See the dense loader (`register_weights_with_cpp`) for the full rationale.
-    unsafe { sys::mlx_qwen35_invalidate_compiled_graphs() };
-
-    // Also invalidate the MoE-specific compiled
-    // graphs (the MTP-verify graph plus the flat + paged AR-decode graphs
-    // in `mlx_qwen35_moe.cpp`), which bake expert/attention weights inside
-    // their traced closures and are NOT touched by the dense invalidation
-    // above. Same write-lock critical section so no in-flight compiled read
-    // overlaps.
-    unsafe { sys::mlx_qwen35_moe_invalidate_compiled_graphs() };
-
-    let store = |name: &str, array: &MxArray| {
-        let c_name = CString::new(name).expect("Weight name contains null byte");
-        unsafe {
-            sys::mlx_store_weight(c_name.as_ptr(), array.as_raw_ptr());
-        }
-    };
-
-    // Projections are already merged by sanitize_weights → merge_split_projections
-    // (handles both bf16 concat and quantized scales/biases concat correctly).
-    // Just store all params directly.
-    for (name, array) in params {
-        store(name, array);
-    }
-
-    let count = unsafe { sys::mlx_weight_count() };
-    info!("Registered {} weights with C++ MoE forward pass", count);
-
-    // Compute the same default PLQs that `apply_weights_moe_inner` uses,
-    // so the C++ side gets the exact (mode, bits, group_size) tuple the
-    // Rust loaders chose for each layer.
-    let (default_plq, default_gate_plq) =
-        compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
-
-    // Walk params for `.scales` companions — those mark quantized
-    // projection prefixes that the compiled C++ path will dispatch on.
-    // For each, derive the effective PLQ via the same logic
-    // `apply_weights_moe_inner` uses, and pass the
-    // (mode, bits, group_size) tuple to the C++ registry.
-    let mut quant_info_count = 0usize;
-    for name in params.keys() {
-        if let Some(prefix) = name.strip_suffix(".scales") {
-            let plq =
-                effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
-            let mode_str = match plq.mode {
-                PerLayerMode::Affine => "affine",
-                PerLayerMode::Mxfp8 => "mxfp8",
-                PerLayerMode::Mxfp4 => "mxfp4",
-                PerLayerMode::Nvfp4 => "nvfp4",
-                // Unreachable: `apply_weights_moe_inner` rejects sym8
-                // checkpoints before registration runs. Refuse rather than
-                // hand the compiled registry a mode it cannot dispatch.
-                PerLayerMode::Sym8 => {
-                    warn!(
-                        "sym8 prefix '{}' reached the MoE quant-info registry; skipping",
-                        prefix
-                    );
-                    continue;
-                }
-            };
-            let c_prefix = CString::new(prefix).expect("Prefix contains null byte");
-            let c_mode = CString::new(mode_str).expect("Mode string contains null byte");
-            unsafe {
-                sys::mlx_store_quant_info(
-                    c_prefix.as_ptr(),
-                    c_mode.as_ptr(),
-                    plq.bits,
-                    plq.group_size,
-                );
-            }
-            quant_info_count += 1;
-        }
-    }
-    info!(
-        "Registered {} quant-info entries with C++ MoE forward pass",
-        quant_info_count
-    );
-
-    // Set model ID AFTER all weights are stored.
-    unsafe { sys::mlx_set_model_id(model_id) };
-    true
 }
 
 /// Create a random-init Qwen3.5 MoE model and save it to disk.

@@ -4,9 +4,99 @@ use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
 use super::config::Qwen3_5Config;
-use super::gated_delta::gated_delta_update;
+use super::gated_delta::{GdnKernelTape, gated_delta_update, gated_delta_update_with_tape};
 use super::quantized_linear::{LinearProj, QuantizedLinear};
 use super::rms_norm_gated::RMSNormGated;
+
+/// Per-GDN-layer tape recorded during the eager MTP verify forward.
+///
+/// Holds everything the eager MTP rollback replay needs to reconstruct the
+/// AR-exact carried GDN state for a layer:
+///   * `kernel` — the `(q, k, v, g, beta)` window handed to the per-step
+///     recurrence kernel (used to replay the recurrent state at T=1).
+///   * `qkv` — the post-mask, pre-conv `[B, T, conv_dim]` activation (used to
+///     rebuild the conv state by slicing the accepted prefix).
+///   * `conv_kernel_dim` — depthwise conv kernel size; `keep = conv_kernel_dim
+///     - 1` is the conv-state window length.
+///
+/// All array fields are lazy `MxArray` clones (no eval, no copy) so recording
+/// stays inside the fused lazy MLX graph.
+#[derive(Clone)]
+pub(crate) struct GdnLayerTape {
+    pub kernel: GdnKernelTape,
+    pub qkv: MxArray,
+    pub conv_kernel_dim: i32,
+}
+
+impl GdnLayerTape {
+    /// Replay the accepted prefix into the pre-verify snapshot caches.
+    ///
+    /// `accepted_steps = accepted_drafts + 1`. Rebuilds BOTH the recurrent
+    /// state (per-step T=1 kernel replay from `snapshot_recurrent`, threading
+    /// bf16 between calls = AR round-trip) and the conv state (slice the
+    /// accepted prefix of the recorded `qkv` onto `snapshot_conv`), then writes
+    /// them into the live cache slots (slot 0 = conv_state, slot 1 =
+    /// recurrent_state).
+    ///
+    /// On full accept this is idempotent with what the verify forward already
+    /// set the conv state to; on partial accept it correctly trims to the
+    /// accepted prefix. Stays inside the lazy graph (no eval).
+    pub(crate) fn replay_into(
+        &self,
+        cache: &mut ArraysCache,
+        snapshot_conv: Option<&MxArray>,
+        snapshot_recurrent: Option<&MxArray>,
+        accepted_steps: usize,
+    ) -> Result<()> {
+        // --- Recurrent state ---------------------------------------------
+        // Start from the pre-verify (bf16) recurrent state. If the snapshot
+        // had no recurrent state (cold cache — should not happen at decode
+        // time), zero-init to the recorded shapes via the kernel's own
+        // zero-state default by re-deriving from `v`.
+        let start_state = match snapshot_recurrent {
+            Some(s) => s.clone(),
+            None => {
+                let batch = self.kernel.v.shape_at(0)?;
+                let num_v_heads = self.kernel.v.shape_at(2)?;
+                let v_dim = self.kernel.v.shape_at(3)?;
+                let k_dim = self.kernel.q.shape_at(3)?;
+                MxArray::zeros(
+                    &[batch, num_v_heads, v_dim, k_dim],
+                    Some(self.kernel.v.dtype()?),
+                )?
+            }
+        };
+        let new_recurrent = self
+            .kernel
+            .replay_recurrent_state(&start_state, accepted_steps)?;
+        cache.set(1, new_recurrent);
+
+        // --- Conv state --------------------------------------------------
+        let keep = (self.conv_kernel_dim - 1) as i64;
+        if keep > 0 {
+            let conv_dim = self.qkv.shape_at(2)?;
+            // Prefix of the recorded qkv covering exactly the accepted steps.
+            let qkv_prefix = self.qkv.slice_axis(1, 0, accepted_steps as i64)?;
+            // conv_input = snapshot.conv_state ++ qkv_prefix  (axis 1).
+            let conv_input = match snapshot_conv {
+                Some(state) => MxArray::concatenate(state, &qkv_prefix, 1)?,
+                None => {
+                    let batch = self.qkv.shape_at(0)?;
+                    let zeros = MxArray::zeros(&[batch, keep, conv_dim], Some(self.qkv.dtype()?))?;
+                    MxArray::concatenate(&zeros, &qkv_prefix, 1)?
+                }
+            };
+            // Keep the last `keep` timesteps as the new conv_state — mirrors
+            // GatedDeltaNet::forward's conv-state update (cache slot 0).
+            let total_len = conv_input.shape_at(1)?;
+            if total_len >= keep {
+                let new_conv_state = conv_input.slice_axis(1, total_len - keep, total_len)?;
+                cache.set(0, new_conv_state);
+            }
+        }
+        Ok(())
+    }
+}
 
 /// GatedDeltaNet: Linear attention module using gated delta recurrence.
 ///
@@ -140,8 +230,26 @@ impl GatedDeltaNet {
         &self,
         x: &MxArray,
         mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+    ) -> Result<MxArray> {
+        self.forward_with_tape(x, mask, cache, use_kernel, None)
+    }
+
+    /// Tape-recording variant of [`GatedDeltaNet::forward`].
+    ///
+    /// When `tape_sink` is `Some`, records the post-mask pre-conv `qkv` plus
+    /// the per-step kernel inputs into a [`GdnLayerTape`] for the eager MTP
+    /// rollback replay. When `None`, behavior is byte-identical to
+    /// [`GatedDeltaNet::forward`]. All recording is by lazy `.clone()` (no
+    /// eval), so it stays inside the fused MLX graph.
+    pub(crate) fn forward_with_tape(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
+        mut tape_sink: Option<&mut Option<GdnLayerTape>>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -187,6 +295,11 @@ impl GatedDeltaNet {
         } else {
             qkv
         };
+
+        // Record the post-mask, pre-conv `qkv` for the eager MTP tape (lazy
+        // clone, no eval). The conv-state rebuild on accept slices the accepted
+        // prefix of this exact tensor.
+        let tape_qkv = tape_sink.as_ref().map(|_| qkv.clone());
 
         // Handle conv_state: always prepend padding (zeros or cached state)
         let conv_state = if let Some(ref cache) = cache {
@@ -274,18 +387,46 @@ impl GatedDeltaNet {
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
-        let (y, new_state) = gated_delta_update(
-            &q,
-            &k,
-            &v,
-            &a,
-            &b,
-            &self.a_log,
-            &self.dt_bias,
-            recurrent_state,
-            mask,
-            use_kernel,
-        )?;
+        let (y, new_state) = if tape_sink.is_some() {
+            // Record the per-step kernel inputs into a local sink, then fold
+            // them (plus the recorded qkv) into the layer tape below.
+            let mut kernel_sink: Option<GdnKernelTape> = None;
+            let result = gated_delta_update_with_tape(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                mask,
+                use_kernel,
+                Some(&mut kernel_sink),
+            )?;
+            if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
+            {
+                *sink = Some(GdnLayerTape {
+                    kernel,
+                    qkv,
+                    conv_kernel_dim: self.conv_kernel_dim,
+                });
+            }
+            result
+        } else {
+            gated_delta_update(
+                &q,
+                &k,
+                &v,
+                &a,
+                &b,
+                &self.a_log,
+                &self.dt_bias,
+                recurrent_state,
+                mask,
+                use_kernel,
+            )?
+        };
 
         // Update recurrent state in cache
         if let Some(cache) = cache {

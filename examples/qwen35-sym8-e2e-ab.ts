@@ -8,7 +8,7 @@
  *              (config quantization mode == "sym8"; eager Rust forward,
  *              int8 W8A8 GEMM at prefill M>=3, fused int8 qmv at decode M<=2)
  *   base arm : the 8-bit affine baseline checkpoint
- *              (stock quantized_matmul; compiled C++ decode path)
+ *              (stock quantized_matmul; eager Rust decode path)
  *
  * One invocation = one model load + warmup + N measured reps in ONE
  * thermal/process arm. Metrics come from the native `reportPerformance` path
