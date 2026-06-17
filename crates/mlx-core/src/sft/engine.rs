@@ -20,9 +20,10 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tracing::{info, warn};
 
-use crate::models::qwen3::{Qwen3Cmd, Qwen3Model};
-use crate::models::qwen3_5::model::{Qwen3_5Model, Qwen35Cmd};
-use crate::models::qwen3_5_moe::model::{Qwen3_5MoeModel, Qwen35MoeCmd};
+use crate::engine::cmd::TrainCmd;
+use crate::models::qwen3::Qwen3Model;
+use crate::models::qwen3_5::model::Qwen3_5Model;
+use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use crate::training_model::{ModelType, TrainStepPlainMetrics, TrainingDispatch};
 
 /// Configuration for the SFT training engine
@@ -212,19 +213,18 @@ impl SftTrainingEngine {
 
         // Send InitTraining to set up optimizer + state on model thread
         let grpo_config = Self::sft_config_to_grpo_config(&config);
+        let dispatch = TrainingDispatch::Qwen3(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen3Cmd::InitTraining {
-                config: Box::new(grpo_config),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(grpo_config),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen3(sender),
+            dispatch,
             config,
             state: Arc::new(RwLock::new(EngineState::default())),
         })
@@ -249,19 +249,18 @@ impl SftTrainingEngine {
             .clone();
 
         let grpo_config = Self::sft_config_to_grpo_config(&config);
+        let dispatch = TrainingDispatch::Qwen35Dense(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen35Cmd::InitTraining {
-                config: Box::new(grpo_config),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(grpo_config),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen35Dense(sender),
+            dispatch,
             config,
             state: Arc::new(RwLock::new(EngineState::default())),
         })
@@ -286,19 +285,18 @@ impl SftTrainingEngine {
             .clone();
 
         let grpo_config = Self::sft_config_to_grpo_config(&config);
+        let dispatch = TrainingDispatch::Qwen35Moe(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen35MoeCmd::InitTraining {
-                config: Box::new(grpo_config),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(grpo_config),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen35Moe(sender),
+            dispatch,
             config,
             state: Arc::new(RwLock::new(EngineState::default())),
         })
@@ -696,44 +694,14 @@ impl SftTrainingEngine {
         config: SftEngineConfig,
     ) -> Result<TrainStepPlainMetrics> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::TrainStepSFT {
-                        input_ids,
-                        input_shape,
-                        labels,
-                        labels_shape,
-                        config,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::TrainStepSFT {
-                        input_ids,
-                        input_shape,
-                        labels,
-                        labels_shape,
-                        config,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::TrainStepSFT {
-                        input_ids,
-                        input_shape,
-                        labels,
-                        labels_shape,
-                        config,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch.send_train(TrainCmd::TrainStepSFT {
+            input_ids,
+            input_shape,
+            labels,
+            labels_shape,
+            config,
+            reply: tx,
+        })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
@@ -745,23 +713,8 @@ impl SftTrainingEngine {
     /// method.
     fn dispatch_reset_training_blocking(&self) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::ResetTraining { reply: tx })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
@@ -774,23 +727,8 @@ impl SftTrainingEngine {
     /// `restore_state()` NAPI method.
     fn dispatch_set_training_step_blocking(&self, step: i64) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::SetTrainingStep { step, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::SetTrainingStep { step, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::SetTrainingStep { step, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::SetTrainingStep { step, reply: tx })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }

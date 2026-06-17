@@ -39,14 +39,15 @@ use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
+use crate::engine::cmd::TrainCmd;
 use crate::grpo::loss::GRPOLossConfig;
 use crate::grpo::rewards::{
     BuiltinRewardConfig, JsonSchemaReward, LengthReward, RewardRegistry, ToolUseReward,
     XMLFormatReward,
 };
-use crate::models::qwen3::{GenerationConfig, Qwen3Cmd, Qwen3Model};
-use crate::models::qwen3_5::model::{Qwen3_5Model, Qwen35Cmd};
-use crate::models::qwen3_5_moe::model::{Qwen3_5MoeModel, Qwen35MoeCmd};
+use crate::models::qwen3::{GenerationConfig, Qwen3Model};
+use crate::models::qwen3_5::model::Qwen3_5Model;
+use crate::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use crate::tokenizer::{ChatMessage, ToolDefinition};
 use crate::tools::build_reward_outputs;
 use crate::training_model::{
@@ -451,19 +452,18 @@ impl GRPOTrainingEngine {
             .clone();
 
         // Send InitTraining to set up optimizer + state on model thread
+        let dispatch = TrainingDispatch::Qwen3(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen3Cmd::InitTraining {
-                config: Box::new(config.clone()),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(config.clone()),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen3(sender),
+            dispatch,
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
@@ -489,19 +489,18 @@ impl GRPOTrainingEngine {
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
 
+        let dispatch = TrainingDispatch::Qwen35Dense(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen35Cmd::InitTraining {
-                config: Box::new(config.clone()),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(config.clone()),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen35Dense(sender),
+            dispatch,
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
@@ -527,19 +526,18 @@ impl GRPOTrainingEngine {
             .ok_or_else(|| Error::from_reason("Model thread not running"))?
             .clone();
 
+        let dispatch = TrainingDispatch::Qwen35Moe(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(Qwen35MoeCmd::InitTraining {
-                config: Box::new(config.clone()),
-                model_type: model_type.clone(),
-                reply: tx,
-            })
-            .map_err(|_| Error::from_reason("Model thread has exited"))?;
+        dispatch.send_train(TrainCmd::InitTraining {
+            config: Box::new(config.clone()),
+            model_type: model_type.clone(),
+            reply: tx,
+        })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited during init"))??;
 
         Ok(Self {
-            dispatch: TrainingDispatch::Qwen35Moe(sender),
+            dispatch,
             model_type,
             config,
             reward_registry: RewardRegistry::new(),
@@ -1577,44 +1575,14 @@ impl GRPOTrainingEngine {
             })
             .collect();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::GenerateForTraining {
-                        prompts: owned_prompts,
-                        group_size,
-                        gen_config,
-                        enable_thinking,
-                        tools,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::GenerateForTraining {
-                        prompts: owned_prompts,
-                        group_size,
-                        gen_config,
-                        enable_thinking,
-                        tools,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::GenerateForTraining {
-                        prompts: owned_prompts,
-                        group_size,
-                        gen_config,
-                        enable_thinking,
-                        tools,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch.send_train(TrainCmd::GenerateForTraining {
+            prompts: owned_prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+            reply: tx,
+        })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
@@ -1628,41 +1596,13 @@ impl GRPOTrainingEngine {
         valid_indices: Option<Vec<usize>>,
     ) -> Result<TrainStepPlainMetrics> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::TrainStepGRPO {
-                        rewards,
-                        group_size,
-                        loss_config,
-                        valid_indices,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::TrainStepGRPO {
-                        rewards,
-                        group_size,
-                        loss_config,
-                        valid_indices,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::TrainStepGRPO {
-                        rewards,
-                        group_size,
-                        loss_config,
-                        valid_indices,
-                        reply: tx,
-                    })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch.send_train(TrainCmd::TrainStepGRPO {
+            rewards,
+            group_size,
+            loss_config,
+            valid_indices,
+            reply: tx,
+        })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
@@ -1679,23 +1619,8 @@ impl GRPOTrainingEngine {
     /// thread (success path uses `metrics.step`, skip path uses this).
     async fn dispatch_bump_skipped_step(&self) -> Result<i64> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::BumpSkippedStep { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::BumpSkippedStep { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::BumpSkippedStep { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::BumpSkippedStep { reply: tx })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
@@ -1707,69 +1632,24 @@ impl GRPOTrainingEngine {
     /// invoked from the sync `reset()` NAPI method.
     fn dispatch_reset_training_blocking(&self) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::ResetTraining { reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::ResetTraining { reply: tx })?;
         rx.blocking_recv()
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
 
     async fn dispatch_save_optimizer_state(&self, path: String) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::SaveOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::SaveOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::SaveOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::SaveOptimizerState { path, reply: tx })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }
 
     async fn dispatch_load_optimizer_state(&self, path: String) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        match &self.dispatch {
-            TrainingDispatch::Qwen3(sender) => {
-                sender
-                    .send(Qwen3Cmd::LoadOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Dense(sender) => {
-                sender
-                    .send(Qwen35Cmd::LoadOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-            TrainingDispatch::Qwen35Moe(sender) => {
-                sender
-                    .send(Qwen35MoeCmd::LoadOptimizerState { path, reply: tx })
-                    .map_err(|_| Error::from_reason("Model thread exited"))?;
-            }
-        }
+        self.dispatch
+            .send_train(TrainCmd::LoadOptimizerState { path, reply: tx })?;
         rx.await
             .map_err(|_| Error::from_reason("Model thread exited"))?
     }

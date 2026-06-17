@@ -1,93 +1,29 @@
 import { QianfanOCRModel as QianfanOCRModelNative } from '@mlx-node/core';
-import type { ChatConfig, ChatMessage } from '@mlx-node/core';
-import { _runChatStream } from '@mlx-node/lm';
-import type { ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
-
-// Save references to the native callback-based session streaming methods
-// before we override them. Captured at module load time so the subclass
-// overrides can delegate without recursing into themselves. Each wrapper
-// method below bridges the callback API to `AsyncGenerator<ChatStreamEvent>`
-// so the wrapper structurally satisfies `SessionCapableModel` and can be
-// passed to `ChatSession<QianfanOCRModel>` from `@mlx-node/lm`.
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQianfanOcrChatStreamSessionStart = QianfanOCRModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQianfanOcrChatStreamSessionContinue = QianfanOCRModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQianfanOcrChatStreamSessionContinueTool = QianfanOCRModelNative.prototype.chatStreamSessionContinueTool;
+import { makeStreamingModel } from '@mlx-node/lm';
+import type { SessionCapableModel } from '@mlx-node/lm';
 
 /**
  * Qianfan-OCR Vision-Language Model wrapper.
  *
- * Streaming is driven through the `ChatSession` API — the overrides
- * below adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
- * satisfies `SessionCapableModel` from `@mlx-node/lm`.
+ * Built from the shared {@link makeStreamingModel} factory in
+ * `@mlx-node/lm` — the empty `extends` inherits the AsyncGenerator
+ * session-streaming overrides (`chatStreamSessionStart` /
+ * `chatStreamSessionContinue` / `chatStreamSessionContinueTool`) so the
+ * wrapper structurally satisfies `SessionCapableModel` and can be
+ * passed to `ChatSession<QianfanOCRModel>`. Importing the factory from
+ * `@mlx-node/lm` is one-directional (vlm → lm), matching the existing
+ * `_runChatStream` dependency, so it introduces no circular dependency.
  *
- * Qianfan-OCR is a VLM (InternViT + Qwen3 language model). The
- * continue path cannot splice new vision features into a live KV
- * cache — image changes always require a fresh session start, which
- * the high-level `ChatSession` wrapper handles via its
- * `lastImagesKey` check.
+ * Qianfan-OCR is a VLM (InternViT + Qwen3 language model). The continue
+ * path cannot splice new vision features into a live KV cache — image
+ * changes always require a fresh session start, which the high-level
+ * `ChatSession` wrapper handles via its `lastImagesKey` check.
+ *
+ * Unlike the LM families, Qianfan-OCR does NOT record its model path
+ * (`recordModelPath: false`) and therefore exposes no
+ * `applyChatTemplate` — preserving its historical surface.
  */
-export class QianfanOCRModel extends QianfanOCRModelNative {
-  static override async load(modelPath: string): Promise<QianfanOCRModel> {
-    const instance = await QianfanOCRModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, QianfanOCRModel.prototype);
-    return instance as unknown as QianfanOCRModel;
-  }
-
-  /** Streaming variant of {@link QianfanOCRModel#chatSessionStart}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeQianfanOcrChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link QianfanOCRModel#chatSessionContinue}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeQianfanOcrChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link QianfanOCRModel#chatSessionContinueTool}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeQianfanOcrChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
+export class QianfanOCRModel extends makeStreamingModel(QianfanOCRModelNative, { recordModelPath: false }) {}
 
 // -------------------------------------------------------------------
 // Compile-time conformance check

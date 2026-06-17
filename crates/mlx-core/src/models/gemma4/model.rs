@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 
 use crate::array::{DType, MxArray};
@@ -13,7 +13,6 @@ use crate::engine::backend::{
     ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
-use crate::engine::napi_glue::start_chat_stream;
 use crate::engine::params::ChatParams;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -107,7 +106,7 @@ use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use tracing::{debug, info};
 
 /// PLE (Per-Layer Embeddings) model-level components.
@@ -4658,248 +4657,16 @@ impl Gemma4Model {
     pub async fn load(model_path: String) -> Result<Gemma4Model> {
         Self::load_from_dir(&model_path).await
     }
+}
 
-    /// Reset all caches and clear cached token history. Exposed so
-    /// tests and session-management code can start from a known clean
-    /// state between turns.
-    ///
-    /// Synchronous on the NAPI boundary — every other `SessionCapableModel`
-    /// exposes `resetCaches(): void` and the `ChatSession<M>` cross-model
-    /// wrapper calls this inline during the image-change restart and
-    /// `reset()` flows. Running it as an async NAPI method would break
-    /// that contract and silently drop reset failures because
-    /// `ChatSession.reset()` and the session-start restart path invoke
-    /// `model.resetCaches()` without awaiting.
-    #[napi]
-    pub fn reset_caches(&self) -> Result<()> {
-        let Some(thread) = self.thread.as_ref() else {
-            // Uninitialized stub (constructed via `new(config)` without
-            // `load()`): nothing to reset. Match the OCR models'
-            // silent no-op to keep `ChatSession.reset()` idempotent.
-            return Ok(());
-        };
-        crate::model_thread::send_and_block(thread, |reply| ChatCmd::ResetCaches { reply })
-    }
-
-    /// Start a new chat session.
-    ///
-    /// Runs the full jinja chat template once, decodes until Gemma4's
-    /// `<turn|>` delimiter, and leaves the KV caches on a clean turn
-    /// boundary so subsequent `chatSessionContinue` /
-    /// `chatSessionContinueTool` calls can append a raw delta on top
-    /// without re-rendering the chat template.
-    #[napi]
-    pub async fn chat_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        // Fast-fail: images on a text-only model.
-        if !self.has_vision
-            && messages
-                .iter()
-                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(
-                "Images provided but model has no vision support (no vision_config in config.json)",
-            ));
-        }
-
-        crate::model_thread::send_and_await(thread, |reply| ChatCmd::SessionStart {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a new user message.
-    ///
-    /// Appends a raw Gemma4 user/model delta to the session's cached KV
-    /// state, then decodes the model reply. Stops on `<turn|>` so the
-    /// cache remains on a clean turn boundary for the next turn.
-    ///
-    /// Requires a live session started via `chatSessionStart`. Errors
-    /// if the session is empty, carries image state, or if
-    /// `config.reuse_cache` is explicitly set to `false`.
-    ///
-    /// `images` is an opt-in guard parameter: when non-empty the native
-    /// side returns an error whose message begins with
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-    /// `ChatSession` layer can catch the prefix and route image-changes
-    /// back through a fresh `chatSessionStart` uniformly across all
-    /// model backends.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-    )]
-    pub async fn chat_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(thread, |reply| ChatCmd::SessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds a Gemma4-format tool delta
-    /// (`\n<|turn>tool\n{content}<turn|>\n<|turn>model\n`) from
-    /// `content` and prefills it on top of the live session caches,
-    /// then decodes the model reply. Stops on `<turn|>` so the cache
-    /// stays on a clean turn boundary for the next turn.
-    ///
-    /// The `tool_call_id` is currently dropped by the wire format —
-    /// Gemma4's chat template identifies tool responses positionally,
-    /// not via an explicit id. Callers may still log it for their own
-    /// bookkeeping.
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<|turn>tool` block so the model receives a clear text-level
-    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-    /// pre-feature output.
-    ///
-    /// Requires a live session started via `chatSessionStart`.
-    #[napi]
-    pub async fn chat_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        is_error: Option<bool>,
-    ) -> Result<ChatResult> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(thread, |reply| ChatCmd::SessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming variant of `chatSessionStart`.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        // Fast-fail: images on a text-only model.
-        if !self.has_vision
-            && messages
-                .iter()
-                .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(
-                "Images provided but model has no vision support (no vision_config in config.json)",
-            ));
-        }
-
-        let plumbing = start_chat_stream(callback);
-        thread.send(ChatCmd::StreamSessionStart {
-            messages,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinue`.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        thread.send(ChatCmd::StreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinueTool`.
-    ///
-    /// `is_error` mirrors the non-streaming entry point — when
-    /// `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<|turn>tool` block.
-    #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
-    )]
-    pub async fn chat_stream_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-        is_error: Option<bool>,
-    ) -> Result<ChatStreamHandle> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        thread.send(ChatCmd::StreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
-    }
+crate::models::chat_napi::chat_napi_surface! {
+    class: Gemma4Model,
+    thread_cmd: crate::engine::cmd::ChatCmd,
+    thread: { option: "Model not initialized. Call Gemma4Model.load() first." },
+    image_guard: { vision: has_vision },
+    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 
 /// How many layers to batch per eval during warmup.

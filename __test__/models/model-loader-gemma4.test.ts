@@ -22,7 +22,14 @@ import { describe, expect, it } from 'vite-plus/test';
  */
 describe('Gemma4Model re-export from @mlx-node/lm', () => {
   it('is a subclass of the native @mlx-node/core Gemma4Model', () => {
-    expect(Object.getPrototypeOf(Gemma4Model)).toBe(Gemma4ModelNative);
+    // `Gemma4Model` is built by the shared `makeStreamingModel` factory,
+    // so its immediate superclass is the factory's intermediate
+    // `StreamingModelImpl` rather than the native class directly. The
+    // subclass relationship still holds transitively — assert it via the
+    // prototype chain rather than a single-hop `getPrototypeOf` so the
+    // check survives the factory's intermediate class.
+    expect(Gemma4Model.prototype instanceof Gemma4ModelNative).toBe(true);
+    expect(Gemma4ModelNative.isPrototypeOf(Gemma4Model)).toBe(true);
   });
 
   it('overrides chatStreamSessionStart with an async generator function', () => {

@@ -22,11 +22,16 @@ use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 
-use crate::engine::backend::{ChatBackend, ResetScope};
+use crate::engine::backend::{ChatBackend, ResetScope, TrainBackend};
 use crate::engine::session;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::grpo::engine::GRPOEngineConfig;
+use crate::grpo::loss::GRPOLossConfig;
 use crate::model_thread::{ResponseTx, StreamTx};
-use crate::tokenizer::ChatMessage;
+use crate::models::qwen3::GenerationConfig;
+use crate::sft::engine::SftEngineConfig;
+use crate::tokenizer::{ChatMessage, ToolDefinition};
+use crate::training_model::{GenerationPlainData, ModelType, TrainStepPlainMetrics};
 
 /// Commands dispatched from NAPI methods to a dedicated model thread.
 ///
@@ -103,6 +108,98 @@ pub(crate) enum ChatCmd {
     /// tests and session-management code can start from a known clean
     /// state between turns.
     ResetCaches { reply: ResponseTx<()> },
+}
+
+/// Lifts a [`ChatCmd`] into a family's thread-command type.
+///
+/// Families whose model thread is `ModelThread<ChatCmd>` (lfm2, gemma4)
+/// use the identity impl; families whose thread carries extra
+/// non-chat variants (qwen3 / qwen3_5 / qwen3_5_moe ship
+/// `Generate` / `SaveModel` / training commands) nest the chat command
+/// as a `Chat(ChatCmd)` variant. The `chat_napi_surface!` macro builds
+/// every dispatched command as `<$ThreadCmd>::from_chat(ChatCmd::…)` so
+/// one method body serves both thread shapes.
+pub(crate) trait FromChatCmd {
+    fn from_chat(cmd: ChatCmd) -> Self;
+}
+
+impl FromChatCmd for ChatCmd {
+    #[inline]
+    fn from_chat(cmd: ChatCmd) -> Self {
+        cmd
+    }
+}
+
+/// Training commands dispatched from the GRPO / SFT engines to a
+/// trainable family's dedicated model thread.
+///
+/// The model-neutral generalization of the per-family training command
+/// variants (the 9 `InitTraining` / `GenerateForTraining` / `TrainStep*`
+/// / optimizer-state / step-counter commands that were byte-identical
+/// across qwen3 / qwen3_5 / qwen3_5_moe). [`handle_train_cmd`] drives
+/// the [`TrainBackend`] impl on each trainable family's `*Inner` struct.
+/// Only the three trainable families nest this as a `Train(TrainCmd)`
+/// variant — gemma4 / lfm2 are inference-only and carry no training arm.
+pub(crate) enum TrainCmd {
+    /// Set up optimizer + training state on the model thread.
+    InitTraining {
+        config: Box<GRPOEngineConfig>,
+        model_type: ModelType,
+        reply: ResponseTx<()>,
+    },
+    /// Generate a group of completions for the next GRPO training step,
+    /// caching the MxArray prompt/completion tensors on the model thread.
+    GenerateForTraining {
+        prompts: Vec<Vec<ChatMessage>>,
+        group_size: usize,
+        gen_config: GenerationConfig,
+        enable_thinking: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+        reply: ResponseTx<GenerationPlainData>,
+    },
+    /// Run one GRPO training step over the cached generation results.
+    TrainStepGRPO {
+        rewards: Vec<f64>,
+        group_size: i32,
+        loss_config: GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
+        reply: ResponseTx<TrainStepPlainMetrics>,
+    },
+    /// Bump the training step counter without applying gradients (engine
+    /// skip paths). Clears cached generation MxArrays; returns the new
+    /// step.
+    BumpSkippedStep { reply: ResponseTx<i64> },
+    /// Restore the training step counter (resume from checkpoint). Does
+    /// not touch optimizer state.
+    SetTrainingStep { step: i64, reply: ResponseTx<()> },
+    /// Drop the training state on the model thread so `InitTraining` can
+    /// run again. No-op if no training state.
+    ResetTraining { reply: ResponseTx<()> },
+    /// Run one SFT training step.
+    TrainStepSFT {
+        input_ids: Vec<i32>,
+        input_shape: Vec<i64>,
+        labels: Vec<i32>,
+        labels_shape: Vec<i64>,
+        config: SftEngineConfig,
+        reply: ResponseTx<TrainStepPlainMetrics>,
+    },
+    /// Persist the optimizer state to `path`.
+    SaveOptimizerState { path: String, reply: ResponseTx<()> },
+    /// Restore the optimizer state from `path`.
+    LoadOptimizerState { path: String, reply: ResponseTx<()> },
+}
+
+/// Lifts a [`TrainCmd`] into a trainable family's thread-command type.
+///
+/// Mirror of [`FromChatCmd`]: each trainable family nests the training
+/// command as a `Train(TrainCmd)` variant. No identity impl is needed —
+/// no family's thread carries a bare `TrainCmd`. The [`crate::training_model::TrainingDispatch`]
+/// fan-out builds every dispatched command as
+/// `<$FamilyCmd>::from_train(TrainCmd::…)` so one engine dispatch helper
+/// serves all three families.
+pub(crate) trait FromTrainCmd {
+    fn from_train(cmd: TrainCmd) -> Self;
 }
 
 /// Command handler for a dedicated model thread — the generic form of
@@ -194,6 +291,107 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
         }
         ChatCmd::ResetCaches { reply } => {
             let _ = reply.send(backend.reset_caches(ResetScope::Command));
+        }
+    }
+}
+
+/// Training-command handler for a trainable family's model thread — the
+/// generic form of the per-family training/save match arms (the inline
+/// `Bump`/`Set`/`Reset` arms plus the `*_sync` forwards) that were
+/// byte-identical across qwen3 / qwen3_5 / qwen3_5_moe.
+///
+/// `Bump`/`Set`/`Reset` operate directly on
+/// [`TrainBackend::training_state_mut`] (verbatim port of the inline
+/// arms); the other six forward to the [`TrainBackend`] `*_sync`
+/// methods. Every arm preserves the per-family `let _ = reply.send(..)`
+/// semantics exactly.
+pub(crate) fn handle_train_cmd<B: TrainBackend>(inner: &mut B, cmd: TrainCmd) {
+    match cmd {
+        TrainCmd::InitTraining {
+            config,
+            model_type,
+            reply,
+        } => {
+            let _ = reply.send(inner.init_training_sync(config, model_type));
+        }
+        TrainCmd::GenerateForTraining {
+            prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+            reply,
+        } => {
+            let _ = reply.send(inner.generate_for_training_thread_sync(
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+            ));
+        }
+        TrainCmd::TrainStepGRPO {
+            rewards,
+            group_size,
+            loss_config,
+            valid_indices,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_grpo_sync(
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+            ));
+        }
+        TrainCmd::BumpSkippedStep { reply } => {
+            let result = if let Some(ts) = inner.training_state_mut() {
+                ts.clear_generation_cache();
+                ts.step += 1;
+                Ok(ts.step)
+            } else {
+                Err(Error::from_reason(
+                    "Training state not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        TrainCmd::SetTrainingStep { step, reply } => {
+            let result = if let Some(ts) = inner.training_state_mut() {
+                ts.step = step;
+                Ok(())
+            } else {
+                Err(Error::from_reason(
+                    "Training state not initialized. Call InitTraining first.",
+                ))
+            };
+            let _ = reply.send(result);
+        }
+        TrainCmd::ResetTraining { reply } => {
+            *inner.training_state_mut() = None;
+            let _ = reply.send(Ok(()));
+        }
+        TrainCmd::TrainStepSFT {
+            input_ids,
+            input_shape,
+            labels,
+            labels_shape,
+            config,
+            reply,
+        } => {
+            let _ = reply.send(inner.train_step_sft_sync(
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+            ));
+        }
+        TrainCmd::SaveOptimizerState { path, reply } => {
+            let _ = reply.send(inner.save_optimizer_state_sync(path));
+        }
+        TrainCmd::LoadOptimizerState { path, reply } => {
+            let _ = reply.send(inner.load_optimizer_state_sync(path));
         }
     }
 }

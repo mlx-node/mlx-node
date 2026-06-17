@@ -95,48 +95,6 @@ async function applyChatTemplateFromModelPath(
   return tokenizer.applyChatTemplate(messages, addGenerationPrompt, tools, enableThinking);
 }
 
-// Capture native callback-based session-streaming methods before subclass overrides shadow them.
-
-// Dense
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeDenseChatStreamSessionStart = Qwen35ModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeDenseChatStreamSessionContinue = Qwen35ModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeDenseChatStreamSessionContinueTool = Qwen35ModelNative.prototype.chatStreamSessionContinueTool;
-
-// MoE
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeMoeChatStreamSessionStart = Qwen35MoeModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeMoeChatStreamSessionContinue = Qwen35MoeModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeMoeChatStreamSessionContinueTool = Qwen35MoeModelNative.prototype.chatStreamSessionContinueTool;
-
-// LFM2
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeLfm2ChatStreamSessionStart = Lfm2ModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeLfm2ChatStreamSessionContinue = Lfm2ModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeLfm2ChatStreamSessionContinueTool = Lfm2ModelNative.prototype.chatStreamSessionContinueTool;
-
-// Gemma4
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeGemma4ChatStreamSessionStart = Gemma4ModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeGemma4ChatStreamSessionContinue = Gemma4ModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeGemma4ChatStreamSessionContinueTool = Gemma4ModelNative.prototype.chatStreamSessionContinueTool;
-
-// Qwen3 (first-gen, text-only)
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQwen3ChatStreamSessionStart = Qwen3ModelNative.prototype.chatStreamSessionStart;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQwen3ChatStreamSessionContinue = Qwen3ModelNative.prototype.chatStreamSessionContinue;
-// oxlint-disable-next-line @typescript-eslint/unbound-method
-const _nativeQwen3ChatStreamSessionContinueTool = Qwen3ModelNative.prototype.chatStreamSessionContinueTool;
-
 /**
  * Shared AsyncGenerator adapter for callback-based native streaming methods.
  *
@@ -321,429 +279,264 @@ export async function* _runChatStream(
   }
 }
 
+// -------------------------------------------------------------------
+// Generic streaming-model factory
+// -------------------------------------------------------------------
+//
+// Every generative family (Qwen3, Qwen3.5 dense / MoE, LFM2, Gemma4,
+// and the QianfanOCR VLM in `@mlx-node/vlm`) wraps its native class
+// identically: capture the three callback-based session-streaming
+// methods, re-expose them as `AsyncGenerator<ChatStreamEvent>`, set the
+// subclass prototype in `static load`, and (for path-recording families)
+// add `applyChatTemplate`. `makeStreamingModel` builds that subclass
+// once so each family becomes a one-line `extends` declaration.
+
+/**
+ * The three callback-based session-streaming methods every native chat
+ * class carries on its prototype (and, structurally, on its instances).
+ * Used both as the native `prototype` shape and as the constructed
+ * instance type so `InstanceType<NativeStreamingCtor>` resolves to the
+ * full native instance surface (`generate`, `saveModel`,
+ * `numParameters`, `hasMtpWeights`, …) — see {@link NativeStreamingCtor}.
+ */
+interface NativeStreamingInstance {
+  chatStreamSessionStart: (...args: never[]) => Promise<ChatStreamHandle>;
+  chatStreamSessionContinue: (...args: never[]) => Promise<ChatStreamHandle>;
+  chatStreamSessionContinueTool: (...args: never[]) => Promise<ChatStreamHandle>;
+}
+
+/**
+ * Minimal structural shape of a native chat model constructor that the
+ * factory needs: a real `new (...)` signature (so `InstanceType<C>`
+ * resolves to the native instance surface and the factory return type
+ * can preserve `generate`/`saveModel`/`numParameters`/… on the public
+ * subclass), a `static load(path)`, and the three callback-based
+ * session-streaming methods on its prototype. The native NAPI classes
+ * (`Qwen35ModelNative` etc.) all satisfy this — the concrete generic
+ * `C` passed at each call site carries the full per-family instance
+ * type, which `InstanceType<C>` recovers.
+ */
+interface NativeStreamingCtor {
+  // A real constructor signature so `InstanceType<C>` resolves to the
+  // concrete native instance type at each call site. The native classes
+  // are NAPI-constructed (no public `new`), but structurally they satisfy
+  // this and the factory never actually invokes `new` on them.
+  new (...args: never[]): NativeStreamingInstance;
+  // The native classes resolve `load` to their own concrete instance
+  // type; the factory only needs it to be an object, and the public
+  // subclass return type re-narrows via `InstanceType<C>` + the
+  // `SessionCapableModel` streaming overrides.
+  load(modelPath: string): Promise<object>;
+  prototype: NativeStreamingInstance;
+}
+
+/** Tuning knobs for {@link makeStreamingModel}. */
+interface StreamingModelOptions {
+  /**
+   * When `true`, `static load` records the on-disk model path so the
+   * generated subclass can serve `applyChatTemplate` from a lazily
+   * constructed tokenizer (see {@link applyChatTemplateFromModelPath}).
+   * When `false` (QianfanOCR) the path is not recorded and
+   * `applyChatTemplate` is omitted.
+   */
+  recordModelPath: boolean;
+  /**
+   * Whether to attach an `applyChatTemplate` method. Defaults to
+   * `recordModelPath` because the method can only work when a path was
+   * recorded. Qwen3 (first-gen) records its path but historically
+   * exposed no `applyChatTemplate`; pass `applyTemplate: false` to keep
+   * that exact surface.
+   */
+  applyTemplate?: boolean;
+}
+
+/**
+ * Shared base type produced by the factory: a `SessionCapableModel`
+ * whose static surface still exposes `load`. Concrete families extend
+ * the returned class with an empty body so they inherit everything and
+ * pick up the correct `.name` (and working `instanceof`) for free.
+ */
+export type StreamingModel = SessionCapableModel;
+
+/**
+ * Build the streaming-model subclass for a native chat model class.
+ *
+ * The returned class:
+ *   - captures the three native callback-based session-streaming methods
+ *     from `NativeClass.prototype`,
+ *   - overrides them as `async *` generators delegating to
+ *     {@link _runChatStream} with identical argument plumbing (including
+ *     `config ?? null`, `images`, `isError ?? null`, and the `signal`),
+ *   - overrides `static load` to re-prototype the native instance onto
+ *     the concrete subclass (`this`) and optionally record the path,
+ *   - exposes `applyChatTemplate` when `opts.applyTemplate` (defaulting
+ *     to `opts.recordModelPath`).
+ *
+ * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) builds its
+ * `QianfanOCRModel` from the same factory. Not part of the public API.
+ */
+export function makeStreamingModel<C extends NativeStreamingCtor>(
+  NativeClass: C,
+  opts: StreamingModelOptions,
+): {
+  // Preserve the native instance surface (`generate`, `batchGenerate`,
+  // `saveModel`, `numParameters`, `hasMtpWeights`, …) by re-deriving it
+  // from `InstanceType<C>`, while letting the `SessionCapableModel`
+  // streaming overrides (AsyncGenerator chat methods + `resetCaches`,
+  // etc.) win. `Omit<…, keyof SessionCapableModel>` drops the native
+  // callback-style chat methods so the re-added `SessionCapableModel`
+  // generator signatures take precedence.
+  new (...args: never[]): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
+  load(
+    modelPath: string,
+  ): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+} {
+  const recordPath = opts.recordModelPath;
+  const applyTemplate = opts.applyTemplate ?? recordPath;
+
+  // Capture the native callback-based methods before the subclass
+  // overrides below shadow them on the prototype.
+  const nativeStart = NativeClass.prototype.chatStreamSessionStart;
+  const nativeContinue = NativeClass.prototype.chatStreamSessionContinue;
+  const nativeContinueTool = NativeClass.prototype.chatStreamSessionContinueTool;
+
+  // `NativeClass` is structurally a constructor; cast to a concrete
+  // constructor type so `class extends` accepts it. Runtime behavior is
+  // unchanged — we extend the real native class.
+  const Base = NativeClass as unknown as new (...args: never[]) => SessionCapableModel;
+
+  class StreamingModelImpl extends Base {
+    static async load(modelPath: string): Promise<StreamingModel> {
+      const instance = await NativeClass.load(modelPath);
+      // Use `this.prototype` (not `StreamingModelImpl.prototype`) so the
+      // concrete subclass declared per family supplies the prototype and
+      // `instanceof ConcreteSubclass` holds.
+      Object.setPrototypeOf(instance, this.prototype);
+      if (recordPath) rememberModelPath(instance, modelPath);
+      return instance as unknown as StreamingModel;
+    }
+
+    // The native methods are callback-based, but `Base` is typed as a
+    // `SessionCapableModel` constructor (whose streaming methods already
+    // return `AsyncGenerator<ChatStreamEvent>`), so these overrides are
+    // type-compatible and need no `@ts-expect-error` suppression. The
+    // callback bridging happens at runtime via the captured natives.
+    async *chatStreamSessionStart(
+      messages: ChatMessage[],
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+    ): AsyncGenerator<ChatStreamEvent> {
+      yield* _runChatStream(
+        (callback) => nativeStart.call(this, messages as never, (config ?? null) as never, callback as never),
+        signal,
+      );
+    }
+
+    async *chatStreamSessionContinue(
+      userMessage: string,
+      images: Uint8Array[] | null,
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+    ): AsyncGenerator<ChatStreamEvent> {
+      yield* _runChatStream(
+        (callback) =>
+          nativeContinue.call(
+            this,
+            userMessage as never,
+            images as never,
+            (config ?? null) as never,
+            callback as never,
+          ),
+        signal,
+      );
+    }
+
+    async *chatStreamSessionContinueTool(
+      toolCallId: string,
+      content: string,
+      config?: ChatConfig | null,
+      signal?: AbortSignal,
+      isError?: boolean | null,
+    ): AsyncGenerator<ChatStreamEvent> {
+      yield* _runChatStream(
+        (callback) =>
+          nativeContinueTool.call(
+            this,
+            toolCallId as never,
+            content as never,
+            (config ?? null) as never,
+            callback as never,
+            (isError ?? null) as never,
+          ),
+        signal,
+      );
+    }
+  }
+
+  if (applyTemplate) {
+    Object.defineProperty(StreamingModelImpl.prototype, 'applyChatTemplate', {
+      configurable: true,
+      writable: true,
+      value(
+        this: object,
+        messages: ChatMessage[],
+        addGenerationPrompt?: boolean | null,
+        tools?: ToolDefinition[] | null,
+        enableThinking?: boolean | null,
+      ): Promise<Uint32Array> {
+        return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
+      },
+    });
+  }
+
+  return StreamingModelImpl as unknown as {
+    new (...args: never[]): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
+    load(
+      modelPath: string,
+    ): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+  };
+}
+
 /**
  * Qwen3.5 dense model with AsyncGenerator-based session streaming.
  *
- * Streaming is driven through the session API — `chatStreamSessionStart`,
- * `chatStreamSessionContinue`, and `chatStreamSessionContinueTool` below —
- * which adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally satisfies
- * `SessionCapableModel` and can be passed to `ChatSession<Qwen35Model>`.
+ * The empty `extends` inherits the factory's streaming overrides,
+ * `static load`, and `applyChatTemplate`, and supplies the concrete
+ * `.name === 'Qwen35Model'` and a working `instanceof`. Records its
+ * model path so `applyChatTemplate` can serve a lazily built tokenizer.
  */
-export class Qwen35Model extends Qwen35ModelNative {
-  static override async load(modelPath: string): Promise<Qwen35Model> {
-    const instance = await Qwen35ModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, Qwen35Model.prototype);
-    rememberModelPath(instance, modelPath);
-    return instance as unknown as Qwen35Model;
-  }
+export class Qwen35Model extends makeStreamingModel(Qwen35ModelNative, { recordModelPath: true }) {}
 
-  applyChatTemplate(
-    messages: ChatMessage[],
-    addGenerationPrompt?: boolean | null,
-    tools?: ToolDefinition[] | null,
-    enableThinking?: boolean | null,
-  ): Promise<Uint32Array> {
-    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
-  }
+/** Qwen3.5 MoE model — see {@link Qwen35Model} for the wrapper shape. */
+export class Qwen35MoeModel extends makeStreamingModel(Qwen35MoeModelNative, { recordModelPath: true }) {}
 
-  /**
-   * Streaming variant of {@link Qwen35Model#chatSessionStart}.
-   *
-   * Resets the KV caches, runs the jinja chat template, prefills on
-   * top of the fresh caches, and streams the decoded reply token-by-
-   * token. Stops on `<|im_end|>` so the cached history ends on a
-   * clean ChatML boundary that subsequent `chatStreamSessionContinue`
-   * deltas can append to. Text-only.
-   *
-   * The optional `signal` parameter wires an AbortSignal into the
-   * `_runChatStream` adapter's fast-abort path. Callers that need
-   * client-disconnect-aware cancellation (e.g. HTTP endpoints) pass
-   * one here and the native decode winds down at the next safepoint.
-   */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeDenseChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
+/** LFM2 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
+export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, { recordModelPath: true }) {}
 
-  /**
-   * Streaming variant of {@link Qwen35Model#chatSessionContinue}.
-   *
-   * Builds a raw ChatML delta on top of the live session caches,
-   * tokenizes it, prefills the delta, and streams the decoded reply.
-   * Requires a live session started via `chatSessionStart` or
-   * `chatStreamSessionStart`. Stops on `<|im_end|>`.
-   *
-   * `images` is the native opt-in guard parameter — callers that
-   * attach a new image set must restart the session via
-   * `chatStreamSessionStart` with the full history. The high-level
-   * `ChatSession` wrapper handles that routing; callers that drive
-   * the wrapper directly should pass `null` for text-only continues.
-   */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeDenseChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /**
-   * Streaming variant of {@link Qwen35Model#chatSessionContinueTool}.
-   *
-   * Builds a ChatML `<tool_response>` delta on top of the live
-   * session caches and streams the decoded assistant reply. Requires
-   * a live session started via `chatSessionStart` /
-   * `chatStreamSessionStart`. `isError` is forwarded to the native
-   * renderer — see `chatSessionContinueTool` for the wire-format
-   * marker semantics.
-   */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeDenseChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
+/** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
+export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, { recordModelPath: true }) {}
 
 /**
- * Qwen3.5 MoE model wrapper.
+ * Qwen3 (first-gen, text-only) model.
  *
- * Streaming is driven through the `ChatSession` API — overrides below
- * adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
- * satisfies `SessionCapableModel`.
+ * Records its model path (so prototype-set + path-recording match the
+ * other families) but, matching its historical surface, exposes NO
+ * `applyChatTemplate` — `applyTemplate: false` suppresses that method.
  */
-export class Qwen35MoeModel extends Qwen35MoeModelNative {
-  static override async load(modelPath: string): Promise<Qwen35MoeModel> {
-    const instance = await Qwen35MoeModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, Qwen35MoeModel.prototype);
-    rememberModelPath(instance, modelPath);
-    return instance as unknown as Qwen35MoeModel;
-  }
-
-  applyChatTemplate(
-    messages: ChatMessage[],
-    addGenerationPrompt?: boolean | null,
-    tools?: ToolDefinition[] | null,
-    enableThinking?: boolean | null,
-  ): Promise<Uint32Array> {
-    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
-  }
-
-  /** Streaming variant of {@link Qwen35MoeModel#chatSessionStart}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeMoeChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Qwen35MoeModel#chatSessionContinue}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeMoeChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Qwen35MoeModel#chatSessionContinueTool}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeMoeChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
-
-/**
- * LFM2 model wrapper.
- *
- * Streaming is driven through the `ChatSession` API — overrides below
- * adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
- * satisfies `SessionCapableModel`. LFM2 is text-only; the native
- * `images` guard rejects non-empty image sets with an
- * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
- */
-export class Lfm2Model extends Lfm2ModelNative {
-  static override async load(modelPath: string): Promise<Lfm2Model> {
-    const instance = await Lfm2ModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, Lfm2Model.prototype);
-    rememberModelPath(instance, modelPath);
-    return instance as unknown as Lfm2Model;
-  }
-
-  applyChatTemplate(
-    messages: ChatMessage[],
-    addGenerationPrompt?: boolean | null,
-    tools?: ToolDefinition[] | null,
-    enableThinking?: boolean | null,
-  ): Promise<Uint32Array> {
-    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
-  }
-
-  /** Streaming variant of {@link Lfm2Model#chatSessionStart}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeLfm2ChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Lfm2Model#chatSessionContinue}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeLfm2ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Lfm2Model#chatSessionContinueTool}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeLfm2ChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
-
-/**
- * Gemma4 model wrapper.
- *
- * Streaming is driven through the `ChatSession` API — overrides below
- * adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
- * satisfies `SessionCapableModel`. Gemma4 is text-only in the
- * current refactor scope; the native `images` guard rejects non-empty
- * image sets with an `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
- */
-export class Gemma4Model extends Gemma4ModelNative {
-  static override async load(modelPath: string): Promise<Gemma4Model> {
-    const instance = await Gemma4ModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, Gemma4Model.prototype);
-    rememberModelPath(instance, modelPath);
-    return instance as unknown as Gemma4Model;
-  }
-
-  applyChatTemplate(
-    messages: ChatMessage[],
-    addGenerationPrompt?: boolean | null,
-    tools?: ToolDefinition[] | null,
-    enableThinking?: boolean | null,
-  ): Promise<Uint32Array> {
-    return applyChatTemplateFromModelPath(this, messages, addGenerationPrompt, tools, enableThinking);
-  }
-
-  /** Streaming variant of {@link Gemma4Model#chatSessionStart}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeGemma4ChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Gemma4Model#chatSessionContinue}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeGemma4ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Gemma4Model#chatSessionContinueTool}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeGemma4ChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
-
-/**
- * Qwen3 (first-gen) model wrapper.
- *
- * Streaming is driven through the `ChatSession` API — overrides below
- * adapt the callback-based native methods to
- * `AsyncGenerator<ChatStreamEvent>` so the wrapper structurally
- * satisfies `SessionCapableModel`. Qwen3 legacy is text-only; the
- * native `images` guard rejects non-empty image sets with an
- * `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix.
- */
-export class Qwen3Model extends Qwen3ModelNative {
-  static override async load(modelPath: string): Promise<Qwen3Model> {
-    const instance = await Qwen3ModelNative.load(modelPath);
-    Object.setPrototypeOf(instance, Qwen3Model.prototype);
-    rememberModelPath(instance, modelPath);
-    return instance as unknown as Qwen3Model;
-  }
-
-  /** Streaming variant of {@link Qwen3Model#chatSessionStart}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionStart(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeQwen3ChatStreamSessionStart.call(this, messages, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Qwen3Model#chatSessionContinue}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinue(
-    userMessage: string,
-    images: Uint8Array[] | null,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) => _nativeQwen3ChatStreamSessionContinue.call(this, userMessage, images, config ?? null, callback),
-      signal,
-    );
-  }
-
-  /** Streaming variant of {@link Qwen3Model#chatSessionContinueTool}. */
-  // @ts-expect-error — override callback-based native method with AsyncGenerator
-  async *chatStreamSessionContinueTool(
-    toolCallId: string,
-    content: string,
-    config?: ChatConfig | null,
-    signal?: AbortSignal,
-    isError?: boolean | null,
-  ): AsyncGenerator<ChatStreamEvent> {
-    yield* _runChatStream(
-      (callback) =>
-        _nativeQwen3ChatStreamSessionContinueTool.call(
-          this,
-          toolCallId,
-          content,
-          config ?? null,
-          callback,
-          isError ?? null,
-        ),
-      signal,
-    );
-  }
-}
+export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, {
+  recordModelPath: true,
+  applyTemplate: false,
+}) {}
 
 // -------------------------------------------------------------------
 // Compile-time conformance check
 // -------------------------------------------------------------------
 //
-// Ensures each wrapper class structurally satisfies
-// `SessionCapableModel` so `ChatSession<XxxModel>` will type-check in
-// downstream code. The assignments are compile-only — the
-// `null as unknown as T` placeholder never runs. If a wrapper's
-// override signature drifts away from the interface, TypeScript will
-// fail to compile this block, surfacing the regression at build time.
+// Ensures each family class structurally satisfies
+// `SessionCapableModel` so `ChatSession<XxxModel>` type-checks in
+// downstream code. Compile-only — the `null as unknown as T`
+// placeholder never runs. If a factory override signature drifts away
+// from the interface, this block fails to compile.
 function _assertSessionCapable(): void {
   const _qwen35: SessionCapableModel = null as unknown as Qwen35Model;
   const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;

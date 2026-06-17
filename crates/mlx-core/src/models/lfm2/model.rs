@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{info, warn};
 
@@ -13,11 +12,10 @@ use crate::engine::backend::{
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
-use crate::engine::napi_glue::start_chat_stream;
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
-    IMAGE_CHANGE_RESTART_PREFIX, ThinkingPolicy, build_chatml_continue_delta_text,
-    build_synthetic_user_message, kv_capacity_round_up,
+    ThinkingPolicy, build_chatml_continue_delta_text, build_synthetic_user_message,
+    kv_capacity_round_up,
 };
 use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::nn::{Embedding, Linear, RMSNorm};
@@ -2631,14 +2629,6 @@ impl Lfm2Model {
         Lfm2Model::load_from_dir(&model_path).await
     }
 
-    /// Reset all caches and clear cached token history. Exposed so
-    /// tests and session-management code can start from a known clean
-    /// state between turns.
-    #[napi]
-    pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| ChatCmd::ResetCaches { reply })
-    }
-
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
     ///
@@ -2656,207 +2646,6 @@ impl Lfm2Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
-    }
-
-    /// Start a new chat session.
-    ///
-    /// Runs the full jinja chat template once, decodes until
-    /// `<|im_end|>`, and leaves the KV/conv caches on a clean ChatML
-    /// boundary so subsequent `chatSessionContinue` /
-    /// `chatSessionContinueTool` calls can append a raw delta on top
-    /// without re-rendering the chat template.
-    ///
-    /// Requires `config.reuse_cache` to be enabled (the default).
-    #[napi]
-    pub async fn chat_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        if messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(format!(
-                "{} LFM2 is text-only; image messages are not supported",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionStart {
-            messages,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a new user message.
-    ///
-    /// Appends a raw ChatML user/assistant delta to the session's
-    /// cached KV/conv state, then decodes the assistant reply. Stops
-    /// on `<|im_end|>` so the cache remains on a clean boundary for
-    /// the next turn.
-    ///
-    /// Requires a live session started via `chatSessionStart`. Errors
-    /// if the session is empty, carries image state, or if
-    /// `config.reuse_cache` is explicitly set to `false`.
-    ///
-    /// LFM2 is text-only; `images` is an opt-in guard parameter: when
-    /// non-empty the native side returns an error whose message begins
-    /// with `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the TypeScript
-    /// `ChatSession` layer can catch the prefix and route
-    /// image-changes back through a fresh `chatSessionStart`
-    /// uniformly across all model backends.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-    )]
-    pub async fn chat_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionContinue {
-            user_message,
-            images,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds an LFM2-format tool delta (`<|im_start|>tool\n{content}
-    /// <|im_end|>`) from `content` and prefills it on top of the live
-    /// session caches, then decodes the assistant reply. Stops on
-    /// `<|im_end|>` so the cache stays on a clean boundary for the
-    /// next turn.
-    ///
-    /// The `tool_call_id` is currently dropped by the wire format —
-    /// LFM2's chat template identifies tool responses positionally,
-    /// not via an explicit id. Callers may still log it for their own
-    /// bookkeeping.
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<|im_start|>tool` block so the model receives a clear text-level
-    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-    /// pre-feature output.
-    ///
-    /// Requires a live session started via `chatSessionStart`.
-    #[napi]
-    pub async fn chat_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        is_error: Option<bool>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-
-        crate::model_thread::send_and_await(&self.thread, |reply| ChatCmd::SessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            reply,
-        })
-        .await
-    }
-
-    /// Streaming variant of `chatSessionStart`.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        if messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(format!(
-                "{} LFM2 is text-only; image messages are not supported",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread.send(ChatCmd::StreamSessionStart {
-            messages,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinue`.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread.send(ChatCmd::StreamSessionContinue {
-            user_message,
-            images,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinueTool`.
-    ///
-    /// `is_error` mirrors the non-streaming entry point — when
-    /// `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<|im_start|>tool` block.
-    #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
-    )]
-    pub async fn chat_stream_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-        is_error: Option<bool>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread.send(ChatCmd::StreamSessionContinueTool {
-            tool_call_id,
-            content,
-            is_error,
-            config,
-            stream_tx: plumbing.stream_tx,
-            cancelled: plumbing.cancelled,
-        })?;
-
-        Ok(plumbing.handle)
     }
 
     // ---------------------------------------------------------------
@@ -2972,6 +2761,16 @@ impl Lfm2Model {
 
         total
     }
+}
+
+crate::models::chat_napi::chat_napi_surface! {
+    class: Lfm2Model,
+    thread_cmd: crate::engine::cmd::ChatCmd,
+    thread: direct,
+    image_guard: text_only,
+    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 
 #[cfg(test)]

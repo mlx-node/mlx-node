@@ -91,6 +91,30 @@ pub(crate) enum TrainingDispatch {
     Qwen35Moe(tokio::sync::mpsc::UnboundedSender<crate::models::qwen3_5_moe::model::Qwen35MoeCmd>),
 }
 
+impl TrainingDispatch {
+    /// Lift a model-neutral [`crate::engine::cmd::TrainCmd`] into the
+    /// active family's thread-command type and send it. The per-family
+    /// sender TYPE is what forces the 3-arm match here (the variants
+    /// cannot share one `UnboundedSender`); the command payload is
+    /// model-neutral and built once via [`crate::engine::cmd::FromTrainCmd`].
+    pub(crate) fn send_train(&self, cmd: crate::engine::cmd::TrainCmd) -> Result<()> {
+        use crate::engine::cmd::FromTrainCmd;
+        match self {
+            TrainingDispatch::Qwen3(sender) => sender
+                .send(crate::models::qwen3::Qwen3Cmd::from_train(cmd))
+                .map_err(|_| Error::from_reason("Model thread exited")),
+            TrainingDispatch::Qwen35Dense(sender) => sender
+                .send(crate::models::qwen3_5::model::Qwen35Cmd::from_train(cmd))
+                .map_err(|_| Error::from_reason("Model thread exited")),
+            TrainingDispatch::Qwen35Moe(sender) => sender
+                .send(crate::models::qwen3_5_moe::model::Qwen35MoeCmd::from_train(
+                    cmd,
+                ))
+                .map_err(|_| Error::from_reason("Model thread exited")),
+        }
+    }
+}
+
 /// Compute SGD parameter updates: param = param - lr * grad.
 ///
 /// Shared helper used by all model implementations to avoid duplicating the

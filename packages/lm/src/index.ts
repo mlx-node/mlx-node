@@ -21,7 +21,7 @@ export { Gemma4Model } from './stream.js';
 
 // Embedding models
 export { HarrierModel } from '@mlx-node/core';
-export { Qwen35Model, Qwen35Model as Qwen3_5Model } from './stream.js';
+export { Qwen35Model } from './stream.js';
 export type { Qwen35Config } from '@mlx-node/core';
 
 // LFM2 models
@@ -64,7 +64,11 @@ export type { ChatStreamFinal, ChatStreamEvent } from './stream.js';
 // `_runChatStream` is the generic adapter used by every model wrapper
 // (and the VLM package's QianfanOCR wrapper) to turn a callback-based
 // native stream into an `AsyncGenerator<ChatStreamEvent>`.
-export { _runChatStream } from './stream.js';
+// `makeStreamingModel` is the factory that builds each family's wrapper
+// subclass from its native class; the VLM package reuses it to build
+// `QianfanOCRModel`.
+export { _runChatStream, makeStreamingModel } from './stream.js';
+export type { StreamingModel } from './stream.js';
 // Cross-model chat session wrapper (see chat-session.ts for design notes).
 // `SessionCapableModel` is the structural interface matched by every
 // generative model wrapper and used as the upper-bound for

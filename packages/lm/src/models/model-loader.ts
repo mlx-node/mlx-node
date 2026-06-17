@@ -10,31 +10,41 @@ import { join } from 'node:path';
 import { HarrierModel, QianfanOCRModel } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
-import type { LoadableModel, TrainableModel } from '../interfaces.js';
+import type { LoadableModel } from '../interfaces.js';
 import { Gemma4Model, Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
-export type ModelType =
-  | 'qwen3'
-  | 'qwen3_5'
-  | 'qwen3_5_moe'
-  | 'internvl_chat'
-  | 'qianfan-ocr'
-  | 'harrier'
-  | 'gemma4'
-  | 'lfm2'
-  | 'lfm2_moe';
+/**
+ * Single source of truth for every supported `model_type`. Each entry
+ * pairs the loader (which native/wrapper class to instantiate) with a
+ * `kind` that drives `ChatSession` eligibility:
+ *
+ *   - `'trainable'` — GRPO/SFT-capable LM (Qwen3 family); chat-capable.
+ *   - `'loadable'`  — chat-capable LM with no trainer engine (Gemma4, LFM2).
+ *   - `'embedding'` — no chat surface (Harrier); rejected by `loadSession`.
+ *   - `'vlm'`       — VLM whose AsyncGenerator wrapper lives in
+ *                     `@mlx-node/vlm` (importing it here would create a
+ *                     circular package dependency), so `loadSession`
+ *                     rejects it and routes callers to `@mlx-node/vlm`.
+ *
+ * The `ModelType` union, the supported-type set, the `loadModel`
+ * dispatch, and the `loadSession` rejection rules are all derived from
+ * this table — adding a family means adding one row here.
+ */
+const MODEL_REGISTRY = {
+  qwen3: { load: (p: string) => Qwen3Model.load(p), kind: 'trainable' },
+  qwen3_5: { load: (p: string) => Qwen35Model.load(p), kind: 'trainable' },
+  qwen3_5_moe: { load: (p: string) => Qwen35MoeModel.load(p), kind: 'trainable' },
+  gemma4: { load: (p: string) => Gemma4Model.load(p), kind: 'loadable' },
+  lfm2: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },
+  lfm2_moe: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },
+  harrier: { load: (p: string) => HarrierModel.load(p), kind: 'embedding' },
+  internvl_chat: { load: (p: string) => QianfanOCRModel.load(p), kind: 'vlm' },
+  'qianfan-ocr': { load: (p: string) => QianfanOCRModel.load(p), kind: 'vlm' },
+} as const satisfies Record<string, { load: (p: string) => Promise<unknown>; kind: string }>;
 
-const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
-  'qwen3',
-  'qwen3_5',
-  'qwen3_5_moe',
-  'internvl_chat',
-  'qianfan-ocr',
-  'harrier',
-  'gemma4',
-  'lfm2',
-  'lfm2_moe',
-]);
+export type ModelType = keyof typeof MODEL_REGISTRY;
+
+const SUPPORTED_MODEL_TYPES = new Set<ModelType>(Object.keys(MODEL_REGISTRY) as ModelType[]);
 
 /**
  * Load a model from disk, auto-detecting architecture from config.json.
@@ -44,25 +54,7 @@ const SUPPORTED_MODEL_TYPES = new Set<ModelType>([
  */
 export async function loadModel(modelPath: string): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);
-
-  switch (modelType) {
-    case 'qwen3_5_moe':
-      return Qwen35MoeModel.load(modelPath) as unknown as Promise<TrainableModel>;
-    case 'qwen3_5':
-      return Qwen35Model.load(modelPath) as unknown as Promise<TrainableModel>;
-    case 'qwen3':
-      return Qwen3Model.load(modelPath) as unknown as Promise<TrainableModel>;
-    case 'harrier':
-      return HarrierModel.load(modelPath) as unknown as Promise<LoadableModel>;
-    case 'internvl_chat':
-    case 'qianfan-ocr':
-      return QianfanOCRModel.load(modelPath) as unknown as Promise<LoadableModel>;
-    case 'gemma4':
-      return Gemma4Model.load(modelPath) as unknown as Promise<LoadableModel>;
-    case 'lfm2':
-    case 'lfm2_moe':
-      return Lfm2Model.load(modelPath) as unknown as Promise<LoadableModel>;
-  }
+  return MODEL_REGISTRY[modelType].load(modelPath) as unknown as Promise<LoadableModel>;
 }
 
 /**
@@ -82,15 +74,17 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
  *     `new ChatSession(model)` directly.
  */
 export async function loadSession(modelPath: string): Promise<ChatSession<SessionCapableModel>> {
-  const m = await loadModel(modelPath);
-  if (m instanceof HarrierModel) {
+  const modelType = await detectModelType(modelPath);
+  const kind = MODEL_REGISTRY[modelType].kind;
+  if (kind === 'embedding') {
     throw new Error('loadSession: embedding models (Harrier) cannot be wrapped in a ChatSession');
   }
-  if (m instanceof QianfanOCRModel) {
+  if (kind === 'vlm') {
     throw new Error(
       'loadSession: Qianfan-OCR / InternVL session support lives in @mlx-node/vlm. Import QianfanOCRModel from @mlx-node/vlm and construct ChatSession(model) directly.',
     );
   }
+  const m = await MODEL_REGISTRY[modelType].load(modelPath);
   return new ChatSession(m as unknown as SessionCapableModel);
 }
 

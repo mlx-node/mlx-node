@@ -9,17 +9,17 @@ use std::iter;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
-use crate::engine::napi_glue::start_chat_stream;
+use crate::engine::cmd::{
+    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
+};
 use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
@@ -33,8 +33,8 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
-use crate::engine::{self, IMAGE_CHANGE_RESTART_PREFIX};
+use crate::engine;
+use crate::engine::types::ChatConfig;
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -116,65 +116,93 @@ pub(crate) enum Qwen3Cmd {
         config: Option<GenerationConfig>,
         reply: ResponseTx<BatchGenerationResult>,
     },
-    // --- Training commands ---
-    InitTraining {
-        config: Box<crate::grpo::engine::GRPOEngineConfig>,
-        model_type: crate::training_model::ModelType,
+    /// Training-session commands, nested verbatim from the model-neutral
+    /// engine (P7c). The thread loop routes these to
+    /// [`crate::engine::cmd::handle_train_cmd`], which drives the
+    /// [`TrainBackend`] impl on [`Qwen3Inner`].
+    Train(TrainCmd),
+    SaveModel {
+        save_path: String,
         reply: ResponseTx<()>,
     },
-    GenerateForTraining {
-        prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
+}
+
+impl FromChatCmd for Qwen3Cmd {
+    #[inline]
+    fn from_chat(cmd: ChatCmd) -> Self {
+        Qwen3Cmd::Chat(cmd)
+    }
+}
+
+impl FromTrainCmd for Qwen3Cmd {
+    #[inline]
+    fn from_train(cmd: TrainCmd) -> Self {
+        Qwen3Cmd::Train(cmd)
+    }
+}
+
+/// Training backend the model-neutral [`handle_train_cmd`] drives. Each
+/// method forwards to the inherent `*_sync_impl` body on [`Qwen3Inner`].
+impl TrainBackend for Qwen3Inner {
+    fn training_state_mut(
+        &mut self,
+    ) -> &mut Option<crate::training_state::ModelThreadTrainingState> {
+        &mut self.training_state
+    }
+
+    fn init_training_sync(
+        &mut self,
+        config: Box<crate::grpo::engine::GRPOEngineConfig>,
+        model_type: crate::training_model::ModelType,
+    ) -> Result<()> {
+        self.init_training_sync_impl(*config, model_type)
+    }
+
+    fn generate_for_training_thread_sync(
+        &mut self,
+        prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
         gen_config: super::GenerationConfig,
         enable_thinking: Option<bool>,
-        tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
-        reply: ResponseTx<crate::training_model::GenerationPlainData>,
-    },
-    TrainStepGRPO {
+        tools: Option<Vec<ToolDefinition>>,
+    ) -> Result<crate::training_model::GenerationPlainData> {
+        self.generate_for_training_thread_sync_impl(
+            prompts,
+            group_size,
+            gen_config,
+            enable_thinking,
+            tools,
+        )
+    }
+
+    fn train_step_grpo_sync(
+        &mut self,
         rewards: Vec<f64>,
         group_size: i32,
         loss_config: crate::grpo::loss::GRPOLossConfig,
         valid_indices: Option<Vec<usize>>,
-        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
-    },
-    /// Bump the training step counter without applying gradients
-    /// (used by engine skip paths that abort before training).
-    /// Also clears cached generation MxArrays.
-    /// Returns the new step.
-    BumpSkippedStep {
-        reply: ResponseTx<i64>,
-    },
-    /// Restore the training step counter (for resume from checkpoint).
-    /// Does not touch optimizer state — that's loaded via LoadOptimizerState.
-    SetTrainingStep {
-        step: i64,
-        reply: ResponseTx<()>,
-    },
-    /// Drop the training state on the model thread.
-    /// After this, InitTraining can be called again. No-op if no training state.
-    ResetTraining {
-        reply: ResponseTx<()>,
-    },
-    TrainStepSFT {
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        self.train_step_grpo_sync_impl(rewards, group_size, loss_config, valid_indices)
+    }
+
+    fn train_step_sft_sync(
+        &mut self,
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
         labels: Vec<i32>,
         labels_shape: Vec<i64>,
         config: crate::sft::engine::SftEngineConfig,
-        reply: ResponseTx<crate::training_model::TrainStepPlainMetrics>,
-    },
-    SaveOptimizerState {
-        path: String,
-        reply: ResponseTx<()>,
-    },
-    LoadOptimizerState {
-        path: String,
-        reply: ResponseTx<()>,
-    },
-    SaveModel {
-        save_path: String,
-        reply: ResponseTx<()>,
-    },
+    ) -> Result<crate::training_model::TrainStepPlainMetrics> {
+        self.train_step_sft_sync_impl(input_ids, input_shape, labels, labels_shape, config)
+    }
+
+    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
+        self.save_optimizer_state_sync_impl(path)
+    }
+
+    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
+        self.load_optimizer_state_sync_impl(path)
+    }
 }
 
 /// Command handler for the dedicated model thread.
@@ -204,91 +232,8 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
             let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
         }
         // --- Training commands ---
-        Qwen3Cmd::InitTraining {
-            config,
-            model_type,
-            reply,
-        } => {
-            let _ = reply.send(inner.init_training_sync(*config, model_type));
-        }
-        Qwen3Cmd::GenerateForTraining {
-            prompts,
-            group_size,
-            gen_config,
-            enable_thinking,
-            tools,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_for_training_thread_sync(
-                prompts,
-                group_size,
-                gen_config,
-                enable_thinking,
-                tools,
-            ));
-        }
-        Qwen3Cmd::TrainStepGRPO {
-            rewards,
-            group_size,
-            loss_config,
-            valid_indices,
-            reply,
-        } => {
-            let _ = reply.send(inner.train_step_grpo_sync(
-                rewards,
-                group_size,
-                loss_config,
-                valid_indices,
-            ));
-        }
-        Qwen3Cmd::BumpSkippedStep { reply } => {
-            let result = if let Some(ref mut ts) = inner.training_state {
-                ts.clear_generation_cache();
-                ts.step += 1;
-                Ok(ts.step)
-            } else {
-                Err(napi::Error::from_reason(
-                    "Training state not initialized. Call InitTraining first.",
-                ))
-            };
-            let _ = reply.send(result);
-        }
-        Qwen3Cmd::SetTrainingStep { step, reply } => {
-            let result = if let Some(ref mut ts) = inner.training_state {
-                ts.step = step;
-                Ok(())
-            } else {
-                Err(napi::Error::from_reason(
-                    "Training state not initialized. Call InitTraining first.",
-                ))
-            };
-            let _ = reply.send(result);
-        }
-        Qwen3Cmd::ResetTraining { reply } => {
-            inner.training_state = None;
-            let _ = reply.send(Ok(()));
-        }
-        Qwen3Cmd::TrainStepSFT {
-            input_ids,
-            input_shape,
-            labels,
-            labels_shape,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.train_step_sft_sync(
-                input_ids,
-                input_shape,
-                labels,
-                labels_shape,
-                config,
-            ));
-        }
-        Qwen3Cmd::SaveOptimizerState { path, reply } => {
-            let _ = reply.send(inner.save_optimizer_state_sync(path));
-        }
-        Qwen3Cmd::LoadOptimizerState { path, reply } => {
-            let _ = reply.send(inner.load_optimizer_state_sync(path));
+        Qwen3Cmd::Train(train_cmd) => {
+            handle_train_cmd(inner, train_cmd);
         }
         Qwen3Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -1203,7 +1148,8 @@ impl Qwen3Inner {
     // ========== Training methods (run on model thread) ==========
 
     /// Initialize training state with optimizer and configuration.
-    fn init_training_sync(
+    /// Inherent body of [`TrainBackend::init_training_sync`].
+    fn init_training_sync_impl(
         &mut self,
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: ModelType,
@@ -1241,7 +1187,8 @@ impl Qwen3Inner {
         Ok(())
     }
 
-    fn save_optimizer_state_sync(&self, path: String) -> Result<()> {
+    /// Inherent body of [`TrainBackend::save_optimizer_state_sync`].
+    fn save_optimizer_state_sync_impl(&self, path: String) -> Result<()> {
         let ts = self.training_state.as_ref().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
@@ -1411,7 +1358,8 @@ impl Qwen3Inner {
         Ok(())
     }
 
-    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()> {
+    /// Inherent body of [`TrainBackend::load_optimizer_state_sync`].
+    fn load_optimizer_state_sync_impl(&mut self, path: String) -> Result<()> {
         let ts = self.training_state.as_mut().ok_or_else(|| {
             napi::Error::from_reason("Training state not initialized. Call InitTraining first.")
         })?;
@@ -1423,7 +1371,8 @@ impl Qwen3Inner {
     /// Tokenizes prompts using Jinja2 chat template, generates completions,
     /// caches MxArray results in training_state for the subsequent training step,
     /// and returns plain data across the thread boundary.
-    fn generate_for_training_thread_sync(
+    /// Inherent body of [`TrainBackend::generate_for_training_thread_sync`].
+    fn generate_for_training_thread_sync_impl(
         &mut self,
         prompts: Vec<Vec<ChatMessage>>,
         group_size: usize,
@@ -1809,7 +1758,8 @@ impl Qwen3Inner {
     /// Consumes cached MxArrays from the generation phase, computes loss and
     /// gradients via autograd, validates and clips gradients, accumulates them,
     /// and applies the optimizer step when accumulation is complete.
-    fn train_step_grpo_sync(
+    /// Inherent body of [`TrainBackend::train_step_grpo_sync`].
+    fn train_step_grpo_sync_impl(
         &mut self,
         rewards: Vec<f64>,
         group_size: i32,
@@ -2024,8 +1974,8 @@ impl Qwen3Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
-                        .collect();
+                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
+                        .collect::<Result<HashMap<_, _>>>()?;
                     &scaled_grads
                 } else {
                     &grads
@@ -2045,15 +1995,21 @@ impl Qwen3Inner {
                     grad_refs,
                 )?;
 
+                // `update_batch` above has already committed the optimizer's step
+                // counter and moment tensors. If this fallible delta build (or the
+                // atomic apply below) errors, the optimizer is left one step ahead
+                // of the still-unchanged model params (all deltas are built before
+                // any are applied). Accepted over panicking; such `?` failures are
+                // fatal device errors that abort the run.
                 // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i]).unwrap();
-                        (name.clone(), delta)
+                        let delta = param_refs[i].sub(&updated[i])?;
+                        Ok((name.clone(), delta))
                     })
-                    .collect();
+                    .collect::<Result<HashMap<_, _>>>()?;
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -2140,7 +2096,8 @@ impl Qwen3Inner {
     /// Receives plain data (Vec<i32> + shape) from the SFT engine, reconstructs
     /// MxArrays on the model thread, computes SFT loss + gradients, validates,
     /// clips, accumulates, and applies optimizer step when accumulation is complete.
-    fn train_step_sft_sync(
+    /// Inherent body of [`TrainBackend::train_step_sft_sync`].
+    fn train_step_sft_sync_impl(
         &mut self,
         input_ids: Vec<i32>,
         input_shape: Vec<i64>,
@@ -2331,8 +2288,8 @@ impl Qwen3Inner {
                     let scale_arr = MxArray::from_float32(&[scale], &[])?;
                     scaled_grads = grads
                         .iter()
-                        .map(|(name, grad)| (name.clone(), grad.mul(&scale_arr).unwrap()))
-                        .collect();
+                        .map(|(name, grad)| Ok((name.clone(), grad.mul(&scale_arr)?)))
+                        .collect::<Result<HashMap<_, _>>>()?;
                     &scaled_grads
                 } else {
                     &grads
@@ -2352,15 +2309,21 @@ impl Qwen3Inner {
                     grad_refs,
                 )?;
 
+                // `update_batch` above has already committed the optimizer's step
+                // counter and moment tensors. If this fallible delta build (or the
+                // atomic apply below) errors, the optimizer is left one step ahead
+                // of the still-unchanged model params (all deltas are built before
+                // any are applied). Accepted over panicking; such `?` failures are
+                // fatal device errors that abort the run.
                 // Create deltas: delta = param - updated (so param - 1.0 * delta = updated)
                 let delta_map: HashMap<String, MxArray> = param_names_vec
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let delta = param_refs[i].sub(&updated[i]).unwrap();
-                        (name.clone(), delta)
+                        let delta = param_refs[i].sub(&updated[i])?;
+                        Ok((name.clone(), delta))
                     })
-                    .collect();
+                    .collect::<Result<HashMap<_, _>>>()?;
 
                 let delta_refs: HashMap<String, &MxArray> =
                     delta_map.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -3576,217 +3539,6 @@ impl Qwen3Model {
         .await
     }
 
-    /// Reset all caches and clear cached token history. Exposed so
-    /// tests and session-management code can start from a known clean
-    /// state between turns.
-    #[napi]
-    pub fn reset_caches(&self) -> Result<()> {
-        crate::model_thread::send_and_block(&self.thread, |reply| {
-            Qwen3Cmd::Chat(ChatCmd::ResetCaches { reply })
-        })
-    }
-
-    /// Start a new chat session.
-    ///
-    /// Runs the full jinja chat template once, decodes until `<|im_end|>`,
-    /// and leaves the KV caches on a clean ChatML boundary so subsequent
-    /// `chatSessionContinue` / `chatSessionContinueTool` calls can
-    /// append a raw delta on top without re-rendering the chat
-    /// template.
-    ///
-    /// Requires `config.reuse_cache` to be enabled (the default).
-    #[napi]
-    pub async fn chat_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        if messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(format!(
-                "{} Qwen3 is text-only; image messages are not supported",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-        let config = config.unwrap_or_default();
-        send_and_await(&self.thread, |reply| {
-            Qwen3Cmd::Chat(ChatCmd::SessionStart {
-                messages,
-                config,
-                reply,
-            })
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a new user message.
-    ///
-    /// Appends a raw ChatML user/assistant delta to the session's
-    /// cached KV state, then decodes the assistant reply. Stops on
-    /// `<|im_end|>` so the cache remains on a clean boundary for the
-    /// next turn.
-    ///
-    /// Requires a live session started via `chatSessionStart`. Errors
-    /// if the session is empty, carries image state, or if
-    /// `config.reuse_cache` is explicitly set to `false`.
-    ///
-    /// Qwen3 legacy is text-only; `images` is an opt-in guard parameter:
-    /// when non-empty the native side returns an error whose message
-    /// begins with `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` so the
-    /// TypeScript `ChatSession` layer can catch the prefix and route
-    /// image-changes back through a fresh `chatSessionStart` uniformly
-    /// across all model backends.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
-    )]
-    pub async fn chat_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-        send_and_await(&self.thread, |reply| {
-            Qwen3Cmd::Chat(ChatCmd::SessionContinue {
-                user_message,
-                images,
-                config,
-                reply,
-            })
-        })
-        .await
-    }
-
-    /// Continue an existing chat session with a tool-result turn.
-    ///
-    /// Builds a Qwen3.5-style `<tool_response>`-wrapped user-role delta
-    /// from `content` and prefills it on top of the live session
-    /// caches, then decodes the assistant reply. Stops on `<|im_end|>`
-    /// so the cache stays on a clean boundary for the next turn.
-    ///
-    /// `is_error` is the structured tool-error signal. When `Some(true)`,
-    /// the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper so the model receives a clear text-level
-    /// cue. `None` / `Some(false)` keep the wire bytes byte-equal to the
-    /// pre-feature output.
-    ///
-    /// Requires a live session started via `chatSessionStart`.
-    #[napi]
-    pub async fn chat_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        is_error: Option<bool>,
-    ) -> Result<ChatResult> {
-        let config = config.unwrap_or_default();
-        send_and_await(&self.thread, |reply| {
-            Qwen3Cmd::Chat(ChatCmd::SessionContinueTool {
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                reply,
-            })
-        })
-        .await
-    }
-
-    /// Streaming variant of `chatSessionStart`.
-    #[napi(
-        ts_args_type = "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_start(
-        &self,
-        messages: Vec<ChatMessage>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        if messages
-            .iter()
-            .any(|m| m.images.as_ref().is_some_and(|imgs| !imgs.is_empty()))
-        {
-            return Err(Error::from_reason(format!(
-                "{} Qwen3 is text-only; image messages are not supported",
-                IMAGE_CHANGE_RESTART_PREFIX
-            )));
-        }
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread
-            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
-                messages,
-                config,
-                stream_tx: plumbing.stream_tx,
-                cancelled: plumbing.cancelled,
-            }))?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinue`.
-    #[napi(
-        ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void"
-    )]
-    pub async fn chat_stream_session_continue(
-        &self,
-        user_message: String,
-        images: Option<Vec<Uint8Array>>,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread
-            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinue {
-                user_message,
-                images,
-                config,
-                stream_tx: plumbing.stream_tx,
-                cancelled: plumbing.cancelled,
-            }))?;
-
-        Ok(plumbing.handle)
-    }
-
-    /// Streaming variant of `chatSessionContinueTool`.
-    ///
-    /// `is_error` mirrors the non-streaming entry point — when
-    /// `Some(true)`, the renderer prepends the shared
-    /// [`crate::tokenizer::TOOL_ERROR_MARKER`] inside the
-    /// `<tool_response>` wrapper.
-    #[napi(
-        ts_args_type = "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined"
-    )]
-    pub async fn chat_stream_session_continue_tool(
-        &self,
-        tool_call_id: String,
-        content: String,
-        config: Option<ChatConfig>,
-        callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-        is_error: Option<bool>,
-    ) -> Result<ChatStreamHandle> {
-        let config = config.unwrap_or_default();
-
-        let plumbing = start_chat_stream(callback);
-        self.thread
-            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinueTool {
-                tool_call_id,
-                content,
-                is_error,
-                config,
-                stream_tx: plumbing.stream_tx,
-                cancelled: plumbing.cancelled,
-            }))?;
-
-        Ok(plumbing.handle)
-    }
-
     /// Generate multiple completions for multiple prompts in batch
     ///
     /// This is an optimized method for GRPO training that generates G completions
@@ -3867,6 +3619,16 @@ impl Qwen3Model {
         // Delegate to tokenizer which handles both simple ChatML and Jinja2 with tools
         tokenizer.apply_chat_template(env, messages, add_generation_prompt, tools, enable_thinking)
     }
+}
+
+crate::models::chat_napi::chat_napi_surface! {
+    class: Qwen3Model,
+    thread_cmd: Qwen3Cmd,
+    thread: direct,
+    image_guard: text_only,
+    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 
 #[cfg(test)]

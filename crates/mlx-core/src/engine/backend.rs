@@ -1538,3 +1538,70 @@ pub(crate) trait PagedBackend: ChatBackend {
         generation_stream
     }
 }
+
+/// Per-family training backend the model-neutral training-command handler
+/// ([`crate::engine::cmd::handle_train_cmd`]) drives.
+///
+/// Implemented only by the trainable families' `*Inner` structs (qwen3 /
+/// qwen3_5 / qwen3_5_moe); gemma4 / lfm2 are inference-only and carry no
+/// training arm. Each `*_sync` method body is the EXISTING per-family
+/// inherent method (`init_training_sync`, `train_step_grpo_sync`, …);
+/// the trait collapses the byte-identical per-family training/save match
+/// arms into one generic handler.
+///
+/// The `Bump`/`Set`/`Reset` commands need NO trait method — they operate
+/// directly on [`Self::training_state_mut`] in the handler.
+pub(crate) trait TrainBackend {
+    /// Mutable access to the model thread's training state — the
+    /// `Option<ModelThreadTrainingState>` field every trainable `*Inner`
+    /// owns. Drives the inline `Bump`/`Set`/`Reset` command arms.
+    fn training_state_mut(
+        &mut self,
+    ) -> &mut Option<crate::training_state::ModelThreadTrainingState>;
+
+    /// Set up optimizer + training state on the model thread. == the
+    /// per-family `init_training_sync`.
+    fn init_training_sync(
+        &mut self,
+        config: Box<crate::grpo::engine::GRPOEngineConfig>,
+        model_type: crate::training_model::ModelType,
+    ) -> Result<()>;
+
+    /// Generate a group of completions for the next GRPO training step.
+    /// == the per-family `generate_for_training_thread_sync`.
+    fn generate_for_training_thread_sync(
+        &mut self,
+        prompts: Vec<Vec<crate::tokenizer::ChatMessage>>,
+        group_size: usize,
+        gen_config: crate::models::qwen3::GenerationConfig,
+        enable_thinking: Option<bool>,
+        tools: Option<Vec<crate::tokenizer::ToolDefinition>>,
+    ) -> Result<crate::training_model::GenerationPlainData>;
+
+    /// Run one GRPO training step. == the per-family `train_step_grpo_sync`.
+    fn train_step_grpo_sync(
+        &mut self,
+        rewards: Vec<f64>,
+        group_size: i32,
+        loss_config: crate::grpo::loss::GRPOLossConfig,
+        valid_indices: Option<Vec<usize>>,
+    ) -> Result<crate::training_model::TrainStepPlainMetrics>;
+
+    /// Run one SFT training step. == the per-family `train_step_sft_sync`.
+    fn train_step_sft_sync(
+        &mut self,
+        input_ids: Vec<i32>,
+        input_shape: Vec<i64>,
+        labels: Vec<i32>,
+        labels_shape: Vec<i64>,
+        config: crate::sft::engine::SftEngineConfig,
+    ) -> Result<crate::training_model::TrainStepPlainMetrics>;
+
+    /// Persist the optimizer state. == the per-family
+    /// `save_optimizer_state_sync` (`&self`).
+    fn save_optimizer_state_sync(&self, path: String) -> Result<()>;
+
+    /// Restore the optimizer state. == the per-family
+    /// `load_optimizer_state_sync`.
+    fn load_optimizer_state_sync(&mut self, path: String) -> Result<()>;
+}
