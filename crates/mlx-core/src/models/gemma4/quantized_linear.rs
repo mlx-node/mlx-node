@@ -4,7 +4,7 @@ use std::ffi::CString;
 use crate::array::MxArray;
 // The int8 W8A8/W8A16 kernels are family-agnostic; importing them from
 // qwen3_5 follows the existing cross-family precedent
-// (`gemma4::persistence` imports `qwen3_5::persistence_common`).
+// (`gemma4::persistence` imports the shared `engine::persistence` helpers).
 use crate::models::qwen3_5::int8_gemm;
 use crate::nn::{Activations, Linear};
 use mlx_sys as sys;

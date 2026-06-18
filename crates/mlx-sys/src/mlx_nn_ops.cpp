@@ -171,6 +171,16 @@ bool ensure_readable(array& arr, const char* context) {
 
 template <typename Out>
 Out read_scalar(const array& arr, size_t index) {
+  // Host-side reads require materialized data. On the CUDA backend data() on an
+  // unevaluated array returns a null/device-only buffer and segfaults in
+  // Buffer::raw_ptr(), so force materialization first. The eval adds no
+  // astype/GPU op (unlike the stall noted above) and is a no-op when the array
+  // is already materialized. On Apple/Metal every caller already evals its
+  // sampled-token array upstream, so this is compiled out there to keep the
+  // prior eval-free host read byte-for-byte identical.
+#if !defined(__APPLE__)
+  const_cast<array&>(arr).eval();
+#endif
   switch (arr.dtype()) {
     case mlx::core::bool_:    return static_cast<Out>(arr.data<bool>()[index]);
     case mlx::core::uint8:    return static_cast<Out>(arr.data<uint8_t>()[index]);

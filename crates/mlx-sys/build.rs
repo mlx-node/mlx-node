@@ -208,28 +208,37 @@ fn main() {
         panic!("expected mlx/CMakeLists.txt relative to crate");
     }
 
+    // Read the target OS/arch up front: they decide whether we build the
+    // Metal backend at all. On macOS we build Metal (unless explicitly
+    // disabled); on Linux we build the CUDA backend and there is no Metal
+    // toolchain to look for.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
+    let is_macos = target_os == "macos";
+
     let metal_disabled = env::var_os("MLX_DISABLE_METAL").is_some();
-    if !metal_disabled && !metal_toolchain_available() {
+    // Metal is built only on macOS and only when not explicitly disabled.
+    // On Linux this is always false → no xcrun/metallib, CUDA backend instead.
+    let build_metal = is_macos && !metal_disabled;
+
+    if build_metal && !metal_toolchain_available() {
         panic!(
             "Metal toolchain not found. Install it with `xcodebuild -downloadComponent MetalToolchain` or set MLX_DISABLE_METAL=1 to force a CPU-only build."
         );
     }
 
     // Compile the paged-attention `.metallib` BEFORE we run the cmake
-    // build for MLX. Both products land in `OUT_DIR`. Skipped if Metal
-    // is disabled (no Metal toolchain) — the C++ side guards the
-    // dispatch with `target_os = "macos"` and the runtime
+    // build for MLX. Both products land in `OUT_DIR`. Skipped when Metal
+    // is not built (Metal disabled, or non-macOS host) — the C++ side guards
+    // the dispatch with `target_os = "macos"` and the runtime
     // `paged_attn_metallib_path` lookup will throw if the metallib is
     // not findable.
     let out_dir_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let paged_metallib_path = if !metal_disabled {
+    let paged_metallib_path = if build_metal {
         Some(compile_paged_attn_metallib(&manifest_dir, &out_dir_path))
     } else {
         None
     };
-
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
-    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
 
     let mut cfg = cmake::Config::new(&mlx_dir);
     cfg.define("MLX_BUILD_TESTS", "OFF")
@@ -237,8 +246,12 @@ fn main() {
         .define("MLX_BUILD_BENCHMARKS", "OFF")
         .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("MLX_BUILD_METAL", if metal_disabled { "OFF" } else { "ON" })
-        .define(
+        .define("MLX_BUILD_METAL", if build_metal { "ON" } else { "OFF" });
+
+    // `CMAKE_OSX_ARCHITECTURES` is an Apple-only knob; setting it on Linux
+    // confuses the GCC/CUDA toolchain. Only emit it on macOS.
+    if is_macos {
+        cfg.define(
             "CMAKE_OSX_ARCHITECTURES",
             if target_arch == "aarch64" {
                 "arm64"
@@ -246,6 +259,7 @@ fn main() {
                 "x86_64"
             },
         );
+    }
 
     if target_os == "macos" {
         let default_c_compiler = xcrun_find("clang").unwrap_or_else(|| "clang".to_string());
@@ -283,6 +297,19 @@ fn main() {
             .define("CMAKE_CXX_COMPILER_RANLIB", &ranlib)
             .cflag(format!("-isysroot {sdk_path}"))
             .cxxflag(format!("-isysroot {sdk_path}"));
+    } else if target_os == "linux" {
+        // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
+        // architecture, but on a GPU-less / headless configure host the
+        // detection query is empty and FATALs. Pass the arch explicitly for
+        // determinism (`121a` is what MLX auto-detected on the GB10 host;
+        // override via MLX_CUDA_ARCHITECTURES). Release build type so the
+        // benchmark numbers are not skewed by an unoptimized default.
+        let cuda_archs = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| "121a".into());
+        cfg.define("MLX_BUILD_CUDA", "ON")
+            .define("MLX_BUILD_METAL", "OFF")
+            .define("MLX_BUILD_CPU", "ON")
+            .define("MLX_CUDA_ARCHITECTURES", &cuda_archs)
+            .define("CMAKE_BUILD_TYPE", "Release");
     }
 
     let dst = cfg.build();
@@ -367,13 +394,46 @@ fn main() {
 
     println!("cargo:rustc-link-lib=static=mlx");
 
-    if !metal_disabled {
-        println!("cargo:rustc-link-lib=framework=Metal");
-        println!("cargo:rustc-link-lib=framework=QuartzCore");
+    if is_macos {
+        if build_metal {
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+        }
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=c++");
+    } else if target_os == "linux" {
+        // CUDA runtime + math libs are PRIVATE deps of the static libmlx —
+        // they are not re-exported through the .a, so we must re-declare them
+        // for the final link of the .node addon. Search both the CUDA lib dir
+        // and the stubs dir (libcuda.so lives only in stubs at build time;
+        // the real driver is found at runtime via LD_LIBRARY_PATH).
+        let cuda_path = env::var("CUDA_PATH")
+            .or_else(|_| env::var("CUDA_HOME"))
+            .unwrap_or_else(|_| "/usr/local/cuda".into());
+        println!("cargo:rustc-link-search=native={cuda_path}/lib64");
+        println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
+        for l in ["cudart", "cublas", "cublasLt", "cufft", "nvrtc", "cuda"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
+        // cuDNN: MLX 9.x uses the split cuDNN. The umbrella `cudnn` shim
+        // re-exports the sub-libraries on most installs; if the link reports
+        // unresolved cuDNN symbols, the real sub-lib names (cudnn_graph,
+        // cudnn_ops, cudnn_engines_*) are added below after verifying against
+        // the cmake link line.
+        println!("cargo:rustc-link-lib=dylib=cudnn");
+        // MLX keeps its CPU backend on even for a CUDA build (some ops have no
+        // CUDA path), so its CBLAS/LAPACK symbols (e.g. `cblas_dgemm`) are
+        // PRIVATE deps of static libmlx that must be re-declared for the final
+        // link. `libblas.so` provides the CBLAS interface; `liblapack.so` the
+        // LAPACK ops. (MLX's CMake found these at /usr/lib/aarch64-linux-gnu.)
+        for l in ["lapack", "blas"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
+        for l in ["stdc++", "dl", "pthread"] {
+            println!("cargo:rustc-link-lib=dylib={l}");
+        }
     }
-    println!("cargo:rustc-link-lib=framework=Foundation");
-    println!("cargo:rustc-link-lib=framework=Accelerate");
-    println!("cargo:rustc-link-lib=c++");
 
     let include_source = mlx_dir.join("mlx");
     let include_generated = dst.join("include");
@@ -381,14 +441,24 @@ fn main() {
     let mut bridge = cc::Build::new();
     bridge
         .cpp(true)
-        .std("c++17")
         .warnings(false)
         .define("MLX_STATIC", None)
         .include(&include_source)
         .include(&mlx_dir);
 
-    if target_os == "macos" {
+    if is_macos {
+        // macOS keeps C++17 (its clang accepts MLX's defaulted operator==
+        // under C++17). Unchanged from the original build to guarantee no
+        // codegen drift on the macOS path.
+        bridge.std("c++17");
         bridge.compiler("clang++");
+    } else {
+        // MLX itself is built with `CMAKE_CXX_STANDARD 20`; its public headers
+        // use C++20-only constructs (e.g. defaulted `operator==` in device.h /
+        // stream.h). GCC enforces the standard strictly, so the bridge must
+        // match C++20 to consume those headers and to resolve the same
+        // `slice_update` overloads MLX compiled against.
+        bridge.std("c++20");
     }
 
     if include_generated.exists() {
@@ -398,20 +468,43 @@ fn main() {
         // `mlx::core::metal::Device` API exposes `MTL::*` types from
         // `<Metal/Metal.hpp>`. The CMake build links MLX against
         // metal_cpp transitively but the cc-rs C++ bridge must be told
-        // explicitly.
-        let metal_cpp_include = include_generated.join("metal_cpp");
-        if metal_cpp_include.exists() {
-            bridge.include(&metal_cpp_include);
+        // explicitly. Only present / needed on macOS — the CUDA build has
+        // no metal_cpp and excludes the TUs that consume it.
+        if is_macos {
+            let metal_cpp_include = include_generated.join("metal_cpp");
+            if metal_cpp_include.exists() {
+                bridge.include(&metal_cpp_include);
+            }
         }
     }
     // Add src/ as include path for metal/*.metal.inc includes
     bridge.include(&src_dir);
+
+    // Translation units that depend on Metal *by header* (raw `MTL::` types
+    // or `#include mlx/backend/metal/device.h`). These do not compile on a
+    // non-Metal host. They are excluded from the Linux build; the symbols
+    // their `eval_gpu` consumers need (`paged_kv_write` / `paged_attention` /
+    // `paged_attention_varlen`) are provided as runtime-throwing stubs in
+    // `mlx_paged_stubs_linux.cpp`, and the Rust callers fall back to the
+    // eager path via the `mlx_metal_is_available()` gates.
+    const METAL_ONLY_TUS: &[&str] = &[
+        "mlx_paged_dispatch.cpp", // raw MTL:: types
+        "mlx_paged_ops.cpp",      // #include mlx/backend/metal/device.h
+        "mlx_paged_profile.cpp",  // __APPLE__-guarded body + Metal include
+    ];
 
     // Compile all .cpp files in src/ (split from original monolithic mlx.cpp)
     for entry in std::fs::read_dir(&src_dir).expect("Failed to read src directory") {
         let entry = entry.expect("Failed to read directory entry");
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "cpp") {
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !is_macos && METAL_ONLY_TUS.contains(&file_name.as_str()) {
+                continue;
+            }
             bridge.file(&path);
         }
     }

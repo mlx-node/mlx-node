@@ -769,7 +769,14 @@ impl Gemma4Inner {
         // Cache dtype: BFloat16 (Gemma4's production dtype). KV-shared layers
         // are aliases and do not consume physical pool slots; they resolve to
         // their anchor's group ordinal through `compute_layer_kinds`.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true) {
+        // The block-paged KV path uses Metal-only kernels; on a non-Metal
+        // backend (the CUDA/Linux build) its write/gather methods are throwing
+        // stubs. Force flat eager there by leaving the adapter None, so the
+        // `paged_adapter.is_some()` routing falls through to the flat path.
+        // macOS is unaffected — the probe is always true, so the default wins.
+        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true)
+            && crate::engine::persistence::compiled_forward_backend_available()
+        {
             let block_size = config.paged_block_size.unwrap_or(16);
             let kv_cache_specs =
                 compute_layer_kv_cache_specs(&config, block_size, KVCacheDType::BFloat16).map_err(
@@ -6760,6 +6767,12 @@ mod tests {
     /// on no-Metal sandboxes.
     #[test]
     fn test_gemma4_inner_paged_adapter_when_flag_is_none_default_on_macos() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(None);
         match super::Gemma4Inner::new(cfg) {
             Ok(inner) => {
@@ -6785,6 +6798,12 @@ mod tests {
     /// gracefully skips on no-Metal sandboxes.
     #[test]
     fn test_gemma4_inner_constructs_paged_adapter_when_flag_is_true() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         let cfg = paged_tiny_config(Some(true));
         match super::Gemma4Inner::new(cfg) {
             Ok(inner) => {
@@ -6873,6 +6892,12 @@ mod tests {
     /// flat path (random weights). Gracefully skipped on no-Metal.
     #[test]
     fn test_run_paged_prefill_decode_smoke() {
+        // Block-paged needs the Metal backend; on a non-Metal build the
+        // adapter is gated off (None) and there is nothing to exercise.
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
         use crate::array::{DType, MxArray};
 
         let cfg = paged_tiny_config(Some(true));

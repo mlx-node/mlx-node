@@ -9,7 +9,8 @@ use tracing::info;
 
 use crate::array::{DType, MxArray};
 use crate::engine::persistence::{
-    dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
+    compiled_forward_backend_available, dequant_fp8_weights, load_all_safetensors,
+    prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for,
@@ -1629,11 +1630,16 @@ impl Lfm2Inner {
             paged_block_size_ok,
             non_quant_floats_bf16,
             crate::models::lfm2::model::quant_compiled_enabled() && quant_embed_supported,
-        ) {
+        ) && compiled_forward_backend_available()
+        {
             // Arm the slot-erasing Drop ONLY when registration actually
             // published the model id (true return). An aborted-to-eager /
             // empty registration leaves no slot, so its Drop must skip the
-            // compiled-weights write lock entirely (the deadlock fix).
+            // compiled-weights write lock entirely (the deadlock fix). The
+            // compiled C++ forward uses Metal-only kernels, so the added
+            // `compiled_forward_backend_available()` gate skips registration on
+            // a non-Metal backend (the eager Rust forward runs instead; the
+            // model_id is never published). macOS keeps registering as before.
             inner.compiled_slot_registered = register_weights_with_cpp(
                 &params,
                 inner.model_id,

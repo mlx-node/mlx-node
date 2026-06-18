@@ -13,13 +13,13 @@
 [![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 [![Rust](https://img.shields.io/badge/Rust-1.90+-orange.svg)](https://www.rust-lang.org/)
 
-[Quick Start](#quick-start) · [Training](#grpo-training) · [Training TUI](#training-tui) · [Architecture](#architecture) · [API Reference](#api-reference) · [Documentation](#documentation)
+[Quick Start](#quick-start) · [Platform Support](#platform-support) · [Training](#grpo-training) · [Training TUI](#training-tui) · [Architecture](#architecture) · [API Reference](#api-reference) · [Documentation](#documentation)
 
 </div>
 
 ---
 
-MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to JavaScript/TypeScript, enabling efficient on-device ML inference and training on Apple Silicon and CUDA devices. Built with a Rust compute layer and TypeScript orchestration, it delivers production-ready GRPO training with 100% feature parity with HuggingFace's [TRL](https://github.com/huggingface/trl) library.
+MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to JavaScript/TypeScript, enabling efficient on-device ML inference and training on Apple Silicon (Metal). Experimental **NVIDIA CUDA** inference is now in preview — validated on the GB10 / DGX Spark (see [Platform Support](#platform-support)). Built with a Rust compute layer and TypeScript orchestration, it delivers production-ready GRPO training with 100% feature parity with HuggingFace's [TRL](https://github.com/huggingface/trl) library.
 
 <div align="center">
 <img src="images/demo.png" alt="MLX-Node Training TUI" width="800">
@@ -34,6 +34,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 |     | Feature                       | Description                                                                               |
 | :-: | :---------------------------- | :---------------------------------------------------------------------------------------- |
 | ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion        |
+| 🧪  | **Experimental CUDA**         | NVIDIA GPU inference via MLX's CUDA backend — Qwen3.6 on GB10 / DGX Spark (preview, eager) |
 | 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO) |
 | 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling          |
 | 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                       |
@@ -112,13 +113,48 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ---
 
+## Platform Support
+
+| Platform                          | Backend | Status                                            |
+| :-------------------------------- | :------ | :------------------------------------------------ |
+| macOS · Apple Silicon (M1–M5)     | Metal   | ✅ Fully supported (inference · training · VLM)   |
+| Linux · aarch64 / glibc · NVIDIA  | CUDA    | 🧪 Experimental — inference preview               |
+
+### NVIDIA CUDA (experimental preview)
+
+MLX-Node runs on NVIDIA GPUs through MLX's CUDA backend. This is an early
+proof-of-concept that uses **device-agnostic eager fallbacks with no custom CUDA
+kernels yet** — functional, but not performance-tuned. Every CUDA change is
+Metal-gated, so the macOS path is byte-for-byte unaffected.
+
+- **Validated:** Qwen3.6 27B dense and 35B-A3B MoE (Q4-affine + NVFP4) run
+  inference on the **NVIDIA GB10 / DGX Spark** (Grace-Blackwell, `sm_121`,
+  CUDA 13.0). Other model families and training are untested on CUDA.
+- **Performance:** decode is memory-bandwidth-bound and currently ~0.6–0.76× of
+  an Apple M3 Max (the GB10's ~273 GB/s vs ~400 GB/s); prefill is limited by the
+  sequential gated-delta (GDN) eager fallback (no CUDA GDN kernel yet). Full
+  numbers: [docs/cuda-poc-benchmark.md](docs/cuda-poc-benchmark.md).
+- **Not yet on CUDA:** custom kernels (GDN, paged attention, FP4 GEMM), training
+  (GRPO/SFT), speculative decoding (MTP), x86_64 Linux, and prebuilt binaries.
+
+Paged attention is Metal-only, so force the eager/flat path when running on CUDA:
+
+```bash
+MLX_QWEN35_FORCE_EAGER=1 MLX_QWEN35_PAGED_OVERRIDE=0 \
+  node examples/lm.ts Qwen3.6-27B-UD-Q4_K_XL-mlx
+```
+
+---
+
 ## Quick Start
 
 ### Prerequisites
 
-- macOS with Apple Silicon (M1/M2/M3/M4/M5) with Metal (Linux/Windows with CUDA is coming soon)
+- macOS with Apple Silicon (M1–M5) and Metal — fully supported
 - Node.js 18+
 - Rust 1.90
+
+> 🧪 **Experimental:** Linux aarch64 (glibc) + NVIDIA CUDA 13.0 (`sm_121`, validated on GB10 / DGX Spark) — inference-only preview. See [Platform Support](#platform-support).
 
 ### Build
 
@@ -129,6 +165,8 @@ git submodule update --init --recursive
 yarn install
 yarn build
 ```
+
+> 🧪 **Experimental CUDA build (Linux aarch64 / GB10):** install the CUDA 13.0 toolkit (`nvcc` on `PATH`) and build on a glibc host with an NVIDIA GPU. `yarn build:native` compiles MLX with the CUDA backend (`sm_121` / arch `121a`) and emits `mlx-core.linux-arm64-gnu.node`; the Metal metallib step is skipped automatically on Linux.
 
 ### Download and convert a Model
 
@@ -361,7 +399,7 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 ├──────────────────────────────────────────────────────────────────────────┤
 │                     mlx-sys FFI + C++ Bridge                             │
 ├──────────────────────────────────────────────────────────────────────────┤
-│                  MLX Library + Metal GPU Backend                         │
+│                  MLX Library + Metal & CUDA GPUs                         │
 │              Lazy evaluation · Operation fusion · GPU kernels            │
 └──────────────────────────────────────────────────────────────────────────┘
 ```

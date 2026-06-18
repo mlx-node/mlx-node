@@ -103,8 +103,8 @@ static array transformer_block_forward_cached(
     cached_values = zeros(buffer_shape, values.dtype());
 
     // Insert initial keys/values at cache_idx
-    cached_keys = slice_update(*cached_keys, keys, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-    cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    cached_keys = slice_update(*cached_keys, keys, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+    cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
   } else {
     // Subsequent calls: check if we need to expand buffer
     int current_capacity = static_cast<int>(cached_keys->shape()[2]);
@@ -124,8 +124,8 @@ static array transformer_block_forward_cached(
     }
 
     // Insert new keys/values
-    cached_keys = slice_update(*cached_keys, keys, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-    cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+    cached_keys = slice_update(*cached_keys, keys, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+    cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
   }
 
   // Get valid keys/values up to new_idx
@@ -427,8 +427,8 @@ static array paddleocr_vl_block_forward_cached(
         cached_keys = zeros(buffer_shape, k_rotated.dtype());
         cached_values = zeros(buffer_shape, values.dtype());
 
-        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_keys = slice_update(*cached_keys, k_rotated, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
     } else {
         int current_capacity = static_cast<int>(cached_keys->shape()[2]);
         if (new_idx > current_capacity) {
@@ -441,8 +441,8 @@ static array paddleocr_vl_block_forward_cached(
             cached_keys = new_k_buffer;
             cached_values = new_v_buffer;
         }
-        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_keys = slice_update(*cached_keys, k_rotated, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
     }
 
     auto keys_valid = slice(*cached_keys, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
@@ -516,8 +516,8 @@ static array paddleocr_vl_block_forward_batched(
         cached_keys = zeros(buffer_shape, k_rotated.dtype());
         cached_values = zeros(buffer_shape, values.dtype());
 
-        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_keys = slice_update(*cached_keys, k_rotated, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
     } else {
         int current_capacity = static_cast<int>(cached_keys->shape()[2]);
         if (new_idx > current_capacity) {
@@ -530,8 +530,8 @@ static array paddleocr_vl_block_forward_batched(
             cached_keys = new_k_buffer;
             cached_values = new_v_buffer;
         }
-        cached_keys = slice_update(*cached_keys, k_rotated, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
-        cached_values = slice_update(*cached_values, values, {0, 0, cache_idx, 0}, {batch, n_kv_heads, new_idx, head_dim});
+        cached_keys = slice_update(*cached_keys, k_rotated, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
+        cached_values = slice_update(*cached_values, values, Shape{0, 0, cache_idx, 0}, Shape{batch, n_kv_heads, new_idx, head_dim});
     }
 
     auto keys_valid = slice(*cached_keys, {0, 0, 0, 0}, {batch, n_kv_heads, new_idx, head_dim});
