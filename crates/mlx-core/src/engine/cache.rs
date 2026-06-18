@@ -91,10 +91,14 @@ pub(crate) fn build_paged_extra_keys(
 /// `drop_last_always` selects the trailing-token policy, which depends on
 /// whether the decode driver forwarded the final committed token into the
 /// physical cache:
-/// - `false` (legacy macro cores): the `decode_loop!` / `decode_loop_mtp!`
-///   macros forward the EOS/stop token *before* the stop check, so it IS in
-///   the cache and must be kept; only a `length` exit (whose final token is
-///   not forwarded) drops the trailing token.
+/// - Legacy macro cores: callers pass `drop_last_always = !last_token_in_cache`.
+///   The `decode_loop!` / `decode_loop_mtp!` macros do NOT always forward the
+///   stop token before checking it — the AR loop skips the forward on its final
+///   step (incl. `max_new_tokens == 1`), and the MTP loop's pre-forward seed
+///   re-check and Step-A post-check stop on a token that has not yet been
+///   forwarded. Those macros write `last_in_cache = false` on exactly those
+///   unforwarded-stop arms, so the helper drops the terminal token when it was
+///   unforwarded OR the finish reason is `length`; otherwise it is kept.
 /// - `true` (generic `run_decode_loop` flow): the shared loop skips the final
 ///   committed token's forward on EVERY exit kind, so it is never in the
 ///   physical cache; the trailing token is dropped unconditionally to keep
@@ -164,7 +168,10 @@ pub(crate) fn save_cache_state_direct<C>(
 ///
 /// `drop_last_always` has the same meaning as in [`save_cache_state_direct`]:
 /// `true` (generic `run_decode_loop` flow) drops the never-forwarded final
-/// token on every exit; `false` (legacy macro cores) drops only on `length`.
+/// token on every exit; legacy macro cores pass `!last_token_in_cache`, which
+/// drops the terminal token when the macro stopped on an unforwarded token
+/// (final-step AR stop, MTP seed / Step-A stop) OR the finish reason is
+/// `length`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save_cache_state_after_delta<C>(
     reuse_cache: bool,
@@ -498,6 +505,44 @@ mod save_cache_state_after_delta_tests {
 
         // All generated tokens kept (the macro forwarded the terminal token).
         assert_eq!(cached_history, vec![1, 2, 3, 10, 11]);
+    }
+
+    #[test]
+    fn direct_unforwarded_stop_drops_trailing_token() {
+        // Legacy-macro contract for an UNFORWARDED stop token: when the macro
+        // stops on a token it never forwarded into the physical KV/GDN cache
+        // (final-step AR stop, or the MTP seed / Step-A stop arms), the caller
+        // passes `drop_last_always = !last_in_cache` with `last_in_cache =
+        // false`. The helper must then drop the terminal token even though the
+        // finish reason is `stop`, keeping `cached_token_history` aligned with
+        // the physical cache length. The generated output the caller returns is
+        // unaffected — only the persisted history is trimmed.
+        let mut cached_history: Vec<u32> = vec![];
+        let mut cached_image_key: Option<u64> = None;
+        let mut cached_rope_deltas: Option<i32> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
+
+        let generated = [10, 11];
+        let last_in_cache = false;
+        save_cache_state_direct(
+            true,
+            false,
+            &generated,
+            "stop",
+            /* drop_last_always */ !last_in_cache,
+            &[1, 2, 3],
+            None,
+            0,
+            &mut cached_history,
+            &mut cached_image_key,
+            &mut cached_rope_deltas,
+            &mut caches,
+        );
+
+        // Unforwarded terminal token 11 dropped from the persisted history.
+        assert_eq!(cached_history, vec![1, 2, 3, 10]);
+        // The generated output itself is untouched by the save helper.
+        assert_eq!(generated, [10, 11]);
     }
 }
 

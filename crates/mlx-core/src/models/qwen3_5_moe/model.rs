@@ -93,6 +93,7 @@ macro_rules! moe_eager_mtp_decode {
         generated_tokens: $generated_tokens:expr,
         token_history: $token_history:expr,
         finish_reason: $finish_reason:expr,
+        last_in_cache: $last_in_cache:ident,
         first_token_instant: $first_token_instant:expr,
         generation_stream: $generation_stream:expr
         $(, streaming: { $($stream_tail:tt)* })?
@@ -394,6 +395,7 @@ macro_rules! moe_eager_mtp_decode {
                 generated_tokens: $generated_tokens,
                 token_history: $token_history,
                 finish_reason: $finish_reason,
+                last_in_cache: $last_in_cache,
                 first_token_instant: $first_token_instant,
                 report_perf: $p.report_performance,
                 generation_stream: $generation_stream
@@ -1704,6 +1706,11 @@ impl Qwen35MoeInner {
 
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             moe_eager_mtp_decode!(
                 inner: self,
@@ -1721,6 +1728,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 generation_stream: generation_stream
             );
@@ -1758,6 +1766,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream
@@ -1770,7 +1779,7 @@ impl Qwen35MoeInner {
             has_images,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
@@ -3082,6 +3091,11 @@ impl Qwen35MoeInner {
         let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             moe_eager_mtp_decode!(
                 inner: self,
@@ -3099,6 +3113,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 generation_stream: generation_stream,
                 streaming: {
@@ -3143,6 +3158,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -3163,7 +3179,7 @@ impl Qwen35MoeInner {
             has_images,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
@@ -3445,6 +3461,11 @@ impl Qwen35MoeInner {
 
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             moe_eager_mtp_decode!(
                 inner: self,
@@ -3462,6 +3483,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 generation_stream: generation_stream
             );
@@ -3498,6 +3520,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream
@@ -3515,7 +3538,7 @@ impl Qwen35MoeInner {
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
@@ -3700,6 +3723,11 @@ impl Qwen35MoeInner {
         let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             moe_eager_mtp_decode!(
                 inner: self,
@@ -3717,6 +3745,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 generation_stream: generation_stream,
                 streaming: {
@@ -3761,6 +3790,7 @@ impl Qwen35MoeInner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -3783,7 +3813,7 @@ impl Qwen35MoeInner {
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,

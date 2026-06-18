@@ -780,6 +780,7 @@ macro_rules! decode_loop {
         generated_tokens: $gen:expr,
         token_history: $hist:expr,
         finish_reason: $reason:expr,
+        last_in_cache: $last_in_cache:ident,
         first_token_instant: $first_tok:expr,
         report_perf: $report:expr,
         generation_stream: $stream:expr
@@ -908,6 +909,7 @@ macro_rules! decode_loop {
 
                 if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     $reason = String::from("cancelled");
+                    $last_in_cache = step + 1 < $max;
                     break;
                 }
 
@@ -945,6 +947,11 @@ macro_rules! decode_loop {
 
             if token_id == $eos || $p.extra_eos_ids.contains(&token_id) {
                 $reason = String::from("stop");
+                // The token just pushed was forwarded into the physical KV/GDN
+                // cache iff this iteration ran a forward (`step + 1 < $max`).
+                // On the final step (incl. `max_new_tokens == 1`, where step 0
+                // is final) no forward runs, so the stop token is unforwarded.
+                $last_in_cache = step + 1 < $max;
                 break;
             }
 
@@ -955,6 +962,7 @@ macro_rules! decode_loop {
                 $p.ngram_size,
             ) {
                 $reason = reason.to_string();
+                $last_in_cache = step + 1 < $max;
                 break;
             }
 
@@ -2243,6 +2251,7 @@ macro_rules! decode_loop_mtp {
         generated_tokens: $gen:expr,
         token_history: $hist:expr,
         finish_reason: $reason:expr,
+        last_in_cache: $last_in_cache:ident,
         first_token_instant: $first_tok:expr,
         report_perf: $report:expr,
         generation_stream: $stream:expr
@@ -2421,12 +2430,17 @@ macro_rules! decode_loop_mtp {
             if let Some(&last) = $gen.last() {
                 if last == $eos || $p.extra_eos_ids.contains(&last) {
                     $reason = String::from("stop");
+                    // This pre-forward re-check fires on the initial seed (or a
+                    // prior-iteration token) BEFORE any forward consumed it, so
+                    // the stop token is not yet in the physical cache.
+                    $last_in_cache = false;
                     break;
                 }
             }
             $(
                 if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                     $reason = String::from("cancelled");
+                    $last_in_cache = false;
                     break;
                 }
             )?
@@ -2434,6 +2448,7 @@ macro_rules! decode_loop_mtp {
                 &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
             ) {
                 $reason = reason.to_string();
+                $last_in_cache = false;
                 break;
             }
             if $gen.len() >= max_as_usize {
@@ -2532,6 +2547,7 @@ macro_rules! decode_loop_mtp {
                     $last_r = _is_reasoning;
                     if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                         $reason = String::from("cancelled");
+                        $last_in_cache = false;
                         break;
                     }
                     let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
@@ -2557,12 +2573,17 @@ macro_rules! decode_loop_mtp {
 
                 if token_id == $eos || $p.extra_eos_ids.contains(&token_id) {
                     $reason = String::from("stop");
+                    // Step A's sampled token only becomes the next `$y` and is
+                    // forwarded on the NEXT iteration, so it is not yet in the
+                    // physical cache when we stop here.
+                    $last_in_cache = false;
                     break;
                 }
                 if let Some(reason) = $crate::sampling::check_repetition_cutoff(
                     &$gen, $p.max_consecutive_tokens, $p.max_ngram_repeats, $p.ngram_size,
                 ) {
                     $reason = reason.to_string();
+                    $last_in_cache = false;
                     break;
                 }
                 if $gen.len() >= max_as_usize {
@@ -2828,6 +2849,12 @@ macro_rules! decode_loop_mtp {
                     if $cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                         $reason = String::from("cancelled");
                         hit_stop = true;
+                        // The last outcome token is the unforwarded boundary
+                        // (bonus/residual); its K/V is laid down only by the
+                        // next cycle's Step A, so it is NOT yet in the physical
+                        // cache. Keep an earlier emitted token (verify wrote its
+                        // K/V), drop the boundary token.
+                        $last_in_cache = cycle_emitted < outcome.tokens.len();
                         break;
                     }
                     let token_text = $crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
@@ -2853,6 +2880,9 @@ macro_rules! decode_loop_mtp {
                 if tok_id == $eos || $p.extra_eos_ids.contains(&tok_id) {
                     $reason = String::from("stop");
                     hit_stop = true;
+                    // The boundary (last) outcome token is forwarded only by the
+                    // next cycle's Step A, so it is not yet in the physical cache.
+                    $last_in_cache = cycle_emitted < outcome.tokens.len();
                     break;
                 }
                 if let Some(reason) = $crate::sampling::check_repetition_cutoff(
@@ -2860,6 +2890,9 @@ macro_rules! decode_loop_mtp {
                 ) {
                     $reason = reason.to_string();
                     hit_stop = true;
+                    // The boundary (last) outcome token is forwarded only by the
+                    // next cycle's Step A, so it is not yet in the physical cache.
+                    $last_in_cache = cycle_emitted < outcome.tokens.len();
                     break;
                 }
             }

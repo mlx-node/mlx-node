@@ -1997,6 +1997,11 @@ impl Qwen35Inner {
 
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
+        // Whether the final committed token reached the physical KV/GDN cache.
+        // The decode macros write `false` when they stop on an unforwarded
+        // token so the save below can drop it from `cached_token_history`.
+        let mut last_in_cache = true;
+
         if eager_mtp {
             profiler.set_label("mtp_eager");
             let mtp_desynced = std::cell::Cell::new(false);
@@ -2525,6 +2530,7 @@ impl Qwen35Inner {
                     generated_tokens: generated_tokens,
                     token_history: token_history,
                     finish_reason: finish_reason,
+                    last_in_cache: last_in_cache,
                     first_token_instant: first_token_instant,
                     report_perf: p.report_performance,
                     generation_stream: generation_stream
@@ -2577,6 +2583,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream
@@ -2593,7 +2600,7 @@ impl Qwen35Inner {
                 p.reuse_cache,
                 &generated_tokens,
                 &finish_reason,
-                /* drop_last_always */ false,
+                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 &mut self.cached_token_history,
                 &mut self.cached_image_key,
@@ -2606,7 +2613,7 @@ impl Qwen35Inner {
                 has_images,
                 &generated_tokens,
                 &finish_reason,
-                /* drop_last_always */ false,
+                /* drop_last_always */ !last_in_cache,
                 &save_tokens,
                 save_expanded_tokens.as_deref(),
                 save_image_cache_key,
@@ -2707,10 +2714,15 @@ impl Qwen35Inner {
         prompt_hidden: Option<MxArray>,
         prompt_hidden_ids: Option<Vec<u32>>,
         prompt_hidden_position_base: usize,
+        last_in_cache: &mut bool,
     ) -> Result<()> {
         profiler.set_label("mtp_eager");
 
         MxArray::async_eval_arrays(&[&y]);
+
+        // Mirrors the macro's `last_in_cache` binding; written by
+        // `decode_loop_mtp!` and propagated to the caller's save below.
+        let mut last_in_cache_local = true;
 
         // Pure-Rust eager MTP. Each `MtpOps` closure forwards through the
         // `Qwen35Inner` graph; GDN rollback uses the K+1 separate `[1,1]`
@@ -3062,6 +3074,7 @@ impl Qwen35Inner {
                 generated_tokens: *generated_tokens,
                 token_history: *token_history,
                 finish_reason: *finish_reason,
+                last_in_cache: last_in_cache_local,
                 first_token_instant: *first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -3082,6 +3095,7 @@ impl Qwen35Inner {
                 return Err(e);
             }
         }
+        *last_in_cache = last_in_cache_local;
         // Propagate a mid-cycle stop: self.caches advanced past the emitted
         // history, so force a full re-prefill next turn.
         if mtp_desynced.get() {
@@ -3966,6 +3980,10 @@ impl Qwen35Inner {
                     }
                 }
 
+                // The paged turn commits cache state through its own
+                // paged-history save (not the legacy `save_cache_state*`
+                // helpers), so the macro's trailing-token signal is unused here.
+                let mut last_in_cache = true;
                 mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
                     mtp_depth: p.mtp_depth,
@@ -3980,10 +3998,12 @@ impl Qwen35Inner {
                     generated_tokens: generated_tokens,
                     token_history: token_history,
                     finish_reason: finish_reason,
+                    last_in_cache: last_in_cache,
                     first_token_instant: *first_token_instant,
                     report_perf: p.report_performance,
                     generation_stream: generation_stream
                 );
+                let _ = last_in_cache;
 
                 if let Some(e) = replay_err_cell.borrow_mut().take() {
                     return Err(e);
@@ -4930,6 +4950,10 @@ impl Qwen35Inner {
                     }
                 }
 
+                // The paged turn commits cache state through its own
+                // paged-history save (not the legacy `save_cache_state*`
+                // helpers), so the macro's trailing-token signal is unused here.
+                let mut last_in_cache = true;
                 mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
                     mtp_depth: p.mtp_depth,
@@ -4944,6 +4968,7 @@ impl Qwen35Inner {
                     generated_tokens: generated_tokens,
                     token_history: token_history,
                     finish_reason: finish_reason,
+                    last_in_cache: last_in_cache,
                     first_token_instant: *first_token_instant,
                     report_perf: p.report_performance,
                     generation_stream: generation_stream,
@@ -4956,6 +4981,7 @@ impl Qwen35Inner {
                         last_is_reasoning: *last_is_reasoning
                     }
                 );
+                let _ = last_in_cache;
 
                 if let Some(e) = replay_err_cell.borrow_mut().take() {
                     return Err(e);
@@ -5294,6 +5320,11 @@ impl Qwen35Inner {
         // (mirrors the non-stream delta path's `None, None, 0`).
         let eager_mtp = p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_none();
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             self.run_flat_stream_eager_mtp(
                 y,
@@ -5318,6 +5349,7 @@ impl Qwen35Inner {
                 None,
                 None,
                 0,
+                &mut last_in_cache,
             )?;
         } else {
             profiler.set_label("chat_stream_delta_rust");
@@ -5351,6 +5383,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -5374,7 +5407,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
@@ -5842,6 +5875,11 @@ impl Qwen35Inner {
             .map(|_| mtp_prompt_history.position_base)
             .unwrap_or(0);
 
+        // Whether the final committed token reached the physical KV/GDN cache;
+        // written by the decode driver so the save below drops it when it was
+        // never forwarded (unforwarded stop token).
+        let mut last_in_cache = true;
+
         if eager_mtp {
             self.run_flat_stream_eager_mtp(
                 y,
@@ -5866,6 +5904,7 @@ impl Qwen35Inner {
                 prompt_hidden,
                 prompt_hidden_ids,
                 prompt_hidden_position_base,
+                &mut last_in_cache,
             )?;
         } else {
             profiler.set_label("chat_stream_rust");
@@ -5899,6 +5938,7 @@ impl Qwen35Inner {
                 generated_tokens: generated_tokens,
                 token_history: token_history,
                 finish_reason: finish_reason,
+                last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
                 generation_stream: generation_stream,
@@ -5919,7 +5959,7 @@ impl Qwen35Inner {
             has_images,
             &generated_tokens,
             &finish_reason,
-            /* drop_last_always */ false,
+            /* drop_last_always */ !last_in_cache,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
