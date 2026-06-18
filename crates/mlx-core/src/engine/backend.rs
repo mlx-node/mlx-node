@@ -447,16 +447,27 @@ pub(crate) struct ThinkingSetup {
 /// Covers the union of what the three existing post-turn persistence
 /// helpers consume at their call sites:
 ///   * [`crate::engine::cache::save_cache_state_direct`] (fresh-prefill
-///     turns; `is_delta == false`) — uses every field except
-///     `last_token_in_cache`;
+///     turns; `is_delta == false`);
 ///   * [`crate::engine::cache::save_cache_state_after_delta`]
 ///     (session-delta turns; `is_delta == true`) — ignores `has_images`
 ///     / `save_expanded_tokens` / `image_cache_key` by design (the
 ///     sticky-image-key invariant documented on that helper);
-///   * `Lfm2Inner::save_cache_state(reuse_cache, save_tokens,
-///     generated_tokens, last_token_in_cache)` — the only consumer of
-///     `last_token_in_cache` (whether the final sampled token's forward
-///     already advanced the caches); other families ignore it.
+///   * `Lfm2Inner::save_cache_state` (conv family).
+///
+/// The shared `run_decode_loop` never forwards the FINAL committed
+/// token (its forward gate skips the last step on length AND
+/// EOS/cancel/repetition exits), so the physical flat KV cache holds
+/// `P + N - 1` tokens. Each family trims its saved history to match:
+///   * materializable families (qwen3 / gemma4, pure-KV) keep ALL `N`
+///     generated tokens on a LENGTH exit and record the missing final
+///     token's K/V via [`DecodeStep::materialize_final`]; on every other
+///     exit they drop the trailing boundary token the next delta
+///     re-renders;
+///   * conv families (lfm2) cannot re-run a forward to record conv
+///     state, so they drop the trailing token ALWAYS.
+///
+/// In every case the post-turn invariant is
+/// `cached_token_history.len() == physical_cache_len`.
 pub(crate) struct SaveStateArgs<'a> {
     pub reuse_cache: bool,
     /// Selects the delta (`save_cache_state_after_delta`) vs fresh-prefill
@@ -473,9 +484,6 @@ pub(crate) struct SaveStateArgs<'a> {
     /// Combined image hash (`save_image_cache_key`); ignored when
     /// `has_images == false`.
     pub image_cache_key: u64,
-    /// LFM2 only — whether the last sampled token's KV/conv update is
-    /// already in the caches. Other families ignore this.
-    pub last_token_in_cache: bool,
 }
 
 /// Why [`ChatBackend::reset_caches`] is being invoked (S5/S6 panel fix

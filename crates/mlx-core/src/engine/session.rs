@@ -751,6 +751,24 @@ fn chat_turn_core<B: ChatBackend>(
             },
             streaming_ctx,
         )?;
+        // Record the final committed token's K/V on a LENGTH exit. The
+        // shared decode loop's forward gate (`step_idx + 1 < max_new_tokens
+        // && !is_terminal`) skips the last token's forward, so a pure-KV
+        // flat stepper (qwen3 / gemma4) ends one token SHORTER than the
+        // keep-all-on-length history its `save_cache_state` persists; one
+        // extra discard-logits forward closes that gap so the saved cache
+        // equals the saved history. LENGTH exits ONLY — an EOS / cancel /
+        // repetition final token is a boundary marker the next delta
+        // re-renders, and `save_cache_state` drops it. Default no-op for
+        // lfm2 (conv state can't re-run a forward — it drops-last instead)
+        // and any family whose flat stepper doesn't override it; the macro
+        // families bypass this flow and the paged flow materializes in
+        // `run_paged_turn`.
+        if finish_reason == "length"
+            && let Some(&last_token) = generated_tokens.last()
+        {
+            step.materialize_final(last_token)?;
+        }
         // Fallible post-loop hook (S5/S6 panel fix — compiled-path
         // export). Runs while the stepper (and its lock/reset guards)
         // is still alive, BEFORE `save_cache_state` below. On Err the
@@ -759,14 +777,6 @@ fn chat_turn_core<B: ChatBackend>(
         // session state is saved.
         step.end_decode()?;
     }
-
-    // lfm2's `last_token_in_cache` derivation: the loop builds the
-    // pipelined forward (which writes the just-sampled token into the
-    // caches) iff `step + 1 < max_new_tokens`, so at EVERY exit the
-    // final pushed token is in the caches exactly when the loop stopped
-    // short of the budget. Families without the trim semantics ignore
-    // the field (see `SaveStateArgs::last_token_in_cache`).
-    let last_token_in_cache = (generated_tokens.len() as i64) < max_new_tokens as i64;
 
     // --- save cache state ---
     backend.save_cache_state(SaveStateArgs {
@@ -778,7 +788,6 @@ fn chat_turn_core<B: ChatBackend>(
         save_tokens: &tokens,
         save_expanded_tokens: None,
         image_cache_key: 0,
-        last_token_in_cache,
     });
 
     // Drop the desync flag only now that `save_cache_state` has committed

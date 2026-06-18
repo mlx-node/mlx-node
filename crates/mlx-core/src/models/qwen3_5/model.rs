@@ -7879,7 +7879,13 @@ impl Qwen35Inner {
     /// `args.tokens` (`cached_history + delta` by construction — the
     /// probes run before any state mutation).
     fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let config = args.config.clone();
+        // Fold generation_config.json defaults into the config the legacy
+        // cores re-extract params from, so VLM/MTP turns honor the same
+        // sampling defaults as the generic AR path (whose `args.params`
+        // already had them applied via `resolve_params`). No-op when the
+        // checkpoint ships no defaults (`gen_defaults` all-None).
+        let mut config = args.config.clone();
+        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
@@ -7942,10 +7948,13 @@ impl Qwen35Inner {
     ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // The legacy entry points re-derived `p` from config at each
-        // dispatch site (`extract_chat_params`); the engine's default
-        // `resolve_params` is the same extraction, so re-extracting an
-        // OWNED copy here is byte-identical.
-        let p = extract_chat_params(args.config);
+        // dispatch site (`extract_chat_params`). To match the engine's
+        // default `resolve_params`, fold generation_config.json defaults in
+        // first so the paged-MTP path honors them too (no-op when the
+        // checkpoint ships none).
+        let mut config = args.config.clone();
+        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
+        let p = extract_chat_params(&config);
         if p.enable_mtp && self.has_mtp_weights() {
             let report_perf = args.config.report_performance.unwrap_or(false);
             let tokenizer = args.tokenizer.clone();

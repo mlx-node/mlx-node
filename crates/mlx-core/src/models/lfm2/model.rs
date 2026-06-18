@@ -168,6 +168,18 @@ impl Drop for Lfm2Inner {
         if self.compiled_slot_registered {
             let _guard = crate::engine::compiled_lock::compiled_weights_write();
             unsafe { mlx_sys::mlx_lfm2_slot_erase(self.model_id) };
+            // Also free this model's C++ weight slot. Registration populated
+            // `g_weight_slots()[model_id]` (a full second copy of every weight
+            // plus auto 2-D transposes and quant_info) via
+            // `mlx_clear_weights` + `mlx_store_weight`; the slot-erase above
+            // only reclaims the compiled-graph closures, NOT those arrays.
+            // Without this, sequential load/drop cycles (server model reload)
+            // leak each dropped model's weights until process exit.
+            // `mlx_clear_weights` empties the slot's maps in place, releasing
+            // the array refs + device buffers; it runs under the same write
+            // lock registration takes, so it is serialized against concurrent
+            // turns on other model threads.
+            unsafe { mlx_sys::mlx_clear_weights(self.model_id) };
         }
     }
 }
@@ -1278,14 +1290,21 @@ impl ChatBackend for Lfm2Inner {
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
         // lfm2's persistence is identical on the fresh and delta paths
         // (one inherent helper; `args.is_delta` is irrelevant here).
-        // `last_token_in_cache` is the lfm2-only trim signal — see
-        // [`SaveStateArgs::last_token_in_cache`] and the derivation note
-        // in the session core.
+        //
+        // Drop-last ALWAYS: the shared decode loop's forward gate
+        // (`step_idx + 1 < max_new_tokens && !is_terminal`) skips the final
+        // committed token's forward on EVERY exit (length AND EOS / cancel /
+        // repetition), so that token is never in the conv/KV cache. Unlike
+        // qwen3/gemma4, lfm2 cannot materialize it (re-running a forward
+        // would advance the non-invertible short-conv state past the saved
+        // history), so the history must instead drop the uncached token to
+        // stay aligned. This mirrors lfm2's own paged `save_paged_history`,
+        // which already drops-last unconditionally.
         self.save_cache_state_internal(
             args.reuse_cache,
             args.save_tokens,
             args.generated_tokens,
-            args.last_token_in_cache,
+            false,
         );
     }
 

@@ -3769,6 +3769,35 @@ impl DecodeStep for Gemma4Decode<'_> {
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
         MxArray::async_eval_arrays(&[next_token]);
     }
+
+    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+        // LENGTH-exit only (the engine gates the call): run ONE more
+        // `forward_inner` for the final committed token so its K/V lands in
+        // the live session caches, then DISCARD the logits. This makes the
+        // per-layer cache offsets equal the keep-all-on-length saved
+        // history. No sample / push / emit. Like the paged override, this
+        // deliberately does NOT fire a sliding decode-boundary checkpoint.
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 materialize_final: caches missing"))?;
+        let input_ids = MxArray::from_int32(&[token_id as i32], &[1, 1])?;
+        crate::models::gemma4::diagnostic::set_step(self.step);
+        self.step += 1;
+        let _logits = forward_inner(
+            &input_ids,
+            &inner.embed_tokens,
+            &inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            inner.embed_weight_t.as_ref(),
+            inner.ple.as_ref(),
+            &inner.config,
+        )?;
+        Ok(())
+    }
 }
 
 /// Paged decode stepper for gemma4 (pure-eager — no compiled path, so no

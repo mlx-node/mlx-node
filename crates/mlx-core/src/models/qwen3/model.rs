@@ -3100,6 +3100,32 @@ impl DecodeStep for Qwen3Decode<'_> {
     fn profiler_relabel(&self) -> Option<&'static str> {
         self.relabel
     }
+
+    fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+        // LENGTH-exit only (the engine gates the call): run ONE more
+        // `forward_fused` for the final committed token so its K/V lands in
+        // the flat turn KV (advancing `turn_cache_idx` + `rope_offsets`
+        // exactly as a normal decode step), then DISCARD the logits. This
+        // makes `turn_cache_idx` (→ `cached_cache_idx` at save) equal the
+        // keep-all-on-length saved history. No sample / push / emit.
+        let input_ids = MxArray::from_int32(&[token_id as i32], &[1, 1])?;
+        let inner = &mut *self.inner;
+        let _logits = Qwen3Model::forward_fused(
+            &input_ids,
+            &self.embedding_weight,
+            &inner.layers,
+            &inner.final_norm,
+            &inner.lm_head,
+            &inner.config,
+            &mut inner.turn_kv_keys,
+            &mut inner.turn_kv_values,
+            &mut inner.turn_cache_idx,
+            &self.rope_offsets,
+            &self.left_padding,
+        )?;
+        self.rope_offsets = self.rope_offsets.add(&self.one_arr)?;
+        Ok(())
+    }
 }
 
 impl ChatBackend for Qwen3Inner {

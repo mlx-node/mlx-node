@@ -503,12 +503,20 @@ mod mock_backend_tests {
         /// D1 knob: make the post-loop `end_decode` hook fail (the
         /// compiled-export error path).
         fail_end_decode: bool,
+        /// Shared physical flat-cache cursor (also held by the backend).
+        /// A qwen3/gemma4-shaped pure-KV stepper advances it by 1 on
+        /// every in-forward KV write and by 1 more when the length-exit
+        /// `materialize_final` records the skipped final token.
+        cache_cursor: Arc<AtomicUsize>,
     }
 
     impl DecodeStep for MockDecode {
         fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
             let idx = self.pos.min(self.script.len().saturating_sub(1));
             self.pos += 1;
+            // Each decode forward writes one token's K/V into the flat
+            // cache (the in-forward KV write a pure-KV family pays).
+            self.cache_cursor.fetch_add(1, Ordering::Relaxed);
             let target = self.script.get(idx).copied().unwrap_or(0) as usize;
             let mut v = vec![0.0f32; VOCAB as usize];
             v[target] = 10.0;
@@ -520,6 +528,14 @@ mod mock_backend_tests {
             if budget_forced {
                 logits.eval();
             }
+        }
+
+        fn materialize_final(&mut self, _token_id: u32) -> Result<()> {
+            // qwen3/gemma4 record the final committed token (whose forward
+            // the decode loop skipped) with one extra discard-logits
+            // forward on a LENGTH exit — modeled here as a +1 cursor bump.
+            self.cache_cursor.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn end_decode(&mut self) -> Result<()> {
@@ -536,7 +552,11 @@ mod mock_backend_tests {
         reuse_cache: bool,
         is_delta: bool,
         finish_reason: String,
-        last_token_in_cache: bool,
+        /// Physical flat-cache length at save time — the cursor advanced
+        /// by prefill (`+prompt_len`), each decode `forward` (`+1`), and
+        /// the length-exit `materialize_final` (`+1`). The post-turn
+        /// invariant pins `history.len() == cache_cursor`.
+        cache_cursor: usize,
     }
 
     /// Scripted [`ChatBackend`]: real tokenizer, lfm2-shaped session
@@ -554,6 +574,12 @@ mod mock_backend_tests {
         save_calls: Vec<SaveCall>,
         reset_calls: Vec<ResetScope>,
         eval_caches_calls: usize,
+        /// Physical flat-cache cursor: prefill advances it by the prompt
+        /// length, each decode `forward` by 1, and a length-exit
+        /// `materialize_final` by 1 more. Shared with the decode stepper
+        /// (qwen3/gemma4-shaped pure-KV cache) so the post-turn invariant
+        /// `history.len() == cache_cursor` is checkable.
+        cache_cursor: Arc<AtomicUsize>,
         // ---- hook knobs (default off == ChatML defaults) ----
         /// D1: fail the stepper's `end_decode`.
         fail_end_decode_knob: bool,
@@ -602,6 +628,7 @@ mod mock_backend_tests {
                 save_calls: Vec::new(),
                 reset_calls: Vec::new(),
                 eval_caches_calls: 0,
+                cache_cursor: Arc::new(AtomicUsize::new(0)),
                 fail_end_decode_knob: false,
                 finalize_marker_knob: false,
                 extra_eos_knob: Vec::new(),
@@ -686,6 +713,8 @@ mod mock_backend_tests {
 
         fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
             self.history.clear();
+            // Clearing the flat KV cache drops the physical cursor too.
+            self.cache_cursor.store(0, Ordering::Relaxed);
             self.reset_calls.push(scope);
             Ok(())
         }
@@ -793,14 +822,17 @@ mod mock_backend_tests {
                 reuse_cache: args.reuse_cache,
                 is_delta: args.is_delta,
                 finish_reason: args.finish_reason.to_string(),
-                last_token_in_cache: args.last_token_in_cache,
+                cache_cursor: self.cache_cursor.load(Ordering::Relaxed),
             });
-            // lfm2-shaped persistence: prompt snapshot + generated
-            // tokens, trimming the final token when it never entered
-            // the caches.
+            // qwen3/gemma4-shaped persistence: prompt snapshot + generated
+            // tokens. On a LENGTH exit keep ALL generated tokens (the
+            // skipped final token's K/V was recorded by `materialize_final`
+            // → cache_cursor already counts it); on any other exit drop the
+            // trailing boundary token the next delta re-renders.
             if args.reuse_cache {
                 let mut full = args.save_tokens.to_vec();
-                let kept = if !args.last_token_in_cache && !args.generated_tokens.is_empty() {
+                let keep_all = args.finish_reason == "length";
+                let kept = if !keep_all && !args.generated_tokens.is_empty() {
                     &args.generated_tokens[..args.generated_tokens.len() - 1]
                 } else {
                     args.generated_tokens
@@ -819,6 +851,9 @@ mod mock_backend_tests {
         fn prefill(&mut self, prompt_tokens: &[u32], _stream: Stream) -> Result<MxArray> {
             self.eval_caches_calls += 1; // prefill+eval cadence proxy
             self.prefill_calls.push(prompt_tokens.to_vec());
+            // Prefill writes the whole prompt's K/V into the flat cache.
+            self.cache_cursor
+                .fetch_add(prompt_tokens.len(), Ordering::Relaxed);
             let script = self
                 .scripts
                 .pop_front()
@@ -851,6 +886,7 @@ mod mock_backend_tests {
                 script: std::mem::take(&mut self.pending_decode_script),
                 pos: 0,
                 fail_end_decode: self.fail_end_decode_knob,
+                cache_cursor: self.cache_cursor.clone(),
             })
         }
     }
@@ -927,14 +963,22 @@ mod mock_backend_tests {
         let prompt1 = backend.prefill_calls[0].clone();
         assert!(!prompt1.is_empty());
         assert_eq!(r1.prompt_tokens as usize, prompt1.len());
-        // History = full prompt + all 4 generated tokens (EOS stop well
-        // under the budget → last token IS in cache).
+        // Turn 1 ends on EOS ("stop"), so the trailing <|im_end|> boundary
+        // token the next delta re-renders is DROPPED — history = full
+        // prompt + the first 3 generated tokens. The decode loop skipped
+        // that token's forward too, so the flat cache never held it: the
+        // drop keeps `history.len() == cache_cursor`.
         let expected_h1: Vec<u32> = prompt1
             .iter()
             .copied()
-            .chain([TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END])
+            .chain([TOK_HELLO, TOK_THINK_END, TOK_WORLD])
             .collect();
         assert_eq!(backend.history, expected_h1);
+        assert_eq!(
+            backend.history.len(),
+            backend.save_calls[0].cache_cursor,
+            "post-turn invariant: history length == physical flat-cache length"
+        );
         assert_eq!(
             backend.begin_decode_turns[0],
             TurnSnapshot {
@@ -943,7 +987,6 @@ mod mock_backend_tests {
                 reuse_cache: true,
             }
         );
-        assert!(backend.save_calls[0].last_token_in_cache);
         assert!(!backend.save_calls[0].is_delta);
         assert_eq!(backend.save_calls[0].finish_reason, "stop");
         assert!(backend.save_calls[0].reuse_cache);
@@ -970,14 +1013,20 @@ mod mock_backend_tests {
         assert!(!delta2.is_empty());
         assert!(delta2.len() < backend.history.len());
         assert_eq!(r2.prompt_tokens as usize, h1_len + delta2.len());
-        // History grew: prior + delta + generated.
+        // History grew: prior + delta + generated, again dropping the
+        // trailing <|im_end|> on this EOS stop.
         let expected_h2: Vec<u32> = expected_h1
             .iter()
             .copied()
             .chain(delta2.iter().copied())
-            .chain([TOK_WORLD, TOK_THINK_END, TOK_OK, TOK_IM_END])
+            .chain([TOK_WORLD, TOK_THINK_END, TOK_OK])
             .collect();
         assert_eq!(backend.history, expected_h2);
+        assert_eq!(
+            backend.history.len(),
+            backend.save_calls[1].cache_cursor,
+            "post-turn invariant holds across a warm delta turn too"
+        );
         assert_eq!(
             backend.begin_decode_turns[1],
             TurnSnapshot {
@@ -1020,6 +1069,97 @@ mod mock_backend_tests {
         assert_eq!(
             backend.reset_calls,
             vec![ResetScope::PrefixMiss, ResetScope::Command]
+        );
+    }
+
+    /// A pure LENGTH exit (budget hit, no EOS) keeps ALL generated tokens
+    /// in history. The decode loop skips the final committed token's
+    /// forward, so without `materialize_final` the physical flat cache
+    /// would end at `P + N - 1` while the keep-all history is `P + N` — the
+    /// #8 multi-turn desync. The materializable stepper records that final
+    /// token's K/V on the length exit, restoring `history.len() ==
+    /// cache_cursor`.
+    #[test]
+    fn flat_length_exit_materializes_final_token() {
+        // No EOS in the script → the turn runs to max_new_tokens.
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_OK]]);
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: ChatConfig {
+                temperature: Some(0.0),
+                max_new_tokens: Some(3),
+                ..Default::default()
+            },
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+
+        assert_eq!(r.finish_reason, "length", "budget hit with no EOS: {r:?}");
+        assert_eq!(r.num_tokens, 3);
+
+        // Keep-all: every generated token persists (no boundary token to
+        // re-render on a length exit).
+        let prompt = backend.prefill_calls[0].clone();
+        let expected: Vec<u32> = prompt
+            .iter()
+            .copied()
+            .chain([TOK_HELLO, TOK_WORLD, TOK_OK])
+            .collect();
+        assert_eq!(backend.history, expected);
+        // The invariant holds ONLY because materialize_final bumped the
+        // cursor for the final token the loop never forwarded.
+        assert_eq!(backend.save_calls[0].finish_reason, "length");
+        assert_eq!(
+            backend.history.len(),
+            backend.save_calls[0].cache_cursor,
+            "length-exit keep-all history must equal the materialized flat cache"
+        );
+        assert_eq!(
+            backend.history.len(),
+            prompt.len() + 3,
+            "P + N tokens persisted on the length exit"
+        );
+    }
+
+    /// An EOS early-stop turn DROPS the terminal token. The decode loop
+    /// skipped its forward (so the flat cache never held it) and the next
+    /// delta re-renders it, so history ends at `P + N - 1` == the physical
+    /// cache. Guards the #9 over-advance (a kept terminal token would make
+    /// history `P + N` while the cache stayed `P + N - 1`).
+    #[test]
+    fn flat_eos_stop_drops_terminal_token() {
+        // Final scripted token is the session EOS → "stop" before budget.
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_IM_END]]);
+
+        let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            messages: user_messages("hello"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+
+        assert_eq!(r.finish_reason, "stop");
+        assert_eq!(r.num_tokens, 3);
+
+        let prompt = backend.prefill_calls[0].clone();
+        // Drop-last: the <|im_end|> boundary token is NOT persisted.
+        let expected: Vec<u32> = prompt
+            .iter()
+            .copied()
+            .chain([TOK_HELLO, TOK_WORLD])
+            .collect();
+        assert_eq!(backend.history, expected);
+        assert_eq!(backend.save_calls[0].finish_reason, "stop");
+        assert_eq!(
+            backend.history.len(),
+            backend.save_calls[0].cache_cursor,
+            "EOS-stop history (drop-last) must equal the flat cache"
+        );
+        assert_eq!(
+            backend.history.len(),
+            prompt.len() + 2,
+            "P + N - 1 tokens persisted on the EOS stop",
         );
     }
 

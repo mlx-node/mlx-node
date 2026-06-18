@@ -5615,7 +5615,13 @@ impl Qwen35MoeInner {
     /// `args.tokens` (`cached_history + delta` by construction — the
     /// probes run before any state mutation).
     fn moe_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        let config = args.config.clone();
+        // Fold generation_config.json defaults into the config the legacy
+        // VLM/MTP cores re-extract params from, so they honor the same
+        // sampling defaults as the generic AR path (whose `args.params`
+        // already had them applied via `resolve_params`). No-op when the
+        // checkpoint ships no defaults (`gen_defaults` all-None).
+        let mut config = args.config.clone();
+        crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
