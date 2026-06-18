@@ -387,10 +387,14 @@ pub(crate) fn get_config_bool(
 /// (`temperature`/`top_k`/`top_p`/`min_p`/`repetition_penalty`) are read
 /// only when present and well-typed; an absent field stays `None`.
 ///
+/// `do_sample` is read as a boolean; `false` maps to greedy decoding
+/// (`temperature = 0`) when a request omits `temperature`, applied in
+/// [`crate::engine::params::apply_generation_defaults`].
+///
 /// `eos_token_id` is read as either a scalar integer (-> one id) or an
 /// array of integers (-> each id). Negative values are dropped (a few
 /// checkpoints use `-1` as a "no token" sentinel) and the rest are cast to
-/// `u32`. Other keys (`do_sample`, `bos_token_id`, `pad_token_id`,
+/// `u32`. Other keys (`bos_token_id`, `pad_token_id`,
 /// `transformers_version`, …) are ignored.
 ///
 /// Never panics on malformed input.
@@ -415,6 +419,7 @@ pub fn parse_generation_defaults(model_dir: &Path) -> ModelGenerationDefaults {
     defaults.top_p = val.get("top_p").and_then(Value::as_f64);
     defaults.min_p = val.get("min_p").and_then(Value::as_f64);
     defaults.repetition_penalty = val.get("repetition_penalty").and_then(Value::as_f64);
+    defaults.do_sample = val.get("do_sample").and_then(Value::as_bool);
 
     if let Some(eos) = val.get("eos_token_id") {
         let mut push_id = |id: i64| {
@@ -604,6 +609,16 @@ mod generation_defaults_tests {
         assert_eq!(d.top_p, Some(0.95));
         assert_eq!(d.min_p, Some(0.05));
         assert_eq!(d.repetition_penalty, Some(1.1));
+        assert_eq!(d.do_sample, Some(true));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn do_sample_false_is_parsed() {
+        let root = write_gen_config(r#"{"do_sample": false, "temperature": 0.7}"#);
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.do_sample, Some(false));
+        assert_eq!(d.temperature, Some(0.7));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -617,6 +632,7 @@ mod generation_defaults_tests {
         assert!(d.top_k.is_none());
         assert!(d.min_p.is_none());
         assert!(d.repetition_penalty.is_none());
+        assert!(d.do_sample.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 }

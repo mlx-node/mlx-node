@@ -1469,6 +1469,7 @@ mod mock_backend_tests {
             top_p: Some(0.95),
             min_p: Some(0.05),
             repetition_penalty: Some(1.1),
+            do_sample: None,
             eos_token_ids: vec![7, 8],
         });
 
@@ -1527,6 +1528,7 @@ mod mock_backend_tests {
             top_p: None, // no model default for top_p
             min_p: Some(0.05),
             repetition_penalty: Some(1.1),
+            do_sample: None,
             eos_token_ids: vec![7],
         };
 
@@ -1553,6 +1555,89 @@ mod mock_backend_tests {
         assert_eq!(empty.temperature, Some(0.3));
         assert!(empty.top_p.is_none(), "None default is a no-op");
         assert!(empty.top_k.is_none());
+    }
+
+    /// `do_sample == Some(false)` forces greedy (`temperature = 0.0`) when the
+    /// request omits temperature, overriding any gen-config temperature, while
+    /// an explicit request temperature still wins. `Some(true)` / `None` leave
+    /// the existing prefill behavior unchanged.
+    #[test]
+    fn apply_generation_defaults_do_sample_false_forces_greedy() {
+        // (a) do_sample:false + request temperature None → forced to 0.0.
+        let mut cfg = ChatConfig::default();
+        apply_generation_defaults(
+            &mut cfg,
+            &ModelGenerationDefaults {
+                do_sample: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.temperature,
+            Some(0.0),
+            "do_sample:false forces greedy when request omits temperature"
+        );
+
+        // (b) do_sample:false + explicit request temperature → request wins.
+        let mut cfg = ChatConfig {
+            temperature: Some(0.8),
+            ..Default::default()
+        };
+        apply_generation_defaults(
+            &mut cfg,
+            &ModelGenerationDefaults {
+                do_sample: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.temperature,
+            Some(0.8),
+            "explicit request temperature wins over do_sample:false"
+        );
+
+        // (c) do_sample:false + gen-config temperature + request None → 0.0
+        // (do_sample overrides the gen-config temperature, matching transformers).
+        let mut cfg = ChatConfig::default();
+        apply_generation_defaults(
+            &mut cfg,
+            &ModelGenerationDefaults {
+                temperature: Some(0.7),
+                do_sample: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.temperature,
+            Some(0.0),
+            "do_sample:false overrides a gen-config temperature default"
+        );
+
+        // (d) do_sample:true + gen-config temperature + request None → 0.7
+        // (existing prefill behavior unchanged).
+        let mut cfg = ChatConfig::default();
+        apply_generation_defaults(
+            &mut cfg,
+            &ModelGenerationDefaults {
+                temperature: Some(0.7),
+                do_sample: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cfg.temperature,
+            Some(0.7),
+            "do_sample:true leaves the gen-config temperature prefill intact"
+        );
+
+        // (e) do_sample:None + request None + no gen-config temperature → stays
+        // None (byte-identical no-op).
+        let mut cfg = ChatConfig::default();
+        apply_generation_defaults(&mut cfg, &ModelGenerationDefaults::default());
+        assert!(
+            cfg.temperature.is_none(),
+            "do_sample:None with no temperature default is a no-op"
+        );
     }
 
     /// D6 — `wired_limit_bytes() == None` skips the WiredLimitContext

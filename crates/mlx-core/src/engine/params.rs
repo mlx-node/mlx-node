@@ -188,6 +188,11 @@ pub struct ModelGenerationDefaults {
     pub top_p: Option<f64>,
     pub min_p: Option<f64>,
     pub repetition_penalty: Option<f64>,
+    /// `do_sample` from `generation_config.json`. `Some(false)` selects
+    /// greedy/argmax decoding (HuggingFace transformers semantics: when
+    /// `do_sample=False`, `temperature` is ignored), mapped here to
+    /// `temperature = 0.0`. `Some(true)` / `None` leave sampling untouched.
+    pub do_sample: Option<bool>,
     pub eos_token_ids: Vec<u32>,
 }
 
@@ -197,9 +202,19 @@ pub struct ModelGenerationDefaults {
 /// explicit request value always wins. A `None` default field is a
 /// no-op. Stop tokens (`eos_token_ids`) are NOT applied here — the engine
 /// folds them in via [`crate::engine::backend::ChatBackend::extra_eos_ids`].
+///
+/// When the request omits `temperature`, `do_sample == Some(false)` forces
+/// greedy decoding by setting `temperature = 0.0`, overriding any
+/// `temperature` the model's `generation_config.json` also carries (matching
+/// HuggingFace transformers, where `do_sample=False` ignores `temperature`).
+/// An explicit request temperature still wins via the `is_none()` guard.
 pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGenerationDefaults) {
     if cfg.temperature.is_none() {
-        cfg.temperature = d.temperature;
+        cfg.temperature = if d.do_sample == Some(false) {
+            Some(0.0)
+        } else {
+            d.temperature
+        };
     }
     if cfg.top_k.is_none() {
         cfg.top_k = d.top_k;
