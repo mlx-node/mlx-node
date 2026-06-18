@@ -123,11 +123,16 @@ pub(crate) struct DecodeLoopArgs<'a> {
     pub profiler: &'a mut DecodeProfiler,
     pub max_new_tokens: i32,
     pub eos_id: u32,
-    /// Additional stop-token ids honored alongside `eos_id` (S5/S6 panel
-    /// fix — BLOCKING "EOS set"). The session core computes the set ONCE
-    /// per turn from [`crate::engine::backend::ChatBackend::extra_eos_ids`]
-    /// — not per step. Empty for every ChatML family today; Gemma4's S7
-    /// migration passes its model-config `eos_token_ids`.
+    /// Additional stop-token ids honored alongside `eos_id`. The session
+    /// core computes the set ONCE per turn from
+    /// [`crate::engine::backend::ChatBackend::extra_eos_ids`] — not per
+    /// step. ChatML families pass their `generation_config.json` eos ids
+    /// (empty when the checkpoint ships no such file); Gemma4 passes its
+    /// model-config `eos_token_ids`. The stop check below combines this set
+    /// with `eos_id` as a UNION (`token_id == eos_id ||
+    /// extra_eos_ids.contains(&token_id)`) — see
+    /// [`crate::engine::params::ModelGenerationDefaults`] for the full
+    /// override order.
     pub extra_eos_ids: &'a [u32],
     /// Streaming-only ordering knob (S5/S6 panel fix — "streaming EOS
     /// order"): check the stop set BEFORE cancellation/emission. From

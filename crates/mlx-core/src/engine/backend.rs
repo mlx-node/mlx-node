@@ -781,6 +781,10 @@ pub(crate) trait ChatBackend {
     /// unspecified `temperature`/`top_k`/`top_p`/`min_p`/`repetition_penalty`
     /// falls back to the checkpoint's shipped value. Stop tokens from the
     /// same file flow separately through [`ChatBackend::extra_eos_ids`].
+    ///
+    /// See [`ModelGenerationDefaults`] for the full override order
+    /// (`request > generation_config.json > builtin`, the eos union, and
+    /// the raw `generate()` / Gemma4 divergences).
     fn generation_defaults(&self) -> Option<&ModelGenerationDefaults> {
         None
     }

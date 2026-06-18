@@ -116,16 +116,71 @@ pub(crate) fn build_chatml_tool_delta_text(
     )
 }
 
-/// Sampling + stop-token defaults read from a model's
-/// `generation_config.json`, applied when a request leaves the matching
-/// field unspecified.
+/// Sampling + stop-token defaults parsed from a model's
+/// `generation_config.json` (via
+/// [`crate::engine::persistence::parse_generation_defaults`]) and applied
+/// when a request leaves the matching field unspecified.
 ///
-/// Precedence is `request value > these defaults > the sampler's builtin
-/// fallback`. A `None` sampling field here means the model ships no
-/// default for it, so the request and then the builtin fallback decide.
-/// `eos_token_ids` carries every stop id from the file's `eos_token_id`
-/// (scalar or array); the engine merges them into the per-turn stop set
-/// alongside the tokenizer's primary EOS.
+/// # Override order (`generation_config.json` vs `config.json`)
+///
+/// The two files do NOT contend for the same fields: sampling comes from
+/// `generation_config.json`, stop tokens are a *union*, and `config.json`
+/// supplies no sampling values at all.
+///
+/// ## Sampling — `temperature` / `top_k` / `top_p` / `min_p` / `repetition_penalty`
+///
+/// ```text
+/// highest wins                     resolution: request.or(gen_config).unwrap_or(builtin)
+///   1. request value (per call)    ── overrides everything below
+///   2. generation_config.json      ── this struct
+///   3. sampler builtin fallback    ── temp 1.0 · top_k 0 · top_p 1.0 · min_p 0.0 · rep_pen 1.0
+///
+///   config.json  ── contributes NOTHING (the per-family Config struct has
+///                   no temperature/top_k/top_p/min_p/repetition_penalty field)
+/// ```
+///
+/// The per-field pre-fill ([`apply_generation_defaults`]) fills a request
+/// field only when it is `None`, so an explicit request value always wins.
+/// The builtin fallbacks are applied LAST, not here: the four
+/// `SamplingConfig` fields via `unwrap_or` in the sampler, and
+/// `repetition_penalty`'s `1.0` in [`extract_chat_params`].
+///
+/// ## Stop tokens — `eos_token_ids` is a UNION, never an override
+///
+/// The single decode stop site (`run_decode_loop`,
+/// `token_id == eos_id || extra_eos_ids.contains(&token_id)`) ORs the
+/// session's primary EOS against this set — it never replaces it:
+///
+/// ```text
+/// ChatML families (qwen3, qwen3_5, qwen3_5_moe, lfm2):
+///   primary eos_id  = TOKENIZER <|im_end|>            (NOT config.json eos_token_id)
+///   union           = generation_config.json eos ids  (this Vec, via extra_eos_ids())
+///   config.json eos_token_id  ── deserialized into Config but UNUSED on the chat path
+/// ```
+///
+/// So if `config.json` says `eos = A` and `generation_config.json` says
+/// `eos = [B, C]`, a ChatSession turn stops on `<|im_end|> ∪ B ∪ C`; `A`
+/// never stops (unless `A == <|im_end|>`). A missing or unparseable
+/// `generation_config.json` yields an empty `Default` (all `None`, empty
+/// `eos_token_ids`), so every touched path stays byte-identical to the
+/// pre-feature behavior.
+///
+/// # Two surfaces that diverge from the above
+///
+/// * **Raw `model.generate()`** (qwen3 / qwen3_5 / qwen3_5_moe only — a
+///   separate, non-ChatSession entrypoint) keeps the same sampling order
+///   but takes its *primary* EOS from `config.json`
+///   (`self.config.eos_token_id`), still unioned with these ids. It honors
+///   a `generation_config.json` `repetition_penalty` for qwen3 only;
+///   qwen3_5/moe expose just the four `SamplingConfig` fields there, so
+///   their `repetition_penalty` default applies on ChatSession (the
+///   full-parity surface) but not on that minimal raw API.
+/// * **Gemma4** routes its sampling defaults through its own `Config`
+///   struct (`default_temperature` / `default_top_k` / `default_top_p`,
+///   populated *from `generation_config.json`* at load — not `config.json`)
+///   instead of this struct, with unset → `0.0` greedy. Its stop set is
+///   `config.json` eos ∪ `generation_config.json` eos ∪ its turn
+///   terminator — same union shape, no override.
 #[derive(Debug, Clone, Default)]
 pub struct ModelGenerationDefaults {
     pub temperature: Option<f64>,
