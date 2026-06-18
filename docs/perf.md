@@ -112,9 +112,8 @@ below — these absolute numbers are meaningless without the prompt):
 > checkpoint.** The numbers above are NOT a fixed property of the
 > checkpoint — on the SAME `qwen3.6-27b-nvfp4-mtp` / depth=3 / T=0,
 > committed-history + prompt-prefill acceptance ranges from **1.44/cycle**
-> `[0.735, 0.471, 0.235]` on a novel three-paragraph prose essay (the
-> `examples/qwen35-mtp-smoke.ts` default prompt — a deliberately HARD
-> case) up to **2.76–3.00/cycle** (`[0.96–1.0, 0.92–1.0, 0.92–1.0]`, i.e.
+> `[0.735, 0.471, 0.235]` on a novel three-paragraph prose essay (a
+> deliberately HARD case) up to **2.76–3.00/cycle** (`[0.96–1.0, 0.92–1.0, 0.92–1.0]`, i.e.
 > the depth-3 ceiling) on predictable text (counting, lists, recitation,
 > repetition). MTP/AR decode speedup tracks acceptance directly: ~1.06×
 > on the prose essay, **1.46×** (AR 20.8 → MTP 30.3 tok/s) on a counting
@@ -135,7 +134,7 @@ verify 21.375 / 21.375), so the verify forward merely tie-breaks to the
 other token. One flip then decorrelates all downstream text. This is
 benign lossless speculative decoding (vLLM / MTPLX / dflash-mlx all
 document it) — **not** a verify-path bug. Because a near-tie can flip at
-any offset, `examples/qwen35-mtp-smoke.ts` treats text divergence as
+any offset, the MTP parity gate treats text divergence as
 informational only; the blocking correctness gate is acceptance health.
 
 ### Draft depth on M3 Max and M5 Max
@@ -167,7 +166,7 @@ same-session sequential A/B; absolute ratios are thermal-sensitive
 > the chained-hidden's lazy slice stalls the pipeline:
 >
 > - **M3 Max / bf16 / nvfp4 / hard prose prompt (the original verdict):** a
->   **controlled** A/B (`examples/qwen35-mtp-controlled-verdict.ts`: warmup +
+>   **controlled** A/B (warmup +
 >   cooldown + alternating-order interleaved pairs, 6 repeats/cell, T=0;
 >   cross-config AR drift **1.0%** ⇒ fair, self-normalized) found it **not a
 >   win** — depth 1 **1.11× ON vs 1.08× OFF** (inconclusive, within ±11pp
@@ -303,8 +302,8 @@ wins:
 
 > - **Naive cold count A/B:** **45.0 → 52.8 tok/s (≈1.17×)**, closing most of
 >   the gap to MTPLX's 56.4 (remaining ~7 % is second-order).
-> - **Controlled harness** (`examples/qwen35-mtp-controlled-verdict.ts`,
->   self-normalized MTP/AR ratio, interleaved, 4 repeats, depth 3): **chained-ON
+> - **Controlled harness** (self-normalized MTP/AR ratio, interleaved, 4
+>   repeats, depth 3): **chained-ON
 >   ratio 1.116 vs OFF 0.879 — chained-ON WINS by +23.7pp, beyond the ±19.8pp
 >   noise band.** Acceptance was *higher* with ON (meanAccepted 1.30 vs 0.91,
 >   per-position `[0.633, 0.433, 0.237]` vs `[0.638, 0.213, 0.064]`), so there
@@ -387,7 +386,6 @@ Cross-references:
   (`chunked_prefill_with_hidden`, `prefill_mtp_commit`).
 - W6.8 adaptive-depth policy:
   `crates/mlx-core/src/models/qwen3_5/adaptive_depth.rs`.
-- Parity gate harness: `examples/qwen35-mtp-smoke.ts`.
 
 ## Key performance patterns
 

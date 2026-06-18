@@ -3,7 +3,7 @@
 # This is a production-ready configuration for training Qwen3 models
 # with GRPO on the GSM8K dataset.
 #
-# Usage: node examples/grpo/train-full.ts --config examples/grpo/config.toml
+# Usage: yarn oxnode examples/grpo/train-github-tool.ts --config examples/grpo/config.toml
 
 # ==============================================================================
 # Model Configuration

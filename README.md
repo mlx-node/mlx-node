@@ -256,7 +256,7 @@ MLX-Node includes a terminal user interface (TUI) built with [Ratatui](https://r
 
 ```bash
 # Basic usage
-cargo run -p mlx-tui -- --import '@oxc-node/core/register' --script ./examples/grpo/train-tool-use.ts
+cargo run -p mlx-tui -- --import '@oxc-node/core/register' --script ./examples/grpo/train-github-tool.ts
 ```
 
 The TUI wraps your Node.js training script and communicates via stdout (JSONL messages) and stdin (control commands).

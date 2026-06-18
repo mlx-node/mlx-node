@@ -2,24 +2,15 @@
 
 This directory contains example scripts demonstrating MLX-Node capabilities.
 
-## Generation Speed Benchmark
+## Generation Speed Benchmark (`lm.ts`)
 
-Compare token generation speed between Node.js (mlx-node) and Python (mlx-lm).
+`lm.ts` runs token generation through mlx-node and reports tokens/second.
 
 ### Prerequisites
-
-**For Node.js:**
 
 ```bash
 # Build the project (from project root)
 yarn install && yarn build
-```
-
-**For Python:**
-
-```bash
-# Install mlx-lm
-pip install mlx-lm
 ```
 
 ### Model Setup
@@ -34,9 +25,7 @@ python -m mlx_lm.convert \
     --dtype float32
 ```
 
-### Running Benchmarks
-
-**Node.js (mlx-node):**
+### Running
 
 ```bash
 node examples/lm.ts
@@ -44,22 +33,13 @@ node examples/lm.ts
 npx oxnode examples/lm.ts
 ```
 
-**Python (mlx-lm):**
-
-```bash
-python examples/test-mlx-lm-speed.py
-```
-
 ### Interpreting Results
 
-Both scripts:
+`lm.ts`:
 
-- Use the same model (`.cache/models/qwen3-0.6b-mlx-f32`)
-- Test with identical prompts
-- Use identical generation parameters:
-  - Node.js: `temperature=0.7, topP=0.9`
-  - Python: `temp=0.7, top_p=0.9, top_k=50` (via sampler)
-- Display tokens/second for performance comparison
+- Uses the model at `.cache/models/qwen3-0.6b-mlx-f32`
+- Generates with `temperature=0.7, topP=0.9`
+- Displays tokens/second for performance
 
 Expected output format:
 
@@ -73,4 +53,4 @@ Generated (42 tokens, 850ms, 49.41 tokens/s):
 - First run may be slower due to model loading and Metal shader compilation
 - Subsequent runs typically show consistent performance
 - tokens/s metric excludes model loading time, only measures generation
-- Both implementations use Apple Metal GPU acceleration
+- Uses Apple Metal GPU acceleration
