@@ -943,7 +943,7 @@ macro_rules! decode_loop {
                 }
             )?
 
-            if token_id == $eos {
+            if token_id == $eos || $p.extra_eos_ids.contains(&token_id) {
                 $reason = String::from("stop");
                 break;
             }
@@ -2419,7 +2419,7 @@ macro_rules! decode_loop_mtp {
             // and any prior-iteration push that landed us on a stop
             // condition exit cleanly without one more forward.
             if let Some(&last) = $gen.last() {
-                if last == $eos {
+                if last == $eos || $p.extra_eos_ids.contains(&last) {
                     $reason = String::from("stop");
                     break;
                 }
@@ -2555,7 +2555,7 @@ macro_rules! decode_loop_mtp {
                     }
                 )?
 
-                if token_id == $eos {
+                if token_id == $eos || $p.extra_eos_ids.contains(&token_id) {
                     $reason = String::from("stop");
                     break;
                 }
@@ -2850,7 +2850,7 @@ macro_rules! decode_loop_mtp {
                         );
                     }
                 )?
-                if tok_id == $eos {
+                if tok_id == $eos || $p.extra_eos_ids.contains(&tok_id) {
                     $reason = String::from("stop");
                     hit_stop = true;
                     break;

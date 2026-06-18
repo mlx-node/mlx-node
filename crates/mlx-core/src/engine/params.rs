@@ -231,6 +231,16 @@ pub(crate) struct ChatParams {
     pub report_performance: bool,
     pub reuse_cache: bool,
     pub include_reasoning: bool,
+    /// Extra EOS ids unioned into every stop-check on the legacy
+    /// whole-turn cores (qwen3.5 dense/MoE VLM, MTP, paged-MTP). Real
+    /// Qwen checkpoints ship `eos_token_id` as a list; the generic
+    /// `run_decode_loop` path already unions these via
+    /// `ChatBackend::extra_eos_ids`, but the legacy cores stop only on
+    /// the single primary `eos_token_id`. Populated at each legacy-core
+    /// build site from `ModelGenerationDefaults::eos_token_ids`. Empty
+    /// (`Vec::new()`) on the generic path → every union check is a true
+    /// no-op (`[].contains()` is always false), byte-identical to before.
+    pub extra_eos_ids: Vec<u32>,
     /// MTP: opt-in flag enabling the Multi-Token Prediction speculative
     /// decode loop. Effective only on the dense compiled path AND when
     /// the model checkpoint carries an MTP head
@@ -365,6 +375,10 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
         include_reasoning: resolve_include_reasoning(config),
+        // Empty by default; populated at the legacy-core build sites from
+        // `ModelGenerationDefaults::eos_token_ids`. On the generic path
+        // this stays empty so every union stop-check is a true no-op.
+        extra_eos_ids: Vec::new(),
         // MTP defaults OFF. When MTP is enabled and the caller does not
         // choose a depth, pin depth 1: current M5 Max measurements show
         // deeper bf16 MTP-head cycles lose more verify/draft time than

@@ -87,11 +87,28 @@ pub(crate) fn build_paged_extra_keys(
 ///
 /// Takes `&mut` refs instead of `Arc<RwLock<>>`. Used by Qwen3.5 Dense on
 /// its dedicated model thread.
+///
+/// `drop_last_always` selects the trailing-token policy, which depends on
+/// whether the decode driver forwarded the final committed token into the
+/// physical cache:
+/// - `false` (legacy macro cores): the `decode_loop!` / `decode_loop_mtp!`
+///   macros forward the EOS/stop token *before* the stop check, so it IS in
+///   the cache and must be kept; only a `length` exit (whose final token is
+///   not forwarded) drops the trailing token.
+/// - `true` (generic `run_decode_loop` flow): the shared loop skips the final
+///   committed token's forward on EVERY exit kind, so it is never in the
+///   physical cache; the trailing token is dropped unconditionally to keep
+///   `cached_token_history.len() == physical_cache_len`. Qwen3.5's GDN
+///   recurrent state is non-invertible, so (unlike qwen3/gemma4) it cannot
+///   materialize the token with an extra forward and must drop it — same
+///   contract as lfm2's `save_cache_state`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save_cache_state_direct<C>(
     reuse_cache: bool,
     has_images: bool,
     generated_tokens: &[u32],
     finish_reason: &str,
+    drop_last_always: bool,
     tokens: &[u32],
     expanded_tokens: Option<&[u32]>,
     image_cache_key: u64,
@@ -106,7 +123,8 @@ pub(crate) fn save_cache_state_direct<C>(
         } else {
             tokens.to_vec()
         };
-        let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+        let drop_last = drop_last_always || finish_reason == "length";
+        let history_tokens = if drop_last && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
             generated_tokens
@@ -143,11 +161,16 @@ pub(crate) fn save_cache_state_direct<C>(
 /// leaves `cached_image_key` untouched on the `reuse_cache=true` branch.
 /// The full-reset `reuse_cache=false` branch still clears everything —
 /// same invariant as the prefill helper.
+///
+/// `drop_last_always` has the same meaning as in [`save_cache_state_direct`]:
+/// `true` (generic `run_decode_loop` flow) drops the never-forwarded final
+/// token on every exit; `false` (legacy macro cores) drops only on `length`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn save_cache_state_after_delta<C>(
     reuse_cache: bool,
     generated_tokens: &[u32],
     finish_reason: &str,
+    drop_last_always: bool,
     save_tokens: &[u32],
     cached_token_history: &mut Vec<u32>,
     cached_image_key: &mut Option<u64>,
@@ -156,7 +179,8 @@ pub(crate) fn save_cache_state_after_delta<C>(
 ) {
     if reuse_cache {
         let mut full_history = save_tokens.to_vec();
-        let history_tokens = if finish_reason == "length" && !generated_tokens.is_empty() {
+        let drop_last = drop_last_always || finish_reason == "length";
+        let history_tokens = if drop_last && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
             generated_tokens
@@ -263,7 +287,7 @@ mod save_cache_state_after_delta_tests {
     //! across text-only follow-ups) and caused the delta path to fail
     //! with a cryptic "chat_tokens_delta_sync is text-only; session
     //! currently holds image state" on the very next turn.
-    use super::save_cache_state_after_delta;
+    use super::{save_cache_state_after_delta, save_cache_state_direct};
 
     /// Stand-in cache element. The helper's reuse_cache=false branch only
     /// does `*caches = None;` and never inspects the element, so a
@@ -284,6 +308,7 @@ mod save_cache_state_after_delta_tests {
             /* reuse_cache */ true,
             /* generated_tokens */ &[10, 11],
             /* finish_reason */ "stop",
+            /* drop_last_always */ false,
             /* save_tokens */ &[1, 2, 3, 4],
             &mut cached_history,
             &mut cached_image_key,
@@ -314,6 +339,7 @@ mod save_cache_state_after_delta_tests {
             true,
             &[10, 11, 12],
             "length",
+            false,
             &[1, 2],
             &mut cached_history,
             &mut cached_image_key,
@@ -340,6 +366,7 @@ mod save_cache_state_after_delta_tests {
             false,
             &[10],
             "stop",
+            false,
             &[1],
             &mut cached_history,
             &mut cached_image_key,
@@ -366,6 +393,7 @@ mod save_cache_state_after_delta_tests {
             true,
             &[42],
             "stop",
+            false,
             &[1, 2],
             &mut cached_history,
             &mut cached_image_key,
@@ -375,6 +403,101 @@ mod save_cache_state_after_delta_tests {
 
         assert_eq!(cached_image_key, None);
         assert_eq!(cached_history, vec![1, 2, 42]);
+    }
+
+    #[test]
+    fn delta_drop_last_always_drops_trailing_token_on_non_length_stop() {
+        // Generic-flow contract (qwen3.5 dense/MoE): the shared
+        // `run_decode_loop` never forwards the final committed token into
+        // the physical cache, regardless of exit kind. With
+        // `drop_last_always = true` the trailing generated token is dropped
+        // even on a non-`length` finish (EOS / stop / cancel / repetition),
+        // keeping `cached_token_history` aligned with the cache length.
+        let mut cached_history: Vec<u32> = vec![];
+        let mut cached_image_key: Option<u64> = None;
+        let mut cached_rope_deltas: Option<i32> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
+
+        save_cache_state_after_delta(
+            /* reuse_cache */ true,
+            /* generated_tokens */ &[10, 11],
+            /* finish_reason */ "stop",
+            /* drop_last_always */ true,
+            /* save_tokens */ &[1, 2, 3],
+            &mut cached_history,
+            &mut cached_image_key,
+            &mut cached_rope_deltas,
+            &mut caches,
+        );
+
+        // Trailing token 11 dropped despite the "stop" finish: only the
+        // forwarded prefix (prompt + [10]) is persisted.
+        assert_eq!(cached_history, vec![1, 2, 3, 10]);
+    }
+
+    #[test]
+    fn direct_drop_last_always_drops_trailing_token_on_non_length_stop() {
+        // Generic-flow FRESH-turn contract (qwen3.5 dense/MoE
+        // `save_cache_state` non-delta branch). The shared `run_decode_loop`
+        // never forwards the final committed token, so on a non-`length`
+        // finish (EOS / stop / cancel / repetition) `drop_last_always = true`
+        // must still drop it, keeping `cached_token_history` aligned with the
+        // physical cache length. Mirrors the delta-helper test for the
+        // fresh-prefill path.
+        let mut cached_history: Vec<u32> = vec![];
+        let mut cached_image_key: Option<u64> = None;
+        let mut cached_rope_deltas: Option<i32> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
+
+        save_cache_state_direct(
+            /* reuse_cache */ true,
+            /* has_images */ false,
+            /* generated_tokens */ &[10, 11],
+            /* finish_reason */ "stop",
+            /* drop_last_always */ true,
+            /* tokens */ &[1, 2, 3],
+            /* expanded_tokens */ None,
+            /* image_cache_key */ 0,
+            &mut cached_history,
+            &mut cached_image_key,
+            &mut cached_rope_deltas,
+            &mut caches,
+        );
+
+        // Token 11 dropped despite "stop"; prompt + forwarded [10] kept.
+        assert_eq!(cached_history, vec![1, 2, 3, 10]);
+        // Text-only fresh turn must not fabricate an image key.
+        assert_eq!(cached_image_key, None);
+    }
+
+    #[test]
+    fn direct_legacy_false_keeps_terminal_token_on_non_length_stop() {
+        // Legacy-macro contract (drop_last_always = false): the macro cores
+        // forward the EOS/stop token BEFORE the stop check, so it IS in the
+        // cache and must be KEPT on a non-`length` finish. This pins that the
+        // false path is unchanged by Fix 1.
+        let mut cached_history: Vec<u32> = vec![];
+        let mut cached_image_key: Option<u64> = None;
+        let mut cached_rope_deltas: Option<i32> = None;
+        let mut caches: Option<Vec<DummyCache>> = None;
+
+        save_cache_state_direct(
+            true,
+            false,
+            &[10, 11],
+            "stop",
+            /* drop_last_always */ false,
+            &[1, 2, 3],
+            None,
+            0,
+            &mut cached_history,
+            &mut cached_image_key,
+            &mut cached_rope_deltas,
+            &mut caches,
+        );
+
+        // All generated tokens kept (the macro forwarded the terminal token).
+        assert_eq!(cached_history, vec![1, 2, 3, 10, 11]);
     }
 }
 

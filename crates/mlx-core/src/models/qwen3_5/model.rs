@@ -1376,7 +1376,8 @@ impl Qwen35Inner {
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-        let p = extract_chat_params(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
         let max_new_tokens = p.max_new_tokens;
 
         let generation_start = if report_perf {
@@ -1775,7 +1776,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let p = extract_chat_params(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -2591,6 +2593,7 @@ impl Qwen35Inner {
                 p.reuse_cache,
                 &generated_tokens,
                 &finish_reason,
+                /* drop_last_always */ false,
                 &save_tokens,
                 &mut self.cached_token_history,
                 &mut self.cached_image_key,
@@ -2603,6 +2606,7 @@ impl Qwen35Inner {
                 has_images,
                 &generated_tokens,
                 &finish_reason,
+                /* drop_last_always */ false,
                 &save_tokens,
                 save_expanded_tokens.as_deref(),
                 save_image_cache_key,
@@ -4014,7 +4018,7 @@ impl Qwen35Inner {
             token_history.push(token_id);
             reasoning_tracker.observe_token(token_id);
 
-            if token_id == eos_token_id {
+            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
                 break;
             }
@@ -4982,7 +4986,7 @@ impl Qwen35Inner {
             let is_reasoning = reasoning_tracker.observe_token(token_id);
             *last_is_reasoning = is_reasoning;
 
-            if token_id == eos_token_id {
+            if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
                 break;
             }
@@ -5124,7 +5128,8 @@ impl Qwen35Inner {
         let mut full_token_history = self.cached_token_history.clone();
         full_token_history.extend(delta_tokens.iter().copied());
 
-        let p = extract_chat_params(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5369,6 +5374,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             &generated_tokens,
             &finish_reason,
+            /* drop_last_always */ false,
             &save_tokens,
             &mut self.cached_token_history,
             &mut self.cached_image_key,
@@ -5508,7 +5514,8 @@ impl Qwen35Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let tokenizer_for_decode = tokenizer.clone();
 
-        let p = engine::extract_chat_params(&config);
+        let mut p = engine::extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -5912,6 +5919,7 @@ impl Qwen35Inner {
             has_images,
             &generated_tokens,
             &finish_reason,
+            /* drop_last_always */ false,
             &tokens,
             Some(&expanded_tokens),
             current_image_cache_key,
@@ -7954,7 +7962,8 @@ impl Qwen35Inner {
         // checkpoint ships none).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        let p = extract_chat_params(&config);
+        let mut p = extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
         if p.enable_mtp && self.has_mtp_weights() {
             let report_perf = args.config.report_performance.unwrap_or(false);
             let tokenizer = args.tokenizer.clone();
@@ -8160,11 +8169,19 @@ impl ChatBackend for Qwen35Inner {
         // still holds the prior prefill's image attention state even
         // though this turn was text-only. Fresh turns (re)set the key
         // from the turn's (always-false here) `has_images`.
+        //
+        // `drop_last_always = true`: this is the generic `run_decode_loop`
+        // flow (flat, non-MTP, non-image dense turns), which never forwards
+        // the final committed token into the physical cache on ANY exit
+        // kind. The GDN recurrent state is non-invertible, so we drop that
+        // token (rather than materialize it) to keep
+        // `cached_token_history.len() == physical_cache_len`.
         if args.is_delta {
             engine::save_cache_state_after_delta(
                 args.reuse_cache,
                 args.generated_tokens,
                 args.finish_reason,
+                /* drop_last_always */ true,
                 args.save_tokens,
                 &mut self.cached_token_history,
                 &mut self.cached_image_key,
@@ -8177,6 +8194,7 @@ impl ChatBackend for Qwen35Inner {
                 args.has_images,
                 args.generated_tokens,
                 args.finish_reason,
+                /* drop_last_always */ true,
                 args.save_tokens,
                 args.save_expanded_tokens,
                 args.image_cache_key,

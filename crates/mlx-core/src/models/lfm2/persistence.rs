@@ -1986,6 +1986,38 @@ fn register_weights_with_cpp_locked(
         return Ok(false);
     }
 
+    // Every error AFTER this point can unwind with `g_weight_slots()[model_id]`
+    // already populated (the store loop below begins writing it). The caller
+    // sets `Lfm2Inner::compiled_slot_registered` ONLY from a successful
+    // `Ok(true)` return, so a mid-registration failure (`?` on a NUL weight
+    // name, a `plq_to_packed_params` mismatch, a `MxArray::zeros` OOM, or a
+    // panic) would otherwise unwind with that flag still false — and
+    // `Lfm2Inner::Drop` would skip its `mlx_clear_weights`, leaking the
+    // half-stored slot until process exit. This guard wipes the slot on any
+    // such unwind. It is disarmed just before each deliberate `Ok(..)` return:
+    // the sym8 `abort_registration` paths already cleared, and the success
+    // path must KEEP the freshly published weights. It runs under the
+    // COMPILED_WEIGHTS_RWLOCK.write() the wrapper already holds and never
+    // re-takes it, so (unlike deferring to Drop) there is no deadlock.
+    struct SlotCleanupGuard {
+        model_id: u64,
+        armed: bool,
+    }
+    impl Drop for SlotCleanupGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                unsafe {
+                    mlx_sys::mlx_clear_weights(self.model_id);
+                    mlx_sys::mlx_lfm2_invalidate_compiled();
+                }
+            }
+        }
+    }
+    let mut slot_cleanup = SlotCleanupGuard {
+        model_id,
+        armed: true,
+    };
+
     let store = |name: &str, arr: &MxArray| -> Result<()> {
         let c_name = std::ffi::CString::new(name)
             .map_err(|e| Error::from_reason(format!("Weight name contains NUL byte: {e}")))?;
@@ -2021,6 +2053,7 @@ fn register_weights_with_cpp_locked(
                         "failed to build [K,N] kernel operand for '{}': {}",
                         name, e.reason
                     ));
+                    slot_cleanup.armed = false;
                     return Ok(false);
                 }
             }
@@ -2083,6 +2116,7 @@ fn register_weights_with_cpp_locked(
                 abort_registration(&format!(
                     "quant-info mode for sym8 prefix '{prefix}' did not round-trip as \"sym8\""
                 ));
+                slot_cleanup.armed = false;
                 return Ok(false);
             }
             sym8_info_count += 1;
@@ -2110,6 +2144,7 @@ fn register_weights_with_cpp_locked(
         abort_registration(
             "checkpoint is sym8-default but no sym8 quant-info entries were registered",
         );
+        slot_cleanup.armed = false;
         return Ok(false);
     }
 
@@ -2149,6 +2184,13 @@ fn register_weights_with_cpp_locked(
             }
         }
     }
+
+    // All fallible registration work is done; from here the function only runs
+    // infallible FFI and returns a deliberate `Ok`. Disarm the cleanup guard: a
+    // `count > 0` success must KEEP the published weights, and the `count == 0`
+    // branch has nothing to clean (no weights landed). The earlier `?` error
+    // paths stay covered — the guard was armed across all of them.
+    slot_cleanup.armed = false;
 
     let count = unsafe { mlx_sys::mlx_weight_count() };
     info!("Registered {count} weights with C++ lfm2 compiled forward path");
