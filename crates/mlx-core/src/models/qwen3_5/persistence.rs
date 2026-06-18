@@ -1653,6 +1653,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
 
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
+                inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Apply weights (GPU finalize precompute reads now-resident pages).
                 apply_weights_inner(

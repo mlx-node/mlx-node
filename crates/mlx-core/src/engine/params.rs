@@ -116,6 +116,50 @@ pub(crate) fn build_chatml_tool_delta_text(
     )
 }
 
+/// Sampling + stop-token defaults read from a model's
+/// `generation_config.json`, applied when a request leaves the matching
+/// field unspecified.
+///
+/// Precedence is `request value > these defaults > the sampler's builtin
+/// fallback`. A `None` sampling field here means the model ships no
+/// default for it, so the request and then the builtin fallback decide.
+/// `eos_token_ids` carries every stop id from the file's `eos_token_id`
+/// (scalar or array); the engine merges them into the per-turn stop set
+/// alongside the tokenizer's primary EOS.
+#[derive(Debug, Clone, Default)]
+pub struct ModelGenerationDefaults {
+    pub temperature: Option<f64>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f64>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+    pub eos_token_ids: Vec<u32>,
+}
+
+/// Pre-fill any unspecified sampling field of `cfg` from `d`.
+///
+/// Each field is filled only when the request left it `None`, so an
+/// explicit request value always wins. A `None` default field is a
+/// no-op. Stop tokens (`eos_token_ids`) are NOT applied here — the engine
+/// folds them in via [`crate::engine::backend::ChatBackend::extra_eos_ids`].
+pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGenerationDefaults) {
+    if cfg.temperature.is_none() {
+        cfg.temperature = d.temperature;
+    }
+    if cfg.top_k.is_none() {
+        cfg.top_k = d.top_k;
+    }
+    if cfg.top_p.is_none() {
+        cfg.top_p = d.top_p;
+    }
+    if cfg.min_p.is_none() {
+        cfg.min_p = d.min_p;
+    }
+    if cfg.repetition_penalty.is_none() {
+        cfg.repetition_penalty = d.repetition_penalty;
+    }
+}
+
 /// Extracted chat parameters with defaults applied.
 pub(crate) struct ChatParams {
     pub max_new_tokens: i32,

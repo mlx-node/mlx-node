@@ -137,6 +137,14 @@ pub(crate) struct Lfm2Inner {
     /// re-register, or a test that holds the write lock and constructs native
     /// Inners). `false` until the load path sets it after a successful publish.
     pub(crate) compiled_slot_registered: bool,
+    /// Sampling + stop-token defaults parsed from the checkpoint's
+    /// `generation_config.json` at load time. Empty for checkpoints that
+    /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
+    /// hooks (`generation_defaults` / `extra_eos_ids`) to fold checkpoint
+    /// defaults under explicit request params. The primary scalar
+    /// `config.eos_token_id` is derived separately in `persistence.rs`;
+    /// this carries the FULL eos list plus sampling defaults on top.
+    gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 impl Drop for Lfm2Inner {
@@ -430,11 +438,22 @@ impl Lfm2Inner {
             // Not compiled-capable until the load path publishes weights and
             // sets this true; keeps Drop off the write lock for native Inners.
             compiled_slot_registered: false,
+            // Empty until the load path parses `generation_config.json`
+            // (set via `set_gen_defaults` in `persistence.rs`).
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
+    }
+
+    /// Install sampling + stop-token defaults parsed from the checkpoint's
+    /// `generation_config.json`. Called once by the load path after
+    /// construction; the defaults are folded under explicit request params
+    /// by the `ChatBackend` sampling/EOS hooks.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     /// Whether the compiled C++ forward path owns this model's weights and may
@@ -1119,6 +1138,14 @@ impl ChatBackend for Lfm2Inner {
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn generation_defaults(&self) -> Option<&crate::engine::ModelGenerationDefaults> {
+        Some(&self.gen_defaults)
+    }
+
+    fn extra_eos_ids(&self) -> Vec<u32> {
+        self.gen_defaults.eos_token_ids.clone()
     }
 
     fn policy(&self) -> ThinkingPolicy {

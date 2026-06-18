@@ -34,7 +34,6 @@ use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::engine;
-use crate::engine::types::ChatConfig;
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -93,6 +92,11 @@ pub(crate) struct Qwen3Inner {
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// Sampling + stop-token defaults parsed from the checkpoint's
+    /// `generation_config.json` at load time. Empty for checkpoints that
+    /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
+    /// hooks and the raw `generate` loop.
+    gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -398,11 +402,18 @@ impl Qwen3Inner {
             pending_exact_match_rewind: Cell::new(false),
             turn_is_streaming: Cell::new(false),
             training_state: None,
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
         self.tokenizer = Some(tokenizer);
+    }
+
+    /// Store the checkpoint's parsed `generation_config.json` defaults.
+    /// Called once at load time after construction.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     fn reset_kv_caches_sync(&mut self) -> Result<()> {
@@ -759,6 +770,20 @@ impl Qwen3Inner {
 
         // Use generate_for_training_sync on the NAPI model (which uses Arc<RwLock<>>)
         // But since we're on the model thread, we do a direct implementation here.
+        //
+        // `GenerationConfig::default()` bakes `Some(builtin)` sampling values, so
+        // unwrapping an OMITTED config would shadow the checkpoint's
+        // generation_config.json defaults (a baked `Some(1.0)` would win the
+        // `.or(gen_defaults)` fold). Capture the caller's ACTUAL sampling fields
+        // first — `None` whenever the field, or the whole config, was omitted —
+        // so an unspecified field still falls back to the model default and only
+        // an explicit request value wins. Non-sampling fields keep using the
+        // builtin-filled `config` below.
+        let req_temperature = config.as_ref().and_then(|c| c.temperature);
+        let req_top_k = config.as_ref().and_then(|c| c.top_k);
+        let req_top_p = config.as_ref().and_then(|c| c.top_p);
+        let req_min_p = config.as_ref().and_then(|c| c.min_p);
+        let req_repetition_penalty = config.as_ref().and_then(|c| c.repetition_penalty);
         let config = config.unwrap_or_default();
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
         // Reject a nonpositive budget on the public `generate()` API (parity
@@ -771,11 +796,17 @@ impl Qwen3Inner {
                 max_new_tokens
             )));
         }
-        let temperature = config.temperature.unwrap_or(1.0);
-        let top_k = config.top_k.unwrap_or(0);
-        let top_p = config.top_p.unwrap_or(1.0);
-        let min_p = config.min_p.unwrap_or(0.0);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(1.0);
+        // Request value wins; otherwise fall back to the checkpoint's
+        // generation_config.json default; otherwise the sampler's builtin.
+        let temperature = req_temperature
+            .or(self.gen_defaults.temperature)
+            .unwrap_or(1.0);
+        let top_k = req_top_k.or(self.gen_defaults.top_k).unwrap_or(0);
+        let top_p = req_top_p.or(self.gen_defaults.top_p).unwrap_or(1.0);
+        let min_p = req_min_p.or(self.gen_defaults.min_p).unwrap_or(0.0);
+        let repetition_penalty = req_repetition_penalty
+            .or(self.gen_defaults.repetition_penalty)
+            .unwrap_or(1.0);
         let repetition_context_size = config.repetition_context_size.unwrap_or(256);
         let presence_penalty = config.presence_penalty.unwrap_or(0.0);
         let presence_context_size = config.presence_context_size.unwrap_or(20);
@@ -814,6 +845,11 @@ impl Qwen3Inner {
             Vec::new()
         };
         let mut finish_reason = "length";
+
+        // Extra stop ids from generation_config.json (e.g. a second EOS).
+        // Captured into a local so the decode loop's `&mut self` borrow does
+        // not conflict with reading `self.gen_defaults`.
+        let extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
 
         let sampling_config = SamplingConfig {
             temperature: Some(temperature),
@@ -963,6 +999,11 @@ impl Qwen3Inner {
             if let Some(eos_id) = eos_token_id
                 && token_value == eos_id as u32
             {
+                finish_reason = "stop";
+                break;
+            }
+            // Honor extra stop ids declared in generation_config.json.
+            if extra_eos_ids.contains(&token_value) {
                 finish_reason = "stop";
                 break;
             }
@@ -3070,20 +3111,12 @@ impl ChatBackend for Qwen3Inner {
             .ok_or_else(|| napi::Error::from_reason("Tokenizer missing <|im_end|> special token"))
     }
 
-    fn resolve_params(&self, config: &ChatConfig) -> engine::ChatParams {
-        // Uniform sampling defaults across ALL qwen3 paths (paged sync,
-        // paged streaming, flat) — same as every sibling ChatML family
-        // (`extract_chat_params`): unset temperature/top_p flow through as
-        // `None` → the sampler's 1.0/1.0 passthrough. origin/main applied
-        // 0.7/0.9 ONLY in the now-deleted non-streaming paged sync core
-        // (`paged_gen_config`); streaming-paged and flat used
-        // `extract_chat_params`. Folding 0.7/0.9 onto every path here would
-        // shift default streaming/flat callers 1.0→0.7 (a behavior + perf
-        // divergence: top_p<1.0 adds a per-step nucleus sort). vLLM's
-        // canonical behavior is one uniform default; honoring the model's
-        // generation_config.json (qwen3 ships 0.6/0.95/20) is the deeper
-        // vLLM alignment, deferred to a separate engine-wide change.
-        engine::extract_chat_params(config)
+    fn generation_defaults(&self) -> Option<&crate::engine::ModelGenerationDefaults> {
+        Some(&self.gen_defaults)
+    }
+
+    fn extra_eos_ids(&self) -> Vec<u32> {
+        self.gen_defaults.eos_token_ids.clone()
     }
 
     // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`

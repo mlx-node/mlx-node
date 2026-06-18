@@ -1218,6 +1218,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Create inner model
                     let mut inner = Qwen35MoeInner::new(config.clone())?;
+                    inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
+                        path,
+                    ));
 
                     // Apply weights directly to inner (no locks)
                     apply_weights_moe_inner(

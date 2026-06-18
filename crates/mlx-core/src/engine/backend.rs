@@ -24,7 +24,8 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::finalize::finalize_chat_result;
 use crate::engine::params::{
-    ChatParams, ThinkingPolicy, extract_chat_params, resolve_enable_thinking,
+    ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
+    extract_chat_params, resolve_enable_thinking,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::profiling::PerformanceMetrics;
@@ -760,7 +761,28 @@ pub(crate) trait ChatBackend {
     /// honors whatever this hook resolves, so the always-on behavior is
     /// expressed here rather than via a separate hook).
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
-        extract_chat_params(config)
+        match self.generation_defaults() {
+            Some(defaults) => {
+                let mut merged = config.clone();
+                apply_generation_defaults(&mut merged, defaults);
+                extract_chat_params(&merged)
+            }
+            None => extract_chat_params(config),
+        }
+    }
+
+    /// The model's `generation_config.json` sampling defaults, used to
+    /// pre-fill any unspecified request field in the default
+    /// [`ChatBackend::resolve_params`].
+    ///
+    /// Default `None` = no model defaults; the request value (or the
+    /// sampler's builtin fallback) decides every field. A family that has
+    /// parsed its `generation_config.json` returns `Some(&...)` so an
+    /// unspecified `temperature`/`top_k`/`top_p`/`min_p`/`repetition_penalty`
+    /// falls back to the checkpoint's shipped value. Stop tokens from the
+    /// same file flow separately through [`ChatBackend::extra_eos_ids`].
+    fn generation_defaults(&self) -> Option<&ModelGenerationDefaults> {
+        None
     }
 
     /// Render + tokenize the fresh-turn prompt from the request

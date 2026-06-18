@@ -12,6 +12,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
+use crate::engine::params::ModelGenerationDefaults;
 use crate::utils::safetensors::load_safetensors_lazy;
 
 /// Load all safetensors files from a directory (supports sharded checkpoints).
@@ -361,6 +362,73 @@ pub(crate) fn get_config_bool(
     default
 }
 
+/// Read a model's `generation_config.json` into a
+/// [`ModelGenerationDefaults`].
+///
+/// The file is optional: a missing or unparseable file yields
+/// `ModelGenerationDefaults::default()` (all fields empty), so callers can
+/// apply it unconditionally as a no-op. Sampling fields
+/// (`temperature`/`top_k`/`top_p`/`min_p`/`repetition_penalty`) are read
+/// only when present and well-typed; an absent field stays `None`.
+///
+/// `eos_token_id` is read as either a scalar integer (-> one id) or an
+/// array of integers (-> each id). Negative values are dropped (a few
+/// checkpoints use `-1` as a "no token" sentinel) and the rest are cast to
+/// `u32`. Other keys (`do_sample`, `bos_token_id`, `pad_token_id`,
+/// `transformers_version`, …) are ignored.
+///
+/// Never panics on malformed input.
+pub fn parse_generation_defaults(model_dir: &Path) -> ModelGenerationDefaults {
+    let mut defaults = ModelGenerationDefaults::default();
+
+    let gen_config_path = model_dir.join("generation_config.json");
+    let Ok(text) = fs::read_to_string(&gen_config_path) else {
+        return defaults;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&text) else {
+        return defaults;
+    };
+
+    defaults.temperature = val.get("temperature").and_then(Value::as_f64);
+    // `try_from` (not `as`) so a malformed out-of-`i32`-range value is dropped
+    // rather than silently wrapping into a bogus negative top_k.
+    defaults.top_k = val
+        .get("top_k")
+        .and_then(Value::as_i64)
+        .and_then(|v| i32::try_from(v).ok());
+    defaults.top_p = val.get("top_p").and_then(Value::as_f64);
+    defaults.min_p = val.get("min_p").and_then(Value::as_f64);
+    defaults.repetition_penalty = val.get("repetition_penalty").and_then(Value::as_f64);
+
+    if let Some(eos) = val.get("eos_token_id") {
+        let mut push_id = |id: i64| {
+            // `try_from` drops both negatives (a few checkpoints use -1 as a
+            // "no token" sentinel) AND ids above u32::MAX, instead of a lossy
+            // `as u32` cast that could wrap into an unrelated stop token.
+            if let Ok(id) = u32::try_from(id) {
+                defaults.eos_token_ids.push(id);
+            }
+        };
+        match eos {
+            Value::Number(_) => {
+                if let Some(id) = eos.as_i64() {
+                    push_id(id);
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Some(id) = item.as_i64() {
+                        push_id(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    defaults
+}
+
 #[cfg(test)]
 mod prewarm_tests {
     use super::*;
@@ -422,6 +490,117 @@ mod prewarm_tests {
             "top-level shard duplicated"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod generation_defaults_tests {
+    use super::*;
+
+    /// Write a `generation_config.json` with the given body into a fresh temp
+    /// dir and return the dir (kept alive by the returned `PathBuf` root).
+    fn write_gen_config(body: &str) -> PathBuf {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "mlx_gen_defaults_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        fs::write(root.join("generation_config.json"), body).expect("write gen config");
+        root
+    }
+
+    #[test]
+    fn missing_file_yields_default() {
+        let mut root = std::env::temp_dir();
+        root.push(format!("mlx_gen_defaults_missing_{}", std::process::id()));
+        // Do NOT create the file.
+        let d = parse_generation_defaults(&root);
+        assert!(d.temperature.is_none());
+        assert!(d.top_k.is_none());
+        assert!(d.top_p.is_none());
+        assert!(d.min_p.is_none());
+        assert!(d.repetition_penalty.is_none());
+        assert!(d.eos_token_ids.is_empty());
+    }
+
+    #[test]
+    fn unparseable_file_yields_default() {
+        let root = write_gen_config("{ this is not valid json ");
+        let d = parse_generation_defaults(&root);
+        assert!(d.temperature.is_none());
+        assert!(d.eos_token_ids.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scalar_eos_token_id_becomes_single_vec() {
+        let root = write_gen_config(r#"{"eos_token_id": 151645}"#);
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.eos_token_ids, vec![151645]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn array_eos_token_id_becomes_vec() {
+        let root = write_gen_config(r#"{"eos_token_id": [151645, 151643, 7]}"#);
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.eos_token_ids, vec![151645, 151643, 7]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn out_of_range_ints_are_dropped() {
+        // top_k above i32::MAX and an eos id above u32::MAX must be DROPPED
+        // (try_from), never wrapped via a lossy cast. In-range values survive.
+        let root = write_gen_config(r#"{"top_k": 5000000000, "eos_token_id": [5000000000, 42]}"#);
+        let d = parse_generation_defaults(&root);
+        assert!(
+            d.top_k.is_none(),
+            "out-of-i32-range top_k dropped, not wrapped"
+        );
+        assert_eq!(d.eos_token_ids, vec![42], "out-of-u32-range eos id dropped");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn negative_eos_ids_are_filtered() {
+        let root = write_gen_config(r#"{"eos_token_id": [-1, 5, -42, 9]}"#);
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.eos_token_ids, vec![5, 9]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sampling_fields_parsed_when_present() {
+        let root = write_gen_config(
+            r#"{"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.05,
+                "repetition_penalty": 1.1, "do_sample": true, "bos_token_id": 1}"#,
+        );
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.temperature, Some(0.6));
+        assert_eq!(d.top_k, Some(20));
+        assert_eq!(d.top_p, Some(0.95));
+        assert_eq!(d.min_p, Some(0.05));
+        assert_eq!(d.repetition_penalty, Some(1.1));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn absent_sampling_field_stays_none() {
+        // Only top_p present; the others must stay None.
+        let root = write_gen_config(r#"{"top_p": 0.9}"#);
+        let d = parse_generation_defaults(&root);
+        assert_eq!(d.top_p, Some(0.9));
+        assert!(d.temperature.is_none());
+        assert!(d.top_k.is_none());
+        assert!(d.min_p.is_none());
+        assert!(d.repetition_penalty.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 }

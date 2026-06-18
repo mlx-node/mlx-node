@@ -1491,6 +1491,7 @@ impl Lfm2Inner {
 
         // Create inner model
         let mut inner = Lfm2Inner::new(config)?;
+        inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
         // Authoritative for ALL checkpoints (set BEFORE the registration gate so
         // `begin_paged_decode` switches its bf16 gate to the
         // `non_quant_floats_bf16` invariant for quantized weights). The companion

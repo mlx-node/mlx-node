@@ -519,6 +519,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
 
                     // Create Qwen3Inner
                     let mut inner = Qwen3Inner::new(config.clone())?;
+                    inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
+                        path,
+                    ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
 
                     // Load parameters into inner

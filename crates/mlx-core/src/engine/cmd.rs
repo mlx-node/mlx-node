@@ -419,8 +419,9 @@ mod mock_backend_tests {
         TurnOutput, TurnSetup, WholeTurnArgs,
     };
     use crate::engine::params::{
-        ChatParams, build_chatml_continue_delta_text, build_chatml_tool_delta_text,
-        extract_chat_params, resolve_enable_thinking,
+        ChatParams, ModelGenerationDefaults, apply_generation_defaults,
+        build_chatml_continue_delta_text, build_chatml_tool_delta_text, extract_chat_params,
+        resolve_enable_thinking,
     };
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::stream::Stream;
@@ -564,6 +565,11 @@ mod mock_backend_tests {
         /// D4: force `report_performance = true` in `resolve_params`
         /// (gemma4's always-report policy).
         force_report_perf_knob: bool,
+        /// generation_config.json defaults returned from
+        /// `generation_defaults()`; `None` == no model defaults (the trait
+        /// default). The mock's `resolve_params` mirrors the default trait
+        /// impl, folding these into any unspecified request field.
+        gen_defaults_knob: Option<ModelGenerationDefaults>,
         /// D6: return `None` from `wired_limit_bytes` (qwen3's
         /// no-WiredLimitContext policy).
         wired_none_knob: bool,
@@ -600,6 +606,7 @@ mod mock_backend_tests {
                 finalize_marker_knob: false,
                 extra_eos_knob: Vec::new(),
                 force_report_perf_knob: false,
+                gen_defaults_knob: None,
                 wired_none_knob: false,
                 paged_complete_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
@@ -683,8 +690,23 @@ mod mock_backend_tests {
             Ok(())
         }
 
+        fn generation_defaults(&self) -> Option<&ModelGenerationDefaults> {
+            self.gen_defaults_knob.as_ref()
+        }
+
         fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
-            let mut p = extract_chat_params(config);
+            // Mirror the default trait body: fold the model's
+            // generation_config.json defaults into any unspecified request
+            // field, then extract. Adds the gemma4-style always-report knob
+            // on top.
+            let mut p = match self.generation_defaults() {
+                Some(defaults) => {
+                    let mut merged = config.clone();
+                    apply_generation_defaults(&mut merged, defaults);
+                    extract_chat_params(&merged)
+                }
+                None => extract_chat_params(config),
+            };
             if self.force_report_perf_knob {
                 // gemma4's always-Some(PerformanceMetrics) policy.
                 p.report_performance = true;
@@ -1293,6 +1315,104 @@ mod mock_backend_tests {
             r_forced.performance.is_some(),
             "resolved report_performance must gate the metrics: {r_forced:?}"
         );
+    }
+
+    /// #38 — the default `resolve_params` folds the model's
+    /// generation_config.json defaults into UNSPECIFIED request fields,
+    /// while an explicit request value always wins.
+    #[test]
+    fn resolve_params_folds_generation_defaults() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        backend.gen_defaults_knob = Some(ModelGenerationDefaults {
+            temperature: Some(0.6),
+            top_k: Some(20),
+            top_p: Some(0.95),
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.1),
+            eos_token_ids: vec![7, 8],
+        });
+
+        // Unspecified request → every field falls back to the model default.
+        let unspecified = ChatConfig::default();
+        let p = backend.resolve_params(&unspecified);
+        let s = p.sampling_config.expect("sampling_config present");
+        assert_eq!(s.temperature, Some(0.6));
+        assert_eq!(s.top_k, Some(20));
+        assert_eq!(s.top_p, Some(0.95));
+        assert_eq!(s.min_p, Some(0.05));
+        assert_eq!(
+            p.repetition_penalty, 1.1,
+            "unspecified repetition_penalty falls back to the model default"
+        );
+
+        // Explicit request value wins over the model default.
+        let explicit = ChatConfig {
+            temperature: Some(0.0),
+            top_p: Some(0.5),
+            ..Default::default()
+        };
+        let p = backend.resolve_params(&explicit);
+        let s = p.sampling_config.expect("sampling_config present");
+        assert_eq!(s.temperature, Some(0.0), "explicit temperature wins");
+        assert_eq!(s.top_p, Some(0.5), "explicit top_p wins");
+        // The fields the request left unspecified still take the model default.
+        assert_eq!(s.top_k, Some(20));
+        assert_eq!(s.min_p, Some(0.05));
+    }
+
+    /// #38 — with no model defaults (`generation_defaults() == None`),
+    /// `resolve_params` is byte-identical to the config-only extraction:
+    /// unspecified fields stay `None` → the sampler's builtin fallback.
+    #[test]
+    fn resolve_params_without_generation_defaults_is_passthrough() {
+        let backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        // gen_defaults_knob defaults to None.
+        let p = backend.resolve_params(&ChatConfig::default());
+        let s = p.sampling_config.expect("sampling_config present");
+        assert!(s.temperature.is_none());
+        assert!(s.top_k.is_none());
+        assert!(s.top_p.is_none());
+        assert!(s.min_p.is_none());
+        assert_eq!(p.repetition_penalty, 1.0, "builtin penalty fallback");
+    }
+
+    /// #38 — `apply_generation_defaults` is a pure is-none pre-fill:
+    /// unspecified fields take the default, explicit ones are untouched,
+    /// and a `None` default field is a no-op.
+    #[test]
+    fn apply_generation_defaults_prefills_only_unspecified() {
+        let defaults = ModelGenerationDefaults {
+            temperature: Some(0.6),
+            top_k: Some(20),
+            top_p: None, // no model default for top_p
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.1),
+            eos_token_ids: vec![7],
+        };
+
+        let mut cfg = ChatConfig {
+            temperature: Some(0.9), // explicit → must survive
+            top_p: Some(0.8),       // explicit, default is None → must survive
+            ..Default::default()
+        };
+        apply_generation_defaults(&mut cfg, &defaults);
+
+        assert_eq!(cfg.temperature, Some(0.9), "explicit temperature untouched");
+        assert_eq!(cfg.top_k, Some(20), "unspecified top_k pre-filled");
+        assert_eq!(cfg.top_p, Some(0.8), "explicit top_p untouched");
+        assert_eq!(cfg.min_p, Some(0.05), "unspecified min_p pre-filled");
+        assert_eq!(cfg.repetition_penalty, Some(1.1));
+
+        // A None default field on an unspecified config field stays None.
+        let mut empty = ChatConfig::default();
+        let only_temp = ModelGenerationDefaults {
+            temperature: Some(0.3),
+            ..Default::default()
+        };
+        apply_generation_defaults(&mut empty, &only_temp);
+        assert_eq!(empty.temperature, Some(0.3));
+        assert!(empty.top_p.is_none(), "None default is a no-op");
+        assert!(empty.top_k.is_none());
     }
 
     /// D6 — `wired_limit_bytes() == None` skips the WiredLimitContext

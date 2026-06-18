@@ -639,6 +639,12 @@ pub(crate) struct Qwen35MoeInner {
     /// streaming-ness). Whole-turn override paths (vision/paged/MTP)
     /// never consult it. Mirrors the dense S8 field.
     turn_is_streaming: Cell<bool>,
+    /// Parsed `generation_config.json` sampling/stop defaults for this
+    /// checkpoint. Folded under any explicit per-request value: a request
+    /// field wins, else this default applies, else the sampler's builtin.
+    /// `eos_token_ids` extends the tokenizer EOS with extra stop ids.
+    /// Default (empty) when the checkpoint ships no `generation_config.json`.
+    gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -960,7 +966,14 @@ impl Qwen35MoeInner {
             mtp_weights_loaded: false,
             training_state: None,
             turn_is_streaming: Cell::new(false),
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Store the checkpoint's parsed `generation_config.json` defaults.
+    /// Called once at load time after construction.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     /// Initialize KV caches.
@@ -3898,14 +3911,24 @@ impl Qwen35MoeInner {
         let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
         let last_logits = last_logits.squeeze(Some(&[1]))?;
 
+        // Request value wins; otherwise fall back to the checkpoint's
+        // generation_config.json default; otherwise the sampler's builtin.
+        // This raw `generate` surface exposes only the four SamplingConfig
+        // fields (no repetition/presence/frequency penalty), so a
+        // generation_config repetition_penalty is honored on the ChatSession
+        // path but intentionally not here. ChatSession is the full-parity surface.
         let sampling_config = Some(SamplingConfig {
-            temperature: config.temperature,
-            top_k: config.top_k,
-            top_p: config.top_p,
-            min_p: config.min_p,
+            temperature: config.temperature.or(self.gen_defaults.temperature),
+            top_k: config.top_k.or(self.gen_defaults.top_k),
+            top_p: config.top_p.or(self.gen_defaults.top_p),
+            min_p: config.min_p.or(self.gen_defaults.min_p),
         });
 
         let eos_id = self.config.eos_token_id as u32;
+        // Extra stop ids from generation_config.json (e.g. a second EOS).
+        // Captured before the loop so its `&mut self` borrows are unaffected.
+        let extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let is_eos = |t: u32| t == eos_id || extra_eos_ids.contains(&t);
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut y = sample(&last_logits, sampling_config)?;
 
@@ -3914,7 +3937,7 @@ impl Qwen35MoeInner {
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
 
-            if token_id == eos_id {
+            if is_eos(token_id) {
                 break;
             }
 
@@ -3944,7 +3967,7 @@ impl Qwen35MoeInner {
 
         self.reset_caches_sync()?;
 
-        let finish_reason = if generated_tokens.last().is_some_and(|&t| t == eos_id) {
+        let finish_reason = if generated_tokens.last().is_some_and(|&t| is_eos(t)) {
             "stop"
         } else {
             "length"
@@ -6120,6 +6143,14 @@ impl ChatBackend for Qwen35MoeInner {
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
+    }
+
+    fn generation_defaults(&self) -> Option<&crate::engine::ModelGenerationDefaults> {
+        Some(&self.gen_defaults)
+    }
+
+    fn extra_eos_ids(&self) -> Vec<u32> {
+        self.gen_defaults.eos_token_ids.clone()
     }
 
     // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
