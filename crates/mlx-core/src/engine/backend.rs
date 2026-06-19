@@ -25,7 +25,9 @@ use crate::engine::params::{
     extract_chat_params, resolve_enable_thinking,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::profiling::PerformanceMetrics;
+use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
@@ -1503,6 +1505,258 @@ pub(crate) trait PagedBackend: ChatBackend {
     fn paged_decode_stream(&self, generation_stream: Stream) -> Stream {
         generation_stream
     }
+}
+
+/// Per-turn setup the engine hands to [`MtpBackend::begin_mtp_decode`].
+///
+/// Paged analog of [`PagedTurnSetup`] — carries the turn constants the
+/// MTP propose/verify loop needs to construct its per-turn stepper. The
+/// per-cycle scratch (snapshot / GDN tape / stashed replay error) does
+/// NOT live here: it becomes STRUCT FIELDS of the concrete
+/// [`MtpStepper`] (the analog of the compiled-paged guards on
+/// [`PagedBackend::PagedDecode`]), so the GDN tape never crosses the
+/// trait boundary.
+///
+/// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
+/// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
+/// adaptive/EV gates on top, exactly as `run_mtp_cycle_inner` does today.
+///
+/// `#[allow(dead_code)]`: SCAFFOLD — the engine-owned `run_mtp_turn`
+/// constructs this and `MtpBackend::begin_mtp_decode` consumes it in a
+/// later step; nothing references it yet.
+#[allow(dead_code)]
+pub(crate) struct MtpTurnSetup<'a> {
+    /// The turn's resolved [`ChatParams`] — `params.sampling_config`
+    /// drives the per-cycle accept policy and `params.max_new_tokens` is
+    /// the decode budget.
+    pub params: &'a ChatParams,
+    /// Session-delta continuation flag (the MTP loop primes the same way
+    /// the AR path does; threaded for parity with [`PagedTurnSetup`]).
+    pub is_delta: bool,
+    /// Requested draft depth for this turn (`1..=5`), before the
+    /// stepper's intra-cycle depth gates.
+    pub depth: usize,
+}
+
+/// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode
+/// whole-turn flows through the engine-owned propose/verify loop instead
+/// of the family-local `decode_loop_mtp!` macro + `MtpOps` closure bundle.
+///
+/// Split out of [`ChatBackend`] for the SAME reason as [`PagedBackend`]:
+/// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
+/// folding it into the base trait would force every family to implement
+/// it. A family opts in by implementing this trait (+ [`MtpStepper`] for
+/// its stepper) and setting its `ChatBackend::mtp_turn` body to
+/// `Some(run_mtp_turn(self, args))`; MTP-less families do not implement
+/// it.
+///
+/// The engine-owned loop (`run_mtp_turn`) relocates the
+/// `decode_loop_mtp!` outer body and `run_mtp_cycle_inner`, calling the
+/// [`MtpStepper`] methods where the macro calls `ops.*`. The stepper
+/// borrows `&mut self` for the whole turn (the analog of
+/// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
+/// per-cycle snapshot/tape/replay-error as its own fields.
+///
+/// `#[allow(dead_code)]`: SCAFFOLD — the families implement this and the
+/// engine-owned `run_mtp_turn` drives it in a later step; no impl or
+/// caller exists yet.
+#[allow(dead_code)]
+pub(crate) trait MtpBackend: ChatBackend {
+    /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
+    /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
+    /// stashed replay error live as STRUCT FIELDS of the concrete stepper
+    /// (declaration order == teardown order, like the compiled-paged
+    /// guards on [`PagedBackend::PagedDecode`]).
+    type MtpDecode<'a>: MtpStepper
+    where
+        Self: 'a;
+
+    /// Build the per-turn MTP stepper (the analog of
+    /// [`PagedBackend::begin_paged_decode`]). Captures the turn constants
+    /// (embedding weight, requested depth, the per-cycle scratch cells)
+    /// into the returned stepper, which then drives the engine-owned
+    /// `run_mtp_turn` propose/verify loop.
+    fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>>;
+}
+
+/// Per-turn MTP stepper the engine-owned propose/verify loop drives — the
+/// 11 [`MtpOps`](crate::models::qwen3_5::mtp_decode) closures as trait
+/// methods, plus the macro-level orchestration hooks the engine takes
+/// over (`profiler_relabel` / `embedding_weight` /
+/// `committed_history_active` / `take_replay_error` / `into_desynced`).
+///
+/// The `&mut self` borrow model is strictly sequential: the engine calls
+/// exactly one method at a time, threading the lazy [`MxArray`] outputs of
+/// one call into the next. `eval_step` / `eval_step_with_chained_hidden`
+/// are `&self` (they only SCHEDULE async eval — no state mutation), every
+/// other forward/draft/verify/rollback/commit method is `&mut self`. The
+/// GDN tape + linear snapshot are private stepper fields (`Scratch`), so
+/// they never cross the trait — exactly as `run_mtp_cycle_inner` keeps
+/// them inside the `MtpOps` closures' captured environment today.
+///
+/// # Invariants the engine must preserve (each gated byte-identical)
+///   * async_eval batching — every `async_eval` stays INSIDE a method;
+///     the engine never schedules a sync.
+///   * Fused chained-hidden — [`Self::eval_step_with_chained_hidden`] is
+///     called at the iteration boundary EXACTLY where the macro calls it;
+///     reordering loses the M5 chained win.
+///   * GDN tape — [`Self::verify_step`] RECORDS, [`Self::rollback`]
+///     REPLAYS via the snapshot; the tape never leaves the stepper.
+///
+/// `#[allow(dead_code)]`: SCAFFOLD — exercised by the
+/// `engine::mtp_turn` mock tests; the production family steppers + the
+/// engine-owned `run_mtp_turn` loop that calls these methods land in a
+/// later step.
+#[allow(dead_code)]
+pub(crate) trait MtpStepper {
+    /// The model's embedding table (already resolved to the LM head when
+    /// `tie_word_embeddings=false`). == the `embedding_weight` arg the
+    /// macro threads into `run_mtp_cycle_inner` and the draft/verify
+    /// steps. Borrowed for the lifetime of the call (the engine passes it
+    /// straight back into [`Self::verify_step`] /
+    /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
+    fn embedding_weight(&self) -> &MxArray;
+
+    /// `true` on the dense path where [`Self::commit_mtp`] runs the real
+    /// committed-history commit (and `run_mtp_cycle` uses the
+    /// `chain_start = 0` draft mask). == `MtpOps::committed_history_active`.
+    /// MoE / cycle-history steppers return `false`.
+    fn committed_history_active(&self) -> bool;
+
+    /// Optional profiler relabel for the MTP path (e.g.
+    /// `"chat_compiled"`); `None` keeps the default family label. Read
+    /// once at turn entry by the engine, mirroring the existing
+    /// `DecodeStep::profiler_relabel` seam.
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Single main-path forward returning `(logits, hidden, needs_squeeze)`
+    /// — `hidden` is `[1, hidden_size]` bf16. == `MtpOps::forward_with_hidden`
+    /// (the `F` closure). Step A's forward + the per-accepted-draft replay
+    /// forwards both go through here.
+    fn forward_with_hidden(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray, bool)>;
+
+    /// One MTP draft step returning `(h_next [1,1,hidden], draft_logits
+    /// [1,vocab])`. == `MtpOps::draft_step` (the `D` closure).
+    fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)>;
+
+    /// MTP verify step returning verify logits `[1, depth+1, vocab]` +
+    /// hiddens `[1, depth+1, hidden]`. RECORDS the GDN tape (consumed by
+    /// [`Self::rollback`]). == `MtpOps::verify_step` (the `V` closure).
+    fn verify_step(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+        depth: usize,
+    ) -> Result<MtpVerifyOutput>;
+
+    /// Greedy argmax-only verify fast path (T=0, penalties no-op,
+    /// no tracing). `None` = this stepper has no such fast path and the
+    /// engine falls back to [`Self::verify_step`]. == the
+    /// `MtpOps::verify_step_argmax_only` `Option<Box<dyn FnMut>>` field
+    /// (None on every eager path today).
+    fn verify_step_argmax_only(
+        &mut self,
+        _ids: &MxArray,
+        _emb: &MxArray,
+        _depth: usize,
+    ) -> Option<Result<MtpVerifyOutput>> {
+        None
+    }
+
+    /// Native-sparse verify fast path. `None` = unavailable, fall back to
+    /// [`Self::verify_step`]. == the `MtpOps::verify_step_sparse`
+    /// `Option<Box<dyn FnMut>>` field (None on every eager path today).
+    fn verify_step_sparse(
+        &mut self,
+        _ids: &MxArray,
+        _emb: &MxArray,
+        _depth: usize,
+        _cfg: &SamplingConfig,
+    ) -> Option<Result<MtpVerifyOutput>> {
+        None
+    }
+
+    /// Snapshot the main path's K/V + GDN linear caches + decode offset
+    /// before verify. == `MtpOps::snapshot_main_linear` (the `S` closure).
+    /// Stores into the stepper's own scratch fields.
+    fn snapshot_main_linear(&mut self);
+
+    /// Rewind the MTP draft state to the accepted prefix and REPLAY the
+    /// GDN tape from the snapshot. Infallible at the call boundary (any
+    /// replay error is STASHED and surfaced by [`Self::take_replay_error`]
+    /// — see the `R` closure `MtpOps::rollback`, which is `FnMut(usize,
+    /// usize)` with no `Result`). `accepted_drafts` / `depth` match the
+    /// cycle's accept count and effective depth.
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize);
+
+    /// On rejection: restore the linear caches + main offset to the
+    /// snapshot point, then run ONE eager `forward_with_hidden` per
+    /// accepted draft so the main linear state catches up. `accepted` is
+    /// the accepted-draft prefix (NOT the residual). ==
+    /// `MtpOps::restore_and_replay_main` (the `RR` closure).
+    fn restore_and_replay_main(&mut self, accepted: &[u32], emb: &MxArray) -> Result<()>;
+
+    /// Committed-history commit. Appends `K+2` exact committed K/V slots
+    /// to the persistent MTP cache. The `anchor` selects the commit
+    /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
+    /// consumes it. A no-op impl keeps the cycle-history policy (MoE /
+    /// tests). == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
+    /// prev_hidden [1,1,hidden], verify_hiddens [1,D+1,hidden],
+    /// committed_ids [K+2], k_accepted, embedding_weight)`.
+    fn commit_mtp(
+        &mut self,
+        anchor: MtpCommitAnchor,
+        seed_h: &MxArray,
+        verify_hiddens: &MxArray,
+        committed_ids: &[u32],
+        k_accepted: usize,
+        emb: &MxArray,
+    ) -> Result<()>;
+
+    /// Re-anchor the MTP draft caches/offset to the main path's current
+    /// position, once per outer iteration AFTER Step A. `chained_anchor`
+    /// is `cycle_seed_was_chained && committed_history_active` — the same
+    /// arg the macro passes. == `MtpOps::begin_cycle` (the `B` closure).
+    fn begin_cycle(&mut self, chained_anchor: bool);
+
+    /// Schedule async eval for an emitted token (+ logits on the
+    /// budget-forced path). `&self` — schedules only, no mutation. ==
+    /// `MtpOps::eval_step` (the `E` closure, which is `Fn`).
+    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool);
+
+    /// Fused chained-hidden eval — folds `verify_hiddens[:, K, :]` into the
+    /// SAME `async_eval` batch as the just-set token. `&self` — schedules
+    /// only. MUST be called at the iteration boundary EXACTLY where the
+    /// macro calls it; do NOT reorder. == `MtpOps::eval_step_with_chained_hidden`
+    /// (the `EX` closure, which is `Fn`).
+    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray);
+
+    /// On a mid-cycle stop (EOS / cancel / length / repetition cutoff)
+    /// after some-but-not-all of the cycle's tokens were emitted: receives
+    /// the count of accepted-but-unemitted tokens. The paged path
+    /// truncates the live adapter; dense / MoE pass a no-op. ==
+    /// `MtpOps::rollback_unemitted` (the `RU` closure).
+    fn rollback_unemitted(&mut self, unemitted: usize);
+
+    /// Take any error stashed by an infallible [`Self::rollback`] replay,
+    /// so the engine can surface it with `?` after the (infallible)
+    /// rollback call. `None` = the cycle's replay (if any) succeeded.
+    fn take_replay_error(&mut self) -> Option<Error> {
+        None
+    }
+
+    /// Consume the stepper and report whether its FLAT caches were left
+    /// desynced by a mid-cycle stop (the flat/MoE `set_flat_caches_desynced`
+    /// signal). The PAGED stepper MUST return `false` — paged truncates its
+    /// adapter via [`Self::rollback_unemitted`] and never touches the FLAT
+    /// desync flag — so the engine skips the set-hook on paged.
+    fn into_desynced(self) -> bool;
 }
 
 /// Per-family training backend the model-neutral training-command handler
