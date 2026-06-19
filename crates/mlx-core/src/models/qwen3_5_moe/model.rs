@@ -37,6 +37,7 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::engine;
+use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::{
     apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
     finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
@@ -58,362 +59,6 @@ fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
             }
         })
         .collect()
-}
-
-/// Pure-Rust eager-MTP decode arm for the MoE model.
-///
-/// Sibling to the compiled-MTP arm (`if mtp_active { ... }`): selected when
-/// the eager gate is on (`MLX_QWEN35_MTP_EAGER` + an MTP head + no paged
-/// adapter + text-only) and the C++ compiled path is disabled. Mirrors the
-/// dense eager arm's `MtpOps` closures 1:1, substituting the MoE eager
-/// forward primitives and the MoE drafter (`Qwen3_5MoeMTPModule`). Uses the
-/// cycle-history policy (`committed_history_active: false`, no-op
-/// `commit_mtp`/`rollback_unemitted`) to match the MoE compiled arm's
-/// acceptance — its C++ `begin_cycle` likewise zeroes the MTP cache each
-/// cycle. The main-cache rollback uses the shared pure-Rust GDN tape replay.
-///
-/// `$inner` is the `&mut Qwen35MoeInner` owning `layers`/`caches`/`mtp`/etc.
-/// All other names are decode-site locals matching the compiled arm. The
-/// optional trailing `streaming: { ... }` tail forwards verbatim to
-/// `decode_loop_mtp!`.
-macro_rules! moe_eager_mtp_decode {
-    (
-        inner: $inner:expr,
-        config: $config:expr,
-        fa_idx: $fa_idx:expr,
-        embedding_weight: $embedding_weight:expr,
-        embedding_weight_t: $embedding_weight_t:expr,
-        rng: $rng:ident,
-        y: $y:expr,
-        params: $p:expr,
-        reasoning_tracker: $reasoning_tracker:expr,
-        profiler: $profiler:expr,
-        max_new_tokens: $max_new_tokens:expr,
-        eos_id: $eos_id:expr,
-        generated_tokens: $generated_tokens:expr,
-        token_history: $token_history:expr,
-        finish_reason: $finish_reason:expr,
-        last_in_cache: $last_in_cache:ident,
-        first_token_instant: $first_token_instant:expr,
-        generation_stream: $generation_stream:expr
-        $(, streaming: { $($stream_tail:tt)* })?
-    ) => {{
-        $profiler.set_label("moe_mtp_eager");
-        MxArray::async_eval_arrays(&[&$y]);
-
-        let mut $rng = rand::rng();
-        let config = $config.clone();
-        let fa_idx_local: usize = $fa_idx;
-        let emb_t_ref: Option<&MxArray> = Some($embedding_weight_t);
-        let emb_capture: &MxArray = $embedding_weight;
-        let mtp_desynced = std::cell::Cell::new(false);
-
-        // Scope the shared cells so they drop before any post-loop reborrow of
-        // `inner`. `inner.caches` is already the live, correct eager state.
-        {
-            // Every closure needs `&mut inner`; the macro / cycle helper call
-            // them strictly sequentially and non-nested, so a shared
-            // `RefCell<&mut Qwen35MoeInner>` borrowed per body is safe.
-            let inner_cell = std::cell::RefCell::new(&mut *$inner);
-            // Drafter K/V caches. Cycle-history policy: `begin_cycle` resets
-            // this fresh each cycle (matching the MoE compiled C++ begin_cycle).
-            let mtp_caches_cell =
-                std::cell::RefCell::new(Qwen3_5MoeMTPModule::fresh_caches(&config));
-            // Pre-verify snapshot of the main caches; consumed by the rollback
-            // replay. Stores the fallible `snapshot_all` result.
-            let snap_cell: std::cell::RefCell<
-                Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-            > = std::cell::RefCell::new(None);
-            // GDN tape recorded by the verify forward, consumed by the rollback
-            // replay. Indexed by ABSOLUTE layer (None for full-attention).
-            let tape_cell: std::cell::RefCell<
-                Vec<Option<super::gated_delta_net::GdnLayerTape>>,
-            > = std::cell::RefCell::new(Vec::new());
-            // `rollback` is infallible but the tape replay is fallible; stash
-            // any replay error here and surface it after the cycle (partial
-            // accept → restore_and_replay_main; full accept → post-loop check).
-            let replay_err_cell: std::cell::RefCell<Option<Error>> =
-                std::cell::RefCell::new(None);
-
-            let mut mtp_ops = mtp_decode::MtpOps {
-                // Step A main forward: eager pre-norm + final-norm + project.
-                // Returns `hidden` `[1, hidden]` (squeeze the time axis) to
-                // match the compiled contract; `logits` `[1, 1, vocab]` with
-                // `needs_squeeze = true`.
-                forward_with_hidden: |ids: &MxArray,
-                                      emb: &MxArray|
-                 -> Result<(MxArray, MxArray, bool)> {
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let pre = forward_pre_norm_inner(
-                        ids,
-                        emb,
-                        &mut inner.layers,
-                        &mut inner.caches,
-                        fa_idx_local,
-                    )?;
-                    let h3 = inner.final_norm.forward(&pre)?;
-                    let logits =
-                        project_logits_from_hidden(&h3, &inner.lm_head, emb, emb_t_ref)?;
-                    let hidden = h3.squeeze(Some(&[1]))?;
-                    Ok((logits, hidden, true))
-                },
-                // One MTP draft step on the eager MoE drafter.
-                draft_step: |prev_hidden: &MxArray,
-                             prev_emb: &MxArray|
-                 -> Result<(MxArray, MxArray)> {
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mut mtp_caches = mtp_caches_cell.borrow_mut();
-                    let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "eager MoE MTP draft_step: inner.mtp is None despite \
-                             has_mtp_weights() gate",
-                        )
-                    })?;
-                    let h_next = mtp.forward(prev_hidden, prev_emb, Some(&mut mtp_caches))?;
-                    let dl3 = project_logits_from_hidden(
-                        &h_next,
-                        &inner.lm_head,
-                        emb_capture,
-                        emb_t_ref,
-                    )?;
-                    let draft_logits = dl3.squeeze(Some(&[1]))?;
-                    Ok((h_next, draft_logits))
-                },
-                // Batched verify: run the K+1 verify ids through the MoE main
-                // stack (recording the GDN tape), advancing `inner.caches`.
-                verify_step: |ids: &MxArray,
-                              emb: &MxArray,
-                              depth: usize|
-                 -> Result<mtp_decode::MtpVerifyOutput> {
-                    let _ = depth;
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mut tape = tape_cell.borrow_mut();
-                    eager_verify_step(
-                        &mut inner.layers,
-                        &mut inner.caches,
-                        &inner.final_norm,
-                        &inner.lm_head,
-                        fa_idx_local,
-                        ids,
-                        emb,
-                        emb_t_ref,
-                        Some(&mut tape),
-                    )
-                },
-                verify_step_argmax_only: None,
-                verify_step_sparse: None,
-                // Pure-Rust GDN tape replay — the correctness keystone. Fires
-                // on BOTH full and partial accept. `accepted_steps =
-                // accepted_drafts + 1`. For every GDN (`Linear`) layer, replay
-                // the accepted prefix of the verify window at T=1 onto the
-                // pre-verify snapshot so the carried recurrent state round-trips
-                // through bf16 every token (matching AR decode). Full-attention
-                // layers rewind their KV offset to `snapshot + accepted_steps`.
-                // Infallible signature: any error is stashed in
-                // `replay_err_cell` and surfaced after the cycle.
-                rollback: |accepted_drafts: usize, _depth: usize| {
-                    if replay_err_cell.borrow().is_some() {
-                        return;
-                    }
-                    let accepted_steps = accepted_drafts + 1;
-                    let result: Result<()> = (|| {
-                        let snap_ref = snap_cell.borrow();
-                        let snap = match snap_ref.as_ref() {
-                            Some(Ok(s)) => s,
-                            Some(Err(e)) => {
-                                return Err(Error::from_reason(format!(
-                                    "eager MoE MTP rollback: snapshot failed: {}",
-                                    e.reason
-                                )));
-                            }
-                            None => {
-                                return Err(Error::from_reason(
-                                    "eager MoE MTP rollback: snapshot missing \
-                                     (snapshot_main_linear did not run)",
-                                ));
-                            }
-                        };
-                        let tape = tape_cell.borrow();
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason("eager MoE MTP rollback: inner.caches is None")
-                        })?;
-                        if caches.len() != snap.len() || caches.len() != tape.len() {
-                            return Err(Error::from_reason(format!(
-                                "eager MoE MTP rollback: length mismatch (caches {}, \
-                                 snapshot {}, tape {})",
-                                caches.len(),
-                                snap.len(),
-                                tape.len(),
-                            )));
-                        }
-                        for (idx, cache) in caches.iter_mut().enumerate() {
-                            let Some(layer_tape) = tape[idx].as_ref() else {
-                                // Full-attention layer: rewind the KV offset to
-                                // `snapshot_offset + accepted_steps` so the next
-                                // forward overwrites the rejected drafts'
-                                // positions. No-op on full accept.
-                                match &snap[idx] {
-                                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                        offset,
-                                    } => {
-                                        let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                            Error::from_reason(format!(
-                                                "eager MoE MTP rollback: layer {idx} has a \
-                                                 FullAttention snapshot but its cache slot is \
-                                                 not FullAttention",
-                                            ))
-                                        })?;
-                                        let target = *offset + accepted_steps as i32;
-                                        kv.trim(target);
-                                    }
-                                    super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                                        return Err(Error::from_reason(format!(
-                                            "eager MoE MTP rollback: layer {idx} has no GDN \
-                                             tape but a Linear snapshot",
-                                        )));
-                                    }
-                                }
-                                continue;
-                            };
-                            let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MoE MTP rollback: layer {idx} has a GDN tape but \
-                                     its cache slot is not Linear",
-                                ))
-                            })?;
-                            let (snap_conv, snap_rec) = match &snap[idx] {
-                                super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                                    conv_state,
-                                    recurrent_state,
-                                } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                                super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                    ..
-                                } => {
-                                    return Err(Error::from_reason(format!(
-                                        "eager MoE MTP rollback: layer {idx} GDN tape but \
-                                         FullAttention snapshot",
-                                    )));
-                                }
-                            };
-                            let window = layer_tape.kernel.window_len()? as usize;
-                            if accepted_steps > window {
-                                return Err(Error::from_reason(format!(
-                                    "eager MoE MTP rollback: accepted_steps {accepted_steps} \
-                                     exceeds recorded window {window} at layer {idx}",
-                                )));
-                            }
-                            layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(e) = result {
-                        *replay_err_cell.borrow_mut() = Some(e);
-                    }
-                },
-                // Materialize the token + main caches; on a budget-forced step
-                // also the logits.
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    let inner = inner_cell.borrow();
-                    async_eval_layer_caches(&inner.caches);
-                    token.eval();
-                    if budget_forced {
-                        logits.eval();
-                    }
-                },
-                // Keep the chained `verify_hidden[K]` slice materialized
-                // alongside the token and the main caches.
-                eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                    let inner = inner_cell.borrow();
-                    async_eval_layer_caches(&inner.caches);
-                    MxArray::async_eval_arrays(&[token, chained_hidden]);
-                },
-                // Cycle-history policy: reset the drafter cache to a fresh one
-                // each cycle so the per-cycle drafts attend their own draft K/V
-                // from RoPE position 0 (matching the MoE compiled begin_cycle).
-                begin_cycle: |_chained_anchor: bool| {
-                    *mtp_caches_cell.borrow_mut() = Qwen3_5MoeMTPModule::fresh_caches(&config);
-                },
-                // Snapshot the main caches before verify mutates them. Stash the
-                // fallible result; surfaced in restore/rollback.
-                snapshot_main_linear: || {
-                    let inner = inner_cell.borrow();
-                    let snap = match inner.caches.as_ref() {
-                        Some(caches) => super::layer_cache::snapshot_all(caches),
-                        None => Err(Error::from_reason(
-                            "eager MoE MTP snapshot_main_linear: inner.caches is None",
-                        )),
-                    };
-                    *snap_cell.borrow_mut() = Some(snap);
-                },
-                // On rejection (partial accept): the GDN tape replay in
-                // `rollback` already reconstructed the AR-exact main cache, so
-                // this only surfaces a stashed replay error and clears the
-                // per-cycle snapshot + tape.
-                restore_and_replay_main: |_accepted_drafts: &[u32],
-                                          _emb: &MxArray|
-                 -> Result<()> {
-                    *snap_cell.borrow_mut() = None;
-                    tape_cell.borrow_mut().clear();
-                    if let Some(e) = replay_err_cell.borrow_mut().take() {
-                        return Err(e);
-                    }
-                    Ok(())
-                },
-                // Committed-history is dense-only; the MoE eager path uses the
-                // cycle-history policy, so the commit hook is a no-op.
-                commit_mtp: |_anchor: mtp_decode::MtpCommitAnchor,
-                             _seed_hidden: &MxArray,
-                             _verify_hiddens: &MxArray,
-                             _committed_ids: &[u32],
-                             _k_accepted: usize,
-                             _emb: &MxArray|
-                 -> Result<()> { Ok(()) },
-                committed_history_active: false,
-                rollback_unemitted: |unemitted: usize| {
-                    if unemitted > 0 {
-                        mtp_desynced.set(true);
-                    }
-                },
-            };
-
-            mtp_decode::decode_loop_mtp!(
-                mtp_ops: mtp_ops,
-                mtp_depth: $p.mtp_depth,
-                mtp_rng: $rng,
-                y: $y,
-                embedding_weight: $embedding_weight.clone(),
-                params: $p,
-                reasoning_tracker: $reasoning_tracker,
-                profiler: $profiler,
-                max_new_tokens: $max_new_tokens,
-                eos_id: $eos_id,
-                generated_tokens: $generated_tokens,
-                token_history: $token_history,
-                finish_reason: $finish_reason,
-                last_in_cache: $last_in_cache,
-                first_token_instant: $first_token_instant,
-                report_perf: $p.report_performance,
-                generation_stream: $generation_stream
-                $(, streaming: { $($stream_tail)* })?
-            );
-
-            // Surface a stashed GDN tape-replay error from a FULL-accept cycle
-            // (partial accept already surfaced via restore_and_replay_main).
-            if let Some(e) = replay_err_cell.borrow_mut().take() {
-                return Err(e);
-            }
-        }
-        // Propagate a mid-cycle stop: self.caches advanced past the emitted
-        // history, so force a full re-prefill next turn.
-        if mtp_desynced.get() {
-            $inner.flat_mtp_caches_desynced = true;
-        }
-    }};
 }
 
 const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
@@ -1711,26 +1356,45 @@ impl Qwen35MoeInner {
         let mut last_in_cache = true;
 
         if eager_mtp {
-            moe_eager_mtp_decode!(
-                inner: self,
-                config: self.config,
-                fa_idx: fa_idx,
-                embedding_weight: &embedding_weight,
-                embedding_weight_t: &embedding_weight_t,
-                rng: rng,
-                y: y,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
-                first_token_instant: first_token_instant,
-                generation_stream: generation_stream
-            );
+            // Pure-Rust eager MoE MTP — the propose/verify whole-turn loop is
+            // engine-owned (`engine::run_mtp_turn`) and drives the
+            // `MoeMtpStepper` (`MtpBackend::begin_mtp_decode`). Cycle-history
+            // v1: no prompt-prefix seed, so the `prompt_hidden*` setup fields
+            // are `None`/`0`. The `profiler.set_label("moe_mtp_eager")` relabel
+            // moved into `MoeMtpStepper::profiler_relabel`.
+            let mut rng = rand::rng();
+            MxArray::async_eval_arrays(&[&y]);
+
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden: None,
+                    prompt_hidden_ids: None,
+                    prompt_hidden_position_base: 0,
+                },
+                None,
+            )?;
+
+            last_in_cache = outcome.last_in_cache;
+            // Propagate a mid-cycle stop: self.caches advanced past the emitted
+            // history, so force a full re-prefill next turn.
+            if outcome.desynced {
+                self.flat_mtp_caches_desynced = true;
+            }
         } else {
             // Rust fallback decode loop
             profiler.set_label("moe_chat_rust");
@@ -3096,34 +2760,53 @@ impl Qwen35MoeInner {
         let mut last_in_cache = true;
 
         if eager_mtp {
-            moe_eager_mtp_decode!(
-                inner: self,
-                config: self.config,
-                fa_idx: fa_idx,
-                embedding_weight: &embedding_weight,
-                embedding_weight_t: &embedding_weight_t,
-                rng: rng,
-                y: y,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
-                first_token_instant: first_token_instant,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
-                }
-            );
+            // Streaming eager MoE MTP — same engine-owned `run_mtp_turn` loop +
+            // `MoeMtpStepper` as the sync site, with a `StreamingCtx` wired so
+            // accepted tokens stream out the `cb` sink incrementally (qwen3_5
+            // MoE does not override `stream_emitter`, so the default ChatML
+            // emitter is byte-identical to the former inline emit).
+            let mut rng = rand::rng();
+            MxArray::async_eval_arrays(&[&y]);
+
+            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+            let streaming = crate::engine::decode::StreamingCtx {
+                callback: cb.0,
+                cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: tokenizer_for_decode.inner(),
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
+            };
+
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden: None,
+                    prompt_hidden_ids: None,
+                    prompt_hidden_position_base: 0,
+                },
+                Some(streaming),
+            )?;
+
+            last_in_cache = outcome.last_in_cache;
+            if outcome.desynced {
+                self.flat_mtp_caches_desynced = true;
+            }
         } else {
             profiler.set_label("moe_chat_stream_rust");
 
@@ -3466,26 +3149,40 @@ impl Qwen35MoeInner {
         let mut last_in_cache = true;
 
         if eager_mtp {
-            moe_eager_mtp_decode!(
-                inner: self,
-                config: self.config,
-                fa_idx: fa_idx,
-                embedding_weight: &embedding_weight,
-                embedding_weight_t: &embedding_weight_t,
-                rng: rng,
-                y: y,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
-                first_token_instant: first_token_instant,
-                generation_stream: generation_stream
-            );
+            // Delta-continuation eager MoE MTP — same engine-owned
+            // `run_mtp_turn` loop + `MoeMtpStepper` as the fresh-prefill sync
+            // site (cycle-history v1: no prompt-prefix seed).
+            let mut rng = rand::rng();
+            MxArray::async_eval_arrays(&[&y]);
+
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden: None,
+                    prompt_hidden_ids: None,
+                    prompt_hidden_position_base: 0,
+                },
+                None,
+            )?;
+
+            last_in_cache = outcome.last_in_cache;
+            if outcome.desynced {
+                self.flat_mtp_caches_desynced = true;
+            }
         } else {
             profiler.set_label("moe_chat_delta_rust");
 
@@ -3728,34 +3425,51 @@ impl Qwen35MoeInner {
         let mut last_in_cache = true;
 
         if eager_mtp {
-            moe_eager_mtp_decode!(
-                inner: self,
-                config: self.config,
-                fa_idx: fa_idx,
-                embedding_weight: &embedding_weight,
-                embedding_weight_t: &embedding_weight_t,
-                rng: rng,
-                y: y,
-                params: p,
-                reasoning_tracker: reasoning_tracker,
-                profiler: profiler,
-                max_new_tokens: p.max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: generated_tokens,
-                token_history: token_history,
-                finish_reason: finish_reason,
-                last_in_cache: last_in_cache,
-                first_token_instant: first_token_instant,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: decode_stream,
-                    tokenizer: tokenizer_for_decode,
-                    streamed_text_len: streamed_text_len,
-                    last_is_reasoning: last_is_reasoning
-                }
-            );
+            // Streaming delta-continuation eager MoE MTP — same engine-owned
+            // `run_mtp_turn` loop + `MoeMtpStepper` + `StreamingCtx` as the
+            // fresh-prefill stream site (cycle-history v1: no prompt seed).
+            let mut rng = rand::rng();
+            MxArray::async_eval_arrays(&[&y]);
+
+            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+            let streaming = crate::engine::decode::StreamingCtx {
+                callback: cb.0,
+                cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: tokenizer_for_decode.inner(),
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
+            };
+
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens: p.max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: p.report_performance,
+                    generation_stream,
+                    prompt_hidden: None,
+                    prompt_hidden_ids: None,
+                    prompt_hidden_position_base: 0,
+                },
+                Some(streaming),
+            )?;
+
+            last_in_cache = outcome.last_in_cache;
+            if outcome.desynced {
+                self.flat_mtp_caches_desynced = true;
+            }
         } else {
             profiler.set_label("moe_chat_stream_delta_rust");
 
@@ -6475,6 +6189,340 @@ impl ChatBackend for Qwen35MoeInner {
         // the full image pipeline (VLM prefill via `vlm_prefill_moe`,
         // M-RoPE deltas, paged-text-only rejection, missing-encoder error).
         Some(self.moe_whole_turn(args))
+    }
+}
+
+/// Per-turn MTP propose/verify stepper for the MoE family's FLAT eager path
+/// that [`crate::engine::mtp_turn::run_mtp_turn`] drives.
+///
+/// CYCLE-HISTORY v1: the drafter cache is reset fresh by [`Self::begin_cycle`]
+/// every cycle and [`Self::commit_mtp`] is a no-op, so the stepper carries no
+/// persistent committed prefix and no committed-length cursor — the simpler
+/// policy the MoE eager MTP path has always run. FLAT-ONLY: the main forward,
+/// verify, and rollback all act on `inner.caches`; there is no paged routing,
+/// adapter, or `MtpStepMode` here.
+pub(crate) struct MoeMtpStepper<'a> {
+    /// The model — owns layers / caches / mtp / final_norm / lm_head and the
+    /// `flat_mtp_caches_desynced` latch.
+    inner: &'a mut Qwen35MoeInner,
+    /// Drafter K/V caches, reset fresh each cycle by [`Self::begin_cycle`]
+    /// (cycle-history v1).
+    mtp_caches: Vec<Qwen3_5LayerCache>,
+    /// Pre-verify snapshot of the main caches, taken in
+    /// [`Self::snapshot_main_linear`], consumed by [`Self::rollback`].
+    snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
+    /// GDN tape recorded by [`Self::verify_step`], consumed by
+    /// [`Self::rollback`].
+    tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Error stashed by the infallible [`Self::rollback`] replay, surfaced by
+    /// [`Self::take_replay_error`].
+    replay_err: Option<Error>,
+    /// Mid-cycle-stop desync latch (set by [`Self::rollback_unemitted`]),
+    /// reported by [`Self::into_desynced`].
+    mtp_desynced: bool,
+    /// The model's embedding table.
+    embedding_weight: MxArray,
+    /// Transposed embedding for the tied-LM-head projection.
+    embedding_weight_t: MxArray,
+    /// Config clone for the per-cycle drafter cache reset.
+    config: Qwen3_5MoeConfig,
+    /// Index of the first full-attention layer, threaded into the MoE eager
+    /// forwards.
+    fa_idx: usize,
+}
+
+impl MtpStepper for MoeMtpStepper<'_> {
+    fn embedding_weight(&self) -> &MxArray {
+        &self.embedding_weight
+    }
+
+    fn committed_history_active(&self) -> bool {
+        false
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        // The eager MoE MTP path set the turn label via
+        // `profiler.set_label("moe_mtp_eager")` at the migration site; the
+        // engine applies this relabel once at turn entry instead.
+        Some("moe_mtp_eager")
+    }
+
+    // Step A main forward: eager pre-norm + final-norm + project. Returns
+    // `hidden` shaped `[1, hidden]` (squeeze the time axis); `logits` stays
+    // `[1, 1, vocab]` with `needs_squeeze = true`.
+    fn forward_with_hidden(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray, bool)> {
+        let inner = &mut *self.inner;
+        let pre =
+            forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches, self.fa_idx)?;
+        let h3 = inner.final_norm.forward(&pre)?;
+        let logits =
+            project_logits_from_hidden(&h3, &inner.lm_head, emb, Some(&self.embedding_weight_t))?;
+        let hidden = h3.squeeze(Some(&[1]))?;
+        Ok((logits, hidden, true))
+    }
+
+    // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
+    // project to `draft_logits` `[1, 1, vocab]` then squeeze the time axis to
+    // `[1, vocab]`.
+    fn draft_step(
+        &mut self,
+        prev_hidden: &MxArray,
+        prev_emb: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let inner = &mut *self.inner;
+        let mtp_caches = &mut self.mtp_caches;
+        let mtp = inner.mtp.as_mut().ok_or_else(|| {
+            Error::from_reason(
+                "eager MoE MTP draft_step: inner.mtp is None despite \
+                 has_mtp_weights() gate",
+            )
+        })?;
+        let h_next = mtp.forward(prev_hidden, prev_emb, Some(mtp_caches))?;
+        let dl3 = project_logits_from_hidden(
+            &h_next,
+            &inner.lm_head,
+            &self.embedding_weight,
+            Some(&self.embedding_weight_t),
+        )?;
+        let draft_logits = dl3.squeeze(Some(&[1]))?;
+        Ok((h_next, draft_logits))
+    }
+
+    // Batched verify: run the K+1 verify ids through the main stack,
+    // advancing `inner.caches` by K+1, recording the GDN tape.
+    fn verify_step(
+        &mut self,
+        ids: &MxArray,
+        emb: &MxArray,
+        depth: usize,
+    ) -> Result<mtp_decode::MtpVerifyOutput> {
+        let _ = depth;
+        let inner = &mut *self.inner;
+        let tape = &mut self.tape;
+        eager_verify_step(
+            &mut inner.layers,
+            &mut inner.caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            self.fa_idx,
+            ids,
+            emb,
+            Some(&self.embedding_weight_t),
+            Some(tape),
+        )
+    }
+
+    // No native argmax-only / sparse verify on the eager path — the accept
+    // loop falls back to dense-logits accept. (Defaults `None`.)
+
+    // Snapshot the main caches before verify mutates them. Stash the fallible
+    // result; surfaced in `rollback` / `restore_and_replay_main`.
+    fn snapshot_main_linear(&mut self) {
+        let inner = &*self.inner;
+        let snap = match inner.caches.as_ref() {
+            Some(caches) => super::layer_cache::snapshot_all(caches),
+            None => Err(Error::from_reason(
+                "eager MoE MTP snapshot_main_linear: inner.caches is None",
+            )),
+        };
+        self.snap = Some(snap);
+    }
+
+    // Pure-Rust GDN tape replay — fires on BOTH full and partial accept.
+    // Infallible signature: any error is stashed in `self.replay_err` and
+    // surfaced later. Full-attention layers rewind their K/V offset to
+    // `snapshot_offset + accepted_steps`; GDN layers replay the recorded tape.
+    fn rollback(&mut self, accepted_drafts: usize, _depth: usize) {
+        if self.replay_err.is_some() {
+            return;
+        }
+        let accepted_steps = accepted_drafts + 1;
+        let result: Result<()> = (|| {
+            let snap = match self.snap.as_ref() {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => {
+                    return Err(Error::from_reason(format!(
+                        "eager MoE MTP rollback: snapshot failed: {}",
+                        e.reason
+                    )));
+                }
+                None => {
+                    return Err(Error::from_reason(
+                        "eager MoE MTP rollback: snapshot missing (snapshot_main_linear \
+                         did not run)",
+                    ));
+                }
+            };
+            let tape = &self.tape;
+            let inner = &mut *self.inner;
+            let caches = inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("eager MoE MTP rollback: inner.caches is None")
+            })?;
+            if caches.len() != snap.len() || caches.len() != tape.len() {
+                return Err(Error::from_reason(format!(
+                    "eager MoE MTP rollback: length mismatch (caches {}, snapshot {}, \
+                     tape {})",
+                    caches.len(),
+                    snap.len(),
+                    tape.len(),
+                )));
+            }
+            for (idx, cache) in caches.iter_mut().enumerate() {
+                let Some(layer_tape) = tape[idx].as_ref() else {
+                    // Full-attention layer: rewind the offset to
+                    // `snapshot_offset + accepted_steps` so the next forward
+                    // overwrites the rejected drafts. No-op on full accept.
+                    match &snap[idx] {
+                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
+                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "eager MoE MTP rollback: layer {idx} has a \
+                                     FullAttention snapshot but its cache slot is \
+                                     not FullAttention",
+                                ))
+                            })?;
+                            let target = *offset + accepted_steps as i32;
+                            kv.trim(target);
+                        }
+                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
+                            return Err(Error::from_reason(format!(
+                                "eager MoE MTP rollback: layer {idx} has no GDN tape \
+                                 but a Linear snapshot",
+                            )));
+                        }
+                    }
+                    continue;
+                };
+                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "eager MoE MTP rollback: layer {idx} has a GDN tape but its \
+                         cache slot is not Linear",
+                    ))
+                })?;
+                let (snap_conv, snap_rec) = match &snap[idx] {
+                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
+                        conv_state,
+                        recurrent_state,
+                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
+                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                        return Err(Error::from_reason(format!(
+                            "eager MoE MTP rollback: layer {idx} GDN tape but \
+                             FullAttention snapshot",
+                        )));
+                    }
+                };
+                let window = layer_tape.kernel.window_len()? as usize;
+                if accepted_steps > window {
+                    return Err(Error::from_reason(format!(
+                        "eager MoE MTP rollback: accepted_steps {accepted_steps} \
+                         exceeds recorded window {window} at layer {idx}",
+                    )));
+                }
+                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.replay_err = Some(e);
+        }
+    }
+
+    // On rejection (partial accept): the GDN tape replay in `rollback` already
+    // reconstructed the AR-exact main cache state, so no re-forward loop is
+    // needed. This only surfaces a stashed replay error and clears the
+    // per-cycle snapshot + tape.
+    fn restore_and_replay_main(&mut self, _accepted: &[u32], _emb: &MxArray) -> Result<()> {
+        self.snap = None;
+        self.tape.clear();
+        if let Some(e) = self.replay_err.take() {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // Cycle-history v1: no committed-history commit.
+    fn commit_mtp(
+        &mut self,
+        _anchor: mtp_decode::MtpCommitAnchor,
+        _seed_hidden: &MxArray,
+        _verify_hiddens: &MxArray,
+        _committed_ids: &[u32],
+        _k_accepted: usize,
+        _emb: &MxArray,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // Cycle-history v1: reset the drafter cache to a fresh cache each cycle
+    // (the `chained_anchor` re-anchor is dense committed-history only).
+    fn begin_cycle(&mut self, _chained_anchor: bool) {
+        self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
+    }
+
+    // Bound the lazy graph: materialize the token plus the main GDN/full-attn
+    // caches; on a budget-forced step also the logits.
+    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        async_eval_layer_caches(&self.inner.caches);
+        token.eval();
+        if budget_forced {
+            logits.eval();
+        }
+    }
+
+    // Chained end-of-iteration eval: keep the chained `verify_hidden[K]` slice
+    // materialized alongside the token and the main caches so the next cycle's
+    // draft graph does not force a separate Metal roundtrip.
+    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_hidden: &MxArray) {
+        async_eval_layer_caches(&self.inner.caches);
+        MxArray::async_eval_arrays(&[token, chained_hidden]);
+    }
+
+    fn rollback_unemitted(&mut self, unemitted: usize) {
+        if unemitted > 0 {
+            self.mtp_desynced = true;
+        }
+    }
+
+    fn take_replay_error(&mut self) -> Option<Error> {
+        self.replay_err.take()
+    }
+
+    fn into_desynced(self) -> bool {
+        self.mtp_desynced
+    }
+}
+
+impl MtpBackend for Qwen35MoeInner {
+    type MtpDecode<'a>
+        = MoeMtpStepper<'a>
+    where
+        Self: 'a;
+
+    fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
+        // Cycle-history v1 ignores the prompt-prefix seed (the dense
+        // committed-history v2 prompt commit has no analog here).
+        let _ = setup;
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let config = self.config.clone();
+        let mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&config);
+        let fa_idx = self.fa_idx;
+        Ok(MoeMtpStepper {
+            inner: self,
+            mtp_caches,
+            snap: None,
+            tape: Vec::new(),
+            replay_err: None,
+            mtp_desynced: false,
+            embedding_weight,
+            embedding_weight_t,
+            config,
+            fa_idx,
+        })
     }
 }
 

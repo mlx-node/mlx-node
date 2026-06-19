@@ -1062,6 +1062,12 @@ pub(crate) use decode_loop;
 ///             and the main offset reaches `snapshot_offset + K`.
 ///        On full-accept the loop skips this hook (verify already
 ///        left the linear state advanced through all D drafts).
+///
+/// Both dense and MoE eager MTP now drive the engine-owned
+/// [`crate::engine::mtp_turn::run_mtp_turn`]/[`crate::engine::backend::MtpStepper`]
+/// path, so this closure bundle and [`run_mtp_cycle_inner`] have no callers;
+/// the type is retained until the shared cycle helper is removed.
+#[allow(dead_code)]
 pub(crate) struct MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, MxArray, bool)>,
@@ -1225,6 +1231,11 @@ impl MtpVerifyOutput {
 /// is the caller's problem; production callers fold the cycle inside
 /// `DENSE_COMPILED_MUTEX` so a `?` early-return drops the
 /// `CompiledResetGuard` and wipes the C++ state cleanly.
+///
+/// No callers remain now that both eager MTP families drive the engine-owned
+/// [`crate::engine::mtp_turn::run_mtp_cycle`]; retained until the shared cycle
+/// helper is removed.
+#[allow(dead_code)]
 pub(crate) fn run_mtp_cycle_inner<F, D, V, R, E, EX, B, S, RR, CM, RU>(
     ops: &mut MtpOps<F, D, V, R, E, EX, B, S, RR, CM, RU>,
     prev_hidden_in: MxArray,
@@ -2232,6 +2243,11 @@ where
 ///     in tests for determinism).
 ///
 /// The `streaming` block is OPTIONAL — same shape as `decode_loop!`.
+///
+/// No callers remain now that both eager MTP families drive the engine-owned
+/// [`crate::engine::mtp_turn::run_mtp_turn`]; retained until the shared loop is
+/// removed.
+#[allow(unused_macros)]
 macro_rules! decode_loop_mtp {
     (
         mtp_ops: $mtp:expr,
@@ -2970,6 +2986,7 @@ macro_rules! decode_loop_mtp {
     }};
 }
 
+#[allow(unused_imports)]
 pub(crate) use decode_loop_mtp;
 
 #[cfg(test)]
