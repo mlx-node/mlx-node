@@ -1075,6 +1075,15 @@ pub(crate) struct MtpTurnArgs<'a> {
     pub first_token_instant: &'a mut Option<Instant>,
     pub report_perf: bool,
     pub generation_stream: Stream,
+    /// Prompt-prefix MTP seed inputs, forwarded verbatim into
+    /// [`MtpTurnSetup`] so [`MtpBackend::begin_mtp_decode`] can commit the
+    /// prompt prefix into the drafter's committed-history cache before the
+    /// loop. == the `prompt_hidden` / `prompt_hidden_ids` /
+    /// `prompt_hidden_position_base` fields of `ChatDecodeInputs` the eager
+    /// block read. `None` / `0` ⇒ no prompt seed (cycle-history v1).
+    pub prompt_hidden: Option<MxArray>,
+    pub prompt_hidden_ids: Option<Vec<u32>>,
+    pub prompt_hidden_position_base: usize,
 }
 
 /// Terminal outs of [`run_mtp_turn`] the caller threads into its save /
@@ -1162,17 +1171,34 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         first_token_instant: first_tok,
         report_perf: report,
         generation_stream,
+        prompt_hidden,
+        prompt_hidden_ids,
+        prompt_hidden_position_base,
     } = args;
 
+    // Materialize the first sampled token's id before building the setup.
+    // The eager block's prompt seed read `y.item_at_int32(0)` after a
+    // `y.eval()` to append `y` to the committed run `[prompt_ids[1..], y]`;
+    // `begin_mtp_decode` now owns that seed, so the engine evals `y` once
+    // here and hands the id through the setup. `y.eval()` is idempotent —
+    // the loop's initial-emit re-evals the same materialized value, so the
+    // sampled token (and every downstream commit) is byte-identical.
+    y.eval();
+    let first_sampled_token = y.item_at_int32(0)? as u32;
+
     // The turn-constant embedding weight + the requested depth + the
-    // per-cycle scratch are captured into the stepper at `begin_mtp_decode`
-    // (the analog of `begin_paged_decode`). The macro threaded
-    // `embedding_weight` as `$emb`; the stepper now owns it and exposes it
-    // via `embedding_weight()`. Read once at turn entry.
+    // per-cycle scratch (and the prompt-prefix seed) are captured into the
+    // stepper at `begin_mtp_decode` (the analog of `begin_paged_decode`). The
+    // macro threaded `embedding_weight` as `$emb`; the stepper now owns it and
+    // exposes it via `embedding_weight()`. Read once at turn entry.
     let setup = MtpTurnSetup {
         params: p,
         is_delta: false,
         depth,
+        prompt_hidden: prompt_hidden.as_ref(),
+        prompt_hidden_ids: prompt_hidden_ids.as_deref(),
+        prompt_hidden_position_base,
+        first_sampled_token,
     };
     let mut step = backend.begin_mtp_decode(&setup)?;
     // Turn-entry reads the engine takes over from the macro/family wiring:
@@ -2954,6 +2980,9 @@ mod tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                prompt_hidden_position_base: 0,
             },
         )
         .unwrap_or_else(|e| panic!("run_mtp_turn failed: {}", e.reason));

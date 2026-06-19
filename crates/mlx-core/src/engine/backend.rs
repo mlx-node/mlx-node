@@ -1536,6 +1536,25 @@ pub(crate) struct MtpTurnSetup<'a> {
     /// Requested draft depth for this turn (`1..=5`), before the
     /// stepper's intra-cycle depth gates.
     pub depth: usize,
+    /// Post-final-norm hidden state for every prefilled prompt token,
+    /// `[1, prefill_len, hidden]`. `Some` only when the MTP prefill ran the
+    /// hidden-emitting forward; consumed ONCE by
+    /// [`MtpBackend::begin_mtp_decode`] to commit the prompt prefix into the
+    /// drafter's committed-history cache (v2). `None` ⇒ no prompt seed.
+    pub prompt_hidden: Option<&'a MxArray>,
+    /// The exact prompt token ids whose hiddens `prompt_hidden` holds —
+    /// `prompt_hidden.shape(1) == prompt_hidden_ids.len()`. `Some` iff
+    /// `prompt_hidden` is `Some`.
+    pub prompt_hidden_ids: Option<&'a [u32]>,
+    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
+    /// row. Zero for full committed history; non-zero for last-window prompt
+    /// seeding (which disables the v2 committed-history prompt seed).
+    pub prompt_hidden_position_base: usize,
+    /// The first generated token (sampled from the prefill logits BEFORE the
+    /// turn). Already materialized — the prompt seed appends it to the
+    /// committed run `[prompt_ids[1..], y]`. == the eager block's
+    /// `y.item_at_int32(0)` read.
+    pub first_sampled_token: u32,
 }
 
 /// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode
