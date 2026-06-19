@@ -12,6 +12,7 @@
 //! `&mut self` borrow model compile and are usable. Nothing in production
 //! calls this module yet, so the families' MTP behavior is byte-identical.
 
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -32,7 +33,7 @@ use crate::models::qwen3_5::mtp_decode::{
 use crate::sampling;
 use crate::stream::Stream;
 
-use crate::engine::decode::{mtp_trace_logits, trace_top2};
+use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
 
 /// One MTP draft+verify cycle, generic over [`MtpStepper`] — a VERBATIM,
 /// mechanical relocation of
@@ -1147,15 +1148,23 @@ pub(crate) struct MtpTurnOutcome {
 /// The post-loop `replay_err_cell` / `mtp_desynced` reads become the
 /// engine-owned `step.take_replay_error()?` / `step.into_desynced()` outs.
 ///
-/// SCAFFOLD STEP (S2a): the SYNC path only — the streaming sub-block
-/// (`decode_loop_mtp!`'s `$(, streaming: {...})?` arm) lands in a later
-/// step via an optional streaming sink. DEAD CODE: nothing in production
-/// drives it yet, so the families' MTP behavior is byte-identical.
+/// The optional `streaming` arm is the engine-owned analog of
+/// `decode_loop_mtp!`'s `$(, streaming: {...})?`: the relocated
+/// per-token streaming emit points at the SAME three sites the sync path
+/// pushes (the initial-`y` push, Step A's sampled token, and the cycle
+/// emit loop) plus the pre-loop cancellation break, routed through the
+/// shared [`StreamingCtx`] / [`crate::engine::backend::StreamEmitter`] /
+/// [`crate::engine::backend::ChunkSink`] abstraction — the SAME emitter
+/// type / incremental detokenization (`step_decode_stream`) /
+/// reasoning-suppression gate `run_decode_loop` uses. `None` ⇒ the SYNC
+/// (non-streaming) path; both share ONE loop with a sink switch, so the
+/// sync path is byte-identical with or without the arm wired.
 #[allow(dead_code)]
 pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     backend: &mut B,
     rng: &mut R,
     args: MtpTurnArgs<'_>,
+    mut streaming: Option<StreamingCtx<'_, '_>>,
 ) -> Result<MtpTurnOutcome> {
     let MtpTurnArgs {
         mut y,
@@ -1334,6 +1343,31 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         generated.push(initial_token_id);
         hist.push(initial_token_id);
         let _is_reasoning = tracker.observe_token(initial_token_id);
+        // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
+        // initial-`$y` arm. The initial seed's cancel-check just SKIPS the
+        // detok+emit (NO break, unlike Step A / the emit loop): a cancel
+        // before the first forward leaves the seed committed but unstreamed.
+        // Detokenize + length-advance stay OUTSIDE the emitter's gate so
+        // DecodeStream sees every token (matching `run_decode_loop`).
+        if let Some(s) = streaming.as_mut() {
+            *s.last_is_reasoning = _is_reasoning;
+            if !s.cancelled.load(Ordering::Relaxed) {
+                let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    s.decode_stream,
+                    s.tokenizer,
+                    initial_token_id,
+                    generated,
+                    *s.streamed_text_len,
+                );
+                *s.streamed_text_len += token_text.len();
+                s.emitter.on_token_text(
+                    &token_text,
+                    _is_reasoning,
+                    p.include_reasoning,
+                    s.callback,
+                );
+            }
+        }
         profiler.step();
     }
 
@@ -1360,6 +1394,18 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             // This pre-forward re-check fires on the initial seed (or a
             // prior-iteration token) BEFORE any forward consumed it, so
             // the stop token is not yet in the physical cache.
+            last_in_cache = false;
+            break;
+        }
+        // Streaming-only pre-loop cancel check — relocated VERBATIM from
+        // `decode_loop_mtp!` (it sits between the EOS pre-check and the
+        // repetition pre-check). A cancel observed at the iteration top
+        // exits "cancelled" before any forward; the last emitted token is
+        // the unforwarded seed/boundary, so it is not yet in the cache.
+        if let Some(s) = streaming.as_ref()
+            && s.cancelled.load(Ordering::Relaxed)
+        {
+            *reason = String::from("cancelled");
             last_in_cache = false;
             break;
         }
@@ -1462,6 +1508,35 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             generated.push(token_id);
             hist.push(token_id);
             let _is_reasoning = tracker.observe_token(token_id);
+
+            // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
+            // Step A arm. It runs AFTER `observe_token` and BEFORE the EOS
+            // check (the macro's order): a cancel observed here breaks
+            // "cancelled" (the just-committed token is unforwarded, so
+            // `last_in_cache = false`); otherwise detokenize + length-advance
+            // (outside the emitter's gate) then emit through the emitter.
+            if let Some(s) = streaming.as_mut() {
+                *s.last_is_reasoning = _is_reasoning;
+                if s.cancelled.load(Ordering::Relaxed) {
+                    *reason = String::from("cancelled");
+                    last_in_cache = false;
+                    break;
+                }
+                let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    s.decode_stream,
+                    s.tokenizer,
+                    token_id,
+                    generated,
+                    *s.streamed_text_len,
+                );
+                *s.streamed_text_len += token_text.len();
+                s.emitter.on_token_text(
+                    &token_text,
+                    _is_reasoning,
+                    p.include_reasoning,
+                    s.callback,
+                );
+            }
 
             if token_id == eos_id || p.extra_eos_ids.contains(&token_id) {
                 *reason = String::from("stop");
@@ -1741,6 +1816,38 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             hist.push(tok_id);
             cycle_emitted += 1;
             let _is_reasoning = tracker.observe_token(tok_id);
+            // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
+            // emit-loop arm. It runs AFTER `observe_token` and BEFORE the EOS
+            // check (the macro's order). A cancel here breaks "cancelled":
+            // the last outcome token is the unforwarded boundary
+            // (bonus/residual), so keep an earlier emitted token (verify
+            // wrote its K/V) but drop the boundary —
+            // `last_in_cache = cycle_emitted < outcome.tokens.len()`.
+            // Detokenize + length-advance stay outside the emitter's gate so
+            // DecodeStream sees every token.
+            if let Some(s) = streaming.as_mut() {
+                *s.last_is_reasoning = _is_reasoning;
+                if s.cancelled.load(Ordering::Relaxed) {
+                    *reason = String::from("cancelled");
+                    hit_stop = true;
+                    last_in_cache = cycle_emitted < outcome.tokens.len();
+                    break;
+                }
+                let token_text = crate::tokenizer::Qwen3Tokenizer::step_decode_stream(
+                    s.decode_stream,
+                    s.tokenizer,
+                    tok_id,
+                    generated,
+                    *s.streamed_text_len,
+                );
+                *s.streamed_text_len += token_text.len();
+                s.emitter.on_token_text(
+                    &token_text,
+                    _is_reasoning,
+                    p.include_reasoning,
+                    s.callback,
+                );
+            }
             if tok_id == eos_id || p.extra_eos_ids.contains(&tok_id) {
                 *reason = String::from("stop");
                 hit_stop = true;
@@ -2984,6 +3091,8 @@ mod tests {
                 prompt_hidden_ids: None,
                 prompt_hidden_position_base: 0,
             },
+            // The whole-turn mock tests drive the SYNC path.
+            None,
         )
         .unwrap_or_else(|e| panic!("run_mtp_turn failed: {}", e.reason));
 

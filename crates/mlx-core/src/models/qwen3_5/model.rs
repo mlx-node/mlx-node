@@ -2044,6 +2044,9 @@ impl Qwen35Inner {
                     prompt_hidden_ids,
                     prompt_hidden_position_base,
                 },
+                // SYNC site: no streaming sink (the streaming flat site wires
+                // its own `StreamingCtx` and shares this one loop).
+                None,
             )?;
 
             last_in_cache = outcome.last_in_cache;
@@ -2171,15 +2174,16 @@ impl Qwen35Inner {
     /// cores (`chat_stream_sync_inner` / `chat_stream_tokens_delta_sync_inner`).
     ///
     /// This is the streaming analogue of the `eager_mtp` arm of
-    /// [`Self::chat_with_caches_inner`]: it builds the same `MtpOps`
-    /// (forward+hidden, draft, batched verify, GDN tape rollback, committed
-    /// commit), runs the same prompt-prefix committed-history seed when a
-    /// prompt hidden is supplied, then drives `decode_loop_mtp!` with the
-    /// `streaming:` block so accepted tokens stream out the `cb` sink
-    /// incrementally. Caller owns prefill, sampling of the first `y`, the
-    /// `WiredLimitContext`, and the post-loop save-cache / final-chunk tail —
-    /// this helper only swaps the AR decode loop for the eager-MTP one and
-    /// mutates the threaded locals in place.
+    /// [`Self::chat_with_caches_inner`]: the propose/verify whole-turn loop is
+    /// engine-owned ([`crate::engine::mtp_turn::run_mtp_turn`]) and drives the
+    /// [`DenseMtpStepper`] ([`MtpBackend::begin_mtp_decode`]) — the SAME stepper
+    /// and prompt-prefix committed-history seed the SYNC site uses. The only
+    /// difference is the streaming sink: this site wires a
+    /// [`crate::engine::decode::StreamingCtx`] (incremental detokenization plus
+    /// the default [`crate::engine::backend::DefaultStreamEmitter`]) so accepted
+    /// tokens stream out the `cb` sink incrementally, sharing ONE loop with the
+    /// sync site. Caller owns prefill, sampling of the first `y`, the
+    /// `WiredLimitContext`, and the post-loop save-cache / final-chunk tail.
     ///
     /// Preconditions (enforced by the callers' gate): `enable_mtp`,
     /// `has_mtp_weights()`, `paged_adapter.is_none()`, text-only. The body is
@@ -2188,7 +2192,7 @@ impl Qwen35Inner {
     #[allow(clippy::too_many_arguments)]
     fn run_flat_stream_eager_mtp<'a>(
         &mut self,
-        mut y: MxArray,
+        y: MxArray,
         token_history: &mut Vec<u32>,
         generated_tokens: &mut Vec<u32>,
         finish_reason: &mut String,
@@ -2208,8 +2212,12 @@ impl Qwen35Inner {
         tokenizer: &'a Arc<Qwen3Tokenizer>,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
-        embedding_weight: MxArray,
-        embedding_weight_t: MxArray,
+        // The embedding table + its transpose are owned by the model and
+        // pulled inside `begin_mtp_decode` (`self.embedding.get_weight()`),
+        // so the engine-owned loop does not read these; kept in the signature
+        // for call-site parity with the AR streaming arm.
+        _embedding_weight: MxArray,
+        _embedding_weight_t: MxArray,
         p: &engine::ChatParams,
         eos_id: u32,
         max_new_tokens: i32,
@@ -2219,389 +2227,58 @@ impl Qwen35Inner {
         prompt_hidden_position_base: usize,
         last_in_cache: &mut bool,
     ) -> Result<()> {
-        profiler.set_label("mtp_eager");
-
+        // The turn profiler relabel ("mtp_eager") now moves into
+        // `DenseMtpStepper::profiler_relabel`, applied once at turn entry by
+        // the engine — mirroring the SYNC site.
         MxArray::async_eval_arrays(&[&y]);
 
-        // Mirrors the macro's `last_in_cache` binding; written by
-        // `decode_loop_mtp!` and propagated to the caller's save below.
-        let mut last_in_cache_local = true;
-
-        // Pure-Rust eager MTP. Each `MtpOps` closure forwards through the
-        // `Qwen35Inner` graph; GDN rollback uses the K+1 separate `[1,1]`
-        // forward semantics.
         let mut rng = rand::rng();
-        let config = self.config.clone();
-        let emb_t_ref: Option<&MxArray> = Some(&embedding_weight_t);
-        let emb_capture: &MxArray = &embedding_weight;
-        let mtp_desynced = std::cell::Cell::new(false);
 
-        {
-            // All 13 closures need `&mut self`; the macro / cycle helper
-            // call them strictly sequentially and non-nested, so a shared
-            // `RefCell<&mut Qwen35Inner>` borrowed for each body is safe.
-            let inner_cell = std::cell::RefCell::new(&mut *self);
-            let mtp_caches_cell = std::cell::RefCell::new(Qwen3_5MTPModule::fresh_caches(&config));
-            let committed_len = std::cell::Cell::new(0i32);
-            let use_committed = prompt_hidden_position_base == 0;
-            let snap_cell: std::cell::RefCell<
-                Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-            > = std::cell::RefCell::new(None);
-            let tape_cell: std::cell::RefCell<Vec<Option<super::gated_delta_net::GdnLayerTape>>> =
-                std::cell::RefCell::new(Vec::new());
-            let replay_err_cell: std::cell::RefCell<Option<Error>> = std::cell::RefCell::new(None);
+        // Wire the streaming sink: incremental detokenization through the
+        // shared `step_decode_stream` + the default ChatML emitter (qwen3_5
+        // does not override `stream_emitter`, so the macro's inline emit is
+        // byte-identical to `DefaultStreamEmitter::on_token_text`). The
+        // engine's `run_mtp_turn` routes the SAME three emit sites + the
+        // pre-loop cancel break through this `StreamingCtx`.
+        let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+        let streaming = crate::engine::decode::StreamingCtx {
+            callback: cb.0,
+            cancelled,
+            decode_stream,
+            tokenizer: tokenizer.inner(),
+            streamed_text_len,
+            last_is_reasoning,
+            emitter: &mut emitter,
+        };
 
-            let mut mtp_ops = mtp_decode::MtpOps {
-                forward_with_hidden: |ids: &MxArray,
-                                      emb: &MxArray|
-                 -> Result<(MxArray, MxArray, bool)> {
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let pre =
-                        forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
-                    let h3 = inner.final_norm.forward(&pre)?;
-                    let logits = project_logits_from_hidden(&h3, &inner.lm_head, emb, emb_t_ref)?;
-                    let hidden = h3.squeeze(Some(&[1]))?;
-                    Ok((logits, hidden, true))
-                },
-                draft_step: |prev_hidden: &MxArray,
-                             prev_emb: &MxArray|
-                 -> Result<(MxArray, MxArray)> {
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mut mtp_caches = mtp_caches_cell.borrow_mut();
-                    let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "eager MTP (stream) draft_step: inner.mtp is None despite \
-                             has_mtp_weights() gate",
-                        )
-                    })?;
-                    let h_next = mtp.forward(prev_hidden, prev_emb, Some(&mut mtp_caches))?;
-                    let dl3 = project_logits_from_hidden(
-                        &h_next,
-                        &inner.lm_head,
-                        emb_capture,
-                        emb_t_ref,
-                    )?;
-                    let draft_logits = dl3.squeeze(Some(&[1]))?;
-                    Ok((h_next, draft_logits))
-                },
-                verify_step: |ids: &MxArray,
-                              emb: &MxArray,
-                              depth: usize|
-                 -> Result<mtp_decode::MtpVerifyOutput> {
-                    let _ = depth;
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mut tape = tape_cell.borrow_mut();
-                    eager_verify_step(
-                        &mut inner.layers,
-                        &mut inner.caches,
-                        &inner.final_norm,
-                        &inner.lm_head,
-                        ids,
-                        emb,
-                        emb_t_ref,
-                        Some(&mut tape),
-                    )
-                },
-                verify_step_argmax_only: None,
-                verify_step_sparse: None,
-                rollback: |accepted_drafts: usize, _depth: usize| {
-                    if replay_err_cell.borrow().is_some() {
-                        return;
-                    }
-                    let accepted_steps = accepted_drafts + 1;
-                    let result: Result<()> = (|| {
-                        let snap_ref = snap_cell.borrow();
-                        let snap = match snap_ref.as_ref() {
-                            Some(Ok(s)) => s,
-                            Some(Err(e)) => {
-                                return Err(Error::from_reason(format!(
-                                    "eager MTP (stream) rollback: snapshot failed: {}",
-                                    e.reason
-                                )));
-                            }
-                            None => {
-                                return Err(Error::from_reason(
-                                    "eager MTP (stream) rollback: snapshot missing \
-                                     (snapshot_main_linear did not run)",
-                                ));
-                            }
-                        };
-                        let tape = tape_cell.borrow();
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason("eager MTP (stream) rollback: inner.caches is None")
-                        })?;
-                        if caches.len() != snap.len() || caches.len() != tape.len() {
-                            return Err(Error::from_reason(format!(
-                                "eager MTP (stream) rollback: length mismatch (caches {}, \
-                                 snapshot {}, tape {})",
-                                caches.len(),
-                                snap.len(),
-                                tape.len(),
-                            )));
-                        }
-                        for (idx, cache) in caches.iter_mut().enumerate() {
-                            let Some(layer_tape) = tape[idx].as_ref() else {
-                                match &snap[idx] {
-                                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                        offset,
-                                    } => {
-                                        let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                            Error::from_reason(format!(
-                                                "eager MTP (stream) rollback: layer {idx} has a \
-                                                 FullAttention snapshot but its cache slot is \
-                                                 not FullAttention",
-                                            ))
-                                        })?;
-                                        let target = *offset + accepted_steps as i32;
-                                        kv.trim(target);
-                                    }
-                                    super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                                        return Err(Error::from_reason(format!(
-                                            "eager MTP (stream) rollback: layer {idx} has no GDN \
-                                             tape but a Linear snapshot",
-                                        )));
-                                    }
-                                }
-                                continue;
-                            };
-                            let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MTP (stream) rollback: layer {idx} has a GDN tape but \
-                                     its cache slot is not Linear",
-                                ))
-                            })?;
-                            let (snap_conv, snap_rec) = match &snap[idx] {
-                                super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                                    conv_state,
-                                    recurrent_state,
-                                } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                                super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                    ..
-                                } => {
-                                    return Err(Error::from_reason(format!(
-                                        "eager MTP (stream) rollback: layer {idx} GDN tape but \
-                                         FullAttention snapshot",
-                                    )));
-                                }
-                            };
-                            let window = layer_tape.kernel.window_len()? as usize;
-                            if accepted_steps > window {
-                                return Err(Error::from_reason(format!(
-                                    "eager MTP (stream) rollback: accepted_steps \
-                                     {accepted_steps} exceeds recorded window {window} at layer \
-                                     {idx}",
-                                )));
-                            }
-                            layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(e) = result {
-                        *replay_err_cell.borrow_mut() = Some(e);
-                    }
-                },
-                eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                    let inner = inner_cell.borrow();
-                    async_eval_layer_caches(&inner.caches);
-                    token.eval();
-                    if budget_forced {
-                        logits.eval();
-                    }
-                },
-                eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                    let inner = inner_cell.borrow();
-                    async_eval_layer_caches(&inner.caches);
-                    MxArray::async_eval_arrays(&[token, chained_hidden]);
-                },
-                begin_cycle: |chained_anchor: bool| {
-                    if !use_committed {
-                        *mtp_caches_cell.borrow_mut() = Qwen3_5MTPModule::fresh_caches(&config);
-                        return;
-                    }
-                    let target = if chained_anchor {
-                        (committed_len.get() - 1).max(0)
-                    } else {
-                        committed_len.get()
-                    };
-                    let mut caches = mtp_caches_cell.borrow_mut();
-                    for c in caches.iter_mut() {
-                        if let Some(kv) = c.as_kv_cache_mut() {
-                            kv.trim(target);
-                        }
-                    }
-                },
-                snapshot_main_linear: || {
-                    let inner = inner_cell.borrow();
-                    let snap = match inner.caches.as_ref() {
-                        Some(caches) => super::layer_cache::snapshot_all(caches),
-                        None => Err(Error::from_reason(
-                            "eager MTP (stream) snapshot_main_linear: inner.caches is None",
-                        )),
-                    };
-                    *snap_cell.borrow_mut() = Some(snap);
-                },
-                restore_and_replay_main: |_accepted_drafts: &[u32], _emb: &MxArray| -> Result<()> {
-                    *snap_cell.borrow_mut() = None;
-                    tape_cell.borrow_mut().clear();
-                    if let Some(e) = replay_err_cell.borrow_mut().take() {
-                        return Err(e);
-                    }
-                    Ok(())
-                },
-                commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
-                             seed_hidden: &MxArray,
-                             verify_hiddens: &MxArray,
-                             committed_ids: &[u32],
-                             _k_accepted: usize,
-                             emb: &MxArray|
-                 -> Result<()> {
-                    if !use_committed {
-                        return Ok(());
-                    }
-                    let m = committed_ids.len();
-                    if m == 0 {
-                        return Ok(());
-                    }
-                    let hidden_dim = verify_hiddens.shape_at(2)?;
-
-                    let hidden_seq = match anchor {
-                        mtp_decode::MtpCommitAnchor::IncludeAnchor => {
-                            let vh_prefix = verify_hiddens
-                                .slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-                            MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
-                        }
-                        mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                            verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
-                        }
-                    };
-
-                    let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-                    let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-                    let gathered = emb.take(&ids_arr, 0)?;
-                    let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
-
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "eager MTP (stream) commit_mtp: inner.mtp is None despite \
-                             has_mtp_weights() gate",
-                        )
-                    })?;
-                    let mut caches = mtp_caches_cell.borrow_mut();
-                    for c in caches.iter_mut() {
-                        if let Some(kv) = c.as_kv_cache_mut() {
-                            kv.trim(committed_len.get());
-                        }
-                    }
-                    let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                    committed_len.set(committed_len.get() + m as i32);
-                    Ok(())
-                },
-                committed_history_active: use_committed,
-                rollback_unemitted: |unemitted: usize| {
-                    if unemitted > 0 {
-                        mtp_desynced.set(true);
-                    }
-                },
-            };
-
-            // Prompt-prefix seed (v2 committed-history only). Mirror the
-            // non-streaming flat seed: commit the contiguous run
-            // `[prompt_hidden_ids[1..], y]` into the persistent MTP cache so
-            // the drafter attends the prompt from cycle 1.
-            if use_committed
-                && let (Some(ph), Some(ph_ids)) =
-                    (prompt_hidden.as_ref(), prompt_hidden_ids.as_ref())
-                && !ph_ids.is_empty()
-            {
-                let prompt_len = ph_ids.len();
-                let hidden_dim = ph.shape_at(2)?;
-                let hidden_len = ph.shape_at(1)? as usize;
-                if hidden_len != prompt_len {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP (stream) prompt-seed: prompt_hidden length {hidden_len} \
-                         does not match prompt_hidden_ids length {prompt_len}"
-                    )));
-                }
-                y.eval();
-                let y_id = y.item_at_int32(0)? as u32;
-
-                let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
-                committed_ids.extend(ph_ids[1..prompt_len].iter().map(|&v| v as i32));
-                committed_ids.push(y_id as i32);
-
-                let chunk_sizes = partition_prefill_chunks(prompt_len);
-                let mut cursor: usize = 0;
-                for &chunk in &chunk_sizes {
-                    let chunk_i64 = chunk as i64;
-                    let start = cursor as i64;
-                    let hidden_seq =
-                        ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-                    let ids_arr =
-                        MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
-                    let gathered = embedding_weight.take(&ids_arr, 0)?;
-                    let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-
-                    let mut inner = inner_cell.borrow_mut();
-                    let inner = &mut **inner;
-                    let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "eager MTP (stream) prompt-seed: inner.mtp is None despite \
-                             has_mtp_weights() gate",
-                        )
-                    })?;
-                    let mut caches = mtp_caches_cell.borrow_mut();
-                    let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                    committed_len.set(committed_len.get() + chunk as i32);
-                    cursor += chunk;
-                }
-            }
-
-            mtp_decode::decode_loop_mtp!(
-                mtp_ops: mtp_ops,
-                mtp_depth: p.mtp_depth,
-                mtp_rng: rng,
-                y: y,
-                embedding_weight: embedding_weight.clone(),
+        let outcome = crate::engine::mtp_turn::run_mtp_turn(
+            self,
+            &mut rng,
+            crate::engine::mtp_turn::MtpTurnArgs {
+                y,
+                depth: p.mtp_depth,
                 params: p,
-                reasoning_tracker: *reasoning_tracker,
-                profiler: *profiler,
-                max_new_tokens: max_new_tokens,
-                eos_id: eos_id,
-                generated_tokens: *generated_tokens,
-                token_history: *token_history,
-                finish_reason: *finish_reason,
-                last_in_cache: last_in_cache_local,
-                first_token_instant: *first_token_instant,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
                 report_perf: p.report_performance,
-                generation_stream: generation_stream,
-                streaming: {
-                    callback: cb,
-                    cancelled: cancelled,
-                    decode_stream: *decode_stream,
-                    tokenizer: *tokenizer,
-                    streamed_text_len: *streamed_text_len,
-                    last_is_reasoning: *last_is_reasoning
-                }
-            );
+                generation_stream,
+                prompt_hidden,
+                prompt_hidden_ids,
+                prompt_hidden_position_base,
+            },
+            Some(streaming),
+        )?;
 
-            // Surface any GDN tape-replay error stashed by the infallible
-            // `rollback` on a FULL-accept cycle (the partial-accept path
-            // already surfaces it via `restore_and_replay_main`).
-            if let Some(e) = replay_err_cell.borrow_mut().take() {
-                return Err(e);
-            }
-        }
-        *last_in_cache = last_in_cache_local;
+        *last_in_cache = outcome.last_in_cache;
         // Propagate a mid-cycle stop: self.caches advanced past the emitted
         // history, so force a full re-prefill next turn.
-        if mtp_desynced.get() {
+        if outcome.desynced {
             self.flat_mtp_caches_desynced = true;
         }
 
