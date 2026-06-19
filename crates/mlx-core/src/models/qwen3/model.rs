@@ -805,8 +805,12 @@ impl Qwen3Inner {
         }
         // Request value wins; otherwise fall back to the checkpoint's
         // generation_config.json default; otherwise the sampler's builtin.
+        // When the request omits temperature, a `do_sample:false` in
+        // generation_config.json forces greedy decoding (temperature 0),
+        // overriding any gen-config temperature (HuggingFace transformers
+        // semantics) — `effective_temperature()` folds that rule in.
         let temperature = req_temperature
-            .or(self.gen_defaults.temperature)
+            .or(self.gen_defaults.effective_temperature())
             .unwrap_or(1.0);
         let top_k = req_top_k.or(self.gen_defaults.top_k).unwrap_or(0);
         let top_p = req_top_p.or(self.gen_defaults.top_p).unwrap_or(1.0);

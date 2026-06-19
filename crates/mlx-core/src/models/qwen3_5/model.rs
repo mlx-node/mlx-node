@@ -6112,12 +6112,18 @@ impl Qwen35Inner {
 
         // Request value wins; otherwise fall back to the checkpoint's
         // generation_config.json default; otherwise the sampler's builtin.
+        // When the request omits temperature, a `do_sample:false` in
+        // generation_config.json forces greedy decoding (temperature 0),
+        // overriding any gen-config temperature (HuggingFace transformers
+        // semantics) — `effective_temperature()` folds that rule in.
         // This raw `generate` surface exposes only the four SamplingConfig
         // fields (no repetition/presence/frequency penalty), so a
         // generation_config repetition_penalty is honored on the ChatSession
         // path but intentionally not here. ChatSession is the full-parity surface.
         let sampling_config = Some(SamplingConfig {
-            temperature: config.temperature.or(self.gen_defaults.temperature),
+            temperature: config
+                .temperature
+                .or(self.gen_defaults.effective_temperature()),
             top_k: config.top_k.or(self.gen_defaults.top_k),
             top_p: config.top_p.or(self.gen_defaults.top_p),
             min_p: config.min_p.or(self.gen_defaults.min_p),

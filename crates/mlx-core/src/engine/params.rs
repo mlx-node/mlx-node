@@ -165,11 +165,14 @@ pub(crate) fn build_chatml_tool_delta_text(
 /// `eos_token_ids`), so every touched path stays byte-identical to the
 /// pre-feature behavior.
 ///
-/// # Two surfaces that diverge from the above
+/// # Two surfaces that differ from the above
 ///
 /// * **Raw `model.generate()`** (qwen3 / qwen3_5 / qwen3_5_moe only — a
-///   separate, non-ChatSession entrypoint) keeps the same sampling order
-///   but takes its *primary* EOS from `config.json`
+///   separate, non-ChatSession entrypoint) keeps the same sampling order,
+///   including `do_sample == Some(false)` forcing greedy decoding
+///   (`temperature = 0.0`) when the request omits `temperature`, via
+///   [`ModelGenerationDefaults::effective_temperature`] — same as the
+///   ChatSession path. It takes its *primary* EOS from `config.json`
 ///   (`self.config.eos_token_id`), still unioned with these ids. It honors
 ///   a `generation_config.json` `repetition_penalty` for qwen3 only;
 ///   qwen3_5/moe expose just the four `SamplingConfig` fields there, so
@@ -196,6 +199,21 @@ pub struct ModelGenerationDefaults {
     pub eos_token_ids: Vec<u32>,
 }
 
+impl ModelGenerationDefaults {
+    /// The effective temperature this checkpoint contributes when a request
+    /// omits `temperature`. `do_sample == Some(false)` forces greedy
+    /// (`Some(0.0)`), overriding any `temperature` in generation_config.json
+    /// (HuggingFace transformers: do_sample=False ignores temperature);
+    /// otherwise the file's `temperature`.
+    pub(crate) fn effective_temperature(&self) -> Option<f64> {
+        if self.do_sample == Some(false) {
+            Some(0.0)
+        } else {
+            self.temperature
+        }
+    }
+}
+
 /// Pre-fill any unspecified sampling field of `cfg` from `d`.
 ///
 /// Each field is filled only when the request left it `None`, so an
@@ -210,11 +228,7 @@ pub struct ModelGenerationDefaults {
 /// An explicit request temperature still wins via the `is_none()` guard.
 pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGenerationDefaults) {
     if cfg.temperature.is_none() {
-        cfg.temperature = if d.do_sample == Some(false) {
-            Some(0.0)
-        } else {
-            d.temperature
-        };
+        cfg.temperature = d.effective_temperature();
     }
     if cfg.top_k.is_none() {
         cfg.top_k = d.top_k;
@@ -803,6 +817,64 @@ mod tests {
         // Exact cap boundary.
         assert_eq!(generated_capacity_hint(8192), 8192);
         assert_eq!(generated_capacity_hint(8193), 8192);
+    }
+
+    #[test]
+    fn effective_temperature_honors_do_sample() {
+        // do_sample:false forces greedy (Some(0.0)) regardless of the
+        // gen-config temperature — matching HuggingFace transformers, where
+        // do_sample=False ignores temperature.
+        let greedy_no_temp = ModelGenerationDefaults {
+            do_sample: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            greedy_no_temp.effective_temperature(),
+            Some(0.0),
+            "do_sample:false with no temperature must force greedy 0.0"
+        );
+
+        let greedy_with_temp = ModelGenerationDefaults {
+            temperature: Some(0.7),
+            do_sample: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            greedy_with_temp.effective_temperature(),
+            Some(0.0),
+            "do_sample:false must override a gen-config temperature"
+        );
+
+        // do_sample:true returns the gen-config temperature unchanged.
+        let sample_with_temp = ModelGenerationDefaults {
+            temperature: Some(0.7),
+            do_sample: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            sample_with_temp.effective_temperature(),
+            Some(0.7),
+            "do_sample:true must pass the gen-config temperature through"
+        );
+
+        // do_sample:None also returns the gen-config temperature unchanged.
+        let unset_with_temp = ModelGenerationDefaults {
+            temperature: Some(0.9),
+            do_sample: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            unset_with_temp.effective_temperature(),
+            Some(0.9),
+            "do_sample:None must pass the gen-config temperature through"
+        );
+
+        // do_sample:None with no temperature stays None (no-op default).
+        assert_eq!(
+            ModelGenerationDefaults::default().effective_temperature(),
+            None,
+            "no do_sample and no temperature must stay None"
+        );
     }
 
     #[test]
