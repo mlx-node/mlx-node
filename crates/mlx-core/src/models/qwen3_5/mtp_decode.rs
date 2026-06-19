@@ -362,7 +362,7 @@ pub(crate) fn mtp_sparse_accept_enabled() -> bool {
 // `mtp_sparse_accept_enabled()` directly.
 #[cfg(not(test))]
 #[inline]
-fn sparse_accept_gate() -> bool {
+pub(crate) fn sparse_accept_gate() -> bool {
     mtp_sparse_accept_enabled()
 }
 
@@ -376,7 +376,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn sparse_accept_gate() -> bool {
+pub(crate) fn sparse_accept_gate() -> bool {
     TEST_FORCE_SPARSE_ACCEPT
         .with(std::cell::Cell::get)
         .unwrap_or_else(mtp_sparse_accept_enabled)
@@ -505,7 +505,7 @@ fn mtp_draft_top_k_override() -> Option<i32> {
     *CACHE.get_or_init(|| parse_env_i32("MLX_MTP_DRAFT_TOP_K"))
 }
 
-fn mtp_draft_sampling_config(
+pub(crate) fn mtp_draft_sampling_config(
     target: crate::sampling::SamplingConfig,
 ) -> crate::sampling::SamplingConfig {
     let mut draft = target;
@@ -560,11 +560,11 @@ fn trace_json_f64(value: f64) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
-fn trace_acceptance_emit(payload: serde_json::Value) {
+pub(crate) fn trace_acceptance_emit(payload: serde_json::Value) {
     eprintln!("MTP_TRACE_ACCEPTANCE {}", payload);
 }
 
-fn trace_acceptance_greedy(
+pub(crate) fn trace_acceptance_greedy(
     depth: usize,
     slot: usize,
     token_history_len: usize,
@@ -603,7 +603,7 @@ fn trace_acceptance_greedy(
     }));
 }
 
-fn trace_acceptance_sparse(
+pub(crate) fn trace_acceptance_sparse(
     path: &'static str,
     depth: usize,
     slot: usize,
@@ -647,7 +647,7 @@ fn trace_acceptance_sparse(
     }));
 }
 
-fn trace_acceptance_dense(
+pub(crate) fn trace_acceptance_dense(
     depth: usize,
     slot: usize,
     token_history_len: usize,
