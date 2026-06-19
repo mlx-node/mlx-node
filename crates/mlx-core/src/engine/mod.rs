@@ -20,6 +20,7 @@ pub(crate) mod penalties;
 pub(crate) mod persistence;
 pub(crate) mod session;
 pub mod types;
+pub(crate) mod vision;
 
 // Flat re-exports of the focused submodules' items so family code and
 // engine-internal callers can import everything through a single

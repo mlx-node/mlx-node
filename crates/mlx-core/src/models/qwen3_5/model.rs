@@ -36,6 +36,7 @@ use super::persistence;
 use super::processing::Qwen35VLImageProcessor;
 use super::vision::Qwen3_5VisionEncoder;
 use crate::engine;
+use crate::engine::vision::{VisionMerge, run_vlm_prefill_layers};
 use crate::engine::{
     apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
     finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
@@ -8604,7 +8605,7 @@ fn vlm_prefill(
 ) -> Result<(MxArray, i64)> {
     use crate::array::clear_cache;
 
-    let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
+    let merge = vlm_prepare_vision_features(
         input_ids,
         image_cache_key,
         pre_processed,
@@ -8632,19 +8633,8 @@ fn vlm_prefill(
     let logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
 
-        let mut h = inputs_embeds.clone();
-
-        // No explicit mask — Qwen3_5Attention uses "causal" SDPA mode
-        let num_layers = layers_guard.len();
-        for i in 0..num_layers {
-            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            let layer_pos = if layers_guard[i].is_linear() {
-                None
-            } else {
-                Some(&position_ids)
-            };
-            h = layers_guard[i].forward(&h, None, cache, layer_pos, true)?;
-        }
+        // Dense relies on Qwen3_5Attention's internal "causal" SDPA → no mask.
+        let h = run_vlm_prefill_layers(layers_guard, caches_guard, &merge, None)?;
 
         let h = final_norm_guard.forward(&h)?;
         let logits = match lm_head_guard {
@@ -8673,7 +8663,7 @@ fn vlm_prefill(
     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
     let last_logits = last_logits.squeeze(Some(&[1]))?;
 
-    Ok((last_logits, rope_deltas))
+    Ok((last_logits, merge.rope_deltas))
 }
 
 /// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,
@@ -8691,7 +8681,7 @@ pub(crate) fn vlm_prepare_vision_features(
     text_model_embedding: &MxArray,
     generation_stream: Stream,
     vision_cache: &VisionCache,
-) -> Result<(MxArray, MxArray, i64)> {
+) -> Result<VisionMerge> {
     // === STEP 1: Compute vision features (with hash cache) ===
     let combined_hash = image_cache_key;
 
@@ -8772,7 +8762,11 @@ pub(crate) fn vlm_prepare_vision_features(
         rope_deltas
     );
 
-    Ok((inputs_embeds, position_ids, rope_deltas))
+    Ok(VisionMerge {
+        inputs_embeds,
+        position_ids,
+        rope_deltas,
+    })
 }
 
 #[cfg(test)]

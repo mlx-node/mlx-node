@@ -38,6 +38,7 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
+use crate::engine::vision::run_vlm_prefill_layers;
 use crate::engine::{
     apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
     finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
@@ -7135,7 +7136,7 @@ fn vlm_prefill_moe(
 ) -> Result<(MxArray, i64)> {
     use crate::array::clear_cache;
 
-    let (inputs_embeds, position_ids, rope_deltas) = vlm_prepare_vision_features(
+    let merge = vlm_prepare_vision_features(
         input_ids,
         image_cache_key,
         pre_processed,
@@ -7151,9 +7152,9 @@ fn vlm_prefill_moe(
     let logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
 
-        let mut h = inputs_embeds.clone();
-        let seq_len = h.shape_at(1)?;
-
+        // MoE's interleaved full-attention layers need an explicit causal mask
+        // (unlike dense, which uses the attention layer's internal causal SDPA).
+        let seq_len = merge.inputs_embeds.shape_at(1)?;
         let fa_mask = if seq_len > 1 {
             let offset = caches_guard
                 .as_ref()
@@ -7164,21 +7165,7 @@ fn vlm_prefill_moe(
             None
         };
 
-        let num_layers = layers_guard.len();
-        for i in 0..num_layers {
-            let mask = if layers_guard[i].is_linear() {
-                None
-            } else {
-                fa_mask.as_ref()
-            };
-            let cache = caches_guard.as_mut().map(|c| &mut c[i]);
-            let layer_pos = if layers_guard[i].is_linear() {
-                None
-            } else {
-                Some(&position_ids)
-            };
-            h = layers_guard[i].forward(&h, mask, cache, layer_pos, true)?;
-        }
+        let h = run_vlm_prefill_layers(layers_guard, caches_guard, &merge, fa_mask.as_ref())?;
 
         let h = final_norm_guard.forward(&h)?;
         let logits = match lm_head_guard {
@@ -7210,7 +7197,7 @@ fn vlm_prefill_moe(
     let seq_len = logits.shape_at(1)?;
     let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
     let last_logits = last_logits.squeeze(Some(&[1]))?;
-    Ok((last_logits, rope_deltas))
+    Ok((last_logits, merge.rope_deltas))
 }
 
 #[cfg(test)]
