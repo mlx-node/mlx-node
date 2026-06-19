@@ -12,12 +12,15 @@
 //! `&mut self` borrow model compile and are usable. Nothing in production
 //! calls this module yet, so the families' MTP behavior is byte-identical.
 
+use std::time::Instant;
+
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
-use crate::engine::backend::MtpStepper;
+use crate::decode_profiler::DecodeProfiler;
+use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::params::ChatParams;
-use crate::engine::penalties::apply_all_penalties;
+use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::qwen3_5::mtp_decode::{
     MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_batch_target_arrays_enabled,
     mtp_defer_verify_hidden_eval, mtp_draft_sampling_config, mtp_greedy_argmax_only_verify_enabled,
@@ -27,6 +30,7 @@ use crate::models::qwen3_5::mtp_decode::{
     trace_acceptance_sparse,
 };
 use crate::sampling;
+use crate::stream::Stream;
 
 use crate::engine::decode::{mtp_trace_logits, trace_top2};
 
@@ -1041,6 +1045,793 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     ))
 }
 
+/// Required arguments of [`run_mtp_turn`] — the MTP analog of
+/// [`crate::engine::decode::DecodeLoopArgs`]. Every field is the macro
+/// parameter of the SAME name in `decode_loop_mtp!`; the turn-constant
+/// `embedding_weight` + the per-cycle scratch live on the
+/// [`MtpStepper`] (captured at `begin_mtp_decode`), so they are NOT here.
+///
+/// `#[allow(dead_code)]`: SCAFFOLD — nothing in production calls
+/// [`run_mtp_turn`] yet (the family steppers + the rewire land in a later
+/// step), so the relocated loop is byte-identical dead code.
+#[allow(dead_code)]
+pub(crate) struct MtpTurnArgs<'a> {
+    /// First generated token (sampled from the prefill logits BEFORE the
+    /// turn). The loop takes ownership; its final reassignment is not
+    /// observed by callers (== the macro's `y`).
+    pub y: MxArray,
+    /// Requested draft depth for this turn (`params.mtp_depth`) — the
+    /// macro's `mtp_depth`. The stepper still applies its intra-cycle
+    /// adaptive/EV gates on top.
+    pub depth: usize,
+    pub params: &'a ChatParams,
+    pub reasoning_tracker: &'a mut ReasoningTracker,
+    pub profiler: &'a mut DecodeProfiler,
+    pub max_new_tokens: i32,
+    pub eos_id: u32,
+    pub generated_tokens: &'a mut Vec<u32>,
+    pub token_history: &'a mut Vec<u32>,
+    pub finish_reason: &'a mut String,
+    pub first_token_instant: &'a mut Option<Instant>,
+    pub report_perf: bool,
+    pub generation_stream: Stream,
+}
+
+/// Terminal outs of [`run_mtp_turn`] the caller threads into its save /
+/// next-turn bookkeeping — the engine-owned surfaces of the two
+/// side-channels the family code reads AFTER the `decode_loop_mtp!` macro
+/// today (`last_in_cache` and the `mtp_desynced` cell).
+///
+/// `#[allow(dead_code)]`: SCAFFOLD — produced only by the dead
+/// [`run_mtp_turn`] / the module's mock tests until the family rewire.
+#[allow(dead_code)]
+pub(crate) struct MtpTurnOutcome {
+    /// Whether the LAST emitted token's K/V is already in the physical
+    /// cache. The save uses `drop_last_always = !last_in_cache` (the
+    /// 90128bfd unforwarded-boundary rule). == the macro's
+    /// `last_in_cache` ident at loop exit.
+    pub last_in_cache: bool,
+    /// Whether a mid-cycle stop left the FLAT caches desynced
+    /// (`rollback_unemitted` with `unemitted > 0`). Flat / MoE set it;
+    /// the paged stepper's [`MtpStepper::into_desynced`] MUST return
+    /// `false`. The caller propagates it into
+    /// `self.flat_mtp_caches_desynced` exactly as the post-macro code does.
+    pub desynced: bool,
+}
+
+/// Engine-owned MTP propose/verify whole-turn loop — the relocated SYNC
+/// (non-streaming) body of `decode_loop_mtp!`, generic over
+/// [`MtpBackend`]. The MTP analog of
+/// [`crate::engine::decode::run_decode_loop`].
+///
+/// Calls [`MtpBackend::begin_mtp_decode`] to build the per-turn stepper,
+/// then drives the relocated outer loop: the initial-`y` emit, Step A vs.
+/// chained-hidden routing, [`run_mtp_cycle`] per cycle, the per-token emit
+/// loop, and the mid-cycle-stop `rollback_unemitted`. Returns the
+/// [`MtpTurnOutcome`] (`last_in_cache` + `desynced`) AND surfaces any
+/// full-accept GDN tape-replay error stashed by the infallible
+/// [`MtpStepper::rollback`] via [`MtpStepper::take_replay_error`] after the
+/// loop — the two side-channels the family code reads after the macro
+/// today.
+///
+/// VERBATIM, mechanical relocation of the macro's SYNC arm: every
+/// surrounding line (the initial-`y` emit, the `max_as_usize` negative
+/// clamp, all stop checks, the `do_step_a` routing, the chained_hidden
+/// stash/drain, the adaptive/EV depth pick + near-tail cap, the per-token
+/// emit loop with `observe`/force-end + every-256-token cache clear, the
+/// `last_in_cache` bookkeeping at the 3 break sites, and the
+/// `eval_step_with_chained_hidden` fused chained eval at the iteration
+/// boundary) is byte-for-byte identical in logic and ORDER, swapping the
+/// macro's `$mtp.<closure>` for `step.<method>` and
+/// `run_mtp_cycle_inner(&mut $mtp, ..)` for `run_mtp_cycle(step, ..)`.
+///
+/// The macro→method swaps (the ONLY substantive change vs the original
+/// body):
+///   * `($mtp.forward_with_hidden)(ids, emb)` → `step.forward_with_hidden(ids, emb)`
+///   * `($mtp.eval_step)(t, l, b)` → `step.eval_step(t, l, b)`
+///   * `($mtp.begin_cycle)(c)` → `step.begin_cycle(c)`
+///   * `$mtp.committed_history_active` (field) → `step.committed_history_active()`
+///   * `($mtp.eval_step_with_chained_hidden)(y, h)` → `step.eval_step_with_chained_hidden(y, h)`
+///   * `($mtp.rollback_unemitted)(u)` → `step.rollback_unemitted(u)`
+///   * `run_mtp_cycle_inner(&mut $mtp, ..)` → `run_mtp_cycle(step, ..)`
+///
+/// The post-loop `replay_err_cell` / `mtp_desynced` reads become the
+/// engine-owned `step.take_replay_error()?` / `step.into_desynced()` outs.
+///
+/// SCAFFOLD STEP (S2a): the SYNC path only — the streaming sub-block
+/// (`decode_loop_mtp!`'s `$(, streaming: {...})?` arm) lands in a later
+/// step via an optional streaming sink. DEAD CODE: nothing in production
+/// drives it yet, so the families' MTP behavior is byte-identical.
+#[allow(dead_code)]
+pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
+    backend: &mut B,
+    rng: &mut R,
+    args: MtpTurnArgs<'_>,
+) -> Result<MtpTurnOutcome> {
+    let MtpTurnArgs {
+        mut y,
+        depth,
+        params: p,
+        reasoning_tracker: tracker,
+        profiler,
+        max_new_tokens: max,
+        eos_id,
+        generated_tokens: generated,
+        token_history: hist,
+        finish_reason: reason,
+        first_token_instant: first_tok,
+        report_perf: report,
+        generation_stream,
+    } = args;
+
+    // The turn-constant embedding weight + the requested depth + the
+    // per-cycle scratch are captured into the stepper at `begin_mtp_decode`
+    // (the analog of `begin_paged_decode`). The macro threaded
+    // `embedding_weight` as `$emb`; the stepper now owns it and exposes it
+    // via `embedding_weight()`. Read once at turn entry.
+    let setup = MtpTurnSetup {
+        params: p,
+        is_delta: false,
+        depth,
+    };
+    let mut step = backend.begin_mtp_decode(&setup)?;
+    // Turn-entry reads the engine takes over from the macro/family wiring:
+    // the profiler relabel (mirrors `DecodeStep::profiler_relabel`) and the
+    // owned embedding-weight handle the macro passed as `$emb`.
+    if let Some(label) = step.profiler_relabel() {
+        profiler.set_label(label);
+    }
+    let emb = step.embedding_weight().clone();
+
+    // `last_in_cache` is owned by the loop here (the macro mutated the
+    // caller's `$last_in_cache` ident in place) and returned in the
+    // outcome. Default `true`: a clean length/EOS exit on a forwarded
+    // token keeps the boundary token in cache.
+    let mut last_in_cache = true;
+
+    // Emit the FIRST token via a normal main-path forward+hidden.
+    // The MTP loop needs an established last-committed token AND
+    // its post-final-norm hidden state to seed the first draft.
+    // After this initial forward, `prev_hidden` / `prev_emb`
+    // carry the seed for the next cycle.
+    let mut prev_hidden_opt: Option<MxArray>;
+    let mut prev_emb_opt: Option<MxArray>;
+    let mut last_committed_id_opt: Option<u32>;
+
+    // Chained-cycle state. `run_mtp_cycle` slices
+    // `verify_hiddens[:, K, :]` and returns it; we stash that
+    // `[1, 1, hidden]` here so the NEXT outer iteration can skip
+    // Step A's ~150 ms main-model forward and feed the chained
+    // hidden directly into the cycle's first MTP draft.
+    //
+    // K = number of accepted drafts this cycle. Semantics:
+    // `verify_hiddens[K]` is the prediction context for the
+    // committed token at position K+1 (bonus on full-accept,
+    // residual on rejection) — i.e. for the LAST emitted token of
+    // this cycle. The next cycle's MTP draft is therefore
+    // `MTP(prev_hidden=verify_hiddens[K], prev_emb=embed(y)) ->
+    // next-next logits`, matching the head's training contract.
+    //
+    // Chaining is GPU-gen-gated (default ON M5+, OFF M1–M4); override
+    // with `MLX_MTP_CHAINED_CYCLES=0/1`. The position-K slice makes it
+    // SEMANTICALLY correct — byte-exact T=0 parity holds in both modes.
+    //
+    // Invariants:
+    //   - `None` on the FIRST iteration (no prior verify) — Step A
+    //     runs unconditionally and re-seeds the hidden from a real
+    //     main forward.
+    //   - `None` when forced-think-end fires — that path needs Step
+    //     A's forward to write `y`'s K/V before injecting the
+    //     forced token. (See the force-end branch below.)
+    //   - `Some(hidden)` after every successful cycle, to be drained
+    //     by the NEXT iteration before its cycle runs.
+    //
+    // The hidden is a lazy MLX array referencing the verify's
+    // position-K `final_norm` graph node; the eager verify step
+    // returns it alongside the verify logits, and it stays alive
+    // for the rest of the decode loop as long as the cycle holds it.
+    let chained_cycles_enabled: bool =
+        crate::models::qwen3_5::mtp_decode::mtp_chained_cycles_enabled();
+    let mut chained_hidden_opt: Option<MxArray> = None;
+
+    // Adaptive MTP depth policy. When `mtp_adaptive_depth` is true
+    // (explicit opt-in from ChatConfig), the policy picks the
+    // per-cycle draft depth from a per-depth EMA of
+    // `accepted_tokens / cycle_wall_ns` plus a DFlash-style 3-state
+    // machine (`full | reduced | probe`). When false, the policy is
+    // constructed but `pick_depth()` returns `p.mtp_depth` on every
+    // call (no transitions ever fire because `record_cycle` is gated
+    // below).
+    //
+    // The eager MTP verify forward builds its graph per cycle from
+    // the live depth, so swinging the depth freely between cycles
+    // carries no extra setup cost.
+    let mut mtp_depth_policy = crate::models::qwen3_5::adaptive_depth::AdaptiveDepthPolicy::new(
+        depth.min(u8::MAX as usize) as u8,
+    );
+    let mtp_adaptive_depth_mode =
+        crate::models::qwen3_5::adaptive_depth::adaptive_depth_mode_from_env();
+    let mut mtp_ev_depth_policy =
+        crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy::new(
+            depth.min(u8::MAX as usize) as u8,
+        );
+
+    // Track cycles for the every-256-emitted-token cache clear.
+    // We use the running `generated.len()` rather than a separate step
+    // counter so MTP and non-MTP loops stay byte-equivalent on
+    // the cache-clear cadence.
+    let mut last_clear_at: usize = generated.len();
+
+    // PARITY-FIX (budget): `max` is the raw `max_new_tokens: i32`
+    // with no upstream clamp on the chat/MTP path, so it can be `0`
+    // or NEGATIVE (reachable via `ChatConfig.maxNewTokens` and
+    // `/v1/responses` `max_output_tokens`). AR's `decode_loop!` uses
+    // `for step in 0..max` — an empty range for `max <= 0` — and
+    // therefore emits 0 tokens. The MTP loop below compares
+    // `generated.len()` against the budget via `as usize`; a NEGATIVE
+    // `max` would wrap to a huge `usize` and never trip the length
+    // cap (effectively unbounded). Clamp negatives to 0 ONCE here
+    // and use this value for every budget comparison so MTP matches
+    // AR's "0 new tokens for a nonpositive budget" semantics. For
+    // `max >= 1` this is numerically identical to `(max as usize)`
+    // ⇒ byte-for-byte identical behavior for valid budgets.
+    let max_as_usize: usize = (max).max(0) as usize;
+
+    // PARITY-FIX: emit the initial `y` (sampled from the prefill's
+    // last logits BEFORE this loop was entered) before Step A's
+    // first iteration. AR's `decode_loop!` macro emits its input
+    // `y` at the top of each iteration; MTP's Step A only emits
+    // the SAMPLED next token, which means the very first token of
+    // the generation (the prefill's seed sample) never reached
+    // `gen`. Without this push MTP's output is the AR output
+    // shifted left by one token. We mirror the per-token bookkeeping
+    // Step A does (eval, tracker.observe_token, profiler) so the
+    // initial token participates identically. The stop checks (EOS,
+    // length, cancel, repetition) run at the top of the loop body
+    // below — they read `gen` so the initial push is visible.
+    //
+    // Guarded on the budget: at entry `gen` holds only
+    // generated tokens (0 here), so `generated.len() < max_as_usize` is
+    // `0 < 0 == false` when `max <= 0` ⇒ NO initial push, matching
+    // AR. For `max >= 1` the guard is `0 < max` (true) ⇒ the push
+    // runs exactly as before.
+    if generated.len() < max_as_usize {
+        let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
+        profiler.begin("extract");
+        y.eval();
+        let initial_token_id = y.item_at_int32(0)? as u32;
+        profiler.end();
+        profiler.mark_first_token();
+        if report && first_tok.is_none() {
+            *first_tok = Some(std::time::Instant::now());
+        }
+        generated.push(initial_token_id);
+        hist.push(initial_token_id);
+        let _is_reasoning = tracker.observe_token(initial_token_id);
+        profiler.step();
+    }
+
+    loop {
+        // Zero budget (nonpositive clamped to 0): AR's `for step in 0..max`
+        // never iterates and never observes cancel/EOS/repetition, so its
+        // finish_reason stays "length". `max_as_usize` is loop-invariant, so
+        // for any budget >= 1 this is a dead branch (no behavior change);
+        // only a 0 budget short-circuits here, before the cancelled check.
+        if max_as_usize == 0 {
+            if reason.is_empty() {
+                *reason = String::from("length");
+            }
+            break;
+        }
+        // PARITY-FIX: re-check the same stop conditions Step A
+        // uses, BEFORE the forward, so the initial push (above)
+        // and any prior-iteration push that landed us on a stop
+        // condition exit cleanly without one more forward.
+        if let Some(&last) = generated.last()
+            && (last == eos_id || p.extra_eos_ids.contains(&last))
+        {
+            *reason = String::from("stop");
+            // This pre-forward re-check fires on the initial seed (or a
+            // prior-iteration token) BEFORE any forward consumed it, so
+            // the stop token is not yet in the physical cache.
+            last_in_cache = false;
+            break;
+        }
+        if let Some(reason_str) = crate::sampling::check_repetition_cutoff(
+            generated,
+            p.max_consecutive_tokens,
+            p.max_ngram_repeats,
+            p.ngram_size,
+        ) {
+            *reason = reason_str.to_string();
+            last_in_cache = false;
+            break;
+        }
+        if generated.len() >= max_as_usize {
+            if reason.is_empty() {
+                *reason = String::from("length");
+            }
+            break;
+        }
+
+        // ---- Step A vs. chained-hidden decision. ------------------
+        // When chained cycles are enabled (`chained_cycles_enabled`,
+        // GPU-generation-gated: default ON on M5+/gen>=17, OFF on
+        // M1–M4; override via `MLX_MTP_CHAINED_CYCLES=0/1`): skip
+        // Step A's full main-model forward when a chained verify
+        // hidden is available from the prior cycle, unless the
+        // tracker is about to force a think-end token (the
+        // forced-token path needs Step A to forward `y` so its K/V
+        // is committed before we inject the forced token). The gate
+        // is a non-consuming `force_think_end_pending()` peek so the
+        // pending flag survives into Step A's single consume below.
+        //
+        // When chained cycles are disabled (M1–M4 default, or
+        // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, byte-exact with
+        // the non-chained path. On M1–M4 the chained path still
+        // regresses depth-3 acceptance (a lazy-slice eval-scheduling
+        // stall), see the comment block at the top of
+        // `decode_loop_mtp!` for details.
+        //
+        // On the chained path the prior cycle's verify already
+        // committed all accepted tokens' K/V, and the next cycle's
+        // verify will write `y`'s K/V at its position-0 input.
+        // The MTP draft seeds from `chained_hidden_opt`
+        // (`verify_hiddens[K]` — the prediction context for the
+        // committed token at position K+1, i.e. y itself). T=0
+        // parity is preserved because verify (= main model) is the
+        // ground truth and at T=0 the residual-sampler picks the
+        // same token regardless of draft accuracy.
+        let do_step_a = !chained_cycles_enabled
+            || chained_hidden_opt.is_none()
+            || tracker.force_think_end_pending();
+        let cycle_seed_was_chained = !do_step_a;
+
+        let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
+
+        if do_step_a {
+            profiler.begin("forward");
+            let next_ids = y.reshape(&[1, 1])?;
+            let (mut logits, hidden, needs_squeeze) = step.forward_with_hidden(&next_ids, &emb)?;
+            if needs_squeeze {
+                logits = logits.squeeze(Some(&[1]))?;
+            }
+            profiler.end();
+
+            let (next_token, budget_forced) = if tracker.should_force_think_end() {
+                let forced_id = tracker.forced_token_id()? as i32;
+                tracing::debug!(
+                    target: "mlx_core::mtp",
+                    forced_id,
+                    "MTP Step A: forcing think-end token (reasoning budget tripped)"
+                );
+                (MxArray::from_int32(&[forced_id], &[1])?, true)
+            } else {
+                profiler.begin("rep_penalty");
+                logits = apply_all_penalties(logits, hist, p)?;
+                profiler.end();
+
+                profiler.begin("sample");
+                let t = crate::sampling::sample(&logits, p.sampling_config)?;
+                profiler.end();
+                (t, false)
+            };
+
+            profiler.begin("eval_caches");
+            step.eval_step(&next_token, &logits, budget_forced);
+            profiler.end();
+
+            profiler.begin("eval_token");
+            next_token.eval();
+            profiler.end();
+
+            profiler.begin("extract");
+            let token_id = next_token.item_at_int32(0)? as u32;
+            profiler.end();
+            profiler.mark_first_token();
+            if report && first_tok.is_none() {
+                *first_tok = Some(std::time::Instant::now());
+            }
+
+            generated.push(token_id);
+            hist.push(token_id);
+            let _is_reasoning = tracker.observe_token(token_id);
+
+            if token_id == eos_id || p.extra_eos_ids.contains(&token_id) {
+                *reason = String::from("stop");
+                // Step A's sampled token only becomes the next `y` and is
+                // forwarded on the NEXT iteration, so it is not yet in the
+                // physical cache when we stop here.
+                last_in_cache = false;
+                break;
+            }
+            if let Some(reason_str) = crate::sampling::check_repetition_cutoff(
+                generated,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                *reason = reason_str.to_string();
+                last_in_cache = false;
+                break;
+            }
+            if generated.len() >= max_as_usize {
+                if reason.is_empty() {
+                    *reason = String::from("length");
+                }
+                break;
+            }
+
+            // Seed for MTP cycles using the hidden returned from this
+            // forward. `hidden` is `[1, hidden_size]`; reshape to
+            // `[1, 1, hidden]` for the draft FFI's `[B, T, hidden]`
+            // contract.
+            let hidden_dim = hidden.shape_at(1)?;
+            prev_hidden_opt = Some(hidden.reshape(&[1, 1, hidden_dim])?);
+            // prev_emb is the embedding of the JUST-emitted token.
+            let id_arr = MxArray::from_int32(&[token_id as i32], &[1])?;
+            let emb_2d = emb.take(&id_arr, 0)?;
+            let h = emb_2d.shape_at(1)?;
+            prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
+            last_committed_id_opt = Some(token_id);
+            y = next_token;
+        } else {
+            // ---- Chained path: skip Step A entirely. --------------
+            // `y` already holds the prior cycle's last accepted
+            // token (set by that cycle's tail update). That token
+            // has already been pushed to `gen` / `hist` /
+            // `tracker` AND streamed to the callback. Its K/V will
+            // be written by THIS cycle's verify at position 0.
+            //
+            // We just need to seed the cycle's MTP draft inputs
+            // from the chained hidden and the embedding of `y`.
+            let chained_h = chained_hidden_opt.take().ok_or_else(|| {
+                napi::Error::from_reason(
+                    "chained_hidden_opt is Some on the chained path \
+                     (guarded by do_step_a)",
+                )
+            })?;
+            // `run_mtp_cycle` already sliced the K-th
+            // position out of the verify hiddens, so `chained_h`
+            // arrives shaped `[1, 1, hidden]` — the same shape the
+            // draft FFI's `[B, T, hidden]` contract expects, no
+            // reshape needed.
+            prev_hidden_opt = Some(chained_h);
+
+            // Read `y`'s id without re-evaluating it; the prior
+            // cycle tail already ran `MxArray::from_int32(...)` to
+            // produce a fully materialised `[1]` int32 array, so
+            // `item_at_int32(0)` here is a CPU-only read.
+            y.eval();
+            let token_id = y.item_at_int32(0)? as u32;
+
+            let id_arr = MxArray::from_int32(&[token_id as i32], &[1])?;
+            let emb_2d = emb.take(&id_arr, 0)?;
+            let h = emb_2d.shape_at(1)?;
+            prev_emb_opt = Some(emb_2d.reshape(&[1, 1, h])?);
+            last_committed_id_opt = Some(token_id);
+            // Note: no `y =` assignment — `y` is already correct.
+            // No tracker.observe_token / no generated.push / no callback —
+            // the prior cycle's emit loop already handled all of
+            // that for the same `token_id`.
+        }
+        profiler.step();
+
+        // ---- Step B: ONE MTP draft+verify cycle. -------------------
+        // On the chained path the prior verify already committed
+        // bonus/residual; this cycle's verify writes the chained
+        // `y`'s K/V at position 0 and extends the prefix by D more
+        // drafts. On full accept per cycle we emit D+1 tokens for
+        // D draft steps + 1 verify (one fewer main forward when
+        // chaining).
+        if generated.len() >= max_as_usize {
+            if reason.is_empty() {
+                *reason = String::from("length");
+            }
+            break;
+        }
+        if tracker.force_think_end_pending() {
+            // Budget tripped during Step A's observe (after Step A's
+            // consume) — defer the forced token to the NEXT cycle's
+            // Step A. This is a NON-consuming peek: the flag stays set,
+            // so next cycle's routing peek (`do_step_a`) forces Step A
+            // and the single consuming call there emits `</think>`.
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                "MTP cycle skipped: think-end queued, deferring to next Step A"
+            );
+            continue;
+        }
+
+        let prev_h = prev_hidden_opt.take().ok_or_else(|| {
+            napi::Error::from_reason("prev_hidden seeded by Step A or chained path")
+        })?;
+        let prev_e = prev_emb_opt
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("prev_emb seeded by Step A or chained path"))?;
+        let last_id = last_committed_id_opt.ok_or_else(|| {
+            napi::Error::from_reason("last_committed seeded by Step A or chained path")
+        })?;
+        // Re-anchor the MTP cache to the main path's CURRENT offset
+        // before launching this cycle's drafts. On the Step-A path
+        // the main offset has
+        // advanced by 1 (Step A's forward) + the prior cycle's
+        // verify advancement. On the chained path the main offset
+        // has only advanced by the prior cycle's verify (Step A
+        // was skipped). EITHER way, this resets the MTP K/V and
+        // sets the MTP offset = current main offset, which is
+        // exactly the contract `begin_cycle` is documented to
+        // honour. Without it the MTP draft RoPE positions diverge
+        // and drafts produce gibberish.
+        // The `begin_cycle` hook emits its own
+        // `mlx_core::mtp` trace (old/new MTP offset) — it is the
+        // only site that knows the dense-vs-MoE offset getters.
+        step.begin_cycle(cycle_seed_was_chained && step.committed_history_active());
+        // Per-cycle depth selection. When adaptive is OFF,
+        // `pick_depth()` returns the seed depth unchanged
+        // (`record_cycle` is gated below). When adaptive is ON, the
+        // policy hill-climbs across depth-EMA + manages the
+        // `full | reduced | probe` state machine.
+        let cycle_depth: usize = if p.mtp_adaptive_depth {
+            match mtp_adaptive_depth_mode {
+                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::Throughput => {
+                    mtp_depth_policy.pick_depth() as usize
+                }
+                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::ExpectedValue => {
+                    mtp_ev_depth_policy.max_depth() as usize
+                }
+            }
+        } else {
+            depth
+        };
+        // Near-tail budget cap. The compiled verify writes `depth+1`
+        // target-cache slots BEFORE the post-verify truncation to
+        // `max_new_tokens`; when fewer than `depth+1` main-cache
+        // slots remain near the tail the write can overrun the
+        // rounded `max_kv_len` allocation. Cap the effective cycle
+        // depth so the verify never needs more main-cache slots than
+        // the remaining generation budget can absorb. `remaining` is
+        // `>= 1` here (the `generated.len() >= max` check above already
+        // broke the loop otherwise). With `effective_depth =
+        // remaining - 1` the verify writes exactly `remaining`
+        // slots and the cycle emits at most `remaining` tokens.
+        let remaining: usize = max_as_usize.saturating_sub(generated.len());
+        let cycle_depth: usize = cycle_depth.min(remaining.saturating_sub(1));
+        if cycle_depth < 1 {
+            // Only 1 token of budget left — an MTP cycle would
+            // draft+verify more tokens than can be emitted. Fall
+            // back to single-token AR decode: skip this cycle and
+            // let the next iteration's Step A emit the final token
+            // (its post-emit `generated.len() >= max` check then breaks
+            // the loop with reason "length"). `chained_hidden_opt`
+            // is still `None` here, so Step A runs unconditionally.
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                remaining,
+                "MTP cycle skipped near tail: AR-decoding the final token(s)"
+            );
+            continue;
+        }
+        profiler.begin("mtp_cycle");
+        let cycle_started_at = std::time::Instant::now();
+        let commit_anchor = if cycle_seed_was_chained && step.committed_history_active() {
+            MtpCommitAnchor::SkipAlreadyCommittedAnchor
+        } else {
+            MtpCommitAnchor::IncludeAnchor
+        };
+        let ev_depth_policy = if p.mtp_adaptive_depth
+            && matches!(
+                mtp_adaptive_depth_mode,
+                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::ExpectedValue
+            ) {
+            Some(&mut mtp_ev_depth_policy)
+        } else {
+            None
+        };
+        let cycle_res = run_mtp_cycle(
+            &mut step,
+            prev_h,
+            prev_e,
+            last_id,
+            &emb,
+            hist,
+            p,
+            rng,
+            profiler,
+            cycle_depth,
+            ev_depth_policy,
+            commit_anchor,
+        );
+        profiler.end();
+        // `run_mtp_cycle` returns the verify-final hidden so
+        // the NEXT outer iteration can skip Step A's ~150 ms
+        // main-model forward. We stash it into `chained_hidden_opt`;
+        // the iteration boundary's `do_step_a` check will drain it.
+        let (outcome, verify_last_hidden) = cycle_res?;
+        chained_hidden_opt = Some(verify_last_hidden);
+
+        // Throttled per-cycle MTP trace. Mirrors the AR loop's
+        // every-32-steps cadence in token-count units so MTP and
+        // AR runs leave comparable breadcrumb density.
+        if (generated.len() / 32) != ((generated.len() + outcome.tokens.len()) / 32) {
+            let first_tok_id = outcome.tokens.first().copied().unwrap_or(0);
+            tracing::info!(
+                "Qwen3.5 decode MTP cycle gen_len={} depth={} committed={} \
+                 first_tok={}",
+                generated.len(),
+                outcome.effective_depth,
+                outcome.tokens.len(),
+                first_tok_id,
+            );
+        }
+        // Feed observation to the policy AFTER the cycle's tokens
+        // have been counted but BEFORE the emit loop's stop checks
+        // (so the record always runs even on partial-emit due to
+        // EOS / length / cancel). `committed` is the number
+        // of tokens the cycle actually produced (drafts accepted +
+        // residual/bonus); range `[1, depth+1]`.
+        let cycle_wall_ns: u64 = cycle_started_at
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        let cycle_committed: u32 = outcome.tokens.len() as u32;
+        if p.mtp_adaptive_depth
+            && matches!(
+                mtp_adaptive_depth_mode,
+                crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::Throughput
+            )
+        {
+            mtp_depth_policy.record_cycle(crate::models::qwen3_5::adaptive_depth::CycleStats {
+                depth: outcome.effective_depth as u8,
+                committed: cycle_committed,
+                wall_ns: cycle_wall_ns,
+            });
+            tracing::debug!(
+                target: "mlx_core::mtp::adaptive",
+                state = mtp_depth_policy.state_label(),
+                depth = outcome.effective_depth,
+                requested_depth = outcome.requested_depth,
+                committed = cycle_committed,
+                wall_ms = (cycle_wall_ns as f64) / 1_000_000.0,
+                next_depth = mtp_depth_policy.pick_depth(),
+                "W6.8 cycle"
+            );
+        }
+
+        // Emit each accepted token through the same stop /
+        // streaming pipeline as the single-token loop.
+        let mut hit_stop = false;
+        let mut cycle_emitted: usize = 0;
+        profiler.begin("mtp_emit_loop");
+        for tok_id in outcome.tokens.iter().copied() {
+            if generated.len() >= max_as_usize {
+                if reason.is_empty() {
+                    *reason = String::from("length");
+                }
+                hit_stop = true;
+                break;
+            }
+            generated.push(tok_id);
+            hist.push(tok_id);
+            cycle_emitted += 1;
+            let _is_reasoning = tracker.observe_token(tok_id);
+            if tok_id == eos_id || p.extra_eos_ids.contains(&tok_id) {
+                *reason = String::from("stop");
+                hit_stop = true;
+                // The boundary (last) outcome token is forwarded only by the
+                // next cycle's Step A, so it is not yet in the physical cache.
+                last_in_cache = cycle_emitted < outcome.tokens.len();
+                break;
+            }
+            if let Some(reason_str) = crate::sampling::check_repetition_cutoff(
+                generated,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                *reason = reason_str.to_string();
+                hit_stop = true;
+                // The boundary (last) outcome token is forwarded only by the
+                // next cycle's Step A, so it is not yet in the physical cache.
+                last_in_cache = cycle_emitted < outcome.tokens.len();
+                break;
+            }
+        }
+        profiler.end();
+        tracing::debug!(
+            target: "mlx_core::mtp",
+            cycle_committed,
+            gen_len = generated.len(),
+            hit_stop,
+            cycle_emitted,
+            "MTP cycle emit loop done"
+        );
+
+        // Every-256-emitted-token cache clear (matches the
+        // single-token loop's cadence in token-count units).
+        if generated.len() >= last_clear_at + 256 {
+            crate::array::synchronize_and_clear_cache();
+            last_clear_at = generated.len();
+        }
+
+        if hit_stop {
+            let unemitted = outcome.tokens.len().saturating_sub(cycle_emitted);
+            if unemitted > 0 {
+                step.rollback_unemitted(unemitted);
+            }
+            break;
+        }
+        // Set `y` to the last accepted token so the next Step A
+        // feeds the right token through main-path forward.
+        // (Step A unconditionally re-seeds `prev_hidden_opt` /
+        // `prev_emb_opt` / `last_committed_id_opt`, so no explicit
+        // drain here.)
+        let last = *outcome
+            .tokens
+            .last()
+            .ok_or_else(|| napi::Error::from_reason("at least one accepted"))?
+            as i32;
+        y = MxArray::from_int32(&[last], &[1])?;
+
+        // When chaining IS enabled, flush the main path's KV-cache
+        // lazy graph BEFORE the next cycle starts AND fuse the
+        // chained `verify_hidden[K]` slice into the SAME `async_eval`
+        // batch as `(token, g_compiled_caches)`.
+        //
+        // A plain `eval_step(y, h, false)` here would leave the
+        // chained hidden LAZY across the iteration boundary (that
+        // helper ignores `h` unless `budget_forced`), so when the
+        // next cycle's `draft_step(...)` built its graph against
+        // `prev_hidden = chained_hidden`, materializing the slice
+        // forced a mid-cycle Metal command-buffer roundtrip that the
+        // Step-A bypass doesn't pay (Step A's `forward_with_hidden`
+        // returns `(logits, hidden)` as siblings of the same compiled
+        // forward and `eval_step` co-schedules them via
+        // `next_token → logits → hidden`).
+        //
+        // `eval_step_with_chained_hidden` extends the same dispatch
+        // to include the slice — so it becomes a sibling of
+        // `(token, caches)`, the kernel scheduler can overlap its
+        // materialization with the next cycle's draft graph
+        // construction, and the chained path stops paying the
+        // per-cycle roundtrip.
+        //
+        // On the Step-A path this whole branch is dead anyway:
+        // Step A's `eval_step` call at the top of the NEXT
+        // iteration handles the cache flush, and there is no
+        // chained hidden to fold. The branch is only entered when
+        // `chained_cycles_enabled=true` AND `chained_hidden_opt`
+        // is `Some(...)`.
+        if chained_cycles_enabled && let Some(ref h) = chained_hidden_opt {
+            step.eval_step_with_chained_hidden(&y, h);
+        }
+        profiler.step();
+    }
+
+    profiler.snapshot_memory_after();
+    profiler.report();
+
+    // Surface any GDN tape-replay error stashed by the infallible
+    // `rollback` on a FULL-accept cycle (the partial-accept path
+    // already surfaces it via `restore_and_replay_main`'s `?` inside
+    // `run_mtp_cycle`). Without this, a full-accept replay failure would
+    // be silently swallowed. == the macro callers' post-loop
+    // `replay_err_cell.borrow_mut().take()` check.
+    if let Some(e) = step.take_replay_error() {
+        return Err(e);
+    }
+
+    // `into_desynced` consumes the stepper; the caller threads the
+    // result into `self.flat_mtp_caches_desynced` exactly as the
+    // post-macro `mtp_desynced.get()` read does. Paged MUST return false.
+    let desynced = step.into_desynced();
+
+    Ok(MtpTurnOutcome {
+        last_in_cache,
+        desynced,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     //! `MtpStepper`-contract tests over a scripted mock — NO model, NO
@@ -1062,7 +1853,7 @@ mod tests {
     };
     use crate::sampling::SamplingConfig;
 
-    use super::run_mtp_cycle;
+    use super::{MtpTurnArgs, run_mtp_cycle, run_mtp_turn};
 
     /// One recorded `MtpStepper` call, tagged so a test can assert the
     /// exact propose/verify/commit/rollback ORDER (the analog of the paged
@@ -1130,6 +1921,17 @@ mod tests {
         // the real argmax/eval/slice math (no Metal model). `None` keeps the
         // tiny scalar returns the call-ledger unit tests use.
         cycle: Option<CycleScript>,
+        // ---- whole-turn driving (the `run_mtp_turn` integration path) ----
+        // When `Some`, `forward_with_hidden` (Step A) returns `[1, vocab]`
+        // logits with a scripted argmax AND each cycle's `draft_step` /
+        // `verify_step` read per-cycle argmaxes, so `run_mtp_turn` walks a
+        // fully deterministic multi-cycle propose/verify sequence with no
+        // Metal model. Mutually exclusive with `cycle` (turn wins if both).
+        turn: Option<TurnScript>,
+        // Optional ledger shared with the owning `MockMtpBackend` so the test
+        // can read the call sequence AFTER `run_mtp_turn` consumes the stepper
+        // via `into_desynced(self)`. `record` mirrors every call here too.
+        shared_ledger: Option<std::rc::Rc<RefCell<Vec<Call>>>>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -1150,6 +1952,38 @@ mod tests {
         next_draft: std::cell::Cell<usize>,
     }
 
+    /// Per-cycle argmax script for the whole-turn [`TurnScript`].
+    /// `draft_argmax[i]` is the i-th `draft_step`'s argmax; `verify_argmax[j]`
+    /// is `argmax(verify_logits[0, j, :])` (length `depth + 1`). The accept
+    /// loop then decides `verify_argmax[i] == draft_argmax[i]` per position
+    /// and reads `verify_argmax[depth]` as the full-accept bonus — exactly the
+    /// `CycleScript` contract, replayed once per cycle.
+    #[derive(Clone)]
+    struct CycleArgmax {
+        draft_argmax: Vec<i32>,
+        verify_argmax: Vec<i32>,
+    }
+
+    /// Whole-turn argmax script driving `run_mtp_turn` over the mock with no
+    /// Metal model.
+    ///
+    /// `step_a_tokens[n]` is the argmax of the n-th `forward_with_hidden`
+    /// (Step A) `[1, vocab]` logits — the token Step A samples and emits at
+    /// the top of outer iteration n. `cycles[c]` scripts cycle c's per-draft
+    /// and per-verify argmaxes; the cursor advances once per `verify_step`
+    /// (which marks the end of a cycle) and resets the in-cycle draft cursor.
+    /// Cursors that run past the end of their script repeat the last value for
+    /// Step A and yield argmax 0 for drafts so an over-long run stays defined.
+    struct TurnScript {
+        vocab: i64,
+        hidden: i64,
+        step_a_tokens: Vec<i32>,
+        cycles: Vec<CycleArgmax>,
+        fwd_cursor: std::cell::Cell<usize>,
+        cycle_cursor: std::cell::Cell<usize>,
+        draft_in_cycle: std::cell::Cell<usize>,
+    }
+
     impl MockMtpStepper {
         fn new() -> Self {
             Self {
@@ -1162,6 +1996,8 @@ mod tests {
                 has_argmax_only: false,
                 has_sparse: false,
                 cycle: None,
+                turn: None,
+                shared_ledger: None,
             }
         }
 
@@ -1188,7 +2024,35 @@ mod tests {
             s
         }
 
+        /// Build a whole-turn mock for the `run_mtp_turn` integration path.
+        /// `embedding_weight` is a `[vocab, hidden]` zero table; the script
+        /// drives Step A + every cycle deterministically.
+        fn with_turn(
+            vocab: i64,
+            hidden: i64,
+            step_a_tokens: Vec<i32>,
+            cycles: Vec<CycleArgmax>,
+        ) -> Self {
+            let mut s = Self::new();
+            s.emb =
+                MxArray::from_float32(&vec![0.0f32; (vocab * hidden) as usize], &[vocab, hidden])
+                    .expect("embedding_weight [vocab,hidden] construction is infallible");
+            s.turn = Some(TurnScript {
+                vocab,
+                hidden,
+                step_a_tokens,
+                cycles,
+                fwd_cursor: std::cell::Cell::new(0),
+                cycle_cursor: std::cell::Cell::new(0),
+                draft_in_cycle: std::cell::Cell::new(0),
+            });
+            s
+        }
+
         fn record(&self, c: Call) {
+            if let Some(shared) = self.shared_ledger.as_ref() {
+                shared.borrow_mut().push(c.clone());
+            }
             self.ledger.borrow_mut().push(c);
         }
 
@@ -1230,8 +2094,27 @@ mod tests {
             _emb: &MxArray,
         ) -> Result<(MxArray, MxArray, bool)> {
             self.record(Call::ForwardWithHidden);
-            // (logits [1,1], hidden [1,1], needs_squeeze) — eager shape.
-            Ok((lazy_scalar(0.0), lazy_scalar(0.0), true))
+            match self.turn.as_ref() {
+                Some(t) => {
+                    // Step A logits `[1, vocab]` whose argmax (the T=0 draw,
+                    // after the engine's `squeeze(axis=1)` on `needs_squeeze`)
+                    // is the scripted `step_a_tokens[n]`; the last entry
+                    // repeats once the script is exhausted. Hidden is
+                    // `[1, hidden]` (eager Step-A shape; the engine reshapes
+                    // it to `[1, 1, hidden]`).
+                    let n = t.fwd_cursor.get();
+                    t.fwd_cursor.set(n + 1);
+                    let idx = n.min(t.step_a_tokens.len().saturating_sub(1));
+                    let argmax_id = t.step_a_tokens.get(idx).copied().unwrap_or(0);
+                    let logits =
+                        MxArray::from_float32(&logits_row(t.vocab, argmax_id), &[1, 1, t.vocab])?;
+                    let hidden =
+                        MxArray::from_float32(&vec![0.0f32; t.hidden as usize], &[1, t.hidden])?;
+                    Ok((logits, hidden, true))
+                }
+                // (logits [1,1], hidden [1,1], needs_squeeze) — eager shape.
+                None => Ok((lazy_scalar(0.0), lazy_scalar(0.0), true)),
+            }
         }
 
         fn draft_step(
@@ -1240,6 +2123,23 @@ mod tests {
             _prev_emb: &MxArray,
         ) -> Result<(MxArray, MxArray)> {
             self.record(Call::DraftStep);
+            if let Some(t) = self.turn.as_ref() {
+                // h_next [1,1,hidden]; draft_logits [1,vocab] whose argmax (the
+                // T=0 draw) is the current cycle's scripted `draft_argmax[i]`.
+                let c_idx = t.cycle_cursor.get();
+                let i = t.draft_in_cycle.get();
+                t.draft_in_cycle.set(i + 1);
+                let argmax_id = t
+                    .cycles
+                    .get(c_idx)
+                    .and_then(|c| c.draft_argmax.get(i).copied())
+                    .unwrap_or(0);
+                let h_next =
+                    MxArray::from_float32(&vec![0.0f32; t.hidden as usize], &[1, 1, t.hidden])?;
+                let draft_logits =
+                    MxArray::from_float32(&logits_row(t.vocab, argmax_id), &[1, t.vocab])?;
+                return Ok((h_next, draft_logits));
+            }
             match self.cycle.as_ref() {
                 Some(c) => {
                     // h_next [1,1,hidden]; draft_logits [1,vocab] whose argmax
@@ -1264,6 +2164,32 @@ mod tests {
             depth: usize,
         ) -> Result<MtpVerifyOutput> {
             self.record(Call::VerifyStep { depth });
+            if let Some(t) = self.turn.as_ref() {
+                // logits [1, depth+1, vocab] with per-position argmax driven by
+                // the current cycle's `verify_argmax`; hiddens
+                // [1, depth+1, hidden]. `verify_step` marks the END of a cycle,
+                // so AFTER building the outputs advance the cycle cursor and
+                // reset the in-cycle draft cursor.
+                let c_idx = t.cycle_cursor.get();
+                let rows = depth + 1;
+                let mut flat: Vec<f32> = Vec::with_capacity(rows * t.vocab as usize);
+                for j in 0..rows {
+                    let argmax_id = t
+                        .cycles
+                        .get(c_idx)
+                        .and_then(|c| c.verify_argmax.get(j).copied())
+                        .unwrap_or(0);
+                    flat.extend(logits_row(t.vocab, argmax_id));
+                }
+                let logits = MxArray::from_float32(&flat, &[1, rows as i64, t.vocab])?;
+                let hiddens = MxArray::from_float32(
+                    &vec![0.0f32; rows * t.hidden as usize],
+                    &[1, rows as i64, t.hidden],
+                )?;
+                t.cycle_cursor.set(c_idx + 1);
+                t.draft_in_cycle.set(0);
+                return Ok(MtpVerifyOutput::logits_only(logits, hiddens));
+            }
             match self.cycle.as_ref() {
                 Some(c) => {
                     // logits [1, depth+1, vocab] with per-position argmax driven
@@ -1800,5 +2726,474 @@ mod tests {
             ],
             "reject cycle: drafts → snapshot → verify → commit → rollback → replay"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `run_mtp_turn` integration tests — DRIVE the relocated OUTER MTP loop
+    // end-to-end over a scripted `MockMtpBackend` (whose `begin_mtp_decode`
+    // hands back a turn-scripted `MockMtpStepper`). NO model, NO Metal. The
+    // mock argmaxes are fake, so the assertions are STRUCTURAL: the emitted
+    // token sequence, the finish_reason, the `last_in_cache` / `desynced`
+    // outs, and the `MtpStepper` call ledger (forward / begin_cycle / draft /
+    // snapshot / verify / commit / rollback / rollback_unemitted /
+    // take_replay_error / into_desynced) the engine drives.
+    //
+    // Chained cycles are forced OFF (`MLX_MTP_CHAINED_CYCLES=0`) so the loop
+    // runs its deterministic always-Step-A mode — the chained path is a
+    // GPU-gen-gated cross-cycle optimization whose ledger shape depends on
+    // host hardware, which would make these structural assertions flaky.
+    // -----------------------------------------------------------------------
+
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::engine::backend::{
+        ChatBackend, FinalizeArgs, MtpBackend, MtpTurnSetup, ResetScope, SaveStateArgs, TurnSetup,
+    };
+    use crate::engine::penalties::ReasoningTracker;
+    use crate::engine::types::ChatResult;
+    use crate::stream::{DeviceType, Stream};
+    use crate::tokenizer::Qwen3Tokenizer;
+
+    /// Serializes the `MLX_MTP_CHAINED_CYCLES` set + the `mtp_chained_cycles_enabled`
+    /// OnceLock read across the turn tests so the forced-OFF value is the one
+    /// that caches. The OnceLock has no in-process caller other than
+    /// `run_mtp_turn`, so a single deterministic "0" write before the first
+    /// `run_mtp_turn` of the binary pins it OFF for all three tests.
+    static CHAINED_OFF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Force chained cycles OFF for a turn test, returning the lock guard that
+    /// keeps the env write + the loop's `mtp_chained_cycles_enabled` read
+    /// serialized.
+    fn force_chained_off() -> std::sync::MutexGuard<'static, ()> {
+        let guard = CHAINED_OFF_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: the lock serializes this write with every other turn test's
+        // write + read; all write the SAME value, and no production code in
+        // the lib-test binary writes this var.
+        unsafe {
+            std::env::set_var("MLX_MTP_CHAINED_CYCLES", "0");
+        }
+        guard
+    }
+
+    /// A never-constructed [`DecodeStep`] so `MockMtpBackend` can satisfy the
+    /// `ChatBackend::Decode<'a>: DecodeStep` bound. `begin_decode` is never
+    /// called on the MTP path, so the methods are unreachable in practice —
+    /// they propagate an error instead of panicking (no `unreachable!`).
+    struct NeverDecode;
+    impl crate::engine::backend::DecodeStep for NeverDecode {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            Err(Error::from_reason("NeverDecode::forward must not run"))
+        }
+        fn eval_step(&mut self, _next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {}
+    }
+
+    /// Scripted [`MtpBackend`] for the `run_mtp_turn` integration tests. Holds
+    /// the turn script + the canned terminal outs; `begin_mtp_decode` builds a
+    /// fresh `MockMtpStepper` wired to the shared ledger so the test can read
+    /// the call sequence AFTER `run_mtp_turn` consumes the stepper.
+    struct MockMtpBackend {
+        vocab: i64,
+        hidden: i64,
+        step_a_tokens: Vec<i32>,
+        cycles: Vec<CycleArgmax>,
+        /// Canned [`MtpStepper::into_desynced`] terminal (paged MUST be false;
+        /// flat/MoE may set true on a mid-cycle stop).
+        desynced: bool,
+        /// Shared ledger the constructed stepper mirrors every call into.
+        ledger: Rc<RefCell<Vec<Call>>>,
+        /// Records that `begin_mtp_decode` ran exactly once.
+        begin_calls: std::cell::Cell<usize>,
+    }
+
+    impl MockMtpBackend {
+        fn new(
+            vocab: i64,
+            hidden: i64,
+            step_a_tokens: Vec<i32>,
+            cycles: Vec<CycleArgmax>,
+            desynced: bool,
+        ) -> Self {
+            Self {
+                vocab,
+                hidden,
+                step_a_tokens,
+                cycles,
+                desynced,
+                ledger: Rc::new(RefCell::new(Vec::new())),
+                begin_calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn ledger_snapshot(&self) -> Vec<Call> {
+            self.ledger.borrow().clone()
+        }
+    }
+
+    // Minimal `ChatBackend` surface — `run_mtp_turn` calls NONE of these (it
+    // only drives `begin_mtp_decode` + the `MtpStepper`), so the never-reached
+    // methods propagate an error instead of panicking.
+    impl ChatBackend for MockMtpBackend {
+        fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+            Err(Error::from_reason(
+                "MockMtpBackend::tokenizer must not run (run_mtp_turn never reads it)",
+            ))
+        }
+        fn family_name(&self) -> &'static str {
+            "mock_mtp"
+        }
+        fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+            Ok(u32::MAX)
+        }
+        fn cached_token_history(&self) -> &[u32] {
+            &[]
+        }
+        fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+            Ok(())
+        }
+        fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+            0
+        }
+        fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+        fn eval_caches(&self) -> Result<()> {
+            Ok(())
+        }
+        fn prefill(&mut self, _prompt_tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+            Err(Error::from_reason("MockMtpBackend::prefill must not run"))
+        }
+
+        type Decode<'a>
+            = NeverDecode
+        where
+            Self: 'a;
+
+        fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+            Err(Error::from_reason(
+                "MockMtpBackend::begin_decode must not run on the MTP path",
+            ))
+        }
+
+        fn finalize_turn(&self, _args: FinalizeArgs<'_>) -> Result<ChatResult> {
+            Err(Error::from_reason(
+                "MockMtpBackend::finalize_turn must not run (run_mtp_turn never finalizes)",
+            ))
+        }
+    }
+
+    impl MtpBackend for MockMtpBackend {
+        type MtpDecode<'a>
+            = MockMtpStepper
+        where
+            Self: 'a;
+
+        fn begin_mtp_decode(&mut self, _setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
+            self.begin_calls.set(self.begin_calls.get() + 1);
+            let mut step = MockMtpStepper::with_turn(
+                self.vocab,
+                self.hidden,
+                self.step_a_tokens.clone(),
+                self.cycles.clone(),
+            );
+            step.desynced = self.desynced;
+            step.shared_ledger = Some(Rc::clone(&self.ledger));
+            Ok(step)
+        }
+    }
+
+    struct TurnOut {
+        generated: Vec<u32>,
+        finish_reason: String,
+        last_in_cache: bool,
+        desynced: bool,
+        ledger: Vec<Call>,
+    }
+
+    /// Drive `run_mtp_turn` over the scripted backend with greedy T=0 params
+    /// (sparse-accept forced ON so the deterministic argmax branch runs). The
+    /// prefill seed `y` is `first_token`; `max_new_tokens` bounds the budget.
+    fn drive_turn(
+        backend: &mut MockMtpBackend,
+        first_token: u32,
+        max_new_tokens: i32,
+        eos_id: u32,
+        depth: usize,
+    ) -> TurnOut {
+        let _force_sparse = ForceSparseAcceptGuard::force(true);
+        let params = {
+            let mut p = greedy_params();
+            p.max_new_tokens = max_new_tokens;
+            p.mtp_depth = depth;
+            p
+        };
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_turn_test", "test");
+        let mut generated: Vec<u32> = Vec::new();
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant: Option<Instant> = None;
+        let mut rng = rand::rng();
+        let y = MxArray::from_int32(&[first_token as i32], &[1])
+            .unwrap_or_else(|e| panic!("y construction: {}", e.reason));
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let outcome = run_mtp_turn(
+            backend,
+            &mut rng,
+            MtpTurnArgs {
+                y,
+                depth,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens: &mut generated,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream,
+            },
+        )
+        .unwrap_or_else(|e| panic!("run_mtp_turn failed: {}", e.reason));
+
+        // The loop keeps token_history in lockstep with generated_tokens.
+        assert_eq!(token_history, generated, "history must mirror generated");
+
+        TurnOut {
+            generated,
+            finish_reason,
+            last_in_cache: outcome.last_in_cache,
+            desynced: outcome.desynced,
+            ledger: backend.ledger_snapshot(),
+        }
+    }
+
+    /// Count ledger entries matching a predicate.
+    fn count(ledger: &[Call], pred: impl Fn(&Call) -> bool) -> usize {
+        ledger.iter().filter(|c| pred(c)).count()
+    }
+
+    #[test]
+    fn run_mtp_turn_normal_full_length_run() {
+        let _chained_off = force_chained_off();
+        // depth 2, every cycle FULL-ACCEPT, no EOS — a genuine MULTI-cycle run
+        // that walks to the LENGTH budget. Step A emits the prefill seed (3)
+        // first; then each outer iteration's Step A forwards the prior accepted
+        // token and emits a NEW non-EOS token, and the cycle emits its
+        // depth+1 accepted-drafts+bonus. vocab 16; no token is the EOS id (15).
+        //
+        // Per-cycle full accept: verify_argmax == draft_argmax at positions
+        // 0,1 and a bonus at position 2.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        // Step A tokens for iterations: 7, 8, 9, ... (non-EOS). Plenty of
+        // cycles scripted; the length cap stops the run.
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![7, 8, 9, 10, 11, 12],
+            vec![cycle; 8],
+            /* desynced */ false,
+        );
+
+        // Budget 8 drives TWO full outer iterations (the near-tail cap shrinks
+        // the 2nd cycle's depth so the run lands EXACTLY on the budget — a
+        // clean top-of-loop length exit, not a mid-cycle truncation):
+        //   gen: [3]                  (initial seed emit)
+        //   iter0 Step A -> 7         gen=[3,7]
+        //   iter0 cycle(depth 2) full accept -> 4,5,bonus 6   gen=[3,7,4,5,6]
+        //   iter1 Step A -> 8         gen=[3,7,4,5,6,8]
+        //   iter1 cycle: remaining=2 -> near-tail cap depth 1 -> draft 4,
+        //                verify [4,5] full accept -> 4,bonus 5  gen=[...,4,5]
+        //   iter2 top: len 8 >= 8 -> length stop (clean, last_in_cache true).
+        let out = drive_turn(&mut backend, 3, 8, 15, 2);
+
+        assert_eq!(
+            out.generated,
+            vec![3, 7, 4, 5, 6, 8, 4, 5],
+            "seed + 2 full outer iterations (Step A + full-accept cycle each)"
+        );
+        assert_eq!(out.finish_reason, "length");
+        // Clean length exit at the top of the loop (no mid-cycle truncation):
+        // the boundary token was emitted by a completed cycle, no
+        // rollback_unemitted, no desync.
+        assert!(out.last_in_cache, "clean length exit keeps last_in_cache");
+        assert!(!out.desynced, "no mid-cycle stop -> not desynced");
+        assert_eq!(backend.begin_calls.get(), 1, "exactly one begin_mtp_decode");
+
+        // Ledger: TWO Step-A forwards + TWO cycles (begin_cycle / snapshot /
+        // verify / commit / rollback each). The 2nd cycle is depth-1 (near-tail
+        // cap), so DraftStep count is 2 (cycle0) + 1 (cycle1) = 3. The terminal
+        // take_replay_error + into_desynced fire exactly once each.
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::ForwardWithHidden)),
+            2,
+            "two Step-A forwards (chained OFF -> Step A every outer iteration)"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::BeginCycle { .. })),
+            2
+        );
+        assert_eq!(count(&out.ledger, |c| matches!(c, Call::DraftStep)), 3);
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::VerifyStep { .. })),
+            2
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::CommitMtp { .. })),
+            2
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::Rollback { .. })),
+            2
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RollbackUnemitted { .. })),
+            0,
+            "clean length exit -> no rollback_unemitted"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::TakeReplayError)),
+            1,
+            "engine surfaces full-accept replay error once post-loop"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::IntoDesynced)),
+            1,
+            "engine consumes the stepper's desync out once"
+        );
+    }
+
+    #[test]
+    fn run_mtp_turn_early_eos_stop() {
+        let _chained_off = force_chained_off();
+        // depth 2. The FIRST cycle's verify emits the EOS id (15) at accept
+        // position 1, so the emit loop commits the accepted draft (4) then the
+        // EOS (15) and STOPS with finish_reason "stop". last_in_cache is false:
+        // the EOS is the cycle's boundary token (its K/V is only laid down by
+        // the next cycle's Step A, which never runs).
+        let cycle = CycleArgmax {
+            // draft 0 -> 4 (accepted: verify_argmax[0]==4); draft 1 -> 5
+            // (REJECTED: verify_argmax[1]==15 != 5) so the residual 15 (EOS)
+            // is emitted and the accept loop stops. Emitted cycle tokens:
+            // [4, 15].
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 15, 6],
+        };
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![7, 8, 9],
+            vec![cycle; 4],
+            /* desynced */ false,
+        );
+
+        // gen: [3] (seed), iter0 Step A -> 7 (=[3,7]), cycle emits 4 then 15:
+        //   push 4 (=[3,7,4]); push 15 -> EOS -> stop mid-cycle? No: the cycle
+        //   emitted ALL its tokens [4,15] (cycle_emitted == 2 == len), so this
+        //   is a stop on the LAST cycle token -> last_in_cache = (2 < 2) = false,
+        //   no rollback_unemitted (unemitted == 0).
+        let out = drive_turn(&mut backend, 3, 64, 15, 2);
+
+        assert_eq!(
+            out.generated,
+            vec![3, 7, 4, 15],
+            "seed + Step-A(7) + cycle(accept 4, residual EOS 15)"
+        );
+        assert_eq!(out.finish_reason, "stop");
+        assert!(
+            !out.last_in_cache,
+            "EOS is the cycle's unforwarded boundary token -> not in cache"
+        );
+        assert!(!out.desynced, "stop on the LAST cycle token -> no desync");
+        // The EOS landed as the cycle's final emitted token, so the emit loop
+        // ran to completion (no unemitted remainder).
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::RollbackUnemitted { .. })),
+            0,
+            "EOS on the last cycle token -> emit loop completed, no rollback_unemitted"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::VerifyStep { .. })),
+            1,
+            "stopped during the first cycle"
+        );
+        assert_eq!(count(&out.ledger, |c| matches!(c, Call::IntoDesynced)), 1);
+    }
+
+    #[test]
+    fn run_mtp_turn_mid_cycle_stop_rolls_back_unemitted() {
+        let _chained_off = force_chained_off();
+        // A TRUE mid-cycle stop: the cycle FULLY accepts depth-3 drafts but an
+        // EOS lands as the 2nd ACCEPTED draft (not the last token), so the emit
+        // loop breaks BEFORE the cycle's remaining tokens — leaving an
+        // unemitted remainder the engine rolls back via rollback_unemitted, and
+        // the flat stepper reports desynced.
+        //
+        // (A length-budget mid-cycle stop is impossible by construction: the
+        // near-tail depth cap shrinks the cycle so it emits exactly the
+        // remaining budget, never overshooting. EOS / repetition / cancel are
+        // the only mid-cycle stop sources — here EOS as an accepted draft.)
+        //
+        // drafts [4, 15(EOS), 6]; verify_argmax [4, 15, 6, 7] → all 3 accepted
+        // (4==4, 15==15, 6==6) + bonus 7, so outcome.tokens = [4, 15, 6, 7].
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 15, 6],
+            verify_argmax: vec![4, 15, 6, 7],
+        };
+        // desynced = true: the flat/MoE stepper sets its desync flag when
+        // rollback_unemitted fires with unemitted > 0.
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![9, 10, 11],
+            vec![cycle; 4],
+            /* desynced */ true,
+        );
+
+        // gen: [3] (seed), iter0 Step A -> 9 (=[3,9]). A generous budget (64)
+        // keeps the near-tail cap from shrinking depth, so the full depth-3
+        // cycle runs: outcome.tokens = [4, 15, 6, 7]. Emit loop:
+        //   push 4  -> gen=[3,9,4]
+        //   push 15 -> EOS -> "stop", cycle_emitted = 2 < tokens.len 4 ->
+        //              last_in_cache = true; hit_stop; break.
+        //   unemitted = 4 - 2 = 2 -> rollback_unemitted(2).
+        let out = drive_turn(&mut backend, 3, 64, 15, 3);
+
+        assert_eq!(
+            out.generated,
+            vec![3, 9, 4, 15],
+            "seed + Step-A(9) + 2 of the cycle's 4 tokens before the mid-cycle EOS"
+        );
+        assert_eq!(out.finish_reason, "stop");
+        // The EOS (15) is an emitted-but-not-last cycle token whose K/V verify
+        // wrote, and the boundary (bonus 7) was never emitted — so the last
+        // EMITTED token IS in cache: cycle_emitted (2) < tokens.len (4).
+        assert!(
+            out.last_in_cache,
+            "mid-cycle stop before the boundary keeps the last emitted token in cache"
+        );
+        assert!(
+            out.desynced,
+            "mid-cycle stop with unemitted>0 leaves the flat caches desynced"
+        );
+        // rollback_unemitted fired exactly once with the 2-token remainder
+        // ([6, 7], the accepted-but-unemitted cycle tail).
+        assert_eq!(
+            out.ledger
+                .iter()
+                .filter_map(|c| match c {
+                    Call::RollbackUnemitted { unemitted } => Some(*unemitted),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![2],
+            "rollback_unemitted(2) — the 2 accepted-but-unemitted cycle tokens"
+        );
+        assert_eq!(count(&out.ledger, |c| matches!(c, Call::IntoDesynced)), 1);
     }
 }
