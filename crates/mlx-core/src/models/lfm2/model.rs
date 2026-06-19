@@ -188,18 +188,16 @@ impl Drop for Lfm2Inner {
 /// [`Lfm2Inner::verify_cache_prefix`] return value plus the incoming
 /// token count.
 ///
-/// Test-only mirror of the inlined branch at the top of the deleted
-/// flat `chat_sync_core` / `chat_stream_sync_core` (now the engine
-/// session core's verify-prefix split)
-/// — separating the decision logic from the native state mutation so
-/// the "exact-match routes to miss" invariant can be pinned by pure-
-/// logic unit tests that do not require a loaded LFM2 model.
-/// Production code keeps the inlined form for zero-overhead dispatch;
-/// this enum exists solely to drive `prefix_cache_decision_tests`'s
-/// four-case coverage (empty cache, strict-extend hit, divergence
-/// miss, exact-match miss). Any change to the inlined production
-/// branch MUST be mirrored here or the test ceases to guard the real
-/// code.
+/// Test-only mirror of the inlined branch in the engine session core's
+/// verify-prefix split — separating the decision logic from the native
+/// state mutation so the "exact-match routes to miss" invariant can be
+/// pinned by pure-logic unit tests that do not require a loaded LFM2
+/// model. Production code keeps the inlined form for zero-overhead
+/// dispatch; this enum exists solely to drive
+/// `prefix_cache_decision_tests`'s four-case coverage (empty cache,
+/// strict-extend hit, divergence miss, exact-match miss). Any change to
+/// the inlined production branch MUST be mirrored here or the test
+/// ceases to guard the real code.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum PrefixCacheDecision {
@@ -223,11 +221,9 @@ pub(crate) enum PrefixCacheDecision {
 /// tokens_len`) and zero-length prefix both route to
 /// [`PrefixCacheDecision::Miss`].
 ///
-/// Mirrors the inlined branch at the top of the deleted flat
-/// `chat_sync_core` / `chat_stream_sync_core` (now the engine session
-/// core's verify-prefix split);
-/// lifting it out keeps the invariant pinnable without loading a real
-/// LFM2 model.
+/// Mirrors the inlined branch in the engine session core's
+/// verify-prefix split; lifting it out keeps the invariant pinnable
+/// without loading a real LFM2 model.
 #[cfg(test)]
 #[inline]
 pub(crate) fn classify_prefix_cache_decision(
@@ -253,14 +249,10 @@ pub(crate) fn classify_prefix_cache_decision(
 /// `is_error` is the structured tool-error signal. When `Some(true)`,
 /// the shared [`crate::tokenizer::TOOL_ERROR_MARKER`] is prepended to
 /// `content` via [`crate::tokenizer::apply_tool_error_marker`]; `None`
-/// / `Some(false)` keep the wire bytes byte-equal to the pre-feature
-/// output.
+/// / `Some(false)` leave the wire bytes free of any marker.
 ///
-/// Extracted from
-/// [`Lfm2Inner::chat_session_continue_tool_sync`] /
-/// [`Lfm2Inner::chat_stream_session_continue_tool_sync`] so the
-/// wire-format choice can be pinned by pure-string unit tests that
-/// don't need a loaded LFM2 model.
+/// Lifted into a free function so the wire-format choice can be pinned
+/// by pure-string unit tests that don't need a loaded LFM2 model.
 pub(crate) fn build_lfm2_tool_delta_text(content: &str, is_error: Option<bool>) -> String {
     let rendered_content = crate::tokenizer::apply_tool_error_marker(content, is_error);
     format!("\n<|im_start|>tool\n{rendered_content}<|im_end|>\n<|im_start|>assistant\n")
@@ -279,18 +271,17 @@ pub(crate) struct Lfm2PagedDecode<'a> {
     // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION order, so
     // these three guards MUST be listed reset-guard → weight-guard → lock so
     // that `Lfm2PagedResetGuard::drop()` (→ `mlx_lfm2_paged_reset()`) runs
-    // WHILE the lifecycle mutex + weight read lock are STILL held. This matches
-    // the original local-variable reverse-drop order (locals declared
-    // lock→weight→reset dropped reset→weight→lock). If the reset ran AFTER the
-    // lifecycle mutex released, another compiled-paged request could acquire
-    // the mutex and seed/use the shared process-global paged state in the
-    // window before this request's delayed reset cleared it → cross-request
-    // null forwards / decode corruption. Do NOT reorder these three fields.
+    // WHILE the lifecycle mutex + weight read lock are STILL held. If the reset
+    // ran AFTER the lifecycle mutex released, another compiled-paged request
+    // could acquire the mutex and seed/use the shared process-global paged
+    // state in the window before this request's delayed reset cleared it →
+    // cross-request null forwards / decode corruption. Do NOT reorder these
+    // three fields.
     //
-    // F1 DROP-ORDER TRAP: `inner: &'a mut` is declared AFTER the three guards.
-    // Fields drop in declaration order, so the guards drop (reset fires under
-    // the still-held locks) BEFORE the `&mut` borrow is conceptually released —
-    // correct. Do NOT move `inner` above the guards.
+    // `inner: &'a mut` is declared AFTER the three guards. Fields drop in
+    // declaration order, so the guards drop (reset fires under the still-held
+    // locks) BEFORE the `&mut` borrow is conceptually released — correct. Do
+    // NOT move `inner` above the guards.
     _paged_reset_guard: Option<Lfm2PagedResetGuard>,
     _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
     _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
@@ -479,10 +470,9 @@ impl Lfm2Inner {
     /// Whether the compiled C++ forward path owns this model's weights and may
     /// be taken for decode. The gate is per-model weight presence
     /// (`mlx_lfm2_model_has_weights(self.model_id)`, which checks the shared
-    /// weight registry), so a SIBLING model loading no longer demotes this model
-    /// to the eager path — that is the per-model-slot coexistence fix. Replaces
-    /// the old single-active-model-id compare (`mlx_lfm2_get_model_id() ==
-    /// model_id`).
+    /// weight registry), so a SIBLING model loading does not demote this model
+    /// to the eager path — each model keeps its own compiled slot, and the gate
+    /// turns on/off only for its own weights.
     ///
     /// Weights are registered ONLY by `register_weights_with_cpp` (load time),
     /// which is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or
@@ -573,12 +563,12 @@ impl Lfm2Inner {
 
     /// Reset all caches and cached token history.
     ///
-    /// Renamed from the pre-S11 inherent `reset_caches` so the
-    /// [`ChatBackend::reset_caches`] trait method (which takes a
-    /// [`ResetScope`]) cannot shadow it at concrete-typed call sites.
-    /// Both engine scopes dispatch here for the SHARED clear; the
-    /// explicit command reset additionally purges the paged prefix
-    /// cache in the trait impl (see [`ChatBackend::reset_caches`]).
+    /// The `_internal` suffix keeps this inherent helper from being
+    /// shadowed by the [`ChatBackend::reset_caches`] trait method (which
+    /// takes a [`ResetScope`]) at concrete-typed call sites. Both engine
+    /// scopes dispatch here for the SHARED clear; the explicit command
+    /// reset additionally purges the paged prefix cache in the trait impl
+    /// (see [`ChatBackend::reset_caches`]).
     fn reset_caches_internal(&mut self) {
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
@@ -685,10 +675,10 @@ impl Lfm2Inner {
     /// reason string) keeps `cached_token_history` aligned with the layer
     /// caches so a later `reuse_cache=true` call can't skip prefill for an
     /// uncached tail token.
-    /// Renamed from the pre-S11 inherent `save_cache_state` so the
-    /// [`ChatBackend::save_cache_state`] trait method (which takes
-    /// [`SaveStateArgs`]) cannot shadow it; the trait impl and the kept
-    /// paged cores all dispatch here.
+    /// The `_internal` suffix keeps this inherent helper from being
+    /// shadowed by the [`ChatBackend::save_cache_state`] trait method
+    /// (which takes [`SaveStateArgs`]); the trait impl and the paged
+    /// backend all dispatch here.
     fn save_cache_state_internal(
         &mut self,
         reuse_cache: bool,
@@ -978,10 +968,10 @@ impl Lfm2Inner {
     /// brought up to the paged cache's `cached_prefix_len` boundary before
     /// pass 2 of `run_paged_prefill_chunk` continues with the suffix.
     ///
-    /// (Name kept for history; this is no longer "conv only" — attention must
-    /// run to feed downstream conv layers the correct residual, otherwise their
-    /// state drifts and paged-CONTINUE diverges from flat. See
-    /// `tests/lfm2_paged_vs_flat_parity.rs::lfm2_paged_budget_forced_warm_continue_parity`.)
+    /// Despite the name, this is NOT conv-only — attention must run to feed
+    /// downstream conv layers the correct residual, otherwise their state
+    /// drifts and paged-CONTINUE diverges from flat. See
+    /// `tests/lfm2_paged_vs_flat_parity.rs::lfm2_paged_budget_forced_warm_continue_parity`.
     fn run_conv_only_prefill(&mut self, prefix_tokens: &[u32]) -> Result<()> {
         if prefix_tokens.is_empty() {
             return Ok(());
@@ -1012,12 +1002,11 @@ impl Lfm2Inner {
                 // pass never touches. The result is byte-identical to
                 // cold/flat for every downstream conv layer's state.
                 //
-                // (WAS a shape-preserving identity passthrough — an
-                // explicitly-approximate reconstruction that dropped the
-                // attention contribution and drifted downstream conv state,
-                // causing paged-CONTINUE to diverge from flat on a warm turn.
+                // A shape-preserving identity passthrough here would be wrong:
+                // it would drop the attention contribution and drift downstream
+                // conv state, diverging paged-CONTINUE from flat on a warm turn.
                 // See tests/lfm2_paged_vs_flat_parity.rs
-                // `lfm2_paged_budget_forced_warm_continue_parity`.)
+                // `lfm2_paged_budget_forced_warm_continue_parity`.
                 hidden_states = layer.forward(&hidden_states, None, None)?;
             } else {
                 // Conv layer: forward through the operator + FFN tail.
@@ -1048,21 +1037,19 @@ impl Lfm2Inner {
     }
 }
 
-/// Eager/compiled flat decode stepper for one lfm2 turn (S11,
+/// Eager/compiled flat decode stepper for one lfm2 turn (built by
 /// [`ChatBackend::begin_decode`]).
 ///
-/// Byte-identical port of the deleted flat cores' decode-loop step
-/// bodies: the compiled C++ step (`mlx_lfm2_moe_forward` +
+/// Each `forward` runs the compiled C++ step (`mlx_lfm2_moe_forward` +
 /// `mlx_lfm2_moe_eval_token_and_caches`) when the turn's seed engaged
 /// the compiled path, else the native [`Lfm2Inner::forward`]. The RAII
-/// guards captured here reproduce the legacy in-scope teardown.
+/// guards captured here tear the compiled state down in-scope.
 pub(crate) struct Lfm2Decode<'a> {
     // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION
     // order, so these three guards MUST be listed reset-guard →
     // weight-guard → lock so that `Lfm2CompiledResetGuard::drop()`
     // (→ `mlx_lfm2_moe_reset()`) runs WHILE the lifecycle mutex +
-    // weight read lock are STILL held — the same reverse-drop order the
-    // deleted cores' locals had (declared lock → weight → reset).
+    // weight read lock are STILL held.
     _compiled_reset_guard: Option<Lfm2CompiledResetGuard>,
     _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
     _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
@@ -1080,7 +1067,7 @@ impl DecodeStep for Lfm2Decode<'_> {
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
         if self.use_compiled {
             // Compiled path returns [B, vocab] (already 2D) — `false` ==
-            // no squeeze, matching the legacy compiled branch.
+            // no squeeze needed.
             let emb = self.embed_tokens_weight.as_ref().ok_or_else(|| {
                 Error::from_reason("lfm2 compiled decode: missing embedding weight")
             })?;
@@ -1104,14 +1091,14 @@ impl DecodeStep for Lfm2Decode<'_> {
                 false,
             ))
         } else {
-            // Eager native forward returns [1, 1, vocab]; `true` == the
-            // legacy loops' explicit `squeeze(Some(&[1]))`.
+            // Eager native forward returns [1, 1, vocab]; `true` signals the
+            // caller to `squeeze(Some(&[1]))` down to [1, vocab].
             Ok((self.inner.forward(input_ids)?, true))
         }
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Legacy lfm2 never force-evals the logits — not even on the
+        // lfm2 never force-evals the logits — not even on the
         // budget-forced path (the forced branch discards them lazily).
         if self.use_compiled {
             // Evaluating the token triggers the whole compiled graph
@@ -1135,8 +1122,7 @@ impl DecodeStep for Lfm2Decode<'_> {
         // `export_compiled_caches` the next turn would feed freed
         // buffers to the GPU. Runs while the guards (fields above) are
         // still held; an `Err` aborts the turn BEFORE
-        // `save_cache_state`, reproducing the legacy
-        // reset-without-export error path.
+        // `save_cache_state`, so the reset fires without a stale export.
         if self.use_compiled && self.reuse_cache {
             self.inner.export_compiled_caches()?;
         }
@@ -1181,13 +1167,13 @@ impl ChatBackend for Lfm2Inner {
         ThinkingPolicy::AlwaysOnBudgetFromEffort
     }
 
-    // `resolve_params`: engine default (`extract_chat_params`) == the
-    // legacy `extract_chat_params(&config)` on every deleted core.
+    // `resolve_params`: engine default (`extract_chat_params`) is the
+    // right behavior for lfm2 — no per-family override needed.
     //
     // `render_prompt`: engine default (jinja `apply_chat_template_sync`
     // with `add_generation_prompt = true`, the request tools, and
-    // `resolve_enable_thinking`) == the deleted cores' render block
-    // byte-for-byte (LFM2's template itself ignores `enable_thinking`).
+    // `resolve_enable_thinking`) is correct for lfm2 (its template itself
+    // ignores `enable_thinking`).
 
     fn render_continue_delta(
         &self,
@@ -1195,9 +1181,8 @@ impl ChatBackend for Lfm2Inner {
         user_message: &str,
         _config: &ChatConfig,
     ) -> Result<Vec<u32>> {
-        // Match the legacy session path's sanitization so the delta is
-        // subject to the same role/content injection protection as the
-        // fresh-prompt path.
+        // Sanitize the delta with the same role/content injection
+        // protection the fresh-prompt path applies.
         let synthetic = build_synthetic_user_message(user_message);
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(std::slice::from_ref(&synthetic));
         let sanitized_user = &sanitized[0].content;
@@ -1207,7 +1192,7 @@ impl ChatBackend for Lfm2Inner {
         // when reasoning. Always suppress the prefix by passing
         // `Some(false)` to the shared builder so the delta stays
         // template-equivalent with the LFM2 jinja output (`config` is
-        // deliberately ignored — the trait gained it for qwen3.5).
+        // deliberately ignored — it only matters for qwen3.5).
         let delta_text = build_chatml_continue_delta_text(sanitized_user, Some(false));
         tok.encode_sync(&delta_text, Some(false))
     }
@@ -1232,9 +1217,8 @@ impl ChatBackend for Lfm2Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        // Shared clear for BOTH scopes (== the legacy inherent reset):
-        // wipe flat caches + token history + image key and release any
-        // live paged request.
+        // Shared clear for BOTH scopes: wipe flat caches + token history +
+        // image key and release any live paged request.
         self.reset_caches_internal();
         // The EXPLICIT command reset must restore a fully cold state:
         // `release_request` alone leaves the request's full blocks
@@ -1242,9 +1226,9 @@ impl ChatBackend for Lfm2Inner {
         // reset-then-rerun of the same prompt would take the prefix-hit
         // 1-token-suffix prefill path — whose bf16 reduction order
         // differs from the cold full prefill, enough to flip a greedy
-        // near-tie (codex S12 finding; observed "says," vs "said" at
-        // token ~6 on the 1.2b checkpoint). Purge the prefix cache so
-        // the next turn replays the cold prefill byte-for-byte.
+        // near-tie (observed "says," vs "said" at token ~6 on the 1.2b
+        // checkpoint). Purge the prefix cache so the next turn replays the
+        // cold prefill byte-for-byte.
         // `PrefixMiss` (turn-internal) keeps the prefix cache:
         // cross-request block reuse after a history miss is the paged
         // design's entire point.
@@ -1262,16 +1246,15 @@ impl ChatBackend for Lfm2Inner {
         Ok(())
     }
 
-    /// **Safety invariant** (moved verbatim from the deleted inherent
-    /// `verify_cache_prefix`): returns ONLY `0` (cache miss) or
+    /// **Safety invariant**: returns ONLY `0` (cache miss) or
     /// `cached_token_history.len()` (exact-append hit or exact match) —
     /// never an intermediate value. The engine's session core routes the
     /// exact-match case (`hit == tokens.len()`) back through the
-    /// miss/reset branch, reproducing the legacy behaviour: LFM2's
-    /// short-conv layers have non-invertible left-padded state and no
-    /// safe "rewind-by-1" primitive, so the qwen3 pure-KV exact-match
-    /// rewind exception is FORBIDDEN here (see the all-or-nothing
-    /// contract on [`ChatBackend::verify_cache_prefix`]).
+    /// miss/reset branch: LFM2's short-conv layers have non-invertible
+    /// left-padded state and no safe "rewind-by-1" primitive, so the
+    /// qwen3 pure-KV exact-match rewind exception is FORBIDDEN here (see
+    /// the all-or-nothing contract on
+    /// [`ChatBackend::verify_cache_prefix`]).
     fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
         if !reuse_cache {
             return 0;
@@ -1309,17 +1292,16 @@ impl ChatBackend for Lfm2Inner {
     }
 
     fn eval_caches(&self) -> Result<()> {
-        // == the deleted cores' post-prefill `eval_lfm2_caches` sync.
+        // Post-prefill sync of every cache array.
         eval_lfm2_caches(&self.caches)
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        // Byte-identical port of the deleted cores' prefill block: lfm2
-        // builds its prompt array as int32 (dtype is load-bearing for
+        // lfm2 builds its prompt array as int32 (dtype is load-bearing for
         // parity), runs the chunked forward, and folds the last-token
-        // slice into the impl (S6 trait contract) using the ACTUAL
-        // returned seq len — `chunked_prefill` returns only the final
-        // chunk's logits for prompts over `PREFILL_STEP_SIZE`.
+        // slice into the impl using the ACTUAL returned seq len —
+        // `chunked_prefill` returns only the final chunk's logits for
+        // prompts over `PREFILL_STEP_SIZE`.
         let token_arr: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
         let prompt = MxArray::from_int32(&token_arr, &[1, prompt_tokens.len() as i64])?;
         let logits = self.chunked_prefill(&prompt, stream)?;
@@ -1334,10 +1316,9 @@ impl ChatBackend for Lfm2Inner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        // lfm2's DELTA decode loop is ALWAYS eager (panel "paged/eager
-        // delta" finding): the legacy delta cores ran the native forward
-        // unconditionally, with no compiled dispatch. Only fresh flat
-        // turns engage the compiled path below.
+        // lfm2's DELTA decode loop is ALWAYS eager: delta turns run the
+        // native forward unconditionally, with no compiled dispatch. Only
+        // fresh flat turns engage the compiled path below.
         if turn.is_delta {
             return Ok(Lfm2Decode {
                 _compiled_reset_guard: None,
@@ -1578,47 +1559,44 @@ impl ChatBackend for Lfm2Inner {
         })
     }
 
-    // `finalize_turn`: engine default (`finalize_chat_result`) == every
-    // deleted core's finalization (the streaming delta core's manually
-    // built done-chunk was field-for-field the same construction,
-    // including the tool_calls finish-reason promotion and the raw_text
-    // reasoning scrub).
+    // `finalize_turn`: engine default (`finalize_chat_result`) is correct
+    // for lfm2 — its done-chunk construction (the tool_calls finish-reason
+    // promotion and the raw_text reasoning scrub) is what both the sync
+    // and streaming paths need, so no per-family override.
 
     fn has_paged_adapter(&self) -> bool {
         self.paged_adapter.is_some()
     }
 
     // `supports_images`: engine default `false` — LFM2 is text-only.
-    // The NAPI entry points additionally keep their legacy
-    // "LFM2 is text-only" pre-checks, which fire before any command is
-    // dispatched, so the engine's typed pre-render rejection is a
-    // defense-in-depth backstop.
+    // The NAPI entry points additionally carry their own "LFM2 is
+    // text-only" pre-checks, which fire before any command is dispatched,
+    // so the engine's typed pre-render rejection is a defense-in-depth
+    // backstop.
     //
     // `text_delta_image_guard`: engine default — `!supports_images() &&
     // session_holds_images()` with the parametrized strings
     // ("chat_tokens_delta_sync is text-only; session currently holds
-    // image state" / the `chat_stream_tokens_delta` twin) byte-matches
-    // the legacy lfm2 guards.
+    // image state" / the `chat_stream_tokens_delta` twin).
     //
     // `extra_eos_ids` / `stream_skip_special_tokens` / `stream_emitter`
     // / `wired_limit_bytes` (usize::MAX) / `profiler_label` /
     // `has_live_session` (`!cached_token_history.is_empty()`): engine
-    // defaults == legacy lfm2 behaviour (lfm2's loops had no profiler;
-    // the default labels only surface when profiling is enabled).
+    // defaults are correct for lfm2 (it has no profiler; the default
+    // labels only surface when profiling is enabled).
 
     fn eos_before_emit(&self) -> bool {
-        // BOTH legacy streaming loops check EOS before the cancellation
-        // check AND before the token's text is detokenized/emitted
-        // ("Check stop condition before streaming to avoid leaking EOS
-        // text") — which also resolves the EOS+cancel race as "stop".
+        // lfm2 checks EOS before the cancellation check AND before the
+        // token's text is detokenized/emitted, to avoid leaking EOS text —
+        // which also resolves the EOS+cancel race as "stop".
         true
     }
 
     fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
         // No-op override (gemma4 precedent): lfm2 has no MTP heads
-        // (acceptance fields stay None) and its legacy metrics never
-        // carried `profile_phases`; the default would add
-        // profiling-gated extras. Keep the payload byte-stable.
+        // (acceptance fields stay None) and carries no `profile_phases`;
+        // the default would add profiling-gated extras. Keep the payload
+        // byte-stable.
     }
 
     fn session_holds_images(&self) -> bool {
@@ -1630,12 +1608,10 @@ impl ChatBackend for Lfm2Inner {
     fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         // CRITICAL (engine paged-probe contract — see the DELIBERATE FIX
         // note at the probe): lfm2's delta paths NEVER touch the paged
-        // adapter. The legacy `chat_tokens_delta_sync` /
-        // `chat_stream_tokens_delta_sync` ran the flat eager
-        // prefill+decode over `self.caches` even when `paged_adapter`
-        // was `Some`. Decline delta turns so the generic flow (eager
-        // flat delta) runs, exactly like legacy; fresh turns take the
-        // generic paged engine for both sync and streaming.
+        // adapter. Decline delta turns so the generic flow (eager flat
+        // delta) runs the flat eager prefill+decode over `self.caches` even
+        // when `paged_adapter` is `Some`; fresh turns take the generic
+        // paged engine for both sync and streaming.
         //
         // ⚠ OPPOSITE of qwen3 (which runs the engine UNCONDITIONALLY for
         // fresh + delta): lfm2 keeps its `is_delta` decline. Consequence:
@@ -1645,26 +1621,20 @@ impl ChatBackend for Lfm2Inner {
         if args.is_delta {
             return None;
         }
-        // P4-2: the forked `paged_turn_sync_core` / `paged_turn_stream_core`
-        // were deleted — the model-neutral `run_paged_turn` drives the whole
-        // turn through `<Lfm2Inner as PagedBackend>` (prime → prefill →
-        // begin_paged_decode → decode loop → save), mirroring qwen3 P4-1.
+        // The model-neutral `run_paged_turn` drives the whole fresh turn
+        // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
+        // begin_paged_decode → decode loop → save).
         //
-        // DELIBERATE behavior convergence (think-budget force ordering):
-        // `run_decode_loop` forces `</think>` FORCE-before-OBSERVE — it peeks
-        // `should_force_think_end()` for the NEXT token before observing the
-        // current one, so a budget of N yields N+1 reasoning tokens. That is
-        // the engine's unit-test-locked contract (engine::decode
+        // Think-budget force ordering: `run_decode_loop` forces `</think>`
+        // FORCE-before-OBSERVE — it peeks `should_force_think_end()` for the
+        // NEXT token before observing the current one, so a budget of N
+        // yields N+1 reasoning tokens. That is the engine's
+        // unit-test-locked contract (engine::decode
         // `budget_forcing_injects_think_end_token`; the observe-after-force
-        // note at decode.rs ~412) and the ordering of lfm2 FLAT + qwen3.
-        // The DELETED lfm2 paged loops were OBSERVE-before-FORCE (budget N →
-        // N tokens) — the ONLY path on origin/main with that ordering, so
-        // main's own flat and paged already disagreed by one token whenever a
-        // think-budget force fired mid-`<think>`. P4-2 converges paged onto
-        // flat (backward-compat waived for this refactor); the only behavior
-        // delta vs legacy lfm2 paged is that one extra reasoning token under
-        // active budget forcing at T=0. `lfm2_paged_vs_flat_greedy_token_parity`
-        // (budget 32) now holds because both paths share this loop.
+        // note at decode.rs ~412), shared by lfm2's flat path, paged path,
+        // and qwen3 — so flat and paged agree token-for-token under a
+        // mid-`<think>` budget force. `lfm2_paged_vs_flat_greedy_token_parity`
+        // (budget 32) holds because both paths share this loop.
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
     }
 }
@@ -1683,20 +1653,18 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
         _input_ids: &MxArray,
         token_id: u32,
     ) -> Result<(MxArray, bool)> {
-        // Runs the BODY of the deleted `paged_compiled_decode_step`,
-        // inlined against `self`'s fields (the compiled-paged session state
-        // now LIVES on the stepper, not a separate `&mut state` arg).
-        // Compiled-paged when `self.cpp_session_ready`, else the pure-Rust
-        // eager paged step.
+        // Runs one paged decode step against `self`'s fields (the
+        // compiled-paged session state lives on the stepper). Compiled-paged
+        // when `self.cpp_session_ready`, else the pure-Rust eager paged
+        // step.
         //
         // PERF: `token_id` is HANDED by the engine (already read once at the
         // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32`
         // the fresh `_input_ids` reshape — that redundant second per-step
-        // eval/sync measurably regressed the fast compiled-paged decode
-        // (~5% on lfm2-1.2B; legacy `paged_compiled_decode_step` took the
-        // `u32` directly and never re-extracted). `record_tokens` + the
-        // `[1, 1]` re-embed below rebuild from the scalar via `from_uint32`,
-        // so `_input_ids` is unused (kept for signature parity).
+        // eval/sync measurably regresses the fast compiled-paged decode
+        // (~5% on lfm2-1.2B). `record_tokens` + the `[1, 1]` re-embed below
+        // rebuild from the scalar via `from_uint32`, so `_input_ids` is
+        // unused (kept for signature parity).
         let step = self.step_counter;
         self.step_counter += 1;
 
@@ -1778,7 +1746,7 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
                     // None, so the struct's eventual field-drop is a no-op (no
                     // double reset / double release).
                     //
-                    // BORROW DISCIPLINE (G4): the `adapter` borrow of
+                    // BORROW DISCIPLINE: the `adapter` borrow of
                     // `self.inner.paged_adapter` ends after the rollback above;
                     // we then mutate `self`'s OWN guard fields, and only THEN
                     // re-borrow `self.inner` for `run_paged_decode_step`. The
@@ -1801,7 +1769,7 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
                 .squeeze(Some(&[1]))?
         };
 
-        // G7: BOTH branches already pre-squeeze to [1, vocab] — the compiled
+        // BOTH branches already pre-squeeze to [1, vocab] — the compiled
         // path returns native 2D [B, vocab]; the eager path runs
         // `run_paged_decode_step` ([1, 1, vocab]) then `squeeze([1])`.
         // `needs_squeeze = FALSE`. ⚠ POLARITY IS INVERTED vs qwen3 (whose
@@ -1813,31 +1781,27 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
         // Single SYNCHRONOUS eval of `next_token` pulls the logits AND the
-        // paged K/V writes through the dependency chain (== legacy
-        // `paged_turn_{sync,stream}_core_inner`'s `y.eval()`, one sync wait);
-        // the loop-top `y.eval()` then no-ops on the already-materialized token.
+        // paged K/V writes through the dependency chain (one sync wait); the
+        // loop-top `y.eval()` then no-ops on the already-materialized token.
         //
         // NOT `async_eval_arrays([next_token, logits])` (the qwen3-style
         // schedule): lfm2's compiled forward has negligible per-step CPU work
         // (~110us issue vs ~5.4ms GPU/token, bandwidth-bound), so the async
         // two-wait (bottom `async_eval` + loop-top `y.eval`) buys ZERO overlap
-        // and costs ~5% vs the single sync wait. Restores decode parity with
-        // fba240b8.
+        // and costs ~5% vs the single sync wait.
         //
-        // `_budget_forced` is unused: the earlier "budget-forced K/V hole" (a
-        // forced final token leaving its compiled K/V co-output lazy) was
-        // REFUTED — the only real cross-turn divergence on a budget-forced
-        // length exit was the conv Pass-1 attention-skip in
-        // `run_conv_only_prefill` (a LOGICAL bug, reproduced byte-identical
-        // under eager AND compiled), now fixed there. See
+        // `_budget_forced` is unused: a forced final token does NOT leave its
+        // compiled K/V co-output lazy (the single sync eval above pulls the
+        // K/V writes through the dependency chain regardless). Cross-turn
+        // parity on a budget-forced length exit instead depends on the conv
+        // Pass-1 running attention in `run_conv_only_prefill`. See
         // tests/lfm2_paged_vs_flat_parity.rs
         // `lfm2_paged_budget_forced_warm_continue_parity`.
         next_token.eval();
     }
 
     fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the legacy paged loops' per-step
-        // `maybe_clear_cache_for_paged_step(step)`.
+        // Paged cadence — per-step cache clear.
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
 
@@ -1912,13 +1876,13 @@ impl PagedBackend for Lfm2Inner {
         let total_budget = plan.len() as u32;
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let seq_id: u32 = 0;
-        // P3: adapter-owned warm-continue/cold-start lifecycle. NOTE: lfm2's
-        // hand-rolled `can_continue` had NO reuse_cache term, so pass LITERAL
-        // `true` — the adapter ANDs reuse_cache into its own can_continue,
-        // and `true` preserves the original always-eligible warm predicate.
-        // ⚠ Do NOT thread the engine's `reuse_cache` here (qwen3 does); the
-        // engine's `reuse_cache` instead drives finalize/save (Decision 2).
-        // Suffix blocks are allocated inside prepare_turn; do not re-allocate.
+        // Adapter-owned warm-continue/cold-start lifecycle. Pass LITERAL
+        // `true` for lfm2's can_continue term — the adapter ANDs reuse_cache
+        // into its own can_continue, so `true` keeps the warm predicate
+        // always-eligible. ⚠ Do NOT thread the engine's `reuse_cache` here
+        // (qwen3 does); for lfm2 the engine's `reuse_cache` instead drives
+        // finalize/save. Suffix blocks are allocated inside prepare_turn; do
+        // not re-allocate.
         let turn_plan = self
             .paged_adapter
             .as_mut()
@@ -1944,8 +1908,7 @@ impl PagedBackend for Lfm2Inner {
         // conv prefix state across turns; each turn reprefills from the start
         // of the prompt over conv layers. `run_paged_turn` is family-neutral
         // and will NOT do this — forget it and conv state goes stale across
-        // turns (legacy `paged_turn_*_core`'s per-turn `self.caches =
-        // init_caches(..)`).
+        // turns.
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
         self.cached_image_key = None;
@@ -1968,8 +1931,7 @@ impl PagedBackend for Lfm2Inner {
         // conv Pass-1 over the cached prefix from `full_tokens`, then the
         // full forward over the suffix, and folds in the last-token slice
         // (returns `[vocab]`). The engine fires the post-prefill
-        // `synchronize_and_clear_cache` AFTER this returns (NOT here) — same
-        // as the legacy core.
+        // `synchronize_and_clear_cache` AFTER this returns (NOT here).
         self.run_paged_prefill_chunk(
             &prefix.full_tokens,
             suffix_tokens,
@@ -1978,8 +1940,7 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
-        // Runs the BODY of the deleted `paged_compiled_decode_setup`,
-        // arming the compiled-paged guards as STRUCT FIELDS of the returned
+        // Arms the compiled-paged guards as STRUCT FIELDS of the returned
         // `Lfm2PagedDecode` (declaration order == drop order == teardown
         // order). MUST run AFTER prefill (reads the adapter pools + conv
         // caches) and the post-prefill cache clear, BEFORE the decode loop.
@@ -2149,12 +2110,11 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // == the legacy paged cores' terminal lifecycle block. Success: keep
-        // the request live across turns when reuse is on so the next turn's
-        // `continue_turn` builds on the partial trailing block's live K/V;
-        // otherwise register full blocks for reuse + release. Infallible
-        // (`let _ =` every call — a teardown failure must not mask the turn
-        // result).
+        // Terminal lifecycle. Success: keep the request live across turns
+        // when reuse is on so the next turn's `continue_turn` builds on the
+        // partial trailing block's live K/V; otherwise register full blocks
+        // for reuse + release. Infallible (`let _ =` every call — a teardown
+        // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
                 let _ = adapter.finalize_turn_keep_live(&[], 0);
@@ -2166,8 +2126,7 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown == the legacy paged cores' `Err(e) =>
-        // release_request()` arm: release fully, partial block_table state is
+        // Error-path teardown: release fully, partial block_table state is
         // unsafe to keep around. Release ONLY — never register / keep live.
         // Infallible (`let _ =` — must not mask the turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -2179,8 +2138,7 @@ impl PagedBackend for Lfm2Inner {
         // lfm2 reprefills the FULL prompt through conv layers EVERY turn
         // (`run_paged_prefill_chunk` Pass-1) even on a warm attention-prefix
         // hit, so ttft measures full-prompt work and the throughput numerator
-        // must be the FULL prompt — NOT the attention suffix. == the legacy
-        // `paged_turn_sync_core` perf call's `tokens.len()` (and the regression
+        // must be the FULL prompt — NOT the attention suffix (pinned by the
         // `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse` guard).
         // The default (`suffix_len`) is the standard-KV qwen behavior, which
         // would under-report lfm2's prefill tok/s by the cache-hit ratio.
@@ -2193,11 +2151,10 @@ impl PagedBackend for Lfm2Inner {
         // persistent per-layer K/V pools; running it on a queue separate from
         // the shared loop's top-of-iteration `y.eval()` (always on the default
         // stream) forces a cross-queue completion-wait every token (~5% on
-        // bandwidth-bound decode). Legacy lfm2 paged decode ran on the default
-        // stream — only `chunked_prefill` used `generation_stream` — so this
-        // restores the legacy single-stream cadence. `paged_prefill` still runs
-        // on `generation_stream`. See the `PagedBackend::paged_decode_stream`
-        // doc for the full mechanism.
+        // bandwidth-bound decode). Keeping paged decode on the default stream
+        // — while `chunked_prefill` and `paged_prefill` use
+        // `generation_stream` — gives a single-stream decode cadence. See the
+        // `PagedBackend::paged_decode_stream` doc for the full mechanism.
         Stream::default(crate::stream::DeviceType::Gpu)
     }
 
@@ -2210,14 +2167,13 @@ impl PagedBackend for Lfm2Inner {
     ) -> Result<()> {
         // lfm2 INVERSE convention vs qwen3 (Decision 1): lfm2 paged ALWAYS
         // drops the last token, regardless of the engine's `keep_all`
-        // (length-exit) signal. The legacy lfm2 paged cores hardcoded
-        // `save_cache_state_internal(true, .., last_token_in_cache=false)`
-        // because the paged decode loop NEVER forwards the LAST sampled token
-        // through `run_paged_decode_step` — so the last `generated` entry is
-        // NOT in the adapter / conv caches and must be dropped to keep the
-        // saved history aligned with the live cache state.
+        // (length-exit) signal, because the paged decode loop NEVER forwards
+        // the LAST sampled token through `run_paged_decode_step` — so the
+        // last `generated` entry is NOT in the adapter / conv caches and must
+        // be dropped to keep the saved history aligned with the live cache
+        // state.
         //
-        // We pass `last_token_in_cache=false` UNCONDITIONALLY to the kept FLAT
+        // We pass `last_token_in_cache=false` UNCONDITIONALLY to the FLAT
         // helper, which does the drop-last trim (model.rs `save_cache_state_internal`)
         // AND the `!reuse_cache → reset_caches_internal()` branch (Decision 2:
         // respect the engine's `reuse_cache`). This writes ONLY
@@ -2231,8 +2187,7 @@ impl PagedBackend for Lfm2Inner {
         //  * LENGTH exit (k==N): adapter = prompt+(N-1) [last forward skipped];
         //    drop-last → history = prompt+(N-1). MATCH.
         //  * EARLY-STOP at g[k-1] (k<N): adapter = prompt+(k-1) [terminal
-        //    forward skipped]; drop-last → history = prompt+(k-1). MATCH
-        //    (== legacy lfm2 paged).
+        //    forward skipped]; drop-last → history = prompt+(k-1). MATCH.
         self.save_cache_state_internal(reuse_cache, save_tokens, generated, false);
         // conv-state save is in-process and infallible (no recurrent-cache
         // eval/clone that can fail like the MoE GDN checkpoint).
@@ -2659,7 +2614,7 @@ pub struct Lfm2Model {
     /// training/generate variants), so the thread dispatches the
     /// model-neutral [`ChatCmd`] directly via
     /// `engine::cmd::handle_chat_cmd::<Lfm2Inner>` — no per-family
-    /// command enum (S11).
+    /// command enum.
     pub(crate) thread: crate::model_thread::ModelThread<ChatCmd>,
     pub(crate) config: Lfm2Config,
     /// Snapshot of `Lfm2Inner::paged_adapter.is_some()` captured at
@@ -2833,14 +2788,14 @@ mod prefix_cache_decision_tests {
     //! load required. The verifier `Lfm2Inner::verify_cache_prefix`
     //! returns either `0` (miss) or `cached_token_history.len()` (exact
     //! prefix relation). The engine session core (and the paged turn
-    //! cores) then classify that value plus the
+    //! path) then classify that value plus the
     //! incoming prompt length into
     //! [`PrefixCacheDecision::StrictExtendHit`] (warm-reuse, skip the
     //! cached prefix, prefill only the tail) vs
     //! [`PrefixCacheDecision::Miss`] (reset caches + re-init + full
     //! prefill).
     //!
-    //! The four cases covered below pin the Round 1 Fix #2 invariant:
+    //! The four cases covered below pin the invariant:
     //! exact-match MUST route to `Miss`, not to `StrictExtendHit` —
     //! LFM2's short-conv layers carry non-invertible left-padded state
     //! and there is no safe "rewind-by-1" primitive. Reprefilling the
@@ -2910,8 +2865,8 @@ mod prefix_cache_decision_tests {
         // way to sample from the already-cached final position without
         // re-running the last forward step, which would duplicate the
         // final token into cache state while persistence only records
-        // the prompt + generated tokens. Round 1 Fix #2 pinned this
-        // invariant — the tests here guard against any regression.
+        // the prompt + generated tokens. The tests here guard this
+        // invariant against any regression.
         assert_eq!(
             classify_prefix_cache_decision(5, 5),
             PrefixCacheDecision::Miss,

@@ -716,7 +716,7 @@ fn apply_weights(
     // `mlx_dequantize(..., "affine")` unconditionally, so MXFP4/MXFP8 metadata
     // at this key would silently mis-dequantize. The convert path already
     // forces `embed_tokens` to affine (see `apply_mxfp_upgrade` and the
-    // legacy no-recipe block), but if a future regression or hand-edited
+    // no-recipe path), but if a future regression or hand-edited
     // checkpoint claims otherwise we want to fail loud rather than emit
     // garbage outputs.
     let embed_quantized = params.contains_key("embed_tokens.scales");
@@ -1759,14 +1759,14 @@ mod tests {
         assert_eq!(dt("norm.weight"), DType::BFloat16);
     }
 
-    /// Finding 1 (partial dense-MLP quant group): a checkpoint where SOME of
+    /// Partial dense-MLP quant group: a checkpoint where SOME of
     /// gate/up/down ship a quantized group and the rest are dense is
     /// truncated/malformed — `apply_weights` must FAIL LOUD naming the
-    /// projections missing their quant group. The old gate-keyed nesting
-    /// silently left the randomly-initialized MLP live (gate quantized,
-    /// up/down dense) or dense-loaded packed sidecar weights unchecked (gate
-    /// dense, up/down quantized). The two happy paths — all-dense and
-    /// all-quantized — must keep loading.
+    /// projections missing their quant group, never leave the
+    /// randomly-initialized MLP live (gate quantized, up/down dense) or
+    /// dense-load packed sidecar weights unchecked (gate dense, up/down
+    /// quantized). The two happy paths — all-dense and all-quantized — must
+    /// keep loading.
     #[test]
     fn partial_dense_mlp_quant_group_fails_loud() {
         let json = serde_json::json!({
@@ -1851,12 +1851,12 @@ mod tests {
         run(&params).expect("all-quantized MLP must keep loading");
     }
 
-    /// Round-2 Finding A (scales-only MLP group): if the MLP projections ship
-    /// ONLY their quant sidecars (`.scales`/`.biases`, `.weight` stripped),
-    /// every builder returns `None`, the tuple match lands in the all-dense
-    /// arm, and the dense loads find no `.weight` keys — the load used to
-    /// return Ok with the constructor-RANDOM MLP live. Must fail loud naming
-    /// the orphaned sidecars.
+    /// Scales-only MLP group: if the MLP projections ship ONLY their quant
+    /// sidecars (`.scales`/`.biases`, `.weight` stripped), every builder
+    /// returns `None`, the tuple match lands in the all-dense arm, and the
+    /// dense loads find no `.weight` keys. The load MUST fail loud naming
+    /// the orphaned sidecars rather than leaving the constructor-RANDOM MLP
+    /// live.
     #[test]
     fn scales_only_mlp_group_fails_loud_not_random() {
         let json = serde_json::json!({
@@ -1923,13 +1923,13 @@ mod tests {
         run(&params).expect("all-dense MLP must keep loading");
     }
 
-    /// Round-3 Finding 3 (vision embedding projection): the dense fallback of
+    /// Vision embedding projection: the dense fallback of
     /// `embed_vision.embedding_projection` must be dtype-guarded. When the
     /// `.scales` sidecar is stripped, the quantized branch (keyed on `.scales`
-    /// presence) is skipped and the packed Uint32 `.weight` used to route
+    /// presence) is skipped and the packed Uint32 `.weight` would route
     /// straight into `set_weight` — the shape can validate while the dtype is
-    /// garbage. Must fail loud naming the key; a bf16 dense weight keeps
-    /// loading.
+    /// garbage. The load MUST fail loud naming the key; a bf16 dense weight
+    /// keeps loading.
     #[test]
     fn vision_embedding_projection_stripped_sidecar_fails_loud() {
         let json = serde_json::json!({
@@ -1998,11 +1998,11 @@ mod tests {
         run(&params).expect("bf16 dense projection must keep loading");
     }
 
-    /// Round-2 Finding A (validator side): `validate_required_weights`' `has()`
-    /// no longer treats a lone `.scales` as satisfying a required `.weight`.
-    /// Every quant format stores its payload under the `.weight` key (packed
-    /// Uint32 / fp8 / int8) with `.scales` as a SIDECAR, so a well-formed
-    /// quantized checkpoint still passes the strict check, while a scales-only
+    /// Validator side: `validate_required_weights`' `has()` does not treat a
+    /// lone `.scales` as satisfying a required `.weight`. Every quant format
+    /// stores its payload under the `.weight` key (packed Uint32 / fp8 /
+    /// int8) with `.scales` as a SIDECAR, so a well-formed quantized
+    /// checkpoint still passes the strict check, while a scales-only
     /// (stripped `.weight`) group is reported missing instead of loading as
     /// constructor-random weights downstream.
     #[test]
@@ -2071,7 +2071,7 @@ mod tests {
         );
     }
 
-    /// Round-2 Finding C (MoE expert dense fallback): `try_build_qsl` returns
+    /// MoE expert dense fallback: `try_build_qsl` returns
     /// `Ok(None)` when `.scales` is absent, so a stripped expert quant group
     /// reaches the dense fallback — including the BARE HF fused key form
     /// (`layers.N.experts.gate_up_proj`, no `.weight` suffix), which is
@@ -2244,8 +2244,8 @@ mod tests {
         let before = unsafe { mlx_sys::mlx_lfm2_get_model_id() };
         assert_eq!(before, SENTINEL, "sentinel id publish failed");
 
-        // Load Gemma4 via the sync inner loader — the exact path that used to
-        // register weights / publish a model id.
+        // Load Gemma4 via the sync inner loader — the path that registers
+        // weights, to confirm it does not publish a compiled model id.
         let loaded = Gemma4Inner::load_from_dir(&model_path);
 
         let after = unsafe { mlx_sys::mlx_lfm2_get_model_id() };

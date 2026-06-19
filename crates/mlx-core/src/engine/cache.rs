@@ -91,7 +91,7 @@ pub(crate) fn build_paged_extra_keys(
 /// `drop_last_always` selects the trailing-token policy, which depends on
 /// whether the decode driver forwarded the final committed token into the
 /// physical cache:
-/// - Legacy macro cores: callers pass `drop_last_always = !last_token_in_cache`.
+/// - MTP/macro cores: callers pass `drop_last_always = !last_token_in_cache`.
 ///   The `decode_loop!` / `decode_loop_mtp!` macros do NOT always forward the
 ///   stop token before checking it — the AR loop skips the forward on its final
 ///   step (incl. `max_new_tokens == 1`), and the MTP loop's pre-forward seed
@@ -168,7 +168,7 @@ pub(crate) fn save_cache_state_direct<C>(
 ///
 /// `drop_last_always` has the same meaning as in [`save_cache_state_direct`]:
 /// `true` (generic `run_decode_loop` flow) drops the never-forwarded final
-/// token on every exit; legacy macro cores pass `!last_token_in_cache`, which
+/// token on every exit; the MTP/macro cores pass `!last_token_in_cache`, which
 /// drops the terminal token when the macro stopped on an unforwarded token
 /// (final-step AR stop, MTP seed / Step-A stop) OR the finish reason is
 /// `length`.
@@ -230,10 +230,10 @@ pub(crate) fn save_cache_state_after_delta<C>(
 /// a prefix count less than `cached.len()`) MUST simultaneously ensure the
 /// caller either (a) restricts the relaxation to pure-KVCache models or
 /// (b) introduces GDN-state checkpointing to enable mid-sequence rewinds.
-/// Neither has been done — the invariant here is the sole reason the
-/// refactor that moved `reset_caches_sync()` from the outer session-start
-/// path into the `cached_prefix_len == 0` (miss) branch of the session
-/// turn core is safe for Qwen3.5 Dense and MoE.
+/// Neither has been done — the invariant here is the sole reason it is
+/// safe for Qwen3.5 Dense and MoE to run `reset_caches_sync()` only in
+/// the `cached_prefix_len == 0` (miss) branch of the session turn core
+/// rather than unconditionally on the session-start path.
 ///
 /// ## Sanctioned exception (pure-KV only): qwen3 flat exact-match rewind
 ///
@@ -286,14 +286,14 @@ pub(crate) fn verify_cache_prefix_direct(
 #[cfg(test)]
 mod save_cache_state_after_delta_tests {
     //! Guards the sticky-`cached_image_key` invariant on the text-only
-    //! delta path. Before the fix, `save_cache_state_direct(has_images:
-    //! false, ...)` was called after every delta continuation, which
-    //! cleared `cached_image_key` even though the live KV cache still
-    //! encoded the prior prefill's image attention state. That
-    //! contradicted the TS `ChatSession` routing contract (warm cache
-    //! across text-only follow-ups) and caused the delta path to fail
-    //! with a cryptic "chat_tokens_delta_sync is text-only; session
-    //! currently holds image state" on the very next turn.
+    //! delta path. Calling `save_cache_state_direct(has_images: false,
+    //! ...)` after a delta continuation would clear `cached_image_key`
+    //! even though the live KV cache still encodes the prior prefill's
+    //! image attention state — contradicting the TS `ChatSession` routing
+    //! contract (warm cache across text-only follow-ups) and making the
+    //! delta path fail with a cryptic "chat_tokens_delta_sync is
+    //! text-only; session currently holds image state" on the next turn.
+    //! [`save_cache_state_after_delta`] preserves the key instead.
     use super::{save_cache_state_after_delta, save_cache_state_direct};
 
     /// Stand-in cache element. The helper's reuse_cache=false branch only
@@ -479,10 +479,9 @@ mod save_cache_state_after_delta_tests {
 
     #[test]
     fn direct_legacy_false_keeps_terminal_token_on_non_length_stop() {
-        // Legacy-macro contract (drop_last_always = false): the macro cores
+        // Macro-core contract (drop_last_always = false): the macro cores
         // forward the EOS/stop token BEFORE the stop check, so it IS in the
-        // cache and must be KEPT on a non-`length` finish. This pins that the
-        // false path is unchanged by Fix 1.
+        // cache and must be KEPT on a non-`length` finish.
         let mut cached_history: Vec<u32> = vec![];
         let mut cached_image_key: Option<u64> = None;
         let mut cached_rope_deltas: Option<i32> = None;
@@ -509,7 +508,7 @@ mod save_cache_state_after_delta_tests {
 
     #[test]
     fn direct_unforwarded_stop_drops_trailing_token() {
-        // Legacy-macro contract for an UNFORWARDED stop token: when the macro
+        // Macro-core contract for an UNFORWARDED stop token: when the macro
         // stops on a token it never forwarded into the physical KV/GDN cache
         // (final-step AR stop, or the MTP seed / Step-A stop arms), the caller
         // passes `drop_last_always = !last_in_cache` with `last_in_cache =
@@ -550,14 +549,13 @@ mod save_cache_state_after_delta_tests {
 mod verify_cache_prefix_invariant_tests {
     //! Guards the all-or-nothing return-value invariant of
     //! `verify_cache_prefix_direct` documented on its rustdoc. The Qwen3.5
-    //! chat_session_start refactor — which moves the unconditional
-    //! `reset_caches_sync()` out of the outer session-start path and
-    //! relies on verify returning either `0` or the full cached length
-    //! to drive the in-core reset-on-miss branch — is **only** safe as
-    //! long as this function never returns a mid-sequence prefix length.
-    //! A regression here would silently let the caller resume decoding on
-    //! a GDN recurrent state that no longer corresponds to the token
-    //! prefix in the KV cache, corrupting every generated token.
+    //! chat_session_start path runs `reset_caches_sync()` only in the
+    //! in-core reset-on-miss branch and relies on verify returning either
+    //! `0` or the full cached length — which is **only** safe as long as
+    //! this function never returns a mid-sequence prefix length. A
+    //! regression here would silently let the caller resume decoding on a
+    //! GDN recurrent state that no longer corresponds to the token prefix
+    //! in the KV cache, corrupting every generated token.
     use super::verify_cache_prefix_direct;
 
     #[test]

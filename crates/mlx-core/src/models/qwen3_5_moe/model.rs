@@ -66,8 +66,8 @@ fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
 /// the eager gate is on (`MLX_QWEN35_MTP_EAGER` + an MTP head + no paged
 /// adapter + text-only) and the C++ compiled path is disabled. Mirrors the
 /// dense eager arm's `MtpOps` closures 1:1, substituting the MoE eager
-/// forward primitives and the MoE drafter (`Qwen3_5MoeMTPModule`). Keeps the
-/// legacy cycle-history policy (`committed_history_active: false`, no-op
+/// forward primitives and the MoE drafter (`Qwen3_5MoeMTPModule`). Uses the
+/// cycle-history policy (`committed_history_active: false`, no-op
 /// `commit_mtp`/`rollback_unemitted`) to match the MoE compiled arm's
 /// acceptance — its C++ `begin_cycle` likewise zeroes the MTP cache each
 /// cycle. The main-cache rollback uses the shared pure-Rust GDN tape replay.
@@ -364,8 +364,8 @@ macro_rules! moe_eager_mtp_decode {
                     }
                     Ok(())
                 },
-                // Committed-history is dense-only; the MoE eager path keeps the
-                // legacy cycle-history policy, so the commit hook is a no-op.
+                // Committed-history is dense-only; the MoE eager path uses the
+                // cycle-history policy, so the commit hook is a no-op.
                 commit_mtp: |_anchor: mtp_decode::MtpCommitAnchor,
                              _seed_hidden: &MxArray,
                              _verify_hiddens: &MxArray,
@@ -639,7 +639,7 @@ pub(crate) struct Qwen35MoeInner {
     /// profiler relabel, which must pick the `moe_chat_*` vs
     /// `moe_chat_stream_*` label family (`TurnSetup` does not carry
     /// streaming-ness). Whole-turn override paths (vision/paged/MTP)
-    /// never consult it. Mirrors the dense S8 field.
+    /// never consult it. Mirrors the dense `turn_is_streaming` field.
     turn_is_streaming: Cell<bool>,
     /// Parsed `generation_config.json` sampling/stop defaults for this
     /// checkpoint. Folded under any explicit per-request value: a request
@@ -666,8 +666,8 @@ pub(crate) enum Qwen35MoeCmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    /// Training-session commands, nested verbatim from the model-neutral
-    /// engine (P7c). The thread loop routes these to
+    /// Training-session commands shared with the model-neutral engine. The
+    /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35MoeInner`].
     Train(TrainCmd),
@@ -781,15 +781,14 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
 }
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
-/// `decode_loop!` / `decode_loop_mtp!` macros (and the legacy streaming
-/// cores kept behind the whole-turn probes) expect from a
+/// `decode_loop!` / `decode_loop_mtp!` macros (and the streaming
+/// cores behind the whole-turn probes) expect from a
 /// `ThreadsafeFunction`-like callback.
 ///
-/// Pre-S9 this wrapped the raw `StreamTx`; the engine now owns the
-/// channel and hands the probes a `&dyn ChunkSink`, so the wrapper
-/// forwards `.call()` to [`ChunkSink::send`] (the call mode is
-/// meaningless on the mpsc path and is dropped, exactly like the old
-/// `StreamTx` wrapper did). Mirrors the dense S8 adapter.
+/// The engine owns the channel and hands the probes a `&dyn ChunkSink`,
+/// so the wrapper forwards `.call()` to [`ChunkSink::send`]; the call
+/// mode is meaningless on the mpsc path and is dropped. Mirrors the
+/// dense `StreamSender` adapter.
 struct StreamSender<'a>(&'a dyn ChunkSink);
 
 impl StreamSender<'_> {
@@ -1413,7 +1412,7 @@ impl Qwen35MoeInner {
     /// `vision_turn` (image-bearing) and `mtp_turn` (MTP-enabled)
     /// probes. The engine already rendered the prompt (`tokens`) and
     /// extracted the raw image payloads (`images`); everything from the
-    /// paged dispatch onward is the legacy pipeline, byte-for-byte.
+    /// paged dispatch onward runs the whole-turn pipeline.
     /// `eos_token_id` is the caller-supplied stop-on token id (typically
     /// `<|im_end|>`) so the cached history ends on a clean ChatML
     /// boundary, yielding a reusable prefix for subsequent session
@@ -1852,8 +1851,8 @@ impl Qwen35MoeInner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // P2: thinking resolved ONCE at turn entry (was a hardcoded
-        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
@@ -1886,15 +1885,15 @@ impl Qwen35MoeInner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
         // reads the PRE-turn live state, so probe the adapter immutably FIRST
         // (prepare_turn mutates request_tokens via continue_turn/reset). The
         // adapter re-reads the same state internally, so live_* is identical to
         // what prepare_turn decides on. extra_keys=&[] (uniform API) is bit-equal
-        // to the old per-block `&lookup_extra_keys` for text-only dispatch
-        // (all-empty per-block vec → identical hashes; see the block_size
-        // comment above). reuse_cache=true: the hand-rolled can_continue had no
-        // reuse term. Suffix blocks are allocated inside prepare_turn.
+        // to `&lookup_extra_keys` for text-only dispatch (all-empty per-block
+        // vec → identical hashes; see the block_size comment above).
+        // reuse_cache=true: continuation eligibility carries no reuse term.
+        // Suffix blocks are allocated inside prepare_turn.
         {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_sync_core: paged_adapter is None")
@@ -2217,8 +2216,8 @@ impl Qwen35MoeInner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // P2: thinking resolved ONCE at turn entry (was a hardcoded
-        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
@@ -2251,8 +2250,8 @@ impl Qwen35MoeInner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // P3: adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
-        // the full byte-identity rationale: pre-turn immutable probe for the
+        // Adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
+        // the full bit-identity rationale: pre-turn immutable probe for the
         // trace, extra_keys=&[] bit-equal to per-block for text-only,
         // reuse_cache=true, suffix blocks allocated internally).
         {
@@ -2805,8 +2804,8 @@ impl Qwen35MoeInner {
     /// engine's `vision_turn` (image-bearing) and `mtp_turn`
     /// (MTP-enabled) probes. The engine already rendered the prompt
     /// (`tokens`) and extracted the raw image payloads (`images`);
-    /// everything from the paged dispatch onward is the legacy
-    /// pipeline, byte-for-byte. `eos_token_id` is the caller-supplied
+    /// everything from the paged dispatch onward runs the whole-turn
+    /// pipeline. `eos_token_id` is the caller-supplied
     /// stop-on token id (typically `<|im_end|>`) so the cached history
     /// ends on a clean ChatML boundary, yielding a reusable prefix for
     /// subsequent session deltas.
@@ -3298,7 +3297,7 @@ impl Qwen35MoeInner {
     /// the next turn. Cache save runs unconditionally at the end so the
     /// session stays consistent even on error. The engine's delta guards
     /// already enforce the session preconditions; the checks here are
-    /// kept verbatim as defense-in-depth for the `mtp_turn` caller.
+    /// defense-in-depth for the `mtp_turn` caller.
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
@@ -5641,29 +5640,29 @@ impl Qwen35MoeInner {
 
 impl Qwen35MoeInner {
     /// Whole-turn MoE dispatch behind the engine's `vision_turn` and
-    /// `mtp_turn` probes (S9).
+    /// `mtp_turn` probes.
     ///
-    /// Routes the four turn shapes onto the kept legacy cores VERBATIM:
+    /// Routes the four turn shapes onto the whole-turn cores:
     /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
     /// [`Self::chat_tokens_delta_sync`], fresh streaming →
     /// [`Self::vision_mtp_whole_turn_stream_core`], delta streaming →
-    /// [`Self::chat_stream_tokens_delta_sync_inner`]. The kept cores own
+    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every MoE-path subtlety the generic flow does not model: VLM
     /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
     /// AR), the paged-always-wins dispatch (including the
     /// paged-text-only rejection for image turns — unlike dense, MoE
     /// has NO `mtp_takes_dense_path` exception: its paged early-return
-    /// runs before any MTP consideration on every legacy path).
+    /// runs before any MTP consideration on every path).
     ///
     /// Delta turns recover the raw delta from the engine-composed
     /// `args.tokens` (`cached_history + delta` by construction — the
     /// probes run before any state mutation).
     fn moe_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Fold generation_config.json defaults into the config the legacy
-        // VLM/MTP cores re-extract params from, so they honor the same
-        // sampling defaults as the generic AR path (whose `args.params`
-        // already had them applied via `resolve_params`). No-op when the
-        // checkpoint ships no defaults (`gen_defaults` all-None).
+        // Fold generation_config.json defaults into the config the VLM/MTP
+        // cores re-extract params from, so they honor the same sampling
+        // defaults as the generic AR path (whose `args.params` already had
+        // them applied via `resolve_params`). No-op when the checkpoint ships
+        // no defaults (`gen_defaults` all-None).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
         let thinking = args.thinking;
@@ -5714,8 +5713,8 @@ impl Qwen35MoeInner {
 }
 
 /// Per-turn decode stepper for the engine's generic (text-only,
-/// non-paged, non-MTP) flow on Qwen3.5 MoE (S9,
-/// [`ChatBackend::begin_decode`]).
+/// non-paged, non-MTP) flow on Qwen3.5 MoE
+/// ([`ChatBackend::begin_decode`]).
 ///
 /// Drives the pure-Rust `forward_inner` over the flat caches.
 pub(crate) struct Qwen35MoeDecode<'a> {
@@ -5822,15 +5821,14 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token` (== legacy
-        // `paged_turn_sync_core_inner`'s `y.eval()`). Restores decode parity
-        // with the legacy core (which also `y.eval()`'d after each sample).
+        // Single SYNCHRONOUS eval of `next_token`: one `y.eval()` per sample
+        // is the cheapest correct cadence for the bandwidth-bound paged
+        // forward.
         next_token.eval();
     }
 
     fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the legacy paged loops' per-step
-        // `maybe_clear_cache_for_paged_step(step)`.
+        // Per-step paged cache-clear cadence.
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
 
@@ -5884,8 +5882,8 @@ impl PagedBackend for Qwen35MoeInner {
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        // == the `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block at the
-        // head of the legacy `paged_turn_sync_core` (~1924-2012).
+        // The `prepare_turn_…` + `prepare_moe_gdn_prefix_state` block that
+        // opens a MoE paged turn.
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
         // vLLM exact-prefix cap: leave at least one prompt token to prefill so
@@ -5907,13 +5905,13 @@ impl PagedBackend for Qwen35MoeInner {
         // would replace the empty positions with real (token_pos, image_hash).
         let lookup_extra_keys = engine::build_paged_extra_keys(plan.len(), block_size, &[]);
 
-        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
         // reads the PRE-turn live state, so probe the adapter immutably FIRST
         // (prepare_turn mutates request_tokens via continue_turn/reset). The
         // adapter re-reads the same state internally, so live_* is identical to
-        // what prepare_turn decides on. reuse_cache=true literal: the legacy
-        // hand-rolled `can_continue` had no reuse term (the engine's reuse_cache
-        // drives finalize/save instead). Suffix blocks are allocated inside
+        // what prepare_turn decides on. reuse_cache=true literal: continuation
+        // eligibility carries no reuse term (the engine's reuse_cache drives
+        // finalize/save instead). Suffix blocks are allocated inside
         // prepare_turn.
         let live_ready;
         let live_prefix_match;
@@ -5977,9 +5975,9 @@ impl PagedBackend for Qwen35MoeInner {
             continued_live_prefix,
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        // Clear the per-turn session state the legacy core cleared here (history
-        // is re-set in `save_paged_history`; rope deltas + image key are reset
-        // because the paged path does not carry them across turns).
+        // Clear the per-turn session state here (history is re-set in
+        // `save_paged_history`; rope deltas + image key are reset because the
+        // paged path does not carry them across turns).
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -6002,13 +6000,13 @@ impl PagedBackend for Qwen35MoeInner {
         prefix: &Self::PrefixState,
         _stream: Stream,
     ) -> Result<MxArray> {
-        // == the prefill block of the legacy `paged_turn_sync_core_inner`
-        // (~2128-2162). `run_paged_prefill_chunk` writes K/V into the adapter
-        // pool, populates the GDN linear caches, runs the GDN pre-pass over the
-        // cached prefix from `full_tokens` (skipped when `gdn_prefix_already_primed`),
-        // then the full forward over the suffix, folding in the last-token slice
-        // (returns `[vocab]`). The engine fires the post-prefill
-        // `synchronize_and_clear_cache` AFTER this returns (NOT here).
+        // The paged prefill block. `run_paged_prefill_chunk` writes K/V into
+        // the adapter pool, populates the GDN linear caches, runs the GDN
+        // pre-pass over the cached prefix from `full_tokens` (skipped when
+        // `gdn_prefix_already_primed`), then the full forward over the suffix,
+        // folding in the last-token slice (returns `[vocab]`). The engine
+        // fires the post-prefill `synchronize_and_clear_cache` AFTER this
+        // returns (NOT here).
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
             |i| self.config.is_linear_layer(i),
@@ -6047,12 +6045,12 @@ impl PagedBackend for Qwen35MoeInner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // == the legacy paged core's terminal lifecycle block (~2036-2052).
-        // Success: keep the request live across turns when reuse is on, using
-        // PER-BLOCK extra keys (NOT qwen3's empty `&[]`), so the next turn's
-        // continue builds on the partial trailing block's live K/V; otherwise
-        // register full blocks for reuse + release. Infallible (`let _ =` every
-        // call — a teardown failure must not mask the turn result).
+        // Terminal lifecycle block of a paged turn. Success: keep the request
+        // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
+        // qwen3's empty `&[]`), so the next turn's continue builds on the
+        // partial trailing block's live K/V; otherwise register full blocks
+        // for reuse + release. Infallible (`let _ =` every call — a teardown
+        // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
                 let total_for_finalize = adapter.request_tokens().len();
@@ -6068,10 +6066,9 @@ impl PagedBackend for Qwen35MoeInner {
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown == the legacy paged core's `Err(e) =>
-        // release_request()` arm (~2046-2049): release fully, partial
-        // block_table state is unsafe to keep. Release ONLY — never register /
-        // keep live. Infallible (`let _ =` — must not mask the turn's error).
+        // Error-path teardown: release fully, partial block_table state is
+        // unsafe to keep. Release ONLY — never register / keep live. Infallible
+        // (`let _ =` — must not mask the turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -6101,8 +6098,7 @@ impl PagedBackend for Qwen35MoeInner {
         // the LAST sampled token (the engine's forward gate skips it AND
         // `materialize_final` is a no-op for moe), so the last `generated` entry
         // is NOT in the adapter / GDN caches and must be dropped to keep the
-        // saved history aligned with the live cache state. This is the verbatim
-        // ordering of the legacy `paged_turn_sync_core` tail (~2054-2065):
+        // saved history aligned with the live cache state. Ordering:
         // finalize → set history (drop-last, last_token_in_cache=false) → GDN
         // checkpoint → clear image key. PRESERVE THIS EXACT ORDER — it is the
         // most delicate part for T=0 byte-equality.
@@ -6121,9 +6117,9 @@ impl PagedBackend for Qwen35MoeInner {
         // GDN history checkpoint — must run AFTER the history is set (it
         // snapshots the live recurrent caches keyed on `cached_token_history`),
         // BEFORE clearing the image key. A checkpoint/eval failure here PROPAGATES
-        // (`?`) to abort the turn, matching the legacy core: a half-snapshotted or
-        // failed-eval GDN state must NOT be published as a reusable warm-continue
-        // checkpoint, or the next turn reads corrupt recurrent state.
+        // (`?`) to abort the turn: a half-snapshotted or failed-eval GDN state
+        // must NOT be published as a reusable warm-continue checkpoint, or the
+        // next turn reads corrupt recurrent state.
         let store = self.remember_moe_gdn_history_checkpoint()?;
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
@@ -6220,12 +6216,11 @@ impl ChatBackend for Qwen35MoeInner {
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         match scope {
-            // == the legacy inline miss-branch reset in the deleted MoE
-            // cores: reset each live layer cache, then install a fresh
-            // hybrid cache vec. PRESERVES `cached_token_history` /
+            // Prefix-miss reset: reset each live layer cache, then install a
+            // fresh hybrid cache vec. PRESERVES `cached_token_history` /
             // `cached_image_key` / `cached_rope_deltas` (the end-of-turn
             // save overwrites them) and the GDN checkpoints (paged-path
-            // state the flat reset never touched).
+            // state the flat reset never touches).
             ResetScope::PrefixMiss => {
                 if let Some(ref mut caches) = self.caches {
                     for cache in caches.iter_mut() {
@@ -6235,8 +6230,8 @@ impl ChatBackend for Qwen35MoeInner {
                 self.caches = Some(fresh_moe_layer_caches(&self.config));
                 Ok(())
             }
-            // == the legacy `reset_caches_sync` (full clear including
-            // history, image key, rope deltas, GDN checkpoints).
+            // Full clear including history, image key, rope deltas, GDN
+            // checkpoints, via `reset_caches_sync`.
             //
             // The EXPLICIT command reset must additionally restore a
             // fully COLD paged state. `reset_caches_sync` does not touch
@@ -6248,8 +6243,8 @@ impl ChatBackend for Qwen35MoeInner {
             // (`find_cached_prefix_per_block_with_max_tokens` ->
             // `find_longest_cache_hit`) instead of the cold full prefill,
             // a different bf16 reduction order that can flip a greedy
-            // near-tie (codex S12 finding on the lfm2 sibling;
-            // qwen3_5_moe shares the identical adapter lifecycle). One
+            // near-tie (observed on the lfm2 sibling; qwen3_5_moe shares
+            // the identical adapter lifecycle). One
             // call both releases the live request and purges every
             // prefix-cache entry. `ResetScope::PrefixMiss` (turn-internal)
             // keeps the prefix cache: cross-request block reuse after a
@@ -6273,8 +6268,8 @@ impl ChatBackend for Qwen35MoeInner {
     /// All-or-nothing prefix match (NO exact-match rewind — the 30 GDN
     /// linear-attention layers carry a recurrent state that cannot
     /// rewind one slot; the engine's exact-match-as-miss handling
-    /// reproduces the legacy zero-delta guard's full reset +
-    /// re-prefill). Text-only by construction: the generic flow never
+    /// performs a full reset + re-prefill on a zero-delta hit).
+    /// Text-only by construction: the generic flow never
     /// carries images (the vision probe owns those turns), so the
     /// expanded-token / image-key inputs collapse to the plain prompt.
     fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
@@ -6343,18 +6338,17 @@ impl ChatBackend for Qwen35MoeInner {
         // No post-prefill cache sync on the MoE reference paths:
         // `chunked_prefill` evals internally per chunk and the decode
         // loop schedules async evals. A blocking sync here would
-        // introduce a stall the legacy paths never paid.
+        // introduce an unnecessary stall.
         Ok(())
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        // Byte-identical port of the deleted MoE cores' text-only
-        // prefill block (the engine's reset-or-delta split already ran;
-        // `self.caches` holds either fresh caches or the live session
+        // Text-only prefill block (the engine's reset-or-delta split already
+        // ran; `self.caches` holds either fresh caches or the live session
         // state). Unlike dense, the MoE `chunked_prefill` returns the
-        // full `[1, seq, vocab]` logits — the legacy callers sliced the
-        // last position inline, so the slice+squeeze folds in here (the
-        // engine's prefill contract is last-token logits).
+        // full `[1, seq, vocab]` logits, so the slice+squeeze to the last
+        // position folds in here (the engine's prefill contract is
+        // last-token logits).
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let prompt = MxArray::from_uint32(prompt_tokens, &[1, prompt_tokens.len() as i64])?;
@@ -6382,7 +6376,7 @@ impl ChatBackend for Qwen35MoeInner {
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
         // NOTE: no decode-entry `info!` trace here — unlike dense, the
-        // legacy MoE cores never logged a "chat_decode entry" line.
+        // MoE path does not log a "chat_decode entry" line.
         let is_streaming = self.turn_is_streaming.get();
 
         let embedding_weight = self.embedding.get_weight();
@@ -6408,18 +6402,16 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn supports_images(&self) -> bool {
-        // Unconditionally true (S9 policy, mirrors dense S8): the vision
-        // probe owns ALL image-bearing fresh turns; a checkpoint loaded
-        // without the vision encoder/processor surfaces the legacy "VLM
-        // prefill requested but vision encoder/processor not loaded" /
-        // "Qwen3.5 MoE paged dispatch is text-only" errors from inside
-        // the kept cores, exactly like today.
+        // Unconditionally true (mirrors dense): the vision probe owns ALL
+        // image-bearing fresh turns; a checkpoint loaded without the vision
+        // encoder/processor surfaces the "VLM prefill requested but vision
+        // encoder/processor not loaded" / "Qwen3.5 MoE paged dispatch is
+        // text-only" errors from inside the whole-turn cores.
         true
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
-        // == the legacy per-turn `WiredLimitContext::new(
-        // config.estimate_memory_bytes(), …)`.
+        // Per-turn wired-memory limit = the model's estimated footprint.
         Some(self.config.estimate_memory_bytes() as usize)
     }
 
@@ -6439,8 +6431,8 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn has_live_session(&self) -> bool {
-        // Legacy delta guard: `self.caches.is_none()` → "requires an
-        // initialized session".
+        // Delta guard: `self.caches.is_none()` means there is no
+        // initialized session to continue.
         self.caches.is_some()
     }
 
@@ -6460,8 +6452,8 @@ impl ChatBackend for Qwen35MoeInner {
         // `run_paged_turn`, which drives the adapter lifecycle via
         // [`PagedBackend`] and reuses the shared `run_decode_loop`. The
         // `paged_turn_sync_core`/`paged_turn_stream_core` cores are
-        // retained as the routing target for the vision/MTP(+delta)
-        // cores' internal `paged_adapter.is_some()` early-returns:
+        // the routing target for the vision/MTP(+delta) cores' internal
+        // `paged_adapter.is_some()` early-returns:
         // image-bearing and MTP turns enter via `vision_turn`/`mtp_turn`
         // and never reach this probe.
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
@@ -6479,10 +6471,9 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // The probe is gated on `!images.is_empty()`; the kept MoE cores
-        // own the full legacy image pipeline (VLM prefill via
-        // `vlm_prefill_moe`, M-RoPE deltas, paged-text-only rejection,
-        // missing-encoder error).
+        // The probe is gated on `!images.is_empty()`; the MoE cores own
+        // the full image pipeline (VLM prefill via `vlm_prefill_moe`,
+        // M-RoPE deltas, paged-text-only rejection, missing-encoder error).
         Some(self.moe_whole_turn(args))
     }
 }
@@ -7176,11 +7167,10 @@ fn vlm_prefill_moe(
 
 #[cfg(test)]
 mod prefix_cache_reuse_integration_tests {
-    //! End-to-end tests for the prefix KV cache reuse refactor on
-    //! Qwen3.5 MoE. These verify that the session-start path (the
-    //! engine's `session_start` since S9) no longer
-    //! unconditionally wipes the cache — stateless agent clients that
-    //! resend the full transcript on every turn should hit the
+    //! End-to-end tests for prefix KV cache reuse on Qwen3.5 MoE. These
+    //! verify that the session-start path (the engine's `session_start`)
+    //! does not unconditionally wipe the cache — stateless agent clients
+    //! that resend the full transcript on every turn should hit the
     //! `verify_cache_prefix_direct` exact-append path and skip redundant
     //! prefill work.
     //!

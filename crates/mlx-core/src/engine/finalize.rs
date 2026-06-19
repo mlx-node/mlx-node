@@ -26,11 +26,10 @@ use crate::tools;
 /// continue a session that never initialized. The exception also
 /// re-throws to the caller so the failure is observable.
 ///
-/// Important: historically this helper emitted a fake `done: true`
-/// `ChatStreamChunk` with `finish_reason: "error"`, which the TS side
-/// treated as a successful final chunk and caused the session to
-/// advance to a bricked turn 1. Do NOT reintroduce that pattern —
-/// guard failures MUST come through as `Err` so the error path is
+/// Important: do NOT emit a fake `done: true` `ChatStreamChunk` with
+/// `finish_reason: "error"` here. The TS side would treat it as a
+/// successful final chunk and advance the session to a bricked turn 1.
+/// Guard failures MUST come through as `Err` so the error path is
 /// exercised.
 pub(crate) fn send_stream_error(stream_tx: &StreamTx<ChatStreamChunk>, message: &str) {
     let _ = stream_tx.send(Err(napi::Error::from_reason(message.to_string())));
@@ -394,12 +393,10 @@ mod tests {
     fn test_raw_text_fallback_mixed_unmatched_tag() {
         // Regression: an UNMATCHED `<think>` opener appearing BEFORE a valid
         // `<longcat_think>…</longcat_think>` block must NOT prevent the longcat
-        // reasoning from being stripped. The earlier hand-rolled scanner picked
-        // the earliest opener of either family and bailed when it had no close,
-        // leaking the later block. Delegating to `tools::parse_thinking` (which
-        // checks each tag family separately) strips the longcat block while
-        // leaving the stray `<think>` literal — exactly matching the parsed
-        // `thinking` boundary, so no reasoning CONTENT leaks.
+        // reasoning from being stripped. `tools::parse_thinking` checks each tag
+        // family separately, so it strips the longcat block while leaving the
+        // stray `<think>` literal — exactly matching the parsed `thinking`
+        // boundary, so no reasoning CONTENT leaks.
         let text = "prefix <think> literal <longcat_think>secret</longcat_think> suffix";
         let out = raw_text_with_reasoning_suppressed(
             text,
@@ -457,7 +454,7 @@ mod tests {
     #[test]
     fn test_fallback_extracts_standalone_tool_call_after_reasoning() {
         // Companion to the above: a `<tool_call>` OUTSIDE reasoning on the fallback path
-        // is still extracted (the fix isolates reasoning, it does not drop real calls).
+        // is still extracted (isolating reasoning does not drop real calls).
         let text = "<think>let me call it</think>\n<tool_call>{\"name\":\"f\"}</tool_call>";
         let (_clean, calls, _thinking) =
             parse_thinking_and_tools(text, &[101u32, 102, 103], true, None, None, false);
@@ -511,11 +508,11 @@ mod tests {
 
 #[cfg(test)]
 mod compute_performance_metrics_tests {
-    //! `compute_performance_metrics` is a faithful numerator / ttft divider:
-    //! `prefill_tokens_per_second = prefill_tokens_len / (ttft_ms/1000)`. This
-    //! documents that the LFM2-paged telemetry fix (using the full-prompt count
-    //! as the numerator) MUST live at the call site — the divider here applies
-    //! whatever numerator it is given, verbatim. Cheap, deterministic, no GPU.
+    //! `compute_performance_metrics` is a plain numerator / ttft divider:
+    //! `prefill_tokens_per_second = prefill_tokens_len / (ttft_ms/1000)`. The
+    //! numerator choice (e.g. LFM2-paged's full-prompt count) MUST be made at
+    //! the call site — the divider here applies whatever numerator it is given,
+    //! verbatim. Cheap, deterministic, no GPU.
     use super::compute_performance_metrics;
     use std::time::{Duration, Instant};
 
@@ -540,9 +537,9 @@ mod compute_performance_metrics_tests {
             m.prefill_tokens_per_second
         );
 
-        // Suffix-scale numerator (6) -> ~40 tok/s: the exact bogus value the
-        // LFM2-paged bug produced (6 / 0.150). Proves the function is a plain
-        // divider and the numerator is the load-bearing choice.
+        // Suffix-scale numerator (6) -> ~40 tok/s (6 / 0.150). Proves the
+        // function is a plain divider and the numerator is the load-bearing
+        // choice.
         let m_suffix =
             compute_performance_metrics(Some(t0), Some(first_tok), 6, 8).expect("metrics present");
         let expected_suffix = 6.0 / 0.150;
@@ -551,8 +548,8 @@ mod compute_performance_metrics_tests {
             "suffix numerator divides directly: expected ~{expected_suffix:.0}, got {}",
             m_suffix.prefill_tokens_per_second
         );
-        // And the full-prompt value is >5x the suffix value, i.e. the bug
-        // under-reported by exactly the cached-prefix ratio.
+        // And the full-prompt value is >5x the suffix value: a suffix
+        // numerator under-reports by exactly the cached-prefix ratio.
         assert!(
             m.prefill_tokens_per_second > 5.0 * m_suffix.prefill_tokens_per_second,
             "full-prompt tok/s ({}) must be >5x suffix tok/s ({})",

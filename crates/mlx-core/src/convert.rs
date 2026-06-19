@@ -107,13 +107,13 @@ struct ShardedModelIndex {
 /// Each convertible model family describes its convert-time behavior through
 /// one [`ConversionRecipe`] impl plus one registry line in [`recipe_for`].
 /// The recipe owns the family weight transform ([`ConversionRecipe::sanitize`])
-/// and a small set of asymmetry flags that the central convert path used to
-/// compute via scattered per-family `matches!(model_type, ...)` checks.
+/// and a small set of asymmetry flags that the central convert path needs,
+/// replacing scattered per-family `matches!(model_type, ...)` checks.
 ///
 /// SCOPE: this module is the convert seam only. It does not touch the
 /// persistence weight loaders, foreign_weights, gguf, or any quant decision
 /// logic. The recipe transforms must stay byte-identical to the free
-/// `sanitize_*` functions they wrap — convert is pure code-motion here.
+/// `sanitize_*` functions they wrap.
 pub(crate) mod recipe {
     use std::collections::HashMap;
 
@@ -145,18 +145,15 @@ pub(crate) mod recipe {
     ///
     /// The `sanitize` signature is the stable SUPERSET of every family's free
     /// `sanitize_*` fn (weights map, config, target dtype string, tie-embeddings,
-    /// verbose), so a family migrates by a verbatim body-move with no further
-    /// signature change. Families not yet migrated keep delegating to their
-    /// existing free `sanitize_*` fns from the central dispatch until their own
-    /// stage moves them in.
+    /// verbose). Families that have not adopted a recipe delegate to their
+    /// existing free `sanitize_*` fns from the central dispatch.
     pub(crate) trait ConversionRecipe {
         /// The HuggingFace `model_type` strings this recipe handles.
         ///
         /// This is the recipe's self-declared registry coverage. The central
         /// dispatch keys off the exact `model_type` string via [`recipe_for`],
-        /// so this method is consumed by the registry-consistency test (and by
-        /// later P8 stages that validate the registry); it carries no runtime
-        /// dispatch role yet.
+        /// so this method is consumed by the registry-consistency test; it
+        /// carries no runtime dispatch role.
         #[allow(dead_code)]
         fn model_types(&self) -> &'static [&'static str];
 
@@ -305,9 +302,9 @@ pub(crate) mod recipe {
             // Delegate prefix handling to the module-level `normalize_mtp_prefix` so
             // the complete prefix set — including the VLM-wrapped
             // `model.language_model.model.` form — is stripped before the bare-prefix
-            // test. A hand-rolled strip-chain here previously missed that prefix,
-            // letting a key like `model.language_model.model.mtp.…` escape MTP
-            // detection and fall through to the language-model branch.
+            // test. A strip-chain that misses that prefix would let a key like
+            // `model.language_model.model.mtp.…` escape MTP detection and fall
+            // through to the language-model branch.
             let is_mtp_key = |k: &str| -> bool {
                 let bare = normalize_mtp_prefix(k);
                 bare.starts_with("mtp.") || bare.starts_with("mtp_")
@@ -1334,10 +1331,9 @@ pub(crate) mod recipe {
     }
 
     /// Gemma4 (text + vision/audio towers). Thinnest family: post-cast prefix
-    /// strip + expert gate_up split, no FP8/norm-shift/MTP. Migrated in S1 —
-    /// its `sanitize` body is the real transform (set via [`set_gemma4_sanitize`]
-    /// to avoid a circular reference back to the parent module's free fn during
-    /// the move).
+    /// strip + expert gate_up split, no FP8/norm-shift/MTP. Its `sanitize` body
+    /// is the real transform (set via [`set_gemma4_sanitize`] to avoid a
+    /// circular reference back to the parent module's free fn).
     pub(crate) struct Gemma4Recipe;
 
     impl ConversionRecipe for Gemma4Recipe {
@@ -3620,11 +3616,11 @@ pub(crate) fn build_unsloth_recipe(
         // Attention/SSM projections WITHOUT AWQ pre-scaling:
         // o_proj input comes from attention computation (not a norm layer),
         // out_proj input comes from GDN computation.
-        // These cannot be AWQ-corrected. They were previously kept at bf16,
-        // but a plain bf16 `matmul` dispatches a `gemv` kernel at M=1
-        // (sequential AR/Step-A) and a split-K `steel_matmul` at M>=2 (batched
-        // MTP verify) — different reduction order flips argmax on near-ties
-        // and breaks T=0 MTP/AR bit-exactness. Quantizing routes them through
+        // These cannot be AWQ-corrected. They are NOT kept at bf16: a plain
+        // bf16 `matmul` dispatches a `gemv` kernel at M=1 (sequential AR) and a
+        // split-K `steel_matmul` at M>=2 (batched MTP verify) — different
+        // reduction order flips argmax on near-ties and breaks T=0 MTP/AR
+        // bit-exactness. Quantizing routes them through
         // the row-independent `qmv` kernel (bit-identical row 0 at M=1 vs
         // M=4). Use 8-bit affine, group_size 64: the highest-precision affine
         // quantization, keeping `out_proj` (KLD ~6.0 — worst tensor) and
@@ -5330,11 +5326,10 @@ mod tests {
     /// Registry-consistency gate: for the exhaustive set of supported
     /// `model_type` strings (plus a non-convertible control), the four
     /// recipe-sourced asymmetry flags must reproduce EXACTLY the
-    /// `matches!(model_type, ...)` computations the convert path used to run
-    /// inline. `recipe_for` is now the sole authority in `convert_model_inner`
-    /// (the inline matches + their `debug_assert_eq!`s are deleted); this test
-    /// pins the contract those flags must satisfy and exercises `model_types()`
-    /// over every entry in [`recipe::CONVERTIBLE_MODEL_TYPES`].
+    /// `matches!(model_type, ...)` classification of each family. `recipe_for`
+    /// is the sole authority in `convert_model_inner`; this test pins the
+    /// contract those flags must satisfy and exercises `model_types()` over
+    /// every entry in [`recipe::CONVERTIBLE_MODEL_TYPES`].
     #[test]
     fn recipe_registry_reproduces_inline_flags() {
         // Every convertible model_type the central dispatch accepts — the
@@ -5410,15 +5405,13 @@ mod tests {
         assert!(!recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
-    /// S1 byte-faithfulness gate for the gemma4 convert sanitize move. Builds a
-    /// tiny synthetic gemma4 tensor map and asserts the key invariants the
-    /// transform must preserve verbatim after relocation into
-    /// `Gemma4Recipe::sanitize`: HF prefix strip + `language_model.model.`
-    /// re-prefix, fused `experts.gate_up_proj` split into
-    /// `switch_glu.gate_proj`/`up_proj`, `experts.down_proj` rename, tied
-    /// `lm_head.weight` drop, and `rotary_emb` skip. There is no cached gemma4
-    /// HF checkpoint locally, so this in-tree synthetic check (plus the
-    /// verbatim-move guarantee) is the byte-equivalence proof for the move.
+    /// Byte-faithfulness gate for `Gemma4Recipe::sanitize`. Builds a tiny
+    /// synthetic gemma4 tensor map and asserts the key invariants the transform
+    /// must preserve: HF prefix strip + `language_model.model.` re-prefix, fused
+    /// `experts.gate_up_proj` split into `switch_glu.gate_proj`/`up_proj`,
+    /// `experts.down_proj` rename, tied `lm_head.weight` drop, and `rotary_emb`
+    /// skip. There is no cached gemma4 HF checkpoint locally, so this in-tree
+    /// synthetic check is the byte-equivalence proof for the transform.
     #[test]
     fn gemma4_recipe_sanitize_transforms() {
         let f32 = |numel: usize, shape: &[i64]| {
@@ -5513,15 +5506,13 @@ mod tests {
         );
     }
 
-    /// Finding B regression: the `--quantize` refuse-pre-quantized-MTP guard
+    /// The `--quantize` refuse-pre-quantized-MTP guard
     /// (`is_pre_quantized_mtp_key`) must detect MTP `scales`/`biases` under ALL
     /// wrapper depths, including the longest triple-wrap
-    /// `model.language_model.model.`. Before the fix the hand-rolled strip chain
-    /// omitted that variant, so `model.language_model.` stripped first, leaving
-    /// `model.mtp.…` (which doesn't start with `mtp.`) → the guard missed it and
-    /// conversion could emit a corrupt checkpoint (MTP scales retained while the
-    /// body quant config was rewritten). The triple-wrapped case below is THE
-    /// regression — it was FALSE before, must be TRUE now.
+    /// `model.language_model.model.`. If a wrapper variant is missed, the guard
+    /// passes and conversion can emit a corrupt checkpoint (MTP scales retained
+    /// while the body quant config is rewritten). The triple-wrapped case below
+    /// is the one most easily missed by a naive strip chain.
     #[test]
     fn is_pre_quantized_mtp_key_detects_all_wrapper_depths() {
         // Pre-quantized MTP keys across every wrapper depth → TRUE.
@@ -5549,13 +5540,12 @@ mod tests {
 
     /// `remap_qwen35_body_key` must strip ALL wrapper depths via the
     /// authoritative longest-first chain before re-prefixing to the canonical
-    /// mlx-vlm body layout. The triple-wrap case is the round-3 adversarial
-    /// regression: the prior hand-rolled chain stripped only the shorter
-    /// `model.language_model.`, leaving `model.layers.*` → it re-emitted a
-    /// DOUBLED `language_model.model.model.layers.*`.
+    /// mlx-vlm body layout. The triple-wrap case is the trap: a chain that
+    /// strips only the shorter `model.language_model.` leaves `model.layers.*`
+    /// and re-emits a DOUBLED `language_model.model.model.layers.*`.
     #[test]
     fn remap_qwen35_body_key_strips_all_wrapper_depths() {
-        // Round-3 adversarial regression: triple-wrap must NOT double `model.model.`.
+        // Triple-wrap must NOT double `model.model.`.
         assert_eq!(
             remap_qwen35_body_key("model.language_model.model.layers.0.self_attn.q_proj.weight"),
             "language_model.model.layers.0.self_attn.q_proj.weight"
@@ -7474,12 +7464,12 @@ mod tests {
         );
     }
 
-    /// Bugbot finding (PR #68): the coherence pass skipped any member with a
-    /// `.scales` key as "already quantized" WITHOUT requiring a packed
-    /// `.weight`, so an orphaned/half-quantized input member let siblings
-    /// quantize into a mixed group every strict loader rejects. The pass must
-    /// fail loud at CONVERT on such input; a genuinely packed member (non-
-    /// float `.weight` + `.scales`) still counts as quantized.
+    /// The coherence pass must NOT treat any member with a `.scales` key as
+    /// "already quantized" WITHOUT requiring a packed `.weight`: an
+    /// orphaned/half-quantized input member would let siblings quantize into a
+    /// mixed group every strict loader rejects. The pass must fail loud at
+    /// CONVERT on such input; a genuinely packed member (non-float `.weight` +
+    /// `.scales`) still counts as quantized.
     #[test]
     fn sym8_group_coherence_rejects_orphaned_or_half_quantized_member() {
         let hidden = 64i64;
@@ -7598,12 +7588,12 @@ mod tests {
         );
     }
 
-    /// Codex follow-up on the Bugbot fix: the coherence pass was seeded ONLY
-    /// from fresh `QuantEntry`s, but the entry phase skips every `.weight`
-    /// with a `.scales` sibling — so a group whose members are ALL stale
-    /// (half-quantized or orphaned) produced no entry, bypassed the pass
-    /// entirely, and converted into output every strict loader rejects. The
-    /// pass now seeds from on-disk `.scales` sidecars too.
+    /// The coherence pass must seed from on-disk `.scales` sidecars, not only
+    /// from fresh `QuantEntry`s. The entry phase skips every `.weight` with a
+    /// `.scales` sibling, so a group whose members are ALL stale
+    /// (half-quantized or orphaned) produces no entry; seeding only from
+    /// entries would bypass the pass entirely and convert into output every
+    /// strict loader rejects.
     #[test]
     fn sym8_group_coherence_catches_all_stale_groups_without_entries() {
         let hidden = 64i64;
@@ -7681,11 +7671,10 @@ mod tests {
         );
     }
 
-    /// Codex round-2 on the Bugbot fix: an int8+f32-scales member must also
-    /// satisfy the LOAD-time sym8 contract (2-D [N,K], K % 16 == 0, and a
-    /// position that can be sym8 at all) — otherwise convert succeeds while
-    /// `try_build_sym8_quantized_linear` / the lfm2 MoE builders reject the
-    /// output at load.
+    /// An int8+f32-scales member must also satisfy the LOAD-time sym8 contract
+    /// (2-D [N,K], K % 16 == 0, and a position that can be sym8 at all) —
+    /// otherwise convert succeeds while `try_build_sym8_quantized_linear` /
+    /// the lfm2 MoE builders reject the output at load.
     #[test]
     fn sym8_group_coherence_rejects_int8_members_violating_loader_contract() {
         let hidden = 64i64;
@@ -8584,14 +8573,14 @@ mod tests {
 
     #[test]
     fn sanitize_qwen35_moe_fp8_branch_preserves_sym8_scales() {
-        // MIXED checkpoint regression: ONE FP8 pair anywhere flips the
-        // sanitizer into the has_fp8 branch, whose post-dequant cast loop used
-        // to astype EVERY remaining float — including a pre-quantized sym8
-        // pair's mandatory Float32 `.scales` sidecar — to the target dtype.
-        // `try_build_sym8_quantized_linear` hard-rejects non-Float32 scales,
-        // so the emitted checkpoint was unloadable. The FP8 branch must apply
-        // the same `.scales`/`.biases`/quantized-base skips as the non-FP8
-        // branch while still casting ordinary floats and dequantizing FP8.
+        // MIXED checkpoint: ONE FP8 pair anywhere flips the sanitizer into the
+        // has_fp8 branch. Its post-dequant cast loop must NOT astype every
+        // remaining float — a pre-quantized sym8 pair's mandatory Float32
+        // `.scales` sidecar must stay Float32, because
+        // `try_build_sym8_quantized_linear` hard-rejects non-Float32 scales and
+        // the checkpoint would be unloadable. The FP8 branch must apply the
+        // same `.scales`/`.biases`/quantized-base skips as the non-FP8 branch
+        // while still casting ordinary floats and dequantizing FP8.
         let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
 
         let mut weights: HashMap<String, MxArray> = HashMap::new();
@@ -8668,13 +8657,13 @@ mod tests {
         assert_eq!(dq.dtype().expect("dequant dtype"), DType::BFloat16);
     }
 
-    /// Codex round-3 finding: the FP8-branch `.scales` skip preserved
-    /// sym8-shaped sidecars UNCONDITIONALLY, so an Int8 weight whose [N]
-    /// scales arrived as BFloat16/Float16 passed through as-is — and the
-    /// strict sym8 loader (`try_build_sym8_quantized_linear`) rejected the
-    /// output. Half-precision [N] scales next to an Int8 [N,K] weight are
-    /// unambiguous sym8 intent, so they must be NORMALIZED to Float32 (a
-    /// lossless upcast) regardless of the target dtype.
+    /// The FP8-branch `.scales` skip must NOT preserve sym8-shaped sidecars
+    /// unconditionally: an Int8 weight whose [N] scales arrive as
+    /// BFloat16/Float16 would pass through as-is, and the strict sym8 loader
+    /// (`try_build_sym8_quantized_linear`) would reject the output.
+    /// Half-precision [N] scales next to an Int8 [N,K] weight are unambiguous
+    /// sym8 intent, so they must be NORMALIZED to Float32 (a lossless upcast)
+    /// regardless of the target dtype.
     #[test]
     fn sanitize_qwen35_moe_fp8_branch_normalizes_half_precision_sym8_scales() {
         let cfg = serde_json::json!({"num_experts": 2, "num_hidden_layers": 2});
@@ -8807,14 +8796,13 @@ mod tests {
         );
     }
 
-    /// Cursor Bugbot finding on the sym8 classifier wiring: the NON-FP8
-    /// branch's cast loop still blanket-skipped every `.scales` key, so a
-    /// pre-quantized sym8 pair whose [N] scales arrived as BFloat16/Float16
-    /// passed through unnormalized — and the strict sym8 loader
-    /// (`try_build_sym8_quantized_linear`) rejected the output. Half-precision
-    /// [N] scales next to an Int8 [N,K] weight are unambiguous sym8 intent and
-    /// must be NORMALIZED to Float32 (a lossless upcast), exactly like the
-    /// has_fp8 branch.
+    /// On the NON-FP8 branch, a blanket `.scales` skip in the cast loop would
+    /// pass a pre-quantized sym8 pair whose [N] scales arrived as
+    /// BFloat16/Float16 through unnormalized — and the strict sym8 loader
+    /// (`try_build_sym8_quantized_linear`) would reject the output.
+    /// Half-precision [N] scales next to an Int8 [N,K] weight are unambiguous
+    /// sym8 intent and must be NORMALIZED to Float32 (a lossless upcast),
+    /// exactly like the has_fp8 branch.
     #[test]
     fn sanitize_qwen35_moe_nonfp8_branch_normalizes_half_precision_sym8_scales() {
         // NO `weight_scale_inv` key anywhere → has_fp8 = false → the else
@@ -8878,9 +8866,9 @@ mod tests {
     }
 
     /// Malformed sym8-like storage (Int8 weight + Uint8 [N] scales) on the
-    /// NON-FP8 branch: previously silently preserved by the blanket `.scales`
-    /// skip, emitting output every strict loader rejects. Convert must fail
-    /// loud naming the tensor instead.
+    /// NON-FP8 branch must make convert fail loud naming the tensor, rather
+    /// than passing the blanket `.scales` skip and emitting output every strict
+    /// loader rejects.
     #[test]
     fn sanitize_qwen35_moe_nonfp8_branch_rejects_malformed_sym8_scales() {
         // NO `weight_scale_inv` key anywhere → has_fp8 = false.
@@ -9237,7 +9225,7 @@ mod tests {
         assert!(!w.keys().any(|k| is_mtp_key(k)));
     }
 
-    // ── Finding 1 regression: `--q-mtp split` keeps the MTP head BF16 ─────
+    // ── `--q-mtp split` keeps the MTP head BF16 ─────
 
     #[test]
     fn qwen35_recipe_skips_mtp_keys_without_policy_wrapper() {
@@ -9423,11 +9411,10 @@ mod tests {
         assert!(out.contains_key(&format!("{base}.scales")));
     }
 
-    /// Cursor Bugbot finding on the sym8 classifier wiring: the lfm2 Step-3
-    /// cast loop still blanket-skipped every `.scales` key, so a pre-quantized
-    /// sym8 pair whose [N] scales arrived as BFloat16/Float16 passed through
-    /// unnormalized — and the strict sym8 loader
-    /// (`try_build_sym8_quantized_linear`) rejected the output. DENSE fixture
+    /// The lfm2 Step-3 cast loop must NOT blanket-skip every `.scales` key: a
+    /// pre-quantized sym8 pair whose [N] scales arrive as BFloat16/Float16 must
+    /// be normalized, or the strict sym8 loader
+    /// (`try_build_sym8_quantized_linear`) rejects the output. DENSE fixture
     /// (no `num_experts`): the pair sits on a dense feed_forward projection,
     /// so neither the per-expert sidecar reject (scoped to
     /// `feed_forward.experts.*`) nor expert stacking touches it, and the final
@@ -9498,12 +9485,11 @@ mod tests {
     }
 
     /// Malformed sym8-like storage (Int8 weight + Uint8 [N] scales) in the
-    /// lfm2 Step-3 cast loop: previously silently preserved by the blanket
-    /// `.scales` skip, emitting output every strict loader rejects. The
-    /// classifier must fail loud naming the (renamed) tensor. Dense fixture,
-    /// same as above: no earlier guard sees the pair (no `experts.` → no
-    /// per-expert reject; no stacking), so the cast loop is the rejection
-    /// point — the final backstop never runs.
+    /// lfm2 cast loop must fail loud naming the (renamed) tensor rather than
+    /// emitting output every strict loader rejects. Dense fixture, same as
+    /// above: no earlier guard sees the pair (no `experts.` → no per-expert
+    /// reject; no stacking), so the cast loop is the rejection point — the
+    /// final backstop never runs.
     #[test]
     fn sanitize_lfm2_moe_rejects_malformed_sym8_scales() {
         let cfg = serde_json::json!({
@@ -9645,7 +9631,7 @@ mod tests {
         );
     }
 
-    // ── Finding 3 regression: stale legacy sidecar removal in split mode ──
+    // ── stale legacy sidecar removal in split mode ──
 
     #[test]
     fn remove_stale_legacy_mtp_artifacts_removes_all_known_sidecars() {

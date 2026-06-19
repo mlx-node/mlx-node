@@ -483,8 +483,8 @@ mod tests {
             .unwrap()
     }
 
-    // ============================ STAGE 1 ============================
-    // GATE S1: int32 output BIT-EXACT (integer matmul is deterministic).
+    // ===================== int8 GEMM bit-exactness ====================
+    // int32 output is BIT-EXACT (integer matmul is deterministic).
     // M ∈ {128,256,512}, K ∈ {2560,9216}, N ∈ {a tile multiple, a non-multiple}.
     // Tile is 128x64, so N=2560 is a multiple of 64; N=2570 is a non-multiple
     // (exercises the edge/tail tile + the contiguous w^T transpose path).
@@ -555,22 +555,22 @@ mod tests {
         }
     }
 
-    // ====================== STAGE 1b (DECISIVE) ======================
-    // GATE S1b: int32 output BIT-EXACT on PARTIAL tiles — the one open
-    // correctness question for the production `mode::multiply` (overwrite, no
-    // output zero-fill) GEMM (`int8_gemm_core_nofill`).
+    // ============= int8 GEMM bit-exactness on PARTIAL tiles ===========
+    // int32 output is BIT-EXACT on PARTIAL tiles — the correctness question
+    // for the production `mode::multiply` (overwrite, no output zero-fill)
+    // GEMM (`int8_gemm_core_nofill`).
     //
     // `mode::multiply` overwrites C with NO MLX init_value fill, so it is only
     // safe if EVERY in-bounds output element is written exactly once — including
-    // when the 128x64 tile overhangs M (M%128!=0) AND N (N%64!=0). The S1 test
-    // only covers M in {128,256,512} (all %128==0), so the partial-M tile and the
-    // DOUBLE-PARTIAL corner tile (M%128!=0 AND N%64!=0 simultaneously) are
-    // untested there. A garbage tail would surface here as a non-bit-exact
-    // element in the overhang region.
+    // when the 128x64 tile overhangs M (M%128!=0) AND N (N%64!=0). The
+    // full-tile test only covers M in {128,256,512} (all %128==0), so the
+    // partial-M tile and the DOUBLE-PARTIAL corner tile (M%128!=0 AND N%64!=0
+    // simultaneously) are untested there. A garbage tail would surface here as
+    // a non-bit-exact element in the overhang region.
     //
     // M in {300, 1025} (both %128!=0) x N in {2560 (%64==0), 2570 (%64!=0)}
     // x K in {2560, 9216}. M=1025 ^ N=2570 is the double-partial corner.
-    // Same deterministic integer reference as S1.
+    // Same deterministic integer reference as the full-tile test.
     #[test]
     fn s1b_int8_gemm_partial_tiles() {
         if gpu_gen() < 17 {
@@ -610,10 +610,10 @@ mod tests {
                     let got: &[i32] = &got;
                     assert_eq!(got.len(), m * n, "size m={m} k={k} n={n}");
 
-                    // SAME integer reference as S1: ref[m,n] = sum_k x[m,k]*w[n,k].
+                    // SAME integer reference: ref[m,n] = sum_k x[m,k]*w[n,k].
                     // Parallelized over ROW ranges via std::thread::scope (the per-
                     // element integer math is byte-for-byte identical to the serial
-                    // S1 loop; only the iteration is split) so the O(M*N*K) debug
+                    // reference loop; only the iteration is split) so the O(M*N*K) debug
                     // reference for the M=1025/K=9216 corner stays in the seconds,
                     // not minutes. Each thread returns its first-mismatch + count.
                     let nthreads = std::thread::available_parallelism()
@@ -681,17 +681,18 @@ mod tests {
     }
 
     // ====================== v1 FUSED-QUANT PARITY ======================
-    // GATE: the fused activation-quant kernel (v1 kernel 2) must be BIT-IDENTICAL
-    // to the lazy MLX chain it replaces — same int8 bytes AND same f32 s_x.
-    // Exercised over the S2 shapes + a couple of MLP-real shapes, with realistic
-    // bf16 magnitudes (so the per-row absmax / round / clip paths are all hit).
+    // The fused activation-quant kernel (v1 kernel 2) must be BIT-IDENTICAL
+    // to the equivalent lazy MLX chain — same int8 bytes AND same f32 s_x.
+    // Exercised over the projection shapes + a couple of MLP-real shapes, with
+    // realistic bf16 magnitudes (so the per-row absmax / round / clip paths are
+    // all hit).
     #[test]
     fn v1_fused_quant_bit_parity() {
         if gpu_gen() < 17 {
             eprintln!("[v1q] SKIP gpu gen {} < 17", gpu_gen());
             return;
         }
-        // (M, K). K must be %16==0. Mix of S2 shapes + MLP-real + a tail M.
+        // (M, K). K must be %16==0. Mix of projection shapes + MLP-real + a tail M.
         let shapes = [
             (512usize, 2560usize),
             (256, 2560),
@@ -771,7 +772,7 @@ mod tests {
     }
 
     // ====================== v1 FUSED-RESCALE PARITY ======================
-    // GATE: the fused int32->bf16 rescale kernel (v1 kernel 3) must match the
+    // The fused int32->bf16 rescale kernel (v1 kernel 3) must match the
     // lazy multi-pass rescale to bf16 EPS (ideally bit-identical — both do
     // (acc*s_x)*s_w in f32 then narrow to bf16). Realistic acc/scale magnitudes.
     #[test]
@@ -860,9 +861,9 @@ mod tests {
         }
     }
 
-    // ===================== STAGE 4b RESIDUAL PROFILE =====================
-    // Localizes the residual ~18-22% prefill regression after the lazy +
-    // load-time-transpose fixes. Times, at the real Qwen3.5-4B MLP shapes and
+    // ===================== RESIDUAL PROFILE =====================
+    // Localizes the residual ~18-22% prefill regression that remains after the
+    // lazy + load-time-transpose fixes. Times, at the real Qwen3.5-4B MLP shapes and
     // M=4096, the pieces of ONE MLP forward so we can attribute the gap:
     //   * bf16 fused-equivalent (2 matmuls + swiglu) — the BASELINE bar
     //   * int8 full W8A8 MLP (quant+gemm+rescale, both projections)
@@ -1161,7 +1162,7 @@ mod tests {
     // =================== CLEAN PURE-GEMM THROUGHPUT PROFILE ===================
     // DIAGNOSTIC (measurement only). Times the in-engine int8 GEMM with a
     // PRE-TRANSPOSED [K,N] weight (zero per-call transpose) vs bf16 matmul at the
-    // real Qwen3.5-4B MLP shapes, M in {512,4096}. Also times the OLD transpose-
+    // real Qwen3.5-4B MLP shapes, M in {512,4096}. Also times the transpose-
     // contaminated matmul_int8 to quantify the contamination delta. Reports
     // absolute TOPS/TFLOPs = 2*M*N*K / sec / 1e12 + ratios.
     //
@@ -1356,7 +1357,7 @@ mod tests {
     }
 
     // ==================== GDN in_proj_qkvz PARITY ====================
-    // GATE (qkvz int8 wiring): per-ROW cosine >= 0.999 of the int8 W8A8 qkvz
+    // qkvz int8 wiring: per-ROW cosine >= 0.999 of the int8 W8A8 qkvz
     // output vs the bf16 `x @ w_qkvz^T` reference, at realistic GDN shapes.
     // qkvz feeds the GDN conv + recurrence so accuracy is load-bearing.
     //
@@ -1760,17 +1761,17 @@ mod tests {
         }
     }
 
-    // ===================== PHASE 0: sym8 DECODE de-risk =====================
+    // ===================== sym8 DECODE de-risk =====================
     // A sym8 (per-channel symmetric int8) checkpoint routes BOTH prefill AND
     // DECODE through int8_w8a8_matmul — a sym8 weight has NO affine packed form to
-    // fall back to at M=1. This gate answers the two open DECODE questions BEFORE
-    // any convert/loader plumbing (kills the project cheaply if decode is bad):
+    // fall back to at M=1. This profile answers two DECODE questions:
     //   (1) CORRECTNESS at M=1 / tiny M: does int8_w8a8_matmul produce a faithful
-    //       result on a 1-row (partial-tile) activation? (s1b proves bit-exact
-    //       partial tiles; this confirms cosine vs an f32 reference at M=1.)
-    //   (2) DECODE PERF: is sym8-GEMM-at-M=1 within parity of affine qmv (today's
-    //       decode path)? Both stream ~1 byte/weight (BW-bound). A dedicated sym8
-    //       qmv (Phase 6) is justified ONLY if this REGRESSES.
+    //       result on a 1-row (partial-tile) activation? (the partial-tile test
+    //       proves bit-exact partial tiles; this confirms cosine vs an f32
+    //       reference at M=1.)
+    //   (2) DECODE PERF: is sym8-GEMM-at-M=1 within parity of affine qmv (the
+    //       affine decode path)? Both stream ~1 byte/weight (BW-bound). A
+    //       dedicated sym8 qmv is justified ONLY if this REGRESSES.
     // The weight is quantized from the bf16 SOURCE (quantize_weight_int8 = the true
     // Option-B single-quant path), and the affine baseline affine-quantizes the
     // SAME w (apples-to-apples sym8-decode vs affine-Q8-decode).
@@ -1927,16 +1928,16 @@ mod tests {
         }
     }
 
-    // ===================== PHASE 6: sym8 DECODE QMV =====================
-    // GATE: the DEDICATED sym8 matvec (int8_w8a8_qmv) must be a FAITHFUL decode
+    // ===================== sym8 DECODE QMV =====================
+    // The DEDICATED sym8 matvec (int8_w8a8_qmv) must be a FAITHFUL decode
     // matvec — per-row cosine vs an f32 reference (x_f32 @ w_f32^T) >= 0.999 at
     // M in {1,4,8} on the three 4B projection shapes {gate_up, down, o_proj}.
-    // Mirrors profile_sym8_decode but exercises the qmv path (which Phase-0
-    // proved is needed because reusing the 128x64 prefill GEMM at M=1 wastes
-    // 127/128 rows -> 1.4-1.8x regression vs affine qmv). The weight is quantized
-    // from the bf16 SOURCE (quantize_weight_int8 = the true Option-B single-quant
-    // path). This phase's bar is correctness + that it RUNS; the perf verdict (qmv
-    // vs affine qmv) is the NEXT phase — we time it here only as a smoke check.
+    // Mirrors profile_sym8_decode but exercises the qmv path, which is needed
+    // because reusing the 128x64 prefill GEMM at M=1 wastes 127/128 rows ->
+    // 1.4-1.8x regression vs affine qmv. The weight is quantized from the bf16
+    // SOURCE (quantize_weight_int8 = the true Option-B single-quant path). This
+    // checks correctness + that it RUNS; the qmv-vs-affine-qmv perf verdict is
+    // separate — we time it here only as a smoke check.
     // Run:
     //   cargo test -p mlx-core --lib int8_gemm::tests::profile_sym8_qmv \
     //     -- --ignored --nocapture
@@ -2109,14 +2110,14 @@ mod tests {
     }
 
     // ===================== W8A16 sym8 DECODE QMV =====================
-    // GATE: the W8A16 decode matvec (int8_w8a16_qmv — bf16 activations read
+    // The W8A16 decode matvec (int8_w8a16_qmv — bf16 activations read
     // directly, NO act quant, f32 accumulate) must be a FAITHFUL decode matvec:
     // per-row cosine vs an f32 reference (x_f32 @ w_f32^T) >= 0.999 at M in
     // {1,2} (the decode dispatch range) on the three 4B projection shapes.
     // Because the activation is EXACT (only weight-quant error remains), the
     // cosine must also be >= the W8A8 qmv's on the same inputs — asserted
     // directly. PERF (informational — the e2e paired A/B is the real gate):
-    // W8A16 qmv vs affine qmv (production affine decode path) vs the old W8A8
+    // W8A16 qmv vs affine qmv (production affine decode path) vs the W8A8
     // qmv at M=1, plus an INT8_QMV16_BN/BK geometry sweep.
     // Run:
     //   cargo test -p mlx-core --release int8_gemm::tests::profile_sym8_qmv_w8a16 \
@@ -2572,8 +2573,8 @@ mod tests {
         );
     }
 
-    // ============================ STAGE 2 ============================
-    // GATE S2: per-ROW cosine >= 0.999 on a real projection shape.
+    // ===================== W8A8 cosine parity =========================
+    // per-ROW cosine >= 0.999 on a real projection shape.
     // x[M=512, hidden=2560] @ w[N=intermediate, K=2560]^T, weight quantized once.
     #[test]
     fn s2_w8a8_cosine_parity() {
@@ -2674,8 +2675,8 @@ mod tests {
     }
 
     // ===================== AFFINE-GROUP W8A8 PARITY =====================
-    // GATE (TDD — drives the new affine_w8a8_matmul op): the int8-activation x
-    // EXACT-affine-weight kernel must equal the reference
+    // The int8-activation x EXACT-affine-weight `affine_w8a8_matmul` kernel
+    // must equal the reference
     //   y_ref = x_rec @ dequant(packed_w)^T
     // where x_rec = s_x * x_q is x quantized to int8 EXACTLY the way the kernel
     // does (the SAME per-token symmetric quant as the symmetric W8A8 path — we
@@ -2888,7 +2889,7 @@ mod tests {
     }
 
     // ============== AFFINE-GROUP W8A8 FALLBACK (K % group_size != 0) ==============
-    // GATE: the op must return Err cleanly (Rust falls back to bf16) when the shape
+    // The op must return Err cleanly (Rust falls back to bf16) when the shape
     // is unsupported. K % group_size != 0 is the affine-specific unsupported case
     // (group dequant requires K divisible by group_size). Here K=200, group_size=64
     // -> 200 % 64 == 8 != 0, so affine_w8a8_matmul must Err (the C++ op returns

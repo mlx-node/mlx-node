@@ -62,12 +62,10 @@ pub(crate) struct Qwen3Inner {
     /// text-only Qwen3 — the field exists so that future session helpers
     /// share the same shape as dense/MoE/VLM inner structs.
     pub(crate) cached_image_key: Option<u64>,
-    /// Turn-scratch KV state for the flat engine flow (S7). The legacy
-    /// flat cores threaded local clones of `cached_kv_keys` /
-    /// `cached_kv_values` / `cached_cache_idx` through prefill + decode
-    /// and wrote them back at save time; the `ChatBackend` split
-    /// (`prefill` → `begin_decode` → `save_cache_state`) needs that
-    /// in-flight state to live on `self` between hook calls. Seeded by
+    /// Turn-scratch KV state for the flat engine flow. The `ChatBackend`
+    /// split (`prefill` → `begin_decode` → `save_cache_state`) needs the
+    /// in-flight clones of `cached_kv_keys` / `cached_kv_values` /
+    /// `cached_cache_idx` to live on `self` between hook calls. Seeded by
     /// [`Qwen3Inner::flat_prefill`], advanced by [`Qwen3Decode`],
     /// persisted (moved into `cached_*`) by
     /// [`ChatBackend::save_cache_state`].
@@ -79,14 +77,14 @@ pub(crate) struct Qwen3Inner {
     /// `verify_cache_prefix` when the rendered prompt EXACTLY equals the
     /// cached history (it then returns `cached_len - 1`), consumed by
     /// the next `flat_prefill`, which backs the write cursor up one slot
-    /// and re-forwards the final token — the legacy "Zero delta —
-    /// re-run last token" branch. `Cell` because the verify hook takes
-    /// `&self`; the inner runs single-threaded on its model thread.
+    /// and re-forwards the final token (the "zero delta — re-run last
+    /// token" case). `Cell` because the verify hook takes `&self`; the
+    /// inner runs single-threaded on its model thread.
     pending_exact_match_rewind: Cell<bool>,
     /// Whether the in-flight generic-flow turn is streaming. Recorded by
     /// [`ChatBackend::profiler_label`] (the one pre-`begin_decode` hook
     /// that receives `is_streaming`; `TurnSetup` does not carry it) so
-    /// `begin_decode` can bake the legacy streaming profiler relabel
+    /// `begin_decode` can bake the streaming profiler relabel
     /// (`"qwen3_chat_stream[_delta]_rust"`) into the stepper.
     turn_is_streaming: Cell<bool>,
     /// Training state owned by the model thread.
@@ -102,7 +100,7 @@ pub(crate) struct Qwen3Inner {
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen3Cmd {
     /// Chat-session commands (start / continue / tool + streaming twins +
-    /// reset-caches), nested verbatim from the model-neutral engine (S7).
+    /// reset-caches), wrapping the model-neutral engine's [`ChatCmd`].
     /// The thread loop routes these to
     /// [`crate::engine::cmd::handle_chat_cmd`], which drives the
     /// [`ChatBackend`] impl on [`Qwen3Inner`]; the per-variant
@@ -120,8 +118,8 @@ pub(crate) enum Qwen3Cmd {
         config: Option<GenerationConfig>,
         reply: ResponseTx<BatchGenerationResult>,
     },
-    /// Training-session commands, nested verbatim from the model-neutral
-    /// engine (P7c). The thread loop routes these to
+    /// Training-session commands, wrapping the model-neutral engine's
+    /// [`TrainCmd`]. The thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen3Inner`].
     Train(TrainCmd),
@@ -494,13 +492,13 @@ impl Qwen3Inner {
     /// Chunk-size-parameterized worker for `run_paged_prefill_chunk`. The
     /// public entry point is a thin wrapper that reads
     /// `MLX_PAGED_PREFILL_CHUNK_SIZE` once via `OnceLock` and forwards. We
-    /// expose this private helper so tests can drive both the legacy
-    /// single-shot path (`chunk_size <= 0`) and the chunked path (>0)
-    /// without process-wide env mutation, and so we can directly verify
-    /// numerical parity between them in the same test binary.
+    /// expose this private helper so tests can drive both the single-shot
+    /// path (`chunk_size <= 0`) and the chunked path (>0) without
+    /// process-wide env mutation, and so we can directly verify numerical
+    /// parity between them in the same test binary.
     ///
     /// `chunk_size <= 0` OR `suffix_tokens.len() <= chunk_size` takes the
-    /// legacy single-shot path. Anything else loops over `chunks(chunk_size)`.
+    /// single-shot path. Anything else loops over `chunks(chunk_size)`.
     fn run_paged_prefill_chunk_with_size(
         &mut self,
         suffix_tokens: &[u32],
@@ -515,9 +513,9 @@ impl Qwen3Inner {
             ));
         }
 
-        // Legacy single-shot path: chunking disabled or suffix already
-        // small enough that a single forward fits within the existing
-        // memory budget.
+        // Single-shot path: chunking disabled or suffix already small
+        // enough that a single forward fits within the existing memory
+        // budget.
         if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
             return self.run_paged_prefill_single_shot(
                 suffix_tokens,
@@ -567,9 +565,8 @@ impl Qwen3Inner {
     }
 
     /// Single-shot prefill: feed the entire suffix through every layer in
-    /// one forward pass. Identical to the pre-chunking implementation.
-    /// Used both by the legacy code path (chunk_size <= 0) and the
-    /// chunked-path's "small enough to skip chunking" fast path.
+    /// one forward pass. Used both by the non-chunked path (chunk_size <= 0)
+    /// and the chunked-path's "small enough to skip chunking" fast path.
     fn run_paged_prefill_single_shot(
         &mut self,
         suffix_tokens: &[u32],
@@ -2627,36 +2624,33 @@ impl Qwen3Inner {
 }
 
 // =====================================================================
-// Neutral chat-engine backend (S7).
+// Neutral chat-engine backend.
 //
 // The chat-session surface (start / continue / tool + streaming twins +
 // reset-caches) is driven by the model-neutral engine: the thread loop
 // routes `Qwen3Cmd::Chat` to `handle_chat_cmd::<Qwen3Inner>`, whose
 // generic session cores (`crate::engine::session`) call back into the
 // `ChatBackend` impl below. The block-paged production path (default
-// ON) moved VERBATIM behind `paged_turn`; the flat (opt-out) path runs
-// the engine's generic prefill + `run_decode_loop` flow via `prefill`
-// / `begin_decode`.
+// ON) runs behind `paged_turn`; the flat (opt-out) path runs the
+// engine's generic prefill + `run_decode_loop` flow via `prefill` /
+// `begin_decode`.
 // =====================================================================
 
 impl Qwen3Inner {
     /// Flat chunked prefill for the engine's generic flow
-    /// ([`ChatBackend::prefill`]). Byte-identical port of the deleted
-    /// flat cores' prefill blocks (2048-token chunks, per-chunk KV evals
-    /// plus `synchronize_and_clear_cache`, last-token logits squeezed
-    /// to `[1, vocab]` like the macro-adopting streaming paths).
+    /// ([`ChatBackend::prefill`]): 2048-token chunks, per-chunk KV evals
+    /// plus `synchronize_and_clear_cache`, last-token logits squeezed to
+    /// `[1, vocab]`.
     ///
     /// Seeds the turn-scratch KV state from the saved session state: on
     /// a prefix miss the engine already ran
     /// `reset_caches(ResetScope::PrefixMiss)`, so the cached vectors are
-    /// empty and the turn starts cold (`vec![None; num_layers]` — the
-    /// legacy `initial_kv_keys.unwrap_or_else` shape); on a hit / delta
-    /// the cached handles are cloned exactly like the legacy locals.
-    /// The exact-match rewind flag (see
-    /// [`Qwen3Inner::pending_exact_match_rewind`]) backs the write
-    /// cursor up one slot so the single re-prefilled token overwrites
-    /// the last cached position — the legacy "Zero delta — re-run last
-    /// token" branch.
+    /// empty and the turn starts cold (`vec![None; num_layers]`); on a
+    /// hit / delta the cached handles are cloned. The exact-match rewind
+    /// flag (see [`Qwen3Inner::pending_exact_match_rewind`]) backs the
+    /// write cursor up one slot so the single re-prefilled token
+    /// overwrites the last cached position (the "zero delta — re-run last
+    /// token" case).
     fn flat_prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
         if prompt_tokens.is_empty() {
             return Err(napi::Error::from_reason(
@@ -2782,8 +2776,7 @@ pub(crate) struct Qwen3PagedDecode<'a> {
     num_layers: usize,
     /// Fixed `[0]` positions array threaded into `forward_paged_adapter`
     /// (the paged forward derives real positions from the adapter
-    /// cursor; this is the legacy `positions_dummy =
-    /// from_int32(&[0], &[1])`).
+    /// cursor, so this placeholder is never read for them).
     positions_dummy: MxArray,
 }
 
@@ -2792,32 +2785,29 @@ impl DecodeStep for Qwen3PagedDecode<'_> {
         // The paged forward needs the concrete token id (record_tokens +
         // re-embed as [1, 1]); recover it from the [1, 1] input the loop
         // reshaped. `item_at_int32` forces the eval of `y` — idempotent
-        // with the loop-top `y.eval()` (the legacy paged loops did the
-        // same `token.eval()` + `item_at_int32`).
+        // with the loop-top `y.eval()`.
         let token_value = input_ids.item_at_int32(0)? as u32;
         let logits = self.inner.run_paged_decode_step(
             token_value,
             self.num_layers,
             &self.positions_dummy,
         )?;
-        // `run_paged_decode_step` returns `[1, 1, vocab]`; the engine
-        // squeezes axis 1 → `[1, vocab]` (the FLAT contract — `sample` /
-        // `apply_all_penalties` accept the leading batch axis). The
-        // legacy paged loop squeezed `[0, 1]` → `[vocab]` then sampled;
-        // both feed the same sampler.
+        // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
+        // the engine's squeeze of axis 1 → `[1, vocab]` (the FLAT
+        // contract — `sample` / `apply_all_penalties` accept the leading
+        // batch axis).
         Ok((logits, true))
     }
 
     fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, _budget_forced: bool) {
-        // The legacy paged stream loop did `async_eval_arrays(&[&next_y])`
-        // on the sampled token; scheduling next_token (+ logits, matching
-        // the flat `Qwen3Decode`) here is equivalent — the loop-top
-        // `y.eval()` forces materialization next iteration.
+        // Schedule next_token (+ logits, matching the flat `Qwen3Decode`)
+        // for async eval; the loop-top `y.eval()` forces materialization
+        // next iteration.
         MxArray::async_eval_arrays(&[next_token, logits]);
     }
 
     fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the legacy paged loops' per-step
+        // Paged cadence — the per-step
         // `maybe_clear_cache_for_paged_step(step)`.
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
@@ -2826,12 +2816,9 @@ impl DecodeStep for Qwen3PagedDecode<'_> {
         // LENGTH-exit only (the engine gates the call): run ONE more
         // `run_paged_decode_step` for the final committed token so its
         // K/V lands in the paged adapter, then DISCARD the logits. This
-        // is the SAME `record_tokens(&[token]) + forward_paged_adapter`
-        // the skipped final loop forward would have run, so the adapter's
-        // `request_tokens()` / cursor advances by exactly 1 to equal the
-        // saved keep-all history — byte-for-byte the state fba240b8 had
-        // after its unconditional bottom-of-loop forward (which also
-        // produced, then dropped, a next token off this same step).
+        // runs `record_tokens(&[token]) + forward_paged_adapter`, so the
+        // adapter's `request_tokens()` / cursor advances by exactly 1 to
+        // equal the saved keep-all history.
         //
         // No sample / no `generated_tokens` push / no chunk / no
         // finish_reason change: the produced logits are simply dropped.
@@ -2885,7 +2872,7 @@ impl PagedBackend for Qwen3Inner {
         // Per-turn seq_id: the adapter is single-request and
         // `reset_for_new_request` makes the previous seq_id irrelevant.
         let seq_id: u32 = 0;
-        // P3: adapter-owned warm-continue / cold-start lifecycle (suffix
+        // Adapter-owned warm-continue / cold-start lifecycle (suffix
         // blocks are allocated inside prepare_turn — do NOT call
         // `allocate_suffix_blocks` again).
         let turn_plan = self
@@ -2940,12 +2927,12 @@ impl PagedBackend for Qwen3Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // == the legacy paged cores' terminal lifecycle block. Success:
-        // keep the request live across turns when reuse is on so the next
-        // turn's `continue_turn` builds on the partial trailing block's
-        // live K/V; otherwise register full blocks for reuse + release.
-        // Infallible (`let _ =` every call — a teardown failure must not
-        // mask the turn result).
+        // Terminal lifecycle for the paged turn. Success: keep the request
+        // live across turns when reuse is on so the next turn's
+        // `continue_turn` builds on the partial trailing block's live K/V;
+        // otherwise register full blocks for reuse + release. Infallible
+        // (`let _ =` every call — a teardown failure must not mask the turn
+        // result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
                 let _ = adapter.finalize_turn_keep_live(&[], 0);
@@ -2957,10 +2944,10 @@ impl PagedBackend for Qwen3Inner {
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown == the legacy paged cores' `Err(e) =>
-        // release_request()` arm: release fully, partial block_table state
-        // is unsafe to keep around. Release ONLY — never register / keep
-        // live. Infallible (`let _ =` — must not mask the turn's error).
+        // Error-path teardown: release the request fully — partial
+        // block_table state is unsafe to keep around. Release ONLY — never
+        // register / keep live. Infallible (`let _ =` — must not mask the
+        // turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -2973,14 +2960,14 @@ impl PagedBackend for Qwen3Inner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        // Port of the legacy paged save block (token history ONLY — the
-        // adapter's pool owns the K/V; never touch
-        // `cached_kv_keys`/`cached_kv_values`/`cached_cache_idx`). `keep_all`
-        // is the FLAT rule (engine: `finish_reason == "length"`), so the
-        // DROP-LAST trim below is IDENTICAL to `save_cache_state`'s
-        // (`finish_reason != "length"` => drop the boundary token). The
-        // engine reconciles `request_tokens()` to this same trimmed history
-        // via `reconcile_paged_request_tokens` before finalize.
+        // Save token history ONLY — the adapter's pool owns the K/V; never
+        // touch `cached_kv_keys`/`cached_kv_values`/`cached_cache_idx`.
+        // `keep_all` is the flat rule (engine: `finish_reason ==
+        // "length"`), so the DROP-LAST trim below matches
+        // `save_cache_state`'s (`finish_reason != "length"` => drop the
+        // boundary token). The engine reconciles `request_tokens()` to this
+        // same trimmed history via `reconcile_paged_request_tokens` before
+        // finalize.
         if reuse_cache {
             let mut full_history = save_tokens.to_vec();
             let history_tokens = if keep_all || generated.is_empty() {
@@ -3024,7 +3011,7 @@ impl PagedBackend for Qwen3Inner {
         // surplus 0; final-step stop: forward never ran, nothing
         // over-recorded).
         //
-        // Return (Codex #3 contract): `true` on reconcile/no-op,
+        // Return contract: `true` on reconcile/no-op,
         // `false` ONLY when the rollback itself returned `Err` (then the
         // adapter is over-recorded vs the saved history, so the engine
         // finalizes with reuse=false = release_request, not keep-live).
@@ -3055,23 +3042,20 @@ impl PagedBackend for Qwen3Inner {
     }
 }
 
-/// Eager flat decode stepper for one qwen3 turn (S7,
-/// [`ChatBackend::begin_decode`]). Owns the turn-constant arrays the
-/// deleted `DecodeOps` closures captured (embedding weight, RoPE offset
-/// cursor, left padding, the `+1` increment) and threads the
-/// turn-scratch KV state on [`Qwen3Inner`] through
-/// [`Qwen3Model::forward_fused`] — a byte-identical port of the closure
-/// bodies the `decode_loop!` macro drove on the flat streaming paths.
+/// Eager flat decode stepper for one qwen3 turn
+/// ([`ChatBackend::begin_decode`]). Owns the turn-constant arrays
+/// (embedding weight, RoPE offset cursor, left padding, the `+1`
+/// increment) and threads the turn-scratch KV state on [`Qwen3Inner`]
+/// through [`Qwen3Model::forward_fused`].
 pub(crate) struct Qwen3Decode<'a> {
     inner: &'a mut Qwen3Inner,
     embedding_weight: MxArray,
     rope_offsets: MxArray,
     left_padding: MxArray,
     one_arr: MxArray,
-    /// Decode-path profiler relabel: the legacy streaming cores called
-    /// `profiler.set_label("qwen3_chat_stream[_delta]_rust")` right
-    /// before entering the macro loop; `None` on the sync paths (which
-    /// historically had no profiler).
+    /// Decode-path profiler relabel:
+    /// `"qwen3_chat_stream[_delta]_rust"` on the streaming paths;
+    /// `None` on the sync paths (which have no profiler).
     relabel: Option<&'static str>,
 }
 
@@ -3092,8 +3076,8 @@ impl DecodeStep for Qwen3Decode<'_> {
             &self.left_padding,
         )?;
         self.rope_offsets = self.rope_offsets.add(&self.one_arr)?;
-        // `true` == the legacy closures' `needs_squeeze`: the eager Rust
-        // forward returns `[1, 1, vocab]`; the loop squeezes axis 1.
+        // `true` requests the engine's squeeze of axis 1: the eager Rust
+        // forward returns `[1, 1, vocab]`.
         Ok((logits, true))
     }
 
@@ -3157,7 +3141,7 @@ impl ChatBackend for Qwen3Inner {
     }
 
     // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
-    // → `thinking_setup` resolves to the legacy
+    // → `thinking_setup` resolves to
     // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
     //   budget: config.thinking_token_budget}`.
 
@@ -3168,19 +3152,17 @@ impl ChatBackend for Qwen3Inner {
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         // qwen3 has no scope-dependent FLAT reset state (no rope deltas /
         // GDN checkpoints): both the turn-internal prefix-miss reset and
-        // the explicit command reset run the full legacy clear, exactly
-        // like the deleted cores (both invoked `reset_kv_caches_sync`).
+        // the explicit command reset run the full clear via
+        // `reset_kv_caches_sync`.
         self.reset_kv_caches_sync()?;
-        // The EXPLICIT command reset must restore the fully cold state
-        // the legacy doc promised: `release_request` (inside
-        // `reset_kv_caches_sync`) leaves the request's full blocks
-        // content-addressed in the allocator's prefix cache, so a
-        // reset-then-rerun of the same prompt would take the prefix-hit
-        // suffix-prefill path — a different bf16 reduction order than
-        // the cold full prefill, enough to flip a greedy near-tie
-        // (codex S12 finding, observed on the lfm2 sibling; qwen3's
-        // paged path shares the identical adapter lifecycle). The
-        // turn-internal `PrefixMiss` reset keeps the prefix cache.
+        // The EXPLICIT command reset must restore the fully cold state:
+        // `release_request` (inside `reset_kv_caches_sync`) leaves the
+        // request's full blocks content-addressed in the allocator's
+        // prefix cache, so a reset-then-rerun of the same prompt would take
+        // the prefix-hit suffix-prefill path — a different bf16 reduction
+        // order than the cold full prefill, enough to flip a greedy
+        // near-tie. The turn-internal `PrefixMiss` reset keeps the prefix
+        // cache.
         if scope == ResetScope::Command
             && let Some(adapter) = self.paged_adapter.as_mut()
         {
@@ -3197,10 +3179,10 @@ impl ChatBackend for Qwen3Inner {
 
     /// All-or-nothing prefix match, PLUS the sanctioned qwen3 pure-KV
     /// exception (see the trait rustdoc): on an EXACT match
-    /// (`tokens == cached_token_history`) the legacy flat cores rewound
-    /// one position and re-forwarded the final token ("Zero delta —
-    /// re-run last token", `cache_idx -= 1`). Expressed here by
-    /// returning `cached_len - 1` and arming
+    /// (`tokens == cached_token_history`) the flat path rewinds one
+    /// position and re-forwards the final token ("zero delta — re-run
+    /// last token", `cache_idx -= 1`). Expressed here by returning
+    /// `cached_len - 1` and arming
     /// [`Qwen3Inner::pending_exact_match_rewind`], which the next
     /// [`Qwen3Inner::flat_prefill`] consumes. Safe ONLY because qwen3's
     /// flat path is a pure standard-KV stack whose last slot can be
@@ -3223,19 +3205,18 @@ impl ChatBackend for Qwen3Inner {
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
-        // Delta turns persist unconditionally (the legacy delta paths
-        // had no reuse branch; the engine's delta guards guarantee
-        // `reuse_cache`); fresh turns mirror the legacy
+        // Delta turns persist unconditionally (the engine's delta guards
+        // guarantee `reuse_cache`); fresh turns take the
         // `if reuse_cache { .. } else { clear }` split.
         if args.is_delta || args.reuse_cache {
             self.cached_kv_keys = std::mem::take(&mut self.turn_kv_keys);
             self.cached_kv_values = std::mem::take(&mut self.turn_kv_values);
             self.cached_cache_idx = self.turn_cache_idx;
-            // Mirror the legacy bookkeeping: exclude the final generated
-            // token when the decode terminated for any reason other
-            // than the `length` budget — in every non-length case the
-            // final token IS the boundary marker (`<|im_end|>` or the
-            // cutoff token) the next delta re-renders itself.
+            // Exclude the final generated token when the decode terminated
+            // for any reason other than the `length` budget — in every
+            // non-length case the final token IS the boundary marker
+            // (`<|im_end|>` or the cutoff token) the next delta re-renders
+            // itself.
             let history_tokens =
                 if args.finish_reason != "length" && !args.generated_tokens.is_empty() {
                     &args.generated_tokens[..args.generated_tokens.len() - 1]
@@ -3245,7 +3226,7 @@ impl ChatBackend for Qwen3Inner {
             let mut full_history = args.save_tokens.to_vec();
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
-            // Qwen3 legacy has no vision path — the image cache key is
+            // Qwen3 has no vision path — the image cache key is
             // structurally always None, but we reset it here for clarity
             // and uniformity with VLM-capable siblings.
             self.cached_image_key = None;
@@ -3262,10 +3243,10 @@ impl ChatBackend for Qwen3Inner {
     }
 
     fn eval_caches(&self) -> Result<()> {
-        // No post-prefill cache sync on qwen3's reference paths: the
-        // chunked prefill already evals per chunk inside `flat_prefill`,
-        // and the decode loop schedules async evals. A blocking sync
-        // here would introduce a stall the legacy paths never paid.
+        // No post-prefill cache sync on qwen3's flat path: the chunked
+        // prefill already evals per chunk inside `flat_prefill`, and the
+        // decode loop schedules async evals. A blocking sync here would
+        // introduce a needless stall.
         Ok(())
     }
 
@@ -3279,9 +3260,8 @@ impl ChatBackend for Qwen3Inner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        // Legacy streaming cores relabeled the profiler to the eager
-        // "_rust" variant right before the macro loop; the sync cores
-        // had no profiler (no relabel).
+        // Streaming turns relabel the profiler to the "_rust" variant;
+        // sync turns have no profiler (no relabel).
         let relabel = if self.turn_is_streaming.get() {
             Some(if turn.is_delta {
                 "qwen3_chat_stream_delta_rust"
@@ -3292,8 +3272,8 @@ impl ChatBackend for Qwen3Inner {
             None
         };
         let embedding_weight = self.embedding.get_weight();
-        // First decode step sees position `cache_idx` — the legacy
-        // post-prefill `rope_offsets = from_int32(&[cache_idx])` reset.
+        // First decode step sees position `cache_idx`: seed
+        // `rope_offsets` from the post-prefill cursor.
         let rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
         let left_padding = MxArray::from_int32(&[0], &[1])?;
         let one_arr = MxArray::from_int32(&[1], &[1])?;
@@ -3328,8 +3308,8 @@ impl ChatBackend for Qwen3Inner {
         match (is_streaming, is_delta) {
             (true, false) => "qwen3_chat_stream",
             (true, true) => "qwen3_chat_stream_delta",
-            // The legacy flat sync cores had no profiler; these default
-            // labels are new and only surface when profiling is enabled.
+            // Sync turns have no profiler; these labels only surface when
+            // profiling is enabled.
             (false, false) => "chat",
             (false, true) => "chat_delta",
         }
@@ -3337,20 +3317,18 @@ impl ChatBackend for Qwen3Inner {
 
     fn session_holds_images(&self) -> bool {
         // Structurally always `None` for text-only qwen3; checked anyway
-        // so the default `text_delta_image_guard` reproduces the legacy
-        // defensive guard byte-for-byte.
+        // so the default `text_delta_image_guard` keeps its defensive
+        // behavior.
         self.cached_image_key.is_some()
     }
 
     fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         // The probe is gated on `has_paged_adapter()`; with the adapter
         // configured EVERY turn (fresh + delta, sync + streaming) takes
-        // the generic paged engine. The legacy sync/stream forked cores +
-        // dispatch were deleted in P4-1 — `run_paged_turn` drives the
-        // adapter lifecycle via [`PagedBackend`], reusing the shared
-        // `run_decode_loop`. The sanctioned streaming-delta fix (probe
-        // runs for delta streaming turns too) is preserved by the
-        // engine's session-core dispatch.
+        // the generic paged engine. `run_paged_turn` drives the adapter
+        // lifecycle via [`PagedBackend`], reusing the shared
+        // `run_decode_loop`. The probe runs for delta streaming turns too,
+        // routed by the engine's session-core dispatch.
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
     }
 }
@@ -4639,7 +4617,7 @@ mod tests {
 
     /// Chunked-prefill parity test: chunked prefill with the same weights and
     /// the same suffix tokens MUST produce the same final logits as the
-    /// legacy single-shot prefill, modulo small bf16 rounding noise.
+    /// single-shot prefill, modulo small bf16 rounding noise.
     ///
     /// Both runs share a single `Qwen3Inner` (so weights are byte-equal)
     /// and the paged-state is reset between them. The same prompt is fed
@@ -5369,8 +5347,8 @@ mod tests {
         // Skip when MLX_PAGED_PREFILL_CHUNK_SIZE is set in the env: the
         // OnceLock-cached `paged_prefill_chunk_size()` is process-global, and
         // a positive value smaller than the 8-token prompt would route the
-        // public wrapper through the chunked branch instead of the legacy
-        // path this test is meant to exercise.
+        // public wrapper through the chunked branch instead of the
+        // single-shot path this test is meant to exercise.
         if crate::array::memory::paged_prefill_chunk_size() != 0 {
             eprintln!(
                 "skipping test_run_paged_prefill_chunk_default_matches_single_shot: \
@@ -5438,10 +5416,10 @@ mod tests {
         }
 
         // Reset adapter, run the same prompt explicitly with chunk_size=0
-        // (the legacy single-shot path). The two should be byte-equal
-        // since the public entry point is a thin wrapper around the
-        // _with_size helper at chunk_size=0 (matches the env-default case
-        // when MLX_PAGED_PREFILL_CHUNK_SIZE is unset).
+        // (the single-shot path). The two should be byte-equal since the
+        // public entry point is a thin wrapper around the _with_size helper
+        // at chunk_size=0 (matches the env-default case when
+        // MLX_PAGED_PREFILL_CHUNK_SIZE is unset).
         {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.release_request().expect("release_request");

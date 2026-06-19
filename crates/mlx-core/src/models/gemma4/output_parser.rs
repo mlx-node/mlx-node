@@ -1807,14 +1807,12 @@ mod tests {
         assert!(v.as_object().unwrap().is_empty());
     }
 
-    /// Regression test for a panic observed in a live Gemma4 session:
+    /// Regression test for a char-boundary panic:
     ///   `start byte index 281 is not a char boundary; it is inside '—'`
-    /// The model emitted a tool-call whose DSL-string value contained an
-    /// em-dash (`—`, 3 bytes in UTF-8). The previous `extract_balanced_braces`
-    /// walked byte-by-byte inside a `<|"|>...<|"|>` payload and then tried to
-    /// `&str`-slice at `s[i..].starts_with(...)`, landing mid-char and
-    /// panicking. After the fix the call should parse (or at minimum the
-    /// stream parser should not abort).
+    /// A tool-call whose DSL-string value contains an em-dash (`—`, 3 bytes
+    /// in UTF-8) must not make `extract_balanced_braces` `&str`-slice at a
+    /// non-boundary position while walking a `<|"|>...<|"|>` payload. The
+    /// call should parse (or at minimum the stream parser must not abort).
     #[test]
     fn stream_parser_survives_multibyte_inside_dsl_string() {
         let mut p = Gemma4StreamParser::new();

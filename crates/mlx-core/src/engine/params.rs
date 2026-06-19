@@ -97,7 +97,7 @@ pub(crate) fn build_chatml_continue_delta_text(
 /// `ChatMessage::is_error` field on the originating message is the
 /// authoritative signal; the marker injection here only affects the
 /// wire bytes the model decodes. `None` / `Some(false)` produce the
-/// unmarked wire format and stay byte-equal to the pre-feature output.
+/// unmarked wire format.
 pub(crate) fn build_chatml_tool_delta_text(
     _tool_call_id: &str,
     content: &str,
@@ -162,8 +162,7 @@ pub(crate) fn build_chatml_tool_delta_text(
 /// `eos = [B, C]`, a ChatSession turn stops on `<|im_end|> ∪ B ∪ C`; `A`
 /// never stops (unless `A == <|im_end|>`). A missing or unparseable
 /// `generation_config.json` yields an empty `Default` (all `None`, empty
-/// `eos_token_ids`), so every touched path stays byte-identical to the
-/// pre-feature behavior.
+/// `eos_token_ids`), so every path falls back to its builtin defaults.
 ///
 /// # Two surfaces that differ from the above
 ///
@@ -260,15 +259,15 @@ pub(crate) struct ChatParams {
     pub report_performance: bool,
     pub reuse_cache: bool,
     pub include_reasoning: bool,
-    /// Extra EOS ids unioned into every stop-check on the legacy
-    /// whole-turn cores (qwen3.5 dense/MoE VLM, MTP, paged-MTP). Real
-    /// Qwen checkpoints ship `eos_token_id` as a list; the generic
+    /// Extra EOS ids unioned into every stop-check on the whole-turn
+    /// cores (qwen3.5 dense/MoE VLM, MTP, paged-MTP). Real Qwen
+    /// checkpoints ship `eos_token_id` as a list; the generic
     /// `run_decode_loop` path already unions these via
-    /// `ChatBackend::extra_eos_ids`, but the legacy cores stop only on
-    /// the single primary `eos_token_id`. Populated at each legacy-core
-    /// build site from `ModelGenerationDefaults::eos_token_ids`. Empty
-    /// (`Vec::new()`) on the generic path → every union check is a true
-    /// no-op (`[].contains()` is always false), byte-identical to before.
+    /// `ChatBackend::extra_eos_ids`, but those cores stop only on the
+    /// single primary `eos_token_id` unless this is populated from
+    /// `ModelGenerationDefaults::eos_token_ids` at their build sites.
+    /// Empty (`Vec::new()`) on the generic path → every union check is a
+    /// true no-op (`[].contains()` is always false).
     pub extra_eos_ids: Vec<u32>,
     /// MTP: opt-in flag enabling the Multi-Token Prediction speculative
     /// decode loop. Effective only on the dense compiled path AND when
@@ -322,31 +321,29 @@ pub(crate) fn default_thinking_budget_for_effort(reasoning_effort: Option<&str>)
     }
 }
 
-/// Declarative thinking-mode policy for one family (P1 3.1 "easy thinking
-/// budget"). [`resolve`] turns this + the request `ChatConfig` into the
-/// concrete [`crate::engine::backend::ThinkingSetup`] the engine feeds
-/// `ReasoningTracker::new`. Each variant is a 1:1 transcription of a
-/// pre-P1 per-family `thinking_setup()` body.
+/// Declarative thinking-mode policy for one family. [`resolve`] turns
+/// this + the request `ChatConfig` into the concrete
+/// [`crate::engine::backend::ThinkingSetup`] the engine feeds
+/// `ReasoningTracker::new`.
 pub(crate) enum ThinkingPolicy {
     /// No think-budget machinery: tracker permanently outside a think
-    /// block (`enabled:false, budget:None`). == legacy gemma4.
+    /// block (`enabled:false, budget:None`). gemma4.
     None,
     /// Honor the chat template's `enable_thinking` (default-on when
-    /// unset); budget = the explicit `thinking_token_budget` only. ==
-    /// legacy qwen3 / qwen3_5 / qwen3_5_moe. This is the DEFAULT policy.
+    /// unset); budget = the explicit `thinking_token_budget` only. qwen3 /
+    /// qwen3_5 / qwen3_5_moe. This is the DEFAULT policy.
     TemplateHonoring,
     /// Always inside a think block; explicit `thinking_token_budget`
     /// wins, else derive from `reasoning_effort` via
-    /// [`default_thinking_budget_for_effort`]. == legacy lfm2 (whose
-    /// template ignores `enable_thinking`). Footgun preserved verbatim:
-    /// `reasoning_effort:"low"` caps the budget to 256 but does NOT
-    /// disable thinking (`enabled` stays `true`).
+    /// [`default_thinking_budget_for_effort`]. lfm2 (whose template
+    /// ignores `enable_thinking`). Footgun: `reasoning_effort:"low"` caps
+    /// the budget to 256 but does NOT disable thinking (`enabled` stays
+    /// `true`).
     AlwaysOnBudgetFromEffort,
 }
 
 /// Resolve a [`ThinkingPolicy`] + request config into the concrete
-/// per-turn [`crate::engine::backend::ThinkingSetup`]. The bodies are
-/// byte-for-byte the pre-P1 per-family `thinking_setup()` impls.
+/// per-turn [`crate::engine::backend::ThinkingSetup`].
 pub(crate) fn resolve(
     policy: ThinkingPolicy,
     config: &ChatConfig,
@@ -404,7 +401,7 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         report_performance: config.report_performance.unwrap_or(false),
         reuse_cache: config.reuse_cache.unwrap_or(true),
         include_reasoning: resolve_include_reasoning(config),
-        // Empty by default; populated at the legacy-core build sites from
+        // Empty by default; whole-turn cores populate this from
         // `ModelGenerationDefaults::eos_token_ids`. On the generic path
         // this stays empty so every union stop-check is a true no-op.
         extra_eos_ids: Vec::new(),
@@ -434,7 +431,7 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
 /// near `i32::MAX` cannot overflow the i32 sum (which would panic in debug / silently wrap
 /// in release) before cache initialization. Inputs are floored at 0 (callers already clamp
 /// budgets to >= 0 via `extract_chat_params`; this is defense in depth — for any
-/// non-negative input the result is byte-identical to the legacy
+/// non-negative input the result equals
 /// `((prefill_len + max_new_tokens + 255) / 256) * 256`).
 ///
 /// Returns `Err` when the rounded capacity would exceed `i32::MAX`, since the native
@@ -612,9 +609,9 @@ mod tool_delta_marker_tests {
     //! `build_chatml_tool_delta_text`. The renderer injects the
     //! `TOOL_ERROR_MARKER` cue into the `<tool_response>` wire content
     //! only when the caller passes `Some(true)`. `None` and
-    //! `Some(false)` keep the output byte-equal to the pre-feature
-    //! behavior — guarding both the hot (successful) path and the
-    //! explicit-false path against accidental drift.
+    //! `Some(false)` leave the output marker-free — guarding both the
+    //! hot (successful) path and the explicit-false path against
+    //! accidental drift.
 
     use super::build_chatml_tool_delta_text;
     use crate::tokenizer::TOOL_ERROR_MARKER;
@@ -646,8 +643,8 @@ mod tool_delta_marker_tests {
 
     #[test]
     fn tool_delta_skips_marker_when_is_error_none() {
-        // None = default; pre-feature output. The marker MUST NOT
-        // appear anywhere in the wire text.
+        // None = default. The marker MUST NOT appear anywhere in the
+        // wire text.
         let payload = "{\"temperature\": 72}";
         let rendered = build_chatml_tool_delta_text("call_ok", payload, None, None);
         assert!(
@@ -711,7 +708,7 @@ mod tool_delta_marker_tests {
 mod tests {
     use super::*;
 
-    /// Legacy formula the helper must reproduce byte-for-byte on the valid
+    /// Reference closed-form the helper must reproduce on the valid
     /// (non-overflowing, non-negative) range.
     fn legacy_round_up(prefill_len: i32, max_new_tokens: i32) -> i32 {
         ((prefill_len + max_new_tokens + 255) / 256) * 256
@@ -721,7 +718,7 @@ mod tests {
     fn kv_capacity_round_up_matches_legacy_formula() {
         // Spread of normal (prefill_len, max_new_tokens) pairs that cannot
         // overflow i32. For every non-negative non-overflowing input the
-        // helper is byte-identical to the legacy idiom.
+        // helper equals the reference closed-form.
         let cases = [
             (0, 0),
             (1, 1),
@@ -739,7 +736,7 @@ mod tests {
             assert_eq!(
                 kv_capacity_round_up(p, m).unwrap(),
                 expected,
-                "kv_capacity_round_up({p}, {m}) must match legacy formula"
+                "kv_capacity_round_up({p}, {m}) must match the reference closed-form"
             );
         }
         // Spot-check a couple of the trickier ones by hand.
@@ -766,8 +763,8 @@ mod tests {
         // One more token rounds up to 2_147_483_648 (> i32::MAX) -> Err.
         assert!(kv_capacity_round_up(0, 2_147_483_393).is_err());
 
-        // The exact review finding: any non-empty prompt + an i32::MAX budget
-        // would overflow the i32 sum in the legacy formula. Now a clean Err.
+        // Any non-empty prompt + an i32::MAX budget would overflow a naive
+        // i32 sum; the i64 computation surfaces it as a clean Err instead.
         assert!(kv_capacity_round_up(1, i32::MAX).is_err());
 
         // i32::MAX budget alone already rounds up past i32::MAX -> Err.

@@ -1,8 +1,9 @@
 //! Shared chat types used by every model family's chat entry points.
 //!
-//! Moved verbatim from `crate::models::qwen3_5::model`, which keeps a
-//! permanent re-export so existing `crate::models::qwen3_5::model::…`
-//! import paths continue to compile unchanged.
+//! Holds the NAPI-exported [`ChatConfig`] / [`ChatResult`] /
+//! [`ChatStreamChunk`] request-response types plus the
+//! [`ChatStreamHandle`] streaming-cancellation token used by every
+//! family chat entry point.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

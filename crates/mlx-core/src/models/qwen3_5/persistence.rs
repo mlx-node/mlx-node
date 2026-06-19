@@ -147,12 +147,13 @@ fn sanitize_weights(
     // convert pipeline transposes it to `[C, K, 1]` (kernel last == 1). So
     // shape[-1] != 1 ⇒ this is a raw HF source ⇒ norms also need shifting.
     //
-    // We previously also OR'd in `has_mtp_weights` here, on the assumption
-    // that "ships MTP heads ⇒ raw HF source". That broke any model our convert
-    // pipeline produces with `mtp.*` retained (e.g. `qwen3.6-27b-nvfp4-mtp`):
-    // the convert already shifted the norms, then load shifted them again,
-    // and AR generation produced garbage tokens. Verified empirically via the
-    // SHIFTING +1 to norm trace below: pre_mean ≈ 0.98, post_mean ≈ 1.98.
+    // MTP presence must NOT be a signal here. OR'ing in `has_mtp_weights` (on
+    // the assumption "ships MTP heads ⇒ raw HF source") breaks any model the
+    // convert pipeline produces with `mtp.*` retained (e.g.
+    // `qwen3.6-27b-nvfp4-mtp`): convert already shifted the norms, a second
+    // shift at load time double-shifts them, and AR generation produces
+    // garbage tokens. The SHIFTING +1 to norm trace below shows the effect:
+    // pre_mean ≈ 0.98, post_mean ≈ 1.98.
     let needs_norm_fix = has_unsanitized_conv1d;
 
     info!(
@@ -1501,10 +1502,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // `mlx_lm_extra_tensors.mtp_file`) that the merge below mmaps and
                 // sanitize/materialize then evals. See `prewarm_checkpoint_pages`.
                 prewarm_checkpoint_pages_with(path, &mtp_sidecar_candidates(path, &raw));
-                // MTP head discovery precedence (backward-compat mandatory):
-                //   1. inline `mtp.*` tensors in the body shards (existing
-                //      checkpoints — handled implicitly by sanitize keeping them);
-                //   2. legacy `mtp.safetensors`-style sidecar (existing path);
+                // MTP head discovery precedence — supports three on-disk
+                // checkpoint layouts:
+                //   1. inline `mtp.*` tensors in the body shards (handled
+                //      implicitly by sanitize keeping them);
+                //   2. `mtp.safetensors`-style sidecar;
                 //   3. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
                 // Only attempt the sidecar/drafter merge when the body itself
                 // carries NO inline `mtp.*` tensors so inline always wins.

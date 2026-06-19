@@ -355,8 +355,8 @@ impl TransformerBlock {
             // `gather_kv_for_decode` Metal kernel directly against the
             // on-GPU paged buffers — avoids the per-step host roundtrip
             // (~57 MB per layer per K/V on long contexts) that
-            // `read_kv_range` performs and that was driving a ~40 GB
-            // memory regression in long-context decode (see Fix #2 spec).
+            // `read_kv_range` performs and that drives a ~40 GB memory
+            // regression in long-context decode.
             //
             // The kernel returns the query/io dtype. Cast back to x's dtype
             // so the rest of the block stays homogeneous. This is a

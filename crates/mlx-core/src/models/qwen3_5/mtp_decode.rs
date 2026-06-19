@@ -319,11 +319,11 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
 // Accept-loop sync collapse via on-device sparse top-K / batched
 // argmax (MTPLX-style).
 //
-// Replaces the legacy per-position accept loop's D forced GPU syncs
+// Replaces the per-position accept loop's D forced GPU syncs
 // (each materializing a full-vocab softmax of ~151k floats) with ONE
 // batched on-device op over all `D+1` verify positions. On the T=0
 // (greedy) path this is `argmax(verify_logits, axis=-1)` → `[1, D+1]`
-// int32, evaluated once. On T>0 we keep the legacy per-position
+// int32, evaluated once. On T>0 we keep the per-position
 // path (residual sampling still needs the full target distribution
 // to draw from `(p_target - p_draft)+`).
 //
@@ -340,8 +340,8 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
 // Default ON for the deterministic fast path. At T=0 with default
 // penalties, acceptance only needs verifier argmax IDs, so this avoids
 // D per-position full-vocab softmax materializations. Set
-// `MLX_MTP_SPARSE_ACCEPT=0` / `false` / `off` to force the legacy
-// per-position path for parity debugging or A/B measurements. The env
+// `MLX_MTP_SPARSE_ACCEPT=0` / `false` / `off` to force the per-position
+// path for parity debugging or A/B measurements. The env
 // var is read once per process and cached.
 pub(crate) fn mtp_sparse_accept_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
@@ -721,29 +721,25 @@ fn trace_acceptance_dense(
 }
 
 // =============================================================================
-// Legacy AR decode loop (`DecodeOps` + `decode_loop!`) — retained for the
-// MTP/vision whole-turn cores only.
+// Eager AR decode driver (`DecodeOps` + `decode_loop!`) — the token-by-token
+// decode loop for the qwen3_5 dense/MoE MTP and vision whole-turn cores.
 //
-// S12 note (why this still exists): every family's standard chat flow now
-// drives the engine's generic `run_decode_loop` (`crate::engine::decode`),
-// but the qwen3_5 dense/MoE WHOLE-TURN cores behind the engine's
-// `mtp_turn` / `vision_turn` probes (`vision_mtp_whole_turn_core` and the
-// delta/streaming twins in `models/qwen3_5/model.rs` and
-// `models/qwen3_5_moe/model.rs`) still invoke `decode_loop!` for their AR
-// fallback arms (MTP compiled-init failure → AR decode; vision turns; the
-// MTP-ineligible delta shapes). Those cores interleave with
-// `decode_loop_mtp!` and the MTP cache-rollback machinery, so the macro
-// lives HERE, next to its sister macro, until Phase 7 genericizes MTP
-// (engine-owned propose/verify trait) and deletes both.
+// The qwen3_5 dense/MoE whole-turn cores behind the engine's `mtp_turn` /
+// `vision_turn` probes (`vision_mtp_whole_turn_core` and the delta/streaming
+// twins in `models/qwen3_5/model.rs` and `models/qwen3_5_moe/model.rs`) invoke
+// `decode_loop!` for their AR arms (MTP compiled-init failure → AR decode;
+// vision turns; the MTP-ineligible delta shapes). Those cores interleave with
+// `decode_loop_mtp!` and the MTP cache-rollback machinery, so the macro lives
+// HERE, next to its sister macro `decode_loop_mtp!`.
 // =============================================================================
 
-/// Closures for model-specific operations in the legacy decode loop.
+/// Closures for model-specific operations in the AR decode loop.
 ///
 /// `F`: forward pass — takes (input_ids [1,1], embedding_weight) → Result<(logits, needs_squeeze)>.
 /// `E`: eval step — takes (next_token, logits, budget_forced) → schedules async eval.
 ///
-/// Superseded by [`crate::engine::backend::DecodeStep`] for the engine's
-/// generic flow; only the `decode_loop!` call sites below still build it.
+/// The engine's generic flow uses [`crate::engine::backend::DecodeStep`];
+/// `DecodeOps` is built by the `decode_loop!` call sites below.
 pub(crate) struct DecodeOps<F, E>
 where
     F: FnMut(&MxArray, &MxArray) -> Result<(MxArray, bool)>,
@@ -753,9 +749,9 @@ where
     pub eval_step: E,
 }
 
-/// Pipelined LEGACY decode loop — qwen3_5 dense/MoE MTP/vision
-/// whole-turn cores only (see the retention note above; the engine's
-/// generic flow uses [`crate::engine::decode::run_decode_loop`]).
+/// Pipelined eager decode loop for the qwen3_5 dense/MoE MTP and vision
+/// whole-turn cores (see the banner above; the engine's generic chat flow
+/// uses [`crate::engine::decode::run_decode_loop`]).
 ///
 /// Generates the token-by-token decode loop with:
 /// - Pipelining: builds step N+1's graph before blocking on step N
@@ -1160,7 +1156,7 @@ where
     /// `run_mtp_cycle_inner` uses the per-step `draft_step` path whose
     /// attention mask is `chain_start <= pos <= offset` with
     /// `chain_start = 0` — correct under committed-history. MoE / tests
-    /// leave this `false` (legacy cycle-history policy).
+    /// leave this `false` (cycle-history policy).
     pub committed_history_active: bool,
     pub rollback_unemitted: RU,
 }
@@ -1327,7 +1323,7 @@ where
         let probs = if use_sparse_accept || use_sparse_stochastic_accept {
             None
         } else {
-            // The legacy stochastic accept path consumes this `probs` as
+            // The stochastic accept path consumes this `probs` as
             // the proposal density `q` inside `accept_with_residual`
             // (`min(1, p/q)` + `(p - q)+` residual). For Leviathan-Chen
             // exactness `q` MUST be the distribution the
@@ -1347,7 +1343,7 @@ where
             // construction for ALL configs (incl. the common `top_k==0` plain
             // temperature/top_p case) and both parity modes.
             //
-            // NOTE: at T=0 the legacy `else` accept branch is only reached
+            // NOTE: at T=0 the non-sparse `else` accept branch is only reached
             // when `MLX_MTP_SPARSE_ACCEPT` is disabled; in that case
             // `accept_with_residual` takes its argmax-only shortcut and never
             // reads `q`. `sampling_distribution` at T=0 returns the (valid,
@@ -1575,7 +1571,7 @@ where
     //     trivial readout from the same batched array.
     //
     // When ineligible (T>0, or any penalty non-default), fall through to
-    // the legacy per-position path below.
+    // the per-position path below.
 
     let sparse_verify_argmax = if use_sparse_accept {
         verify_target_argmax.as_ref()
@@ -1682,8 +1678,8 @@ where
         // `verify_logits` may still be lazy from the verify dispatch
         // (especially under `MLX_MTP_VERIFY_ASYNC_EVAL=1`). The
         // `.eval()` below is the SINGLE sync point for the accept
-        // loop — vs the legacy D × per-position `p_target.eval()`
-        // path that forced D full-vocab softmaxes through Metal.
+        // loop — vs the D × per-position `p_target.eval()`
+        // path that forces D full-vocab softmaxes through Metal.
         profiler.begin("mtp_accept_argmax");
         let fallback_argmax;
         let argmax_arr = if let Some(argmax_arr) = sparse_verify_argmax {
@@ -1872,7 +1868,7 @@ where
         let verify_logits = verify_logits_ref
             .ok_or_else(|| Error::from_reason("MTP legacy accept requires verifier logits"))?;
         let mut hist_extended: Vec<u32> = token_history.to_vec();
-        // Legacy per-position path. Kept for T>0 (where residual
+        // Per-position path. Used for T>0 (where residual
         // sampling needs the full target distribution) and for
         // penalty-active configurations (where `hist_extended`
         // mutates the per-position logits inside the loop).
@@ -1899,8 +1895,8 @@ where
             //
             // At T=0 `accept_with_residual` only reads `argmax(p_target)`;
             // `sampling_distribution` returns the one-hot argmax there, so the
-            // argmax (and thus the T=0 commit decision) is byte-identical to
-            // the prior `softmax` while never erroring at T=0.
+            // argmax (and thus the T=0 commit decision) matches a plain
+            // `softmax` of the same logits while never erroring at T=0.
             let p_target = sampling::sampling_distribution(&penalized, params.sampling_config)?
                 .astype(DType::Float32)?;
             p_target.eval();
@@ -1984,7 +1980,7 @@ where
 
     // Diagnostic — `MLX_MTP_TRACE_LOGITS=1` per-committed-token verify
     // top-2 logit trace. Runs AFTER the accept loop so it is read-only
-    // and does not perturb the sparse/legacy accept hot path. Each
+    // and does not perturb the sparse/per-position accept hot path. Each
     // `accepted_tokens[j]` was committed from verify slot `j` of the
     // batched verify forward; `verify_logits` is `[1, depth+1, vocab]`.
     // The first `K` slots are accepted drafts; the final slot is the
@@ -3292,7 +3288,7 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Cycle-level acceptance tests use the legacy cycle-history
+            // Cycle-level acceptance tests use the cycle-history
             // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
@@ -3474,7 +3470,7 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Cycle-level acceptance tests use the legacy cycle-history
+            // Cycle-level acceptance tests use the cycle-history
             // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
@@ -3557,7 +3553,7 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Cycle-level acceptance tests use the legacy cycle-history
+            // Cycle-level acceptance tests use the cycle-history
             // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
@@ -3658,7 +3654,7 @@ mod mtp_cycle_tests {
                 *commit_seen.borrow_mut() = Some((committed_ids.to_vec(), accepted_drafts));
                 Ok(())
             },
-            // Cycle-level acceptance tests use the legacy cycle-history
+            // Cycle-level acceptance tests use the cycle-history
             // policy, so committed-history is inactive.
             committed_history_active: false,
             rollback_unemitted: |_: usize| {},
@@ -3944,7 +3940,7 @@ mod mtp_cycle_tests {
         // Fail closed: this gate is only meaningful if it actually drove the
         // production T=0 sparse-accept commit path. `"mtp_accept_argmax"` is
         // begun ONLY inside the `if use_sparse_accept` branch, so its absence
-        // means the cycle silently took the legacy/stochastic accept path and
+        // means the cycle silently took the stochastic accept path and
         // the byte-equivalence assertions below would be testing the wrong
         // code.
         assert!(

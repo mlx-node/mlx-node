@@ -1223,7 +1223,8 @@ mod tests {
             gl_strong.is_finite(),
             "compute_g_log went non-finite under strong decay: {gl_strong}"
         );
-        // Confirm the OLD g.log() path really does blow up here (justifies the fix).
+        // Confirm the naive `g.log()` path really does blow up here, which is
+        // why `compute_g_log` computes the log directly.
         let old = max_abs(&compute_g(&alog_big, &a_big, &dt_bias)?.log()?)?;
         assert!(
             !old.is_finite(),

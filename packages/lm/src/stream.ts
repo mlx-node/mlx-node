@@ -43,13 +43,13 @@ export interface ChatStreamFinal {
    * prefix-cache reuse without round-tripping to the non-streaming
    * path.
    *
-   * As of Round 6 Fix #2 the native `ChatStreamChunk` surfaces
-   * `cachedTokens` on the terminal (`done == true`) chunk for every
-   * streaming entry point (Qwen3, Qwen3.5 Dense / MoE, LFM2, Gemma4,
-   * QianfanOCR) — start-path chunks carry the matched prefix length
-   * from `verify_cache_prefix_direct`, delta-path chunks carry the
-   * reused prior-history length. Non-terminal deltas still carry
-   * `None` / `undefined` (only the terminal chunk is authoritative).
+   * The native `ChatStreamChunk` surfaces `cachedTokens` on the
+   * terminal (`done == true`) chunk for every streaming entry point
+   * (Qwen3, Qwen3.5 Dense / MoE, LFM2, Gemma4, QianfanOCR) — start-path
+   * chunks carry the matched prefix length from
+   * `verify_cache_prefix_direct`, delta-path chunks carry the reused
+   * prior-history length. Non-terminal deltas carry `None` /
+   * `undefined` (only the terminal chunk is authoritative).
    *
    * This field remains OPTIONAL because the bridge-level mock tests
    * (and any future in-process driver that constructs its own
@@ -230,14 +230,13 @@ export async function* _runChatStream(
         if (item.error) throw item.error;
         const chunk = item.chunk!;
         if (chunk.done) {
-          // Round 6 Fix #2: the native `ChatStreamChunk` now carries
-          // `cachedTokens` on the terminal (`done == true`) chunk for
-          // every streaming entry point. Emit it on the final event
-          // verbatim — undefined means the native dispatch did not
-          // populate it (e.g. a bridge-level mock or a future
-          // in-process driver), in which case downstream consumers
-          // treat the absence as "unknown / not plumbed" and skip
-          // emitting e.g. `X-Cached-Tokens` rather than reporting a
+          // The native `ChatStreamChunk` carries `cachedTokens` on the
+          // terminal (`done == true`) chunk for every streaming entry
+          // point. Emit it on the final event verbatim — undefined means
+          // the native dispatch did not populate it (e.g. a bridge-level
+          // mock or an in-process driver), in which case downstream
+          // consumers treat the absence as "unknown / not plumbed" and
+          // skip emitting e.g. `X-Cached-Tokens` rather than reporting a
           // fabricated `0`.
           const chunkWithCached = chunk as ChatStreamChunk & { cachedTokens?: number };
           const finalEvent: ChatStreamFinal = {
@@ -343,9 +342,9 @@ interface StreamingModelOptions {
   /**
    * Whether to attach an `applyChatTemplate` method. Defaults to
    * `recordModelPath` because the method can only work when a path was
-   * recorded. Qwen3 (first-gen) records its path but historically
-   * exposed no `applyChatTemplate`; pass `applyTemplate: false` to keep
-   * that exact surface.
+   * recorded. Qwen3 (first-gen) records its path but exposes no
+   * `applyChatTemplate`; pass `applyTemplate: false` to suppress the
+   * method while still recording the path.
    */
   applyTemplate?: boolean;
 }
@@ -520,8 +519,8 @@ export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, { recordM
  * Qwen3 (first-gen, text-only) model.
  *
  * Records its model path (so prototype-set + path-recording match the
- * other families) but, matching its historical surface, exposes NO
- * `applyChatTemplate` — `applyTemplate: false` suppresses that method.
+ * other families) but exposes NO `applyChatTemplate` —
+ * `applyTemplate: false` suppresses that method.
  */
 export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, {
   recordModelPath: true,

@@ -201,7 +201,7 @@ fn prewarm_files(files: &[PathBuf]) {
 /// pages — the in-engine equivalent of a manual `cat model.safetensors >/dev/null`.
 /// Routing GPU evals via the CPU *stream* does NOT help: the mmap arrays are
 /// created GPU-bound during load, so their eval runs on the GPU regardless of
-/// the current default stream. Warming the page cache is the fix.
+/// the current default stream. Warming the page cache avoids the stall.
 ///
 /// Best-effort: open/read errors are logged and ignored, so load then proceeds
 /// exactly as it would have without pre-warming. Shared across every model
@@ -461,11 +461,11 @@ mod prewarm_tests {
         fs::write(p, b"").expect("touch");
     }
 
-    // Regression for the cold-mmap prewarm: the set of files we warm MUST cover
-    // every safetensors location a loader can later mmap — the model dir AND the
-    // MTP head layouts (`mtp-drafter/`, `mtp/`, sibling `<name>-mtp/`) plus an
-    // explicit non-standard sidecar passed as an `extra_file`. Missing any of
-    // these re-opens the watchdog hole this fix closes.
+    // The set of files we warm MUST cover every safetensors location a loader
+    // can later mmap — the model dir AND the MTP head layouts (`mtp-drafter/`,
+    // `mtp/`, sibling `<name>-mtp/`) plus an explicit non-standard sidecar
+    // passed as an `extra_file`. Missing any of these re-opens the cold-mmap
+    // GPU-watchdog hole the prewarm exists to close.
     #[test]
     fn collect_safetensors_covers_mtp_sidecar_and_drafter_layouts() {
         let root = std::env::temp_dir().join(format!("prewarm_cover_{}", std::process::id()));

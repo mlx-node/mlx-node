@@ -42,7 +42,8 @@ pub struct Qwen3Config {
     /// `BlockAllocator` + `LayerKVPool` pair and constructs a
     /// `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
     /// block-paged storage with refcounted prefix caching). When
-    /// `Some(false)`, the legacy flat `Vec<KVCache>` path is used instead.
+    /// `Some(false)`, the flat (non-paged) `Vec<KVCache>` cache path is
+    /// used instead.
     ///
     /// Default: true.
     #[serde(default)]

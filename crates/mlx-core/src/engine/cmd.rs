@@ -1,21 +1,16 @@
 //! Shared model-thread command enum + dispatcher.
 //!
-//! [`ChatCmd`] is the model-neutral generalization of the legacy lfm2
-//! command enum (`models/lfm2/model.rs`, deleted in S11) — exactly its
-//! 7-variant shape and payload fields, with the family prefix dropped
-//! from the variant names. [`handle_chat_cmd`] generalizes the legacy
-//! per-family command handler: each arm calls the corresponding generic
-//! session core from [`crate::engine::session`] instead of a per-family
-//! `*_sync` method. S7+ migrations swap each family's
-//! `ModelThread<FamilyCmd>` over to `ModelThread<ChatCmd>` +
-//! `handle_chat_cmd::<FamilyInner>` and delete the per-family copies.
+//! [`ChatCmd`] is the model-neutral chat command: a 7-variant shape with
+//! the per-turn payload fields. [`handle_chat_cmd`] dispatches each arm
+//! to the corresponding generic session core from
+//! [`crate::engine::session`].
 //!
 //! Families whose command enums carry MORE than the 7 chat variants
 //! (qwen3 / qwen3_5 / qwen3_5_moe ship Generate / SaveModel / training
-//! variants) do NOT swap wholesale: they keep `ModelThread<FamilyCmd>`
-//! and either nest `Chat(engine::ChatCmd)` as a variant or delegate the
-//! 7 chat arms straight to `handle_chat_cmd::<FamilyInner>` — only lfm2
-//! (and gemma4's chat-only thread) swap the thread type itself.
+//! variants) keep `ModelThread<FamilyCmd>` and either nest
+//! `Chat(engine::ChatCmd)` as a variant or delegate the 7 chat arms
+//! straight to `handle_chat_cmd::<FamilyInner>`. lfm2 (and gemma4's
+//! chat-only thread) use `ModelThread<ChatCmd>` directly.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -35,9 +30,8 @@ use crate::training_model::{GenerationPlainData, ModelType, TrainStepPlainMetric
 
 /// Commands dispatched from NAPI methods to a dedicated model thread.
 ///
-/// Same shape as the legacy lfm2 command enum (the reference family
-/// enum, deleted in S11); each generic session core's rustdoc carries
-/// the full behavioural contracts.
+/// Each generic session core's rustdoc carries the full behavioural
+/// contracts.
 pub(crate) enum ChatCmd {
     /// Start a new session via the jinja-render path with the family's
     /// session stop token ([`ChatBackend::session_eos_id`]). Full
@@ -133,13 +127,12 @@ impl FromChatCmd for ChatCmd {
 /// Training commands dispatched from the GRPO / SFT engines to a
 /// trainable family's dedicated model thread.
 ///
-/// The model-neutral generalization of the per-family training command
-/// variants (the 9 `InitTraining` / `GenerateForTraining` / `TrainStep*`
-/// / optimizer-state / step-counter commands that were byte-identical
-/// across qwen3 / qwen3_5 / qwen3_5_moe). [`handle_train_cmd`] drives
-/// the [`TrainBackend`] impl on each trainable family's `*Inner` struct.
-/// Only the three trainable families nest this as a `Train(TrainCmd)`
-/// variant — gemma4 / lfm2 are inference-only and carry no training arm.
+/// The model-neutral training command: 9 `InitTraining` /
+/// `GenerateForTraining` / `TrainStep*` / optimizer-state / step-counter
+/// variants. [`handle_train_cmd`] drives the [`TrainBackend`] impl on
+/// each trainable family's `*Inner` struct. Only the three trainable
+/// families nest this as a `Train(TrainCmd)` variant — gemma4 / lfm2 are
+/// inference-only and carry no training arm.
 pub(crate) enum TrainCmd {
     /// Set up optimizer + training state on the model thread.
     InitTraining {
@@ -202,14 +195,12 @@ pub(crate) trait FromTrainCmd {
     fn from_train(cmd: TrainCmd) -> Self;
 }
 
-/// Command handler for a dedicated model thread — the generic form of
-/// the legacy lfm2 command handler (deleted in S11).
+/// Command handler for a dedicated model thread.
 ///
-/// NOTE (carried over from the lfm2 reference): no per-request cache
-/// drain here. On a multi-model server the MLX allocator free-pool is
-/// process-wide, so flushing after a request on model A discards
-/// blocks about to be reused by model B. The TS idle sweeper in
-/// `@mlx-node/server` handles between-turn drains.
+/// NOTE: no per-request cache drain here. On a multi-model server the
+/// MLX allocator free-pool is process-wide, so flushing after a request
+/// on model A discards blocks about to be reused by model B. The TS idle
+/// sweeper in `@mlx-node/server` handles between-turn drains.
 pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
     match cmd {
         ChatCmd::SessionStart {
@@ -295,16 +286,12 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
     }
 }
 
-/// Training-command handler for a trainable family's model thread — the
-/// generic form of the per-family training/save match arms (the inline
-/// `Bump`/`Set`/`Reset` arms plus the `*_sync` forwards) that were
-/// byte-identical across qwen3 / qwen3_5 / qwen3_5_moe.
+/// Training-command handler for a trainable family's model thread.
 ///
 /// `Bump`/`Set`/`Reset` operate directly on
-/// [`TrainBackend::training_state_mut`] (verbatim port of the inline
-/// arms); the other six forward to the [`TrainBackend`] `*_sync`
-/// methods. Every arm preserves the per-family `let _ = reply.send(..)`
-/// semantics exactly.
+/// [`TrainBackend::training_state_mut`]; the other six forward to the
+/// [`TrainBackend`] `*_sync` methods. Every arm sends its result back
+/// via `let _ = reply.send(..)`.
 pub(crate) fn handle_train_cmd<B: TrainBackend>(inner: &mut B, cmd: TrainCmd) {
     match cmd {
         TrainCmd::InitTraining {
@@ -398,9 +385,9 @@ pub(crate) fn handle_train_cmd<B: TrainBackend>(inner: &mut B, cmd: TrainCmd) {
 
 #[cfg(test)]
 mod mock_backend_tests {
-    //! End-to-end mock integration test for the S6 stack: a scripted
-    //! [`ChatBackend`] + a real (hermetic, inline-fixture)
-    //! [`Qwen3Tokenizer`] drive [`handle_chat_cmd`] through
+    //! End-to-end mock integration test: a scripted [`ChatBackend`] + a
+    //! real (hermetic, inline-fixture) [`Qwen3Tokenizer`] drive
+    //! [`handle_chat_cmd`] through
     //! SessionStart → SessionContinue → SessionContinueTool plus the
     //! streaming start path, pinning the ChatResult invariants
     //! (finish_reason, num_tokens, cached_tokens, token-history
@@ -493,14 +480,13 @@ mod mock_backend_tests {
         Arc::new(tok)
     }
 
-    /// Scripted decode stepper (same pattern as the S5
-    /// `run_decode_loop` mock): forward call N returns `[1, vocab]`
-    /// logits whose argmax is `script[N]`; T=0 sampling then commits
-    /// exactly that token.
+    /// Scripted decode stepper (same pattern as the `run_decode_loop`
+    /// mock): forward call N returns `[1, vocab]` logits whose argmax is
+    /// `script[N]`; T=0 sampling then commits exactly that token.
     struct MockDecode {
         script: Vec<u32>,
         pos: usize,
-        /// D1 knob: make the post-loop `end_decode` hook fail (the
+        /// Knob: make the post-loop `end_decode` hook fail (the
         /// compiled-export error path).
         fail_end_decode: bool,
         /// Shared physical flat-cache cursor (also held by the backend).
@@ -563,7 +549,7 @@ mod mock_backend_tests {
     /// state (token-history prefix cache), scripted per-turn argmax
     /// targets. Turn script layout: `script[0]` is the prefill-sampled
     /// first token; `script[1..]` feeds the stepper. The `*_knob`
-    /// fields exercise the S6.5 panel-fix hooks.
+    /// fields exercise the optional backend hooks.
     struct MockBackend {
         tokenizer: Arc<Qwen3Tokenizer>,
         history: Vec<u32>,
@@ -581,14 +567,14 @@ mod mock_backend_tests {
         /// `history.len() == cache_cursor` is checkable.
         cache_cursor: Arc<AtomicUsize>,
         // ---- hook knobs (default off == ChatML defaults) ----
-        /// D1: fail the stepper's `end_decode`.
+        /// Fail the stepper's `end_decode`.
         fail_end_decode_knob: bool,
-        /// D2: tag `finalize_turn`'s output so tests can prove the
-        /// override (not the default pipeline) produced the result.
+        /// Tag `finalize_turn`'s output so tests can prove the override
+        /// (not the default pipeline) produced the result.
         finalize_marker_knob: bool,
-        /// D3: extra stop ids returned from `extra_eos_ids`.
+        /// Extra stop ids returned from `extra_eos_ids`.
         extra_eos_knob: Vec<u32>,
-        /// D4: force `report_performance = true` in `resolve_params`
+        /// Force `report_performance = true` in `resolve_params`
         /// (gemma4's always-report policy).
         force_report_perf_knob: bool,
         /// generation_config.json defaults returned from
@@ -596,16 +582,16 @@ mod mock_backend_tests {
         /// default). The mock's `resolve_params` mirrors the default trait
         /// impl, folding these into any unspecified request field.
         gen_defaults_knob: Option<ModelGenerationDefaults>,
-        /// D6: return `None` from `wired_limit_bytes` (qwen3's
+        /// Return `None` from `wired_limit_bytes` (qwen3's
         /// no-WiredLimitContext policy).
         wired_none_knob: bool,
-        /// Codex F1: report a paged adapter and answer the `paged_turn`
-        /// probe with `TurnOutput::Complete` — the streaming-contract
-        /// violation the session core must reject loudly.
+        /// Report a paged adapter and answer the `paged_turn` probe with
+        /// `TurnOutput::Complete` — the streaming-contract violation the
+        /// session core must reject loudly.
         paged_complete_knob: bool,
-        /// Codex F2: `render_prompt` invocation counter (interior
-        /// mutability — the hook takes `&self`). The pre-render image
-        /// guard must reject text-only image turns with this still 0.
+        /// `render_prompt` invocation counter (interior mutability — the
+        /// hook takes `&self`). The pre-render image guard must reject
+        /// text-only image turns with this still 0.
         render_prompt_calls: AtomicUsize,
     }
 
@@ -670,9 +656,9 @@ mod mock_backend_tests {
             messages: &[ChatMessage],
             config: &ChatConfig,
         ) -> Result<Vec<u32>> {
-            // Counting renderer (Codex F2 regression tests): same body
-            // as the trait default, plus the invocation counter the
-            // pre-render image-guard tests assert on.
+            // Counting renderer: same body as the trait default, plus the
+            // invocation counter the pre-render image-guard tests assert
+            // on.
             self.render_prompt_calls.fetch_add(1, Ordering::Relaxed);
             tok.apply_chat_template_sync(
                 messages,
@@ -762,9 +748,9 @@ mod mock_backend_tests {
         fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
             if self.paged_complete_knob {
                 // Deliberate streaming-contract violation under
-                // streaming (Codex F1): a probe that completes a
-                // sink-bearing turn must return Streamed, never
-                // Complete. On the sync path this is the correct shape.
+                // streaming: a probe that completes a sink-bearing turn
+                // must return Streamed, never Complete. On the sync path
+                // this is the correct shape.
                 Some(Ok(TurnOutput::Complete(Box::new(ChatResult {
                     text: "PAGED_COMPLETE".to_string(),
                     tool_calls: Vec::new(),
@@ -1064,7 +1050,7 @@ mod mock_backend_tests {
             .unwrap_or_else(|e| panic!("reset reply dropped: {e}"))
             .unwrap_or_else(|e| panic!("reset failed: {}", e.reason));
         assert!(backend.history.is_empty());
-        // D12: the explicit command reset arrives with Command scope
+        // The explicit command reset arrives with Command scope
         // (distinct from the turn-internal PrefixMiss above).
         assert_eq!(
             backend.reset_calls,
@@ -1346,9 +1332,9 @@ mod mock_backend_tests {
         let _ = (h1, r1);
     }
 
-    // ---- S6.5 panel-fix seams ----
+    // ---- optional hook seams ----
 
-    /// D1 — `end_decode` Err aborts the turn BEFORE `save_cache_state`:
+    /// `end_decode` Err aborts the turn BEFORE `save_cache_state`:
     /// the error propagates to the caller, no save call is recorded, and
     /// the session history stays untouched (the compiled-export error
     /// path: reset-without-export, nothing persisted).
@@ -1381,9 +1367,9 @@ mod mock_backend_tests {
         assert_eq!(backend.prefill_calls.len(), 1);
     }
 
-    /// D2 — the `finalize_turn` override (not the default pipeline)
-    /// produces the result, and the session core still overwrites
-    /// `cached_tokens` AFTER the hook returns.
+    /// The `finalize_turn` override (not the default pipeline) produces
+    /// the result, and the session core still overwrites `cached_tokens`
+    /// AFTER the hook returns.
     #[test]
     fn finalize_turn_override_reaches_result_and_cached_tokens_overwrite_wins() {
         let mut backend =
@@ -1407,8 +1393,8 @@ mod mock_backend_tests {
         );
     }
 
-    /// D3 — extra stop ids flow from `extra_eos_ids` through the session
-    /// core into the decode loop (stop well before the session EOS).
+    /// Extra stop ids flow from `extra_eos_ids` through the session core
+    /// into the decode loop (stop well before the session EOS).
     #[test]
     fn extra_eos_ids_stop_the_session_turn() {
         let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_OK, TOK_IM_END]]);
@@ -1425,7 +1411,7 @@ mod mock_backend_tests {
         assert_eq!(r.num_tokens, 2, "stopped on the extra id: {r:?}");
     }
 
-    /// D4 — `resolve_params` override is honored end to end: forcing
+    /// `resolve_params` override is honored end to end: forcing
     /// `report_performance = true` (gemma4's always-report policy) on a
     /// default config yields `Some(performance)` where the config-only
     /// extraction (default false) yields `None`.
@@ -1457,7 +1443,7 @@ mod mock_backend_tests {
         );
     }
 
-    /// #38 — the default `resolve_params` folds the model's
+    /// The default `resolve_params` folds the model's
     /// generation_config.json defaults into UNSPECIFIED request fields,
     /// while an explicit request value always wins.
     #[test]
@@ -1501,8 +1487,8 @@ mod mock_backend_tests {
         assert_eq!(s.min_p, Some(0.05));
     }
 
-    /// #38 — with no model defaults (`generation_defaults() == None`),
-    /// `resolve_params` is byte-identical to the config-only extraction:
+    /// With no model defaults (`generation_defaults() == None`),
+    /// `resolve_params` is identical to the config-only extraction:
     /// unspecified fields stay `None` → the sampler's builtin fallback.
     #[test]
     fn resolve_params_without_generation_defaults_is_passthrough() {
@@ -1517,7 +1503,7 @@ mod mock_backend_tests {
         assert_eq!(p.repetition_penalty, 1.0, "builtin penalty fallback");
     }
 
-    /// #38 — `apply_generation_defaults` is a pure is-none pre-fill:
+    /// `apply_generation_defaults` is a pure is-none pre-fill:
     /// unspecified fields take the default, explicit ones are untouched,
     /// and a `None` default field is a no-op.
     #[test]
@@ -1640,7 +1626,7 @@ mod mock_backend_tests {
         );
     }
 
-    /// D6 — `wired_limit_bytes() == None` skips the WiredLimitContext
+    /// `wired_limit_bytes() == None` skips the WiredLimitContext
     /// entirely (qwen3's policy); the turn still completes.
     #[test]
     fn wired_limit_none_turn_completes() {
@@ -1656,11 +1642,9 @@ mod mock_backend_tests {
         assert_eq!(r.finish_reason, "stop");
     }
 
-    /// D11 — a STREAMING delta turn's terminal chunk reports the
-    /// family's `stream_delta_prompt_tokens` choice (default since S12:
-    /// the FULL history+delta length, matching the sync delta result —
-    /// every migrated family settled on full, so the five identical
-    /// per-family overrides were folded into the default and deleted).
+    /// A STREAMING delta turn's terminal chunk reports the family's
+    /// `stream_delta_prompt_tokens` choice (default: the FULL
+    /// history+delta length, matching the sync delta result).
     #[test]
     fn streaming_delta_terminal_chunk_reports_full_prompt_tokens() {
         let mut backend = MockBackend::new(vec![
@@ -1711,8 +1695,8 @@ mod mock_backend_tests {
         assert_eq!(last.cached_tokens, Some(h1_len as u32));
     }
 
-    /// D7 — the streaming delta guards name the streaming entry points;
-    /// the sync twin keeps the sync names (asserted in
+    /// The streaming delta guards name the streaming entry points; the
+    /// sync twin keeps the sync names (asserted in
     /// `delta_guards_reject_bad_sessions`).
     #[test]
     fn streaming_delta_guard_strings_name_streaming_entry_points() {
@@ -1742,10 +1726,10 @@ mod mock_backend_tests {
         );
     }
 
-    // ---- codex adversarial-review regressions ----
+    // ---- streaming-contract regressions ----
 
-    /// Codex F1 [HIGH] — a whole-turn probe returning
-    /// `TurnOutput::Complete` on a STREAMING turn must NOT silently
+    /// A whole-turn probe returning `TurnOutput::Complete` on a
+    /// STREAMING turn must NOT silently
     /// close the stream (no chunks, no done-chunk, no error — JS
     /// consumers hang). The session core rejects the contract violation
     /// and the streaming wrapper delivers exactly one `Err` through the
@@ -1794,9 +1778,9 @@ mod mock_backend_tests {
         assert!(backend.history.is_empty());
     }
 
-    /// Codex F1 companion — the SAME `Complete` outcome on the sync
-    /// (sink-less) path is the correct contract and flows through
-    /// unchanged: the guard must only bite under streaming.
+    /// The SAME `Complete` outcome on the sync (sink-less) path is the
+    /// correct contract and flows through unchanged: the guard must only
+    /// bite under streaming.
     #[test]
     fn sync_whole_turn_complete_outcome_flows_through() {
         let mut backend = MockBackend::new(vec![]);
@@ -1812,8 +1796,8 @@ mod mock_backend_tests {
         assert_eq!(r.finish_reason, "stop");
     }
 
-    /// Codex F2 [MEDIUM] (sync) — an image-bearing FRESH turn on a
-    /// text-only backend is rejected with the typed
+    /// (sync) An image-bearing FRESH turn on a text-only backend is
+    /// rejected with the typed
     /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error BEFORE the prompt
     /// renderer runs: `serialize_message_for_jinja` represents image
     /// content as an array, so a text-only family's template could
@@ -1857,9 +1841,8 @@ mod mock_backend_tests {
         assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 1);
     }
 
-    /// Codex F2 [MEDIUM] (stream) — same rejection on the streaming
-    /// twin: exactly one typed `Err` through the sink, no done-chunk,
-    /// renderer never called.
+    /// (stream) Same rejection on the streaming twin: exactly one typed
+    /// `Err` through the sink, no done-chunk, renderer never called.
     #[test]
     fn text_only_image_fresh_turn_rejected_before_render_stream() {
         let mut backend = MockBackend::new(vec![]);

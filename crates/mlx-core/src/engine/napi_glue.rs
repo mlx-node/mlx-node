@@ -1,9 +1,8 @@
 //! Shared NAPI streaming glue: the `StreamTx → ThreadsafeFunction`
 //! forwarding pump every streaming chat entry point spawns.
 //!
-//! Generalizes the per-family inline pattern (e.g.
-//! `models/lfm2/model.rs::chat_stream_session_start` and its twins on
-//! every family):
+//! Each streaming entry point dispatches via [`start_chat_stream`] + one
+//! `thread.send(ChatCmd::Stream…)` call, which sets up:
 //!
 //! ```text
 //! let cancelled = Arc::new(AtomicBool::new(false));
@@ -17,9 +16,6 @@
 //! });
 //! Ok(ChatStreamHandle { cancelled })
 //! ```
-//!
-//! S7+ migrations replace each family's copy with
-//! [`start_chat_stream`] + one `thread.send(ChatCmd::Stream…)` call.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -46,8 +42,7 @@ pub(crate) struct ChatStreamPlumbing {
 /// Build the cancel flag + mpsc channel and spawn the forwarding pump.
 ///
 /// Must be called from a Tokio runtime context (every `#[napi]` async
-/// method qualifies — same constraint as the per-family inline copies
-/// this replaces). If the subsequent `thread.send(..)` fails, dropping
+/// method qualifies). If the subsequent `thread.send(..)` fails, dropping
 /// the returned plumbing closes the channel and the pump task exits on
 /// its own.
 pub(crate) fn start_chat_stream(
@@ -67,7 +62,7 @@ pub(crate) fn start_chat_stream(
 /// The forwarding pump: drain the model thread's stream channel into
 /// the JS callback until the producer drops (turn finished or the
 /// model thread exited). Always `NonBlocking` — a torn-down JS
-/// callback just drops the chunk, matching the per-family pumps.
+/// callback just drops the chunk.
 pub(crate) fn spawn_stream_pump(
     mut stream_rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
     callback: ThreadsafeFunction<ChatStreamChunk, ()>,

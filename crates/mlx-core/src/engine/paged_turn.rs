@@ -42,11 +42,10 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let think_end_id = tokenizer.think_end_id();
     let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
 
-    // D3: the legacy `paged_chat_turn` forced `reuse_cache = true` on
-    // delta turns (the engine's delta guards already rejected an
-    // explicit `Some(false)`); fresh turns resolved from config (==
-    // `p.reuse_cache`). Compute it ONCE here and thread it into prime +
-    // finalize + save so all three agree.
+    // Delta turns force `reuse_cache = true` (the engine's delta guards
+    // already rejected an explicit `Some(false)`); fresh turns resolve
+    // from config (== `p.reuse_cache`). Computed ONCE here and threaded
+    // into prime + finalize + save so all three agree.
     let reuse_cache = if is_delta { true } else { p.reuse_cache };
 
     // ---- perf / instant init (== chat_turn_core) ----
@@ -64,7 +63,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // `block_size = 0`: qwen3 ignores it; VLM families read their own
     // adapter's block size inside `prime_prefix_state`.
     //
-    // ABORT-ON-ERROR (Codex HIGH): prime resets the adapter + attaches the
+    // ABORT-ON-ERROR: prime resets the adapter + attaches the
     // cached-prefix blocks and can THEN fail allocating suffix blocks (OOM),
     // leaving a LIVE request with a partial block table. Release it before
     // propagating — same shape as the post-prime `paged_prefill` match
@@ -81,9 +80,9 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     };
     let effective_cached_prefix_len = prefix.effective_cached_prefix_len();
     let suffix_len = prefix.suffix_len();
-    // Empty-prompt / zero-suffix guard (the forked core's debug_assert +
-    // the vLLM cap guarantees suffix_len >= 1; surface a real error
-    // rather than feed the paged forward a 0-token chunk). Prime SUCCEEDED
+    // Empty-prompt / zero-suffix guard (the vLLM cap guarantees
+    // suffix_len >= 1; surface a real error rather than feed the paged
+    // forward a 0-token chunk). Prime SUCCEEDED
     // here, so a LIVE request exists — abort it (release the live request)
     // before surfacing the error, same as every other post-prime exit.
     if suffix_len == 0 {
@@ -126,12 +125,11 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let mut emitter: Option<Box<dyn StreamEmitter>> = args.sink.map(|_| backend.stream_emitter());
 
     // ---- prefill ----
-    // ABORT-ON-ERROR (Codex HIGH): every fallible step from here through
-    // `end_decode` must release the live paged request before propagating
-    // — == the legacy forked cores' `Err(e) => release_request()` arm. A
-    // bare `?` would leave the adapter's request_tokens/block_table
-    // advanced with partial/unwritten KV. No live stepper holds
-    // `&mut backend` yet, so `abort_paged_turn` can borrow it directly.
+    // ABORT-ON-ERROR: every fallible step from here through `end_decode`
+    // must release the live paged request before propagating. A bare `?`
+    // would leave the adapter's request_tokens/block_table advanced with
+    // partial/unwritten KV. No live stepper holds `&mut backend` yet, so
+    // `abort_paged_turn` can borrow it directly.
     profiler.begin_prefill();
     let last_logits = match backend.paged_prefill(suffix, &prefix, generation_stream) {
         Ok(l) => l,
@@ -175,11 +173,11 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // block's close (releasing the borrow), then the error is handled
     // below where `&mut backend` is free again.
     // The stream the per-step DECODE forward runs on. lfm2 returns the DEFAULT
-    // stream (single-stream decode == legacy, no per-token cross-queue sync);
-    // qwen3/others return `generation_stream` (dedicated decode queue, == their
-    // legacy paged loop). `paged_prefill` above always used `generation_stream`.
-    // Computed HERE, before the closure borrows `&mut backend` via
-    // `begin_paged_decode` (this hook only needs `&self`).
+    // stream (single-stream decode, no per-token cross-queue sync);
+    // qwen3/others return `generation_stream` (dedicated decode queue).
+    // `paged_prefill` above always used `generation_stream`. Computed HERE,
+    // before the closure borrows `&mut backend` via `begin_paged_decode`
+    // (this hook only needs `&self`).
     let decode_generation_stream = backend.paged_decode_stream(generation_stream);
     let decode_result: Result<()> = (|| {
         let setup = PagedTurnSetup {
@@ -231,13 +229,12 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         // ends one token shorter than the saved keep-all history. One
         // extra `materialize_final` (record + forward, logits discarded)
         // closes that gap so `request_tokens()` == the saved history,
-        // matching mlx-lm / mlx-vlm / origin-main fba240b8 (vLLM
-        // one-shorts for batched throughput; not adopted here). Runs
-        // BEFORE `end_decode` so the token's K/V is part of the caches a
-        // future compiled-paged family exports there. LENGTH exits ONLY:
-        // an EOS / cancel / repetition final token is a boundary marker
-        // the next delta re-renders (and fba240b8 broke before its
-        // forward too), so it must NOT be materialized.
+        // matching mlx-lm / mlx-vlm (vLLM one-shorts for batched
+        // throughput; not adopted here). Runs BEFORE `end_decode` so the
+        // token's K/V is part of the caches a future compiled-paged family
+        // exports there. LENGTH exits ONLY: an EOS / cancel / repetition
+        // final token is a boundary marker the next delta re-renders, so
+        // it must NOT be materialized.
         if finish_reason == "length"
             && let Some(&last_token) = generated_tokens.last()
         {
@@ -262,15 +259,15 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         return Err(e);
     }
 
-    // ---- save-history alignment (D2 — mirrors the FLAT save_cache_state
-    // rule, model.rs `save_cache_state` lines ~3138-3143). ----
+    // ---- save-history alignment (mirrors the FLAT save_cache_state
+    // rule). ----
     // KEEP-ALL iff the turn hit the length budget; DROP-LAST on any other
     // stop (EOS / cutoff / cancel) — in every non-length case the final
     // committed token IS the boundary marker (`<|im_end|>` / cutoff) the
     // next delta re-renders, so it must NOT be persisted. This is the
     // EXACT FLAT rule (`finish_reason != "length"` => drop-last); the
-    // earlier inverted form silently truncated a CONTENT token from the
-    // conversation on a length exit (Codex HIGH).
+    // inverted form would silently truncate a CONTENT token from the
+    // conversation on a length exit.
     let keep_all = finish_reason == "length";
 
     // ---- perf-parity adapter reconcile (warm-continue) — run BEFORE the
@@ -283,9 +280,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // (dropped-from-history) stop token, while the saved history drops it.
     // The next turn's warm-continue gate
     // (`prompt.starts_with(request_tokens())`) would then FAIL on that
-    // trailing stop token => a needless cold prefill. The legacy forked
-    // paged core recorded at the loop BOTTOM (after the stop-check), so it
-    // never recorded the stop token and warm-continue worked.
+    // trailing stop token => a needless cold prefill.
     //
     // `reconcile_paged_request_tokens` rolls the adapter back to the
     // to-be-saved history length so `request_tokens()` matches the dropped
@@ -293,11 +288,10 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // already recorded the final token's K/V, so the adapter EQUALS the
     // kept history, no surplus to roll back; and a no-op when the stop
     // landed on the final step, whose forward never ran). Returns whether
-    // the reconcile succeeded
-    // (Codex #3 contract): `true` on reconcile/no-op, `false` only if the
-    // adapter rollback FAILED (then it is left over-recorded vs the saved
-    // history). NO-OP on the non-reuse path (finalize releases the request
-    // anyway), where we keep `reconcile_ok = true`.
+    // the reconcile succeeded: `true` on reconcile/no-op, `false` only if
+    // the adapter rollback FAILED (then it is left over-recorded vs the
+    // saved history). NO-OP on the non-reuse path (finalize releases the
+    // request anyway), where we keep `reconcile_ok = true`.
     let reconcile_ok = if reuse_cache {
         backend.reconcile_paged_request_tokens(args.tokens.len(), &generated_tokens, keep_all)
     } else {
@@ -308,8 +302,8 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // release/finalize). Runs AFTER the reconcile so registration sees the
     // corrected token set, and AFTER the stepper drop so the request is
     // finalized once decode's borrow is released. ----
-    // Gate keep-live on the reconcile (Codex #3): finalize with reuse iff
-    // BOTH the turn reuses caches AND the reconcile succeeded. On a
+    // Gate keep-live on the reconcile: finalize with reuse iff BOTH the
+    // turn reuses caches AND the reconcile succeeded. On a
     // reconcile FAILURE `finalize_paged_turn(false)` takes the
     // release_request arm — we must NOT finalize_turn_keep_live an
     // unreconciled / over-recorded request (its `request_tokens()` no
@@ -319,14 +313,14 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // cold-prefills correctly off the persisted tokens.
     backend.finalize_paged_turn(reuse_cache && reconcile_ok);
 
-    // ---- save paged history (D2 — NOT the FLAT save_cache_state field
-    // set; token history + image key ONLY). Computed IDENTICALLY to the
-    // FLAT save now (same keep_all rule), so the paged cached_token_history
-    // matches what save_cache_state would persist. ----
+    // ---- save paged history (NOT the FLAT save_cache_state field set;
+    // token history + image key ONLY). Computed IDENTICALLY to the FLAT
+    // save (same keep_all rule), so the paged cached_token_history matches
+    // what save_cache_state would persist. ----
     // Fallible: a family's post-history checkpoint (MoE GDN warm-continue)
     // can fail; propagate so the turn aborts rather than returning a result
     // backed by an un-checkpointed cache. The request is already finalized
-    // (kept-live) above, matching the legacy core's `?` after finalize.
+    // (kept-live) above, so this `?` aborts after finalize.
     backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache)?;
 
     // ---- finalize (== chat_turn_core tail) ----
@@ -396,9 +390,9 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         reasoning_tokens,
     })?;
     // cached_tokens overwrite stays in the engine (AFTER finalize — the
-    // override must not fill it): the forked paged cores reported the
-    // matched prefix length; for delta turns the warm-continue
-    // effective_cached_prefix_len covers the full prior history.
+    // override must not fill it): it reports the matched prefix length;
+    // for delta turns the warm-continue effective_cached_prefix_len covers
+    // the full prior history.
     result.cached_tokens = effective_cached_prefix_len as u32;
 
     if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
@@ -414,7 +408,7 @@ mod tests {
     //! [`PagedBackend`] — NO model, NO Metal. The decode-loop internals
     //! (forward/eval counts, EOS, cutoffs) are already covered by
     //! `decode::run_decode_loop_tests`; the UNIQUE value here is the
-    //! `run_paged_turn`-level call SEQUENCE (D6): prime → prefill →
+    //! `run_paged_turn`-level call SEQUENCE: prime → prefill →
     //! begin_decode → (loop) → end_decode → finalize → save, each
     //! exactly once in order — plus the pipelined `forward_count ==
     //! max_new - 1` invariant.
@@ -457,14 +451,14 @@ mod tests {
     /// Captured arguments of the most recent `save_paged_history` call,
     /// PLUS the persisted history the qwen3 trim would produce — shared
     /// with the test via `Arc<Mutex<..>>`. The history-preservation
-    /// regression tests assert on this (D2 length-exit keep-all vs
+    /// regression tests assert on this (length-exit keep-all vs
     /// early-stop drop-last).
     #[derive(Clone, Default)]
     struct SavedHistory {
         generated: Vec<u32>,
         keep_all: bool,
         /// `save_tokens + (keep_all ? generated : generated[..len-1])` —
-        /// the byte-identical port of qwen3 `save_paged_history`'s trim.
+        /// matches qwen3 `save_paged_history`'s trim.
         persisted_history: Vec<u32>,
     }
 
@@ -767,9 +761,9 @@ mod tests {
             generated: &[u32],
             keep_all: bool,
         ) -> bool {
-            // Byte-identical port of qwen3 `reconcile_paged_request_tokens`:
-            // roll the simulated cursor back to the to-be-saved history
-            // length (same trim as save_paged_history). `saturating_sub`
+            // Matches qwen3 `reconcile_paged_request_tokens`: roll the
+            // simulated cursor back to the to-be-saved history length
+            // (same trim as save_paged_history). `saturating_sub`
             // makes it a no-op on a length exit (cursor already EQUALS the
             // kept history — `materialize_final` recorded the final token,
             // surplus 0) and when the stop landed on the final step
@@ -802,14 +796,14 @@ mod tests {
             if self.fail_save {
                 // Models the MoE GDN checkpoint failing after the history is
                 // staged: propagate so the turn aborts, leaving the request
-                // kept-live (finalize already ran) — exactly the legacy `?`.
+                // kept-live (finalize already ran).
                 return Err(Error::from_reason("mock save failure"));
             }
             if !reuse_cache {
                 *self.saved.lock().expect("saved poisoned") = None;
                 return Ok(());
             }
-            // Byte-identical port of qwen3 `save_paged_history`'s trim:
+            // Matches qwen3 `save_paged_history`'s trim:
             // KEEP-ALL iff length exit (`keep_all`), else DROP-LAST.
             let history_tokens: &[u32] = if keep_all || generated.is_empty() {
                 generated
@@ -999,12 +993,12 @@ mod tests {
     /// flush re-streams it. The concatenation therefore reconstructs the
     /// full decode with no token dropped and none duplicated.
     ///
-    /// A fresh re-read (the reverted bug) would break one iteration
-    /// earlier, dropping step_idx 1's post-forward token from
-    /// `generated_tokens` AND from the stream — the residual would then
-    /// re-stream a SHORTER text and `done.raw_text` (decoded from the
-    /// shorter committed set) would still equal the concatenation, but the
-    /// committed-count assertion below pins origin/main parity directly.
+    /// A fresh re-read would break one iteration earlier, dropping
+    /// step_idx 1's post-forward token from `generated_tokens` AND from
+    /// the stream — the residual would then re-stream a SHORTER text and
+    /// `done.raw_text` (decoded from the shorter committed set) would still
+    /// equal the concatenation, but the committed-count assertion below
+    /// pins origin/main parity directly.
     #[test]
     fn streaming_cancel_during_forward_total_text_matches_decode_of_committed() {
         const MAX_NEW: i32 = 6; // budget far past the cancel point
@@ -1205,7 +1199,7 @@ mod tests {
 
     /// Abort path (0): `prime_prefix_state` returns `Err` AFTER mutating the
     /// adapter (prefix blocks attached) but BEFORE any suffix split exists —
-    /// the OOM-during-suffix-alloc case (Codex HIGH #2). prime resets the
+    /// the OOM-during-suffix-alloc case. prime resets the
     /// adapter + attaches cached-prefix blocks and can then fail allocating
     /// suffix blocks, leaving a LIVE request with a partial block table. The
     /// turn must release it via `abort_paged_turn` and run NONE of the
@@ -1333,10 +1327,10 @@ mod tests {
     /// prime/prefill/mid-decode aborts, the SUCCESS lifecycle (decode +
     /// `finalize_paged_turn`) DID run, so the request is intentionally
     /// retained — the save `Err` must NOT additionally call
-    /// `abort_paged_turn`. This is the exact legacy `paged_turn_sync_core`
-    /// teardown: `finalize_turn_keep_live_per_block` → set history →
-    /// `remember_moe_gdn_history_checkpoint()?` returned `Err` with the
-    /// request still kept-live, and the turn propagated. The error short-
+    /// `abort_paged_turn`. The teardown is:
+    /// `finalize_turn_keep_live_per_block` → set history →
+    /// `remember_moe_gdn_history_checkpoint()?` returns `Err` with the
+    /// request still kept-live, and the turn propagates. The error short-
     /// circuits BEFORE the result-building `finalize_turn`.
     #[test]
     fn run_paged_turn_propagates_save_error_keeps_request_live() {
@@ -1360,9 +1354,9 @@ mod tests {
             "save_paged_history must have been attempted; got {seq:?}"
         );
         // THE CONTRACT: a save-Err does NOT release the request. The request
-        // was finalized-keep-live; releasing it here would diverge from the
-        // legacy core (which propagated the checkpoint `?` with the request
-        // still live for the session caller to tear down).
+        // was finalized-keep-live; releasing it here would propagate the
+        // checkpoint `?` while leaving the request live for the session
+        // caller to tear down.
         assert!(
             !seq.contains(&"abort_paged_turn"),
             "save-Err after finalize must NOT release the kept-live request; got {seq:?}"
@@ -1374,7 +1368,7 @@ mod tests {
         );
     }
 
-    // ---- D2 history-preservation regression (Codex HIGH #3) ----
+    // ---- history-preservation regression ----
 
     /// Outcome of one history-preservation turn: the `ChatResult`'s
     /// finish_reason + the committed token count, the `SavedHistory` the
@@ -1475,26 +1469,24 @@ mod tests {
         }
     }
 
-    /// D2 (the bug) + P4-1 final-token materialization: a turn that exits
-    /// by the LENGTH budget must persist the FULL first-assistant token
-    /// sequence — the last committed token is CONTENT (no boundary marker
-    /// was generated), so dropping it would silently truncate the
-    /// conversation (Codex HIGH #3, the INVERTED keep_all). `keep_all ==
+    /// Final-token materialization: a turn that exits by the LENGTH budget
+    /// must persist the FULL first-assistant token sequence — the last
+    /// committed token is CONTENT (no boundary marker was generated), so
+    /// dropping it would silently truncate the conversation. `keep_all ==
     /// true` on a length exit, so the persisted history (== the next
     /// turn's prompt prefix) keeps every generated token.
     ///
-    /// The adapter cursor now EQUALS that kept history (NOT 1 shorter):
-    /// the engine's `materialize_final` runs ONE extra recorded decode
-    /// step for the final token on a length exit, so the final token's
-    /// K/V is in the adapter and a warm-continue reuses it exactly. This
-    /// matches mlx-lm, mlx-vlm, and origin/main `fba240b8` — all run the
-    /// extra forward on the last token (discarding its output) so the last
-    /// token's K/V is cached; only vLLM leaves it one-short, a
-    /// batched-throughput optimization this single-stream engine does not
-    /// adopt. So `request_tokens()` == the kept history (== `fba240b8`),
-    /// restoring exact `cached_tokens` parity and exact-KV warm
-    /// continuation, and `reconcile_paged_request_tokens` sees no surplus
-    /// (a true no-op) on this path.
+    /// The adapter cursor EQUALS that kept history (NOT 1 shorter): the
+    /// engine's `materialize_final` runs ONE extra recorded decode step
+    /// for the final token on a length exit, so the final token's K/V is
+    /// in the adapter and a warm-continue reuses it exactly. This matches
+    /// mlx-lm and mlx-vlm — both run the extra forward on the last token
+    /// (discarding its output) so the last token's K/V is cached; only
+    /// vLLM leaves it one-short, a batched-throughput optimization this
+    /// single-stream engine does not adopt. So `request_tokens()` == the
+    /// kept history, restoring exact `cached_tokens` parity and exact-KV
+    /// warm continuation, and `reconcile_paged_request_tokens` sees no
+    /// surplus (a true no-op) on this path.
     #[test]
     fn length_exit_preserves_full_assistant_sequence_for_next_turn() {
         const MAX_NEW: i32 = 6;
@@ -1510,7 +1502,7 @@ mod tests {
         assert_eq!(outcome.num_tokens, MAX_NEW as u32);
 
         // The engine passed keep_all == true (the FLAT rule for a length
-        // exit) — the load-bearing fix for Codex HIGH #3.
+        // exit).
         assert!(
             outcome.saved.keep_all,
             "length exit must set keep_all=true (FLAT save_cache_state rule)"
@@ -1522,9 +1514,9 @@ mod tests {
             .collect();
         assert_eq!(outcome.saved.generated, expected_generated);
 
-        // THE BUG ASSERTION: the persisted history (== next turn's prompt
-        // prefix) contains the FULL prompt + ALL generated tokens — the
-        // last CONTENT token is NOT dropped.
+        // The persisted history (== next turn's prompt prefix) contains
+        // the FULL prompt + ALL generated tokens — the last CONTENT token
+        // is NOT dropped.
         let mut expected_history = prompt.to_vec();
         expected_history.extend_from_slice(&expected_generated);
         assert_eq!(
@@ -1555,7 +1547,7 @@ mod tests {
             outcome.saved.persisted_history.len(),
             "on a length exit the adapter EQUALS the kept history: \
              `materialize_final` recorded the final token's K/V (matching \
-             mlx-lm / mlx-vlm / origin-main fba240b8), so the warm-continue \
+             mlx-lm / mlx-vlm), so the warm-continue \
              reuses it exactly with no re-prefilled tail"
         );
     }
@@ -1563,9 +1555,9 @@ mod tests {
     /// FLAT-parity counterpart: a turn that exits by an EARLY STOP (the
     /// decode forward emits the session EOS) must DROP the final committed
     /// token — it IS the boundary marker (`<|im_end|>`) the next delta
-    /// re-renders, so persisting it would duplicate it. After the fix
-    /// `keep_all == false` on a non-length exit, mirroring FLAT
-    /// `save_cache_state`. The reconcile rolls the over-recorded EOS off
+    /// re-renders, so persisting it would duplicate it. `keep_all ==
+    /// false` on a non-length exit, mirroring FLAT `save_cache_state`. The
+    /// reconcile rolls the over-recorded EOS off
     /// the adapter cursor so the persisted history and the live cursor
     /// agree exactly (warm-continue parity with the pre-pipeline core).
     #[test]

@@ -1067,11 +1067,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // `prewarm_checkpoint_pages`.
                     prewarm_checkpoint_pages(path);
 
-                    // MTP head discovery precedence (backward-compat mandatory):
-                    //   1. inline `mtp.*` tensors in the body shards (existing
-                    //      MoE-MTP checkpoints — kept as-is by sanitize);
+                    // MTP head discovery precedence — supports two on-disk
+                    // checkpoint layouts:
+                    //   1. inline `mtp.*` tensors in the body shards (kept
+                    //      as-is by sanitize);
                     //   2. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
-                    // MoE has no legacy `mtp.safetensors` sidecar path; the
+                    // MoE has no `mtp.safetensors` sidecar path; the
                     // drafter merge only fires when the body carries NO inline
                     // `mtp.*` tensors so inline always wins. The re-prefixed
                     // `mtp.layers.{i}.mlp.switch_mlp.*` + `...gate.weight` keys
@@ -1510,8 +1511,8 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
 mod tests {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
 
-    /// T7 regression: the MoE body strip (`sanitize_weights`) delegates to the
-    /// shared longest-first `strip_wrapper_prefix`, so a raw, un-converted HF
+    /// The MoE body strip (`sanitize_weights`) delegates to the shared
+    /// longest-first `strip_wrapper_prefix`, so a raw, un-converted HF
     /// VLM-wrapped checkpoint's triple-prefixed inline-MTP key is normalized to
     /// the canonical `mtp.*` form instead of being silently dropped (the
     /// shorter `model.language_model.` strip would have left

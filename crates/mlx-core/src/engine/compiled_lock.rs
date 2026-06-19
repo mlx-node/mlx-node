@@ -2,16 +2,16 @@
 //!
 //! The compiled paths share process-global C++ state (the `g_weights()` map,
 //! `g_active_model_id`, per-family compiled decode caches), so every family
-//! that drives them must serialize on these one-per-process locks. Moved here
-//! from `models::qwen3_5::model` so the contract lives in family-neutral code.
+//! that drives them must serialize on these one-per-process locks. The
+//! contract lives in family-neutral code here.
 
 use std::sync::atomic::AtomicU64;
 
 /// Monotonically incrementing counter for assigning unique model IDs across
 /// EVERY family that drives the shared C++ compiled-weight registry. The C++
 /// `g_weights()` map is process-global and keyed by model id, so ids must be
-/// globally unique across all variants (Qwen3.5 dense/MoE, LFM2, …). Lives in
-/// family-neutral code so the surviving compiled paths keep a single id space.
+/// globally unique across all variants (Qwen3.5 dense/MoE, LFM2, …). It lives
+/// in family-neutral code so every compiled path shares a single id space.
 pub(crate) static QWEN35_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1); // 0 = no model
 
 /// Block size hard-coded into the compiled C++ paged graphs (the
@@ -49,7 +49,7 @@ pub(crate) static COMPILED_LIFECYCLE_MUTEX: std::sync::Mutex<()> = std::sync::Mu
 
 /// Acquire the [`COMPILED_WEIGHTS_RWLOCK`] write lock, recovering from poison.
 ///
-/// Used by the surviving compiled families' weight registration/clear paths
+/// Used by the compiled families' weight registration/clear paths
 /// (e.g. lfm2 `persistence::register_weights_with_cpp`). A panic during a
 /// prior registration/clear while holding this write lock poisons the
 /// rwlock; a bare `.write().unwrap()` would then panic every subsequent
@@ -76,10 +76,10 @@ pub(crate) fn compiled_weights_write() -> std::sync::RwLockWriteGuard<'static, (
 mod tests {
     use super::*;
 
-    /// Codex regression: a panic while HOLDING the weights write lock (a
-    /// torn registration/clear) poisons the rwlock. The surviving
-    /// compiled families' registration path acquires the write lock
-    /// through [`compiled_weights_write`]; this must keep succeeding so a
+    /// A panic while HOLDING the weights write lock (a torn
+    /// registration/clear) poisons the rwlock. The compiled families'
+    /// registration path acquires the write lock through
+    /// [`compiled_weights_write`]; this must keep succeeding so a
     /// subsequent model load can re-register cleanly instead of panicking
     /// the model thread.
     ///

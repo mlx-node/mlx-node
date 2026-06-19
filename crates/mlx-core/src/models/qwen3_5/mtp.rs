@@ -677,9 +677,9 @@ mod tests {
     /// the loader requires for a dense MTP head. We compare against the
     /// shared `mtp_drafter::missing_required_mtp_keys` (the single source of
     /// truth used by the drafter-merge gate and the MoE post-sanitize gate),
-    /// so the save key set can never silently drift below what load needs —
-    /// the exact bug this fix closes (`save_model_sync` previously emitted
-    /// NO mtp.* keys, disabling speculative decode on reload).
+    /// so the save key set can never silently drift below what load needs. If
+    /// `save_model_sync` emitted NO mtp.* keys, speculative decode would be
+    /// disabled on reload.
     #[test]
     fn get_parameters_is_superset_of_required_keys() {
         use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};

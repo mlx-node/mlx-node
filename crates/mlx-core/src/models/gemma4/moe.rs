@@ -81,8 +81,8 @@ impl Gemma4Router {
             num_experts,
         )?;
 
-        // Extract top-k scores and softmax over them ONLY (not all experts)
-        // This is the key difference from the old implementation which did softmax over ALL experts
+        // Extract top-k scores and softmax over them ONLY (not all experts):
+        // the softmax denominator spans only the top-k, not the full expert set.
         let top_k_scores = expert_scores.take_along_axis(&top_k_indices, -1)?;
         let top_k_weights = Activations::softmax_precise(&top_k_scores, Some(-1))?;
 

@@ -1124,16 +1124,15 @@ mod tests {
     /// `mtp.layers.{i}.mlp.{gate,up,down}_proj.weight`, NOT the MoE
     /// `switch_mlp.* + mlp.gate` schema. The completeness gate MUST derive
     /// its expected variant from `Qwen3_5MoeMTPModule::mtp_mlp_variant`
-    /// (`is_moe_layer(fa_idx)`); the previous hardcoded `Moe` would have
-    /// rejected this complete checkpoint and silently disabled MTP. We:
+    /// (`is_moe_layer(fa_idx)`); a hardcoded `Moe` variant would reject this
+    /// complete checkpoint and silently disable MTP. We:
     ///   1. confirm the chosen config really is dense-flavored
     ///      (`is_linear_layer(fa_idx) == false` so construction succeeds, and
     ///      `is_moe_layer(fa_idx) == false` so the MLP is dense);
     ///   2. assert `get_parameters()` is COMPLETE under the derived (Dense)
     ///      variant (save/load agree); and
-    ///   3. assert the OLD hardcoded `Moe` variant would have flagged it
-    ///      incomplete — locking in that the flavor-derivation is the
-    ///      load-bearing fix, not a no-op.
+    ///   3. assert a hardcoded `Moe` variant flags it incomplete — proving
+    ///      the flavor-derivation is load-bearing, not a no-op.
     #[test]
     fn dense_flavored_moe_mtp_load_gate_uses_derived_variant() {
         use crate::models::mtp_drafter::{DrafterBodyVariant, missing_required_mtp_keys};
@@ -1193,9 +1192,10 @@ mod tests {
              missing: {missing_derived:?}"
         );
 
-        // (2) CONTRAST: the OLD hardcoded `Moe` gate would WRONGLY reject this
+        // (2) CONTRAST: a hardcoded `Moe` gate WRONGLY rejects this
         // complete dense-flavored checkpoint (demands switch_mlp.* + mlp.gate
-        // that a dense MLP never emits). This is what locks the fix in.
+        // that a dense MLP never emits). This is what makes the derivation
+        // load-bearing.
         let missing_hardcoded_moe =
             missing_required_mtp_keys(&params, DrafterBodyVariant::Moe, cfg.n_mtp_layers);
         assert!(

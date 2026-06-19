@@ -132,14 +132,12 @@ pub(crate) struct PleComponents {
     pub vocab_size_per_layer_input: i32,
 }
 
-/// Adapter giving the kept paged/vision streaming cores their legacy
-/// `cb.call(result, mode)` shape over the engine's [`ChunkSink`].
+/// Adapter giving the paged/vision streaming cores a `cb.call(result, mode)`
+/// shape over the engine's [`ChunkSink`].
 ///
-/// Pre-S10 this wrapped the raw `StreamTx`; the engine now owns the
-/// channel and hands the probes/emitter a `&dyn ChunkSink`, so the
-/// wrapper forwards `.call()` to [`ChunkSink::send`] (the call mode is
-/// meaningless on the mpsc path and is dropped, exactly like the old
-/// `StreamTx` wrapper did).
+/// The engine owns the channel and hands the probes/emitter a `&dyn
+/// ChunkSink`, so the wrapper forwards `.call()` to [`ChunkSink::send`].
+/// The call mode is meaningless on the mpsc path and is dropped.
 struct StreamSender<'a>(&'a dyn ChunkSink);
 
 impl StreamSender<'_> {
@@ -254,11 +252,10 @@ fn promote_channel_only_output(parsed: &mut super::output_parser::Gemma4ParsedOu
     }
 }
 
-/// Gemma4's [`StreamEmitter`] (S10): routes every committed token's raw
+/// Gemma4's [`StreamEmitter`]: routes every committed token's raw
 /// (special-token-preserving — [`ChatBackend::stream_skip_special_tokens`]
 /// returns `false`) text through [`Gemma4StreamParser`] +
-/// [`Gemma4StreamDispatchState`], reproducing the deleted flat streaming
-/// cores' segment pipeline byte-for-byte: channel/tool-call segmentation,
+/// [`Gemma4StreamDispatchState`]: channel/tool-call segmentation,
 /// pending-reasoning buffering, channel-only promotion, empty-chunk
 /// filtering. `is_reasoning` / `include_reasoning` are deliberately
 /// ignored — Gemma4's reasoning labeling comes from the parser's channel
@@ -298,12 +295,11 @@ impl StreamEmitter for Gemma4Emitter {
         _include_reasoning: bool,
         sink: &dyn ChunkSink,
     ) {
-        // Legacy residual flush: feed the leftover bytes through the same
-        // parser. The trailing `flush()` half of the legacy block lives in
-        // `finish` below (the engine calls `finish` unconditionally, so
-        // the flush happens whether or not a residual existed — identical
-        // segment sequence either way since `dispatch_segments` is
-        // stateful-sequential).
+        // Residual flush: feed the leftover bytes through the same parser.
+        // The trailing `flush()` lives in `finish` below (the engine calls
+        // `finish` unconditionally, so the flush happens whether or not a
+        // residual existed — identical segment sequence either way since
+        // `dispatch_segments` is stateful-sequential).
         let cb = StreamSender(sink);
         let segments = self.parser.feed(residual);
         self.dispatch.dispatch_segments(segments, &cb);
@@ -316,14 +312,11 @@ impl StreamEmitter for Gemma4Emitter {
         self.dispatch.finish(&cb);
 
         // Terminal chunk: text stays empty (segments already streamed);
-        // tool_calls/thinking come from the STREAM PARSER (legacy
-        // `stream_parser.tool_calls()` / `.thinking()`); everything else
-        // from the finalized result. `result.finish_reason` already
-        // carries the tool_calls promotion from `finalize_turn` —
-        // identical by construction to the legacy parser-side promotion
-        // (both parse the same raw text; documented accepted drift #10
-        // confines divergence to the step_decode_stream error-recovery
-        // corner).
+        // tool_calls/thinking come from the stream parser
+        // (`parser.tool_calls()` / `.thinking()`); everything else from the
+        // finalized result. `result.finish_reason` already carries the
+        // tool_calls promotion from `finalize_turn`, which parses the same
+        // raw text the parser does.
         let parsed_tool_calls = self.parser.tool_calls();
         let parsed_thinking = self.parser.thinking();
         cb.call(
@@ -417,7 +410,7 @@ pub struct Gemma4Model {
     /// Gemma4 is chat-only (no training/generate variants), so the
     /// thread dispatches the model-neutral [`ChatCmd`] directly via
     /// `engine::cmd::handle_chat_cmd::<Gemma4Inner>` — no per-family
-    /// command enum (S10).
+    /// command enum.
     pub(crate) thread: Option<crate::model_thread::ModelThread<ChatCmd>>,
     pub(crate) model_id: u64,
     /// Whether the loaded config includes `vision_config`. Mirrored here so
@@ -1578,15 +1571,13 @@ impl Gemma4Inner {
     }
 
     /// Decode + resize + patch raw image bytes and expand the rendered
-    /// prompt's per-image `<|image|>` placeholders (S10).
+    /// prompt's per-image `<|image|>` placeholders.
     ///
-    /// == the deleted flat cores' image preamble: the engine session core
-    /// now owns message-side image extraction
+    /// The engine session core owns message-side image extraction
     /// (`engine::session::extract_images_from_messages`) and prompt
     /// rendering; the raw bytes arrive via [`WholeTurnArgs::images`].
-    /// The "no vision support" rejection keeps its exact legacy string —
-    /// it surfaces from INSIDE the vision turn (after render), per the
-    /// documented S10 error-precedence drift.
+    /// The "no vision support" rejection surfaces from INSIDE the vision
+    /// turn (after render).
     fn prepare_vision_tokens(
         &self,
         rendered_tokens: &[u32],
@@ -1626,16 +1617,15 @@ impl Gemma4Inner {
         Ok((expanded, processed_images, new_image_key))
     }
 
-    /// Vision (VLM) whole-turn core, non-streaming (S10): the legacy flat
-    /// `chat_sync_core` VISION flow over a pre-rendered prompt. Owns
-    /// image processing, `<|image|>` expansion, the merged-embedding
-    /// prefill, the flat decode loop, session save (incl. the image
-    /// cache key), and Gemma4 output parsing.
+    /// Vision (VLM) whole-turn core, non-streaming: the VISION flow over a
+    /// pre-rendered prompt. Owns image processing, `<|image|>` expansion,
+    /// the merged-embedding prefill, the flat decode loop, session save
+    /// (incl. the image cache key), and Gemma4 output parsing.
     ///
-    /// Image-bearing turns always cold-start: the legacy
-    /// `verify_cache_prefix(.., has_images = true)` forced a miss
-    /// whenever images were involved on either side, so the reset + full
-    /// prefill here is unconditional and `cached_tokens` reports 0.
+    /// Image-bearing turns always cold-start: `verify_cache_prefix(..,
+    /// has_images = true)` forces a miss whenever images are involved on
+    /// either side, so the reset + full prefill here is unconditional and
+    /// `cached_tokens` reports 0.
     fn vision_whole_turn_sync_core(
         &mut self,
         rendered_tokens: &[u32],
@@ -1805,7 +1795,7 @@ impl Gemma4Inner {
 
         // Decode loop — matches mlx-lm generate.py pattern (see the
         // engine's `run_decode_loop` for the text path; this vision core
-        // keeps the legacy flat loop verbatim):
+        // runs its own flat loop):
         // 1. Build lazy graph per step via forward_inner
         // 2. async_eval the output token (caches materialize through dependency graph)
         // 3. Double-buffer: build step N+1 while GPU executes step N
@@ -1951,10 +1941,10 @@ impl Gemma4Inner {
         })
     }
 
-    /// Vision (VLM) whole-turn core, streaming (S10): the legacy flat
-    /// `chat_stream_sync_core` VISION flow over a pre-rendered prompt.
-    /// Same cold-start semantics as [`Self::vision_whole_turn_sync_core`];
-    /// streams parser segments and emits the terminal chunk itself.
+    /// Vision (VLM) whole-turn core, streaming: the VISION flow over a
+    /// pre-rendered prompt. Same cold-start semantics as
+    /// [`Self::vision_whole_turn_sync_core`]; streams parser segments and
+    /// emits the terminal chunk itself.
     #[allow(clippy::too_many_arguments)]
     fn vision_whole_turn_stream_core(
         &mut self,
@@ -3692,11 +3682,11 @@ impl Gemma4Inner {
     }
 
     /// Vision whole-turn dispatch for the engine's
-    /// [`ChatBackend::vision_turn`] probe (S10). Only fresh turns carry
+    /// [`ChatBackend::vision_turn`] probe. Only fresh turns carry
     /// images (the engine's delta inputs are text-only by construction
     /// and the delta image guard rejects image-holding sessions), so
-    /// both cores cold-start unconditionally — the legacy
-    /// `verify_cache_prefix(.., has_images = true)` forced miss.
+    /// both cores cold-start unconditionally —
+    /// `verify_cache_prefix(.., has_images = true)` forces a miss.
     fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         match (args.sink, args.cancelled) {
@@ -3726,18 +3716,17 @@ impl Gemma4Inner {
     }
 }
 
-/// Eager flat decode stepper for one gemma4 turn (S10,
-/// [`ChatBackend::begin_decode`]). Byte-identical port of the legacy
-/// flat decode-loop step bodies: `diagnostic::set_step(step)` before
-/// every forward (the `MLX_DEBUG_GEMMA4_DUMP` per-step dump),
-/// `forward_inner` over the live session caches, async-eval of the
-/// sampled token only (gemma4 never async-evals the logits).
+/// Eager flat decode stepper for one gemma4 turn
+/// ([`ChatBackend::begin_decode`]). Runs the flat decode-loop step body:
+/// `diagnostic::set_step(step)` before every forward (the
+/// `MLX_DEBUG_GEMMA4_DUMP` per-step dump), `forward_inner` over the live
+/// session caches, async-eval of the sampled token only (gemma4 never
+/// async-evals the logits).
 pub(crate) struct Gemma4Decode<'a> {
     inner: &'a mut Gemma4Inner,
     /// Diagnostic step counter. The engine loop has no step index in the
-    /// `DecodeStep` seam, so the stepper carries its own — same 0-based
-    /// sequence the legacy `for step in 0..max_new_tokens` loops fed to
-    /// `set_step`.
+    /// `DecodeStep` seam, so the stepper carries its own 0-based sequence
+    /// to feed `set_step`.
     step: i32,
 }
 
@@ -3761,8 +3750,8 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.ple.as_ref(),
             &inner.config,
         )?;
-        // `true` == the legacy loops' explicit `squeeze(Some(&[1]))`:
-        // the eager forward returns `[1, 1, vocab]`.
+        // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
+        // forward returns `[1, 1, vocab]`.
         Ok((logits, true))
     }
 
@@ -3807,10 +3796,9 @@ impl DecodeStep for Gemma4Decode<'_> {
 /// sliding-window KV checkpoint machinery as a side effect of each
 /// committed decode step.
 pub(crate) struct Gemma4PagedDecode<'a> {
-    /// Diagnostic step counter (the legacy `for step in 0..max_new_tokens`
-    /// loop value fed to `set_step` before every paged forward). The
-    /// engine loop has no step index in the `DecodeStep` seam, so the
-    /// stepper carries its own.
+    /// Diagnostic step counter, fed to `set_step` before every paged
+    /// forward. The engine loop has no step index in the `DecodeStep`
+    /// seam, so the stepper carries its own.
     step: i32,
     inner: &'a mut Gemma4Inner,
 }
@@ -3837,28 +3825,26 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         // top (BEFORE the forward), then returns `[1, 1, vocab]`.
         let logits = self.inner.run_paged_decode_step(token_id)?;
         // The sliding-window decode-boundary checkpoint runs RIGHT AFTER
-        // the forward (matching the legacy paged loops), reading the
-        // adapter's post-record cursor. It must NOT move to `maintain_cache`
-        // (which runs at the loop TOP, before this forward, so it would read
-        // a stale cursor) — see the engine loop ordering. Fallible: a
-        // checkpoint/eval error aborts the turn.
+        // the forward, reading the adapter's post-record cursor. It must
+        // NOT move to `maintain_cache` (which runs at the loop TOP, before
+        // this forward, so it would read a stale cursor) — see the engine
+        // loop ordering. Fallible: a checkpoint/eval error aborts the turn.
         self.inner
             .maybe_remember_gemma4_sliding_decode_boundary_checkpoint("paged", trace_enabled)?;
-        // `run_paged_decode_step` returns `[1, 1, vocab]`; the engine
-        // squeezes axis 1 (the eager convention, == the legacy loops'
-        // explicit `squeeze(Some(&[1]))`).
+        // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
+        // the engine's squeeze of axis 1 (the eager convention).
         Ok((logits, true))
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // The legacy paged loops async-evaled the sampled token only
-        // (gemma4 never async-evals the logits); the loop-top `y.eval()`
-        // forces materialization next iteration.
+        // Async-eval the sampled token only (gemma4 never async-evals the
+        // logits); the loop-top `y.eval()` forces materialization next
+        // iteration.
         MxArray::async_eval_arrays(&[next_token]);
     }
 
     fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the legacy paged loops' per-step
+        // Paged cadence — the per-step
         // `maybe_clear_cache_for_paged_step(step)`.
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
@@ -3871,10 +3857,9 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         // saved keep-all history.
         //
         // Deliberately does NOT fire the sliding decode-boundary checkpoint:
-        // the legacy loops broke on `step + 1 >= max_new_tokens` BEFORE both
-        // the final forward AND its boundary checkpoint, so the final
-        // length-exit token was never checkpointed. The history checkpoint
-        // (in `save_paged_history`) covers the kept history instead.
+        // the final length-exit token is not checkpointed at the boundary.
+        // The history checkpoint (in `save_paged_history`) covers the kept
+        // history instead.
         let _logits = self.inner.run_paged_decode_step(token_id)?;
         Ok(())
     }
@@ -3956,9 +3941,9 @@ impl PagedBackend for Gemma4Inner {
         prefix: &Self::PrefixState,
         _stream: Stream,
     ) -> Result<MxArray> {
-        // The legacy sync core set the diagnostic step to -1 before the
-        // prefill forward (diagnostic-only). The engine fires the
-        // post-prefill `synchronize_and_clear_cache` AFTER this returns.
+        // Mark the diagnostic step as -1 (prefill) before the forward
+        // (diagnostic-only). The engine fires the post-prefill
+        // `synchronize_and_clear_cache` AFTER this returns.
         crate::models::gemma4::diagnostic::set_step(-1);
         self.run_paged_prefill_chunk(
             &prefix.full_tokens,
@@ -3976,11 +3961,11 @@ impl PagedBackend for Gemma4Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // == the legacy paged cores' terminal lifecycle block. Success:
-        // keep the request live across turns when reuse is on so the next
-        // turn builds on the partial trailing block's live K/V; otherwise
-        // register full blocks for reuse + release. Infallible (`let _ =`
-        // every call — a teardown failure must not mask the turn result).
+        // Terminal lifecycle for the paged turn. Success: keep the request
+        // live across turns when reuse is on so the next turn builds on the
+        // partial trailing block's live K/V; otherwise register full blocks
+        // for reuse + release. Infallible (`let _ =` every call — a teardown
+        // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
                 let _ = adapter.finalize_turn_keep_live(&[], 0);
@@ -3992,9 +3977,8 @@ impl PagedBackend for Gemma4Inner {
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown == the legacy paged cores' `Err(e) =>
-        // release_request()` arm: release fully, partial block_table state
-        // is unsafe to keep around. Infallible (`let _ =`).
+        // Error-path teardown: release the request fully — partial
+        // block_table state is unsafe to keep around. Infallible (`let _ =`).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
@@ -4007,14 +3991,13 @@ impl PagedBackend for Gemma4Inner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        // Port of the legacy paged save block (token history ONLY — the
-        // adapter's pool owns the K/V). `keep_all` is the FLAT rule
-        // (engine: `finish_reason == "length"`), so the DROP-LAST trim is
-        // IDENTICAL to the legacy core's. The engine reconciles
-        // `request_tokens()` to this same trimmed history via
-        // `reconcile_paged_request_tokens` BEFORE finalize, so the adapter
-        // and the saved history stay aligned for the next turn's
-        // warm-continue.
+        // Save token history ONLY — the adapter's pool owns the K/V.
+        // `keep_all` is the flat rule (engine: `finish_reason ==
+        // "length"`); when it is false the terminal stop token is dropped
+        // (DROP-LAST trim). The engine reconciles `request_tokens()` to this
+        // same trimmed history via `reconcile_paged_request_tokens` BEFORE
+        // finalize, so the adapter and the saved history stay aligned for
+        // the next turn's warm-continue.
         if reuse_cache {
             let mut full_history = save_tokens.to_vec();
             let history_tokens = if keep_all || generated.is_empty() {
@@ -4027,9 +4010,9 @@ impl PagedBackend for Gemma4Inner {
             self.cached_image_key = None;
             // Sliding-window warm-continue checkpoint keyed on the freshly
             // set history (post-reconcile `request_tokens()` == the trimmed
-            // history). Fallible: a checkpoint/eval error aborts the turn —
-            // the legacy core propagated it with `?` so reusable state is
-            // never published without a materialized checkpoint.
+            // history). Fallible: a checkpoint/eval error aborts the turn so
+            // reusable state is never published without a materialized
+            // checkpoint.
             let history_for_checkpoint = self.cached_token_history.clone();
             let _store_trace =
                 self.remember_gemma4_sliding_history_checkpoint(&history_for_checkpoint)?;
@@ -4110,33 +4093,31 @@ impl ChatBackend for Gemma4Inner {
 
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
         let mut p = engine::extract_chat_params(config);
-        // Fold the MODEL-config sampling defaults in; unset → T=0 greedy
-        // (the legacy `make_sampling_config` short-circuit; the engine's
-        // `sampling::sample` argmax fast path at T=0 is byte-equivalent
-        // to the legacy `sample_next_token` argmax shortcut).
+        // Fold the MODEL-config sampling defaults in; unset → T=0 greedy.
+        // The engine's `sampling::sample` argmax fast path at T=0 is the
+        // greedy argmax.
         p.sampling_config = make_sampling_config(config, &self.config);
-        // Legacy gemma4 documents the penalty fields as SILENT NO-OPS
-        // (its decode loops never read them). Neutralize so the engine's
-        // `apply_all_penalties` skips all penalty work structurally.
+        // gemma4 treats the penalty fields as no-ops. Neutralize so the
+        // engine's `apply_all_penalties` skips all penalty work
+        // structurally.
         p.repetition_penalty = 1.0;
         p.presence_penalty = 0.0;
         p.frequency_penalty = 0.0;
-        // Legacy gemma4 ALWAYS returns Some(PerformanceMetrics),
-        // regardless of `config.report_performance`.
+        // gemma4 ALWAYS returns Some(PerformanceMetrics), regardless of
+        // `config.report_performance`.
         p.report_performance = true;
-        // Legacy gemma4 never suppressed reasoning deltas at the loop
-        // level (`include_reasoning` is a documented silent no-op; the
-        // stream parser routes channel segments itself). Defensive: pin
-        // `true` so the engine's emitter gate can never suppress.
+        // gemma4 never suppresses reasoning deltas at the loop level
+        // (`include_reasoning` is a no-op here; the stream parser routes
+        // channel segments itself). Defensive: pin `true` so the engine's
+        // emitter gate can never suppress.
         p.include_reasoning = true;
         p
     }
 
     /// Template default path == the engine default; template-less
-    /// checkpoints take gemma4's manual `<|turn>` wire-format fallback
-    /// (verbatim from the deleted flat cores). Documented accepted
-    /// drift: a single no-template `enable_thinking` error string (the
-    /// sync core's long form) replaces the per-core variants.
+    /// checkpoints take gemma4's manual `<|turn>` wire-format fallback.
+    /// A single no-template `enable_thinking` error string covers all
+    /// entry points.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
@@ -4252,9 +4233,8 @@ impl ChatBackend for Gemma4Inner {
         // prefix cache. A reset-then-rerun of the same prompt would then take
         // the prefix-hit suffix-prefill path (via `find_longest_cache_hit`
         // inside `prepare_gemma4_paged_turn`) — a different bf16 reduction
-        // order than the cold full prefill, enough to flip a greedy near-tie
-        // (codex S12 finding on the lfm2 sibling; gemma4 shares the identical
-        // adapter lifecycle and ships paged ON by default).
+        // order than the cold full prefill, enough to flip a greedy
+        // near-tie.
         // `release_request_and_purge_prefix_cache` releases the live request
         // (the release gemma4's reset otherwise skips) AND purges every
         // prefix-cache entry. The turn-internal `PrefixMiss` reset keeps the
@@ -4274,17 +4254,15 @@ impl ChatBackend for Gemma4Inner {
         Ok(())
     }
 
-    /// Byte-identical port of the deleted inherent
-    /// `verify_cache_prefix(tokens, reuse_cache, has_images)` minus the
-    /// `has_images` parameter — the engine routes every image-bearing
-    /// turn through `vision_turn` BEFORE this check, so only the
-    /// session-side half of the legacy image gate
-    /// (`cached_image_key.is_some()` → miss) remains.
+    /// Prefix-reuse check. The engine routes every image-bearing turn
+    /// through `vision_turn` BEFORE this check, so only the session-side
+    /// image gate (`cached_image_key.is_some()` → miss) is needed here;
+    /// there is no `has_images` parameter.
     ///
     /// All-or-nothing: returns `0` or `cached.len()` (exact-match falls
     /// through the `hit == tokens.len()` branch in the session core to
-    /// the miss/reset path — gemma4's compiled sliding-window cache has
-    /// no "rewind by one" primitive; see the deleted core's comment).
+    /// the miss/reset path — gemma4's sliding-window cache has no "rewind
+    /// by one" primitive).
     fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
         if !reuse_cache {
             return 0;
@@ -4316,14 +4294,14 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
-        // Legacy flat save block (identical on the fresh and delta
-        // paths): persist `prompt + generated`, dropping the terminal
-        // turn-boundary token when the decode terminated on stop so the
-        // cached history ends on the `<turn|>` boundary the next delta
-        // re-renders itself. Unconditional — the legacy flat cores had
-        // no `reuse_cache` branch here (only the paged core does, and
-        // paged turns never reach this hook), and the engine's
-        // session_start guard rejects `reuse_cache=Some(false)` anyway.
+        // Flat save (identical on the fresh and delta paths): persist
+        // `prompt + generated`, dropping the terminal turn-boundary token
+        // when the decode terminated on stop so the cached history ends on
+        // the `<turn|>` boundary the next delta re-renders itself.
+        // Unconditional — there is no `reuse_cache` branch here (only the
+        // paged core has one, and paged turns never reach this hook), and
+        // the engine's session_start guard rejects `reuse_cache=Some(false)`
+        // anyway.
         let history_tokens: &[u32] =
             if args.finish_reason != "length" && !args.generated_tokens.is_empty() {
                 &args.generated_tokens[..args.generated_tokens.len() - 1]
@@ -4335,18 +4313,16 @@ impl ChatBackend for Gemma4Inner {
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         if !args.is_delta {
-            // Fresh text-only turn: clear any stale image key (the
-            // legacy text branch set `self.cached_image_key =
-            // new_image_key` where `new_image_key == None` without
-            // images). Delta turns leave it untouched — text-only by
-            // the delta image guard, so it is structurally `None`.
+            // Fresh text-only turn: clear any stale image key (a text-only
+            // turn has no image key to set). Delta turns leave it
+            // untouched — text-only by the delta image guard, so it is
+            // structurally `None`.
             self.cached_image_key = None;
         }
     }
 
     fn eval_caches(&self) -> Result<()> {
-        // == the legacy post-sample `eval_gemma4_caches(..)` call that
-        // materialized the prefill KV before entering the decode loop.
+        // Materialize the prefill KV before entering the decode loop.
         eval_gemma4_caches(
             self.caches
                 .as_ref()
@@ -4354,24 +4330,20 @@ impl ChatBackend for Gemma4Inner {
         )
     }
 
-    /// Flat prefill for the engine's generic flow: byte-identical port
-    /// of the deleted cores' prefill blocks. `prefill_body_gemma4`
+    /// Flat prefill for the engine's generic flow. `prefill_body_gemma4`
     /// processes `tokens[0 .. N-1]` through the body (a no-op when
     /// `N == 1`), the per-layer KV evals materialize, then the last
     /// token runs the full forward for sampling-ready `[1, vocab]`
     /// logits. Serves the fresh path (full prompt or strict-extend
-    /// tail) and the session-delta path identically — the legacy fresh
-    /// core and `chat_tokens_delta_sync` shared this exact shape.
+    /// tail) and the session-delta path identically.
     ///
     /// `diagnostic::set_step(-1)` marks the prefill forward for
-    /// `MLX_DEBUG_GEMMA4_DUMP` (documented accepted drift: now uniform
-    /// across entry points — the legacy delta paths skipped it).
+    /// `MLX_DEBUG_GEMMA4_DUMP`, uniformly across entry points.
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
         // Defensive: caches must be live before the prefill runs. The
         // engine's miss-reset re-inits, and verify/`has_live_session`
         // check liveness — but if somebody cleared the caches
-        // out-of-band between turns, re-init here (legacy
-        // `if self.caches.is_none() { init }` block).
+        // out-of-band between turns, re-init here.
         if self.caches.is_none() {
             self.init_caches_sync()?;
         }
@@ -4446,8 +4418,8 @@ impl ChatBackend for Gemma4Inner {
     /// `parse_gemma4_output` → `promote_channel_only_output` →
     /// tool-calls finish-reason promotion. `reasoning_tokens` arrives as
     /// 0 (thinking disabled) and `prompt_tokens` / `performance` are
-    /// used verbatim — both match the legacy result fields.
-    /// `cached_tokens` is overwritten by the session core.
+    /// passed through unchanged. `cached_tokens` is overwritten by the
+    /// session core.
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
         let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -4476,23 +4448,22 @@ impl ChatBackend for Gemma4Inner {
     }
 
     /// UNCONDITIONALLY `true` — even for checkpoints without a vision
-    /// tower. The legacy cores accepted image-bearing messages on every
-    /// entry point and surfaced the exact "Images provided but model has
-    /// no vision support (no vision_config in config.json)" error from
-    /// INSIDE the turn (after template rendering); returning `false`
-    /// here would replace that with the engine's typed pre-render
-    /// restart-prefix error. The legacy error surfaces from inside
-    /// `vision_turn` instead (see `prepare_vision_tokens`).
+    /// tower. Image-bearing messages are accepted on every entry point and
+    /// surface the exact "Images provided but model has no vision support
+    /// (no vision_config in config.json)" error from INSIDE the turn (after
+    /// template rendering); returning `false` here would replace that with
+    /// the engine's typed pre-render restart-prefix error. The error
+    /// surfaces from inside `vision_turn` instead (see
+    /// `prepare_vision_tokens`).
     fn supports_images(&self) -> bool {
         true
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
-        // == `is_eos_token(token, &self.config.eos_token_ids, eos)`:
-        // the MODEL-config eos list (`<eos>` / `<end_of_turn>`) honored
-        // alongside the session `<turn|>` id. The legacy check compared
-        // `eos_ids.contains(&(token as i32))` — a negative config id can
-        // never equal a `u32`-cast token, so filter instead of wrapping.
+        // The MODEL-config eos list (`<eos>` / `<end_of_turn>`) honored
+        // alongside the session `<turn|>` id. A negative config id can
+        // never equal a `u32`-cast token, so filter those out instead of
+        // wrapping.
         self.config
             .eos_token_ids
             .iter()
@@ -4514,14 +4485,12 @@ impl ChatBackend for Gemma4Inner {
     }
 
     /// REJECT text deltas on image-holding sessions despite
-    /// `supports_images() == true` (the qwen3.5 sticky-image-key default
-    /// would accept them): gemma4's prefix reuse is text-only, so a
-    /// delta on top of an image session would prefill on caches whose
+    /// `supports_images() == true`: gemma4's prefix reuse is text-only, so
+    /// a delta on top of an image session would prefill on caches whose
     /// positions include expanded image tokens the history bookkeeping
-    /// does not model. Byte-identical legacy strings (NO space after the
-    /// prefix): `"{PREFIX}chat_tokens_delta_sync is text-only; session
-    /// currently holds image state"` / the `chat_stream_tokens_delta`
-    /// twin.
+    /// does not model. The message has NO space after the prefix:
+    /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
+    /// state"`.
     fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
         if self.cached_image_key.is_some() {
             Some(format!(
@@ -4534,18 +4503,14 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
-        // No-op: gemma4 has no MTP heads (acceptance fields stay None)
-        // and its legacy metrics never carried `profile_phases`. The
-        // default would only add profiling-gated extras; keeping the
-        // payload byte-stable instead.
+        // No-op: gemma4 has no MTP heads (acceptance fields stay None) and
+        // its metrics carry no `profile_phases`. The default would only add
+        // profiling-gated extras; keep the payload byte-stable instead.
     }
 
     fn has_live_session(&self) -> bool {
-        // Folds BOTH legacy delta guards (empty `cached_token_history`
-        // AND `caches.is_none()`) into the engine's single
-        // "requires an initialized session" check — documented accepted
-        // drift (one message instead of two, and the caches check now
-        // runs before the image guard instead of after).
+        // Requires an initialized session: a non-empty
+        // `cached_token_history` AND live `caches`.
         !self.cached_token_history.is_empty() && self.caches.is_some()
     }
 
@@ -4642,11 +4607,9 @@ impl Gemma4Model {
     /// to keep `ChatSession.reset()` idempotent across both runnable
     /// and stub instances.
     ///
-    /// Callers relying on the pre-round-2 behavior where `new(config)`
-    /// returned a runnable model MUST migrate to `await
-    /// Gemma4Model.load(path)`. The constructor signature is unchanged
-    /// on purpose (NAPI-RS pins it), so this is a deliberate runtime
-    /// behavior break covered by the regression tests in
+    /// A runnable model requires `await Gemma4Model.load(path)`. The
+    /// constructor signature is fixed by NAPI-RS; the stub-only behavior is
+    /// covered by the regression tests in
     /// `__test__/models/model-loader-gemma4.test.ts`.
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Self {
@@ -4672,12 +4635,12 @@ impl Gemma4Model {
     ///
     /// `true` iff `Gemma4Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Gemma4Config::use_block_paged_cache`, default-ON since the
-    /// `gemma4_paged_vs_flat_parity` integration test verified greedy
-    /// byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
-    /// CLAUDE.md). Stubs constructed via `new(config)` always return
-    /// `false`. Surfaced through this NAPI method so server endpoints
-    /// can branch on it without a model-thread roundtrip.
+    /// `Gemma4Config::use_block_paged_cache`). The
+    /// `gemma4_paged_vs_flat_parity` integration test pins greedy
+    /// byte-equal at BF16 against real Gemma-4-E2B-IT weights. Stubs
+    /// constructed via `new(config)` always return `false`. Surfaced
+    /// through this NAPI method so server endpoints can branch on it
+    /// without a model-thread roundtrip.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
@@ -4799,10 +4762,9 @@ fn init_caches_for_config(config: &Gemma4Config) -> Vec<Gemma4LayerCache> {
 ///
 /// The config-level `eos_token_ids` are always honored. The caller-supplied
 /// `eos_token_id` is treated as an additional stop token — it does NOT
-/// replace the config list. This matches the deleted dense core's
-/// (`chat_sync_core`) semantics: session-start callers get their clean
-/// boundary token (for Gemma4 that is `<turn|>`) while still respecting
-/// the underlying model's intrinsic eos set.
+/// replace the config list. Session-start callers get their clean boundary
+/// token (for Gemma4 that is `<turn|>`) while still respecting the
+/// underlying model's intrinsic eos set.
 #[inline]
 fn is_eos_token(token: u32, eos_ids: &[i32], eos_token_id: u32) -> bool {
     if eos_ids.contains(&(token as i32)) {
@@ -7781,15 +7743,14 @@ mod prefix_cache_decision_tests {
     //! [`PrefixCacheDecision::Miss`] (reset caches + re-init + full
     //! prefill).
     //!
-    //! The four cases covered below pin the Round 1 Fix #1 invariant:
-    //! exact-match MUST route to `Miss`, not to `StrictExtendHit` — a
-    //! previous revision treated exact-match as a shortcut and corrupted
-    //! the next warm-hit turn by advancing cache state to
-    //! `prompt + last_token` while the history write-back only persisted
-    //! `tokens + generated`. The `#[ignore]`-gated integration tests
-    //! above exercise the end-to-end behaviour against a loaded Gemma4
-    //! model; this module guarantees the decision logic stays correct
-    //! in every CI run without a model dependency.
+    //! The four cases covered below pin the invariant: exact-match MUST
+    //! route to `Miss`, not to `StrictExtendHit`. Treating exact-match as a
+    //! shortcut would corrupt the next warm-hit turn by advancing cache
+    //! state to `prompt + last_token` while the history write-back only
+    //! persists `tokens + generated`. The `#[ignore]`-gated integration
+    //! tests above exercise the end-to-end behaviour against a loaded
+    //! Gemma4 model; this module guarantees the decision logic stays
+    //! correct in every CI run without a model dependency.
 
     use super::{PrefixCacheDecision, classify_prefix_cache_decision};
 
@@ -7856,8 +7817,8 @@ mod prefix_cache_decision_tests {
         // history write-back persists `tokens + generated`, desyncing
         // cache and history for the next warm-hit turn.
         //
-        // This is the core Round 1 Fix #1 invariant — guarding against
-        // a regression that silently corrupts multi-turn correctness.
+        // This invariant guards against silently corrupting multi-turn
+        // correctness.
         assert_eq!(
             classify_prefix_cache_decision(5, 5),
             PrefixCacheDecision::Miss,

@@ -131,9 +131,10 @@ pub struct Gemma4Config {
     /// separate physical storage.
     ///
     /// Default: `true` (paged adapter on; opt-out via
-    /// `use_block_paged_cache: false` in `config.json` to fall back to
-    /// the legacy all-flat `Gemma4LayerCache` path). Parity is verified
-    /// by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
+    /// `use_block_paged_cache: false` in `config.json` to use the flat
+    /// (non-paged) all-`Gemma4LayerCache` path instead). Parity between
+    /// the two paths is verified by
+    /// `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
     /// real Gemma-4-E2B weights.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]

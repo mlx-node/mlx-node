@@ -78,11 +78,10 @@ impl ReasoningTracker {
     }
 
     /// Build a tracker from an already-resolved
-    /// [`crate::engine::backend::ThinkingSetup`] (P2 single source of
-    /// truth). Byte-identical to
+    /// [`crate::engine::backend::ThinkingSetup`]. Equivalent to
     /// `Self::new(setup.enabled, setup.budget, think_end_id)`; this is the
-    /// ONE construction point the whole-turn cores call so the per-family
-    /// inline `resolve_enable_thinking` sites disappear.
+    /// ONE construction point the whole-turn cores call, so the
+    /// thinking-mode resolution lives in a single place.
     pub fn from_setup(
         setup: &crate::engine::backend::ThinkingSetup,
         think_end_id: Option<u32>,

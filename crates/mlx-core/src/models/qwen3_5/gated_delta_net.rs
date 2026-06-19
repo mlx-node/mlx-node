@@ -201,7 +201,7 @@ impl GatedDeltaNet {
     /// Safe to call repeatedly (idempotent).
     ///
     /// Only applies when both in_proj_qkvz and in_proj_ba are non-quantized
-    /// Standard linears. Quantized models continue on the legacy 2-matmul
+    /// Standard linears. Quantized models stay on the unfused 2-matmul
     /// path (no-op here).
     pub fn finalize_in_proj(&mut self) -> Result<()> {
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
@@ -266,7 +266,7 @@ impl GatedDeltaNet {
             let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
             (qkvz, ba)
         } else {
-            // Legacy path: two separate matmuls.
+            // Unfused path: two separate matmuls.
             let qkvz = self.in_proj_qkvz.forward(x)?;
             let ba = self.in_proj_ba.forward(x)?;
             (qkvz, ba)

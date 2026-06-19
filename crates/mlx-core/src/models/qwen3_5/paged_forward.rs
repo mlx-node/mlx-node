@@ -28,8 +28,8 @@
 //!   without their K/V reaching back into the pool — so pass 1 is
 //!   GDN-only, with attention layers acting as identity passthroughs
 //!   (their MLP / residual contribution is approximated). This is
-//!   the same limitation LFM2 documents as P1 — pure-cache-hit
-//!   dispatch is not bit-equal to a fresh prefill on hybrid models.
+//!   the same limitation LFM2 has — pure-cache-hit dispatch is not
+//!   bit-equal to a fresh prefill on hybrid models.
 //!   For the **no-cache** case (cached_prefix_len = 0), pass 1 is
 //!   skipped entirely and the result is exact.
 

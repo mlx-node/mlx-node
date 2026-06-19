@@ -331,8 +331,8 @@ pub(crate) enum Qwen35Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    /// Training-session commands, nested verbatim from the model-neutral
-    /// engine (P7c). The thread loop routes these to
+    /// Training-session commands shared with the model-neutral engine. The
+    /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35Inner`].
     Train(TrainCmd),
@@ -492,9 +492,9 @@ pub(crate) struct ChatDecodeInputs {
     pub tokenizer: Arc<Qwen3Tokenizer>,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
-    /// Resolved thinking-mode state for the turn (P2 single source of
-    /// truth). Threaded from `WholeTurnArgs::thinking`; replaces the
-    /// inline `resolve_enable_thinking` the cores recomputed.
+    /// Resolved thinking-mode state for the turn — the single source of
+    /// truth, threaded from `WholeTurnArgs::thinking` so the cores share
+    /// one `resolve_enable_thinking` result.
     pub thinking: ThinkingSetup,
     /// End-of-sequence token id for the decode loop. For `vision_mtp_whole_turn_core` this
     /// is `config.eos_token_id`; for the session delta path it's
@@ -1350,7 +1350,7 @@ impl Qwen35Inner {
     /// `vision_turn` (image-bearing) and `mtp_turn` (MTP-enabled) probes.
     /// The engine already rendered the prompt (`tokens`) and extracted the
     /// raw image payloads (`images`); everything from the paged dispatch
-    /// onward is the legacy pipeline, byte-for-byte. `eos_token_id` is the
+    /// onward runs the whole-turn pipeline. `eos_token_id` is the
     /// caller-supplied stop-on token id (`<|im_end|>` for ChatML
     /// boundaries) so the cached history ends on a clean delimiter that
     /// subsequent session-delta turns can append to.
@@ -1712,8 +1712,8 @@ impl Qwen35Inner {
     ///
     /// Requires a live session: `self.caches` must have been initialized by a
     /// prior session-start turn. Errors otherwise. (The engine's delta
-    /// guards already enforce this; the checks here are kept verbatim as
-    /// defense-in-depth for the `mtp_turn` caller.)
+    /// guards already enforce this; the checks here are defense-in-depth
+    /// for the `mtp_turn` caller.)
     pub(crate) fn chat_tokens_delta_sync(
         &mut self,
         delta_tokens: Vec<u32>,
@@ -2350,9 +2350,9 @@ impl Qwen35Inner {
                     },
                     // On rejection (partial accept): the GDN tape replay in
                     // `rollback` already reconstructed the AR-exact main cache
-                    // state for every layer, so the old K+1 `[1, 1]` re-forward
-                    // loop is gone. This closure now only surfaces a stashed
-                    // replay error and clears the per-cycle snapshot + tape.
+                    // state for every layer, so no K+1 `[1, 1]` re-forward loop
+                    // is needed. This closure only surfaces a stashed replay
+                    // error and clears the per-cycle snapshot + tape.
                     restore_and_replay_main: |_accepted_drafts: &[u32],
                                               _emb: &MxArray|
                      -> Result<()> {
@@ -2443,7 +2443,7 @@ impl Qwen35Inner {
                     // Committed-history is active iff the persistent-prefix
                     // policy is in force this turn: the cycle helper then uses
                     // the `chain_start = 0` per-step draft mask. v1 falls back
-                    // to the legacy cycle-history mask.
+                    // to the cycle-history mask.
                     committed_history_active: use_committed,
                     rollback_unemitted: |unemitted: usize| {
                         if unemitted > 0 {
@@ -2681,7 +2681,7 @@ impl Qwen35Inner {
     /// Preconditions (enforced by the callers' gate): `enable_mtp`,
     /// `has_mtp_weights()`, `paged_adapter.is_none()`, text-only. The body is
     /// byte-identical to the non-streaming eager MTP decode (same accept/rewind
-    /// math, same GDN tape replay) — only the streamed deltas are new.
+    /// math, same GDN tape replay) — only the streamed deltas differ.
     #[allow(clippy::too_many_arguments)]
     fn run_flat_stream_eager_mtp<'a>(
         &mut self,
@@ -3162,8 +3162,8 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // P2: thinking resolved ONCE at turn entry (was a hardcoded
-        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
@@ -3202,14 +3202,13 @@ impl Qwen35Inner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
         // reads the PRE-turn live state, so probe the adapter immutably FIRST
         // (prepare_turn mutates request_tokens via continue_turn/reset). The
         // adapter re-reads the same state internally, so live_* matches what
-        // prepare_turn decides. extra_keys=&[] (uniform API) is bit-equal to the
-        // old per-block `&lookup_extra_keys` for text-only dispatch (all-empty
-        // per-block vec → identical hashes; see the block_size comment above).
-        // reuse_cache=true: the hand-rolled can_continue had no reuse term.
+        // prepare_turn decides. extra_keys=&[] (uniform API) is bit-equal to
+        // `&lookup_extra_keys` for text-only dispatch (all-empty per-block vec
+        // → identical hashes; see the block_size comment above).
         // Suffix blocks are allocated inside prepare_turn.
         {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
@@ -3981,8 +3980,8 @@ impl Qwen35Inner {
                 }
 
                 // The paged turn commits cache state through its own
-                // paged-history save (not the legacy `save_cache_state*`
-                // helpers), so the macro's trailing-token signal is unused here.
+                // paged-history save (not the `save_cache_state*` helpers),
+                // so the macro's trailing-token signal is unused here.
                 let mut last_in_cache = true;
                 mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -4132,8 +4131,8 @@ impl Qwen35Inner {
 
         let think_end_id = tokenizer.think_end_id();
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
-        // P2: thinking resolved ONCE at turn entry (was a hardcoded
-        // `thinking_enabled = true`; now honors `enable_thinking=false`).
+        // Thinking is resolved ONCE at turn entry and honors
+        // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
@@ -4170,8 +4169,8 @@ impl Qwen35Inner {
         let live_prefix_match;
         let live_tokens_len;
         let mut live_mismatch = TokenPrefixMismatchTrace::default();
-        // P3: adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
-        // the full byte-identity rationale: pre-turn immutable probe for the
+        // Adapter-owned warm/cold lifecycle (see paged_turn_sync_core for
+        // the full bit-identity rationale: pre-turn immutable probe for the
         // trace, extra_keys=&[] bit-equal to per-block for text-only,
         // reuse_cache=true, suffix blocks allocated internally).
         {
@@ -4951,8 +4950,8 @@ impl Qwen35Inner {
                 }
 
                 // The paged turn commits cache state through its own
-                // paged-history save (not the legacy `save_cache_state*`
-                // helpers), so the macro's trailing-token signal is unused here.
+                // paged-history save (not the `save_cache_state*` helpers),
+                // so the macro's trailing-token signal is unused here.
                 let mut last_in_cache = true;
                 mtp_decode::decode_loop_mtp!(
                     mtp_ops: mtp_ops,
@@ -5291,7 +5290,6 @@ impl Qwen35Inner {
         // way the next paged→dense turn still performs the protective one-time
         // full rebuild over the authoritative history rather than trusting
         // half-advanced flat caches paired with a stale `cached_token_history`.
-        // (mtp-reload P2)
         let _seq_len = full_token_history.len() as i64;
         profiler.end_prefill();
 
@@ -5419,7 +5417,7 @@ impl Qwen35Inner {
         // committed history and the flat caches together, so the one-time
         // protective rebuild is no longer needed until a later paged-core turn
         // re-dirties it. Placing the clear here (not after prefill) guarantees
-        // any mid-turn `?`-error leaves the flag dirty. (mtp-reload P2)
+        // any mid-turn `?`-error leaves the flag dirty.
         self.paged_full_attn_caches_dirty = false;
 
         // Decode the full reply text and emit the final done chunk.
@@ -5520,8 +5518,8 @@ impl Qwen35Inner {
     /// engine's `vision_turn` (image-bearing) and `mtp_turn`
     /// (MTP-enabled) probes. The engine already rendered the prompt
     /// (`tokens`) and extracted the raw image payloads (`images`);
-    /// everything from the MTP-on-paged dispatch onward is the legacy
-    /// pipeline, byte-for-byte.
+    /// everything from the MTP-on-paged dispatch onward runs the
+    /// whole-turn pipeline.
     fn chat_stream_sync_inner(
         &mut self,
         tokens: Vec<u32>,
@@ -5975,7 +5973,6 @@ impl Qwen35Inner {
         // paged-core turn re-dirties it. Placing the clear here (not after
         // prefill) guarantees any mid-turn `?`-error — prefill OR decode —
         // leaves the flag dirty so the next paged→dense turn rebuilds.
-        // (mtp-reload P2)
         self.paged_full_attn_caches_dirty = false;
 
         let text = tokenizer_for_decode
@@ -7463,15 +7460,13 @@ impl Qwen35Inner {
 }
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
-/// `decode_loop!` / `decode_loop_mtp!` macros (and the legacy streaming
-/// cores kept behind the whole-turn probes) expect from a
+/// `decode_loop!` / `decode_loop_mtp!` macros (and the streaming
+/// cores behind the whole-turn probes) expect from a
 /// `ThreadsafeFunction`-like callback.
 ///
-/// Pre-S8 this wrapped the raw `StreamTx`; the engine now owns the
-/// channel and hands the probes a `&dyn ChunkSink`, so the wrapper
-/// forwards `.call()` to [`ChunkSink::send`] (the call mode is
-/// meaningless on the mpsc path and is dropped, exactly like the old
-/// `StreamTx` wrapper did).
+/// The engine owns the channel and hands the probes a `&dyn ChunkSink`,
+/// so the wrapper forwards `.call()` to [`ChunkSink::send`]; the call
+/// mode is meaningless on the mpsc path and is dropped.
 struct StreamSender<'a>(&'a dyn ChunkSink);
 
 impl StreamSender<'_> {
@@ -7547,17 +7542,15 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token` (== legacy
-        // `paged_turn_sync_core_inner`'s `y.eval()`): the compiled-paged forward
-        // is bandwidth-bound, so the async two-wait (bottom `async_eval` +
-        // loop-top `y.eval`) buys ZERO overlap. Restores decode parity with the
-        // legacy core (which also `y.eval()`'d after each sample).
+        // Single SYNCHRONOUS eval of `next_token`: the compiled-paged forward
+        // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
+        // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
+        // is the cheapest correct cadence.
         next_token.eval();
     }
 
     fn maintain_cache(&mut self, step: i32) {
-        // Paged cadence — the legacy paged loops' per-step
-        // `maybe_clear_cache_for_paged_step(step)`.
+        // Per-step paged cache-clear cadence.
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
 
@@ -7611,8 +7604,8 @@ impl PagedBackend for Qwen35Inner {
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        // == the `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block at
-        // the head of the legacy `paged_turn_sync_core`.
+        // The `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block that
+        // opens a dense paged turn.
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
         // vLLM exact-prefix cap: leave at least one prompt token to prefill so
@@ -7634,13 +7627,13 @@ impl PagedBackend for Qwen35Inner {
         // would replace the empty positions with real (token_pos, image_hash).
         let lookup_extra_keys = engine::build_paged_extra_keys(plan.len(), block_size, &[]);
 
-        // P3: adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
+        // Adapter-owned warm/cold lifecycle. The [MLX_TRACE] line below
         // reads the PRE-turn live state, so probe the adapter immutably FIRST
         // (prepare_turn mutates request_tokens via continue_turn/reset). The
         // adapter re-reads the same state internally, so live_* is identical to
-        // what prepare_turn decides on. reuse_cache=true literal: the legacy
-        // hand-rolled `can_continue` had no reuse term (the engine's reuse_cache
-        // drives finalize/save instead). Suffix blocks are allocated inside
+        // what prepare_turn decides on. reuse_cache=true literal: continuation
+        // eligibility carries no reuse term (the engine's reuse_cache drives
+        // finalize/save instead). Suffix blocks are allocated inside
         // prepare_turn.
         let live_ready;
         let live_prefix_match;
@@ -7704,9 +7697,9 @@ impl PagedBackend for Qwen35Inner {
             continued_live_prefix,
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
-        // Clear the per-turn session state the legacy core cleared here (history
-        // is re-set in `save_paged_history`; rope deltas + image key are reset
-        // because the paged path does not carry them across turns).
+        // Clear the per-turn session state here (history is re-set in
+        // `save_paged_history`; rope deltas + image key are reset because the
+        // paged path does not carry them across turns).
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_rope_deltas = None;
@@ -7729,15 +7722,14 @@ impl PagedBackend for Qwen35Inner {
         prefix: &Self::PrefixState,
         _stream: Stream,
     ) -> Result<MxArray> {
-        // == the NON-hidden prefill block of the legacy
-        // `paged_turn_sync_core_inner`. `run_paged_prefill_chunk` writes K/V
+        // The NON-hidden paged prefill. `run_paged_prefill_chunk` writes K/V
         // into the adapter pool, populates the GDN linear caches, runs the GDN
         // pre-pass over the cached prefix from `full_tokens` (skipped when
         // `gdn_prefix_already_primed`), then the full forward over the suffix,
         // folding in the last-token slice (returns `[vocab]`). The engine fires
         // the post-prefill `synchronize_and_clear_cache` AFTER this returns
         // (NOT here). The MTP `_with_hidden` variant is NOT used here — MTP
-        // turns route through the kept `paged_turn_sync_core`, not the engine.
+        // turns route through `paged_turn_sync_core`, not the engine.
         let layer_kinds =
             super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
                 self.config.is_linear_layer(i)
@@ -7776,10 +7768,10 @@ impl PagedBackend for Qwen35Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // == the legacy paged core's terminal lifecycle block. Success: keep
-        // the request live across turns when reuse is on, using PER-BLOCK extra
-        // keys (NOT qwen3's empty `&[]`), so the next turn's continue builds on
-        // the partial trailing block's live K/V; otherwise register full blocks
+        // Terminal lifecycle block of a paged turn. Success: keep the request
+        // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
+        // qwen3's empty `&[]`), so the next turn's continue builds on the
+        // partial trailing block's live K/V; otherwise register full blocks
         // for reuse + release. Infallible (`let _ =` every call — a teardown
         // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -7797,8 +7789,7 @@ impl PagedBackend for Qwen35Inner {
     }
 
     fn abort_paged_turn(&mut self) {
-        // Error-path teardown == the legacy paged core's `Err(e) =>
-        // release_request()` arm: release fully, partial block_table state is
+        // Error-path teardown: release fully, partial block_table state is
         // unsafe to keep. Release ONLY — never register / keep live. Infallible
         // (`let _ =` — must not mask the turn's error).
         if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -7830,8 +7821,7 @@ impl PagedBackend for Qwen35Inner {
         // the LAST sampled token (the engine's forward gate skips it AND
         // `materialize_final` is a no-op for dense), so the last `generated`
         // entry is NOT in the adapter / GDN caches and must be dropped to keep
-        // the saved history aligned with the live cache state. This is the
-        // verbatim ordering of the legacy `paged_turn_sync_core` tail:
+        // the saved history aligned with the live cache state. Ordering:
         // finalize → set history (drop-last, last_token_in_cache=false) → GDN
         // checkpoint → clear image key. PRESERVE THIS EXACT ORDER — it is the
         // most delicate part for T=0 byte-equality.
@@ -7850,9 +7840,9 @@ impl PagedBackend for Qwen35Inner {
         // GDN history checkpoint — must run AFTER the history is set (it
         // snapshots the live recurrent caches keyed on `cached_token_history`),
         // BEFORE clearing the image key. A checkpoint/eval failure here
-        // PROPAGATES (`?`) to abort the turn, matching the legacy core: a
-        // half-snapshotted or failed-eval GDN state must NOT be published as a
-        // reusable warm-continue checkpoint, or the next turn reads corrupt
+        // PROPAGATES (`?`) to abort the turn: a half-snapshotted or
+        // failed-eval GDN state must NOT be published as a reusable
+        // warm-continue checkpoint, or the next turn reads corrupt
         // recurrent state.
         let store = self.remember_dense_gdn_history_checkpoint()?;
         if inference_trace_enabled() {
@@ -7917,13 +7907,13 @@ impl PagedBackend for Qwen35Inner {
 
 impl Qwen35Inner {
     /// Whole-turn dense dispatch behind the engine's `vision_turn` and
-    /// `mtp_turn` probes (S8).
+    /// `mtp_turn` probes.
     ///
-    /// Routes the four turn shapes onto the kept legacy cores VERBATIM:
+    /// Routes the four turn shapes onto the whole-turn cores:
     /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
     /// [`Self::chat_tokens_delta_sync`], fresh streaming →
     /// [`Self::chat_stream_sync_inner`], delta streaming →
-    /// [`Self::chat_stream_tokens_delta_sync_inner`]. The kept cores own
+    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every dense-path subtlety the generic flow does not model: VLM
     /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
     /// AR), the MTP-on-paged `mtp_takes_dense_path` release/rebuild
@@ -7933,7 +7923,7 @@ impl Qwen35Inner {
     /// `args.tokens` (`cached_history + delta` by construction — the
     /// probes run before any state mutation).
     fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Fold generation_config.json defaults into the config the legacy
+        // Fold generation_config.json defaults into the config the whole-turn
         // cores re-extract params from, so VLM/MTP turns honor the same
         // sampling defaults as the generic AR path (whose `args.params`
         // already had them applied via `resolve_params`). No-op when the
@@ -7990,22 +7980,21 @@ impl Qwen35Inner {
     ///
     /// Conditional router (dense differs from MoE here — `run_decode_loop` has
     /// NO MTP gate, so MTP turns must NOT route through it):
-    ///   * MTP turns (`enable_mtp && has_mtp_weights`) keep the legacy native
-    ///     paged-MTP path UNCHANGED. The streaming-MTP probe declined earlier
+    ///   * MTP turns (`enable_mtp && has_mtp_weights`) take the native
+    ///     paged-MTP path. The streaming-MTP probe declined earlier
     ///     (routed to `mtp_turn` → `dense_whole_turn`), so only SYNC reaches
-    ///     here with MTP on; the kept `paged_turn_sync_core` self-handles the
+    ///     here with MTP on; `paged_turn_sync_core` self-handles the
     ///     compiled-availability check + MTP gate + silent AR fallback. The
     ///     `(sink, cancelled)` match is preserved so any future MTP-stream
-    ///     entry still finds its legacy dispatch target.
+    ///     entry still finds its dispatch target.
     ///   * NON-MTP turns (sync or stream) → the new generic AR+paged path via
     ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
     ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The legacy entry points re-derived `p` from config at each
-        // dispatch site (`extract_chat_params`). To match the engine's
-        // default `resolve_params`, fold generation_config.json defaults in
-        // first so the paged-MTP path honors them too (no-op when the
-        // checkpoint ships none).
+        // The MTP cores re-derive `p` from config (`extract_chat_params`). To
+        // match the engine's default `resolve_params`, fold
+        // generation_config.json defaults in first so the paged-MTP path
+        // honors them too (no-op when the checkpoint ships none).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
         let mut p = extract_chat_params(&config);
@@ -8048,8 +8037,8 @@ impl Qwen35Inner {
         // This paged turn writes full-attention K/V into the paged adapter
         // pool, NOT the flat `self.caches`, so the flat full-attention slots no
         // longer reflect the conversation. A later streaming dense-MTP fallback
-        // must rebuild the flat caches before decoding. The legacy paged cores
-        // set this at their core entry; this is the sole new set-site for the
+        // must rebuild the flat caches before decoding. The MTP paged cores
+        // set this at their core entry; this is the set-site for the
         // generic path. See `paged_full_attn_caches_dirty`.
         self.paged_full_attn_caches_dirty = true;
         crate::engine::paged_turn::run_paged_turn(self, args)
@@ -8057,14 +8046,13 @@ impl Qwen35Inner {
 }
 
 /// Per-turn decode stepper for the engine's generic (text-only,
-/// non-paged, non-MTP) flow on Qwen3.5 dense (S8,
-/// [`ChatBackend::begin_decode`]).
+/// non-paged, non-MTP) flow on Qwen3.5 dense
+/// ([`ChatBackend::begin_decode`]).
 ///
-/// Carries the compiled-vs-eager dispatch the deleted dense cores'
-/// `DecodeOps` closures + lock scaffolding expressed: the compiled arm
-/// drives `forward_compiled` against the C++ graph seeded by
-/// `begin_decode`, the eager arm drives the pure-Rust `forward_inner`
-/// over the flat caches.
+/// Carries the compiled-vs-eager dispatch: the compiled arm drives
+/// `forward_compiled` against the C++ graph seeded by `begin_decode`,
+/// the eager arm drives the pure-Rust `forward_inner` over the flat
+/// caches.
 pub(crate) struct Qwen35Decode<'a> {
     inner: &'a mut Qwen35Inner,
     embedding_weight: MxArray,
@@ -8126,7 +8114,7 @@ impl ChatBackend for Qwen35Inner {
     }
 
     // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
-    // → `thinking_setup` resolves to the legacy
+    // → `thinking_setup` resolves to
     // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
     //   budget: config.thinking_token_budget}`.
 
@@ -8136,12 +8124,11 @@ impl ChatBackend for Qwen35Inner {
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         match scope {
-            // == the legacy inline miss-branch reset in the deleted
-            // dense cores: reset each live layer cache, then install a
+            // Prefix-miss reset: reset each live layer cache, then install a
             // fresh hybrid cache vec. PRESERVES `cached_token_history` /
             // `cached_image_key` / `cached_rope_deltas` (the end-of-turn
             // save overwrites them) and the GDN checkpoints (paged-path
-            // state the flat reset never touched).
+            // state the flat reset never touches).
             ResetScope::PrefixMiss => {
                 if let Some(ref mut caches) = self.caches {
                     for cache in caches.iter_mut() {
@@ -8151,8 +8138,8 @@ impl ChatBackend for Qwen35Inner {
                 self.caches = Some(fresh_dense_layer_caches(&self.config));
                 Ok(())
             }
-            // == the legacy `reset_caches_sync` (full clear including
-            // history, image key, rope deltas, GDN checkpoints).
+            // Full clear including history, image key, rope deltas, GDN
+            // checkpoints, via `reset_caches_sync`.
             ResetScope::Command => {
                 self.reset_caches_sync()?;
                 // The EXPLICIT command reset must restore a fully cold
@@ -8163,9 +8150,9 @@ impl ChatBackend for Qwen35Inner {
                 // the same prompt would take the prefix-hit suffix-prefill
                 // path (`verify_cache_prefix_direct` > 0) — a different
                 // bf16 reduction order than the cold full prefill, enough
-                // to flip a greedy near-tie (codex S12 finding, observed
-                // on the lfm2 sibling: "says," vs "said" at token ~6;
-                // qwen3.5 shares the identical adapter lifecycle).
+                // to flip a greedy near-tie (observed on the lfm2 sibling:
+                // "says," vs "said" at token ~6; qwen3.5 shares the
+                // identical adapter lifecycle).
                 // Releasing the live request AND purging the prefix cache
                 // makes the next turn replay the cold prefill byte-for-byte.
                 if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -8184,8 +8171,8 @@ impl ChatBackend for Qwen35Inner {
 
     /// All-or-nothing prefix match (NO exact-match rewind — the GDN
     /// recurrent state cannot rewind one slot; the engine's
-    /// exact-match-as-miss handling reproduces the legacy zero-delta
-    /// guard's full reset + re-prefill). Text-only by construction: the
+    /// exact-match-as-miss handling performs a full reset + re-prefill on a
+    /// zero-delta hit). Text-only by construction: the
     /// generic flow never carries images (the vision probe owns those
     /// turns), so the expanded-token / image-key inputs collapse to the
     /// plain prompt.
@@ -8256,14 +8243,13 @@ impl ChatBackend for Qwen35Inner {
         // No post-prefill cache sync on qwen3.5's reference paths:
         // `chunked_prefill` evals internally per chunk and the decode
         // loop schedules async evals. A blocking sync here would
-        // introduce a stall the legacy paths never paid.
+        // introduce an unnecessary stall.
         Ok(())
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
-        // Byte-identical port of the deleted dense cores' text-only
-        // prefill block (the engine's reset-or-delta split already ran;
-        // `self.caches` holds either fresh caches or the live session
+        // Text-only prefill block (the engine's reset-or-delta split already
+        // ran; `self.caches` holds either fresh caches or the live session
         // state).
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
@@ -8344,18 +8330,16 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn supports_images(&self) -> bool {
-        // Unconditionally true (S8 policy): the vision probe owns ALL
-        // image-bearing fresh turns; a checkpoint loaded without the
-        // vision encoder/processor surfaces the legacy "VLM prefill
-        // requested but vision encoder/processor not loaded" /
-        // paged-text-only errors from inside the kept cores, exactly
-        // like today.
+        // Unconditionally true: the vision probe owns ALL image-bearing
+        // fresh turns; a checkpoint loaded without the vision
+        // encoder/processor surfaces the "VLM prefill requested but vision
+        // encoder/processor not loaded" / paged-text-only errors from inside
+        // the whole-turn cores.
         true
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
-        // == the legacy per-turn `WiredLimitContext::new(
-        // config.estimate_memory_bytes(), …)`.
+        // Per-turn wired-memory limit = the model's estimated footprint.
         Some(self.config.estimate_memory_bytes() as usize)
     }
 
@@ -8365,8 +8349,7 @@ impl ChatBackend for Qwen35Inner {
         // hook exactly once per generic-flow turn, before
         // `begin_decode`; whole-turn override paths return from the
         // probes earlier and never consult either hook. The labels are
-        // the engine defaults — qwen3_5 dense IS the reference family
-        // they were lifted from.
+        // the engine defaults.
         self.turn_is_streaming.set(is_streaming);
         match (is_streaming, is_delta) {
             (false, false) => "chat",
@@ -8377,8 +8360,8 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn has_live_session(&self) -> bool {
-        // Legacy delta guard: `self.caches.is_none()` → "requires an
-        // initialized session".
+        // Delta guard: `self.caches.is_none()` means there is no
+        // initialized session to continue.
         self.caches.is_some()
     }
 
@@ -8390,16 +8373,15 @@ impl ChatBackend for Qwen35Inner {
         // Both SYNC and STREAMING turns take the paged core. The paged
         // cores self-handle MTP via the `eager_mtp_paged` arm
         // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
-        // which is the only surviving streaming eager-MTP path.
+        // the streaming eager-MTP path.
         Some(self.paged_whole_turn(args))
     }
 
     fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // == the legacy `p.enable_mtp && has_mtp_weights` dispatch
-        // shape: such turns ran the dense cores whose internal MTP gate
-        // does the compiled-availability check, `init_mtp_compiled…`,
-        // and the silent AR fallback on init failure. Everything beyond
-        // this entry condition stays inside the kept cores.
+        // `p.enable_mtp && has_mtp_weights` turns run the dense cores whose
+        // internal MTP gate does the compiled-availability check,
+        // `init_mtp_compiled…`, and the silent AR fallback on init failure.
+        // Everything beyond this entry condition stays inside those cores.
         if !(args.params.enable_mtp && self.has_mtp_weights()) {
             return None;
         }
@@ -8407,9 +8389,9 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // The probe is gated on `!images.is_empty()`; the kept dense
-        // cores own the full legacy image pipeline (VLM prefill, M-RoPE
-        // deltas, paged-text-only rejection, missing-encoder error).
+        // The probe is gated on `!images.is_empty()`; the dense cores own
+        // the full image pipeline (VLM prefill, M-RoPE deltas,
+        // paged-text-only rejection, missing-encoder error).
         Some(self.dense_whole_turn(args))
     }
 }
@@ -9956,8 +9938,9 @@ mod rope_index_tests {
 
     #[test]
     fn two_image_runs_separated_by_text_emits_every_position() {
-        // THE regression test for the P2 bug — pre-fix this crashed the
-        // downstream reshape with a length mismatch.
+        // Two image runs separated by interior text must emit a position for
+        // EVERY token; a dropped interior-text position makes the downstream
+        // reshape in get_rope_index fail with a length mismatch.
         let _g = mlx_lock().lock().unwrap();
         let mut tokens: Vec<i32> = Vec::new();
         tokens.push(TEXT_A); // position 0
@@ -9971,9 +9954,9 @@ mod rope_index_tests {
         let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
         let (t, _h, _w) = extract_positions(&pos);
 
-        // seq_len == tokens.len() — every token must have a position
-        // (the old single-span path dropped the interior text entries,
-        // which then failed the reshape at the end of get_rope_index).
+        // seq_len == tokens.len() — every token must have a position;
+        // dropping the interior text entries fails the reshape at the end
+        // of get_rope_index.
         assert_eq!(
             t.len(),
             tokens.len(),
@@ -10063,12 +10046,10 @@ mod rope_index_tests {
         // markers and `inject_image_placeholders` crams every image's
         // tokens into a single splice after BOS. For N images with
         // distinct grids, the prompt carries ONE big contiguous run of
-        // `sum(per_image_counts)` image tokens. The old strict guard
-        // rejected this as "run layout mismatch" even though it was
-        // the legitimate fallback layout that previously worked via
-        // the old single-span position walk. The new path synthesises
-        // per-image sub-run offsets from the shared span and emits
-        // correct M-RoPE positions for each image.
+        // `sum(per_image_counts)` image tokens. This is a legitimate
+        // fallback layout: the path synthesises per-image sub-run offsets
+        // from the shared span and emits correct M-RoPE positions for each
+        // image (rather than rejecting it as a "run layout mismatch").
         let _g = mlx_lock().lock().unwrap();
         // Two 1×2×2 grids → 4 image tokens each, 8 total.
         let mut tokens = vec![TEXT_A];
@@ -10130,9 +10111,8 @@ mod prefix_cache_reuse_integration_tests {
     //!
     //! The test bodies are intentionally skeletal — they document what
     //! needs to hold rather than wiring up the full model-loading
-    //! boilerplate. Flesh them out alongside the upcoming end-to-end
-    //! harness in `serve.ts` / the pi-mono vitest-migration smoke test
-    //! (plan doc §Verification).
+    //! boilerplate. Flesh them out alongside the end-to-end harness in
+    //! `serve.ts`.
 
     /// Append hit: two back-to-back session-start calls where the second's
     /// token sequence is `first_tokens + extra_tokens`. The result of the
