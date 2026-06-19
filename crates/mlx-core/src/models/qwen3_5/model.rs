@@ -3270,8 +3270,8 @@ impl Qwen35Inner {
 
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
-            // `eager_mtp_paged` arm. Same MtpOps spine; the `decode_loop_mtp!`
-            // `streaming:` block emits decoded text per token via `cb`.
+            // `eager_mtp_paged` arm. Same stepper spine; the engine's
+            // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
             MxArray::async_eval_arrays(&[&y]);
 
             let mut profiler =
@@ -5798,8 +5798,8 @@ impl Qwen35Inner {
 }
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
-/// `decode_loop!` / `decode_loop_mtp!` macros (and the streaming
-/// cores behind the whole-turn probes) expect from a
+/// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
+/// streaming cores behind the whole-turn probes) expect from a
 /// `ThreadsafeFunction`-like callback.
 ///
 /// The engine owns the channel and hands the probes a `&dyn ChunkSink`,

@@ -426,8 +426,8 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
 }
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
-/// `decode_loop!` / `decode_loop_mtp!` macros (and the streaming
-/// cores behind the whole-turn probes) expect from a
+/// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
+/// streaming cores behind the whole-turn probes) expect from a
 /// `ThreadsafeFunction`-like callback.
 ///
 /// The engine owns the channel and hands the probes a `&dyn ChunkSink`,

@@ -1981,8 +1981,9 @@ mod tests {
     use crate::array::MxArray;
     use crate::engine::backend::MtpStepper;
     use crate::engine::params::ChatParams;
+    use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
     use crate::models::qwen3_5::mtp_decode::{
-        ForceSparseAcceptGuard, MtpCommitAnchor, MtpVerifyOutput,
+        ForceSparseAcceptGuard, MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput,
     };
     use crate::sampling::SamplingConfig;
 
@@ -2065,6 +2066,11 @@ mod tests {
         // can read the call sequence AFTER `run_mtp_turn` consumes the stepper
         // via `into_desynced(self)`. `record` mirrors every call here too.
         shared_ledger: Option<std::rc::Rc<RefCell<Vec<Call>>>>,
+        // `(committed_ids, k_accepted)` the cycle handed to the most recent
+        // `commit_mtp` — the only place it surfaces the exact committed-token
+        // sequence (anchor policy + accepted prefix + boundary). `None` until
+        // the first commit.
+        commit_payload: RefCell<Option<(Vec<u32>, usize)>>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -2131,6 +2137,7 @@ mod tests {
                 cycle: None,
                 turn: None,
                 shared_ledger: None,
+                commit_payload: RefCell::new(None),
             }
         }
 
@@ -2413,12 +2420,20 @@ mod tests {
                 anchor,
                 k: k_accepted,
             });
-            // The K+2 committed-sequence shape the real commit consumes.
+            // Committed-sequence shape: `IncludeAnchor` prepends the anchor
+            // (`[last_committed, d_0..d_{K-1}, boundary]` = K+2);
+            // `SkipAlreadyCommittedAnchor` (chained cycles) omits it
+            // (`[d_0..d_{K-1}, boundary]` = K+1).
+            let expected_len = match anchor {
+                MtpCommitAnchor::IncludeAnchor => k_accepted + 2,
+                MtpCommitAnchor::SkipAlreadyCommittedAnchor => k_accepted + 1,
+            };
             assert_eq!(
                 committed_ids.len(),
-                k_accepted + 2,
-                "committed_ids is [last_committed, d_0..d_{{K-1}}, boundary] (K+2)"
+                expected_len,
+                "committed_ids length must match the anchor policy"
             );
+            *self.commit_payload.borrow_mut() = Some((committed_ids.to_vec(), k_accepted));
             Ok(())
         }
 
@@ -2452,8 +2467,8 @@ mod tests {
     }
 
     /// Drive a short scripted propose/verify/commit/rollback sequence
-    /// through the trait, EXACTLY in the order `run_mtp_cycle_inner` calls
-    /// `ops.*` today (Step A forward → begin_cycle → D draft steps →
+    /// through the trait, EXACTLY in the order `run_mtp_cycle` calls the
+    /// stepper methods (Step A forward → begin_cycle → D draft steps →
     /// snapshot → verify → commit → rollback → restore/replay on reject →
     /// eval), then the iteration-boundary fused chained eval. Proves the
     /// strictly-sequential `&mut self` borrow model + GAT-free dyn-less
@@ -2558,7 +2573,7 @@ mod tests {
                 Call::EvalStepWithChainedHidden,
             ],
             "the engine must drive the MTP propose/verify/commit/rollback \
-             sequence in the order run_mtp_cycle_inner calls ops.* today"
+             sequence in the order run_mtp_cycle calls the stepper methods"
         );
         // Paged MUST report not-desynced; the mock default mirrors that.
         assert!(
@@ -2700,27 +2715,39 @@ mod tests {
         }
     }
 
-    /// Run one scripted `run_mtp_cycle` over the canned mock. Returns the
-    /// cycle outcome, the recorded call ledger, and the `CommitMtp` ledger
-    /// entry's accepted-draft count `k` (the only place the cycle surfaces K).
-    /// Forces the sparse-accept gate ON so the deterministic T=0 branch runs
-    /// regardless of `MLX_MTP_SPARSE_ACCEPT`.
-    fn run_scripted_cycle(
+    /// Outcome of one scripted `run_mtp_cycle` over the canned mock.
+    struct ScriptedCycle {
+        outcome: MtpCycleOutcome,
+        ledger: Vec<Call>,
+        /// `(committed_ids, k_accepted)` the cycle handed to `commit_mtp` —
+        /// the exact committed-token sequence under the chosen anchor policy.
+        commit_payload: Option<(Vec<u32>, usize)>,
+        /// Whether the T=0 sparse-accept commit path (`mtp_accept_argmax`)
+        /// actually ran. Fail-closed coverage: a test asserting the
+        /// deterministic-commit contract must confirm it took that branch.
+        ran_sparse: bool,
+    }
+
+    /// Run one scripted `run_mtp_cycle` over the canned mock with an explicit
+    /// EV depth policy and commit anchor. Forces the sparse-accept gate ON so
+    /// the deterministic T=0 branch runs regardless of `MLX_MTP_SPARSE_ACCEPT`,
+    /// and enables the profiler so `ran_sparse` can fail-closed.
+    fn run_scripted_cycle_full(
         vocab: i64,
         hidden: i64,
         draft_argmax: Vec<i32>,
         verify_argmax: Vec<i32>,
         depth: usize,
         last_committed_id: u32,
-    ) -> (
-        crate::models::qwen3_5::mtp_decode::MtpCycleOutcome,
-        Vec<Call>,
-    ) {
+        ev_policy: Option<ExpectedValueDepthPolicy>,
+        commit_anchor: MtpCommitAnchor,
+    ) -> ScriptedCycle {
         let _force = ForceSparseAcceptGuard::force(true);
         let mut step = MockMtpStepper::with_cycle(vocab, hidden, draft_argmax, verify_argmax);
         let params = greedy_params();
         let mut rng = rand::rng();
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_test", "test");
+        profiler.enable_for_test();
         // Embedding weight is the mock's own `[vocab, hidden]` table.
         let emb = step.emb.clone();
         let prev_hidden =
@@ -2728,6 +2755,7 @@ mod tests {
         let prev_emb =
             MxArray::from_float32(&vec![0.0f32; hidden as usize], &[1, 1, hidden]).unwrap();
         let token_history: Vec<u32> = vec![1, 2, 3];
+        let mut ev = ev_policy;
         let (outcome, _vh) = run_mtp_cycle(
             &mut step,
             prev_hidden,
@@ -2739,12 +2767,42 @@ mod tests {
             &mut rng,
             &mut profiler,
             depth,
-            None,
-            MtpCommitAnchor::IncludeAnchor,
+            ev.as_mut(),
+            commit_anchor,
         )
         .expect("scripted run_mtp_cycle must succeed");
         let ledger = step.snapshot();
-        (outcome, ledger)
+        let commit_payload = step.commit_payload.borrow().clone();
+        let ran_sparse = profiler.ran_phase("mtp_accept_argmax");
+        ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ran_sparse,
+        }
+    }
+
+    /// Thin wrapper for the common case: no EV gate, `IncludeAnchor` (Step-A)
+    /// commit policy. Returns just the outcome + call ledger.
+    fn run_scripted_cycle(
+        vocab: i64,
+        hidden: i64,
+        draft_argmax: Vec<i32>,
+        verify_argmax: Vec<i32>,
+        depth: usize,
+        last_committed_id: u32,
+    ) -> (MtpCycleOutcome, Vec<Call>) {
+        let r = run_scripted_cycle_full(
+            vocab,
+            hidden,
+            draft_argmax,
+            verify_argmax,
+            depth,
+            last_committed_id,
+            None,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        (r.outcome, r.ledger)
     }
 
     /// Extract the `k_accepted` the cycle reported through its single
@@ -2765,7 +2823,21 @@ mod tests {
         // position 3 is the full-accept bonus (id 6). The cycle commits all 3
         // drafts + the bonus (4 tokens), K == depth, and SKIPS
         // restore_and_replay_main (verify already advanced the linear state).
-        let (outcome, ledger) = run_scripted_cycle(8, 4, vec![3, 4, 5], vec![3, 4, 5, 6], 3, 3);
+        let ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![3, 4, 5],
+            vec![3, 4, 5, 6],
+            3,
+            3,
+            None,
+            MtpCommitAnchor::IncludeAnchor,
+        );
 
         assert_eq!(
             outcome.tokens,
@@ -2775,6 +2847,11 @@ mod tests {
         assert_eq!(outcome.requested_depth, 3);
         assert_eq!(outcome.effective_depth, 3);
         assert_eq!(commit_k(&ledger), 3, "K == effective_depth on full accept");
+        assert_eq!(
+            commit_payload,
+            Some((vec![3u32, 3, 4, 5, 6], 3)),
+            "full-accept IncludeAnchor commits [last_committed, all drafts, bonus]"
+        );
 
         // Call ORDER the cycle itself drives (turn-entry reads like
         // profiler_relabel / committed_history_active / embedding_weight and
@@ -2858,6 +2935,388 @@ mod tests {
                 Call::RestoreAndReplayMain { accepted: 2 },
             ],
             "reject cycle: drafts → snapshot → verify → commit → rollback → replay"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_all_reject_emits_residual() {
+        // depth 3, reject at position 0: draft [1,2,3]; verify argmax
+        // [6,7,0,0] → pos 0 rejects (6 != 1) and the residual (6) is emitted.
+        // Emits exactly 1 residual, K == 0, rollback (0,3) so the dispatch
+        // delta `0 - 3 = -3` rewinds the full window, and replay re-runs only
+        // the anchor (`[last_committed]`, len 1).
+        let ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![6, 7, 0, 0],
+            3,
+            0,
+            None,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_eq!(
+            outcome.tokens,
+            vec![6],
+            "all-reject emits exactly 1 residual"
+        );
+        assert_eq!(outcome.effective_depth, 3, "all 3 drafts were still built");
+        assert_eq!(commit_k(&ledger), 0, "K == 0 on first-position reject");
+        assert_eq!(
+            commit_payload,
+            Some((vec![0u32, 6], 0)),
+            "all-reject IncludeAnchor commits [last_committed, residual]"
+        );
+        assert_eq!(
+            ledger,
+            vec![
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 3 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 0,
+                },
+                Call::Rollback {
+                    accepted: 0,
+                    depth: 3,
+                },
+                Call::RestoreAndReplayMain { accepted: 1 },
+            ],
+            "all-reject: drafts → snapshot → verify → commit → rollback → replay(anchor only)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_depth_one_degenerates() {
+        // depth 1: 1 draft + 1 verify slot. Full accept → 2 tokens
+        // [draft, bonus]; K == 1; verify already advanced the linear state so
+        // there is NO replay.
+        let ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![5],
+            vec![5, 7],
+            1,
+            0,
+            None,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_eq!(
+            outcome.tokens,
+            vec![5, 7],
+            "depth-1 full accept = [draft, bonus]"
+        );
+        assert_eq!(outcome.effective_depth, 1);
+        assert_eq!(commit_k(&ledger), 1);
+        assert_eq!(
+            commit_payload,
+            Some((vec![0u32, 5, 7], 1)),
+            "depth-1 full-accept commits [last_committed, draft, bonus]"
+        );
+        assert!(
+            !ledger
+                .iter()
+                .any(|c| matches!(c, Call::RestoreAndReplayMain { .. })),
+            "depth-1 full accept must NOT replay"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_partial_reject_at_pos2_reports_k2() {
+        // depth 3, reject at position 2: draft [1,2,3]; verify argmax
+        // [1,2,6,0] → pos 0,1 accept, pos 2 rejects (6 != 3), residual 6.
+        // Emits [1,2,6] (2 accepted drafts + residual). K == 2 (NOT 3 — the
+        // residual has no draft K/V slot and is excluded), rollback (2,3),
+        // replay = [anchor, d_0, d_1] (len 3). Locks the off-by-one regression.
+        let ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            16,
+            4,
+            vec![1, 2, 3],
+            vec![1, 2, 6, 0],
+            3,
+            0,
+            None,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_eq!(
+            outcome.tokens,
+            vec![1, 2, 6],
+            "2 accepted drafts + residual"
+        );
+        assert_eq!(
+            commit_k(&ledger),
+            2,
+            "K == accepted-draft prefix length (residual excluded)"
+        );
+        assert_eq!(
+            commit_payload,
+            Some((vec![0u32, 1, 2, 6], 2)),
+            "partial-reject IncludeAnchor commits [last_committed, accepted drafts, residual]"
+        );
+        assert_eq!(
+            ledger,
+            vec![
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 3 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 2,
+                },
+                Call::Rollback {
+                    accepted: 2,
+                    depth: 3,
+                },
+                Call::RestoreAndReplayMain { accepted: 3 },
+            ],
+            "partial-reject K=2: replay [anchor, d_0, d_1] (len 3)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_ev_depth_gate_shortens_effective_depth() {
+        // Caller requests depth 3, but the EV cost model (accept ewma
+        // [0.70, 0.10, ..], `min_extra_accept` 0.30) votes against deepening
+        // past `base_depth = 1`, so verify/rollback/commit must all use the
+        // shortened `effective_depth = 1`. `for_test` leaves `allow_deepen`
+        // true, so the cost model is the sole gate (matches the original
+        // closure-driven contract test).
+        let ev = ExpectedValueDepthPolicy::for_test(3, 1, [0.70, 0.10, 0.05, 0.05, 0.05], 0.30);
+        let ScriptedCycle {
+            outcome,
+            ledger,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![1, 4],
+            3,
+            0,
+            Some(ev),
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_eq!(outcome.requested_depth, 3);
+        assert_eq!(
+            outcome.effective_depth, 1,
+            "EV gate shortened the cycle to one draft"
+        );
+        assert_eq!(
+            outcome.tokens,
+            vec![1, 4],
+            "shortened full accept emits the accepted draft plus bonus"
+        );
+        assert_eq!(commit_k(&ledger), 1);
+        assert_eq!(
+            commit_payload,
+            Some((vec![0u32, 1, 4], 1)),
+            "commit payload matches the shortened verify window"
+        );
+        assert_eq!(
+            ledger,
+            vec![
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 1 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 1,
+                },
+                Call::Rollback {
+                    accepted: 1,
+                    depth: 1,
+                },
+            ],
+            "EV-gated cycle: 1 draft → snapshot → verify(depth 1) → commit → rollback (no replay)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_chained_full_accept_skips_anchor() {
+        // Chained cycle (`SkipAlreadyCommittedAnchor`): the anchor was already
+        // committed by the prior cycle, so a full-accept commit carries only
+        // the newly emitted tokens `[d_0, d_1, d_2, bonus]` (K+1, no anchor).
+        let ScriptedCycle {
+            outcome,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
+            3,
+            0,
+            None,
+            MtpCommitAnchor::SkipAlreadyCommittedAnchor,
+        );
+        assert_eq!(outcome.tokens, vec![1, 2, 3, 4]);
+        assert_eq!(
+            commit_payload,
+            Some((vec![1u32, 2, 3, 4], 3)),
+            "chained full-accept commits only newly emitted tokens (no anchor)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_chained_partial_reject_skips_anchor() {
+        // Chained partial reject (K=2): commit carries only `[d_0, d_1,
+        // residual]` — the anchor is not re-committed.
+        let ScriptedCycle {
+            outcome,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![1, 2, 6, 0],
+            3,
+            0,
+            None,
+            MtpCommitAnchor::SkipAlreadyCommittedAnchor,
+        );
+        assert_eq!(outcome.tokens, vec![1, 2, 6]);
+        assert_eq!(
+            commit_payload,
+            Some((vec![1u32, 2, 6], 2)),
+            "chained partial-reject must not re-commit the anchor token"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_chained_all_reject_single_residual() {
+        // Chained all-reject (K=0): commit carries only the single residual
+        // (`[residual]`, K+1 = 1) under the chained one-token commit path.
+        let ScriptedCycle {
+            outcome,
+            commit_payload,
+            ..
+        } = run_scripted_cycle_full(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![6, 7, 0, 0],
+            3,
+            0,
+            None,
+            MtpCommitAnchor::SkipAlreadyCommittedAnchor,
+        );
+        assert_eq!(outcome.tokens, vec![6]);
+        assert_eq!(
+            commit_payload,
+            Some((vec![6u32], 0)),
+            "chained all-reject uses the one-token residual commit path"
+        );
+    }
+
+    /// The T=0 safety gate that graduates `MLX_MTP_EV_ALLOW_DEEPEN`.
+    ///
+    /// Invariant: intra-cycle deepening can only EXTEND the committed sequence
+    /// — it must NEVER mutate an already-committed prefix. The SAME
+    /// deterministic T=0 cycle is run twice, differing only in `allow_deepen`
+    /// (shallow `false` stops the gate at `base_depth = 1`; deep `true` extends
+    /// it to `max_depth = 3`). `accept_ewma` pinned high + costs zeroed
+    /// (`for_test`) so the cost model always votes to deepen when allowed —
+    /// `allow_deepen` is the SOLE difference. With drafter/verifier argmaxes
+    /// equal on every overlapping position both runs full-accept, and the
+    /// shallow token/commit window MUST be a byte-identical prefix of the deep
+    /// one.
+    ///
+    /// GREEN => the Rust accept/commit layer the EV gate controls is
+    /// depth-invariant at T=0 => the deepen flag is safe. RED => a REAL safety
+    /// violation; keep the flag OFF and root-cause. Do NOT weaken this test.
+    #[test]
+    fn run_mtp_cycle_ev_deepen_t0_committed_tokens_byte_identical() {
+        // draft d_0=1, d_1=2, d_2=3; verifier argmax matches each plus a bonus
+        // argmax (4) at the final slot — depth-independent (causal) per slot.
+        let run = |allow_deepen: bool| -> ScriptedCycle {
+            let mut ev =
+                ExpectedValueDepthPolicy::for_test(3, 1, [0.99, 0.99, 0.99, 0.99, 0.99], 0.0);
+            ev.set_allow_deepen(allow_deepen);
+            run_scripted_cycle_full(
+                8,
+                4,
+                vec![1, 2, 3],
+                vec![1, 2, 3, 4],
+                3,
+                0,
+                Some(ev),
+                MtpCommitAnchor::IncludeAnchor,
+            )
+        };
+
+        let shallow = run(false);
+        let deep = run(true);
+
+        // Fail closed: the byte-equivalence claim is only meaningful if both
+        // runs drove the production T=0 sparse-accept commit path.
+        assert!(
+            shallow.ran_sparse && deep.ran_sparse,
+            "both runs must exercise the T=0 sparse-accept commit path"
+        );
+
+        // Sanity: the flag actually changed the drafted depth (else vacuous).
+        assert_eq!(
+            shallow.outcome.effective_depth, 1,
+            "allow_deepen=false stops the gate at base_depth=1"
+        );
+        assert_eq!(
+            deep.outcome.effective_depth, 3,
+            "allow_deepen=true extends the gate to max_depth on a full-accept chain"
+        );
+
+        assert_eq!(shallow.outcome.tokens, vec![1u32, 2]);
+        assert_eq!(deep.outcome.tokens, vec![1u32, 2, 3, 4]);
+
+        // THE SAFETY INVARIANT: the shallow emitted-token window is a
+        // byte-identical PREFIX of the deep window — deepening only appends.
+        assert!(
+            deep.outcome
+                .tokens
+                .starts_with(&shallow.outcome.tokens[..1]),
+            "deepen must not mutate the first committed token: shallow={:?} deep={:?}",
+            shallow.outcome.tokens,
+            deep.outcome.tokens
+        );
+        assert_eq!(
+            shallow.outcome.tokens[1], deep.outcome.tokens[1],
+            "shallow full-accept bonus@K_s equals the token deeper drafting commits at that slot"
+        );
+
+        // Commit payloads carry the same invariant (IncludeAnchor →
+        // [last_committed, emitted...]).
+        let (shallow_ids, shallow_k) = shallow.commit_payload.expect("shallow commit");
+        let (deep_ids, deep_k) = deep.commit_payload.expect("deep commit");
+        assert_eq!(shallow_ids, vec![0u32, 1, 2]);
+        assert_eq!(deep_ids, vec![0u32, 1, 2, 3, 4]);
+        assert_eq!(shallow_k, 1);
+        assert_eq!(deep_k, 3);
+        assert_eq!(
+            shallow_ids[..2],
+            deep_ids[..2],
+            "committed anchor + first accepted draft are byte-identical across depths"
         );
     }
 

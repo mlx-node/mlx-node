@@ -1026,8 +1026,8 @@ pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
 /// argmax fallback stays within `p_target`'s support; an exact correction
 /// is impossible in the degenerate regime where the residual carries no
 /// mass, so we pick the highest-probability target token instead.
-// `pub(crate)`: the W6 `chat_common::run_mtp_cycle_inner` speculative
-// decode helper is the production caller.
+// `pub(crate)`: the engine's `crate::engine::mtp_turn::run_mtp_cycle`
+// speculative-decode helper is the production caller.
 pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     p_target: &MxArray,
     p_draft: &MxArray,

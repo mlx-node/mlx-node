@@ -1243,9 +1243,9 @@ pub(crate) trait ChatBackend {
     }
 
     /// MTP speculative-decode whole-turn path. == the
-    /// `p.enable_mtp && has_mtp_weights` branch driving
-    /// `decode_loop_mtp!` in `models/qwen3_5/model.rs` /
-    /// `models/qwen3_5_moe/model.rs`.
+    /// `p.enable_mtp && has_mtp_weights` branch in
+    /// `models/qwen3_5/model.rs` / `models/qwen3_5_moe/model.rs`, now
+    /// driving the engine-owned `run_mtp_turn`.
     ///
     /// Streaming contract: see [`TurnOutput`] — with `args.sink`
     /// attached, stream everything through the sink and return
@@ -1519,7 +1519,7 @@ pub(crate) trait PagedBackend: ChatBackend {
 ///
 /// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
 /// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
-/// adaptive/EV gates on top, exactly as `run_mtp_cycle_inner` does today.
+/// adaptive/EV gates on top, exactly as the per-cycle `run_mtp_cycle` does.
 ///
 /// `#[allow(dead_code)]`: SCAFFOLD — the engine-owned `run_mtp_turn`
 /// constructs this and `MtpBackend::begin_mtp_decode` consumes it in a
@@ -1559,7 +1559,8 @@ pub(crate) struct MtpTurnSetup<'a> {
 
 /// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode
 /// whole-turn flows through the engine-owned propose/verify loop instead
-/// of the family-local `decode_loop_mtp!` macro + `MtpOps` closure bundle.
+/// of the former family-local `decode_loop_mtp!` macro + `MtpOps` closure
+/// bundle (now removed).
 ///
 /// Split out of [`ChatBackend`] for the SAME reason as [`PagedBackend`]:
 /// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
@@ -1569,9 +1570,9 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// `Some(run_mtp_turn(self, args))`; MTP-less families do not implement
 /// it.
 ///
-/// The engine-owned loop (`run_mtp_turn`) relocates the
-/// `decode_loop_mtp!` outer body and `run_mtp_cycle_inner`, calling the
-/// [`MtpStepper`] methods where the macro calls `ops.*`. The stepper
+/// The engine-owned loop (`run_mtp_turn`) is the relocated
+/// `decode_loop_mtp!` outer body + `run_mtp_cycle_inner` (both now
+/// removed), calling the [`MtpStepper`] methods where those called `ops.*`. The stepper
 /// borrows `&mut self` for the whole turn (the analog of
 /// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
 /// per-cycle snapshot/tape/replay-error as its own fields.
@@ -1599,10 +1600,12 @@ pub(crate) trait MtpBackend: ChatBackend {
 }
 
 /// Per-turn MTP stepper the engine-owned propose/verify loop drives — the
-/// 11 [`MtpOps`](crate::models::qwen3_5::mtp_decode) closures as trait
+/// 11 closures of the former `MtpOps` bundle (now removed) as trait
 /// methods, plus the macro-level orchestration hooks the engine takes
 /// over (`profiler_relabel` / `embedding_weight` /
 /// `committed_history_active` / `take_replay_error` / `into_desynced`).
+/// The `== MtpOps::*` notes on each method below map it to its origin
+/// closure for historical reference.
 ///
 /// The `&mut self` borrow model is strictly sequential: the engine calls
 /// exactly one method at a time, threading the lazy [`MxArray`] outputs of
@@ -1610,8 +1613,8 @@ pub(crate) trait MtpBackend: ChatBackend {
 /// are `&self` (they only SCHEDULE async eval — no state mutation), every
 /// other forward/draft/verify/rollback/commit method is `&mut self`. The
 /// GDN tape + linear snapshot are private stepper fields (`Scratch`), so
-/// they never cross the trait — exactly as `run_mtp_cycle_inner` keeps
-/// them inside the `MtpOps` closures' captured environment today.
+/// they never cross the trait — exactly as the former `run_mtp_cycle_inner`
+/// kept them inside the `MtpOps` closures' captured environment.
 ///
 /// # Invariants the engine must preserve (each gated byte-identical)
 ///   * async_eval batching — every `async_eval` stays INSIDE a method;
@@ -1630,7 +1633,7 @@ pub(crate) trait MtpBackend: ChatBackend {
 pub(crate) trait MtpStepper {
     /// The model's embedding table (already resolved to the LM head when
     /// `tie_word_embeddings=false`). == the `embedding_weight` arg the
-    /// macro threads into `run_mtp_cycle_inner` and the draft/verify
+    /// engine threads into `run_mtp_cycle` and the draft/verify
     /// steps. Borrowed for the lifetime of the call (the engine passes it
     /// straight back into [`Self::verify_step`] /
     /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
@@ -1741,7 +1744,7 @@ pub(crate) trait MtpStepper {
     /// Re-anchor the MTP draft caches/offset to the main path's current
     /// position, once per outer iteration AFTER Step A. `chained_anchor`
     /// is `cycle_seed_was_chained && committed_history_active` — the same
-    /// arg the macro passes. == `MtpOps::begin_cycle` (the `B` closure).
+    /// arg the engine loop passes. == `MtpOps::begin_cycle` (the `B` closure).
     fn begin_cycle(&mut self, chained_anchor: bool);
 
     /// Schedule async eval for an emitted token (+ logits on the
@@ -1752,7 +1755,7 @@ pub(crate) trait MtpStepper {
     /// Fused chained-hidden eval — folds `verify_hiddens[:, K, :]` into the
     /// SAME `async_eval` batch as the just-set token. `&self` — schedules
     /// only. MUST be called at the iteration boundary EXACTLY where the
-    /// macro calls it; do NOT reorder. == `MtpOps::eval_step_with_chained_hidden`
+    /// engine loop calls it; do NOT reorder. == `MtpOps::eval_step_with_chained_hidden`
     /// (the `EX` closure, which is `Fn`).
     fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray);
 

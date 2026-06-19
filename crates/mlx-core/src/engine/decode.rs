@@ -33,7 +33,7 @@ use crate::tokenizer::Qwen3Tokenizer;
 // token it logs the position index, the committed token id, and the
 // top-2 (token id + logit value) of the forward that produced it:
 //   * the AR `decode_loop!` logs the single-token decode forward;
-//   * `run_mtp_cycle_inner` logs the batched verify forward, per
+//   * the engine's `run_mtp_cycle` logs the batched verify forward, per
 //     verify slot.
 //
 // The trace exists to resolve whether an AR-vs-MTP argmax flip is a

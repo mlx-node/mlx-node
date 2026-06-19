@@ -142,8 +142,8 @@ const NEIGHBOR_PROBE_CYCLES: u32 = MIN_COLD_SAMPLES;
 
 /// Adaptive state machine.
 ///
-/// Why an explicit `Explore` state: production callers in `decode_loop_mtp!`
-/// only ever record observations at the depth `pick_depth()` returned, so
+/// Why an explicit `Explore` state: the engine's `run_mtp_cycle`
+/// only ever records observations at the depth `pick_depth()` returned, so
 /// without bootstrap the EMA for unsampled depths stays 0.0 forever and the
 /// hill-climb can never discover a non-seed depth (a 3-seeded policy would
 /// only oscillate between {3, 1}, never trying 2/4/5).
@@ -185,7 +185,7 @@ pub(crate) enum AdaptiveState {
 /// Per-cycle observation passed to the policy.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CycleStats {
-    /// Depth used this cycle (the `D` arg to `run_mtp_cycle_inner`).
+    /// Depth used this cycle (the `depth` arg to `run_mtp_cycle`).
     pub depth: u8,
     /// Tokens committed this cycle. On full-accept this is `D + 1`
     /// (the D drafts + bonus). On partial-accept it's `K + 1`
@@ -430,7 +430,7 @@ impl WindowStats {
 }
 
 /// Adaptive depth policy state. One per chat session / decode-loop
-/// invocation. Lives on the stack inside the `decode_loop_mtp!` macro
+/// invocation. Lives on the stack inside the engine's `run_mtp_turn` loop
 /// and is dropped at decode end.
 pub(crate) struct AdaptiveDepthPolicy {
     /// Per-depth EMA of tokens/sec rate. Indexed by `depth - 1`.
@@ -506,8 +506,8 @@ impl AdaptiveDepthPolicy {
     }
 
     /// Construct a NO-OP policy that always returns `fixed_depth`.
-    /// Used in tests to exercise the bounds-clamping path; production
-    /// callers in `decode_loop_mtp!` skip `record_cycle` when adaptive
+    /// Used in tests to exercise the bounds-clamping path; the engine's
+    /// `run_mtp_cycle` skips `record_cycle` when adaptive
     /// is off so the same `pick_depth()` always returns the seed.
     #[cfg(test)]
     pub fn fixed(fixed_depth: u8) -> Self {
@@ -536,8 +536,8 @@ impl AdaptiveDepthPolicy {
         }
     }
 
-    /// Diagnostic snapshot of per-depth EMA. Used by tests; production
-    /// callers in `decode_loop_mtp!` log the chosen depth + state
+    /// Diagnostic snapshot of per-depth EMA. Used by tests; the engine's
+    /// `run_mtp_cycle` logs the chosen depth + state
     /// label per cycle via `tracing::debug!`.
     #[cfg(test)]
     #[allow(dead_code)]
@@ -813,8 +813,8 @@ mod tests {
     //! No Metal, no MLX, no model load — these run in `cargo test
     //! -p mlx-core --lib adaptive_depth`.
     //!
-    //! IMPORTANT: production callers in `decode_loop_mtp!` only ever
-    //! call `record_cycle` with the depth `pick_depth()` returned. The
+    //! IMPORTANT: the engine's `run_mtp_cycle` only ever
+    //! calls `record_cycle` with the depth `pick_depth()` returned. The
     //! `drive_cycles` helper below enforces that contract; any test
     //! that manually injects observations at a depth `pick_depth()`
     //! did NOT return is testing a non-production code path and will
@@ -825,7 +825,7 @@ mod tests {
     /// Drive the policy for `n` cycles, always asking `pick_depth()`
     /// for the depth and computing `(committed, wall_ns)` from the
     /// caller-supplied closure. Mirrors the production loop in
-    /// `decode_loop_mtp!` byte-for-byte.
+    /// the engine's `run_mtp_cycle` byte-for-byte.
     fn drive_cycles(
         p: &mut AdaptiveDepthPolicy,
         n: u32,

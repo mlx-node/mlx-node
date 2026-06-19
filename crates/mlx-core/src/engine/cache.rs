@@ -92,7 +92,7 @@ pub(crate) fn build_paged_extra_keys(
 /// whether the decode driver forwarded the final committed token into the
 /// physical cache:
 /// - MTP/macro cores: callers pass `drop_last_always = !last_token_in_cache`.
-///   The `decode_loop!` / `decode_loop_mtp!` macros do NOT always forward the
+///   The `decode_loop!` macro and the engine's MTP loop do NOT always forward the
 ///   stop token before checking it — the AR loop skips the forward on its final
 ///   step (incl. `max_new_tokens == 1`), and the MTP loop's pre-forward seed
 ///   re-check and Step-A post-check stop on a token that has not yet been
