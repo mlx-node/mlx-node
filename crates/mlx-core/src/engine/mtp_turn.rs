@@ -2089,6 +2089,15 @@ mod tests {
         draft_argmax: Vec<i32>,
         verify_argmax: Vec<i32>,
         next_draft: std::cell::Cell<usize>,
+        /// Value placed at every NON-argmax logit slot. `0.0` for the T=0
+        /// sparse-accept tests (only the argmax matters there, so the softmax
+        /// shape is irrelevant). The dense-accept tests set this to an
+        /// under-flowing negative (`-1e30`, `exp == 0.0` in f32) so `softmax`
+        /// is EXACTLY one-hot at the argmax: the draft / bonus / residual draws
+        /// are degenerate and the stochastic `accept_with_residual` outcome is
+        /// deterministic BY CONSTRUCTION, independent of both the MLX sampler
+        /// RNG and the Rust accept RNG.
+        neg_fill: f32,
     }
 
     /// Per-cycle argmax script for the whole-turn [`TurnScript`].
@@ -2160,7 +2169,34 @@ mod tests {
                 draft_argmax,
                 verify_argmax,
                 next_draft: std::cell::Cell::new(0),
+                neg_fill: 0.0,
             });
+            s
+        }
+
+        /// Like [`with_cycle`], but gives the logits EXACT zero-support at every
+        /// non-argmax slot so the cycle can run its DENSE stochastic
+        /// `accept_with_residual` branch (T>0) deterministically BY
+        /// CONSTRUCTION. In f32 `exp(-1e30) == 0.0` (underflow), so `softmax`
+        /// over these logits is exactly one-hot at the argmax: the per-position
+        /// draft / bonus / residual categorical draws are degenerate (all mass
+        /// on one token), so the emitted tokens do NOT depend on the MLX sampler
+        /// RNG at all. A full-accept position then has draft logits == verify
+        /// logits (accept ratio exactly 1.0, accept for any draw) and a
+        /// disagreement puts ALL residual mass on the verifier argmax.
+        ///
+        /// A literal `-inf` would also be exact-one-hot but risks `inf * 0 ==
+        /// NaN` in downstream ops; a finite under-flowing fill is strictly safer.
+        fn with_cycle_dense(
+            vocab: i64,
+            hidden: i64,
+            draft_argmax: Vec<i32>,
+            verify_argmax: Vec<i32>,
+        ) -> Self {
+            let mut s = Self::with_cycle(vocab, hidden, draft_argmax, verify_argmax);
+            if let Some(c) = s.cycle.as_mut() {
+                c.neg_fill = -1.0e30;
+            }
             s
         }
 
@@ -2205,7 +2241,16 @@ mod tests {
     /// argmax over the final axis is `argmax_id`: a one-hot-ish vector with a
     /// large positive spike at `argmax_id` and zeros elsewhere.
     fn logits_row(vocab: i64, argmax_id: i32) -> Vec<f32> {
-        let mut row = vec![0.0f32; vocab as usize];
+        logits_row_filled(vocab, argmax_id, 0.0)
+    }
+
+    /// `logits_row` with an explicit non-argmax fill value. A large negative
+    /// fill (e.g. `-30.0`) makes `softmax` ~one-hot at `argmax_id`, which the
+    /// dense `accept_with_residual` tests rely on for deterministic accept /
+    /// reject (the argmax stays `argmax_id` for any fill `< 10.0`, so the T=0
+    /// argmax-only callers are unaffected by the choice of fill).
+    fn logits_row_filled(vocab: i64, argmax_id: i32, fill: f32) -> Vec<f32> {
+        let mut row = vec![fill; vocab as usize];
         if (0..vocab as i32).contains(&argmax_id) {
             row[argmax_id as usize] = 10.0;
         }
@@ -2289,8 +2334,10 @@ mod tests {
                     let argmax_id = c.draft_argmax.get(i).copied().unwrap_or(0);
                     let h_next =
                         MxArray::from_float32(&vec![0.0f32; c.hidden as usize], &[1, 1, c.hidden])?;
-                    let draft_logits =
-                        MxArray::from_float32(&logits_row(c.vocab, argmax_id), &[1, c.vocab])?;
+                    let draft_logits = MxArray::from_float32(
+                        &logits_row_filled(c.vocab, argmax_id, c.neg_fill),
+                        &[1, c.vocab],
+                    )?;
                     Ok((h_next, draft_logits))
                 }
                 None => Ok((lazy_scalar(0.0), lazy_scalar(0.0))),
@@ -2338,7 +2385,7 @@ mod tests {
                     let mut flat: Vec<f32> = Vec::with_capacity(rows * c.vocab as usize);
                     for j in 0..rows {
                         let argmax_id = c.verify_argmax.get(j).copied().unwrap_or(0);
-                        flat.extend(logits_row(c.vocab, argmax_id));
+                        flat.extend(logits_row_filled(c.vocab, argmax_id, c.neg_fill));
                     }
                     let logits = MxArray::from_float32(&flat, &[1, rows as i64, c.vocab])?;
                     let hiddens = MxArray::from_float32(
@@ -2715,6 +2762,23 @@ mod tests {
         }
     }
 
+    /// T=1.0 `ChatParams` — drives `run_mtp_cycle` down the DENSE stochastic
+    /// `accept_with_residual` branch: `temperature == 1.0` is not greedy
+    /// (`use_sparse_accept == false`) and the batched-target-array env is
+    /// off by default (`use_sparse_stochastic_accept == false`), so neither
+    /// sparse fast path applies. All penalties stay at their no-op defaults.
+    fn dense_params() -> ChatParams {
+        ChatParams {
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(1.0),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            }),
+            ..greedy_params()
+        }
+    }
+
     /// Outcome of one scripted `run_mtp_cycle` over the canned mock.
     struct ScriptedCycle {
         outcome: MtpCycleOutcome,
@@ -2803,6 +2867,97 @@ mod tests {
             MtpCommitAnchor::IncludeAnchor,
         );
         (r.outcome, r.ledger)
+    }
+
+    /// Outcome of one scripted `run_mtp_cycle` that took the DENSE stochastic
+    /// `accept_with_residual` branch. The three `ran_*` flags fail-closed:
+    /// the dense branch fires `mtp_accept_loop` and NEITHER sparse phase, so a
+    /// test asserts `ran_accept_loop && !ran_argmax_sparse &&
+    /// !ran_stochastic_sparse` to prove it really exercised the dense path.
+    struct DenseScriptedCycle {
+        outcome: MtpCycleOutcome,
+        ledger: Vec<Call>,
+        commit_payload: Option<(Vec<u32>, usize)>,
+        ran_accept_loop: bool,
+        ran_argmax_sparse: bool,
+        ran_stochastic_sparse: bool,
+    }
+
+    /// Run one scripted `run_mtp_cycle` down the DENSE stochastic
+    /// `accept_with_residual` branch (T=1.0). Forces the sparse-accept gate
+    /// OFF (defensive — T≠0 already disqualifies it). `with_cycle_dense`'s
+    /// exact-one-hot logits make every draw degenerate, so the result is
+    /// deterministic by construction; the FIXED RNG seed is belt-and-suspenders
+    /// (with one-hot support the accept/residual draw never has a choice to
+    /// make). Captures the profiler phases so the caller can prove the dense
+    /// branch ran.
+    ///
+    /// This restores the engine-level dense-accept coverage the deleted
+    /// `mod mtp_cycle_tests` provided at T=1.0 (the migrated `run_scripted_cycle`
+    /// tests only exercise the T=0 sparse-accept branch).
+    fn run_scripted_cycle_dense(
+        vocab: i64,
+        hidden: i64,
+        draft_argmax: Vec<i32>,
+        verify_argmax: Vec<i32>,
+        depth: usize,
+        last_committed_id: u32,
+        commit_anchor: MtpCommitAnchor,
+    ) -> DenseScriptedCycle {
+        let _force = ForceSparseAcceptGuard::force(false);
+        let mut step = MockMtpStepper::with_cycle_dense(vocab, hidden, draft_argmax, verify_argmax);
+        let params = dense_params();
+        let mut rng =
+            <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD0E5_DEAD_BEEF_F00D);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_dense_test", "test");
+        profiler.enable_for_test();
+        let emb = step.emb.clone();
+        let prev_hidden =
+            MxArray::from_float32(&vec![0.0f32; hidden as usize], &[1, 1, hidden]).unwrap();
+        let prev_emb =
+            MxArray::from_float32(&vec![0.0f32; hidden as usize], &[1, 1, hidden]).unwrap();
+        let token_history: Vec<u32> = vec![1, 2, 3];
+        let (outcome, _vh) = run_mtp_cycle(
+            &mut step,
+            prev_hidden,
+            prev_emb,
+            last_committed_id,
+            &emb,
+            &token_history,
+            &params,
+            &mut rng,
+            &mut profiler,
+            depth,
+            None,
+            commit_anchor,
+        )
+        .expect("scripted dense run_mtp_cycle must succeed");
+        DenseScriptedCycle {
+            outcome,
+            ledger: step.snapshot(),
+            commit_payload: step.commit_payload.borrow().clone(),
+            ran_accept_loop: profiler.ran_phase("mtp_accept_loop"),
+            ran_argmax_sparse: profiler.ran_phase("mtp_accept_argmax"),
+            ran_stochastic_sparse: profiler.ran_phase("mtp_accept_sparse_probs"),
+        }
+    }
+
+    /// Assert the cycle really took the DENSE `accept_with_residual` branch:
+    /// the accept loop ran and NEITHER sparse fast path did.
+    fn assert_dense_branch(r: &DenseScriptedCycle, label: &str) {
+        assert!(
+            r.ran_accept_loop,
+            "{label}: the accept loop must have run (dense branch fires `mtp_accept_loop`)"
+        );
+        assert!(
+            !r.ran_argmax_sparse,
+            "{label}: must NOT take the T=0 sparse-accept fast path (`mtp_accept_argmax`)"
+        );
+        assert!(
+            !r.ran_stochastic_sparse,
+            "{label}: must NOT take the batched sparse-stochastic fast path \
+             (`mtp_accept_sparse_probs`)"
+        );
     }
 
     /// Extract the `k_accepted` the cycle reported through its single
@@ -3090,6 +3245,156 @@ mod tests {
                 Call::RestoreAndReplayMain { accepted: 3 },
             ],
             "partial-reject K=2: replay [anchor, d_0, d_1] (len 3)"
+        );
+    }
+
+    // ---- DENSE stochastic `accept_with_residual` branch (T=1.0) ----
+    // The tests above force the T=0 sparse-accept fast path. These three drive
+    // the same accept / partial-reject / all-reject contracts through the DENSE
+    // `accept_with_residual` branch instead (T=1.0, exact-one-hot logits →
+    // deterministic by construction), restoring the engine-level coverage the
+    // deleted `mod mtp_cycle_tests` provided at T=1.0. Each asserts (via
+    // `assert_dense_branch`) that it really took the dense path — the accept
+    // loop ran and NEITHER sparse fast path did.
+
+    #[test]
+    fn run_mtp_cycle_dense_full_accept_depth3() {
+        // depth 3, every draft accepted through the DENSE accept ratio
+        // (draft logits == verify logits at each accept position → ratio
+        // exactly 1.0). Commits 3 drafts + bonus, K == depth, no replay.
+        let r = run_scripted_cycle_dense(
+            8,
+            4,
+            vec![3, 4, 5],
+            vec![3, 4, 5, 6],
+            3,
+            3,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_dense_branch(&r, "dense_full_accept");
+        assert_eq!(
+            r.outcome.tokens,
+            vec![3, 4, 5, 6],
+            "dense full accept emits 3 accepted drafts + bonus"
+        );
+        assert_eq!(r.outcome.effective_depth, 3);
+        assert_eq!(
+            r.commit_payload,
+            Some((vec![3u32, 3, 4, 5, 6], 3)),
+            "dense full-accept IncludeAnchor commits [last_committed, all drafts, bonus]"
+        );
+        assert_eq!(
+            r.ledger,
+            vec![
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 3 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 3,
+                },
+                Call::Rollback {
+                    accepted: 3,
+                    depth: 3,
+                },
+            ],
+            "dense full-accept: 3 drafts → snapshot → verify → commit → rollback (no replay)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_dense_partial_reject_at_pos2() {
+        // depth 3, dense accept at pos 0,1 (ratio 1.0), reject at pos 2 (target
+        // mass sits on verifier argmax 6, so the dense reject + residual draw
+        // lands on 6). Emits [1,2,6], K == 2, rollback (2,3), replay len 3.
+        let r = run_scripted_cycle_dense(
+            16,
+            4,
+            vec![1, 2, 3],
+            vec![1, 2, 6, 0],
+            3,
+            0,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_dense_branch(&r, "dense_partial_reject");
+        assert_eq!(
+            r.outcome.tokens,
+            vec![1, 2, 6],
+            "dense partial-reject: 2 accepted drafts + residual"
+        );
+        assert_eq!(
+            r.commit_payload,
+            Some((vec![0u32, 1, 2, 6], 2)),
+            "dense partial-reject IncludeAnchor commits [last_committed, accepted drafts, residual]"
+        );
+        assert_eq!(
+            r.ledger,
+            vec![
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 3 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 2,
+                },
+                Call::Rollback {
+                    accepted: 2,
+                    depth: 3,
+                },
+                Call::RestoreAndReplayMain { accepted: 3 },
+            ],
+            "dense partial-reject K=2: replay [anchor, d_0, d_1] (len 3)"
+        );
+    }
+
+    #[test]
+    fn run_mtp_cycle_dense_all_reject_emits_residual() {
+        // depth 3, dense reject at position 0 (target mass on verifier argmax
+        // 6 → residual draw is 6). Emits exactly 1 residual, K == 0, rollback
+        // (0,3), replay re-runs only the anchor (len 1).
+        let r = run_scripted_cycle_dense(
+            8,
+            4,
+            vec![1, 2, 3],
+            vec![6, 7, 0, 0],
+            3,
+            0,
+            MtpCommitAnchor::IncludeAnchor,
+        );
+        assert_dense_branch(&r, "dense_all_reject");
+        assert_eq!(
+            r.outcome.tokens,
+            vec![6],
+            "dense all-reject emits exactly 1 residual"
+        );
+        assert_eq!(
+            r.commit_payload,
+            Some((vec![0u32, 6], 0)),
+            "dense all-reject IncludeAnchor commits [last_committed, residual]"
+        );
+        assert_eq!(
+            r.ledger,
+            vec![
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::DraftStep,
+                Call::SnapshotMainLinear,
+                Call::VerifyStep { depth: 3 },
+                Call::CommitMtp {
+                    anchor: MtpCommitAnchor::IncludeAnchor,
+                    k: 0,
+                },
+                Call::Rollback {
+                    accepted: 0,
+                    depth: 3,
+                },
+                Call::RestoreAndReplayMain { accepted: 1 },
+            ],
+            "dense all-reject: drafts → snapshot → verify → commit → rollback → replay(anchor only)"
         );
     }
 
