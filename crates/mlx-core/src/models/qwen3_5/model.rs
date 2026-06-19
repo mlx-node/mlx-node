@@ -2716,10 +2716,6 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            let embedding_weight = self.embedding.get_weight();
-            let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-            let config = self.config.clone();
-
             // Prompt-tail ids + position base for the committed-history seed.
             // `prompt_hidden` is only `Some` when `want_prompt_hidden` held,
             // which already requires `cached_prefix_len == 0` (=> position_base
@@ -2732,479 +2728,41 @@ impl Qwen35Inner {
                 tokens[start..].to_vec()
             };
 
-            {
-                let inner_cell = std::cell::RefCell::new(&mut *self);
-                let adapter_cell = std::rc::Rc::new(std::cell::RefCell::new(
-                    inner_cell
-                        .borrow_mut()
-                        .paged_adapter
-                        .take()
-                        .ok_or_else(|| {
-                            Error::from_reason(
-                                "paged_turn_sync_core_inner: paged_adapter dropped before eager \
-                                 MTP gate",
-                            )
-                        })?,
-                ));
-                let adapter_fwd = std::rc::Rc::clone(&adapter_cell);
-                let adapter_verify = std::rc::Rc::clone(&adapter_cell);
-                let adapter_rollback = std::rc::Rc::clone(&adapter_cell);
-                let adapter_rollback_unemitted = std::rc::Rc::clone(&adapter_cell);
+            let mut rng = rand::rng();
 
-                let layer_kinds_ref = &layer_kinds;
-                let emb_t_ref: Option<&MxArray> = Some(&embedding_weight_t);
-                let emb_capture: &MxArray = &embedding_weight;
-
-                // Persistent drafter cache (committed-history v2) + cursor.
-                let mtp_caches_cell =
-                    std::cell::RefCell::new(Qwen3_5MTPModule::fresh_caches(&config));
-                let committed_len = std::cell::Cell::new(0i32);
-                let use_committed = prompt_hidden_position_base == 0;
-
-                // Pre-verify snapshot of the FLAT GDN Linear caches +
-                // tape recorded by verify, consumed by rollback. The
-                // full-attention slots in `self.caches` are unused on the
-                // paged path (the adapter owns K/V); their snapshot is
-                // harmless and the rollback skips them in favour of
-                // `adapter.rollback_last_tokens`.
-                let snap_cell: std::cell::RefCell<
-                    Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-                > = std::cell::RefCell::new(None);
-                let tape_cell: std::cell::RefCell<
-                    Vec<Option<super::gated_delta_net::GdnLayerTape>>,
-                > = std::cell::RefCell::new(Vec::new());
-                let replay_err_cell: std::cell::RefCell<Option<Error>> =
-                    std::cell::RefCell::new(None);
-
-                let mut rng = rand::rng();
-
-                let mut mtp_ops = mtp_decode::MtpOps {
-                    // Step A: eager [1,1] paged forward (full-attn via adapter,
-                    // GDN flat) + final-norm + project. Returns hidden squeezed
-                    // to `[1, hidden]` (`needs_squeeze = true`) and logits
-                    // `[1, 1, vocab]`, matching the eager-flat contract.
-                    forward_with_hidden: |ids: &MxArray,
-                                          emb: &MxArray|
-                     -> Result<(MxArray, MxArray, bool)> {
-                        ids.eval();
-                        let token_id = ids.item_at_int32(0)? as u32;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP forward_with_hidden: caches is None",
-                            )
-                        })?;
-                        let mut adapter = adapter_fwd.borrow_mut();
-                        let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
-                            token_id,
-                            &inner.embedding,
-                            &mut inner.layers,
-                            caches,
-                            &inner.final_norm,
-                            &inner.lm_head,
-                            emb,
-                            emb_t_ref,
-                            layer_kinds_ref,
-                            &mut adapter,
-                        )?;
-                        Ok((logits, hidden, true))
-                    },
-                    // Drafter — identical to the flat eager arm (paged-agnostic).
-                    draft_step: |prev_hidden: &MxArray,
-                                 prev_emb: &MxArray|
-                     -> Result<(MxArray, MxArray)> {
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mut mtp_caches = mtp_caches_cell.borrow_mut();
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP draft_step: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let h_next = mtp.forward(prev_hidden, prev_emb, Some(&mut mtp_caches))?;
-                        let dl3 = project_logits_from_hidden(
-                            &h_next,
-                            &inner.lm_head,
-                            emb_capture,
-                            emb_t_ref,
-                        )?;
-                        let draft_logits = dl3.squeeze(Some(&[1]))?;
-                        Ok((h_next, draft_logits))
-                    },
-                    // Batched verify: eager [1, K+1] paged forward recording the
-                    // GDN tape. Slice `ids` to `depth+1` (the macro hands
-                    // exactly that, but slice defensively so the adapter records
-                    // exactly K+1 tokens — the rollback count depends on it).
-                    verify_step: |ids: &MxArray,
-                                  emb: &MxArray,
-                                  depth: usize|
-                     -> Result<mtp_decode::MtpVerifyOutput> {
-                        let id_window = ids.to_int32().map_err(|e| {
-                            Error::from_reason(format!(
-                                "eager paged MTP verify_step: ids to_int32: {}",
-                                e.reason
-                            ))
-                        })?;
-                        if id_window.len() < depth + 1 {
-                            return Err(Error::from_reason(format!(
-                                "eager paged MTP verify_step: ids has {} elements, need {}",
-                                id_window.len(),
-                                depth + 1
-                            )));
-                        }
-                        let id_slice: Vec<i32> =
-                            id_window.iter().take(depth + 1).copied().collect();
-                        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason("eager paged MTP verify_step: caches is None")
-                        })?;
-                        let mut tape = tape_cell.borrow_mut();
-                        let mut adapter = adapter_verify.borrow_mut();
-                        super::paged_forward::run_paged_verify_step(
-                            &verify_in,
-                            &inner.embedding,
-                            &mut inner.layers,
-                            caches,
-                            &inner.final_norm,
-                            &inner.lm_head,
-                            emb,
-                            emb_t_ref,
-                            layer_kinds_ref,
-                            &mut adapter,
-                            &mut tape,
-                        )
-                    },
-                    verify_step_argmax_only: None,
-                    verify_step_sparse: None,
-                    // Rollback: GDN linear state via the shared tape replay
-                    // (IDENTICAL to flat) + full-attention paged K/V via
-                    // `adapter.rollback_last_tokens(rejected)`. `accepted_steps
-                    // = accepted_drafts + 1`; the verify advanced the adapter by
-                    // `depth + 1`, so `rejected = depth - accepted_drafts`.
-                    rollback: |accepted_drafts: usize, depth: usize| {
-                        if replay_err_cell.borrow().is_some() {
-                            return;
-                        }
-                        // Rewind the full-attention paged K/V first (independent
-                        // of the GDN tape replay). On full accept rejected == 0
-                        // (no-op).
-                        let rejected = depth.saturating_sub(accepted_drafts);
-                        if rejected > 0
-                            && let Ok(mut adapter) = adapter_rollback.try_borrow_mut()
-                            && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-                        {
-                            tracing::warn!(
-                                target: "mlx_core::qwen3_5::paged",
-                                "eager MTP-paged rollback_last_tokens({rejected}) failed \
-                                 (ignored): {e}",
-                            );
-                        }
-                        let accepted_steps = accepted_drafts + 1;
-                        let result: Result<()> = (|| {
-                            let snap_ref = snap_cell.borrow();
-                            let snap = match snap_ref.as_ref() {
-                                Some(Ok(s)) => s,
-                                Some(Err(e)) => {
-                                    return Err(Error::from_reason(format!(
-                                        "eager paged MTP rollback: snapshot failed: {}",
-                                        e.reason
-                                    )));
-                                }
-                                None => {
-                                    return Err(Error::from_reason(
-                                        "eager paged MTP rollback: snapshot missing \
-                                         (snapshot_main_linear did not run)",
-                                    ));
-                                }
-                            };
-                            let tape = tape_cell.borrow();
-                            let mut inner = inner_cell.borrow_mut();
-                            let inner = &mut **inner;
-                            let caches = inner.caches.as_mut().ok_or_else(|| {
-                                Error::from_reason("eager paged MTP rollback: inner.caches is None")
-                            })?;
-                            if caches.len() != snap.len() || caches.len() != tape.len() {
-                                return Err(Error::from_reason(format!(
-                                    "eager paged MTP rollback: length mismatch (caches {}, \
-                                     snapshot {}, tape {})",
-                                    caches.len(),
-                                    snap.len(),
-                                    tape.len(),
-                                )));
-                            }
-                            for (idx, cache) in caches.iter_mut().enumerate() {
-                                let Some(layer_tape) = tape[idx].as_ref() else {
-                                    // Full-attention layer: K/V lives in the
-                                    // paged pool and was already rewound by
-                                    // `adapter.rollback_last_tokens` above. The
-                                    // `self.caches` FullAttention slot is unused
-                                    // on the paged path, so skip it.
-                                    continue;
-                                };
-                                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                                    Error::from_reason(format!(
-                                        "eager paged MTP rollback: layer {idx} has a GDN tape but \
-                                         its cache slot is not Linear",
-                                    ))
-                                })?;
-                                let (snap_conv, snap_rec) = match &snap[idx] {
-                                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                                        conv_state,
-                                        recurrent_state,
-                                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                        ..
-                                    } => {
-                                        return Err(Error::from_reason(format!(
-                                            "eager paged MTP rollback: layer {idx} GDN tape but \
-                                             FullAttention snapshot",
-                                        )));
-                                    }
-                                };
-                                let window = layer_tape.kernel.window_len()? as usize;
-                                if accepted_steps > window {
-                                    return Err(Error::from_reason(format!(
-                                        "eager paged MTP rollback: accepted_steps {accepted_steps} \
-                                         exceeds recorded window {window} at layer {idx}",
-                                    )));
-                                }
-                                layer_tape.replay_into(
-                                    arrays,
-                                    snap_conv,
-                                    snap_rec,
-                                    accepted_steps,
-                                )?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = result {
-                            *replay_err_cell.borrow_mut() = Some(e);
-                        }
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        let inner = inner_cell.borrow();
-                        async_eval_layer_caches(&inner.caches);
-                        token.eval();
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                        let inner = inner_cell.borrow();
-                        async_eval_layer_caches(&inner.caches);
-                        MxArray::async_eval_arrays(&[token, chained_hidden]);
-                    },
-                    // Re-anchor the persistent drafter cache (committed-history
-                    // v2) — identical to the flat eager arm.
-                    begin_cycle: |chained_anchor: bool| {
-                        if !use_committed {
-                            *mtp_caches_cell.borrow_mut() = Qwen3_5MTPModule::fresh_caches(&config);
-                            return;
-                        }
-                        let target = if chained_anchor {
-                            (committed_len.get() - 1).max(0)
-                        } else {
-                            committed_len.get()
-                        };
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        for c in caches.iter_mut() {
-                            if let Some(kv) = c.as_kv_cache_mut() {
-                                kv.trim(target);
-                            }
-                        }
-                    },
-                    // Snapshot the FLAT GDN/full-attn caches before verify
-                    // mutates them. (Only the GDN Linear slots are consumed by
-                    // the rollback; the full-attn slots are unused on paging.)
-                    snapshot_main_linear: || {
-                        let inner = inner_cell.borrow();
-                        let snap = match inner.caches.as_ref() {
-                            Some(caches) => super::layer_cache::snapshot_all(caches),
-                            None => Err(Error::from_reason(
-                                "eager paged MTP snapshot_main_linear: inner.caches is None",
-                            )),
-                        };
-                        *snap_cell.borrow_mut() = Some(snap);
-                    },
-                    // On rejection the GDN tape replay in `rollback` already
-                    // reconstructed the AR-exact GDN state and
-                    // `rollback_last_tokens` rewound the paged K/V. This closure
-                    // surfaces a stashed replay error and clears the per-cycle
-                    // snapshot + tape.
-                    restore_and_replay_main: |_accepted_drafts: &[u32],
-                                              _emb: &MxArray|
-                     -> Result<()> {
-                        *snap_cell.borrow_mut() = None;
-                        tape_cell.borrow_mut().clear();
-                        if let Some(e) = replay_err_cell.borrow_mut().take() {
-                            return Err(e);
-                        }
-                        Ok(())
-                    },
-                    // Committed-history commit — identical to the flat eager arm.
-                    commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
-                                 seed_hidden: &MxArray,
-                                 verify_hiddens: &MxArray,
-                                 committed_ids: &[u32],
-                                 _k_accepted: usize,
-                                 emb: &MxArray|
-                     -> Result<()> {
-                        if !use_committed {
-                            return Ok(());
-                        }
-                        let m = committed_ids.len();
-                        if m == 0 {
-                            return Ok(());
-                        }
-                        let hidden_dim = verify_hiddens.shape_at(2)?;
-                        let hidden_seq = match anchor {
-                            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
-                                let vh_prefix = verify_hiddens
-                                    .slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-                                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
-                            }
-                            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
-                            }
-                        };
-                        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-                        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-                        let gathered = emb.take(&ids_arr, 0)?;
-                        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP commit_mtp: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        for c in caches.iter_mut() {
-                            if let Some(kv) = c.as_kv_cache_mut() {
-                                kv.trim(committed_len.get());
-                            }
-                        }
-                        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                        committed_len.set(committed_len.get() + m as i32);
-                        Ok(())
-                    },
-                    committed_history_active: use_committed,
-                    rollback_unemitted: |unemitted: usize| {
-                        if let Ok(mut adapter) = adapter_rollback_unemitted.try_borrow_mut()
-                            && let Err(e) = adapter.rollback_last_tokens(unemitted as u32)
-                        {
-                            tracing::warn!(
-                                target: "mlx_core::qwen3_5::paged",
-                                "eager MTP-paged rollback_unemitted({unemitted}) failed \
-                                 (ignored): {e}",
-                            );
-                        }
-                    },
-                };
-
-                // Prompt-prefix seed (committed-history v2 only). Mirror the
-                // flat eager arm: commit `[prompt_hidden_ids[1..], y]` into the
-                // persistent drafter cache so the drafter attends the prompt
-                // from cycle 1.
-                if use_committed
-                    && let Some(ph) = prompt_hidden.as_ref()
-                    && !prompt_hidden_ids.is_empty()
-                {
-                    let prompt_len = prompt_hidden_ids.len();
-                    let hidden_dim = ph.shape_at(2)?;
-                    let hidden_len = ph.shape_at(1)? as usize;
-                    if hidden_len != prompt_len {
-                        return Err(Error::from_reason(format!(
-                            "eager paged MTP prompt-seed: prompt_hidden length {hidden_len} \
-                             does not match prompt_hidden_ids length {prompt_len}"
-                        )));
-                    }
-                    y.eval();
-                    let y_id = y.item_at_int32(0)? as u32;
-                    let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
-                    committed_ids
-                        .extend(prompt_hidden_ids[1..prompt_len].iter().map(|&v| v as i32));
-                    committed_ids.push(y_id as i32);
-
-                    let chunk_sizes = partition_prefill_chunks(prompt_len);
-                    let mut cursor: usize = 0;
-                    for &chunk in &chunk_sizes {
-                        let chunk_i64 = chunk as i64;
-                        let start = cursor as i64;
-                        let hidden_seq =
-                            ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-                        let ids_arr = MxArray::from_int32(
-                            &committed_ids[cursor..cursor + chunk],
-                            &[chunk_i64],
-                        )?;
-                        let gathered = embedding_weight.take(&ids_arr, 0)?;
-                        let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP prompt-seed: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                        committed_len.set(committed_len.get() + chunk as i32);
-                        cursor += chunk;
-                    }
-                }
-
-                // The paged turn commits cache state through its own
-                // paged-history save (not the `save_cache_state*` helpers),
-                // so the macro's trailing-token signal is unused here.
-                let mut last_in_cache = true;
-                mtp_decode::decode_loop_mtp!(
-                    mtp_ops: mtp_ops,
-                    mtp_depth: p.mtp_depth,
-                    mtp_rng: rng,
-                    y: y,
-                    embedding_weight: embedding_weight.clone(),
+            // The propose/verify whole-turn loop is engine-owned
+            // (`run_mtp_turn`) and drives the `DenseMtpStepper` in its PAGED
+            // mode: `begin_mtp_decode` moves `self.paged_adapter` into the
+            // stepper for the turn, runs the committed-history prompt seed, and
+            // routes the Step-A / verify forwards through the adapter; the
+            // stepper's `Drop` restores the adapter into `self.paged_adapter`
+            // before this call returns, so the paged-history save below finds
+            // it. The paged path commits cache state through its own
+            // paged-history save, so `outcome.last_in_cache` is unused here.
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
                     params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    last_in_cache: last_in_cache,
-                    first_token_instant: *first_token_instant,
+                    reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant,
                     report_perf: p.report_performance,
-                    generation_stream: generation_stream
-                );
-                let _ = last_in_cache;
-
-                if let Some(e) = replay_err_cell.borrow_mut().take() {
-                    return Err(e);
-                }
-
-                // Drop `mtp_ops` (whose non-`move` closures borrow the
-                // `Rc<RefCell<adapter>>` clones) and the clone bindings
-                // themselves so the sole remaining strong ref is `adapter_cell`,
-                // then move the adapter back into `self` for the post-turn save
-                // path.
-                drop(mtp_ops);
-                drop(adapter_fwd);
-                drop(adapter_verify);
-                drop(adapter_rollback);
-                drop(adapter_rollback_unemitted);
-                let recovered = std::rc::Rc::try_unwrap(adapter_cell)
-                    .map_err(|_| {
-                        Error::from_reason("eager paged MTP: adapter still borrowed at turn end")
-                    })?
-                    .into_inner();
-                inner_cell.borrow_mut().paged_adapter = Some(recovered);
-            }
+                    generation_stream,
+                    prompt_hidden,
+                    prompt_hidden_ids: Some(prompt_hidden_ids),
+                    prompt_hidden_position_base,
+                },
+                None,
+            )?;
+            let _ = outcome.last_in_cache;
 
             // `self.caches` already holds the live GDN state (the eager paged
             // forwards wrote it directly) — no compiled cache export needed.
@@ -3727,10 +3285,6 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            let embedding_weight = self.embedding.get_weight();
-            let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
-            let config = self.config.clone();
-
             let prompt_hidden_position_base = mtp_prompt_history.position_base;
             let prompt_hidden_ids: Vec<u32> = {
                 let start = mtp_prompt_history
@@ -3739,447 +3293,51 @@ impl Qwen35Inner {
                 tokens[start..].to_vec()
             };
 
-            {
-                let inner_cell = std::cell::RefCell::new(&mut *self);
-                let adapter_cell = std::rc::Rc::new(std::cell::RefCell::new(
-                    inner_cell
-                        .borrow_mut()
-                        .paged_adapter
-                        .take()
-                        .ok_or_else(|| {
-                            Error::from_reason(
-                                "paged_turn_stream_core_inner: paged_adapter dropped before eager \
-                                 MTP gate",
-                            )
-                        })?,
-                ));
-                let adapter_fwd = std::rc::Rc::clone(&adapter_cell);
-                let adapter_verify = std::rc::Rc::clone(&adapter_cell);
-                let adapter_rollback = std::rc::Rc::clone(&adapter_cell);
-                let adapter_rollback_unemitted = std::rc::Rc::clone(&adapter_cell);
+            let mut rng = rand::rng();
 
-                let layer_kinds_ref = &layer_kinds;
-                let emb_t_ref: Option<&MxArray> = Some(&embedding_weight_t);
-                let emb_capture: &MxArray = &embedding_weight;
+            // Streaming twin of the sync paged arm: the propose/verify whole-turn
+            // loop is engine-owned (`run_mtp_turn`) and drives the
+            // `DenseMtpStepper` in its PAGED mode. The streaming sink wires the
+            // shared incremental detokenizer + the default ChatML emitter so
+            // accepted tokens stream out `cb` per token; the stepper's `Drop`
+            // restores `self.paged_adapter` before this call returns (the
+            // paged-history save below relies on it). `outcome.last_in_cache` is
+            // unused (the paged-history save owns cache state).
+            let mut emitter = crate::engine::backend::DefaultStreamEmitter;
+            let streaming = crate::engine::decode::StreamingCtx {
+                callback: cb.0,
+                cancelled,
+                decode_stream,
+                tokenizer: tokenizer.inner(),
+                streamed_text_len,
+                last_is_reasoning,
+                emitter: &mut emitter,
+            };
 
-                let mtp_caches_cell =
-                    std::cell::RefCell::new(Qwen3_5MTPModule::fresh_caches(&config));
-                let committed_len = std::cell::Cell::new(0i32);
-                let use_committed = prompt_hidden_position_base == 0;
-
-                let snap_cell: std::cell::RefCell<
-                    Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-                > = std::cell::RefCell::new(None);
-                let tape_cell: std::cell::RefCell<
-                    Vec<Option<super::gated_delta_net::GdnLayerTape>>,
-                > = std::cell::RefCell::new(Vec::new());
-                let replay_err_cell: std::cell::RefCell<Option<Error>> =
-                    std::cell::RefCell::new(None);
-
-                let mut rng = rand::rng();
-
-                let mut mtp_ops = mtp_decode::MtpOps {
-                    forward_with_hidden: |ids: &MxArray,
-                                          emb: &MxArray|
-                     -> Result<(MxArray, MxArray, bool)> {
-                        ids.eval();
-                        let token_id = ids.item_at_int32(0)? as u32;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP (stream) forward_with_hidden: caches is None",
-                            )
-                        })?;
-                        let mut adapter = adapter_fwd.borrow_mut();
-                        let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
-                            token_id,
-                            &inner.embedding,
-                            &mut inner.layers,
-                            caches,
-                            &inner.final_norm,
-                            &inner.lm_head,
-                            emb,
-                            emb_t_ref,
-                            layer_kinds_ref,
-                            &mut adapter,
-                        )?;
-                        Ok((logits, hidden, true))
-                    },
-                    draft_step: |prev_hidden: &MxArray,
-                                 prev_emb: &MxArray|
-                     -> Result<(MxArray, MxArray)> {
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mut mtp_caches = mtp_caches_cell.borrow_mut();
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP (stream) draft_step: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let h_next = mtp.forward(prev_hidden, prev_emb, Some(&mut mtp_caches))?;
-                        let dl3 = project_logits_from_hidden(
-                            &h_next,
-                            &inner.lm_head,
-                            emb_capture,
-                            emb_t_ref,
-                        )?;
-                        let draft_logits = dl3.squeeze(Some(&[1]))?;
-                        Ok((h_next, draft_logits))
-                    },
-                    verify_step: |ids: &MxArray,
-                                  emb: &MxArray,
-                                  depth: usize|
-                     -> Result<mtp_decode::MtpVerifyOutput> {
-                        let id_window = ids.to_int32().map_err(|e| {
-                            Error::from_reason(format!(
-                                "eager paged MTP (stream) verify_step: ids to_int32: {}",
-                                e.reason
-                            ))
-                        })?;
-                        if id_window.len() < depth + 1 {
-                            return Err(Error::from_reason(format!(
-                                "eager paged MTP (stream) verify_step: ids has {} elements, \
-                                 need {}",
-                                id_window.len(),
-                                depth + 1
-                            )));
-                        }
-                        let id_slice: Vec<i32> =
-                            id_window.iter().take(depth + 1).copied().collect();
-                        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let caches = inner.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP (stream) verify_step: caches is None",
-                            )
-                        })?;
-                        let mut tape = tape_cell.borrow_mut();
-                        let mut adapter = adapter_verify.borrow_mut();
-                        super::paged_forward::run_paged_verify_step(
-                            &verify_in,
-                            &inner.embedding,
-                            &mut inner.layers,
-                            caches,
-                            &inner.final_norm,
-                            &inner.lm_head,
-                            emb,
-                            emb_t_ref,
-                            layer_kinds_ref,
-                            &mut adapter,
-                            &mut tape,
-                        )
-                    },
-                    verify_step_argmax_only: None,
-                    verify_step_sparse: None,
-                    rollback: |accepted_drafts: usize, depth: usize| {
-                        if replay_err_cell.borrow().is_some() {
-                            return;
-                        }
-                        let rejected = depth.saturating_sub(accepted_drafts);
-                        if rejected > 0
-                            && let Ok(mut adapter) = adapter_rollback.try_borrow_mut()
-                            && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-                        {
-                            tracing::warn!(
-                                target: "mlx_core::qwen3_5::paged",
-                                "eager MTP-paged (stream) rollback_last_tokens({rejected}) failed \
-                                 (ignored): {e}",
-                            );
-                        }
-                        let accepted_steps = accepted_drafts + 1;
-                        let result: Result<()> = (|| {
-                            let snap_ref = snap_cell.borrow();
-                            let snap = match snap_ref.as_ref() {
-                                Some(Ok(s)) => s,
-                                Some(Err(e)) => {
-                                    return Err(Error::from_reason(format!(
-                                        "eager paged MTP (stream) rollback: snapshot failed: {}",
-                                        e.reason
-                                    )));
-                                }
-                                None => {
-                                    return Err(Error::from_reason(
-                                        "eager paged MTP (stream) rollback: snapshot missing \
-                                         (snapshot_main_linear did not run)",
-                                    ));
-                                }
-                            };
-                            let tape = tape_cell.borrow();
-                            let mut inner = inner_cell.borrow_mut();
-                            let inner = &mut **inner;
-                            let caches = inner.caches.as_mut().ok_or_else(|| {
-                                Error::from_reason(
-                                    "eager paged MTP (stream) rollback: inner.caches is None",
-                                )
-                            })?;
-                            if caches.len() != snap.len() || caches.len() != tape.len() {
-                                return Err(Error::from_reason(format!(
-                                    "eager paged MTP (stream) rollback: length mismatch (caches \
-                                     {}, snapshot {}, tape {})",
-                                    caches.len(),
-                                    snap.len(),
-                                    tape.len(),
-                                )));
-                            }
-                            for (idx, cache) in caches.iter_mut().enumerate() {
-                                let Some(layer_tape) = tape[idx].as_ref() else {
-                                    continue;
-                                };
-                                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                                    Error::from_reason(format!(
-                                        "eager paged MTP (stream) rollback: layer {idx} has a GDN \
-                                         tape but its cache slot is not Linear",
-                                    ))
-                                })?;
-                                let (snap_conv, snap_rec) = match &snap[idx] {
-                                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                                        conv_state,
-                                        recurrent_state,
-                                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention {
-                                        ..
-                                    } => {
-                                        return Err(Error::from_reason(format!(
-                                            "eager paged MTP (stream) rollback: layer {idx} GDN \
-                                             tape but FullAttention snapshot",
-                                        )));
-                                    }
-                                };
-                                let window = layer_tape.kernel.window_len()? as usize;
-                                if accepted_steps > window {
-                                    return Err(Error::from_reason(format!(
-                                        "eager paged MTP (stream) rollback: accepted_steps \
-                                         {accepted_steps} exceeds recorded window {window} at \
-                                         layer {idx}",
-                                    )));
-                                }
-                                layer_tape.replay_into(
-                                    arrays,
-                                    snap_conv,
-                                    snap_rec,
-                                    accepted_steps,
-                                )?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = result {
-                            *replay_err_cell.borrow_mut() = Some(e);
-                        }
-                    },
-                    eval_step: |token: &MxArray, logits: &MxArray, budget_forced: bool| {
-                        let inner = inner_cell.borrow();
-                        async_eval_layer_caches(&inner.caches);
-                        token.eval();
-                        if budget_forced {
-                            logits.eval();
-                        }
-                    },
-                    eval_step_with_chained_hidden: |token: &MxArray, chained_hidden: &MxArray| {
-                        let inner = inner_cell.borrow();
-                        async_eval_layer_caches(&inner.caches);
-                        MxArray::async_eval_arrays(&[token, chained_hidden]);
-                    },
-                    begin_cycle: |chained_anchor: bool| {
-                        if !use_committed {
-                            *mtp_caches_cell.borrow_mut() = Qwen3_5MTPModule::fresh_caches(&config);
-                            return;
-                        }
-                        let target = if chained_anchor {
-                            (committed_len.get() - 1).max(0)
-                        } else {
-                            committed_len.get()
-                        };
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        for c in caches.iter_mut() {
-                            if let Some(kv) = c.as_kv_cache_mut() {
-                                kv.trim(target);
-                            }
-                        }
-                    },
-                    snapshot_main_linear: || {
-                        let inner = inner_cell.borrow();
-                        let snap = match inner.caches.as_ref() {
-                            Some(caches) => super::layer_cache::snapshot_all(caches),
-                            None => Err(Error::from_reason(
-                                "eager paged MTP (stream) snapshot_main_linear: inner.caches is \
-                                 None",
-                            )),
-                        };
-                        *snap_cell.borrow_mut() = Some(snap);
-                    },
-                    restore_and_replay_main: |_accepted_drafts: &[u32],
-                                              _emb: &MxArray|
-                     -> Result<()> {
-                        *snap_cell.borrow_mut() = None;
-                        tape_cell.borrow_mut().clear();
-                        if let Some(e) = replay_err_cell.borrow_mut().take() {
-                            return Err(e);
-                        }
-                        Ok(())
-                    },
-                    commit_mtp: |anchor: mtp_decode::MtpCommitAnchor,
-                                 seed_hidden: &MxArray,
-                                 verify_hiddens: &MxArray,
-                                 committed_ids: &[u32],
-                                 _k_accepted: usize,
-                                 emb: &MxArray|
-                     -> Result<()> {
-                        if !use_committed {
-                            return Ok(());
-                        }
-                        let m = committed_ids.len();
-                        if m == 0 {
-                            return Ok(());
-                        }
-                        let hidden_dim = verify_hiddens.shape_at(2)?;
-                        let hidden_seq = match anchor {
-                            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
-                                let vh_prefix = verify_hiddens
-                                    .slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-                                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
-                            }
-                            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
-                            }
-                        };
-                        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-                        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-                        let gathered = emb.take(&ids_arr, 0)?;
-                        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP (stream) commit_mtp: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        for c in caches.iter_mut() {
-                            if let Some(kv) = c.as_kv_cache_mut() {
-                                kv.trim(committed_len.get());
-                            }
-                        }
-                        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                        committed_len.set(committed_len.get() + m as i32);
-                        Ok(())
-                    },
-                    committed_history_active: use_committed,
-                    rollback_unemitted: |unemitted: usize| {
-                        if let Ok(mut adapter) = adapter_rollback_unemitted.try_borrow_mut()
-                            && let Err(e) = adapter.rollback_last_tokens(unemitted as u32)
-                        {
-                            tracing::warn!(
-                                target: "mlx_core::qwen3_5::paged",
-                                "eager MTP-paged (stream) rollback_unemitted({unemitted}) failed \
-                                 (ignored): {e}",
-                            );
-                        }
-                    },
-                };
-
-                if use_committed
-                    && let Some(ph) = prompt_hidden.as_ref()
-                    && !prompt_hidden_ids.is_empty()
-                {
-                    let prompt_len = prompt_hidden_ids.len();
-                    let hidden_dim = ph.shape_at(2)?;
-                    let hidden_len = ph.shape_at(1)? as usize;
-                    if hidden_len != prompt_len {
-                        return Err(Error::from_reason(format!(
-                            "eager paged MTP (stream) prompt-seed: prompt_hidden length \
-                             {hidden_len} does not match prompt_hidden_ids length {prompt_len}"
-                        )));
-                    }
-                    y.eval();
-                    let y_id = y.item_at_int32(0)? as u32;
-                    let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
-                    committed_ids
-                        .extend(prompt_hidden_ids[1..prompt_len].iter().map(|&v| v as i32));
-                    committed_ids.push(y_id as i32);
-
-                    let chunk_sizes = partition_prefill_chunks(prompt_len);
-                    let mut cursor: usize = 0;
-                    for &chunk in &chunk_sizes {
-                        let chunk_i64 = chunk as i64;
-                        let start = cursor as i64;
-                        let hidden_seq =
-                            ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-                        let ids_arr = MxArray::from_int32(
-                            &committed_ids[cursor..cursor + chunk],
-                            &[chunk_i64],
-                        )?;
-                        let gathered = embedding_weight.take(&ids_arr, 0)?;
-                        let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-                        let mut inner = inner_cell.borrow_mut();
-                        let inner = &mut **inner;
-                        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "eager paged MTP (stream) prompt-seed: inner.mtp is None despite \
-                                 has_mtp_weights() gate",
-                            )
-                        })?;
-                        let mut caches = mtp_caches_cell.borrow_mut();
-                        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(&mut caches))?;
-                        committed_len.set(committed_len.get() + chunk as i32);
-                        cursor += chunk;
-                    }
-                }
-
-                // The paged turn commits cache state through its own
-                // paged-history save (not the `save_cache_state*` helpers),
-                // so the macro's trailing-token signal is unused here.
-                let mut last_in_cache = true;
-                mtp_decode::decode_loop_mtp!(
-                    mtp_ops: mtp_ops,
-                    mtp_depth: p.mtp_depth,
-                    mtp_rng: rng,
-                    y: y,
-                    embedding_weight: embedding_weight.clone(),
+            let outcome = crate::engine::mtp_turn::run_mtp_turn(
+                self,
+                &mut rng,
+                crate::engine::mtp_turn::MtpTurnArgs {
+                    y: y.clone(),
+                    depth: p.mtp_depth,
                     params: p,
-                    reasoning_tracker: reasoning_tracker,
-                    profiler: profiler,
-                    max_new_tokens: max_new_tokens,
-                    eos_id: eos_id,
-                    generated_tokens: generated_tokens,
-                    token_history: token_history,
-                    finish_reason: finish_reason,
-                    last_in_cache: last_in_cache,
-                    first_token_instant: *first_token_instant,
+                    reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant,
                     report_perf: p.report_performance,
-                    generation_stream: generation_stream,
-                    streaming: {
-                        callback: cb,
-                        cancelled: cancelled,
-                        decode_stream: *decode_stream,
-                        tokenizer: *tokenizer,
-                        streamed_text_len: *streamed_text_len,
-                        last_is_reasoning: *last_is_reasoning
-                    }
-                );
-                let _ = last_in_cache;
-
-                if let Some(e) = replay_err_cell.borrow_mut().take() {
-                    return Err(e);
-                }
-
-                drop(mtp_ops);
-                drop(adapter_fwd);
-                drop(adapter_verify);
-                drop(adapter_rollback);
-                drop(adapter_rollback_unemitted);
-                let recovered = std::rc::Rc::try_unwrap(adapter_cell)
-                    .map_err(|_| {
-                        Error::from_reason(
-                            "eager paged MTP (stream): adapter still borrowed at turn end",
-                        )
-                    })?
-                    .into_inner();
-                inner_cell.borrow_mut().paged_adapter = Some(recovered);
-            }
+                    generation_stream,
+                    prompt_hidden,
+                    prompt_hidden_ids: Some(prompt_hidden_ids),
+                    prompt_hidden_position_base,
+                },
+                Some(streaming),
+            )?;
+            let _ = outcome.last_in_cache;
 
             return Ok((generated_tokens, finish_reason));
         }
@@ -7280,9 +6438,19 @@ impl DecodeStep for Qwen35Decode<'_> {
 /// sequentially and non-nested, so the interior mutability the closures needed
 /// to share `&mut self` is gone.
 ///
-/// FLAT path only (S2b). The struct is shaped so a `mode: Flat | Paged`
-/// adapter can be added at S4 without reshaping the fields; the paged arm is
-/// NOT implemented here.
+/// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
+/// [`MtpStepMode`]: the flat mode runs the eager pre-norm forwards against
+/// `inner.caches`; the paged mode routes the main Step-A / verify forwards
+/// through the captured [`PagedKVCacheAdapter`]
+/// ([`super::paged_forward::run_paged_step_with_hidden`] /
+/// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
+/// state stays FLAT in `inner.caches` Linear slots. Only four methods
+/// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
+/// branch on the mode; every other method is mode-identical (the drafter and
+/// the committed-history commit are paged-agnostic). The paged adapter is moved
+/// into the stepper at [`MtpBackend::begin_mtp_decode`] and restored into
+/// `inner.paged_adapter` by [`Drop`] so the post-turn paged-history save finds
+/// it, on EVERY exit path of `run_mtp_turn`.
 pub(crate) struct DenseMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch. == the closures'
@@ -7320,6 +6488,36 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Config clone for the per-cycle drafter cache reset/fresh build. == the
     /// closures' captured `config`.
     config: Qwen3_5Config,
+    /// Flat vs. paged main-forward routing. `Paged` owns the turn's
+    /// [`PagedKVCacheAdapter`] (moved in at `begin_mtp_decode`, restored into
+    /// `inner.paged_adapter` by [`Drop`]).
+    mode: MtpStepMode,
+    /// Per-layer attention/linear classification consumed by the paged
+    /// forwards. Empty on the flat path (unused there).
+    layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
+}
+
+/// Main-forward routing for [`DenseMtpStepper`]: `Flat` runs the eager
+/// pre-norm forwards against `inner.caches`; `Paged` routes full-attention
+/// K/V through the owned adapter while GDN state stays flat. The adapter is
+/// boxed so the unit `Flat` variant does not pad out to the adapter's size.
+enum MtpStepMode {
+    Flat,
+    Paged(Box<PagedKVCacheAdapter>),
+}
+
+impl Drop for DenseMtpStepper<'_> {
+    fn drop(&mut self) {
+        // Restore the paged adapter into the model so the post-turn
+        // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
+        // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
+        // path of `run_mtp_turn` — the `Ok` tail, the `take_replay_error`
+        // early return, and any mid-loop `?` propagation. Idempotent: the
+        // adapter is taken out of `mode` here, so a second drop is a no-op.
+        if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
+            self.inner.paged_adapter = Some(*adapter);
+        }
+    }
 }
 
 impl MtpStepper for DenseMtpStepper<'_> {
@@ -7347,13 +6545,42 @@ impl MtpStepper for DenseMtpStepper<'_> {
         ids: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray, bool)> {
-        let inner = &mut *self.inner;
-        let pre = forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
-        let h3 = inner.final_norm.forward(&pre)?;
-        let logits =
-            project_logits_from_hidden(&h3, &inner.lm_head, emb, Some(&self.embedding_weight_t))?;
-        let hidden = h3.squeeze(Some(&[1]))?;
-        Ok((logits, hidden, true))
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                let inner = &mut *self.inner;
+                let pre = forward_pre_norm_inner(ids, emb, &mut inner.layers, &mut inner.caches)?;
+                let h3 = inner.final_norm.forward(&pre)?;
+                let logits = project_logits_from_hidden(
+                    &h3,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                )?;
+                let hidden = h3.squeeze(Some(&[1]))?;
+                Ok((logits, hidden, true))
+            }
+            MtpStepMode::Paged(adapter) => {
+                ids.eval();
+                let token_id = ids.item_at_int32(0)? as u32;
+                let inner = &mut *self.inner;
+                let caches = inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
+                })?;
+                let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
+                    token_id,
+                    &inner.embedding,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    &self.layer_kinds,
+                    adapter,
+                )?;
+                Ok((logits, hidden, true))
+            }
+        }
     }
 
     // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
@@ -7391,19 +6618,60 @@ impl MtpStepper for DenseMtpStepper<'_> {
         emb: &MxArray,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let _ = depth;
-        let inner = &mut *self.inner;
-        let tape = &mut self.tape;
-        eager_verify_step(
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            ids,
-            emb,
-            Some(&self.embedding_weight_t),
-            Some(tape),
-        )
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                let _ = depth;
+                let inner = &mut *self.inner;
+                let tape = &mut self.tape;
+                eager_verify_step(
+                    &mut inner.layers,
+                    &mut inner.caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    ids,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    Some(tape),
+                )
+            }
+            MtpStepMode::Paged(adapter) => {
+                // Slice `ids` to exactly `depth+1` defensively so the adapter
+                // records exactly K+1 tokens — the rollback count depends on it.
+                let id_window = ids.to_int32().map_err(|e| {
+                    Error::from_reason(format!(
+                        "eager paged MTP verify_step: ids to_int32: {}",
+                        e.reason
+                    ))
+                })?;
+                if id_window.len() < depth + 1 {
+                    return Err(Error::from_reason(format!(
+                        "eager paged MTP verify_step: ids has {} elements, need {}",
+                        id_window.len(),
+                        depth + 1
+                    )));
+                }
+                let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+                let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+                let inner = &mut *self.inner;
+                let caches = inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("eager paged MTP verify_step: caches is None")
+                })?;
+                let tape = &mut self.tape;
+                super::paged_forward::run_paged_verify_step(
+                    &verify_in,
+                    &inner.embedding,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    emb,
+                    Some(&self.embedding_weight_t),
+                    &self.layer_kinds,
+                    adapter,
+                    tape,
+                )
+            }
+        }
     }
 
     // No native argmax-only / sparse verify on the eager path — the accept
@@ -7425,9 +6693,27 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // Pure-Rust GDN tape replay — the correctness keystone. Fires on BOTH
     // full and partial accept. Infallible signature: any error is stashed in
     // `self.replay_err` and surfaced later.
-    fn rollback(&mut self, accepted_drafts: usize, _depth: usize) {
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
         if self.replay_err.is_some() {
             return;
+        }
+        // Paged path rewinds the full-attention K/V (which lives in the paged
+        // pool, not `inner.caches`) by `rejected` tokens before the shared GDN
+        // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
+        // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
+        // inside the replay loop instead.
+        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        if let MtpStepMode::Paged(adapter) = &mut self.mode {
+            let rejected = depth.saturating_sub(accepted_drafts);
+            if rejected > 0
+                && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
+            {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    "eager MTP-paged rollback_last_tokens({rejected}) failed \
+                     (ignored): {e}",
+                );
+            }
         }
         let accepted_steps = accepted_drafts + 1;
         let result: Result<()> = (|| {
@@ -7463,6 +6749,14 @@ impl MtpStepper for DenseMtpStepper<'_> {
             }
             for (idx, cache) in caches.iter_mut().enumerate() {
                 let Some(layer_tape) = tape[idx].as_ref() else {
+                    if paged {
+                        // Full-attention layer on the paged path: K/V lives in
+                        // the paged pool and was already rewound by
+                        // `adapter.rollback_last_tokens` above. The
+                        // `inner.caches` FullAttention slot is unused on the
+                        // paged path, so skip it.
+                        continue;
+                    }
                     // Full-attention layer: rewind the offset to
                     // `snapshot_offset + accepted_steps` so the next forward
                     // overwrites the rejected drafts. No-op on full accept.
@@ -7643,8 +6937,23 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        if unemitted > 0 {
-            self.mtp_desynced = true;
+        match &mut self.mode {
+            MtpStepMode::Flat => {
+                if unemitted > 0 {
+                    self.mtp_desynced = true;
+                }
+            }
+            MtpStepMode::Paged(adapter) => {
+                // Truncate the live paged adapter by the accepted-but-unemitted
+                // tokens; the paged path never sets the FLAT desync latch.
+                if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
+                    tracing::warn!(
+                        target: "mlx_core::qwen3_5::paged",
+                        "eager MTP-paged rollback_unemitted({unemitted}) failed \
+                         (ignored): {e}",
+                    );
+                }
+            }
         }
     }
 
@@ -7653,7 +6962,15 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn into_desynced(self) -> bool {
-        self.mtp_desynced
+        // Paged truncates its adapter in `rollback_unemitted` and never touches
+        // the FLAT desync latch, so it always reports `false`. The adapter is
+        // restored into `inner.paged_adapter` by the `Drop` impl that runs as
+        // `self` falls out of scope here. (`self` is consumed by value rather
+        // than destructured because the `Drop` impl forbids moving fields out.)
+        match self.mode {
+            MtpStepMode::Flat => self.mtp_desynced,
+            MtpStepMode::Paged(_) => false,
+        }
     }
 }
 
@@ -7677,6 +6994,21 @@ impl MtpBackend for Qwen35Inner {
         // (`position_base != 0`) fall back to v1 cycle-history.
         let use_committed = setup.prompt_hidden_position_base == 0;
 
+        // Auto-select the main-forward routing: the paged cores leave a paged
+        // adapter on `self`, so `take()` moves it into the stepper for the turn
+        // (restored by `Drop`); the flat cores have none and run flat. The
+        // paged forwards need the per-layer kind classification (unused flat).
+        let (mode, layer_kinds) = match self.paged_adapter.take() {
+            Some(adapter) => {
+                let layer_kinds = super::decoder_layer::compute_layer_kinds(
+                    self.config.num_layers as usize,
+                    |i| self.config.is_linear_layer(i),
+                );
+                (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
+            }
+            None => (MtpStepMode::Flat, Vec::new()),
+        };
+
         let mut stepper = DenseMtpStepper {
             inner: self,
             mtp_caches: Qwen3_5MTPModule::fresh_caches(&config),
@@ -7689,6 +7021,8 @@ impl MtpBackend for Qwen35Inner {
             embedding_weight,
             embedding_weight_t,
             config,
+            mode,
+            layer_kinds,
         };
 
         // Prompt-prefix seed (v2 committed-history only). Mirror the compiled
