@@ -385,10 +385,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor>(
   // etc.) win. `Omit<…, keyof SessionCapableModel>` drops the native
   // callback-style chat methods so the re-added `SessionCapableModel`
   // generator signatures take precedence.
-  new (...args: never[]): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
-  load(
-    modelPath: string,
-  ): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+  //
+  // `ConstructorParameters<C>` (not `never[]`) keeps each native config
+  // constructor — e.g. `new Gemma4Model(config)` / `new QianfanOCRModel(config)`
+  // — visible on the generated wrapper for TypeScript consumers.
+  new (...args: ConstructorParameters<C>): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
+  load(modelPath: string): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
 } {
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
@@ -489,10 +491,8 @@ export function makeStreamingModel<C extends NativeStreamingCtor>(
   }
 
   return StreamingModelImpl as unknown as {
-    new (...args: never[]): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
-    load(
-      modelPath: string,
-    ): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+    new (...args: ConstructorParameters<C>): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
+    load(modelPath: string): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
   };
 }
 
