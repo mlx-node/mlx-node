@@ -420,9 +420,15 @@ pub(crate) mod recipe {
                             };
                             if handle.is_null() {
                                 warn!("  Failed to dequantize vision weight: {}", weight_key);
-                                // Put originals back
+                                // Put originals back faithfully, including the
+                                // `.biases` sidecar removed above, so a failed
+                                // dequant preserves the complete source quant group
+                                // instead of writing an incomplete (corrupt) one.
                                 new_weights.insert(weight_key, w);
                                 new_weights.insert(scale_key.clone(), s);
+                                if let Some(b) = biases {
+                                    new_weights.insert(biases_key, b);
+                                }
                             } else {
                                 let dequant = MxArray::from_handle(handle, "vision_dequant")?;
                                 let dequant = dequant.astype(target_dtype)?;
