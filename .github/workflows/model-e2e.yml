@@ -17,7 +17,7 @@ name: Model E2E
 # Excluded families:
 #   * qwen3_5 MoE — smallest published checkpoint is 35B-A3B (~70GB); there is
 #     no small option, and it would not fit a standard macOS runner's RAM.
-#   * gemma4 uses `google/gemma-3n-E2B-it` (HF-gated; CI's HUGGINGFACE_TOKEN has
+#   * gemma4 uses `google/gemma-4-E2B-it` (HF-gated; CI's HUGGINGFACE_TOKEN has
 #     access). It is the heaviest leg; if it OOMs the 7GB standard runner, move
 #     just that leg to a larger `macos-*-xlarge` runner or convert it quantized.
 
@@ -126,8 +126,8 @@ jobs:
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
           - name: gemma4
-            model: google/gemma-3n-E2B-it
-            slug: gemma-3n-e2b
+            model: google/gemma-4-E2B-it
+            slug: gemma-4-e2b
             mtype: gemma4
             env: MLX_TEST_MODEL_PATH MLX_TEST_GEMMA4_MODEL_PATH
             tests: >-
