@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
@@ -15,14 +15,11 @@ use crate::engine::cmd::ChatCmd;
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
     ThinkingPolicy, build_chatml_continue_delta_text, build_synthetic_user_message,
-    kv_capacity_round_up,
 };
-use crate::models::qwen3_5::arrays_cache::ArraysCache;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
-use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Lfm2Config;
@@ -42,16 +39,6 @@ use super::layer_cache::Lfm2LayerCache;
 fn last_token_slice_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
-}
-
-/// Escape hatch for the quantized compiled decode path (flat + paged). Returns
-/// `true` (enabled) unless `MLX_LFM2_DISABLE_QUANT_COMPILED` is set, which forces
-/// quantized checkpoints back onto the eager decode path (the A/B baseline and a
-/// production escape hatch). Read once via `OnceLock` (process-global, NOT
-/// per-request) matching the `last_token_slice_enabled` house style.
-pub(crate) fn quant_compiled_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_QUANT_COMPILED").is_none())
 }
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -86,57 +73,6 @@ pub(crate) struct Lfm2Inner {
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
-    /// Unique non-zero id for the compiled C++ forward path.
-    /// Drawn from the shared `QWEN35_MODEL_ID_COUNTER` (see the assignment in
-    /// `Lfm2Inner::new`) so ids are globally unique across every model that
-    /// shares the compiled weight registry. Used by
-    /// [`Lfm2Inner::compiled_path_active`] to gate the (not-yet-enabled)
-    /// compiled path.
-    pub(crate) model_id: u64,
-    /// True iff EVERY registered floating weight is BFloat16 (with the sole
-    /// intentional exception of `*.expert_bias`, kept F32 on MoE checkpoints).
-    /// Computed once at load time over the full registered param map (see
-    /// `all_registered_float_weights_are_bf16` in `persistence.rs`) and consulted
-    /// by `<Lfm2Inner as PagedBackend>::begin_paged_decode` to gate
-    /// compiled-PAGED decode: the compiled-paged graph + paged KV pools are bf16-only
-    /// (`KvDtype::Bf16`, bf16 static mask), and the paged graph consumes far more
-    /// than q/k/v — operator/FFN/final norms, q/k norms, out_proj, conv
-    /// weights/biases, dense-MLP or MoE router/expert weights, and (untied)
-    /// lm_head — any of which, if non-bf16, would flow a non-bf16 hidden state /
-    /// q / k / v into the bf16-only `paged_kv_write`/`paged_attention`. A
-    /// load-time scan of the whole map is authoritative (it sees exactly what
-    /// the C++ `get_weight` reads) and matches the graph, not a hand-picked
-    /// subset. `false` until weights register (defaults safe: a model that
-    /// somehow reached decode unregistered falls back to eager paged).
-    pub(crate) all_float_weights_bf16: bool,
-    /// True iff this checkpoint is quantized (any `.scales`-suffixed tensor).
-    /// Computed once at load time (`persistence.rs`: `params.keys().any(.scales)`)
-    /// and set unconditionally after construction, so it is authoritative for ALL
-    /// checkpoints (independent of whether the compiled path registered).
-    /// `begin_paged_decode` consults it to switch the compiled-paged
-    /// bf16-only gate over to the `non_quant_floats_bf16` invariant — quantized
-    /// `.weight` tensors are uint32-packed, not bf16, so the all-float scan is
-    /// meaningless for them.
-    pub(crate) is_quantized: bool,
-    /// True iff every NON-quantized floating weight is BFloat16 — the
-    /// quantized-checkpoint analogue of `all_float_weights_bf16`. The packed
-    /// `.weight` tensors are uint32 (skipped); their float `.scales`/`.biases`
-    /// companions plus the unquantized dense floats (norms, conv biases, untied
-    /// lm_head, the dense bf16 embedding) must all be bf16 so the hidden state
-    /// feeding the bf16-only `paged_kv_write`/`paged_attention` stays bf16.
-    /// `false` until a quantized checkpoint registers; only meaningful then.
-    pub(crate) non_quant_floats_bf16: bool,
-    /// True iff this model published its weights to the shared C++ registry
-    /// (`register_weights_with_cpp` reached `mlx_set_model_id`), making it
-    /// compiled-capable and therefore eligible to create an entry in
-    /// `g_lfm2_slots()` on its first `activate`. Gates the whole `Drop` body:
-    /// an unregistered (native/eager) Inner never owns a slot, so it must NOT
-    /// touch the compiled-weights write lock on drop — taking it is what
-    /// deadlocks when an Inner is dropped on a thread already holding that
-    /// non-reentrant `RwLock.write()` (e.g. the load path's same-thread
-    /// re-register, or a test that holds the write lock and constructs native
-    /// Inners). `false` until the load path sets it after a successful publish.
-    pub(crate) compiled_slot_registered: bool,
     /// Sampling + stop-token defaults parsed from the checkpoint's
     /// `generation_config.json` at load time. Empty for checkpoints that
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
@@ -145,43 +81,6 @@ pub(crate) struct Lfm2Inner {
     /// `config.eos_token_id` is derived separately in `persistence.rs`;
     /// this carries the FULL eos list plus sampling defaults on top.
     gen_defaults: crate::engine::ModelGenerationDefaults,
-}
-
-impl Drop for Lfm2Inner {
-    fn drop(&mut self) {
-        // Release this model's lfm2 compiled slot so MLX reclaims the baked
-        // graph tapes its std::function tables hold (and `compile_erase`s the
-        // slot's per-epoch fun_ids).
-        //
-        // Gated on `compiled_slot_registered`: only a model that published its
-        // weights can ever have created a slot, so a native/eager Inner skips
-        // BOTH the lock and the erase. Skipping the lock is the deadlock fix —
-        // dropping an Inner while THIS thread already holds the non-reentrant
-        // compiled-weights write lock (load-path re-register, or a test holding
-        // it) would re-enter `RwLock.write()` and hang forever.
-        //
-        // When it IS registered, the erase runs under the compiled-weights
-        // write lock — the same lock model (re)registration takes — so erasing
-        // this entry is serialized against any concurrent turn on another model
-        // thread mutating the shared lfm2-slot map (std::unordered_map
-        // insert/erase are not concurrency safe even on distinct keys).
-        if self.compiled_slot_registered {
-            let _guard = crate::engine::compiled_lock::compiled_weights_write();
-            unsafe { mlx_sys::mlx_lfm2_slot_erase(self.model_id) };
-            // Also free this model's C++ weight slot. Registration populated
-            // `g_weight_slots()[model_id]` (a full second copy of every weight
-            // plus auto 2-D transposes and quant_info) via
-            // `mlx_clear_weights` + `mlx_store_weight`; the slot-erase above
-            // only reclaims the compiled-graph closures, NOT those arrays.
-            // Without this, sequential load/drop cycles (server model reload)
-            // leak each dropped model's weights until process exit.
-            // `mlx_clear_weights` empties the slot's maps in place, releasing
-            // the array refs + device buffers; it runs under the same write
-            // lock registration takes, so it is serialized against concurrent
-            // turns on other model threads.
-            unsafe { mlx_sys::mlx_clear_weights(self.model_id) };
-        }
-    }
 }
 
 /// Classification of the prefix-cache decision made from a
@@ -258,41 +157,13 @@ pub(crate) fn build_lfm2_tool_delta_text(content: &str, is_error: Option<bool>) 
     format!("\n<|im_start|>tool\n{rendered_content}<|im_end|>\n<|im_start|>assistant\n")
 }
 
-/// Paged decode stepper for lfm2 / lfm2_moe (compiled-paged hybrid — the
-/// paged analog of the FLAT [`Lfm2Decode`]). Drives
-/// [`crate::engine::decode::run_decode_loop`] through the generic
-/// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
-/// compiled C++ paged step when seeded, else the pure-Rust eager paged
-/// step. Created by `<Lfm2Inner as PagedBackend>::begin_paged_decode`
-/// (which armed the guards + seeded the C++ paged session), consumed
-/// across the whole decode loop, dropped at loop exit (the
-/// `Lfm2PagedResetGuard` resets the C++ paged globals on EVERY exit path).
+/// Paged decode stepper for lfm2 / lfm2_moe (the paged analog of the FLAT
+/// [`Lfm2Decode`]). Drives [`crate::engine::decode::run_decode_loop`] through
+/// the generic [`crate::engine::paged_turn::run_paged_turn`]: each `forward`
+/// runs the pure-Rust eager paged step. Created by
+/// `<Lfm2Inner as PagedBackend>::begin_paged_decode`.
 pub(crate) struct Lfm2PagedDecode<'a> {
-    // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION order, so
-    // these three guards MUST be listed reset-guard → weight-guard → lock so
-    // that `Lfm2PagedResetGuard::drop()` (→ `mlx_lfm2_paged_reset()`) runs
-    // WHILE the lifecycle mutex + weight read lock are STILL held. If the reset
-    // ran AFTER the lifecycle mutex released, another compiled-paged request
-    // could acquire the mutex and seed/use the shared process-global paged
-    // state in the window before this request's delayed reset cleared it →
-    // cross-request null forwards / decode corruption. Do NOT reorder these
-    // three fields.
-    //
-    // `inner: &'a mut` is declared AFTER the three guards. Fields drop in
-    // declaration order, so the guards drop (reset fires under the still-held
-    // locks) BEFORE the `&mut` borrow is conceptually released — correct. Do
-    // NOT move `inner` above the guards.
-    _paged_reset_guard: Option<Lfm2PagedResetGuard>,
-    _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
-    _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
     inner: &'a mut Lfm2Inner,
-    cpp_session_ready: bool,
-    cpp_compiled_step_completed: bool,
-    max_blocks_per_seq: u32,
-    /// Supplies the `step` arg the compiled-step body logs; the engine's
-    /// loop owns the real step index, this is a faithful local mirror that
-    /// `forward` bumps each call (only consulted in fall-back warn logs).
-    step_counter: i32,
 }
 
 impl Lfm2Inner {
@@ -423,32 +294,6 @@ impl Lfm2Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             paged_adapter,
-            // HARD INVARIANT (compiled-path gate correctness): the model id MUST
-            // come from the SINGLE shared counter, not a per-family one. The
-            // compiled C++ path keys ownership on one process-global atom
-            // (`g_active_model_id`) shared with qwen3.5 (dense + MoE); if lfm2
-            // drew from its own counter, an lfm2 id could equal a resident
-            // qwen3.5 id and the id-equality gate would false-positive,
-            // decoding the other family's weights → gibberish. Allocating from
-            // qwen3.5's counter makes every live id globally unique, so a
-            // non-match is a clean ownership eviction, never a collision. Any
-            // future compiled model sharing the registry MUST also draw from
-            // this counter.
-            model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
-                .fetch_add(1, Ordering::Relaxed),
-            // Safe default: not bf16-clean until the load path verifies the
-            // registered weights (set in `persistence.rs` alongside the C++
-            // weight registration). A non-match keeps compiled-PAGED OFF.
-            all_float_weights_bf16: false,
-            // Safe defaults: `Lfm2Inner::new` only sees `config` (no params/scales),
-            // so both are set post-construction in `persistence.rs` — `is_quantized`
-            // unconditionally, `non_quant_floats_bf16` only when a quantized
-            // checkpoint registers. Defaults keep the quantized compiled path OFF.
-            is_quantized: false,
-            non_quant_floats_bf16: false,
-            // Not compiled-capable until the load path publishes weights and
-            // sets this true; keeps Drop off the write lock for native Inners.
-            compiled_slot_registered: false,
             // Empty until the load path parses `generation_config.json`
             // (set via `set_gen_defaults` in `persistence.rs`).
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
@@ -467,48 +312,12 @@ impl Lfm2Inner {
         self.gen_defaults = defaults;
     }
 
-    /// Whether the compiled C++ forward path owns this model's weights and may
-    /// be taken for decode. The gate is per-model weight presence
-    /// (`mlx_lfm2_model_has_weights(self.model_id)`, which checks the shared
-    /// weight registry), so a SIBLING model loading does not demote this model
-    /// to the eager path — each model keeps its own compiled slot, and the gate
-    /// turns on/off only for its own weights.
-    ///
-    /// Weights are registered ONLY by `register_weights_with_cpp` (load time),
-    /// which is invoked for bf16/f16 checkpoints — DENSE or sparse-MoE, FLAT or
-    /// PAGED — AND for QUANTIZED checkpoints (authoritative per-projection
-    /// quant-info is published, so `linear_proj` / `lfm2_switch_linear` dispatch
-    /// correctly), gated by the `MLX_LFM2_DISABLE_QUANT_COMPILED` hatch + a dense
-    /// (non-packed) input embedding; see `should_register_compiled`. The single
-    /// registered weight map + per-model compiled slot serve BOTH the flat
-    /// (`lfm2_decode_fn`) and paged (`lfm2_decode_fn_paged`) compiled graphs; the
-    /// per-step dispatcher picks the right one, after `mlx_lfm2_activate_model`
-    /// has swapped this model's slot into the working register for the turn. The
-    /// gate is false until an lfm2 model registers its weights (and false again
-    /// once its own weights are cleared — but NOT when a sibling loads).
-    pub(crate) fn compiled_path_active(&self) -> bool {
-        unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) != 0 }
-    }
-
     /// Forward pass through the full model.
     ///
     /// Follows `lfm2.py:258-279` (Lfm2Model.__call__) + Model.__call__ (tied lm_head).
     ///
     /// Returns logits [B, T, vocab_size].
-    ///
-    /// `pub(crate)` so the persistence-module test
-    /// `production_compiled_decode_matches_native_with_conv_bias` can drive this
-    /// pure-native per-step forward as the parity REFERENCE for the production
-    /// compiled conv_bias=true decode path. Crate-internal only — no public/NAPI
-    /// surface change.
     pub(crate) fn forward(&mut self, input_ids: &MxArray) -> Result<MxArray> {
-        // PREFILL stays native. The compiled C++ decode path is wired ONLY into
-        // the single-token decode stepper (`Lfm2Decode`, built by
-        // `ChatBackend::begin_decode`; it seeds the
-        // compiled graph from the post-prefill caches this native forward
-        // builds, then drives `mlx_lfm2_moe_forward` per step). `forward()`
-        // never calls the compiled path.
-
         // 1. Token embeddings (no scaling)
         let mut h = self.embed_tokens.forward(input_ids)?;
 
@@ -585,83 +394,6 @@ impl Lfm2Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
-    }
-
-    /// Export the compiled C++ decode caches back into `self.caches`, then
-    /// MATERIALIZE the imported handles so subsequent native turns (or the
-    /// next compiled seed) read live buffers — NOT lazy graph nodes that the
-    /// `Lfm2CompiledResetGuard`'s `mlx_lfm2_moe_reset()` is about to free.
-    ///
-    /// Caller invariant: this must run BEFORE the reset guard drops, and the
-    /// export → import → eval must complete with no `?`-early-return between
-    /// the import and the eval (we collect every imported cache, install it,
-    /// then eval the whole set in one shot).
-    fn export_compiled_caches(&mut self) -> Result<()> {
-        let num_layers = self.config.num_hidden_layers as usize;
-        let mut export_ptrs: Vec<*mut mlx_sys::mlx_array> =
-            vec![std::ptr::null_mut(); num_layers * 2];
-        let exported = unsafe {
-            mlx_sys::mlx_lfm2_moe_export_caches(export_ptrs.as_mut_ptr(), (num_layers * 2) as i32)
-        };
-        if exported <= 0 {
-            // Nothing live to export (e.g. compiled init bailed). Leave the
-            // native caches from prefill in place; native is the source of
-            // truth in that case.
-            return Ok(());
-        }
-
-        let cache_offset = unsafe { mlx_sys::mlx_lfm2_moe_get_cache_offset() };
-
-        let mut new_caches: Vec<Lfm2LayerCache> = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            if self.config.is_attention_layer(i) {
-                let k_ptr = export_ptrs[i * 2];
-                let v_ptr = export_ptrs[i * 2 + 1];
-                if k_ptr.is_null() || v_ptr.is_null() {
-                    return Err(Error::from_reason(
-                        "lfm2 compiled cache export: null attn KV handle",
-                    ));
-                }
-                // `from_handle` wraps the heap-allocated handle (null-checked).
-                let keys = MxArray::from_handle(k_ptr, "lfm2 compiled export keys")?;
-                let values = MxArray::from_handle(v_ptr, "lfm2 compiled export values")?;
-                let mut kv = KVCache::new();
-                kv.set_keys(keys);
-                kv.set_values(values);
-                kv.set_offset(cache_offset);
-                new_caches.push(Lfm2LayerCache::Attention(kv));
-            } else {
-                let s_ptr = export_ptrs[i * 2];
-                if s_ptr.is_null() {
-                    return Err(Error::from_reason(
-                        "lfm2 compiled cache export: null conv state handle",
-                    ));
-                }
-                let state = MxArray::from_handle(s_ptr, "lfm2 compiled export conv state")?;
-                // slot.b (export_ptrs[i*2+1]) is the unused scalar placeholder —
-                // a freshly heap-allocated copy. Wrap + drop to release it so it
-                // doesn't leak (export hands back an owned heap handle).
-                let placeholder = export_ptrs[i * 2 + 1];
-                if !placeholder.is_null() {
-                    let _ =
-                        MxArray::from_handle(placeholder, "lfm2 compiled export conv placeholder");
-                }
-                let mut conv = ArraysCache::new(1);
-                conv.set(0, state);
-                new_caches.push(Lfm2LayerCache::Conv(conv));
-            }
-        }
-
-        // Materialize the freshly-imported handles BEFORE installing them as
-        // `self.caches`. If the eval fails, the `?` returns while
-        // `Lfm2CompiledResetGuard` still drops and frees the compiled globals
-        // — so we must NOT have already replaced `self.caches` with lazy
-        // handles that reference those soon-to-be-freed nodes. Keeping the old
-        // (last-safe-native) caches on failure lets a subsequent native turn
-        // fall back cleanly instead of feeding freed buffers to the GPU.
-        eval_lfm2_caches(&new_caches)?;
-        self.caches = new_caches;
-        Ok(())
     }
 
     /// Save cache state for reuse in the next chat-session continue call.
@@ -1037,96 +769,24 @@ impl Lfm2Inner {
     }
 }
 
-/// Eager/compiled flat decode stepper for one lfm2 turn (built by
-/// [`ChatBackend::begin_decode`]).
-///
-/// Each `forward` runs the compiled C++ step (`mlx_lfm2_moe_forward` +
-/// `mlx_lfm2_moe_eval_token_and_caches`) when the turn's seed engaged
-/// the compiled path, else the native [`Lfm2Inner::forward`]. The RAII
-/// guards captured here tear the compiled state down in-scope.
+/// Eager flat decode stepper for one lfm2 turn (built by
+/// [`ChatBackend::begin_decode`]). Each `forward` runs the native
+/// [`Lfm2Inner::forward`].
 pub(crate) struct Lfm2Decode<'a> {
-    // DROP ORDER IS LOAD-BEARING. Struct fields drop in DECLARATION
-    // order, so these three guards MUST be listed reset-guard →
-    // weight-guard → lock so that `Lfm2CompiledResetGuard::drop()`
-    // (→ `mlx_lfm2_moe_reset()`) runs WHILE the lifecycle mutex +
-    // weight read lock are STILL held.
-    _compiled_reset_guard: Option<Lfm2CompiledResetGuard>,
-    _weight_guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
-    _compiled_lock: Option<std::sync::MutexGuard<'static, ()>>,
     inner: &'a mut Lfm2Inner,
-    /// Tied dense embedding weight — captured only on the compiled path
-    /// (the eager forward reads `self.embed_tokens` itself).
-    embed_tokens_weight: Option<MxArray>,
-    use_compiled: bool,
-    /// `params.reuse_cache` captured at `begin_decode` — gates the
-    /// compiled-cache export in [`DecodeStep::end_decode`].
-    reuse_cache: bool,
 }
 
 impl DecodeStep for Lfm2Decode<'_> {
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
-        if self.use_compiled {
-            // Compiled path returns [B, vocab] (already 2D) — `false` ==
-            // no squeeze needed.
-            let emb = self.embed_tokens_weight.as_ref().ok_or_else(|| {
-                Error::from_reason("lfm2 compiled decode: missing embedding weight")
-            })?;
-            let mut out_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-            let mut off: i32 = 0;
-            unsafe {
-                mlx_sys::mlx_lfm2_moe_forward(
-                    input_ids.as_raw_ptr(),
-                    emb.as_raw_ptr(),
-                    &mut out_ptr,
-                    &mut off,
-                );
-            }
-            if out_ptr.is_null() {
-                return Err(Error::from_reason(
-                    "lfm2 compiled decode: mlx_lfm2_moe_forward returned null logits",
-                ));
-            }
-            Ok((
-                MxArray::from_handle(out_ptr, "lfm2 compiled decode logits")?,
-                false,
-            ))
-        } else {
-            // Eager native forward returns [1, 1, vocab]; `true` signals the
-            // caller to `squeeze(Some(&[1]))` down to [1, vocab].
-            Ok((self.inner.forward(input_ids)?, true))
-        }
+        // Eager native forward returns [1, 1, vocab]; `true` signals the
+        // caller to `squeeze(Some(&[1]))` down to [1, vocab].
+        Ok((self.inner.forward(input_ids)?, true))
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
         // lfm2 never force-evals the logits — not even on the
         // budget-forced path (the forced branch discards them lazily).
-        if self.use_compiled {
-            // Evaluating the token triggers the whole compiled graph
-            // (logits + caches via the dependency edges).
-            unsafe {
-                mlx_sys::mlx_lfm2_moe_eval_token_and_caches(next_token.as_raw_ptr());
-            }
-        } else {
-            MxArray::async_eval_arrays(&[next_token]);
-        }
-    }
-
-    fn end_decode(&mut self) -> Result<()> {
-        // TEARDOWN: when the compiled path ran and the caller wants to
-        // reuse the cache, export the C++ caches back into
-        // `inner.caches` and MATERIALIZE them BEFORE
-        // `Lfm2CompiledResetGuard` drops (which calls
-        // `mlx_lfm2_moe_reset()` and frees the compiled globals).
-        // Exported handles are lazy copies whose graph still references
-        // compiled nodes; without the eval inside
-        // `export_compiled_caches` the next turn would feed freed
-        // buffers to the GPU. Runs while the guards (fields above) are
-        // still held; an `Err` aborts the turn BEFORE
-        // `save_cache_state`, so the reset fires without a stale export.
-        if self.use_compiled && self.reuse_cache {
-            self.inner.export_compiled_caches()?;
-        }
-        Ok(())
+        MxArray::async_eval_arrays(&[next_token]);
     }
 }
 
@@ -1315,248 +975,8 @@ impl ChatBackend for Lfm2Inner {
     where
         Self: 'a;
 
-    fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        // lfm2's DELTA decode loop is ALWAYS eager: delta turns run the
-        // native forward unconditionally, with no compiled dispatch. Only
-        // fresh flat turns engage the compiled path below.
-        if turn.is_delta {
-            return Ok(Lfm2Decode {
-                _compiled_reset_guard: None,
-                _weight_guard: None,
-                _compiled_lock: None,
-                inner: self,
-                embed_tokens_weight: None,
-                use_compiled: false,
-                reuse_cache: turn.params.reuse_cache,
-            });
-        }
-
-        let max_new_tokens = turn.params.max_new_tokens;
-
-        // ===== Compiled C++ decode-path dispatch =====
-        // Serialize the compiled lifecycle across model instances on the SHARED
-        // cross-family mutex (the same instance qwen3.5 locks), then re-validate
-        // ownership under the weight RwLock read guard, held for the whole
-        // decode loop. Poison-recover both locks (a panicked prior holder must
-        // not wedge inference forever — banned `.unwrap()` on these paths).
-        //
-        // LOCK CONTRACT (compiled-closure lifecycle, mirrors the qwen3.5 dense
-        // path): registration is the WRITER — `register_weights_with_cpp` holds
-        // `COMPILED_WEIGHTS_RWLOCK.write()` and, in one critical section, clears
-        // + re-stores weights, bumps the compile epoch
-        // (`mlx_lfm2_invalidate_compiled`), then publishes the model id
-        // (`mlx_set_model_id`). Decode is the READER — the weight read guard
-        // (`.read()`, poison-recovered) below spans BOTH the
-        // `mlx_lfm2_model_has_weights()` re-check (+ the `activate` that selects
-        // this model's compiled slot) AND every subsequent `mlx_lfm2_moe_*`
-        // invocation this turn (the stepper holds it until it drops, after the
-        // decode loop and the post-loop cache export). So the
-        // (epoch, id) pair this read guard validates is exactly the one the
-        // compiled graph executes against — a registration cannot interleave
-        // between the re-check and the forwards. The C++ side additionally
-        // guards the epoch-check + recompile with its own `g_lfm2_compiled_mu`
-        // and returns the closure BY VALUE, so even a hypothetical caller that
-        // did NOT hold this read lock could not dangle its closure handle.
-        let use_compiled_pre = self.compiled_path_active();
-        let compiled_lock = if use_compiled_pre {
-            Some(
-                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut weight_guard = None;
-        // `mut` so the seed step below can drop back to native on any failure.
-        let mut use_compiled = if use_compiled_pre {
-            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            // Re-check this model's weight presence under the read lock — a
-            // concurrent reload/clear of THIS model could have dropped its
-            // weights between the probe and here (a sibling model loading does
-            // not, which is the per-model-slot coexistence fix).
-            if unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) } != 0 {
-                weight_guard = Some(guard);
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if use_compiled {
-            // Swap this model's compiled slot into the working register before
-            // arming the reset guard and the first compiled FFI
-            // (init_from_prefill / forward), parking any other model. The flat
-            // prefill above is eager pure-Rust (cache reads + the Rust-side
-            // embedding `get_weight`), so no C++ `get_weight` runs before this.
-            // Held under the caller's lifecycle lock for the lifetime of this
-            // call.
-            unsafe { mlx_sys::mlx_lfm2_activate_model(self.model_id) };
-        }
-
-        // Seed the compiled decode graph ONCE from the post-prefill caches.
-        // On any failure (init bailed, missing handle), drop back to native by
-        // clearing `use_compiled` for the loop. The distinct reset guard fires
-        // `mlx_lfm2_moe_reset()` on EVERY exit path (including `?`
-        // early-returns and a partial/failed seed) so no stale C++ state leaks.
-        let compiled_reset_guard = if use_compiled {
-            Some(Lfm2CompiledResetGuard)
-        } else {
-            None
-        };
-        let embed_tokens_weight = if use_compiled {
-            // Tied dense embedding only — lfm2 compiled checkpoints (dense OR
-            // MoE) are never packed-quantized on the compiled path (the gate
-            // excludes any packed input embedding, and bf16 lfm2 ships a dense
-            // embedding). `get_weight()` is infallible (returns MxArray, not
-            // Result).
-            Some(self.embed_tokens.get_weight())
-        } else {
-            None
-        };
-        if use_compiled {
-            let num_layers = self.config.num_hidden_layers as usize;
-
-            // CRITICAL: seed the compiled decode position from the LIVE
-            // attention KV offset, NOT the prompt length. The `KVCache`
-            // offset accumulates prefix + delta across every chunk and
-            // across reuse, so it is the true sequence position (this is
-            // why lfm2 deliberately ignores `turn.total_seq_len`). Seeding
-            // from a logits/prompt length would build the C++ causal mask
-            // and KV write index from a too-small offset, masking out valid
-            // prefix tokens and overwriting live slots. All attention layers
-            // must agree on the offset; if any disagrees (corrupt/partial
-            // cache), fall back to native rather than seed a wrong position.
-            let mut cache_offset: Option<i32> = None;
-            let mut offset_ok = true;
-            for cache in self.caches.iter() {
-                if let Lfm2LayerCache::Attention(kv) = cache {
-                    let off = kv.get_offset();
-                    match cache_offset {
-                        None => cache_offset = Some(off),
-                        Some(prev) if prev != off => {
-                            offset_ok = false;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let prefill_len = cache_offset.unwrap_or(0);
-            if !offset_ok || cache_offset.is_none() {
-                // No attention layer (impossible for a real lfm2 config — every
-                // shipping checkpoint interleaves ≥1 full_attention layer) or
-                // attention layers reporting inconsistent offsets (corrupt /
-                // partial cache). Either way, refuse to seed a wrong position
-                // and fall back to native. The debug log distinguishes this
-                // from the missing-handle fallback below so a hypothetical
-                // zero-attention config doesn't fail silently.
-                tracing::debug!(
-                    "lfm2 compiled decode: no consistent attention KV offset \
-                     (offset_ok={offset_ok}, has_offset={}); using native path",
-                    cache_offset.is_some()
-                );
-                offset_ok = false;
-            }
-            // Budget the fixed padded cache from the TRUE position so decode
-            // can never exceed it (slice_update OOB / silent corruption).
-            let max_kv_len = kv_capacity_round_up(prefill_len, max_new_tokens)?;
-
-            // Per-layer attn/conv map — built DYNAMICALLY from config (lfm2
-            // mixes conv/attn irregularly; never a modulo/hardcoded pattern).
-            let is_attn: Vec<i32> = (0..num_layers)
-                .map(|i| i32::from(self.config.is_attention_layer(i)))
-                .collect();
-
-            // Cache pointers, stride 2 by ABSOLUTE layer idx. attn layer ->
-            // KVCache keys_ref()/values_ref() (MATERIALIZED via the engine's
-            // post-prefill `eval_caches`); conv layer -> ArraysCache slot 0,
-            // null at +1.
-            let mut cache_ptrs: Vec<*mut mlx_sys::mlx_array> =
-                vec![std::ptr::null_mut(); num_layers * 2];
-            // Carry the offset-consistency check forward: a bad/inconsistent
-            // attention offset must also block the seed (→ native fallback).
-            let mut seed_ok = offset_ok;
-            for (i, cache) in self.caches.iter().enumerate() {
-                match cache {
-                    Lfm2LayerCache::Attention(kv) => match (kv.keys_ref(), kv.values_ref()) {
-                        (Some(k), Some(v)) => {
-                            cache_ptrs[i * 2] = k.as_raw_ptr();
-                            cache_ptrs[i * 2 + 1] = v.as_raw_ptr();
-                        }
-                        _ => {
-                            seed_ok = false;
-                            break;
-                        }
-                    },
-                    Lfm2LayerCache::Conv(c) => match c.get(0) {
-                        Some(state) => {
-                            cache_ptrs[i * 2] = state.as_raw_ptr();
-                            // slot.b stays null — conv branch never reads it.
-                        }
-                        None => {
-                            seed_ok = false;
-                            break;
-                        }
-                    },
-                }
-            }
-
-            if seed_ok {
-                unsafe {
-                    mlx_sys::mlx_lfm2_moe_init_from_prefill(
-                        self.config.num_hidden_layers,
-                        self.config.hidden_size,
-                        self.config.num_attention_heads,
-                        self.config.num_key_value_heads,
-                        self.config.head_dim(),
-                        self.config.rope_theta as f32,
-                        self.config.norm_eps as f32,
-                        self.config.conv_l_cache,
-                        self.config.num_experts.unwrap_or(0),
-                        self.config.num_experts_per_tok.unwrap_or(0),
-                        self.config.num_dense_layers.unwrap_or(0),
-                        i32::from(self.config.norm_topk_prob.unwrap_or(true)),
-                        i32::from(self.config.use_expert_bias.unwrap_or(true)),
-                        i32::from(self.config.tie_embedding),
-                        i32::from(self.config.conv_bias),
-                        max_kv_len,
-                        1,
-                        is_attn.as_ptr(),
-                        cache_ptrs.as_mut_ptr(),
-                        prefill_len,
-                    );
-                }
-                // C++ init is `void` but can still bail internally (a null
-                // slot or a padding/concatenate exception sets g_lfm2_inited
-                // = false). Confirm it actually seeded; if not, drop to native
-                // BEFORE the loop rather than letting the first forward return
-                // null logits and be treated as a fatal error.
-                if unsafe { mlx_sys::mlx_lfm2_moe_is_initialized() } == 0 {
-                    warn!("lfm2 compiled decode: C++ seed did not initialize; using native path");
-                    use_compiled = false;
-                }
-            } else {
-                warn!(
-                    "lfm2 compiled decode: missing/inconsistent post-prefill cache state; using native path"
-                );
-                use_compiled = false;
-            }
-        }
-
-        Ok(Lfm2Decode {
-            _compiled_reset_guard: compiled_reset_guard,
-            _weight_guard: weight_guard,
-            _compiled_lock: compiled_lock,
-            inner: self,
-            embed_tokens_weight,
-            use_compiled,
-            reuse_cache: turn.params.reuse_cache,
-        })
+    fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        Ok(Lfm2Decode { inner: self })
     }
 
     // `finalize_turn`: engine default (`finalize_chat_result`) is correct
@@ -1653,129 +1073,21 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
         _input_ids: &MxArray,
         token_id: u32,
     ) -> Result<(MxArray, bool)> {
-        // Runs one paged decode step against `self`'s fields (the
-        // compiled-paged session state lives on the stepper). Compiled-paged
-        // when `self.cpp_session_ready`, else the pure-Rust eager paged
-        // step.
-        //
-        // PERF: `token_id` is HANDED by the engine (already read once at the
-        // loop top via `y.item_at_int32`), so we do NOT re-`item_at_int32`
-        // the fresh `_input_ids` reshape — that redundant second per-step
-        // eval/sync measurably regresses the fast compiled-paged decode
-        // (~5% on lfm2-1.2B). `record_tokens` + the `[1, 1]` re-embed below
-        // rebuild from the scalar via `from_uint32`, so `_input_ids` is
-        // unused (kept for signature parity).
-        let step = self.step_counter;
-        self.step_counter += 1;
+        // `token_id` is HANDED by the engine (already read once at the loop
+        // top via `y.item_at_int32`), so `_input_ids` is unused (kept for
+        // signature parity); `run_paged_decode_step` re-records the token
+        // from the scalar.
+        let logits = self
+            .inner
+            .run_paged_decode_step(token_id)?
+            .squeeze(Some(&[1]))?;
 
-        // Defense-in-depth: if the C++ compiled-paged forward returns null
-        // on the FIRST step, roll back the `record_tokens` cursor advance,
-        // flip `cpp_session_ready = false`, and re-run this token through
-        // `run_paged_decode_step` (which re-calls `record_tokens` on the
-        // now-rolled-back cursor). After ANY compiled step has succeeded the
-        // C++ conv state has advanced but is never imported back into
-        // `self.inner.caches`, so a Rust fallback would read stale state —
-        // propagate the error as fatal instead of silently corrupting.
-        let logits = if self.cpp_session_ready {
-            let embedding_weight = self.inner.embed_tokens.get_weight();
-            let max_blocks_per_seq = self.max_blocks_per_seq;
-            let adapter = self.inner.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "Lfm2PagedDecode::forward: paged_adapter dropped mid-decode (cpp)",
-                )
-            })?;
-            adapter
-                .record_tokens(&[token_id])
-                .map_err(Error::from_reason)?;
-            let inputs = adapter
-                .build_paged_attention_inputs(1, 1, max_blocks_per_seq)
-                .map_err(Error::from_reason)?;
-            let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
-            match forward_lfm2_cpp_paged(&input_ids, &embedding_weight, &inputs) {
-                Ok(logits) => {
-                    self.cpp_compiled_step_completed = true;
-                    // Compiled-paged logits are [B, vocab] (already 2D).
-                    logits
-                }
-                Err(e) => {
-                    if crate::engine::should_propagate_compiled_paged_error(
-                        self.cpp_compiled_step_completed,
-                    ) {
-                        // PROPAGATE branch: an earlier compiled step already
-                        // ran. Roll back the cursor then `return Err(e)`
-                        // WITHOUT touching the three guards — the stepper's
-                        // field-drop (on the `run_paged_turn` decode-scope
-                        // close) fires the reset under the still-held locks,
-                        // in declaration order. Touching the guards here too
-                        // would double-reset.
-                        warn!(
-                            "lfm2 compiled paged forward failed mid-decode (step={step}) AFTER \
-                             an earlier compiled step succeeded. The C++ conv state has \
-                             advanced but is not imported back into self.caches, so a \
-                             pure-Rust fallback would run from stale state and silently \
-                             corrupt the response. Propagating as fatal. cause: {e}"
-                        );
-                        adapter
-                            .rollback_last_tokens(1)
-                            .map_err(Error::from_reason)?;
-                        return Err(e);
-                    }
-                    warn!(
-                        "lfm2 compiled paged forward failed on first decode step \
-                         (step={step}); rolling back token cursor and falling back to \
-                         pure-Rust paged decode for the rest of this request. cause: {e}"
-                    );
-                    adapter
-                        .rollback_last_tokens(1)
-                        .map_err(Error::from_reason)?;
-                    self.cpp_session_ready = false;
-                    // SILENT-FALLBACK branch: the rest of this turn runs
-                    // pure-Rust eager paged decode (`run_paged_decode_step`
-                    // touches none of the C++ compiled paged globals), so the
-                    // seeded compiled-paged session is now dead. Tear it down
-                    // and release the process-wide locks NOW instead of
-                    // pinning them for the whole generation (they otherwise
-                    // block weight registration `.write()` / other compiled
-                    // startups `.lock()`).
-                    //
-                    // ORDER IS LOAD-BEARING (mirrors the struct field drop
-                    // order, see `Lfm2PagedDecode`): drop the reset guard
-                    // FIRST so `mlx_lfm2_paged_reset()` runs WHILE the
-                    // lifecycle mutex + weight read lock are STILL held; only
-                    // THEN release the locks. After this all three guards are
-                    // None, so the struct's eventual field-drop is a no-op (no
-                    // double reset / double release).
-                    //
-                    // BORROW DISCIPLINE: the `adapter` borrow of
-                    // `self.inner.paged_adapter` ends after the rollback above;
-                    // we then mutate `self`'s OWN guard fields, and only THEN
-                    // re-borrow `self.inner` for `run_paged_decode_step`. The
-                    // guard-mutation and the `self.inner` call are SEQUENCED,
-                    // never interleaved — interleaving would be E0499.
-                    drop(self._paged_reset_guard.take());
-                    self._weight_guard = None;
-                    self._compiled_lock = None;
-                    // Re-run this token through the pure-Rust paged decode
-                    // (re-records the token on the rolled-back cursor).
-                    self.inner
-                        .run_paged_decode_step(token_id)?
-                        .squeeze(Some(&[1]))?
-                }
-            }
-        } else {
-            // Pure-Rust paged decode fallback.
-            self.inner
-                .run_paged_decode_step(token_id)?
-                .squeeze(Some(&[1]))?
-        };
-
-        // BOTH branches already pre-squeeze to [1, vocab] — the compiled
-        // path returns native 2D [B, vocab]; the eager path runs
-        // `run_paged_decode_step` ([1, 1, vocab]) then `squeeze([1])`.
-        // `needs_squeeze = FALSE`. ⚠ POLARITY IS INVERTED vs qwen3 (whose
-        // `Qwen3PagedDecode::forward` returns `true` from a direct
-        // `run_paged_decode_step`) — lfm2's squeeze lives in this body, so
-        // returning `true` here would double-squeeze and break the sampler.
+        // `run_paged_decode_step` returns [1, 1, vocab] and the `squeeze([1])`
+        // above already reduces it to [1, vocab], so `needs_squeeze = FALSE`.
+        // ⚠ POLARITY IS INVERTED vs qwen3 (whose `Qwen3PagedDecode::forward`
+        // returns `true` from a direct `run_paged_decode_step`) — lfm2's
+        // squeeze lives in this body, so returning `true` here would
+        // double-squeeze and break the sampler.
         Ok((logits, false))
     }
 
@@ -1805,29 +1117,16 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
         crate::array::maybe_clear_cache_for_paged_step(step);
     }
 
-    fn compiled_step_completed(&self) -> Option<bool> {
-        // Surface the silent-eager-fallback latch (contract-honest for a
-        // compiled-paged stepper). lfm2 already consumes it internally in
-        // `forward` via `should_propagate_compiled_paged_error`; returning
-        // `Some(..)` here is cheap and forward-compatible.
-        Some(self.cpp_compiled_step_completed)
-    }
-
-    // `materialize_final` — DO NOT override (default no-op). CRITICAL: lfm2
-    // PAGED must NOT re-run a decode step for the final length-exit token.
-    // The C++ compiled conv-state global only advanced for the tokens the
-    // loop actually forwarded; re-running `run_paged_decode_step` here would
-    // record a token the compiled conv state never advanced → conv desync.
-    // The drop-on-length `save_paged_history` already keeps history aligned
-    // with the adapter (see the token-accounting proof on
+    // `materialize_final` — DO NOT override (default no-op). lfm2 PAGED must
+    // NOT re-run a decode step for the final length-exit token. The
+    // drop-on-length `save_paged_history` already keeps history aligned with
+    // the adapter (see the token-accounting proof on
     // `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra forward
     // is needed.
     //
-    // `end_decode` — DO NOT override (default Ok(())). lfm2 PAGED seeds conv
-    // from scratch each turn (no cross-turn conv export — the eager paged
-    // path reprefills conv from token 0 every turn), so there is nothing to
-    // export back into `self.caches`. (The FLAT `Lfm2Decode::end_decode`
-    // exports the compiled caches — that is the FLAT path ONLY.)
+    // `end_decode` — DO NOT override (default Ok(())). lfm2 PAGED reprefills
+    // conv from token 0 every turn, so there is nothing to export back into
+    // `self.caches`.
 }
 
 /// lfm2 paged prefix state — the effective prefix/suffix split from
@@ -1940,173 +1239,7 @@ impl PagedBackend for Lfm2Inner {
     }
 
     fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
-        // Arms the compiled-paged guards as STRUCT FIELDS of the returned
-        // `Lfm2PagedDecode` (declaration order == drop order == teardown
-        // order). MUST run AFTER prefill (reads the adapter pools + conv
-        // caches) and the post-prefill cache clear, BEFORE the decode loop.
-        //
-        // ===== Compiled C++ PAGED decode-path dispatch =====
-        // Mirrors the FLAT path's lock contract (`Lfm2Decode` via
-        // `ChatBackend::begin_decode`) and qwen3.5's paged `cpp_session_ready`
-        // gate. The compiled-PAGED decode runs only when ALL of:
-        //   1. `compiled_path_active()` — weights registered for our model_id.
-        //   1b. The model weights are bf16 (the compiled-PAGED graph + paged
-        //      KV pools are bf16-only: `KvDtype::Bf16`, bf16 static mask).
-        //   2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE` (16).
-        //   3. `init_lfm2_paged_compiled_session` succeeds.
-        //
-        // LOCK CONTRACT (same as the flat path): registration is the WRITER;
-        // decode is the READER — the `_weight_guard` (`.read()`,
-        // poison-recovered) spans the `mlx_lfm2_model_has_weights()` re-check (+
-        // the `activate` that selects this model's compiled slot), the seed, and
-        // (on the stepper) EVERY `forward_lfm2_cpp_paged` step.
-        //
-        // CONV STATE: unlike qwen's GDN linear caches, lfm2 needs NO
-        // cross-turn conv export — the eager paged path reprefills conv from
-        // token 0 each turn (`prime_prefix_state`'s `self.caches =
-        // init_caches(..)`), so the compiled-paged graph threads conv state
-        // WITHIN a turn only and there is no post-loop export step (hence
-        // `Lfm2PagedDecode::end_decode` is the default no-op).
-        use crate::engine::compiled_lock::CPP_PAGED_REQUIRED_BLOCK_SIZE;
-        let mut use_cpp_pre = self.compiled_path_active();
-        // bf16-activation gate (1b): the gate MUST match what the graph
-        // consumes (operator/FFN/final norms, q/k norms, attention out_proj,
-        // conv weights/biases, dense-MLP or MoE router/expert weights, the
-        // untied lm_head, q/k/v) — not a hand-picked subset.
-        //  - bf16 checkpoint: EVERY float weight must be bf16
-        //    (`all_float_weights_bf16`).
-        //  - QUANTIZED checkpoint: the NON-quantized floats + quant float
-        //    companions are bf16 (`non_quant_floats_bf16`), AND the
-        //    `MLX_LFM2_DISABLE_QUANT_COMPILED` escape hatch is not set.
-        // `*.expert_bias` (intentional F32 on MoE) is the one allowed
-        // exception, handled in the load-time scans.
-        let activations_bf16 = if self.is_quantized {
-            quant_compiled_enabled() && self.non_quant_floats_bf16
-        } else {
-            self.all_float_weights_bf16
-        };
-        if use_cpp_pre && !activations_bf16 {
-            warn!(
-                "lfm2 compiled paged decode: activation-dtype invariant unmet (a non-bf16 float \
-                 weight — embedding, norm, projection, conv, FFN/MoE, or lm_head — or quantized \
-                 compiled decode disabled); the compiled-PAGED graph + paged KV pools are \
-                 bf16-only, so using the pure-Rust eager paged decode path for this request."
-            );
-            use_cpp_pre = false;
-        }
-        let mut compiled_lock = if use_cpp_pre {
-            Some(
-                crate::engine::compiled_lock::COMPILED_LIFECYCLE_MUTEX
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()),
-            )
-        } else {
-            None
-        };
-        let mut weight_guard = None;
-        let cpp_session_ready = if use_cpp_pre {
-            let guard = crate::engine::compiled_lock::COMPILED_WEIGHTS_RWLOCK
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            // Re-check this model's weight presence under the read lock — a
-            // concurrent reload/clear of THIS model could have dropped its
-            // weights between the probe and here (a sibling model loading does
-            // not, which is the per-model-slot coexistence fix).
-            if unsafe { mlx_sys::mlx_lfm2_model_has_weights(self.model_id) } != 0 {
-                weight_guard = Some(guard);
-                // Swap this model's compiled slot into the working register
-                // before the seed FFI and every later paged forward, parking
-                // any other model. Held under the lifecycle lock above. (The
-                // paged prefill that populated `self.caches` / the adapter
-                // pools is eager pure-Rust, so no C++ `get_weight` ran before
-                // this activate.)
-                unsafe { mlx_sys::mlx_lfm2_activate_model(self.model_id) };
-                // Seed the compiled-paged graph ONCE from the live
-                // post-prefill adapter pools + conv state. On any failure drop
-                // back to the pure-Rust paged decode for the whole turn.
-                let caches_ref = &self.caches;
-                let adapter_ref = self.paged_adapter.as_ref().ok_or_else(|| {
-                    Error::from_reason("begin_paged_decode: paged_adapter dropped post-prefill")
-                })?;
-                if adapter_ref.block_size() != CPP_PAGED_REQUIRED_BLOCK_SIZE {
-                    warn!(
-                        "lfm2 compiled paged decode: adapter block_size={} but compiled graph \
-                         requires {}; falling back to pure-Rust paged decode",
-                        adapter_ref.block_size(),
-                        CPP_PAGED_REQUIRED_BLOCK_SIZE
-                    );
-                    false
-                } else {
-                    let prefill_offset = adapter_ref.current_token_count() as i32;
-                    match init_lfm2_paged_compiled_session(
-                        &self.config,
-                        caches_ref,
-                        adapter_ref,
-                        prefill_offset,
-                    ) {
-                        Ok(()) => true,
-                        Err(e) => {
-                            warn!(
-                                "lfm2 compiled paged decode: seed failed ({e}); falling back to \
-                                 pure-Rust paged decode"
-                            );
-                            false
-                        }
-                    }
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        // When the compiled-paged session did NOT come up (model_id eviction,
-        // block_size mismatch, or seed failure), the decode loop runs the
-        // pure-Rust eager paged path, which touches none of the C++ compiled
-        // globals. Holding the cross-family lifecycle mutex / weight read lock
-        // across that whole loop is needless and blocks weight registration
-        // (.write()) and other compiled startups (.lock()) for the entire
-        // generation. Drop them now. Safe because cpp_session_ready==false
-        // here implies the reset guard is None (no seed ran), so the
-        // reset-while-locks-held drop-order invariant is vacuous.
-        if !cpp_session_ready {
-            weight_guard = None;
-            compiled_lock = None;
-        }
-
-        // RAII guard: resets the compiled-PAGED C++ globals
-        // (`mlx_lfm2_paged_reset`) on EVERY exit path — including a `?`
-        // early-return or a first-step fallback that flips `cpp_session_ready`
-        // off — so the next request never seeds against stale paged pools.
-        // Armed iff the seed succeeded.
-        let paged_reset_guard = cpp_session_ready.then_some(Lfm2PagedResetGuard);
-
-        // Compile-cached `max_blocks_per_seq` shape — `max_position_embeddings`
-        // div_ceil block_size keeps the compile-cache key stable across every
-        // decode step within one turn (matches qwen's paged decode loop).
-        let max_blocks_per_seq: u32 = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-                Error::from_reason("begin_paged_decode: paged_adapter dropped pre-decode")
-            })?;
-            let max_seq = self.config.max_position_embeddings as u32;
-            max_seq.div_ceil(adapter.block_size())
-        };
-
-        Ok(Lfm2PagedDecode {
-            _paged_reset_guard: paged_reset_guard,
-            _weight_guard: weight_guard,
-            _compiled_lock: compiled_lock,
-            inner: self,
-            cpp_session_ready,
-            // Tracks whether ANY compiled-paged step has completed this turn.
-            // A mid-turn failure (after the first successful compiled step)
-            // PROPAGATES; only a first-step failure falls back (mirrors qwen's
-            // `should_propagate_compiled_paged_error`).
-            cpp_compiled_step_completed: false,
-            max_blocks_per_seq,
-            step_counter: 0,
-        })
+        Ok(Lfm2PagedDecode { inner: self })
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool) {
@@ -2238,327 +1371,10 @@ impl PagedBackend for Lfm2Inner {
     }
 }
 
-/// Initialize caches matching the layer types.
-/// RAII guard that calls `mlx_lfm2_moe_reset()` on drop, tearing down the
-/// compiled lfm2 decode globals (caches + offset + inited flag).
-///
-/// lfm2 owns its own compiled C++ state and resets it here. Ensures the
-/// compiled state is always torn down even when the decode loop returns early
-/// via `?`, so the next generation never sees stale compiled caches.
-struct Lfm2CompiledResetGuard;
-
-impl Drop for Lfm2CompiledResetGuard {
-    fn drop(&mut self) {
-        unsafe {
-            mlx_sys::mlx_lfm2_moe_reset();
-        }
-    }
-}
-
-/// RAII guard that calls `mlx_lfm2_paged_reset()` on drop, tearing down the
-/// compiled-PAGED lfm2 decode globals (per-layer pools / scales / conv-state,
-/// offset, inited flag).
-///
-/// DISTINCT from [`Lfm2CompiledResetGuard`] (the FLAT path, which calls
-/// `mlx_lfm2_moe_reset()`): the flat and paged decode families own strictly
-/// separate C++ state and must each reset their own. Like the flat guard, this
-/// ensures the compiled-paged globals are always torn down even when the decode
-/// loop returns early via `?`, so the next generation never seeds against stale
-/// paged pools.
-///
-/// Armed by `<Lfm2Inner as PagedBackend>::begin_paged_decode` (as a field of
-/// the returned `Lfm2PagedDecode`) when the compiled-paged seed succeeds.
-struct Lfm2PagedResetGuard;
-
-impl Drop for Lfm2PagedResetGuard {
-    fn drop(&mut self) {
-        unsafe {
-            mlx_sys::mlx_lfm2_paged_reset();
-        }
-    }
-}
-
-/// Initialize the compiled-PAGED lfm2 decode graph from the live post-prefill
-/// state — the adapter's per-attention-layer paged KV pool/scale arrays AND the
-/// per-conv-layer conv-state arrays already populated by the pure-Rust eager
-/// paged prefill (`run_paged_prefill_chunk`).
-///
-/// Mirrors qwen3.5's `init_paged_dense_compiled_session` (qwen3_5/model.rs) but
-/// for lfm2's irregular conv/attn interleave: instead of a modulo `is_linear`
-/// test, the per-layer dispatch is driven by the explicit
-/// `config.is_attention_layer(i)` map (built into `is_attn` and passed to C++).
-///
-/// # Layer-index contract
-///
-/// The C++ FFI (`mlx_lfm2_moe_init_paged`) accepts five per-layer handle arrays
-/// of size `num_layers` (absolute decoder count). For each absolute layer `i`:
-/// * Attention layer: `k_pool_handles[i]` / `v_pool_handles[i]` /
-///   `k_scale_handles[i]` / `v_scale_handles[i]` come from the adapter's
-///   `LayerKVPool` at the COMPACT (attention-layer) ordinal `paged_idx`; the
-///   `conv_state_handles[i]` slot is null. The compact-ordinal mapping is
-///   computed by [`Lfm2Inner::compute_layer_kinds`], the same helper the
-///   production eager paged dispatch uses.
-/// * Conv layer: `conv_state_handles[i]` is the layer's conv state
-///   `[B, l_cache-1, hidden]` from its `Lfm2LayerCache::Conv(ArraysCache)` slot
-///   0; the pool/scale slots are null. (No cross-turn conv export is needed —
-///   the eager paged path reprefills conv from token 0 each turn — so the
-///   compiled graph threads conv state WITHIN a turn only.)
-///
-/// # Caller contract
-///
-/// 1. `caches` is fully populated by a prior pure-Rust eager paged prefill.
-/// 2. `adapter.block_size() == CPP_PAGED_REQUIRED_BLOCK_SIZE` (16): the compiled
-///    paged graph hard-codes `block_size=16` into its `paged_kv_write` /
-///    `paged_attention` calls. The caller MUST gate on this before invoking.
-/// 3. The C++ weights for this model are still registered (caller verified
-///    `mlx_lfm2_model_has_weights(self.model_id)` and holds the read lock), and
-///    this model's compiled slot has been activated for the turn via
-///    `mlx_lfm2_activate_model(self.model_id)`.
-///
-/// `prefill_offset` is the global token cursor the compiled paged graph's
-/// `g_lfm2_paged_offset_int` starts incrementing from; the caller passes
-/// `adapter.current_token_count() as i32`. Every attention layer shares this
-/// single adapter cursor (paged attention has ONE logical sequence position, not
-/// a per-layer KVCache offset like the flat path), so there is no per-layer
-/// offset to disagree — the consistency invariant the flat seed checks is
-/// structurally guaranteed here. We still validate the cursor is non-negative
-/// and that the cache vector length matches the config so a corrupt session
-/// falls back to native rather than seeding a wrong position.
-///
-/// On any failure (cache-length mismatch, missing pool/scale handle, missing
-/// conv state, or the C++ FFI returning a non-zero status), returns `Err` so the
-/// caller falls back to the pure-Rust eager paged decode path.
-fn init_lfm2_paged_compiled_session(
-    config: &Lfm2Config,
-    caches: &[Lfm2LayerCache],
-    paged_adapter: &PagedKVCacheAdapter,
-    prefill_offset: i32,
-) -> Result<()> {
-    let num_layers_us = config.num_hidden_layers as usize;
-    if caches.len() != num_layers_us {
-        return Err(Error::from_reason(format!(
-            "init_lfm2_paged_compiled_session: caches.len()={} but config.num_hidden_layers={}",
-            caches.len(),
-            num_layers_us
-        )));
-    }
-    if prefill_offset < 0 {
-        return Err(Error::from_reason(format!(
-            "init_lfm2_paged_compiled_session: negative prefill_offset={prefill_offset}; refusing \
-             to seed a wrong position. Caller must fall back to the pure-Rust paged path."
-        )));
-    }
-
-    // Per-layer attn/conv dispatch — built DYNAMICALLY from config (lfm2 mixes
-    // conv/attn irregularly; never a modulo/hardcoded pattern). Mirrors the flat
-    // seed's `is_attn` construction.
-    let is_attn: Vec<i32> = (0..num_layers_us)
-        .map(|i| i32::from(config.is_attention_layer(i)))
-        .collect();
-
-    // Compact-ordinal mapping (paged_idx counts only attention layers), the same
-    // helper the eager paged forward uses.
-    let layer_kinds = compute_layer_kinds_for(config, num_layers_us);
-
-    let mut k_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_pool_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut k_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut v_scale_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-    let mut conv_state_handles: Vec<*mut mlx_sys::mlx_array> =
-        vec![std::ptr::null_mut(); num_layers_us];
-
-    // Hold every wrapping `MxArray` alive across the FFI call so the C++ side has
-    // time to copy each handle into its own globals before the temporaries drop.
-    let mut held_arrays: Vec<MxArray> = Vec::with_capacity(num_layers_us * 4);
-
-    for (i, kind) in layer_kinds.iter().enumerate() {
-        match kind {
-            Lfm2LayerKind::FullAttention { paged_idx } => {
-                let k_arr = paged_adapter.key_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_lfm2_paged_compiled_session: key_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let v_arr = paged_adapter.value_pool_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_lfm2_paged_compiled_session: value_pool_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let ks_arr = paged_adapter.k_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_lfm2_paged_compiled_session: k_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                let vs_arr = paged_adapter.v_scale_array(*paged_idx).map_err(|e| {
-                    Error::from_reason(format!(
-                        "init_lfm2_paged_compiled_session: v_scale_array(layer={i}, \
-                         paged_idx={paged_idx}): {e}",
-                    ))
-                })?;
-                k_pool_handles[i] = k_arr.as_raw_ptr();
-                v_pool_handles[i] = v_arr.as_raw_ptr();
-                k_scale_handles[i] = ks_arr.as_raw_ptr();
-                v_scale_handles[i] = vs_arr.as_raw_ptr();
-                held_arrays.push(k_arr);
-                held_arrays.push(v_arr);
-                held_arrays.push(ks_arr);
-                held_arrays.push(vs_arr);
-            }
-            Lfm2LayerKind::Conv => {
-                // Conv state lives in `self.caches[i]` (NOT the adapter): the
-                // eager paged prefill writes it into the layer's
-                // `Lfm2LayerCache::Conv(ArraysCache)` slot 0 as
-                // `[B, l_cache-1, hidden]`.
-                let conv_cache = match &caches[i] {
-                    Lfm2LayerCache::Conv(c) => c,
-                    Lfm2LayerCache::Attention(_) => {
-                        return Err(Error::from_reason(format!(
-                            "init_lfm2_paged_compiled_session: layer {i} is Conv by config but \
-                             cache slot is Attention",
-                        )));
-                    }
-                };
-                let state = conv_cache.get(0).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "init_lfm2_paged_compiled_session: layer {i} conv_state not populated; \
-                         the eager paged prefill must run before C++ paged init",
-                    ))
-                })?;
-                conv_state_handles[i] = state.as_raw_ptr();
-            }
-        }
-    }
-
-    let status = unsafe {
-        mlx_sys::mlx_lfm2_moe_init_paged(
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim(),
-            config.rope_theta as f32,
-            config.norm_eps as f32,
-            config.conv_l_cache,
-            config.num_experts.unwrap_or(0),
-            config.num_experts_per_tok.unwrap_or(0),
-            config.num_dense_layers.unwrap_or(0),
-            i32::from(config.norm_topk_prob.unwrap_or(true)),
-            i32::from(config.use_expert_bias.unwrap_or(true)),
-            i32::from(config.tie_embedding),
-            i32::from(config.conv_bias),
-            // max_kv_len is accepted for ABI symmetry with the flat init; the
-            // paged graph sizes its pools from the adapter, so any non-negative
-            // value is fine here. Pass the global position so the field carries a
-            // meaningful sequence length rather than 0.
-            prefill_offset,
-            1, // batch_size
-            crate::engine::compiled_lock::CPP_PAGED_REQUIRED_BLOCK_SIZE as i32,
-            is_attn.as_ptr(),
-            k_pool_handles.as_mut_ptr(),
-            v_pool_handles.as_mut_ptr(),
-            k_scale_handles.as_mut_ptr(),
-            v_scale_handles.as_mut_ptr(),
-            conv_state_handles.as_mut_ptr(),
-            prefill_offset,
-        )
-    };
-
-    // Drop the held wrappers only AFTER the FFI call returns: the C++ init copies
-    // each handle into its globals (and force-evals the attn pools), so by here
-    // it no longer needs our temporaries alive.
-    drop(held_arrays);
-
-    // The C++ side returns 0 on success, -1 on failure (missing handle, bad
-    // block_size, dtype mismatch, or any caught exception). On failure it leaves
-    // `g_lfm2_paged_inited` cleared so a subsequent `mlx_lfm2_moe_forward_paged`
-    // would null its logits; surfacing the status here lets the caller fall back
-    // to the pure-Rust paged path before any decode-step FFI is dispatched.
-    if status != 0 {
-        // Belt-and-suspenders: the C++ init now clears the paged globals on every
-        // failure path itself, but a failed init mutates process-wide GPU-backed
-        // state, so we also fire the reset from the Rust side. `mlx_lfm2_paged_reset`
-        // is idempotent (clears config/is_attn/pool/scale vectors + offset + inited
-        // flag), so a double reset is harmless. This guarantees no stale imported
-        // array handles / populated pool vectors leak when the seed aborts and the
-        // caller drops back to the pure-Rust paged path (no `Lfm2PagedResetGuard`
-        // is armed on the Err branch).
-        unsafe { mlx_sys::mlx_lfm2_paged_reset() };
-        return Err(Error::from_reason(format!(
-            "init_lfm2_paged_compiled_session: mlx_lfm2_moe_init_paged returned status={status} \
-             (expected 0); see stderr for the C++ diagnostic. Caller must fall back to the \
-             pure-Rust paged path."
-        )));
-    }
-
-    Ok(())
-}
-
-/// Single-token decode step using the C++ compiled-PAGED forward pass.
-///
-/// Per-step wrapper mirroring qwen3.5's `forward_dense_cpp_paged`: threads the
-/// paged-attention inputs (offset_arr, block_table, slot_mapping,
-/// num_valid_tokens, num_valid_blocks, seq_lens) so each attention layer writes
-/// its new K/V into the adapter's paged Metal pool via `paged_kv_write` and
-/// gathers via `paged_attention`, while conv layers thread their state through
-/// the compiled graph's cache slots.
-///
-/// Caller contract (enforced in the decode loop, not here):
-/// * `init_lfm2_paged_compiled_session` has been called this turn (so
-///   `g_lfm2_paged_inited == true`).
-/// * `adapter.record_tokens(&[token_id])` has advanced the cursor (and lazily
-///   allocated any new block) for this step.
-/// * `inputs` was just built via
-///   `adapter.build_paged_attention_inputs(1, 1, max_blocks_per_seq)`.
-///
-/// On any FFI failure (`output_logits == null`) returns `Err` so the dispatcher
-/// can fall back to the pure-Rust paged decode (first step) or propagate (after
-/// a compiled step has mutated the C++ paged globals).
-fn forward_lfm2_cpp_paged(
-    input_ids: &MxArray,
-    embedding_weight: &MxArray,
-    inputs: &crate::transformer::paged_attention_inputs::PagedAttentionInputs,
-) -> Result<MxArray> {
-    let mut output_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-    let mut cache_offset_out: i32 = 0;
-    unsafe {
-        mlx_sys::mlx_lfm2_moe_forward_paged(
-            input_ids.as_raw_ptr(),
-            embedding_weight.as_raw_ptr(),
-            inputs.offset_arr.as_raw_ptr(),
-            inputs.block_table.as_raw_ptr(),
-            inputs.slot_mapping.as_raw_ptr(),
-            inputs.num_valid_tokens.as_raw_ptr(),
-            inputs.num_valid_blocks.as_raw_ptr(),
-            inputs.seq_lens.as_raw_ptr(),
-            &mut output_ptr,
-            &mut cache_offset_out,
-        );
-    }
-
-    if output_ptr.is_null() {
-        return Err(Error::from_reason(
-            "lfm2 compiled paged forward step returned null — check stderr for diagnostic. \
-             (Common causes: g_lfm2_paged_inited = false, slot_mapping shape != [1], \
-             input_ids size != 1, or weights cleared by another model load.)",
-        ));
-    }
-
-    MxArray::from_handle(output_ptr, "lfm2 compiled paged forward logits")
-}
-
 /// Free-function form of [`Lfm2Inner::compute_layer_kinds`] usable without a
-/// `self` borrow (the paged compiled session init only has `&Lfm2Config` +
-/// `&[Lfm2LayerCache]`, not the whole `Lfm2Inner`). Identical mapping:
-/// `FullAttention { paged_idx }` for attention layers (paged_idx counts only
-/// those, in original order) and `Conv` otherwise. Called by
-/// `init_lfm2_paged_compiled_session` (decode-loop wiring).
+/// `self` borrow. Identical mapping: `FullAttention { paged_idx }` for
+/// attention layers (paged_idx counts only those, in original order) and
+/// `Conv` otherwise.
 fn compute_layer_kinds_for(config: &Lfm2Config, num_layers: usize) -> Vec<Lfm2LayerKind> {
     let mut kinds = Vec::with_capacity(num_layers);
     let mut paged_idx: u32 = 0;

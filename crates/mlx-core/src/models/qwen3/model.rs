@@ -2827,7 +2827,7 @@ impl DecodeStep for Qwen3PagedDecode<'_> {
                 .run_paged_decode_step(token_id, self.num_layers, &self.positions_dummy)?;
         Ok(())
     }
-    // compiled_step_completed → default None; end_decode → default Ok(()).
+    // end_decode → default Ok(()).
 }
 
 /// qwen3 paged prefix state — the effective prefix/suffix split from

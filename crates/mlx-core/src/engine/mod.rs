@@ -26,7 +26,6 @@ pub(crate) mod vision;
 // engine-internal callers can import everything through a single
 // `crate::engine::<item>` path.
 pub(crate) use cache::*;
-pub(crate) use decode::*;
 pub(crate) use finalize::*;
 pub(crate) use params::*;
 pub(crate) use penalties::*;

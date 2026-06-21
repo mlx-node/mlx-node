@@ -458,8 +458,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     const MAX_NEW_TURN1: i32 = 2;
     const MAX_NEW_TURN2: i32 = 32;
 
-    // ---- Turn 1: budget-forced length exit on the PAGED (compiled) path ----
-    let compiled_before = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
+    // ---- Turn 1: budget-forced length exit on the PAGED path ----
     let r1 = warm_model
         .chat_session_start(
             vec![user_message(user1)],
@@ -467,22 +466,15 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
         )
         .await
         .expect("turn 1 (budget-forced) paged chat_session_start failed");
-    let compiled_after = unsafe { mlx_sys::mlx_lfm2_moe_compiled_paged_call_count() };
-    let compiled_delta = compiled_after.saturating_sub(compiled_before);
 
     eprintln!(
-        "[warm-cont] turn1: num_tokens={} finish={} compiled_paged_delta={compiled_delta} raw_text={:?}",
+        "[warm-cont] turn1: num_tokens={} finish={} raw_text={:?}",
         r1.num_tokens, r1.finish_reason, r1.raw_text,
     );
 
-    // Compiled-paged engagement gate: a 0 delta means the eager paged fallback
-    // ran (it evals K/V eagerly and has NO lazy hole) → nothing to bite, skip.
-    // INFO only — the bug (conv Pass-1 attention-skip in run_conv_only_prefill)
-    // is LOGICAL and reproduces byte-identically under BOTH compiled
-    // (compiled_paged_delta>0) and eager (MLX_NO_COMPILE=1, delta==0), so the
-    // assertion below holds regardless of which backend ran. The counter is
-    // printed purely to record which path the run exercised.
-    eprintln!("[warm-cont] turn1 compiled_paged_delta={compiled_delta} (0 ⇒ eager path ran)");
+    // The bug (conv Pass-1 attention-skip in run_conv_only_prefill) is LOGICAL
+    // and reproduces byte-identically on the eager paged path, so the assertion
+    // below holds regardless of any backend detail.
 
     // Preconditions that pin the EXACT shape the bug needs: a LENGTH exit (the
     // forced </think> is the FINAL committed token, no next forward) committing

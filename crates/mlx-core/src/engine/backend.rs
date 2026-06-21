@@ -111,32 +111,15 @@ pub(crate) trait DecodeStep {
         None
     }
 
-    /// Fallible post-loop hook for the compiled-path families. Called by
-    /// `chat_turn_core` after
+    /// Fallible post-loop hook. Called by `chat_turn_core` after
     /// [`crate::engine::decode::run_decode_loop`] returns successfully,
-    /// while the stepper is still alive (so its lock/reset guards have
-    /// NOT dropped yet) and BEFORE [`ChatBackend::save_cache_state`].
-    /// On `Err` the turn aborts: the error propagates, the stepper drops
-    /// (firing its reset guards), and `save_cache_state` is never
-    /// called.
+    /// while the stepper is still alive (so its guards have NOT dropped
+    /// yet) and BEFORE [`ChatBackend::save_cache_state`]. On `Err` the
+    /// turn aborts: the error propagates, the stepper drops, and
+    /// `save_cache_state` is never called.
     ///
-    /// This is where a compiled-path family exports its C++ decode caches
-    /// back into its Rust caches, gated on the turn's `reuse_cache`
-    /// (available via [`TurnSetup::params`], captured at `begin_decode`
-    /// time). The only non-default user today is lfm2 FLAT (`Lfm2Decode`):
-    /// `export_compiled_caches()` before `Lfm2CompiledResetGuard` drops.
-    /// lfm2's PAGED stepper (`Lfm2PagedDecode`) keeps the default no-op:
-    /// the eager paged path reprefills conv state from token 0 every turn,
-    /// so there is no cross-turn compiled cache to export. The pure-eager
-    /// families (qwen3_5 dense/MoE, qwen3, gemma4) keep the default no-op —
-    /// their Rust caches are mutated in place during decode.
-    ///
-    /// The error-path equivalence is exact: a decode error skips the
-    /// export but still resets (guards drop), and an export/eval error
-    /// propagates as the turn's error before any session state is saved —
-    /// drop-without-`end_decode` reproduces reset-without-export
-    /// byte-for-byte. A `Drop`-based export could not express this
-    /// (`Drop` swallows the abort-the-turn error).
+    /// Every family keeps the default no-op — their Rust caches are
+    /// mutated in place during decode, so there is nothing to export.
     fn end_decode(&mut self) -> Result<()> {
         Ok(())
     }
@@ -152,25 +135,6 @@ pub(crate) trait DecodeStep {
         if (step + 1) % 256 == 0 {
             crate::array::synchronize_and_clear_cache();
         }
-    }
-
-    /// Whether ANY compiled C++ paged step has succeeded earlier in this
-    /// turn — the silent-eager-fallback latch consumed by
-    /// [`crate::engine::decode::should_propagate_compiled_paged_error`].
-    ///
-    /// Default `None`: the stepper has no compiled paged path (every
-    /// FLAT stepper, and pure-eager paged steppers like qwen3).
-    /// `Some(bool)` lets a compiled-paged stepper's `forward` /
-    /// `end_decode` gate its fall-back-vs-propagate decision through the
-    /// shared helper.
-    ///
-    /// `#[allow(dead_code)]`: the only `PagedBackend` impl, qwen3, is
-    /// pure-eager and keeps the `None` default, so the consumption point
-    /// (a compiled-paged paged family routing its `should_propagate_…`
-    /// decision through this hook) has no caller yet.
-    #[allow(dead_code)]
-    fn compiled_step_completed(&self) -> Option<bool> {
-        None
     }
 
     /// Materialize the final committed token's K/V into the decode cache
@@ -1285,13 +1249,8 @@ pub(crate) trait ChatBackend {
 /// double-borrow that forced the per-family inlined paged loops.
 pub(crate) trait PagedBackend: ChatBackend {
     /// Per-step paged decode stepper. Borrows `&mut self` for the whole
-    /// decode loop (the analog of [`ChatBackend::Decode`]). For compiled-
-    /// paged families the lifecycle guards (lifecycle mutex, weight-read
-    /// guard, reset guard) live as STRUCT FIELDS of the concrete stepper
-    /// — declaration order == teardown order — and
-    /// [`DecodeStep::compiled_step_completed`] returns the
-    /// silent-eager-fallback latch. Pure-eager families (qwen3) carry
-    /// only borrowed refs.
+    /// decode loop (the analog of [`ChatBackend::Decode`]). Pure-eager
+    /// families (qwen3) carry only borrowed refs.
     type PagedDecode<'a>: DecodeStep
     where
         Self: 'a;

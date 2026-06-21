@@ -3863,7 +3863,7 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         let _logits = self.inner.run_paged_decode_step(token_id)?;
         Ok(())
     }
-    // compiled_step_completed → default None; end_decode → default Ok(()).
+    // end_decode → default Ok(()).
 }
 
 /// gemma4 paged prefix state — the effective prefix/suffix split from

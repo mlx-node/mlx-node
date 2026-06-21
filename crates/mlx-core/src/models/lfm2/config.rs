@@ -198,17 +198,13 @@ impl Lfm2Config {
     /// * An explicit `Some(_)` from config.json always wins (user/converter
     ///   pinned the storage backend — never override it).
     /// * When the field is absent (`None`) AND the checkpoint is quantized,
-    ///   default to `Some(false)` (flat eager decode). Quantized checkpoints
-    ///   can never register with the compiled-PAGED C++ path
-    ///   (`should_register_compiled` short-circuits on `is_quantized`), so the
-    ///   paged route degenerates to the slow eager-PAGED loop
-    ///   (~12 `synchronize_mlx()`/token, blocking `y.eval()`, no async
-    ///   double-buffering). The flat path uses an in-graph `KVCache` +
+    ///   default to `Some(false)` (flat eager decode). The eager-PAGED loop is
+    ///   slow (~12 `synchronize_mlx()`/token, blocking `y.eval()`, no async
+    ///   double-buffering), whereas the flat path uses an in-graph `KVCache` +
     ///   `async_eval_arrays` (zero per-layer sync) and is ~1.84× faster on the
     ///   measured mxfp8 LFM2.5-8B-A1B workload.
     /// * Otherwise (absent + not quantized, e.g. bf16) leave it `None` so
-    ///   `Lfm2Inner::new`'s `unwrap_or(true)` continues to yield PAGED — which
-    ///   bf16 wants (PR #66 compiled-PAGED ~1.5×).
+    ///   `Lfm2Inner::new`'s `unwrap_or(true)` continues to yield PAGED.
     pub fn resolve_use_block_paged_default(
         explicit: Option<bool>,
         is_quantized: bool,

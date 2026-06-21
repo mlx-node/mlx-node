@@ -44,7 +44,7 @@ bool mlx_compile_clear_cache() {
 
 // Temperatures in `[0, GREEDY_TEMPERATURE_EPS]` are treated as greedy (argmax)
 // by every sampler below. This MUST match the Rust MTP accept gates in
-// chat_common.rs / sampling.rs (`temperature <= 1e-6` == greedy): keeping the
+// engine/params.rs / sampling.rs (`temperature <= 1e-6` == greedy): keeping the
 // threshold identical makes the draft draw, target/bonus draw,
 // sampling_distribution, the AR sampler, and the accept gates byte-consistent
 // for tiny T (otherwise a tiny nonzero T would draw stochastically but accept

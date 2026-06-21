@@ -3,16 +3,14 @@
 // `mlx_paged_ops.cpp` (which DEFINES `mlx::core::fast::paged_kv_write` /
 // `paged_attention` / `paged_attention_varlen`) is excluded from the
 // non-Apple build because it `#include`s `mlx/backend/metal/device.h` and
-// dispatches Metal kernels. But the compiled-paged forward graphs in
-// `mlx_qwen35.cpp` / `mlx_qwen35_moe.cpp` / `mlx_lfm2_moe.cpp` reference
-// these symbols (through the inline helpers in `mlx_qwen35_common.h` /
-// `mlx_lfm2_common.h`), so the Linux link would fail with undefined
-// references without a definition.
+// dispatches Metal kernels. But other FFI translation units reference these
+// symbols (the paged dispatch entry points in `mlx_paged_dispatch.cpp` and
+// their callers), so the Linux link would fail with undefined references
+// without a definition.
 //
-// On a CUDA host the compiled-paged path is never actually invoked: the
-// Rust loaders gate compiled-forward registration on
-// `mlx_metal_is_available()` (false on CUDA), so `mlx_qwen35_get_model_id()`
-// never matches and every forward takes the eager Rust path. These stubs
+// On a CUDA host the block-paged Metal path is never actually invoked: the
+// Rust loaders gate paged-attention use on `mlx_metal_is_available()` (false
+// on CUDA), so every forward takes the non-paged eager path. These stubs
 // therefore only need to exist for the linker; reaching one at runtime is a
 // bug, so they throw loudly rather than silently mis-compute.
 //
