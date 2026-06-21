@@ -254,21 +254,3 @@ impl DecoderLayer {
         });
     }
 }
-
-impl crate::engine::vision::VlmPrefillLayer for DecoderLayer {
-    type Cache = Qwen3_5LayerCache;
-
-    fn vlm_is_linear(&self) -> bool {
-        self.is_linear()
-    }
-
-    fn vlm_forward(
-        &mut self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        cache: Option<&mut Qwen3_5LayerCache>,
-        position_ids: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        self.forward(x, mask, cache, position_ids, true)
-    }
-}

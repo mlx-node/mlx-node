@@ -1945,10 +1945,23 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // paged-enabled checkpoint.
         use_block_paged_cache: {
             let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
-            match std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok().as_deref() {
+            let resolved = match std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") => Some(true),
                 Some("0") | Some("false") | Some("FALSE") => Some(false),
                 _ => explicit,
+            };
+            // Vision (VLM) checkpoints default to the block-paged KV backend:
+            // dense image turns only run on the paged-vision core. When the
+            // config leaves `use_block_paged_cache` unset and a `vision_config`
+            // is present, force paged on. An explicit value (or the
+            // `MLX_QWEN35_PAGED_OVERRIDE` env gate, including `=0`) is honored
+            // as-is. A sym8-VL checkpoint that lands on `Some(true)` here is
+            // flipped back to `Some(false)` by the sym8 force above, leaving it
+            // flat so its image turns are rejected at dispatch.
+            match resolved {
+                Some(_) => resolved,
+                None if raw.get("vision_config").is_some() => Some(true),
+                None => None,
             }
         },
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),

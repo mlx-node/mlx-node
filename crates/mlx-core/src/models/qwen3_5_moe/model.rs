@@ -20,7 +20,6 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
-use crate::models::paddleocr_vl::processing::ProcessedImages;
 use crate::models::qwen3_5::model::{
     VisionCache, VisionCacheInner, async_eval_layer_caches, compute_image_token_counts_per_image,
     eval_layer_caches, inject_image_placeholders, vlm_prepare_vision_features,
@@ -38,7 +37,6 @@ use crate::array::MxArray;
 use crate::array::mask::create_causal_mask;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
-use crate::engine::vision::run_vlm_prefill_layers;
 use crate::engine::{
     apply_all_penalties, compute_image_cache_key, compute_performance_metrics, extract_chat_params,
     finalize_chat_result, save_cache_state_direct, verify_cache_prefix_direct,
@@ -1099,16 +1097,10 @@ impl Qwen35MoeInner {
         // Block-paged dispatch — early-return onto the paged core.
         if self.paged_adapter.is_some() {
             if has_images {
-                // Image-bearing MTP+paged is not supported (the eager paged MTP
-                // stepper has no M-RoPE prefill seed); reject it. Plain
-                // (non-MTP) image turns prefill through the paged adapter.
-                if p.enable_mtp && self.has_mtp_weights() {
-                    return Err(Error::from_reason(
-                        "Qwen3.5 MoE MTP+paged dispatch is text-only; image-bearing MTP turns \
-                         require use_block_paged_cache=false (text-only turns continue to \
-                         work).",
-                    ));
-                }
+                // All image turns (MTP or not) prefill through the paged-vision
+                // core. The eager paged MTP stepper has no M-RoPE prefill seed,
+                // so the core decodes plain autoregressively regardless of the
+                // per-request MTP flag — it never reads the MTP head.
                 return self.vision_paged_turn_sync_core(
                     tokens,
                     images,
@@ -1129,6 +1121,18 @@ impl Qwen35MoeInner {
             );
         }
 
+        // The flat fallback below is text-only. A MoE image turn requires the
+        // block-paged backend; reaching here with images means the model was
+        // loaded without a paged adapter (use_block_paged_cache=false or a
+        // non-Metal build).
+        if has_images {
+            return Err(Error::from_reason(
+                "qwen3.5 MoE image turns require the block-paged KV backend; the model was \
+                 loaded without a paged adapter (use_block_paged_cache=false or non-Metal \
+                 build)",
+            ));
+        }
+
         // Pure-Rust eager MTP. Active when the per-request flag is set and the
         // checkpoint carries an MTP head; runs the speculative-decode arm on
         // `Qwen35MoeInner`'s flat caches. Text-only flat turns only (the paged
@@ -1138,25 +1142,10 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
 
-        // === VLM image processing ===
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-            if let (Some(_vision_enc), Some(img_proc)) =
-                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
-            {
-                let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-                let processed_pre = img_proc.process_many(&image_refs)?;
-                let per_image_token_counts =
-                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(images);
-                (expanded, cache_key, Some(processed_pre))
-            } else {
-                (tokens.clone(), 0u64, None)
-            }
-        } else {
-            (tokens.clone(), 0u64, None)
-        };
+        // Text-only from here: the `has_images` early-return above is the only
+        // image path. These bindings preserve the shared cache-reuse / decode
+        // plumbing (`has_images` is always false on this branch).
+        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
 
         // === Cache reuse: prefix verification ===
         let cached_prefix_len = if self.flat_mtp_caches_desynced {
@@ -1274,67 +1263,12 @@ impl Qwen35MoeInner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // === VLM or text prefill branching ===
+        // === Text prefill ===
+        // Image turns never reach here — they early-return onto the paged-vision
+        // core (or error when no paged adapter is present). This is the
+        // text-only flat path.
         profiler.begin_prefill();
-        let (mut last_logits, _seq_len) = if has_images && cached_prefix_len > 0 {
-            // VLM cache reuse: same images, incremental text-only prefill.
-            // Routed through chunked_prefill — typically the delta is a
-            // small user turn so this is a one-iteration no-op, but a user
-            // pasting a long follow-up message still benefits.
-            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-
-            let logits = chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                fa_idx,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
-
-            let seq_len = logits.shape_at(1)?;
-            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-            let last_logits = last_logits.squeeze(Some(&[1]))?;
-            (last_logits, expanded_tokens.len() as i64)
-        } else if has_images && cached_prefix_len == 0 {
-            if let Some(vision_enc) = self.vision_encoder.clone() {
-                let final_tokens = &expanded_tokens;
-                let processed = vlm_processed
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
-
-                let input_ids =
-                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
-
-                let (logits, rope_deltas) = vlm_prefill_moe(
-                    &input_ids,
-                    current_image_cache_key,
-                    processed,
-                    &vision_enc,
-                    sms,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    generation_stream,
-                    fa_idx,
-                    Some(&embedding_weight_t),
-                    &self.vision_cache,
-                )?;
-
-                self.cached_rope_deltas = Some(rope_deltas as i32);
-                let vlm_seq_len = final_tokens.len() as i64;
-                (logits, vlm_seq_len)
-            } else {
-                return Err(Error::from_reason(
-                    "VLM prefill requested but vision encoder/processor not loaded",
-                ));
-            }
-        } else {
+        let (mut last_logits, _seq_len) = {
             // Standard text prefill. Chunked to bound peak GPU memory for
             // long prompts (e.g. 40k+ tokens) — see `chunked_prefill` docs.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
@@ -3220,16 +3154,9 @@ impl Qwen35MoeInner {
         // Block-paged dispatch — early-return BEFORE the compile lock.
         if self.paged_adapter.is_some() {
             if has_images {
-                // Image-bearing MTP+paged is not supported (the paged stream
-                // core is text-only with no M-RoPE-seeded MTP); reject it.
-                // Plain (non-MTP) image turns prefill through the paged adapter.
-                if p.enable_mtp && self.has_mtp_weights() {
-                    return Err(Error::from_reason(
-                        "Qwen3.5 MoE MTP+paged dispatch is text-only; image-bearing MTP turns \
-                         require use_block_paged_cache=false (text-only turns continue to \
-                         work).",
-                    ));
-                }
+                // All image turns (MTP or not) prefill through the paged-vision
+                // stream core. It decodes plain autoregressively regardless of
+                // the per-request MTP flag — it never reads the MTP head.
                 return self.vision_paged_turn_stream_core(
                     tokens,
                     images,
@@ -3254,6 +3181,18 @@ impl Qwen35MoeInner {
             );
         }
 
+        // The flat fallback below is text-only. A MoE image turn requires the
+        // block-paged backend; reaching here with images means the model was
+        // loaded without a paged adapter (use_block_paged_cache=false or a
+        // non-Metal build).
+        if has_images {
+            return Err(Error::from_reason(
+                "qwen3.5 MoE image turns require the block-paged KV backend; the model was \
+                 loaded without a paged adapter (use_block_paged_cache=false or non-Metal \
+                 build)",
+            ));
+        }
+
         // Pure-Rust eager MTP. Text-only flat turns only (paged already
         // early-returned above).
         let eager_mtp =
@@ -3261,25 +3200,10 @@ impl Qwen35MoeInner {
 
         let embedding_weight = self.embedding.get_weight();
 
-        // VLM image processing
-        let sms = self.spatial_merge_size.unwrap_or(2);
-        let (expanded_tokens, current_image_cache_key, vlm_processed) = if has_images {
-            if let (Some(_vision_enc), Some(img_proc)) =
-                (self.vision_encoder.as_ref(), self.image_processor.as_ref())
-            {
-                let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
-                let processed_pre = img_proc.process_many(&image_refs)?;
-                let per_image_token_counts =
-                    compute_image_token_counts_per_image(&processed_pre.grid_thw(), sms)?;
-                let expanded = inject_image_placeholders(&tokens, &per_image_token_counts);
-                let cache_key = compute_image_cache_key(images);
-                (expanded, cache_key, Some(processed_pre))
-            } else {
-                (tokens.clone(), 0u64, None)
-            }
-        } else {
-            (tokens.clone(), 0u64, None)
-        };
+        // Text-only from here: the `has_images` early-return above is the only
+        // image path. These bindings preserve the shared cache-reuse / decode
+        // plumbing (`has_images` is always false on this branch).
+        let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
 
         // Cache reuse
         let cached_prefix_len = if self.flat_mtp_caches_desynced {
@@ -3383,65 +3307,11 @@ impl Qwen35MoeInner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        // VLM or text prefill
+        // Text prefill. Image turns never reach here — they early-return onto
+        // the paged-vision stream core (or error when no paged adapter is
+        // present). This is the text-only flat path.
         profiler.begin_prefill();
-        let (mut last_logits, _seq_len) = if has_images && cached_prefix_len > 0 {
-            // VLM cache reuse (streaming): same images, incremental text-only
-            // prefill. See the sync sibling for the rationale.
-            let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-
-            let logits = chunked_prefill(
-                &prompt,
-                &embedding_weight,
-                &mut self.layers,
-                &mut self.caches,
-                &self.final_norm,
-                &self.lm_head,
-                fa_idx,
-                Some(&embedding_weight_t),
-                generation_stream,
-            )?;
-
-            let seq_len = logits.shape_at(1)?;
-            let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-            let last_logits = last_logits.squeeze(Some(&[1]))?;
-            (last_logits, expanded_tokens.len() as i64)
-        } else if has_images && cached_prefix_len == 0 {
-            if let Some(vision_enc) = self.vision_encoder.clone() {
-                let final_tokens = &expanded_tokens;
-                let processed = vlm_processed
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("VLM processed images missing"))?;
-
-                let input_ids =
-                    MxArray::from_uint32(final_tokens, &[1, final_tokens.len() as i64])?;
-
-                let (logits, rope_deltas) = vlm_prefill_moe(
-                    &input_ids,
-                    current_image_cache_key,
-                    processed,
-                    &vision_enc,
-                    sms,
-                    &embedding_weight,
-                    &mut self.layers,
-                    &mut self.caches,
-                    &self.final_norm,
-                    &self.lm_head,
-                    generation_stream,
-                    fa_idx,
-                    Some(&embedding_weight_t),
-                    &self.vision_cache,
-                )?;
-
-                self.cached_rope_deltas = Some(rope_deltas as i32);
-                let vlm_seq_len = final_tokens.len() as i64;
-                (logits, vlm_seq_len)
-            } else {
-                return Err(Error::from_reason(
-                    "VLM prefill requested but vision encoder/processor not loaded",
-                ));
-            }
-        } else {
+        let (mut last_logits, _seq_len) = {
             // Chunked to bound peak GPU memory for long prompts. See
             // `chunked_prefill` docs for the memory rationale.
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
@@ -3460,12 +3330,7 @@ impl Qwen35MoeInner {
             let seq_len = logits.shape_at(1)?;
             let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
             let last_logits = last_logits.squeeze(Some(&[1]))?;
-            let total_seq_len = if has_images {
-                expanded_tokens.len() as i64
-            } else {
-                tokens.len() as i64
-            };
-            (last_logits, total_seq_len)
+            (last_logits, tokens.len() as i64)
         };
         profiler.end_prefill();
         // caches now reflect the prefilled history
@@ -7835,94 +7700,6 @@ fn chunked_prefill_with_size(
         )?
     };
     Ok(logits)
-}
-
-/// VLM prefill for MoE model using Rust path with M-RoPE position IDs.
-///
-/// Processes images through vision encoder, merges features into embeddings,
-/// computes M-RoPE positions, and runs forward through all layers.
-/// Returns (last_logits [1, vocab], rope_deltas).
-#[allow(clippy::too_many_arguments)]
-fn vlm_prefill_moe(
-    input_ids: &MxArray,
-    image_cache_key: u64,
-    pre_processed: &ProcessedImages,
-    vision_encoder: &Qwen3_5VisionEncoder,
-    spatial_merge_size: i32,
-    text_model_embedding: &MxArray,
-    layers_guard: &mut [DecoderLayer],
-    caches_guard: &mut Option<Vec<Qwen3_5LayerCache>>,
-    final_norm_guard: &RMSNorm,
-    lm_head_guard: &Option<LinearProj>,
-    generation_stream: Stream,
-    fa_idx: usize,
-    embedding_weight_t: Option<&MxArray>,
-    vision_cache: &VisionCache,
-) -> Result<(MxArray, i64)> {
-    use crate::array::clear_cache;
-
-    let merge = vlm_prepare_vision_features(
-        input_ids,
-        image_cache_key,
-        pre_processed,
-        vision_encoder,
-        spatial_merge_size,
-        text_model_embedding,
-        generation_stream,
-        vision_cache,
-    )?;
-
-    // === STEP 4: Rust prefill with M-RoPE ===
-    // MoE VLM always uses Rust path for prefill (no C++ VLM prefill for MoE)
-    let logits = {
-        let _stream_ctx = StreamContext::new(generation_stream);
-
-        // MoE's interleaved full-attention layers need an explicit causal mask
-        // (unlike dense, which uses the attention layer's internal causal SDPA).
-        let seq_len = merge.inputs_embeds.shape_at(1)?;
-        let fa_mask = if seq_len > 1 {
-            let offset = caches_guard
-                .as_ref()
-                .map(|c| c[fa_idx].offset())
-                .unwrap_or(0);
-            Some(create_causal_mask(seq_len as i32, Some(offset), None)?)
-        } else {
-            None
-        };
-
-        let h = run_vlm_prefill_layers(layers_guard, caches_guard, &merge, fa_mask.as_ref())?;
-
-        let h = final_norm_guard.forward(&h)?;
-        let logits = match lm_head_guard {
-            Some(head) => head.forward(&h)?,
-            None => match embedding_weight_t {
-                Some(wt) => h.matmul(wt)?,
-                None => {
-                    let wt = text_model_embedding.transpose(Some(&[1, 0]))?;
-                    h.matmul(&wt)?
-                }
-            },
-        };
-
-        // Eval caches to break lazy chains
-        if let Some(ref caches) = *caches_guard {
-            let mut cache_arrays: Vec<&MxArray> = Vec::new();
-            for cache in caches.iter() {
-                cache.collect_arrays(&mut cache_arrays);
-            }
-            if !cache_arrays.is_empty() {
-                MxArray::async_eval_arrays(&cache_arrays);
-            }
-        }
-        clear_cache();
-
-        logits
-    };
-
-    let seq_len = logits.shape_at(1)?;
-    let last_logits = logits.slice_axis(1, seq_len - 1, seq_len)?;
-    let last_logits = last_logits.squeeze(Some(&[1]))?;
-    Ok((last_logits, merge.rope_deltas))
 }
 
 #[cfg(test)]

@@ -1,30 +1,25 @@
 //! Correctness gate for the Gemma4 **vision** (image+text) PAGED path.
 //!
-//! This is a CORRECTNESS gate, NOT a byte-exact-vs-flat parity gate. Paged
-//! decode is intentionally ~1 bf16 ULP off from flat over long KV context: the
-//! paged block-attention kernel reduces in a different order than flat's
-//! monolithic SDPA, so the two diverge only at a late near-tie. (This is the
-//! accepted paged-vs-eager gap; vLLM ships the identical thing and never forces
-//! bit-equality.) An image is a long prefill, so a byte-exact-vs-flat VLM
-//! assertion would be the WRONG bar — stricter than even paged-TEXT meets, and
-//! stricter than vLLM holds itself to.
-//!
-//! Instead, matching the philosophy of `gemma4_vl_image_chat.rs`, this gate
-//! proves the paged vision path is CORRECT via three independent properties:
+//! Gemma4 image turns run ONLY on the block-paged KV backend; there is no
+//! flat-vision path. This gate therefore proves the paged vision path is
+//! CORRECT on its own terms (no flat reference exists to compare against) via
+//! three independent properties, matching the philosophy of
+//! `gemma4_vl_image_chat.rs`:
+//!   * COHERENCE — paged(image) produces real (non-empty) output.
 //!   * DETERMINISM — paged(image) at T=0 is byte-identical run-to-run.
 //!   * IMAGE-DEPENDENCE — paged(image) differs from paged(no-image), so the
 //!     vision features actually reach generation (a path that silently dropped
 //!     the image would fail this).
-//!   * TRACKS-FLAT — paged(image) shares a long common prefix with flat(image).
-//!     The prefill is bit-identical, so both paths start identically; a real
-//!     position/PLE bug would diverge almost immediately (well under 24 chars),
-//!     while the benign ~1-ULP decode tie only flips a near-tie much later. A
-//!     shared prefix of at least 24 chars therefore passes for a correct port
-//!     and fails for a real bug — without demanding full byte-equality.
 //!
-//! The single source checkpoint is cloned twice (config-only patch:
-//! `use_block_paged_cache` off vs on) so flat and paged differ only in cache
-//! topology — every weight tensor is the same file (symlinked).
+//! Plus an ERROR-CONTRACT property: a model loaded WITHOUT a paged adapter
+//! (`use_block_paged_cache: false`) has no vision path, so an image turn must
+//! return an error indicating the block-paged backend is required — it must
+//! NOT silently fall back.
+//!
+//! The single source checkpoint is cloned with a config-only patch
+//! (`use_block_paged_cache` on for the correctness clones, off for the
+//! error-contract clone) so the clones differ only in cache topology — every
+//! weight tensor is the same file (symlinked).
 //!
 //! Gated on `MLX_TEST_GEMMA4_VL_MODEL_PATH` (a Gemma-4-VL checkpoint, e.g.
 //! gemma-4-e2b-it-mlx) and a test image (`MLX_TEST_VLM_IMAGE_PATH` else
@@ -160,11 +155,6 @@ fn user_message(content: &str) -> ChatMessage {
 
 const PROMPT: &str = "Describe this image briefly.";
 
-/// Length (in chars) of the leading common prefix shared by `a` and `b`.
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
-}
-
 /// Resolve the test image: `MLX_TEST_VLM_IMAGE_PATH` else `examples/ocr.png`
 /// relative to the repo root (CARGO_MANIFEST_DIR is `crates/mlx-core`, so the
 /// repo root is two levels up).
@@ -198,14 +188,9 @@ async fn gemma4_paged_vlm_correctness() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let flat_dir =
-        clone_model_dir(&src, "gemma4-vlm-flat", false).expect("clone flat model dir failed");
     let paged_dir =
         clone_model_dir(&src, "gemma4-vlm-paged", true).expect("clone paged model dir failed");
 
-    let flat_model = Gemma4Model::load(flat_dir.to_string_lossy().to_string())
-        .await
-        .expect("failed to load flat-path Gemma-4-VL model");
     let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string())
         .await
         .expect("failed to load paged-path Gemma-4-VL model");
@@ -256,36 +241,10 @@ async fn gemma4_paged_vlm_correctness() {
         "paged path ignored the image (with/without image produced identical output)"
     );
 
-    // --- 4. TRACKS-FLAT: paged(image) shares a long common prefix with
-    // flat(image). The prefill is bit-identical, so the paths start identically;
-    // a real position/PLE bug would diverge almost immediately (well under 24
-    // chars), while the benign ~1-ULP paged-decode tie only flips a near-tie
-    // much later. A >=24-char shared prefix therefore passes for a correct port
-    // and fails for a real bug — without demanding full byte-equality. ---
-    let flat_a = flat_model
-        .chat_session_start(
-            vec![user_message_with_image(PROMPT, &image)],
-            Some(correctness_chat_config(64)),
-        )
-        .await
-        .expect("flat(image) chat_session_start failed");
-    let shared = common_prefix_chars(&flat_a.text, &paged_a.text);
-    eprintln!(
-        "tracks-flat: flat num_tokens={} paged num_tokens={} common_prefix_chars={}",
-        flat_a.num_tokens, paged_a.num_tokens, shared
-    );
-    assert!(
-        shared >= 24,
-        "paged(image) does not track flat(image): common prefix only {shared} chars \
-         (a real position/PLE bug diverges well under 24)\n\
-         FLAT  text={:?}\nPAGED text={:?}",
-        flat_a.text,
-        paged_a.text,
-    );
-
     eprintln!(
         "Gemma-4-VL paged-VLM correctness: coherence + determinism + \
-         image-dependence + tracks-flat ({shared}-char shared prefix) all passed"
+         image-dependence all passed (paged num_tokens={})",
+        paged_a.num_tokens
     );
 }
 
@@ -359,5 +318,60 @@ async fn gemma4_paged_vlm_continue_is_rejected() {
     eprintln!(
         "Gemma-4-VL paged-VLM continue: text continue correctly REJECTED \
          (image session demands restart)"
+    );
+}
+
+/// Error contract: a model loaded WITHOUT a paged adapter
+/// (`use_block_paged_cache: false`) has no vision path. An image turn must
+/// return an error indicating the block-paged backend is required — it must
+/// NOT silently fall back to a flat path (the flat-vision path was removed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_GEMMA4_VL_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH"]
+async fn gemma4_image_turn_without_paged_adapter_errors() {
+    let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_VL_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_GEMMA4_VL_MODEL_PATH unset");
+        return;
+    };
+    let src = PathBuf::from(&model_path);
+    if !src.exists() {
+        eprintln!(
+            "skipping: MLX_TEST_GEMMA4_VL_MODEL_PATH does not exist: {}",
+            src.display()
+        );
+        return;
+    }
+    let Some(image_path) = resolve_image_path() else {
+        eprintln!("skipping: no test image (set MLX_TEST_VLM_IMAGE_PATH or add examples/ocr.png)");
+        return;
+    };
+    let image = std::fs::read(&image_path).expect("failed to read test image");
+
+    // Clone with `use_block_paged_cache: false` so the model loads with no
+    // paged adapter (the only configuration where the vision path is absent).
+    let flat_dir = clone_model_dir(&src, "gemma4-vlm-no-paged", false)
+        .expect("clone no-paged model dir failed");
+    let flat_model = Gemma4Model::load(flat_dir.to_string_lossy().to_string())
+        .await
+        .expect("failed to load no-paged Gemma-4-VL model");
+
+    let result = flat_model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image)],
+            Some(correctness_chat_config(48)),
+        )
+        .await;
+    let err = result.expect_err(
+        "an image turn on a model with no paged adapter must error, not silently fall back",
+    );
+    assert!(
+        err.reason.contains("block-paged"),
+        "expected a 'block-paged backend required' error, got: {}",
+        err.reason
+    );
+
+    eprintln!(
+        "Gemma-4-VL no-paged image turn: correctly ERRORED \
+         (block-paged backend required): {}",
+        err.reason
     );
 }

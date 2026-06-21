@@ -75,15 +75,18 @@ pub struct Qwen3_5Config {
     /// when unset, they run the eager flat decode. Either way the forward
     /// is pure-Rust eager.
     ///
-    /// **VLM under paged**: a VLM checkpoint loads with this flag set, and a
-    /// fresh single-turn image-bearing prompt prefills through the paged
-    /// adapter (M-RoPE positions feed the rotary; the merged vision
-    /// embeddings feed the forward). Image-bearing MTP turns, and warm
-    /// image-bearing session continues / cache-hit reuse, are still rejected
-    /// at runtime (the GDN two-pass warm prefix is not byte-exact).
+    /// **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+    /// dense image turns ONLY run on the paged-vision core. A fresh single-turn
+    /// image-bearing prompt prefills through the paged adapter (M-RoPE positions
+    /// feed the rotary; the merged vision embeddings feed the forward) and
+    /// decodes plain AR — MTP weights are ignored on image turns. Warm
+    /// image-bearing session continues / cache-hit reuse are still rejected at
+    /// runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
+    /// that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
+    /// a sym8 checkpoint) errors at dispatch.
     ///
-    /// Default: `None` / `false` (use the eager flat decode path).
-    /// Default-flip pending real-weights parity verification.
+    /// Default: `None` for text-only checkpoints (eager flat decode);
+    /// `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,

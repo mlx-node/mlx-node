@@ -1458,7 +1458,20 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .get("paged_block_size")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
-        use_block_paged_cache: raw.get("use_block_paged_cache").and_then(|v| v.as_bool()),
+        use_block_paged_cache: {
+            let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
+            // Vision (VLM) checkpoints default to the block-paged KV backend:
+            // MoE image turns only run on the paged-vision core. When the config
+            // leaves `use_block_paged_cache` unset and a `vision_config` is
+            // present, force paged on. An explicit value is honored as-is; an
+            // explicit `false` leaves the model flat so its image turns are
+            // rejected at dispatch.
+            match explicit {
+                Some(_) => explicit,
+                None if raw.get("vision_config").is_some() => Some(true),
+                None => None,
+            }
+        },
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
     })
 }

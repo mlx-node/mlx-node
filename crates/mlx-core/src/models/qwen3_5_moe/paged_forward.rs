@@ -392,10 +392,9 @@ pub(crate) fn run_paged_prefill_single_shot(
 /// SINGLE-TURN ONLY: runs on a fresh prefill (`cached_prefix_len == 0`); there
 /// is no GDN prefix replay and no cache-hit read-back. The forward runs in one
 /// shot over the whole sequence so the GDN recurrent-state accumulation and
-/// M-RoPE positions match the flat VLM prefill. No explicit causal mask is
-/// passed: `Qwen3_5Attention::forward_paged` applies its internal causal SDPA
-/// (this is the single divergence from the flat MoE VLM path, which builds an
-/// explicit `create_causal_mask` for the shared `run_vlm_prefill_layers` seam).
+/// M-RoPE positions stay consistent across the prefill. No explicit causal
+/// mask is passed: `Qwen3_5Attention::forward_paged` applies its internal
+/// causal SDPA.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_vlm_prefill_moe(
     expanded_tokens: &[u32],

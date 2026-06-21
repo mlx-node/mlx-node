@@ -107,7 +107,7 @@ use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
-use tracing::{debug, info};
+use tracing::info;
 
 /// PLE (Per-Layer Embeddings) model-level components.
 ///
@@ -1617,657 +1617,6 @@ impl Gemma4Inner {
         Ok((expanded, processed_images, new_image_key))
     }
 
-    /// Vision (VLM) whole-turn core, non-streaming: the VISION flow over a
-    /// pre-rendered prompt. Owns image processing, `<|image|>` expansion,
-    /// the merged-embedding prefill, the flat decode loop, session save
-    /// (incl. the image cache key), and Gemma4 output parsing.
-    ///
-    /// Image-bearing turns always cold-start: `verify_cache_prefix(..,
-    /// has_images = true)` forces a miss whenever images are involved on
-    /// either side, so the reset + full prefill here is unconditional and
-    /// `cached_tokens` reports 0.
-    fn vision_whole_turn_sync_core(
-        &mut self,
-        rendered_tokens: &[u32],
-        raw_images: &[Vec<u8>],
-        tokenizer: &Arc<Qwen3Tokenizer>,
-        config: &ChatConfig,
-        eos_token_id: u32,
-    ) -> Result<ChatResult> {
-        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, new_image_key) =
-            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
-        let sampling_config = make_sampling_config(config, &self.config);
-        let repetition_cutoff = repetition_cutoff_from_config(config);
-        let eos_ids = self.config.eos_token_ids.clone();
-
-        // Cache miss by construction (images involved): drop any stale
-        // caches/history and re-init, then full re-prefill.
-        self.reset_caches_sync()?;
-        self.init_caches_sync()?;
-
-        let prefill_slice: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let prefill_len = prefill_slice.len();
-        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
-
-        // Create dedicated generation stream for GPU scheduling.
-        let generation_stream = Stream::new(DeviceType::Gpu);
-
-        // Wired memory: pin model weights in GPU memory (prevents paging for large models).
-        // Uses usize::MAX to always set limit to max_recommended_working_set_size.
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
-
-        let generation_start = std::time::Instant::now();
-        let prompt_token_count = tokens.len();
-
-        // Vision prefill: build merged embeddings (text embeddings with
-        // vision features scattered at image_token positions).
-        let vision_embeds: Option<MxArray> = if let Some(ref vt) = self.vision_tower
-            && let Some(ref ev) = self.embed_vision
-        {
-            let image_token_id = self.config.image_token_id.unwrap_or(258880);
-
-            // Run vision tower on each image and collect features
-            let mut all_features: Vec<MxArray> = Vec::new();
-            for proc in &processed_images {
-                let features = vt.forward(&proc.pixel_values)?;
-                let projected = ev.forward(&features)?;
-                all_features.push(projected);
-            }
-
-            // Concatenate all image features: [1, total_soft_tokens, hidden_size]
-            let image_features = if all_features.len() == 1 {
-                all_features.remove(0)
-            } else {
-                let refs: Vec<&MxArray> = all_features.iter().collect();
-                MxArray::concatenate_many(refs, Some(1))?
-            };
-
-            // Build text embeddings
-            let text_embeds = self.embed_tokens.forward(&prompt)?;
-            let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-
-            // Cast image features to text embedding dtype
-            let embed_dtype = text_embeds.dtype()?;
-            let image_features = image_features.astype(embed_dtype)?;
-
-            // masked_scatter: replace image_token positions with vision features
-            let image_token = MxArray::scalar_int(image_token_id)?;
-            let image_mask = prompt.equal(&image_token)?;
-
-            // Validate: number of True positions in mask must match vision feature count
-            let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
-            mask_count_arr.eval();
-            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
-            let feature_count = image_features.shape_at(1)?;
-            if mask_count != feature_count {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
-                         Check that image token expansion produced the correct number of tokens."
-                    ),
-                ));
-            }
-
-            let image_mask_expanded = image_mask.expand_dims(-1)?;
-            let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
-
-            let merged = masked_scatter(&text_embeds, &image_mask_expanded, &image_features)?;
-            Some(merged)
-        } else {
-            None
-        };
-
-        // Prefill: process tokens [0:N-1] through body only (no lm_head),
-        // then run last token through full forward to get logits.
-        // Matches mlx-lm generate_step pattern.
-        {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let caches = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?;
-            if let Some(ref embeds) = vision_embeds {
-                // Vision path: prefill with merged embeddings
-                prefill_body_gemma4_with_embeds(
-                    &prompt,
-                    embeds,
-                    &self.embed_tokens,
-                    &self.layers,
-                    caches,
-                    &self.final_norm,
-                    self.ple.as_ref(),
-                    &self.config,
-                )?;
-            } else {
-                // Text-only fallback (checkpoint lacks the vision tower)
-                prefill_body_gemma4(
-                    &prompt,
-                    &self.embed_tokens,
-                    &self.layers,
-                    caches,
-                    &self.final_norm,
-                    self.ple.as_ref(),
-                    &self.config,
-                )?;
-            }
-        }
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?,
-        )?;
-
-        // Last token → logits. `prefill_body_gemma4*` processed
-        // `[0 .. prefill_len - 1]` and left the final token for us.
-        let last_token = prompt.slice_axis(1, prefill_len as i64 - 1, prefill_len as i64)?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let caches = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?;
-            crate::models::gemma4::diagnostic::set_step(-1);
-            forward_inner(
-                &last_token,
-                &self.embed_tokens,
-                &self.layers,
-                caches,
-                &self.final_norm,
-                &self.lm_head,
-                self.embed_weight_t.as_ref(),
-                self.ple.as_ref(),
-                &self.config,
-            )?
-        };
-        let logits = logits.squeeze(Some(&[1]))?;
-        let y = sample_next_token(&logits, sampling_config)?;
-        y.eval();
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?,
-        )?;
-
-        // Mark first token time (TTFT = time to first token)
-        let first_token_instant = std::time::Instant::now();
-
-        // Decode loop — matches mlx-lm generate.py pattern (see the
-        // engine's `run_decode_loop` for the text path; this vision core
-        // runs its own flat loop):
-        // 1. Build lazy graph per step via forward_inner
-        // 2. async_eval the output token (caches materialize through dependency graph)
-        // 3. Double-buffer: build step N+1 while GPU executes step N
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = "length".to_string();
-
-        {
-            let mut current_y = y;
-            for step in 0..max_new_tokens {
-                let next_y = if step + 1 < max_new_tokens {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("Gemma4 vision decode: caches missing")
-                    })?;
-
-                    let next_ids = current_y.reshape(&[1, 1])?;
-                    crate::models::gemma4::diagnostic::set_step(step);
-                    let logits = forward_inner(
-                        &next_ids,
-                        &self.embed_tokens,
-                        &self.layers,
-                        caches,
-                        &self.final_norm,
-                        &self.lm_head,
-                        self.embed_weight_t.as_ref(),
-                        self.ple.as_ref(),
-                        &self.config,
-                    )?;
-                    let logits = logits.squeeze(Some(&[1]))?;
-                    let next_token = sample_next_token(&logits, sampling_config)?;
-                    MxArray::async_eval_arrays(&[&next_token]);
-                    Some(next_token)
-                } else {
-                    None
-                };
-
-                // Force `current_y` to evaluate before reading its host value.
-                // See `paged_turn_sync_core_inner` for the full rationale
-                // (`item_at_int32` reads CPU memory without an implicit eval).
-                current_y.eval();
-                let token_id = current_y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-
-                if is_eos_token(token_id, &eos_ids, eos_token_id) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-                if let Some(reason) =
-                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
-                {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if let Some(next_token) = next_y {
-                    current_y = next_token;
-                } else {
-                    break;
-                }
-
-                if (step + 1) % 256 == 0 {
-                    crate::array::clear_cache();
-                }
-            }
-        }
-
-        // Decode text with special tokens preserved so we can extract
-        // Gemma4's `<|channel>...<channel|>` reasoning and
-        // `<|tool_call>...<tool_call|>` tool-call DSL blocks.
-        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
-
-        // Save session state so subsequent `chat_session_continue` calls
-        // can append a raw delta on top of the live caches. Drop the
-        // last generated token when `finish_reason != "length"` so the
-        // cached history ends on the turn-terminator boundary.
-        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
-            &generated_tokens[..generated_tokens.len() - 1]
-        } else {
-            &generated_tokens[..]
-        };
-        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
-        new_history.extend(tokens.iter().copied());
-        new_history.extend_from_slice(history_tokens);
-        self.cached_token_history = new_history;
-        self.cached_image_key = new_image_key;
-
-        // Compute performance metrics
-        let generation_end = std::time::Instant::now();
-        let ttft_ms = first_token_instant
-            .duration_since(generation_start)
-            .as_secs_f64()
-            * 1000.0;
-        let decode_ms = generation_end
-            .duration_since(first_token_instant)
-            .as_secs_f64()
-            * 1000.0;
-        let gen_toks = generated_tokens.len() as f64;
-        let mem_after = crate::array::get_active_memory();
-        debug!(
-            "[gemma4-chat] after generate: {:.2} GB active",
-            mem_after / 1e9
-        );
-
-        let performance = Some(crate::profiling::PerformanceMetrics {
-            ttft_ms,
-            prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prefill_len as f64 / (ttft_ms / 1000.0)
-            } else {
-                0.0
-            },
-            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                (gen_toks - 1.0) / (decode_ms / 1000.0)
-            } else {
-                0.0
-            },
-            // Gemma4 has no MTP heads — acceptance fields stay None.
-            mtp_mean_accepted_tokens: None,
-            mtp_mean_accepted_tokens_total: None,
-            mtp_acceptance_by_position: None,
-            mtp_cycles: None,
-            mtp_mean_depth: None,
-            profile_phases: None,
-        });
-
-        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
-        promote_channel_only_output(&mut parsed);
-        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        Ok(ChatResult {
-            text: parsed.text,
-            tool_calls: parsed.tool_calls,
-            thinking: parsed.thinking,
-            num_tokens: generated_tokens.len() as u32,
-            prompt_tokens: prompt_token_count as u32,
-            reasoning_tokens: 0,
-            finish_reason,
-            raw_text,
-            cached_tokens: 0,
-            performance,
-        })
-    }
-
-    /// Vision (VLM) whole-turn core, streaming: the VISION flow over a
-    /// pre-rendered prompt. Same cold-start semantics as
-    /// [`Self::vision_whole_turn_sync_core`]; streams parser segments and
-    /// emits the terminal chunk itself.
-    #[allow(clippy::too_many_arguments)]
-    fn vision_whole_turn_stream_core(
-        &mut self,
-        rendered_tokens: &[u32],
-        raw_images: &[Vec<u8>],
-        tokenizer: &Arc<Qwen3Tokenizer>,
-        config: &ChatConfig,
-        eos_token_id: u32,
-        sink: &dyn ChunkSink,
-        cancelled: &AtomicBool,
-    ) -> Result<()> {
-        let cb = StreamSender(sink);
-        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, new_image_key) =
-            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
-        let sampling_config = make_sampling_config(config, &self.config);
-        let repetition_cutoff = repetition_cutoff_from_config(config);
-        let eos_ids = self.config.eos_token_ids.clone();
-
-        // Cache miss by construction (images involved) — see the
-        // non-streaming core.
-        self.reset_caches_sync()?;
-        self.init_caches_sync()?;
-
-        let prefill_slice: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let prefill_len = prefill_slice.len();
-        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
-
-        let generation_stream = Stream::new(DeviceType::Gpu);
-        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
-
-        let generation_start = std::time::Instant::now();
-        let prompt_token_count = tokens.len();
-
-        let vision_embeds: Option<MxArray> = if let Some(ref vt) = self.vision_tower
-            && let Some(ref ev) = self.embed_vision
-        {
-            let image_token_id = self.config.image_token_id.unwrap_or(258880);
-            let mut all_features: Vec<MxArray> = Vec::new();
-            for proc in &processed_images {
-                let features = vt.forward(&proc.pixel_values)?;
-                let projected = ev.forward(&features)?;
-                all_features.push(projected);
-            }
-            let image_features = if all_features.len() == 1 {
-                all_features.remove(0)
-            } else {
-                let refs: Vec<&MxArray> = all_features.iter().collect();
-                MxArray::concatenate_many(refs, Some(1))?
-            };
-            let text_embeds = self.embed_tokens.forward(&prompt)?;
-            let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-            let embed_dtype = text_embeds.dtype()?;
-            let image_features = image_features.astype(embed_dtype)?;
-            let image_token = MxArray::scalar_int(image_token_id)?;
-            let image_mask = prompt.equal(&image_token)?;
-            let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
-            mask_count_arr.eval();
-            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
-            let feature_count = image_features.shape_at(1)?;
-            if mask_count != feature_count {
-                return Err(Error::new(
-                    Status::GenericFailure,
-                    format!(
-                        "Image token count ({mask_count}) does not match vision feature count ({feature_count})."
-                    ),
-                ));
-            }
-            let image_mask_expanded = image_mask.expand_dims(-1)?;
-            let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
-            Some(masked_scatter(
-                &text_embeds,
-                &image_mask_expanded,
-                &image_features,
-            )?)
-        } else {
-            None
-        };
-
-        {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let caches = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?;
-            if let Some(ref embeds) = vision_embeds {
-                prefill_body_gemma4_with_embeds(
-                    &prompt,
-                    embeds,
-                    &self.embed_tokens,
-                    &self.layers,
-                    caches,
-                    &self.final_norm,
-                    self.ple.as_ref(),
-                    &self.config,
-                )?;
-            } else {
-                prefill_body_gemma4(
-                    &prompt,
-                    &self.embed_tokens,
-                    &self.layers,
-                    caches,
-                    &self.final_norm,
-                    self.ple.as_ref(),
-                    &self.config,
-                )?;
-            }
-        }
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?,
-        )?;
-
-        let last_token = prompt.slice_axis(1, prefill_len as i64 - 1, prefill_len as i64)?;
-        let logits = {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            let caches = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?;
-            crate::models::gemma4::diagnostic::set_step(-1);
-            forward_inner(
-                &last_token,
-                &self.embed_tokens,
-                &self.layers,
-                caches,
-                &self.final_norm,
-                &self.lm_head,
-                self.embed_weight_t.as_ref(),
-                self.ple.as_ref(),
-                &self.config,
-            )?
-        };
-        let logits = logits.squeeze(Some(&[1]))?;
-        let y = sample_next_token(&logits, sampling_config)?;
-        y.eval();
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 vision prefill: caches missing"))?,
-        )?;
-
-        let first_token_instant = std::time::Instant::now();
-        let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut finish_reason = "length".to_string();
-
-        // `decode_stream(false)` preserves Gemma4 special tokens
-        // (`<|channel>`, `<|tool_call>`, …) in the streamed text so the
-        // stream parser can see them. The final `decode_sync(…, false)`
-        // below mirrors this for consistency with the parsed result.
-        let mut decode_stream = tokenizer.inner().decode_stream(false);
-        let mut streamed_text_len = 0;
-        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
-        let mut stream_dispatch = Gemma4StreamDispatchState::default();
-
-        {
-            let mut current_y = y;
-            for step in 0..max_new_tokens {
-                let next_y = if step + 1 < max_new_tokens {
-                    let _stream_ctx = StreamContext::new(generation_stream);
-                    let caches = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("Gemma4 vision decode: caches missing")
-                    })?;
-                    let next_ids = current_y.reshape(&[1, 1])?;
-                    crate::models::gemma4::diagnostic::set_step(step);
-                    let logits = forward_inner(
-                        &next_ids,
-                        &self.embed_tokens,
-                        &self.layers,
-                        caches,
-                        &self.final_norm,
-                        &self.lm_head,
-                        self.embed_weight_t.as_ref(),
-                        self.ple.as_ref(),
-                        &self.config,
-                    )?;
-                    let logits = logits.squeeze(Some(&[1]))?;
-                    let next_token = sample_next_token(&logits, sampling_config)?;
-                    MxArray::async_eval_arrays(&[&next_token]);
-                    Some(next_token)
-                } else {
-                    None
-                };
-
-                // See `paged_turn_sync_core_inner` for the rationale.
-                current_y.eval();
-                let token_id = current_y.item_at_int32(0)? as u32;
-                generated_tokens.push(token_id);
-
-                if cancelled.load(Ordering::Relaxed) {
-                    finish_reason = "cancelled".to_string();
-                    break;
-                }
-
-                let token_text = Qwen3Tokenizer::step_decode_stream(
-                    &mut decode_stream,
-                    tokenizer.inner(),
-                    token_id,
-                    &generated_tokens,
-                    streamed_text_len,
-                );
-                streamed_text_len += token_text.len();
-
-                let segments = stream_parser.feed(&token_text);
-                stream_dispatch.dispatch_segments(segments, &cb);
-
-                if is_eos_token(token_id, &eos_ids, eos_token_id) {
-                    finish_reason = "stop".to_string();
-                    break;
-                }
-                if let Some(reason) =
-                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
-                {
-                    finish_reason = reason.to_string();
-                    break;
-                }
-                if let Some(next_token) = next_y {
-                    current_y = next_token;
-                } else {
-                    break;
-                }
-
-                if (step + 1) % 256 == 0 {
-                    crate::array::clear_cache();
-                }
-            }
-        }
-
-        // `decode_sync(…, false)` matches the streaming decoder setting
-        // so any residual bytes left inside the tokenizer's DecodeStream
-        // surface with the same special-token representation the stream
-        // parser was fed.
-        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
-
-        // Flush any residual bytes that might not have resolved at the streaming layer
-        if raw_text.len() > streamed_text_len {
-            let residual = raw_text[streamed_text_len..].to_string();
-            let mut segments = stream_parser.feed(&residual);
-            segments.extend(stream_parser.flush());
-            stream_dispatch.dispatch_segments(segments, &cb);
-        } else {
-            let tail = stream_parser.flush();
-            stream_dispatch.dispatch_segments(tail, &cb);
-        }
-        stream_dispatch.finish(&cb);
-
-        // Save session state — see the non-streaming core.
-        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
-            &generated_tokens[..generated_tokens.len() - 1]
-        } else {
-            &generated_tokens[..]
-        };
-        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
-        new_history.extend(tokens.iter().copied());
-        new_history.extend_from_slice(history_tokens);
-        self.cached_token_history = new_history;
-        self.cached_image_key = new_image_key;
-
-        let generation_end = std::time::Instant::now();
-        let ttft_ms = first_token_instant
-            .duration_since(generation_start)
-            .as_secs_f64()
-            * 1000.0;
-        let decode_ms = generation_end
-            .duration_since(first_token_instant)
-            .as_secs_f64()
-            * 1000.0;
-        let gen_toks = generated_tokens.len() as f64;
-
-        let performance = Some(crate::profiling::PerformanceMetrics {
-            ttft_ms,
-            prefill_tokens_per_second: if ttft_ms > 0.0 {
-                prefill_len as f64 / (ttft_ms / 1000.0)
-            } else {
-                0.0
-            },
-            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
-                (gen_toks - 1.0) / (decode_ms / 1000.0)
-            } else {
-                0.0
-            },
-            // Gemma4 has no MTP heads — acceptance fields stay None.
-            mtp_mean_accepted_tokens: None,
-            mtp_mean_accepted_tokens_total: None,
-            mtp_acceptance_by_position: None,
-            mtp_cycles: None,
-            mtp_mean_depth: None,
-            profile_phases: None,
-        });
-
-        let parsed_tool_calls = stream_parser.tool_calls();
-        let parsed_thinking = stream_parser.thinking();
-        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
-            "tool_calls".to_string()
-        } else {
-            finish_reason
-        };
-
-        // Emit final block
-        cb.call(
-            Ok(ChatStreamChunk {
-                text: String::new(),
-                done: true,
-                finish_reason: Some(finish_reason),
-                tool_calls: Some(parsed_tool_calls),
-                thinking: parsed_thinking,
-                num_tokens: Some(generated_tokens.len() as u32),
-                prompt_tokens: Some(prompt_token_count as u32),
-                reasoning_tokens: Some(0),
-                raw_text: Some(raw_text),
-                // Image turns always cold-start (cache miss by
-                // construction) — no reusable prefix to report.
-                cached_tokens: Some(0),
-                performance,
-                is_reasoning: None,
-            }),
-            ThreadsafeFunctionCallMode::NonBlocking,
-        );
-
-        Ok(())
-    }
-
     /// Build the merged image+text input embeddings for a vision prefill.
     ///
     /// Runs the vision tower on each processed image, projects features, then
@@ -2333,11 +1682,10 @@ impl Gemma4Inner {
     /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
     /// non-streaming.
     ///
-    /// Same image-prep as [`Self::vision_whole_turn_sync_core`] (process
-    /// images, expand `<|image|>` tokens, `masked_scatter` features into the
-    /// residual) but writes full-attention K/V into the paged adapter pool
-    /// instead of the flat global caches. Sliding layers still use the flat
-    /// rotating caches.
+    /// Shared image-prep (`prepare_vision_tokens` to expand `<|image|>`
+    /// tokens, `build_gemma4_vision_embeds` to `masked_scatter` features
+    /// into the residual) writes full-attention K/V into the paged adapter
+    /// pool. Sliding layers still use the flat rotating caches.
     ///
     /// Single-image-turn-only and cold-start by construction: the adapter is
     /// reset with `max_cache_hit_tokens = 0` and the sliding caches are rebuilt
@@ -3716,9 +3064,8 @@ impl Gemma4Inner {
     ///     `sqrt(hidden_size)` by the caller) instead of
     ///     `embed_tokens.forward(token_ids)`;
     ///   * PLE per-layer embeddings zero the image-token positions in
-    ///     `chunk_token_ids` before `compute_ple` — matching
-    ///     `prefill_body_gemma4_with_embeds`, because the image positions carry
-    ///     vision features in the residual, not token PLE residuals.
+    ///     `chunk_token_ids` before `compute_ple`, because the image positions
+    ///     carry vision features in the residual, not token PLE residuals.
     ///
     /// `chunk_token_ids` is the expanded token slice for this chunk (drives the
     /// PLE image mask and the sliding-mask sequence length).
@@ -3743,7 +3090,6 @@ impl Gemma4Inner {
 
         // PLE over image-masked token ids: image positions hold vision
         // features (not token embeddings), so their PLE residual must be zero.
-        // Same masking as `prefill_body_gemma4_with_embeds`.
         let projected_ple: Option<MxArray> = if let Some(ref ple) = self.ple {
             let image_token_id = self.config.image_token_id.unwrap_or(258880);
             let image_token = MxArray::scalar_int(image_token_id)?;
@@ -3902,9 +3248,9 @@ impl Gemma4Inner {
     ///
     /// Single-shot only: the adapter holds zero tokens and the sliding flat
     /// caches were freshly built, so `cached_prefix_len == 0` and there is no
-    /// prefix-cache restore. Mirrors the flat vision core's
-    /// `prefill_body_gemma4_with_embeds` + last-token `forward_inner` split,
-    /// which is load-bearing — see [`Self::run_paged_prefill_chunk`] for why
+    /// prefix-cache restore. Splits the merged-embedding body prefill from a
+    /// last-token `forward_inner`, a split that is load-bearing — see
+    /// [`Self::run_paged_prefill_chunk`] for why
     /// the final prompt token must run through the cache-hit branch separately
     /// (BF16 SDPA drift otherwise flips argmax to a zero-embedding `<unused>`
     /// token and the `<turn|>` stop is missed).
@@ -4559,54 +3905,43 @@ impl Gemma4Inner {
     /// [`ChatBackend::vision_turn`] probe. Only fresh turns carry
     /// images (the engine's delta inputs are text-only by construction
     /// and the delta image guard rejects image-holding sessions), so
-    /// both cores cold-start unconditionally —
+    /// the paged cores cold-start unconditionally —
     /// `verify_cache_prefix(.., has_images = true)` forces a miss.
+    ///
+    /// Image turns run ONLY on the block-paged KV backend. A model with
+    /// no paged adapter (explicit `use_block_paged_cache: false`, a
+    /// non-Metal build, or paged init failure) has no vision path and
+    /// returns an error instead of silently falling back.
     fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        if self.paged_adapter.is_none() {
+            return Err(Error::from_reason(
+                "gemma4 image turns require the block-paged KV backend; the model was loaded \
+                 without a paged adapter (use_block_paged_cache=false, non-Metal build, or paged \
+                 init failed)",
+            ));
+        }
         let tokenizer = args.tokenizer.clone();
-        let paged = self.paged_adapter.is_some();
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
-                if paged {
-                    self.vision_paged_turn_stream_core(
-                        args.tokens,
-                        args.images,
-                        &tokenizer,
-                        args.config,
-                        args.eos_id,
-                        sink,
-                        cancelled,
-                    )?;
-                } else {
-                    self.vision_whole_turn_stream_core(
-                        args.tokens,
-                        args.images,
-                        &tokenizer,
-                        args.config,
-                        args.eos_id,
-                        sink,
-                        cancelled,
-                    )?;
-                }
+                self.vision_paged_turn_stream_core(
+                    args.tokens,
+                    args.images,
+                    &tokenizer,
+                    args.config,
+                    args.eos_id,
+                    sink,
+                    cancelled,
+                )?;
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = if paged {
-                    self.vision_paged_turn_sync_core(
-                        args.tokens,
-                        args.images,
-                        &tokenizer,
-                        args.config,
-                        args.eos_id,
-                    )?
-                } else {
-                    self.vision_whole_turn_sync_core(
-                        args.tokens,
-                        args.images,
-                        &tokenizer,
-                        args.config,
-                        args.eos_id,
-                    )?
-                };
+                let result = self.vision_paged_turn_sync_core(
+                    args.tokens,
+                    args.images,
+                    &tokenizer,
+                    args.config,
+                    args.eos_id,
+                )?;
                 Ok(TurnOutput::Complete(Box::new(result)))
             }
         }
@@ -6887,92 +6222,6 @@ fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<M
     // where mask=1 use aligned (source), else keep input
     let result = mask_flat.where_(&aligned, &input_flat)?;
     result.reshape(&input_shape)
-}
-
-/// Chunked prefill with pre-computed embeddings (for vision path).
-///
-/// Same as `prefill_body_gemma4` but uses pre-merged `inputs_embeds` instead
-/// of looking up from the embedding table. PLE tokens at image positions are
-/// zeroed to avoid confusing the per-layer embeddings with vision token IDs.
-fn prefill_body_gemma4_with_embeds(
-    prompt: &MxArray,
-    inputs_embeds: &MxArray,
-    embedding: &Embedding,
-    layers: &[Gemma4DecoderLayer],
-    caches: &mut [Gemma4LayerCache],
-    final_norm: &RMSNorm,
-    ple: Option<&PleComponents>,
-    config: &Gemma4Config,
-) -> Result<()> {
-    let total_len = inputs_embeds.shape_at(1)?;
-
-    if total_len <= 1 {
-        return Ok(());
-    }
-
-    // Process tokens [0:N-1] — leave last token for forward_inner
-    let prefill_len = total_len - 1;
-    let all_embeds = inputs_embeds.slice_axis(1, 0, prefill_len)?;
-
-    // PLE: mask image token positions to 0 before computing per-layer embeddings
-    let all_ple: Option<MxArray> = if let Some(ple) = ple {
-        let prefill_ids = prompt.slice_axis(1, 0, prefill_len)?;
-        let image_token_id = config.image_token_id.unwrap_or(258880);
-        let image_token = MxArray::scalar_int(image_token_id)?;
-        let image_mask = prefill_ids.equal(&image_token)?;
-        let zero = MxArray::scalar_int(0)?;
-        let masked_ids = image_mask.where_(&zero, &prefill_ids)?;
-        Some(compute_ple(&masked_ids, &all_embeds, ple, prefill_len)?)
-    } else {
-        None
-    };
-
-    let mut offset: i64 = 0;
-
-    while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
-        let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
-        let chunk_ple = all_ple
-            .as_ref()
-            .map(|p| p.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE))
-            .transpose()?;
-
-        let _hidden = forward_body(
-            None,
-            Some(chunk_embeds),
-            embedding,
-            layers,
-            caches,
-            final_norm,
-            ple,
-            chunk_ple.as_ref(),
-            config,
-        )?;
-        eval_gemma4_caches(caches)?;
-        crate::array::clear_cache();
-        offset += GEMMA4_PREFILL_STEP_SIZE;
-    }
-
-    if offset < prefill_len {
-        let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
-        let remaining_ple = all_ple
-            .as_ref()
-            .map(|p| p.slice_axis(1, offset, prefill_len))
-            .transpose()?;
-
-        let _hidden = forward_body(
-            None,
-            Some(remaining_embeds),
-            embedding,
-            layers,
-            caches,
-            final_norm,
-            ple,
-            remaining_ple.as_ref(),
-            config,
-        )?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

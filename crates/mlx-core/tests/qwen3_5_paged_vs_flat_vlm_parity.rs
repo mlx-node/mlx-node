@@ -1,30 +1,30 @@
-//! Correctness gate for the Qwen3.5 dense **vision** (image+text) PAGED path.
+//! Correctness + error-contract gate for the Qwen3.5 dense **vision**
+//! (image+text) path.
 //!
-//! This is a CORRECTNESS gate, NOT a byte-exact-vs-flat parity gate. Paged
-//! decode is intentionally ~1 bf16 ULP off from flat over long KV context: the
-//! paged block-attention kernel reduces in a different order than flat's
-//! monolithic SDPA, so the two diverge only at a late near-tie. (This is the
-//! accepted paged-vs-eager gap; vLLM ships the identical thing and never forces
-//! bit-equality.) An image is a long prefill, so a byte-exact-vs-flat VLM
-//! assertion would be the WRONG bar — stricter than even paged-TEXT meets, and
-//! stricter than vLLM holds itself to.
+//! Dense image turns run ONLY on the block-paged backend. VLM checkpoints
+//! default to paged at load; the flat path no longer has a vision arm, so a
+//! vision turn that reaches a None paged adapter ERRORS at dispatch. This file
+//! therefore proves two things:
 //!
-//! Instead, matching the philosophy of `qwen3_5_vl_image_chat.rs`, this gate
-//! proves the paged vision path is CORRECT via three independent properties:
+//!   1. The paged vision path is CORRECT (the only path image turns take).
+//!   2. A flat-loaded (`use_block_paged_cache: false`) clone REJECTS an image
+//!      turn with a clear "requires the block-paged KV backend" error, rather
+//!      than silently running a removed flat-vision path.
+//!
+//! For (1) this is a CORRECTNESS gate, NOT a byte-exact-vs-flat parity gate
+//! (the flat-vision path is gone, so there is nothing to compare against).
+//! Matching the philosophy of `qwen3_5_vl_image_chat.rs`, it proves the paged
+//! vision path is CORRECT via three independent properties:
+//!   * COHERENCE — paged(image) produces real (non-empty) output.
 //!   * DETERMINISM — paged(image) at T=0 is byte-identical run-to-run.
 //!   * IMAGE-DEPENDENCE — paged(image) differs from paged(no-image), so the
 //!     vision features actually reach generation (a path that silently dropped
 //!     the image would fail this).
-//!   * TRACKS-FLAT — paged(image) shares a long common prefix with flat(image).
-//!     The prefill is bit-identical (proven), so both paths start identically;
-//!     a real M-RoPE/position bug would diverge almost immediately (well under
-//!     24 chars), while the benign ~1-ULP decode tie only flips a near-tie much
-//!     later. A >=24-char shared prefix therefore passes for a correct port and
-//!     fails for a real bug — without demanding full byte-equality.
 //!
-//! The single source checkpoint is cloned twice (config-only patch:
-//! `use_block_paged_cache` off vs on) so flat and paged differ only in cache
-//! topology — every weight tensor is the same file (symlinked).
+//! The source checkpoint is cloned with a config-only patch
+//! (`use_block_paged_cache` on for the paged clone, off for the error-contract
+//! clone) so the clones differ only in cache topology — every weight tensor is
+//! the same file (symlinked).
 //!
 //! Gated on `MLX_TEST_QWEN35_VL_MODEL_PATH` (a vision checkpoint) and a test
 //! image (`MLX_TEST_VLM_IMAGE_PATH` else `examples/ocr.png`). A plain
@@ -163,11 +163,6 @@ fn user_message(content: &str) -> ChatMessage {
 
 const PROMPT: &str = "Describe this image briefly.";
 
-/// Length (in chars) of the leading common prefix shared by `a` and `b`.
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
-}
-
 /// Resolve the test image: `MLX_TEST_VLM_IMAGE_PATH` else `examples/ocr.png`
 /// relative to the repo root (CARGO_MANIFEST_DIR is `crates/mlx-core`, so the
 /// repo root is two levels up).
@@ -212,14 +207,9 @@ async fn qwen3_5_paged_vlm_correctness() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let flat_dir =
-        clone_model_dir(&src, "qwen35-vlm-flat", false).expect("clone flat model dir failed");
     let paged_dir =
         clone_model_dir(&src, "qwen35-vlm-paged", true).expect("clone paged model dir failed");
 
-    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
-        .await
-        .expect("failed to load flat-path Qwen3.5-VL model");
     let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
         .await
         .expect("failed to load paged-path Qwen3.5-VL model");
@@ -270,36 +260,9 @@ async fn qwen3_5_paged_vlm_correctness() {
         "paged path ignored the image (with/without image produced identical output)"
     );
 
-    // --- 4. TRACKS-FLAT: paged(image) shares a long common prefix with
-    // flat(image). The prefill is bit-identical, so the paths start identically;
-    // a real M-RoPE/position bug would diverge almost immediately (well under
-    // 24 chars), while the benign ~1-ULP paged-decode tie only flips a near-tie
-    // much later. A >=24-char shared prefix therefore passes for a correct port
-    // and fails for a real bug — without demanding full byte-equality. ---
-    let flat_a = flat_model
-        .chat_session_start(
-            vec![user_message_with_image(PROMPT, &image)],
-            Some(correctness_chat_config(64)),
-        )
-        .await
-        .expect("flat(image) chat_session_start failed");
-    let shared = common_prefix_chars(&flat_a.text, &paged_a.text);
-    eprintln!(
-        "tracks-flat: flat num_tokens={} paged num_tokens={} common_prefix_chars={}",
-        flat_a.num_tokens, paged_a.num_tokens, shared
-    );
-    assert!(
-        shared >= 24,
-        "paged(image) does not track flat(image): common prefix only {shared} chars \
-         (a real M-RoPE/position bug diverges well under 24)\n\
-         FLAT  text={:?}\nPAGED text={:?}",
-        flat_a.text,
-        paged_a.text,
-    );
-
     eprintln!(
         "Qwen3.5-VL dense paged-VLM correctness: coherence + determinism + \
-         image-dependence + tracks-flat ({shared}-char shared prefix) all passed"
+         image-dependence all passed"
     );
 }
 
@@ -393,5 +356,68 @@ async fn qwen3_5_paged_vlm_continue_preserves_image_context() {
         "Qwen3.5-VL dense paged-VLM continue: image context preserved \
          (cached_tokens={} > 0)",
         r2.cached_tokens
+    );
+}
+
+/// Error contract: a VLM checkpoint loaded with `use_block_paged_cache: false`
+/// has NO paged adapter, so an image turn must ERROR (the flat-vision path was
+/// removed) rather than silently running text-only or crashing. The message
+/// must indicate the block-paged backend is required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_QWEN35_VL_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH for a Qwen3.5-VL dense checkpoint + test image"]
+async fn qwen3_5_flat_vlm_image_turn_errors_without_paged_backend() {
+    // A stray `MLX_QWEN35_PAGED_OVERRIDE=1` would force the flat clone ONTO the
+    // paged path and the image turn would succeed, masking this contract.
+    // Assert it is unset rather than mutating the environment: a read is
+    // race-free, whereas `remove_var` inside a `multi_thread` test races
+    // concurrent model loads that read env.
+    assert!(
+        std::env::var_os("MLX_QWEN35_PAGED_OVERRIDE").is_none(),
+        "unset MLX_QWEN35_PAGED_OVERRIDE before running this flat-VLM error-contract \
+         test; =1 forces the flat clone onto the paged path and the image turn would \
+         succeed, masking the contract",
+    );
+    let Ok(model_path) = std::env::var("MLX_TEST_QWEN35_VL_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_QWEN35_VL_MODEL_PATH unset");
+        return;
+    };
+    let src = PathBuf::from(&model_path);
+    if !src.exists() {
+        eprintln!(
+            "skipping: MLX_TEST_QWEN35_VL_MODEL_PATH does not exist: {}",
+            src.display()
+        );
+        return;
+    }
+    let Some(image_path) = resolve_image_path() else {
+        eprintln!("skipping: no test image (set MLX_TEST_VLM_IMAGE_PATH or add examples/ocr.png)");
+        return;
+    };
+    let image = std::fs::read(&image_path).expect("failed to read test image");
+
+    // Clone with `use_block_paged_cache: false` — this explicit false survives
+    // the vision→paged load-force, so no paged adapter is built.
+    let flat_dir =
+        clone_model_dir(&src, "qwen35-vlm-flat-error", false).expect("clone flat model dir failed");
+    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
+        .await
+        .expect("failed to load flat-path Qwen3.5-VL model");
+
+    let result = flat_model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image)],
+            Some(correctness_chat_config(16)),
+        )
+        .await;
+
+    let err = result.expect_err(
+        "flat VLM image turn must ERROR (no paged adapter, flat-vision path removed), \
+         not produce a ChatResult",
+    );
+    let msg = err.to_string();
+    eprintln!("flat-VLM image-turn error message: {msg}");
+    assert!(
+        msg.contains("block-paged"),
+        "flat VLM image-turn error must indicate the block-paged backend is required; got: {msg}"
     );
 }

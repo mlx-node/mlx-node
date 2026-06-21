@@ -339,11 +339,10 @@ fn run_paged_prefill_single_shot(
 
 /// Single-turn image-bearing paged prefill.
 ///
-/// The paged sibling of the flat `run_vlm_prefill_layers`: it feeds the
-/// vision encoder's image-merged token embeddings (`merge.inputs_embeds`)
-/// through the paged adapter and applies 3-row M-RoPE over
-/// `merge.position_ids` on the full-attention layers, while GDN/linear layers
-/// run with neither mask nor positions (matching the flat VLM policy).
+/// Feeds the vision encoder's image-merged token embeddings
+/// (`merge.inputs_embeds`) through the paged adapter and applies 3-row M-RoPE
+/// over `merge.position_ids` on the full-attention layers, while GDN/linear
+/// layers run with neither mask nor positions.
 ///
 /// `expanded_tokens` are the placeholder-expanded prompt tokens (one entry per
 /// embedding row). They drive `record_tokens` / the physical slot cursor only;
