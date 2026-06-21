@@ -269,11 +269,13 @@ impl Qwen3_5Attention {
     /// 2. `attn_layer_idx` is the FULL-ATTENTION ORDINAL into the
     ///    adapter pool (NOT the absolute decoder index). Pool was sized
     ///    by `Qwen3_5Config::full_attention_layer_count()`.
-    /// 3. The paged forward unconditionally uses standard scalar-offset
-    ///    `self.rope` (no M-RoPE branching). Text-only inputs match the
-    ///    flat path's behaviour (which uses `self.rope` whenever
-    ///    `position_ids = None`); image-bearing turns are rejected
-    ///    upstream at the chat-entry sites before reaching this fn.
+    /// 3. RoPE selection mirrors [`Self::forward`]: when `position_ids`
+    ///    is `Some` and this is a VLM checkpoint (`self.mrope` set), apply
+    ///    3-row M-RoPE over those positions (the image-bearing prefill
+    ///    path); otherwise use standard scalar-offset `self.rope` from
+    ///    `first_logical_position` (the text-only path). The text-only
+    ///    `position_ids = None` branch is byte-identical to the flat path's
+    ///    `position_ids = None` behaviour.
     ///
     /// Returns `[B, T, hidden_size]` (post-output-projection,
     /// post-gate) so the layer's residual `h = x + r` matches the flat
@@ -287,6 +289,7 @@ impl Qwen3_5Attention {
         first_logical_position: u32,
         cached_prefix_len: u32,
         is_prefill: bool,
+        position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -325,13 +328,32 @@ impl Qwen3_5Attention {
         let queries = self.q_norm.forward(&queries)?;
         let keys = self.k_norm.forward(&keys)?;
 
-        // Standard scalar-offset partial RoPE. Paged path is text-only;
-        // image-bearing turns are rejected at the chat-entry sites
-        // (`vision_mtp_whole_turn_core` / `chat_stream_sync_inner` and the MoE
-        // counterparts) before reaching this forward.
-        let rope_offset = first_logical_position as i32;
-        let queries = self.rope.forward(&queries, Some(rope_offset))?;
-        let keys = self.rope.forward(&keys, Some(rope_offset))?;
+        // RoPE: 3-row M-RoPE over `position_ids` for image-bearing prefill,
+        // standard scalar offset otherwise. The M-RoPE arm reproduces the flat
+        // path's layout and transpose order exactly ([B,T,H,D] -> [B,H,T,D] ->
+        // rotate -> [B,T,H,D]) so the rotation is bf16-bit-identical to flat;
+        // the `None` (text-only) arm matches the flat path's scalar-offset
+        // behaviour.
+        let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
+            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
+                &q_t,
+                &k_t,
+                &cos,
+                &sin,
+                mrope.mrope_section_arr().to_vec(),
+            )?;
+            let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
+            (q_out, k_out)
+        } else {
+            let rope_offset = first_logical_position as i32;
+            let queries = self.rope.forward(&queries, Some(rope_offset))?;
+            let keys = self.rope.forward(&keys, Some(rope_offset))?;
+            (queries, keys)
+        };
 
         // Transpose to [B, H, T, D] for SDPA.
         let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;

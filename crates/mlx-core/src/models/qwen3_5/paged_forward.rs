@@ -38,6 +38,7 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
+use crate::engine::vision::VisionMerge;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -229,6 +230,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             caches,
             layer_kinds,
             paged_adapter,
+            /* inputs_embeds */ None,
+            /* position_ids */ None,
         )?;
 
         if is_last_chunk {
@@ -327,6 +330,62 @@ fn run_paged_prefill_single_shot(
         caches,
         layer_kinds,
         paged_adapter,
+        /* inputs_embeds */ None,
+        /* position_ids */ None,
+    )?;
+
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+}
+
+/// Single-turn image-bearing paged prefill.
+///
+/// The paged sibling of the flat `run_vlm_prefill_layers`: it feeds the
+/// vision encoder's image-merged token embeddings (`merge.inputs_embeds`)
+/// through the paged adapter and applies 3-row M-RoPE over
+/// `merge.position_ids` on the full-attention layers, while GDN/linear layers
+/// run with neither mask nor positions (matching the flat VLM policy).
+///
+/// `expanded_tokens` are the placeholder-expanded prompt tokens (one entry per
+/// embedding row). They drive `record_tokens` / the physical slot cursor only;
+/// the forward itself consumes the merged embeddings, not re-embedded ids.
+///
+/// SINGLE-TURN ONLY: runs on a fresh prefill (`cached_prefix_len == 0`); there
+/// is no GDN prefix replay and no cache-hit read-back. The forward is run in
+/// one shot over the whole sequence so the GDN recurrent-state accumulation
+/// and M-RoPE positions match the flat VLM prefill exactly.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_vlm_prefill(
+    expanded_tokens: &[u32],
+    merge: &VisionMerge,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<Linear>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+) -> Result<MxArray> {
+    if expanded_tokens.is_empty() {
+        return Err(Error::from_reason(
+            "run_paged_vlm_prefill called with empty prompt",
+        ));
+    }
+
+    paged_adapter
+        .record_tokens(expanded_tokens)
+        .map_err(Error::from_reason)?;
+
+    let hidden_states = run_paged_prefill_one_chunk(
+        expanded_tokens,
+        /* chunk_first_position */ 0,
+        embed,
+        layers,
+        caches,
+        layer_kinds,
+        paged_adapter,
+        Some(&merge.inputs_embeds),
+        Some(&merge.position_ids),
     )?;
 
     project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
@@ -457,6 +516,8 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             caches,
             layer_kinds,
             paged_adapter,
+            /* inputs_embeds */ None,
+            /* position_ids */ None,
         )?;
 
         let chunk_hidden = if overlaps_kept_tail || is_last_chunk {
@@ -563,6 +624,8 @@ fn run_paged_prefill_single_shot_with_hidden(
         caches,
         layer_kinds,
         paged_adapter,
+        /* inputs_embeds */ None,
+        /* position_ids */ None,
     )?;
 
     project_last_token_logits_with_full_hidden(
@@ -574,6 +637,15 @@ fn run_paged_prefill_single_shot_with_hidden(
     )
 }
 
+/// Forward one paged prefill chunk through every layer.
+///
+/// `inputs_embeds` is the image-merged token embeddings `[1, T, hidden]` for an
+/// image-bearing prefill; when `Some` it replaces `embed.forward(chunk_tokens)`,
+/// while `chunk_tokens` still drives `record_tokens` / the slot cursor upstream.
+/// `position_ids` is the per-chunk M-RoPE slice `[3, 1, T]` (full-attention
+/// layers only); both are `None` on the text-only path, which is byte-identical
+/// to the prior behaviour.
+#[allow(clippy::too_many_arguments)]
 fn run_paged_prefill_one_chunk(
     chunk_tokens: &[u32],
     chunk_first_position: u32,
@@ -582,13 +654,20 @@ fn run_paged_prefill_one_chunk(
     caches: &mut [Qwen3_5LayerCache],
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    inputs_embeds: Option<&MxArray>,
+    position_ids: Option<&MxArray>,
 ) -> Result<MxArray> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
 
-    let chunk_len = chunk_tokens.len() as i64;
-    let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len])?;
-    let mut hidden_states = embed.forward(&input_ids)?;
+    let mut hidden_states = match inputs_embeds {
+        Some(embeds) => embeds.clone(),
+        None => {
+            let chunk_len = chunk_tokens.len() as i64;
+            let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len])?;
+            embed.forward(&input_ids)?
+        }
+    };
 
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
@@ -596,6 +675,12 @@ fn run_paged_prefill_one_chunk(
         .zip(layer_kinds.iter().copied())
         .enumerate()
     {
+        // M-RoPE positions feed full-attention layers only; GDN/linear layers
+        // take none (matches the flat VLM prefill policy).
+        let layer_positions = match kind {
+            Qwen3_5LayerKind::FullAttentionPaged { .. } => position_ids,
+            Qwen3_5LayerKind::Linear => None,
+        };
         hidden_states = layer.forward_paged_or_flat(
             &hidden_states,
             kind,
@@ -605,7 +690,7 @@ fn run_paged_prefill_one_chunk(
             /* is_prefill */ true,
             /* mask */ None,
             Some(cache_slot),
-            /* position_ids */ None,
+            layer_positions,
             /* use_kernel */ true,
         )?;
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;

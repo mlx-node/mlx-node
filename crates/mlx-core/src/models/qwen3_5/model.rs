@@ -1393,10 +1393,25 @@ impl Qwen35Inner {
         // MTP via the gate inside `paged_turn_sync_core_inner`.
         if self.paged_adapter.is_some() {
             if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
+                // Image-bearing MTP+paged is not supported (the eager paged MTP
+                // stepper has no M-RoPE prefill seed); reject it. Plain
+                // (non-MTP) image turns prefill through the paged adapter.
+                if p.enable_mtp && self.has_mtp_weights() {
+                    return Err(Error::from_reason(
+                        "Qwen3.5 MTP+paged dispatch is text-only; image-bearing MTP turns \
+                         require use_block_paged_cache=false (text-only turns continue to \
+                         work).",
+                    ));
+                }
+                return self.vision_paged_turn_sync_core(
+                    tokens,
+                    images,
+                    tokenizer,
+                    eos_token_id,
+                    p,
+                    report_perf,
+                    thinking,
+                );
             }
             return self.paged_turn_sync_core(
                 tokens,
@@ -2837,6 +2852,732 @@ impl Qwen35Inner {
         Ok((generated_tokens, finish_reason, None))
     }
 
+    /// Single-turn image-bearing block-paged dispatch (non-streaming).
+    ///
+    /// The paged sibling of the flat VLM prefill: it processes the images,
+    /// merges the vision features into the token embeddings, computes M-RoPE
+    /// positions, then prefills through the paged adapter via
+    /// [`super::paged_forward::run_paged_vlm_prefill`] and runs the plain
+    /// autoregressive decode loop.
+    ///
+    /// SINGLE-TURN ONLY: the adapter is cold-started (no cache-hit, no warm
+    /// continue) and decode uses the scalar-offset RoPE path (the physical
+    /// token count), matching the flat path's decode RoPE. MTP is not
+    /// supported here — image-bearing MTP+paged turns are rejected upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_paged_turn_sync_core(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: engine::ChatParams,
+        report_perf: bool,
+        thinking: ThinkingSetup,
+    ) -> Result<ChatResult> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "VLM prefill requested but vision encoder/processor not loaded",
+                    ));
+                }
+            };
+
+        // This paged turn writes full-attention K/V into the paged adapter pool,
+        // leaving the flat `self.caches` full-attention slots stale. A later
+        // dense-MTP fallback must rebuild them first.
+        self.paged_full_attn_caches_dirty = true;
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let sampling_config = p.sampling_config;
+
+        // === VLM image processing: expand placeholders + merge features ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+        let prompt_token_count = expanded_tokens.len() as u32;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // === Cold-start the paged adapter on the expanded sequence ===
+        let seq_id: u32 = 0;
+        let total_budget = expanded_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &expanded_tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        // Fresh per-layer caches (GDN linear slots + empty full-attention slots).
+        let new_caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(new_caches);
+
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            // === PREFILL ===
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_sync_core: caches not initialized")
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_sync_core: paged_adapter dropped")
+                })?;
+                super::paged_forward::run_paged_vlm_prefill(
+                    &expanded_tokens,
+                    &merge,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+
+            let mut token_history: Vec<u32> = expanded_tokens.clone();
+            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+            let mut y = sample(&last_logits, sampling_config)?;
+            y.eval();
+
+            crate::array::synchronize_and_clear_cache();
+            if report_perf {
+                first_token_instant = Some(std::time::Instant::now());
+            }
+
+            // === DECODE LOOP (autoregressive, scalar-offset RoPE) ===
+            let max_new_tokens = p.max_new_tokens;
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+                token_history.push(token_id);
+                reasoning_tracker.observe_token(token_id);
+
+                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &generated_tokens,
+                    p.max_consecutive_tokens,
+                    p.max_ngram_repeats,
+                    p.ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason("vision_paged_turn_sync_core: caches dropped mid-decode")
+                    })?;
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
+                        )
+                    })?;
+                    let logits = super::paged_forward::run_paged_decode_step(
+                        token_id,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                    )?;
+                    logits.squeeze(Some(&[1]))?
+                };
+
+                if reasoning_tracker.should_force_think_end() {
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                    y = MxArray::from_int32(&[forced_id], &[1])?;
+                    y.eval();
+                    continue;
+                }
+                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
+
+                y = sample(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        // Terminal lifecycle, mirroring the text paged core
+        // (`paged_turn_sync_core` / `finalize_paged_turn`). The error path
+        // always releases the request and returns. The success path is
+        // resolved below so the session ends in exactly one of two states,
+        // never a partial one: FULLY continuable (keep-live registered AND GDN
+        // checkpoint stored AND history + image key published) or
+        // NON-continuable (request released AND history cleared AND image key
+        // None) so a follow-up text continue is safely rejected instead of
+        // cold-prefilling image-placeholder ids as ordinary tokens.
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Build the saved history: the EXPANDED (image-placeholder) prompt plus
+        // all generated tokens except the last — the paged decode loop never
+        // forwards the final sampled token into the cache, so it would not match
+        // the live `request_tokens` (drop-last rule shared with the text paged
+        // core).
+        let mut full_history = expanded_tokens.clone();
+        if !generated_tokens.is_empty() {
+            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
+        }
+
+        // Keep-live registration must run before the GDN checkpoint, which
+        // snapshots the live recurrent state; short-circuit `&&` preserves that
+        // order. `remember_dense_gdn_history_checkpoint` snapshots from
+        // `cached_token_history`, so publish the history first, then checkpoint.
+        // Any failure downgrades to NON-continuable rather than discarding the
+        // already-successful generation output.
+        let keep_live_ok = p.reuse_cache
+            && match self.paged_adapter.as_mut() {
+                Some(adapter) => {
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let bs = adapter.block_size();
+                    let finalize_extra_keys =
+                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
+                    adapter
+                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                        .is_ok()
+                }
+                None => false,
+            };
+        let continuable = if keep_live_ok {
+            self.cached_token_history = full_history;
+            self.remember_dense_gdn_history_checkpoint().is_ok()
+        } else {
+            false
+        };
+
+        if continuable {
+            // FULLY continuable: live KV + GDN recurrent state encode the image
+            // context; `cached_image_key` records it (flat vision save contract).
+            self.cached_image_key = Some(image_cache_key);
+        } else {
+            // No-reuse, keep-live failure, or checkpoint failure: release the
+            // request and reset to a pristine non-live state. `reset_caches_sync`
+            // nulls `self.caches` (so `has_live_session()` reports false) and
+            // clears token history, image key, rope deltas, and GDN checkpoints,
+            // so a follow-up continue is rejected ("requires an initialized
+            // session") instead of cold-prefilling image-placeholder ids.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            let _ = self.reset_caches_sync();
+        }
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                expanded_tokens.len(),
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let mut result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            p.include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tracker.reasoning_token_count(),
+        )?;
+        result.cached_tokens = 0;
+        Ok(result)
+    }
+
+    /// Streaming twin of [`Self::vision_paged_turn_sync_core`].
+    ///
+    /// Single-turn image-bearing block-paged dispatch that emits each
+    /// generated token through the streaming callback. Same prefill + decode
+    /// spine; MTP is rejected upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_paged_turn_stream_core(
+        &mut self,
+        tokens: Vec<u32>,
+        images: &[Vec<u8>],
+        tokenizer: Arc<Qwen3Tokenizer>,
+        eos_token_id: u32,
+        p: engine::ChatParams,
+        report_perf: bool,
+        cb: &StreamSender<'_>,
+        cancelled: &AtomicBool,
+        thinking: ThinkingSetup,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+
+        let (vision_encoder, img_proc) =
+            match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
+                (Some(enc), Some(proc)) => (enc, proc),
+                _ => {
+                    return Err(Error::from_reason(
+                        "VLM prefill requested but vision encoder/processor not loaded",
+                    ));
+                }
+            };
+
+        self.paged_full_attn_caches_dirty = true;
+
+        let include_reasoning = p.include_reasoning;
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+        let thinking_enabled = thinking.enabled;
+        let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        let generation_start = if report_perf {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let sampling_config = p.sampling_config;
+
+        let mut decode_stream = tokenizer.inner().decode_stream(true);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = thinking_enabled;
+
+        // === VLM image processing: expand placeholders + merge features ===
+        let sms = self.spatial_merge_size.unwrap_or(2);
+        let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
+        let processed = img_proc.process_many(&image_refs)?;
+        let per_image_token_counts =
+            compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
+        let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        let image_cache_key = compute_image_cache_key(images);
+        let prompt_token_count = expanded_tokens.len() as u32;
+
+        let embed = self.embedding.clone();
+        let embedding_weight = embed.get_weight();
+        let input_ids = MxArray::from_uint32(&expanded_tokens, &[1, expanded_tokens.len() as i64])?;
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
+        let _wired_ctx =
+            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
+
+        let merge = vlm_prepare_vision_features(
+            &input_ids,
+            image_cache_key,
+            &processed,
+            &vision_encoder,
+            sms,
+            &embedding_weight,
+            generation_stream,
+            &self.vision_cache,
+        )?;
+
+        // === Cold-start the paged adapter on the expanded sequence ===
+        let seq_id: u32 = 0;
+        let total_budget = expanded_tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &expanded_tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.cached_rope_deltas = None;
+
+        let new_caches = (0..self.config.num_layers as usize)
+            .map(|i| {
+                if self.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect();
+        self.caches = Some(new_caches);
+
+        let layer_kinds =
+            super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
+                self.config.is_linear_layer(i)
+            });
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            // === PREFILL ===
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_stream_core: caches not initialized")
+                })?;
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("vision_paged_turn_stream_core: paged_adapter dropped")
+                })?;
+                super::paged_forward::run_paged_vlm_prefill(
+                    &expanded_tokens,
+                    &merge,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &embedding_weight,
+                    &layer_kinds,
+                    adapter,
+                )?
+            };
+
+            let mut token_history: Vec<u32> = expanded_tokens.clone();
+            let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+            let mut y = sample(&last_logits, sampling_config)?;
+            y.eval();
+
+            crate::array::synchronize_and_clear_cache();
+            if report_perf {
+                first_token_instant = Some(std::time::Instant::now());
+            }
+
+            let max_new_tokens = p.max_new_tokens;
+            let mut generated_tokens: Vec<u32> =
+                Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+                token_history.push(token_id);
+                let is_reasoning = reasoning_tracker.observe_token(token_id);
+                last_is_reasoning = is_reasoning;
+
+                if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = String::from("cancelled");
+                    break;
+                }
+
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    token_id,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+                if include_reasoning || !is_reasoning {
+                    cb.call(
+                        Ok(ChatStreamChunk {
+                            text: token_text,
+                            done: false,
+                            finish_reason: None,
+                            tool_calls: None,
+                            thinking: None,
+                            num_tokens: None,
+                            prompt_tokens: None,
+                            reasoning_tokens: None,
+                            raw_text: None,
+                            cached_tokens: None,
+                            performance: None,
+                            is_reasoning: Some(is_reasoning),
+                        }),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                }
+
+                if let Some(reason) = crate::sampling::check_repetition_cutoff(
+                    &generated_tokens,
+                    p.max_consecutive_tokens,
+                    p.max_ngram_repeats,
+                    p.ngram_size,
+                ) {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    let caches_ref = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_stream_core: caches dropped mid-decode",
+                        )
+                    })?;
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
+                        )
+                    })?;
+                    let logits = super::paged_forward::run_paged_decode_step(
+                        token_id,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                    )?;
+                    logits.squeeze(Some(&[1]))?
+                };
+
+                if reasoning_tracker.should_force_think_end() {
+                    let forced_id = reasoning_tracker.forced_token_id()? as i32;
+                    y = MxArray::from_int32(&[forced_id], &[1])?;
+                    y.eval();
+                    continue;
+                }
+                let next_logits = apply_all_penalties(next_logits, &token_history, &p)?;
+
+                y = sample(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        // Terminal lifecycle, mirroring the text paged core. The error path
+        // always releases and returns. The success path is resolved below so
+        // the session ends FULLY continuable (keep-live + GDN checkpoint +
+        // history + image key) or NON-continuable (released + history cleared +
+        // image key None), never partial — a follow-up text continue must never
+        // cold-prefill image-placeholder ids as ordinary tokens.
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => t,
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        // Saved history: expanded prompt + generated[..len-1] (drop-last rule
+        // shared with the sync sibling / text paged core).
+        let mut full_history = expanded_tokens.clone();
+        if !generated_tokens.is_empty() {
+            full_history.extend_from_slice(&generated_tokens[..generated_tokens.len() - 1]);
+        }
+
+        // Keep-live before the GDN checkpoint (which snapshots the live state);
+        // checkpoint reads `cached_token_history`, so publish it first. Any
+        // failure downgrades to NON-continuable rather than discarding output.
+        let keep_live_ok = p.reuse_cache
+            && match self.paged_adapter.as_mut() {
+                Some(adapter) => {
+                    let total_for_finalize = adapter.request_tokens().len();
+                    let bs = adapter.block_size();
+                    let finalize_extra_keys =
+                        engine::build_paged_extra_keys(total_for_finalize, bs, &[]);
+                    adapter
+                        .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                        .is_ok()
+                }
+                None => false,
+            };
+        let continuable = if keep_live_ok {
+            self.cached_token_history = full_history;
+            self.remember_dense_gdn_history_checkpoint().is_ok()
+        } else {
+            false
+        };
+
+        if continuable {
+            self.cached_image_key = Some(image_cache_key);
+        } else {
+            // Non-continuable: release the request and reset to a pristine
+            // non-live state so a follow-up continue is rejected instead of
+            // cold-prefilling image-placeholder ids. `reset_caches_sync` nulls
+            // `self.caches` (so `has_live_session()` is false) and clears token
+            // history, image key, rope deltas, and GDN checkpoints.
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            let _ = self.reset_caches_sync();
+        }
+
+        // Flush residual buffered bytes (mirrors flat / text paged streaming).
+        let full_text = tokenizer
+            .decode_sync(&generated_tokens, true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to decode generated tokens: {}", e);
+                String::new()
+            });
+        if full_text.len() > streamed_text_len {
+            let residual = full_text[streamed_text_len..].to_string();
+            if include_reasoning || !last_is_reasoning {
+                cb.call(
+                    Ok(ChatStreamChunk {
+                        text: residual,
+                        done: false,
+                        finish_reason: None,
+                        tool_calls: None,
+                        thinking: None,
+                        num_tokens: None,
+                        prompt_tokens: None,
+                        reasoning_tokens: None,
+                        raw_text: None,
+                        cached_tokens: None,
+                        performance: None,
+                        is_reasoning: Some(last_is_reasoning),
+                    }),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+            }
+        }
+
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                expanded_tokens.len(),
+                generated_tokens.len(),
+            )
+        } else {
+            None
+        };
+
+        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+        let result = finalize_chat_result(
+            &tokenizer,
+            &generated_tokens,
+            finish_reason,
+            think_end_id,
+            think_end_str.as_deref(),
+            performance,
+            include_reasoning,
+            thinking_enabled,
+            prompt_token_count,
+            reasoning_tokens,
+        )?;
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: result.text.clone(),
+                done: true,
+                finish_reason: Some(result.finish_reason.clone()),
+                tool_calls: Some(result.tool_calls.clone()),
+                thinking: result.thinking.clone(),
+                num_tokens: Some(result.num_tokens),
+                prompt_tokens: Some(result.prompt_tokens),
+                reasoning_tokens: Some(result.reasoning_tokens),
+                raw_text: Some(result.raw_text.clone()),
+                cached_tokens: Some(0),
+                performance: result.performance.clone(),
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
     /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
     ///
     /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and
@@ -3911,10 +4652,17 @@ impl Qwen35Inner {
         }
         if self.paged_adapter.is_some() && !mtp_takes_dense_path {
             if has_images {
-                return Err(Error::from_reason(
-                    "Qwen3.5 paged dispatch is text-only; image-bearing turns require \
-                     use_block_paged_cache=false (text-only turns continue to work).",
-                ));
+                return self.vision_paged_turn_stream_core(
+                    tokens,
+                    images,
+                    tokenizer_for_decode,
+                    eos_token_id,
+                    p,
+                    report_perf,
+                    cb,
+                    cancelled,
+                    thinking,
+                );
             }
             return self.paged_turn_stream_core(
                 tokens,

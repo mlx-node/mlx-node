@@ -83,8 +83,12 @@ pub struct Qwen3_5MoeConfig {
     /// either way. When disabled, full-attention layers run the eager flat
     /// decode instead.
     ///
-    /// VLM (vision encoder present) is rejected with an error in
-    /// `Qwen35MoeInner::new`.
+    /// **VLM under paged**: a VLM checkpoint loads with this flag set, and a
+    /// fresh single-turn image-bearing prompt prefills through the paged
+    /// adapter (M-RoPE positions feed the rotary; the merged vision embeddings
+    /// feed the forward). Image-bearing MTP turns are still rejected at
+    /// runtime; warm image-bearing session continues / cache-hit reuse are
+    /// cold-started (no warm GDN two-pass prefix).
     ///
     /// Default: `None` / `false`.
     #[serde(default)]

@@ -75,10 +75,12 @@ pub struct Qwen3_5Config {
     /// when unset, they run the eager flat decode. Either way the forward
     /// is pure-Rust eager.
     ///
-    /// **VLM is rejected**: when both `vision_encoder.is_some()` and
-    /// this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
-    /// a descriptive error. Paged dispatch through M-RoPE / vision
-    /// features is deferred.
+    /// **VLM under paged**: a VLM checkpoint loads with this flag set, and a
+    /// fresh single-turn image-bearing prompt prefills through the paged
+    /// adapter (M-RoPE positions feed the rotary; the merged vision
+    /// embeddings feed the forward). Image-bearing MTP turns, and warm
+    /// image-bearing session continues / cache-hit reuse, are still rejected
+    /// at runtime (the GDN two-pass warm prefix is not byte-exact).
     ///
     /// Default: `None` / `false` (use the eager flat decode path).
     /// Default-flip pending real-weights parity verification.

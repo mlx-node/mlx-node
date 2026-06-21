@@ -252,9 +252,11 @@ impl DecoderLayer {
     /// `FullAttentionPaged` branch it is ignored — the adapter owns
     /// K/V.
     ///
-    /// `position_ids` and `use_kernel` are forwarded only to the flat
-    /// `forward(...)` path; the paged path is text-only and uses the
-    /// scalar partial-RoPE inside `forward_paged`.
+    /// `use_kernel` is forwarded only to the flat `forward(...)` path.
+    /// `position_ids` is forwarded to both: the flat `forward(...)` and the
+    /// `FullAttentionPaged` branch's `forward_paged`, which applies 3-row
+    /// M-RoPE over those positions for an image-bearing prefill and the
+    /// scalar partial-RoPE when they are `None` (text-only).
     ///
     /// **Layer-kind / operator coherence**: an attention-type
     /// mismatch (e.g. `FullAttentionPaged` on a Linear operator)
@@ -291,7 +293,6 @@ impl DecoderLayer {
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for paged layers
-                let _ = position_ids;
                 let _ = use_kernel;
                 let _ = mask; // paged path uses internal causal mask
                 let attn = match &self.attn {
@@ -303,7 +304,9 @@ impl DecoderLayer {
                         ));
                     }
                 };
-                // Pre-norm + paged attention.
+                // Pre-norm + paged attention. `position_ids` carries M-RoPE
+                // positions for the image-bearing prefill; `None` keeps the
+                // scalar-offset text path.
                 let normed = self.input_layernorm.forward(x)?;
                 let attn_out = attn.forward_paged(
                     &normed,
@@ -312,6 +315,7 @@ impl DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    position_ids,
                 )?;
                 // Residual.
                 let h = x.add(&attn_out)?;
@@ -376,6 +380,8 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
+                // MTP tape forwards are text-only (image-bearing MTP+paged turns
+                // are rejected upstream), so the scalar-offset RoPE path is used.
                 let attn_out = attn.forward_paged(
                     &normed,
                     adapter,
@@ -383,6 +389,7 @@ impl DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    None,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;

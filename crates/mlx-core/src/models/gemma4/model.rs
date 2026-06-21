@@ -2268,6 +2268,550 @@ impl Gemma4Inner {
         Ok(())
     }
 
+    /// Build the merged image+text input embeddings for a vision prefill.
+    ///
+    /// Runs the vision tower on each processed image, projects features, then
+    /// `masked_scatter`s them into the scaled text embeddings at the
+    /// `image_token` positions. Returns `None` when the checkpoint lacks a
+    /// vision tower (text-only fallback). Shared by the flat and paged vision
+    /// cores so the merge math is identical across cache topologies.
+    ///
+    /// `prompt` is the `[1, prompt_len]` int32 expanded token array.
+    fn build_gemma4_vision_embeds(
+        &self,
+        prompt: &MxArray,
+        processed_images: &[ProcessedGemma4Image],
+    ) -> Result<Option<MxArray>> {
+        let (Some(vt), Some(ev)) = (self.vision_tower.as_ref(), self.embed_vision.as_ref()) else {
+            return Ok(None);
+        };
+        let image_token_id = self.config.image_token_id.unwrap_or(258880);
+
+        let mut all_features: Vec<MxArray> = Vec::new();
+        for proc in processed_images {
+            let features = vt.forward(&proc.pixel_values)?;
+            let projected = ev.forward(&features)?;
+            all_features.push(projected);
+        }
+        let image_features = if all_features.len() == 1 {
+            all_features.remove(0)
+        } else {
+            let refs: Vec<&MxArray> = all_features.iter().collect();
+            MxArray::concatenate_many(refs, Some(1))?
+        };
+
+        let text_embeds = self.embed_tokens.forward(prompt)?;
+        let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+        let embed_dtype = text_embeds.dtype()?;
+        let image_features = image_features.astype(embed_dtype)?;
+
+        let image_token = MxArray::scalar_int(image_token_id)?;
+        let image_mask = prompt.equal(&image_token)?;
+        let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
+        mask_count_arr.eval();
+        let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+        let feature_count = image_features.shape_at(1)?;
+        if mask_count != feature_count {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
+                     Check that image token expansion produced the correct number of tokens."
+                ),
+            ));
+        }
+
+        let image_mask_expanded = image_mask.expand_dims(-1)?;
+        let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
+        Ok(Some(masked_scatter(
+            &text_embeds,
+            &image_mask_expanded,
+            &image_features,
+        )?))
+    }
+
+    /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
+    /// non-streaming.
+    ///
+    /// Same image-prep as [`Self::vision_whole_turn_sync_core`] (process
+    /// images, expand `<|image|>` tokens, `masked_scatter` features into the
+    /// residual) but writes full-attention K/V into the paged adapter pool
+    /// instead of the flat global caches. Sliding layers still use the flat
+    /// rotating caches.
+    ///
+    /// Single-image-turn-only and cold-start by construction: the adapter is
+    /// reset with `max_cache_hit_tokens = 0` and the sliding caches are rebuilt
+    /// fresh, so `cached_prefix_len == 0` and there is no warm-continue. The
+    /// request is released on BOTH success and error; `cached_tokens` is 0.
+    fn vision_paged_turn_sync_core(
+        &mut self,
+        rendered_tokens: &[u32],
+        raw_images: &[Vec<u8>],
+        tokenizer: &Arc<Qwen3Tokenizer>,
+        config: &ChatConfig,
+        eos_token_id: u32,
+    ) -> Result<ChatResult> {
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        let (tokens, processed_images, new_image_key) =
+            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+        let sampling_config = make_sampling_config(config, &self.config);
+        let repetition_cutoff = repetition_cutoff_from_config(config);
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        let prefill_slice: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let prefill_len = prefill_slice.len();
+        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
+        let prompt_token_count = tokens.len();
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+
+        let vision_embeds = self.build_gemma4_vision_embeds(&prompt, &processed_images)?;
+
+        // Derive layer kinds before acquiring the paged request. This reads
+        // only `self.config` (no adapter/cache dependency) and is fallible, so
+        // running it here keeps the only fallible op ahead of the request
+        // acquisition — an early Err can never leak a prepared request.
+        let layer_kinds = self.compute_layer_kinds()?;
+
+        // Cold-start the paged adapter on the expanded sequence.
+        let seq_id: u32 = 0;
+        let total_budget = tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        // Fresh sliding flat caches + clear all reuse/checkpoint state so the
+        // cold prefill starts from an empty context.
+        self.caches = Some(init_caches_for_config(&self.config));
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.sliding_prefix_checkpoints.clear();
+        self.sliding_prompt_boundary_checkpoint = None;
+        self.sliding_last_history_checkpoint = None;
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                crate::models::gemma4::diagnostic::set_step(-1);
+                match vision_embeds {
+                    Some(ref embeds) => {
+                        self.run_paged_vlm_prefill(&tokens, embeds, &layer_kinds)?
+                    }
+                    None => {
+                        // Text-only fallback (checkpoint lacks the vision
+                        // tower): drive the same paged prefill seeded from
+                        // token embeddings.
+                        let text_embeds = self.embed_tokens.forward(&prompt)?;
+                        let text_embeds =
+                            text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+                        self.run_paged_vlm_prefill(&tokens, &text_embeds, &layer_kinds)?
+                    }
+                }
+            };
+
+            crate::array::synchronize_and_clear_cache();
+
+            let mut y = sample_next_token(&last_logits, sampling_config)?;
+            y.eval();
+
+            let mut generated_tokens: Vec<u32> = Vec::new();
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
+                    finish_reason = String::from("stop");
+                    break;
+                }
+                if let Some(reason) =
+                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
+                {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    crate::models::gemma4::diagnostic::set_step(step);
+                    self.run_paged_decode_step(token_id)?
+                };
+                let next_logits = next_logits.squeeze(Some(&[1]))?;
+                y = sample_next_token(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        let first_token_instant = std::time::Instant::now();
+
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+
+        // Image turns are single-shot; the paged request is released above and
+        // no warm prefix survives. Save a non-empty history (prompt plus the
+        // generated tokens, dropping the last when the turn ended on a
+        // terminator) so `has_live_session()` stays true and a follow-up text
+        // delta reaches `text_delta_image_guard`, which rejects it because the
+        // session holds image state. Mirrors the flat vision core.
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+        new_history.extend(tokens.iter().copied());
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        self.cached_image_key = new_image_key;
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                prefill_len as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
+        });
+
+        let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
+        promote_channel_only_output(&mut parsed);
+        let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        Ok(ChatResult {
+            text: parsed.text,
+            tool_calls: parsed.tool_calls,
+            thinking: parsed.thinking,
+            num_tokens: generated_tokens.len() as u32,
+            prompt_tokens: prompt_token_count as u32,
+            reasoning_tokens: 0,
+            finish_reason,
+            raw_text,
+            cached_tokens: 0,
+            performance,
+        })
+    }
+
+    /// Streaming twin of [`Self::vision_paged_turn_sync_core`]. Same paged
+    /// prefill + decode spine; streams parser segments and emits the terminal
+    /// chunk itself.
+    #[allow(clippy::too_many_arguments)]
+    fn vision_paged_turn_stream_core(
+        &mut self,
+        rendered_tokens: &[u32],
+        raw_images: &[Vec<u8>],
+        tokenizer: &Arc<Qwen3Tokenizer>,
+        config: &ChatConfig,
+        eos_token_id: u32,
+        sink: &dyn ChunkSink,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        let cb = StreamSender(sink);
+        let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
+        let (tokens, processed_images, new_image_key) =
+            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
+        if tokens.is_empty() {
+            return Err(Error::from_reason("Empty prompt"));
+        }
+        let sampling_config = make_sampling_config(config, &self.config);
+        let repetition_cutoff = repetition_cutoff_from_config(config);
+        let eos_ids = self.config.eos_token_ids.clone();
+
+        let prefill_slice: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let prefill_len = prefill_slice.len();
+        let prompt = MxArray::from_int32(&prefill_slice, &[1, prefill_len as i64])?;
+        let prompt_token_count = tokens.len();
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+        let _wired_ctx = crate::stream::WiredLimitContext::new(usize::MAX, vec![generation_stream]);
+
+        let generation_start = std::time::Instant::now();
+
+        let vision_embeds = self.build_gemma4_vision_embeds(&prompt, &processed_images)?;
+
+        // Derive layer kinds before acquiring the paged request (fallible, but
+        // depends only on `self.config`). Hoisting it ahead of the request
+        // acquisition keeps an early Err from leaking a prepared request.
+        let layer_kinds = self.compute_layer_kinds()?;
+
+        let seq_id: u32 = 0;
+        let total_budget = tokens.len() as u32;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
+            })?;
+            adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    &tokens,
+                    total_budget,
+                    /* reuse_cache */ false,
+                    &[],
+                    /* cache_salt */ 0,
+                    /* skip_lookup */ true,
+                    /* max_cache_hit_tokens */ 0,
+                )
+                .map_err(Error::from_reason)?;
+        }
+        self.caches = Some(init_caches_for_config(&self.config));
+        self.cached_token_history.clear();
+        self.cached_image_key = None;
+        self.sliding_prefix_checkpoints.clear();
+        self.sliding_prompt_boundary_checkpoint = None;
+        self.sliding_last_history_checkpoint = None;
+
+        let mut decode_stream = tokenizer.inner().decode_stream(false);
+        let mut streamed_text_len = 0;
+        let mut stream_parser = super::output_parser::Gemma4StreamParser::new();
+        let mut stream_dispatch = Gemma4StreamDispatchState::default();
+
+        let forward_result = (|| -> Result<(Vec<u32>, String)> {
+            let last_logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                crate::models::gemma4::diagnostic::set_step(-1);
+                match vision_embeds {
+                    Some(ref embeds) => {
+                        self.run_paged_vlm_prefill(&tokens, embeds, &layer_kinds)?
+                    }
+                    None => {
+                        let text_embeds = self.embed_tokens.forward(&prompt)?;
+                        let text_embeds =
+                            text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+                        self.run_paged_vlm_prefill(&tokens, &text_embeds, &layer_kinds)?
+                    }
+                }
+            };
+
+            crate::array::synchronize_and_clear_cache();
+
+            let mut y = sample_next_token(&last_logits, sampling_config)?;
+            y.eval();
+
+            let mut generated_tokens: Vec<u32> = Vec::new();
+            let mut finish_reason = String::from("length");
+
+            for step in 0..max_new_tokens {
+                let token_id = y.item_at_int32(0)? as u32;
+                generated_tokens.push(token_id);
+
+                if cancelled.load(Ordering::Relaxed) {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
+
+                let token_text = Qwen3Tokenizer::step_decode_stream(
+                    &mut decode_stream,
+                    tokenizer.inner(),
+                    token_id,
+                    &generated_tokens,
+                    streamed_text_len,
+                );
+                streamed_text_len += token_text.len();
+                let segments = stream_parser.feed(&token_text);
+                stream_dispatch.dispatch_segments(segments, &cb);
+
+                if is_eos_token(token_id, &eos_ids, eos_token_id) {
+                    finish_reason = "stop".to_string();
+                    break;
+                }
+                if let Some(reason) =
+                    check_gemma4_repetition_cutoff(&generated_tokens, repetition_cutoff)
+                {
+                    finish_reason = reason.to_string();
+                    break;
+                }
+                if step + 1 >= max_new_tokens {
+                    break;
+                }
+
+                let next_logits = {
+                    let _stream_ctx = StreamContext::new(generation_stream);
+                    crate::models::gemma4::diagnostic::set_step(step);
+                    self.run_paged_decode_step(token_id)?
+                };
+                let next_logits = next_logits.squeeze(Some(&[1]))?;
+                y = sample_next_token(&next_logits, sampling_config)?;
+                y.eval();
+
+                crate::array::maybe_clear_cache_for_paged_step(step);
+            }
+
+            Ok((generated_tokens, finish_reason))
+        })();
+
+        let (generated_tokens, finish_reason) = match forward_result {
+            Ok(t) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                t
+            }
+            Err(e) => {
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                return Err(e);
+            }
+        };
+
+        let first_token_instant = std::time::Instant::now();
+
+        let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
+
+        // Flush residual bytes through the stream parser.
+        if raw_text.len() > streamed_text_len {
+            let residual = raw_text[streamed_text_len..].to_string();
+            let mut segments = stream_parser.feed(&residual);
+            segments.extend(stream_parser.flush());
+            stream_dispatch.dispatch_segments(segments, &cb);
+        } else {
+            let tail = stream_parser.flush();
+            stream_dispatch.dispatch_segments(tail, &cb);
+        }
+        stream_dispatch.finish(&cb);
+
+        // Save a non-empty history (prompt plus the generated tokens, dropping
+        // the last when the turn ended on a terminator) so `has_live_session()`
+        // stays true and a follow-up text delta reaches `text_delta_image_guard`,
+        // which rejects it because the session holds image state. Mirrors the
+        // flat vision core.
+        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens[..]
+        };
+        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+        new_history.extend(tokens.iter().copied());
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        self.cached_image_key = new_image_key;
+
+        let generation_end = std::time::Instant::now();
+        let ttft_ms = first_token_instant
+            .duration_since(generation_start)
+            .as_secs_f64()
+            * 1000.0;
+        let decode_ms = generation_end
+            .duration_since(first_token_instant)
+            .as_secs_f64()
+            * 1000.0;
+        let gen_toks = generated_tokens.len() as f64;
+
+        let performance = Some(crate::profiling::PerformanceMetrics {
+            ttft_ms,
+            prefill_tokens_per_second: if ttft_ms > 0.0 {
+                prefill_len as f64 / (ttft_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_tokens_per_second: if decode_ms > 0.0 && gen_toks > 1.0 {
+                (gen_toks - 1.0) / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
+        });
+
+        let parsed_tool_calls = stream_parser.tool_calls();
+        let parsed_thinking = stream_parser.thinking();
+        let finish_reason = if parsed_tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+
+        cb.call(
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: Some(parsed_tool_calls),
+                thinking: parsed_thinking,
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: Some(prompt_token_count as u32),
+                reasoning_tokens: Some(0),
+                raw_text: Some(raw_text),
+                cached_tokens: Some(0),
+                performance,
+                is_reasoning: None,
+            }),
+            ThreadsafeFunctionCallMode::NonBlocking,
+        );
+
+        Ok(())
+    }
+
     // =================================================================
     // Block-paged dispatch (paged_turn_sync_core + helpers).
     //
@@ -3161,6 +3705,336 @@ impl Gemma4Inner {
         Ok(hidden_states)
     }
 
+    /// Vision variant of [`Self::run_paged_prefill_layer_loop`]: drives one
+    /// contiguous chunk of the merged image+text embeddings through the hybrid
+    /// paged dispatch (global → adapter, sliding → flat rotating cache,
+    /// KV-shared → anchor stash).
+    ///
+    /// Identical layer routing to the text loop, with two image-aware seams:
+    ///   * the residual stream is seeded from the supplied `chunk_embeds`
+    ///     (the `masked_scatter` output for this chunk, ALREADY scaled by
+    ///     `sqrt(hidden_size)` by the caller) instead of
+    ///     `embed_tokens.forward(token_ids)`;
+    ///   * PLE per-layer embeddings zero the image-token positions in
+    ///     `chunk_token_ids` before `compute_ple` — matching
+    ///     `prefill_body_gemma4_with_embeds`, because the image positions carry
+    ///     vision features in the residual, not token PLE residuals.
+    ///
+    /// `chunk_token_ids` is the expanded token slice for this chunk (drives the
+    /// PLE image mask and the sliding-mask sequence length).
+    /// `chunk_embeds` is `[1, chunk_len, hidden]`.
+    fn run_paged_vlm_prefill_layer_loop(
+        &mut self,
+        chunk_token_ids: &[u32],
+        chunk_embeds: &MxArray,
+        first_logical_position: u32,
+        cached_prefix_len_for_chunk: u32,
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<MxArray> {
+        let chunk_len = chunk_token_ids.len() as u32;
+        if chunk_len == 0 {
+            return Err(Error::from_reason(
+                "run_paged_vlm_prefill_layer_loop: chunk_token_ids must be non-empty",
+            ));
+        }
+
+        let input_ids = MxArray::from_uint32(chunk_token_ids, &[1, chunk_len as i64])?;
+        let mut hidden_states = chunk_embeds.clone();
+
+        // PLE over image-masked token ids: image positions hold vision
+        // features (not token embeddings), so their PLE residual must be zero.
+        // Same masking as `prefill_body_gemma4_with_embeds`.
+        let projected_ple: Option<MxArray> = if let Some(ref ple) = self.ple {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880);
+            let image_token = MxArray::scalar_int(image_token_id)?;
+            let image_mask = input_ids.equal(&image_token)?;
+            let zero = MxArray::scalar_int(0)?;
+            let masked_ids = image_mask.where_(&zero, &input_ids)?;
+            let pre_layer_h = hidden_states.clone();
+            Some(compute_ple(
+                &masked_ids,
+                &pre_layer_h,
+                ple,
+                chunk_len as i64,
+            )?)
+        } else {
+            None
+        };
+
+        // Sliding mask against the bounded rotating-cache attention view —
+        // identical derivation to the text paged loop.
+        let seq_len = chunk_len as i64;
+        let sliding_offset = self
+            .caches
+            .as_ref()
+            .and_then(|caches| {
+                caches
+                    .iter()
+                    .enumerate()
+                    .find(|(i, _)| self.config.is_sliding_layer(*i))
+                    .map(|(_, c)| c.get_offset())
+            })
+            .unwrap_or(0);
+        let sliding_window = self.config.sliding_window as i64;
+        let sliding_mask_offset =
+            sliding_mask_offset_for_chunk(seq_len, sliding_offset, sliding_window);
+        let sliding_mask = sliding_mask_offset
+            .map(|offset| create_sliding_mask(seq_len, offset, sliding_window))
+            .transpose()?;
+
+        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
+        let num_layers = self.layers.len();
+        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
+
+        #[allow(clippy::needless_range_loop)]
+        for layer_idx in 0..num_layers {
+            crate::models::gemma4::diagnostic::set_layer(layer_idx);
+            let kind = layer_kinds[layer_idx];
+            let layer: &Gemma4DecoderLayer = unsafe {
+                let ptr = self.layers.as_ptr().add(layer_idx);
+                &*ptr
+            };
+            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+                sliding_mask.as_ref()
+            } else {
+                None
+            };
+
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason(
+                    "run_paged_vlm_prefill_layer_loop: paged_adapter dropped mid-forward",
+                )
+            })?;
+            let flat_cache: Option<&mut Gemma4LayerCache> =
+                if matches!(kind, Gemma4LayerKind::Sliding) {
+                    let caches = unsafe {
+                        let raw = self.caches.as_mut().ok_or_else(|| {
+                            Error::from_reason(
+                                "run_paged_vlm_prefill_layer_loop: sliding cache slot missing",
+                            )
+                        })? as *mut Vec<Gemma4LayerCache>;
+                        &mut *raw
+                    };
+                    Some(&mut caches[layer_idx])
+                } else {
+                    None
+                };
+
+            let shared_inputs = match kind {
+                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                    let total_ctx = cached_prefix_len_for_chunk + chunk_len;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset: first_logical_position as i32,
+                        total_ctx,
+                        keys: None,
+                        values: None,
+                    })
+                }
+                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
+                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "run_paged_vlm_prefill_layer_loop: SharedOnSliding anchor {} stash \
+                             missing",
+                            anchor_layer_idx
+                        ))
+                    })?;
+                    let cache_offset =
+                        (first_logical_position as i32 + chunk_len as i32) - seq_len as i32;
+                    Some(super::decoder_layer::SharedKvInputs {
+                        cache_offset,
+                        total_ctx: 0,
+                        keys: Some(k),
+                        values: Some(v),
+                    })
+                }
+                _ => None,
+            };
+
+            let needs_stash = has_kv_sharing
+                && matches!(kind, Gemma4LayerKind::Sliding)
+                && self.config.should_store_shared_kv(layer_idx);
+
+            let ple_input = projected_ple.as_ref().map(|p| {
+                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|s| s.squeeze(Some(&[2])))
+            });
+            let ple_input_ref = match &ple_input {
+                Some(Ok(arr)) => Some(arr),
+                _ => None,
+            };
+
+            let next_hidden_states = layer.forward_paged_or_flat(
+                &hidden_states,
+                kind,
+                adapter,
+                first_logical_position,
+                cached_prefix_len_for_chunk,
+                /* is_prefill */ true,
+                mask,
+                flat_cache,
+                ple_input_ref,
+                needs_stash,
+                shared_inputs,
+            )?;
+            hidden_states = next_hidden_states;
+
+            if needs_stash {
+                let caches = unsafe {
+                    let raw = self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_vlm_prefill_layer_loop: sliding cache slot missing \
+                             post-forward",
+                        )
+                    })? as *mut Vec<Gemma4LayerCache>;
+                    &mut *raw
+                };
+                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
+                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
+                }
+            }
+            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
+        }
+
+        Ok(hidden_states)
+    }
+
+    /// Cold-start paged prefill over the merged image+text embeddings.
+    ///
+    /// Single-shot only: the adapter holds zero tokens and the sliding flat
+    /// caches were freshly built, so `cached_prefix_len == 0` and there is no
+    /// prefix-cache restore. Mirrors the flat vision core's
+    /// `prefill_body_gemma4_with_embeds` + last-token `forward_inner` split,
+    /// which is load-bearing — see [`Self::run_paged_prefill_chunk`] for why
+    /// the final prompt token must run through the cache-hit branch separately
+    /// (BF16 SDPA drift otherwise flips argmax to a zero-embedding `<unused>`
+    /// token and the `<turn|>` stop is missed).
+    ///
+    /// `expanded_tokens` is the full `BOI + N×image + EOI` expanded sequence.
+    /// `inputs_embeds` is `[1, prompt_len, hidden]`, ALREADY scaled by
+    /// `sqrt(hidden_size)` and with vision features scattered at the image
+    /// positions. Returns the final token's logits squeezed to `[vocab]`.
+    fn run_paged_vlm_prefill(
+        &mut self,
+        expanded_tokens: &[u32],
+        inputs_embeds: &MxArray,
+        layer_kinds: &[Gemma4LayerKind],
+    ) -> Result<MxArray> {
+        if expanded_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_vlm_prefill called with empty prompt",
+            ));
+        }
+        let prompt_len = expanded_tokens.len() as u32;
+
+        crate::models::gemma4::diagnostic::set_path("paged");
+        crate::models::gemma4::diagnostic::set_step(-1);
+
+        // Pass 1: tokens [0..prompt_len-1] in bounded chunks. Pass 2: the
+        // FINAL token, run with cached_prefix_len_for_chunk > 0 so global
+        // layers take the same cache-hit reduction order decode uses.
+        let mut pass1_position: u32 = 0;
+        if prompt_len > 1 {
+            let pass1_len = (prompt_len - 1) as usize;
+            let configured_chunk_size = crate::array::paged_prefill_chunk_size();
+            let chunk_size = if configured_chunk_size <= 0 {
+                pass1_len
+            } else {
+                (configured_chunk_size as usize).max(1)
+            };
+            let mut offset: usize = 0;
+            while offset < pass1_len {
+                let end = (offset + chunk_size).min(pass1_len);
+                let chunk_tokens = &expanded_tokens[offset..end];
+                let chunk_len = (end - offset) as i64;
+                let chunk_embeds =
+                    inputs_embeds.slice_axis(1, offset as i64, offset as i64 + chunk_len)?;
+                {
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
+                    })?;
+                    adapter
+                        .record_tokens(chunk_tokens)
+                        .map_err(Error::from_reason)?;
+                }
+                let _hidden = self.run_paged_vlm_prefill_layer_loop(
+                    chunk_tokens,
+                    &chunk_embeds,
+                    pass1_position,
+                    pass1_position,
+                    layer_kinds,
+                )?;
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    adapter
+                        .eval_pending_pool_writes()
+                        .map_err(Error::from_reason)?;
+                }
+                if let Some(caches) = self.caches.as_ref() {
+                    eval_gemma4_caches(caches)?;
+                }
+                crate::array::clear_cache();
+                pass1_position = pass1_position
+                    .checked_add((end - offset) as u32)
+                    .ok_or_else(|| {
+                        Error::from_reason("run_paged_vlm_prefill: token position overflow")
+                    })?;
+                offset = end;
+            }
+        }
+
+        // Pass 2: the FINAL token (length 1).
+        let last_idx = (prompt_len - 1) as usize;
+        let pass2_tokens = &expanded_tokens[last_idx..];
+        let pass2_embeds = inputs_embeds.slice_axis(1, last_idx as i64, prompt_len as i64)?;
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
+            })?;
+            adapter
+                .record_tokens(pass2_tokens)
+                .map_err(Error::from_reason)?;
+        }
+        let mut hidden_states = self.run_paged_vlm_prefill_layer_loop(
+            pass2_tokens,
+            &pass2_embeds,
+            pass1_position,
+            pass1_position,
+            layer_kinds,
+        )?;
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter
+                .eval_pending_pool_writes()
+                .map_err(Error::from_reason)?;
+        }
+
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
+        let logits = if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)?
+        } else if let Some(ref w_t) = self.embed_weight_t {
+            hidden_states.matmul(w_t)?
+        } else {
+            let weight = self.embed_tokens.get_weight();
+            let weight_t = weight.transpose(Some(&[1, 0]))?;
+            hidden_states.matmul(&weight_t)?
+        };
+        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
+        let logits = if let Some(cap) = self.config.final_logit_softcapping {
+            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
+            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
+            let capped = MxArray::from_handle(handle, "logit_softcap")?;
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
+            capped
+        } else {
+            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
+            logits
+        };
+
+        let last_seq_len = logits.shape_at(1)?;
+        logits
+            .slice_axis(1, last_seq_len - 1, last_seq_len)?
+            .squeeze(Some(&[0, 1]))
+    }
+
     /// Run one paged decode step: feed `[token_id]` through the model.
     fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
         let first_logical_position = {
@@ -3689,27 +4563,50 @@ impl Gemma4Inner {
     /// `verify_cache_prefix(.., has_images = true)` forces a miss.
     fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
+        let paged = self.paged_adapter.is_some();
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
-                self.vision_whole_turn_stream_core(
-                    args.tokens,
-                    args.images,
-                    &tokenizer,
-                    args.config,
-                    args.eos_id,
-                    sink,
-                    cancelled,
-                )?;
+                if paged {
+                    self.vision_paged_turn_stream_core(
+                        args.tokens,
+                        args.images,
+                        &tokenizer,
+                        args.config,
+                        args.eos_id,
+                        sink,
+                        cancelled,
+                    )?;
+                } else {
+                    self.vision_whole_turn_stream_core(
+                        args.tokens,
+                        args.images,
+                        &tokenizer,
+                        args.config,
+                        args.eos_id,
+                        sink,
+                        cancelled,
+                    )?;
+                }
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = self.vision_whole_turn_sync_core(
-                    args.tokens,
-                    args.images,
-                    &tokenizer,
-                    args.config,
-                    args.eos_id,
-                )?;
+                let result = if paged {
+                    self.vision_paged_turn_sync_core(
+                        args.tokens,
+                        args.images,
+                        &tokenizer,
+                        args.config,
+                        args.eos_id,
+                    )?
+                } else {
+                    self.vision_whole_turn_sync_core(
+                        args.tokens,
+                        args.images,
+                        &tokenizer,
+                        args.config,
+                        args.eos_id,
+                    )?
+                };
                 Ok(TurnOutput::Complete(Box::new(result)))
             }
         }

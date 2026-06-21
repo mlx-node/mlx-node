@@ -189,7 +189,6 @@ impl DecoderLayer {
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache;
-                let _ = position_ids;
                 let _ = use_kernel;
                 let _ = mask;
                 let attn = match &self.attn {
@@ -202,6 +201,8 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
+                // `position_ids` carries M-RoPE positions for an image-bearing
+                // prefill; `None` keeps the scalar-offset text path.
                 let attn_out = attn.forward_paged(
                     &normed,
                     adapter,
@@ -209,6 +210,7 @@ impl DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    position_ids,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
