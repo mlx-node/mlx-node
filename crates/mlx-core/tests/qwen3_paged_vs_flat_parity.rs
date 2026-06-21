@@ -104,19 +104,25 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
         // about don't have subdirs.
     }
 
-    if use_block_paged {
+    {
         let cfg_path = dst.join("config.json");
         let raw = fs::read_to_string(&cfg_path)
             .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
         let mut cfg: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-        cfg["use_block_paged_cache"] = serde_json::Value::Bool(true);
-        // Bound the adapter pool memory so the test stays light. 256 MB is
-        // large enough to hold the test's tiny prompts × all 28 attention
-        // layers of Qwen3-0.6B (head_dim=128, kv_heads=8) and small enough
-        // to not balloon CI runners.
-        cfg["paged_cache_memory_mb"] = serde_json::Value::from(256u32);
-        cfg["paged_block_size"] = serde_json::Value::from(16u32);
+        // Pin the cache mode explicitly for BOTH clones. qwen3 defaults
+        // `use_block_paged_cache` to true, so the flat clone must write the
+        // flag as `false` — otherwise it silently runs paged and the parity
+        // test compares paged-vs-paged (a false green that proves nothing).
+        cfg["use_block_paged_cache"] = serde_json::Value::Bool(use_block_paged);
+        if use_block_paged {
+            // Bound the adapter pool memory so the test stays light. 256 MB is
+            // large enough to hold the test's tiny prompts × all 28 attention
+            // layers of Qwen3-0.6B (head_dim=128, kv_heads=8) and small enough
+            // to not balloon CI runners.
+            cfg["paged_cache_memory_mb"] = serde_json::Value::from(256u32);
+            cfg["paged_block_size"] = serde_json::Value::from(16u32);
+        }
         let pretty = serde_json::to_string_pretty(&cfg)
             .map_err(|e| format!("serialize config.json: {e}"))?;
         fs::write(&cfg_path, pretty)
@@ -353,19 +359,54 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     // the cached turn-1 history; the paged path's `find_cached_prefix` +
     // `register_full_blocks_for_reuse` should likewise reuse the registered
     // prefix blocks. Both should produce the same delta-prefilled reply.
+    // Warm-continue is asserted byte-exact over a SHORT horizon, not the full
+    // 32-token reply. The flat path runs one contiguous fused SDPA over the
+    // reused prefix KV; the paged path runs the block-wise online-softmax
+    // kernel (block_size=16) — a different summation order, so over a long
+    // free-running greedy decode the low bits of the bf16 KV scores drift and
+    // eventually flip an argmax near-tie (coherent-but-different prose, ~token
+    // 12 here). That is float non-associativity, not a KV-reuse bug: a real
+    // prefix-reuse fault (wrong positions, dropped/duplicated KV, or a silent
+    // cold-prefill) diverges at token 0-1. Eight tokens is the same byte-exact
+    // warm horizon the lfm2 length-exit parity uses; it proves the reused
+    // prefix KV reproduces flat without tripping the long-decode near-tie.
+    const WARM_MAX_NEW: i32 = 8;
     let user2 = "And in another word?";
     let r2_flat = flat_model
-        .chat_session_continue(user2.to_string(), None, Some(parity_chat_config(32)))
+        .chat_session_continue(
+            user2.to_string(),
+            None,
+            Some(parity_chat_config(WARM_MAX_NEW)),
+        )
         .await
         .expect("turn 2 flat chat_session_continue failed");
     let r2_paged = paged_model
-        .chat_session_continue(user2.to_string(), None, Some(parity_chat_config(32)))
+        .chat_session_continue(
+            user2.to_string(),
+            None,
+            Some(parity_chat_config(WARM_MAX_NEW)),
+        )
         .await
         .expect("turn 2 paged chat_session_continue failed");
 
     eprintln!(
         "two-turn parity: turn2 flat num_tokens={} cached={} | paged num_tokens={} cached={}",
         r2_flat.num_tokens, r2_flat.cached_tokens, r2_paged.num_tokens, r2_paged.cached_tokens,
+    );
+
+    // Both paths must actually have REUSED the turn-1 prefix (a cold-prefill
+    // fallback would read cached=0 and silently pass a byte comparison while
+    // proving nothing about reuse). The reused prefix length must match too.
+    assert!(
+        r2_flat.cached_tokens > 0 && r2_paged.cached_tokens > 0,
+        "warm-continue must reuse the turn-1 prefix: flat cached={} paged cached={}",
+        r2_flat.cached_tokens,
+        r2_paged.cached_tokens,
+    );
+    assert_eq!(
+        r2_flat.cached_tokens, r2_paged.cached_tokens,
+        "flat and paged must reuse the same prefix length: flat={} paged={}",
+        r2_flat.cached_tokens, r2_paged.cached_tokens,
     );
 
     // Compare `raw_text` (the verbatim decoded token stream) rather than

@@ -94,6 +94,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
     struct TurnSnapshot {
         ttft_ms: f64,
         prompt_tokens: u32,
+        cached_tokens: u32,
     }
 
     // --- Turn 1: chat_session_start establishes a clean session ---
@@ -114,6 +115,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
             .expect("turn 1 performance missing")
             .ttft_ms,
         prompt_tokens: r1.prompt_tokens,
+        cached_tokens: r1.cached_tokens,
     };
     println!(
         "turn 1 ttft={:.1}ms prompt_tokens={} num_tokens={}",
@@ -153,6 +155,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: result.prompt_tokens,
+            cached_tokens: result.cached_tokens,
         });
 
         assert!(
@@ -198,35 +201,65 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         turn4.prompt_tokens
     );
 
-    // 2. TTFT stays flat (<=1.5x of turn 1) across all turns. The broken
-    //    pre-Phase-1 path would balloon linearly as the history grows —
-    //    1.5x is a generous bound that still catches a full re-prefill
-    //    regression.
-    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    // 2. The delta path reuses the entire prior context (the live KV cache)
+    //    and freshly prefills ONLY the new turn's ChatML delta. We assert on
+    //    that token accounting rather than wall-clock TTFT: TTFT flakes on
+    //    shared CI runners (tiny warm-GPU times dominated by fixed per-turn
+    //    setup, not prefill work) and is a WEAK signal — a path that silently
+    //    rebuilt the cache each turn could still post a fast TTFT on a fast
+    //    machine. `cached_tokens` is the deterministic proof.
+
+    // 2a. cached_tokens GROWS across delta turns: each delta reuses the full,
+    //     ever-longer prior context. A regressed delta that desynced and
+    //     re-prefilled from scratch reports cached_tokens == 0 (the engine's
+    //     `is_delta && !desynced` gate), so non-zero, strictly-growing
+    //     cached_tokens is direct evidence the cache is reused, not rebuilt.
+    assert_eq!(
+        turn1.cached_tokens, 0,
+        "turn 1 cold-starts but reported cached_tokens={}",
+        turn1.cached_tokens
+    );
     assert!(
-        turn4.ttft_ms < bound_vs_turn1,
-        "delta-path TTFT regression vs turn 1: turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn1.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn1,
+        turn2.cached_tokens > 0,
+        "delta turn 2 reused nothing (cached_tokens=0) — cache was rebuilt. snapshots: {:?}",
+        snapshots
+    );
+    assert!(
+        turn3.cached_tokens > turn2.cached_tokens,
+        "delta turn 3 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn2.cached_tokens,
+        turn3.cached_tokens,
+        snapshots
+    );
+    assert!(
+        turn4.cached_tokens > turn3.cached_tokens,
+        "delta turn 4 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn3.cached_tokens,
+        turn4.cached_tokens,
         snapshots
     );
 
-    // 3. Turn 4 should be in the same flat-TTFT regime as turn 2 (the
-    //    first delta turn). Turn 1 includes any one-time warmups the
-    //    session-start path happens to do — comparing turn 4 to turn 2
-    //    filters that out and catches a gradual slowdown across deltas
-    //    that an only-vs-turn-1 check would miss. Allow 2x noise to
-    //    avoid flakes on shared runners.
-    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    // 2b. The freshly-prefilled span (prompt_tokens - cached_tokens) stays
+    //     small and FLAT even as the context grows — it is just one new user
+    //     turn's ChatML each time, never the whole transcript. A full
+    //     re-prefill regression would make turn 4's fresh span scale with the
+    //     accumulated history instead.
+    let uncached = |t: &TurnSnapshot| t.prompt_tokens.saturating_sub(t.cached_tokens);
     assert!(
-        turn4.ttft_ms < bound_vs_turn2,
-        "turn 4 TTFT much slower than turn 2: turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. \
-         snapshots: {:?}",
-        turn2.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn2,
+        uncached(turn4) < turn4.cached_tokens,
+        "delta turn 4 prefilled more than it reused — work is not flat: \
+         prompt={} cached={} uncached={}. snapshots: {:?}",
+        turn4.prompt_tokens,
+        turn4.cached_tokens,
+        uncached(turn4),
+        snapshots
+    );
+    assert!(
+        uncached(turn4) <= uncached(turn2) * 2,
+        "delta turn 4's fresh prefill ({}) ballooned vs turn 2's ({}) — TTFT \
+         would regress. snapshots: {:?}",
+        uncached(turn4),
+        uncached(turn2),
         snapshots
     );
 }

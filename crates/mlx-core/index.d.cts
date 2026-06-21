@@ -143,11 +143,9 @@ export declare class Gemma4Model {
    * to keep `ChatSession.reset()` idempotent across both runnable
    * and stub instances.
    *
-   * Callers relying on the pre-round-2 behavior where `new(config)`
-   * returned a runnable model MUST migrate to `await
-   * Gemma4Model.load(path)`. The constructor signature is unchanged
-   * on purpose (NAPI-RS pins it), so this is a deliberate runtime
-   * behavior break covered by the regression tests in
+   * A runnable model requires `await Gemma4Model.load(path)`. The
+   * constructor signature is fixed by NAPI-RS; the stub-only behavior is
+   * covered by the regression tests in
    * `__test__/models/model-loader-gemma4.test.ts`.
    */
   constructor(config: Gemma4Config);
@@ -159,12 +157,12 @@ export declare class Gemma4Model {
    *
    * `true` iff `Gemma4Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Gemma4Config::use_block_paged_cache`, default-ON since the
-   * `gemma4_paged_vs_flat_parity` integration test verified greedy
-   * byte-equal at BF16 against real Gemma-4-E2B-IT weights — see
-   * CLAUDE.md). Stubs constructed via `new(config)` always return
-   * `false`. Surfaced through this NAPI method so server endpoints
-   * can branch on it without a model-thread roundtrip.
+   * `Gemma4Config::use_block_paged_cache`). The
+   * `gemma4_paged_vs_flat_parity` integration test pins greedy
+   * byte-equal at BF16 against real Gemma-4-E2B-IT weights. Stubs
+   * constructed via `new(config)` always return `false`. Surfaced
+   * through this NAPI method so server endpoints can branch on it
+   * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
   modelId(): number;
@@ -2837,9 +2835,10 @@ export interface Gemma4Config {
    * separate physical storage.
    *
    * Default: `true` (paged adapter on; opt-out via
-   * `use_block_paged_cache: false` in `config.json` to fall back to
-   * the legacy all-flat `Gemma4LayerCache` path). Parity is verified
-   * by `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
+   * `use_block_paged_cache: false` in `config.json` to use the flat
+   * (non-paged) all-`Gemma4LayerCache` path instead). Parity between
+   * the two paths is verified by
+   * `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs` against
    * real Gemma-4-E2B weights.
    */
   useBlockPagedCache?: boolean | undefined;
@@ -4006,7 +4005,8 @@ export interface Qwen3Config {
    * `BlockAllocator` + `LayerKVPool` pair and constructs a
    * `PagedKVCacheAdapter` for cross-request KV prefix reuse (vLLM-style
    * block-paged storage with refcounted prefix caching). When
-   * `Some(false)`, the legacy flat `Vec<KVCache>` path is used instead.
+   * `Some(false)`, the flat (non-paged) `Vec<KVCache>` cache path is
+   * used instead.
    *
    * Default: true.
    */

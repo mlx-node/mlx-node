@@ -295,8 +295,12 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
       return false;
     }
 
-    // Use contiguous copy to flatten multi-dim arrays into row-major buffer
-    auto flat = flatten(*arr);
+    // Flatten on the CPU device. flatten() otherwise inherits the ambient
+    // default device; if that is the GPU, a single tensor larger than the GPU
+    // per-buffer cap — e.g. gemma4's embed_tokens_per_layer.weight (~4.7 GB) —
+    // is migrated into one Metal buffer and trips metal::malloc on memory-
+    // constrained GPUs. Host RAM has no per-buffer cap, so pin the read to CPU.
+    auto flat = flatten(*arr, mlx::core::Device::cpu);
     flat.eval();
 
     if (dtype == mlx::core::bfloat16) {

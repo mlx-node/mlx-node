@@ -208,8 +208,8 @@ jobs:
               --test qwen3_5_delta_chat
               --test p2_paged_thinking_honors_enable
           - name: lfm2
-            model: LiquidAI/LFM2-1.2B
-            slug: lfm2-1.2b
+            model: LiquidAI/LFM2.5-1.2B-Thinking
+            slug: lfm2.5-1.2b-thinking
             mtype: lfm2
             env: MLX_TEST_MODEL_PATH MLX_TEST_LFM2_MODEL_PATH
             tests: >-

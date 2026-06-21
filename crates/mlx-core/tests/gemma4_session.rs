@@ -84,7 +84,7 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
     // Turn 1: plain session start.
     let cfg1 = chat_config_default(32);
     let r1 = model
-        .chat_session_start(vec![user_message("Say hi in one short word.")], Some(cfg1))
+        .chat_session_start(vec![user_message("In exactly one short word, and nothing else, with no explanation and no punctuation and no preamble whatsoever, how would you warmly and politely greet a brand-new friend that you happen to be meeting for the very first time on this fine and bright sunny morning, bearing in mind that they have travelled a very long way over the hills and across the wide river and through the quiet forest to come and see you today and would dearly appreciate a simple kind and gentle word of welcome from you?")], Some(cfg1))
         .await
         .expect("turn 1 chat_session_start failed");
     assert_eq!(
@@ -92,11 +92,6 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
         "turn 1 should cold-start: cached_tokens={}",
         r1.cached_tokens
     );
-    let ttft1 = r1
-        .performance
-        .as_ref()
-        .expect("turn 1 performance missing")
-        .ttft_ms;
 
     // Turn 2: resend the full transcript extended by a fresh user turn.
     // Gemma4's chat template renders "assistant" -> "model" turn blocks
@@ -104,7 +99,9 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
     // of the cached history.
     let cfg2 = chat_config_default(32);
     let turn2_msgs = vec![
-        user_message("Say hi in one short word."),
+        user_message(
+            "In exactly one short word, and nothing else, with no explanation and no punctuation and no preamble whatsoever, how would you warmly and politely greet a brand-new friend that you happen to be meeting for the very first time on this fine and bright sunny morning, bearing in mind that they have travelled a very long way over the hills and across the wide river and through the quiet forest to come and see you today and would dearly appreciate a simple kind and gentle word of welcome from you?",
+        ),
         ChatMessage {
             role: "assistant".to_string(),
             content: r1.text.clone(),
@@ -132,18 +129,33 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
         "unexpected finish_reason on turn 2: {}",
         r2.finish_reason
     );
-    let ttft2 = r2
-        .performance
-        .as_ref()
-        .expect("turn 2 performance missing")
-        .ttft_ms;
-    // On a prefix-reuse hit only the delta is prefilled, so turn 2 must
-    // not balloon TTFT. 1.5x turn1 is generous jitter headroom.
+    // On a prefix-reuse hit the engine reprocesses only the new suffix: the
+    // matched prefix (turn 1's rendered transcript) is served from the
+    // content-addressed cache and `cached_tokens` reports it. Assert that
+    // token accounting directly instead of wall-clock TTFT — TTFT is a flaky
+    // CI signal (tiny warm-GPU times dominated by fixed per-turn setup, not
+    // prefill work) AND a weak one (a broken reuse that silently re-prefilled
+    // the whole prompt could still report a fast TTFT on a fast machine). The
+    // deterministic proof that "only the delta was prefilled" is that the
+    // freshly-prefilled span is smaller than the reused prefix.
+    let uncached_delta = r2.prompt_tokens.saturating_sub(r2.cached_tokens);
+    eprintln!(
+        "prefix-reuse token accounting: prompt_tokens={} cached_tokens={} uncached_delta={}",
+        r2.prompt_tokens, r2.cached_tokens, uncached_delta,
+    );
+    // The reused prefix must be the clear MAJORITY of the work: turn 2
+    // reprocesses only the short new suffix (the one-word reply + the new
+    // user turn), while turn 1's long question is served from the
+    // content-addressed cache. `cached_tokens >= 2 * uncached_delta` proves
+    // that deterministically — a broken reuse that re-prefilled the whole
+    // prompt would push uncached_delta up to the full prompt and fail.
     assert!(
-        ttft2 < ttft1 * 1.5,
-        "prefix-reuse hit did not flatten TTFT: turn1={:.1}ms turn2={:.1}ms",
-        ttft1,
-        ttft2,
+        uncached_delta * 2 < r2.cached_tokens,
+        "prefix reuse is not the clear majority of the work: reused \
+         prefix={} freshly-prefilled suffix={} (prompt_tokens={})",
+        r2.cached_tokens,
+        uncached_delta,
+        r2.prompt_tokens,
     );
 }
 
