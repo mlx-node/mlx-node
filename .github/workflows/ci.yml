@@ -169,9 +169,15 @@ jobs:
   # the `model-e2e` label. Excluded families:
   #   * qwen3_5 MoE — smallest published checkpoint is 35B-A3B (~70GB); there is
   #     no small option, and it would not fit a standard macOS runner's RAM.
-  #   * gemma4 uses `google/gemma-4-E2B-it` (HF-gated; CI's HUGGINGFACE_TOKEN has
-  #     access). It is the heaviest leg; if it OOMs the 7GB standard runner, move
-  #     just that leg to a larger `macos-*-xlarge` runner or convert it quantized.
+  #   * gemma4 (`google/gemma-4-E2B-it`, HF-gated; CI's HUGGINGFACE_TOKEN has
+  #     access) — bf16 E2B is ~9.6GB on disk, and the paged-vs-flat parity test
+  #     holds a flat AND a paged instance resident at once (measured ~20GB peak
+  #     RSS; one instance alone ~10GB), so it SIGKILL/jetsam OOMs the 7GB standard
+  #     runner. To re-enable: run this leg on a `macos-*-xlarge` (~14GB) runner
+  #     with the parity test restructured to load the two models sequentially
+  #     (drop flat before loading paged), or convert the checkpoint quantized so
+  #     both instances fit. The PLE buffer-cap sharding fix that lets E2B load at
+  #     all is already in place.
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
@@ -215,14 +221,6 @@ jobs:
             tests: >-
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
-          - name: gemma4
-            model: google/gemma-4-E2B-it
-            slug: gemma-4-e2b
-            mtype: gemma4
-            env: MLX_TEST_MODEL_PATH MLX_TEST_GEMMA4_MODEL_PATH
-            tests: >-
-              --test gemma4_paged_vs_flat_parity
-              --test gemma4_session
     steps:
       - uses: actions/checkout@v6
         with:
