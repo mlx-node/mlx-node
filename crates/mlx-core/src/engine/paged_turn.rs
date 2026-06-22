@@ -387,7 +387,15 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         prompt_token_count as u32
     };
 
-    let mut result = backend.finalize_turn(FinalizeArgs {
+    // Fallible: a family's finalize may decode the assistant text here (gemma4)
+    // and error. `finalize_paged_turn` + `save_paged_history` above ALREADY
+    // published the kept-live request and advanced `cached_token_history` for
+    // this turn, but the caller treats an Err turn as failed and does not append
+    // it. Reset the session to a cold, non-live state before propagating — the
+    // same rollback as the save_paged_history failure above — so the next delta
+    // restarts from a fresh prefill instead of warm-continuing onto a native
+    // cache that holds a turn the conversation omits.
+    let mut result = match backend.finalize_turn(FinalizeArgs {
         tokenizer: &tokenizer,
         generated_tokens: &generated_tokens,
         finish_reason,
@@ -398,7 +406,13 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
         thinking_enabled: thinking.enabled,
         prompt_tokens: reported_prompt_tokens,
         reasoning_tokens,
-    })?;
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = backend.reset_caches(ResetScope::Command);
+            return Err(e);
+        }
+    };
     // cached_tokens overwrite stays in the engine (AFTER finalize — the
     // override must not fill it): it reports the matched prefix length;
     // for delta turns the warm-continue effective_cached_prefix_len covers
