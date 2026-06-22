@@ -472,6 +472,95 @@ fn read_passthrough_bytes(src: &PassthroughSource) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Load a dense bf16 2-D tensor as axis-0 row shards, each `<= shard_byte_budget`
+/// bytes, streaming the rows straight from the source file (no whole-tensor MLX
+/// array is ever built, so the Metal per-buffer cap never applies).
+///
+/// Returns `(shards, rows_per_shard)`: `shards` concatenated along axis 0 equal
+/// the full `[vocab, cols]` table; `rows_per_shard` is the uniform axis-0 stride
+/// (every shard but the last has exactly this many rows). Used for tables like
+/// gemma-4-E2B's ~4GB `embed_tokens_per_layer.weight` that exceed the cap.
+pub(crate) fn load_bf16_tensor_sharded(
+    model_dir: &std::path::Path,
+    key: &str,
+    shard_byte_budget: usize,
+) -> Result<(Vec<MxArray>, i64)> {
+    use mlx_sys as sys;
+
+    // Locate the safetensors file holding `key` (single-file or sharded layout)
+    // and read only its header to get the data offset + shape + dtype.
+    let mut found: Option<(std::path::PathBuf, TensorInfo, usize)> = None;
+    let entries = std::fs::read_dir(model_dir)
+        .map_err(|e| Error::from_reason(format!("read_dir {model_dir:?} failed: {e}")))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let st = SafeTensorsFile::load(&p)?;
+        if let Some(info) = st.tensors.get(key) {
+            found = Some((p, info.clone(), st.data_offset));
+            break;
+        }
+    }
+    let (file_path, info, data_offset) = found.ok_or_else(|| {
+        Error::from_reason(format!(
+            "tensor {key} not found in any safetensors under {model_dir:?}"
+        ))
+    })?;
+
+    if !matches!(info.dtype, SafeTensorDType::BF16) {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} is {:?}, expected BF16",
+            info.dtype
+        )));
+    }
+    if info.shape.len() != 2 {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} is {}-D, expected 2-D",
+            info.shape.len()
+        )));
+    }
+    let vocab = info.shape[0] as i64;
+    let cols = info.shape[1] as i64;
+    let row_bytes = cols as usize * 2; // bf16 = 2 bytes/element
+    if row_bytes == 0 {
+        return Err(Error::from_reason(format!(
+            "load_bf16_tensor_sharded: {key} has zero columns"
+        )));
+    }
+    let rows_per_shard = ((shard_byte_budget / row_bytes).max(1)) as i64;
+    // Absolute file offset where this tensor's data begins.
+    let tensor_base = (data_offset + info.data_offsets[0]) as u64;
+
+    let path_str = file_path
+        .to_str()
+        .ok_or_else(|| Error::from_reason("safetensors path is not valid UTF-8"))?;
+    let c_path = std::ffi::CString::new(path_str)
+        .map_err(|_| Error::from_reason("safetensors path contains a null byte"))?;
+
+    let mut shards: Vec<MxArray> = Vec::new();
+    let mut base: i64 = 0;
+    while base < vocab {
+        let rows_s = (vocab - base).min(rows_per_shard);
+        let shard_offset = tensor_base + (base as u64) * (row_bytes as u64);
+        let shard_len = rows_s as usize * row_bytes;
+        let mut buf = vec![0u8; shard_len];
+        let ok = unsafe {
+            sys::mlx_safetensor_read_raw(c_path.as_ptr(), shard_offset, buf.as_mut_ptr(), buf.len())
+        };
+        if !ok {
+            return Err(Error::from_reason(format!(
+                "Failed to read shard of {key} from {path_str} (offset={shard_offset}, len={shard_len})"
+            )));
+        }
+        let u16_data = bytes_to_u16(&buf);
+        shards.push(MxArray::from_bfloat16(&u16_data, &[rows_s, cols])?);
+        base += rows_s;
+    }
+    Ok((shards, rows_per_shard))
+}
+
 /// Snapshot MLX's allocator counters in MB. Returns `(active, peak, cache)`.
 /// Each accessor is fallible (returns -1 if the Metal allocator is
 /// uninitialised, e.g. CPU-only host or convert path that never touched the
@@ -1069,6 +1158,47 @@ mod tests {
         // And both must equal the original little-endian u16 input.
         let expected: Vec<u8> = bits.iter().flat_map(|&x| x.to_le_bytes()).collect();
         assert_eq!(raw_bytes, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Streaming a bf16 table into axis-0 row shards must reconstruct the source
+    // rows exactly — exercises the file discovery + per-shard offset math
+    // (tensor_base + base*row_bytes) and the short final shard.
+    #[test]
+    fn load_bf16_tensor_sharded_matches_source_rows() {
+        let dir = std::env::temp_dir().join(format!("st_shard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        // [7, 4] bf16 with every element distinct, so a wrong offset is obvious.
+        const V: usize = 7;
+        const C: usize = 4;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let arr = MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("embed_tokens_per_layer.weight".to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        // Budget = 2 rows (2*C*2 bytes) → rows_per_shard 2 → shards [2,2,2,1].
+        let budget = 2 * C * 2;
+        let (shards, rows_per_shard) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        assert_eq!(rows_per_shard, 2);
+        assert_eq!(shards.len(), 4);
+
+        // Concatenated shard rows (in order) must equal the source, byte-exact.
+        let mut got: Vec<u16> = Vec::new();
+        for (s, shard) in shards.iter().enumerate() {
+            let rows_s = if s < 3 { 2 } else { 1 };
+            assert_eq!(shard.shape_at(0).unwrap(), rows_s as i64);
+            assert_eq!(shard.shape_at(1).unwrap(), C as i64);
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, bits,
+            "sharded load must reconstruct the source tensor rows exactly"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

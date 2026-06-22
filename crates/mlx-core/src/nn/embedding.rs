@@ -28,6 +28,24 @@ struct QuantizedEmbeddingBackend {
     mode: String,
 }
 
+/// Row-sharded backend for a dense bf16 embedding table whose single tensor
+/// exceeds the Metal per-buffer cap (e.g. gemma-4-E2B's ~4GB
+/// `embed_tokens_per_layer.weight` on a memory-constrained device, where the
+/// whole-tensor materialize eval cannot allocate one buffer).
+///
+/// The table `[vocab, cols]` is split along axis 0 into `shards`, each a
+/// sub-cap `[rows_s, cols]` array (`rows_s <= rows_per_shard`, the last shard
+/// shorter). Because every token's full embedding is one contiguous axis-0 row,
+/// each token lands entirely inside one shard, so the gather reconstructs the
+/// exact bytes of `take(full_table, ids, 0)` (see `forward_sharded`).
+#[derive(Clone)]
+struct ShardedEmbedding {
+    /// Sub-cap row blocks; concatenated along axis 0 they are the full table.
+    shards: Vec<MxArray>,
+    /// Uniform axis-0 stride: shard `s` covers rows `[s*rows_per_shard, …)`.
+    rows_per_shard: i64,
+}
+
 pub struct Embedding {
     /// Dense (bf16) weight. For a plain bf16 embedding this is the lookup
     /// table. For a PACKED-quantized embedding (`quantized_packed` set) this is
@@ -47,6 +65,10 @@ pub struct Embedding {
     /// lfm2 opt-in path). When present, `forward`/`as_linear` use the packed
     /// tensors instead of the dense `weight`.
     quantized_packed: Option<QuantizedEmbeddingBackend>,
+    /// Row-sharded backend (set only via `set_sharded()`). When present,
+    /// `forward` gathers across the sub-cap shards instead of reading the dense
+    /// `weight`; used for tables too large to materialize as one Metal buffer.
+    sharded: Option<ShardedEmbedding>,
 }
 
 impl Embedding {
@@ -62,6 +84,7 @@ impl Embedding {
             embedding_dim,
             is_quantized_flag: false,
             quantized_packed: None,
+            sharded: None,
         })
     }
 
@@ -91,6 +114,9 @@ impl Embedding {
                 q.bits,
                 &q.mode,
             );
+        }
+        if let Some(ref sh) = self.sharded {
+            return forward_sharded(sh, indices);
         }
         self.weight.take(indices, 0)
     }
@@ -149,7 +175,83 @@ impl Embedding {
         self.weight = weight.clone();
         self.is_quantized_flag = false;
         self.quantized_packed = None;
+        self.sharded = None;
         Ok(())
+    }
+
+    /// Install a row-sharded dense table (axis-0 row blocks). Used when the full
+    /// table is too large to materialize as one Metal buffer; `forward` then
+    /// gathers across the shards. `shards` concatenated along axis 0 must equal
+    /// the full `[num_embeddings, embedding_dim]` table, and `rows_per_shard` is
+    /// the uniform axis-0 stride (every shard but the last has this many rows).
+    pub fn set_sharded(&mut self, shards: Vec<MxArray>, rows_per_shard: i64) -> Result<()> {
+        if shards.is_empty() {
+            return Err(Error::from_reason("set_sharded: shards must be non-empty"));
+        }
+        if rows_per_shard <= 0 {
+            return Err(Error::from_reason(
+                "set_sharded: rows_per_shard must be > 0",
+            ));
+        }
+        // The dense `load_weight` shape check is skipped on this path, so enforce
+        // the same contract the gather relies on: the shards must reconstruct the
+        // full `[num_embeddings, embedding_dim]` table. `forward_sharded` reads
+        // each shard's base row as `index * rows_per_shard`, so every shard but
+        // the last must have exactly `rows_per_shard` rows; the last holds the
+        // remainder. Reject a drifted checkpoint here instead of silently
+        // gathering wrong rows or failing later in the projection.
+        let last = shards.len() - 1;
+        let mut total_rows: i64 = 0;
+        for (i, shard) in shards.iter().enumerate() {
+            if shard.ndim()? != 2 {
+                return Err(Error::from_reason(format!(
+                    "set_sharded: shard {i} must be 2-D, got {:?}",
+                    shard.shape()?.as_ref()
+                )));
+            }
+            let cols = shard.shape_at(1)?;
+            if cols != self.embedding_dim as i64 {
+                return Err(Error::from_reason(format!(
+                    "set_sharded: shard {i} has {cols} columns, expected {}",
+                    self.embedding_dim
+                )));
+            }
+            let rows = shard.shape_at(0)?;
+            if i != last && rows != rows_per_shard {
+                return Err(Error::from_reason(format!(
+                    "set_sharded: non-final shard {i} has {rows} rows, expected stride {rows_per_shard}"
+                )));
+            }
+            if i == last && (rows < 1 || rows > rows_per_shard) {
+                return Err(Error::from_reason(format!(
+                    "set_sharded: final shard {i} has {rows} rows, expected 1..={rows_per_shard}"
+                )));
+            }
+            total_rows = total_rows.saturating_add(rows);
+        }
+        if total_rows != self.num_embeddings as i64 {
+            return Err(Error::from_reason(format!(
+                "set_sharded: shard rows sum to {total_rows}, expected {}",
+                self.num_embeddings
+            )));
+        }
+        self.sharded = Some(ShardedEmbedding {
+            shards,
+            rows_per_shard,
+        });
+        self.is_quantized_flag = false;
+        self.quantized_packed = None;
+        Ok(())
+    }
+
+    /// The sharded table's sub-cap arrays (empty when not sharded). Lets the
+    /// loader feed them to the chunked weight-materialize pass, since they live
+    /// outside the `params` map the rest of the weights are materialized from.
+    pub fn shard_arrays(&self) -> &[MxArray] {
+        match self.sharded {
+            Some(ref sh) => &sh.shards,
+            None => &[],
+        }
     }
 
     /// Load quantized embedding weights (LEGACY pre-dequantized path).
@@ -308,6 +410,7 @@ impl Clone for Embedding {
                     bits: q.bits,
                     mode: q.mode.clone(),
                 }),
+            sharded: self.sharded.clone(),
         }
     }
 }
@@ -332,8 +435,68 @@ impl Embedding {
             embedding_dim: shape[1] as u32,
             is_quantized_flag: false,
             quantized_packed: None,
+            sharded: None,
         })
     }
+}
+
+/// Gather embedding rows across a row-sharded table, byte-identical to
+/// `take(full_table, indices, axis=0)`.
+///
+/// `indices` are assumed already in range `[0, vocab)` (the gemma4 PLE path
+/// pre-masks OOV ids to 0). For each token id `t`, exactly one shard `s*`
+/// satisfies `base_s <= t < base_s + rows_s`, and `shards[s*][t - base_s]` is
+/// the same bytes as row `t` of the full table (shards are a pure axis-0
+/// partition). The reconstruction uses only `take` and `where_` — both pure
+/// data movement, no arithmetic on the bf16 values — so the result is bitwise
+/// identical to the unsharded gather. Per-shard index clamping only keeps each
+/// `take` in-bounds; out-of-shard candidates are discarded by the mask.
+///
+/// Bit-exactness caveat: Metal's `where_` (select) flushes bf16 denormals
+/// (~1e-38) to zero, so a denormal weight reads back as 0 here while a dense
+/// `take` preserves it. This is numerically negligible and irrelevant for real
+/// weights (trained tables hold no denormals, and the PLE forward's immediate
+/// `* sqrt(ple_dim)` would flush them anyway); normals, ±0, NaN and ±Inf are
+/// preserved exactly. Paged and flat both gather through here, so the behavior
+/// is identical across cache backends.
+fn forward_sharded(sh: &ShardedEmbedding, indices: &MxArray) -> Result<MxArray> {
+    let stride = sh.rows_per_shard;
+
+    // Mask broadcast shape: indices.shape ++ [1], so a per-token bool selects
+    // across the trailing embedding-dim axis of the gathered rows.
+    let mut mask_shape: Vec<i64> = indices.shape()?.as_ref().to_vec();
+    mask_shape.push(1);
+
+    // Seed with shard 0 (base 0). Ids beyond shard 0 read a clamped (wrong) row
+    // here, but every such id is overwritten by its own shard's `where_` below.
+    let rows0 = sh.shards[0].shape_at(0)?;
+    let max0 = MxArray::scalar_int((rows0 - 1) as i32)?;
+    let local0 = indices.minimum(&max0)?;
+    let mut result = sh.shards[0].take(&local0, 0)?;
+
+    let zero = MxArray::scalar_int(0)?;
+    for (s, shard) in sh.shards.iter().enumerate().skip(1) {
+        let base = (s as i64) * stride;
+        let rows_s = shard.shape_at(0)?;
+
+        let base_arr = MxArray::scalar_int(base as i32)?;
+        let hi_arr = MxArray::scalar_int((base + rows_s) as i32)?;
+        let in_shard = indices
+            .greater_equal(&base_arr)?
+            .logical_and(&indices.less(&hi_arr)?)?
+            .reshape(&mask_shape)?;
+
+        let neg_base = MxArray::scalar_int(-(base as i32))?;
+        let max_local = MxArray::scalar_int((rows_s - 1) as i32)?;
+        let local = indices
+            .add(&neg_base)?
+            .maximum(&zero)?
+            .minimum(&max_local)?;
+        let cand = shard.take(&local, 0)?;
+
+        result = in_shard.where_(&cand, &result)?;
+    }
+    Ok(result)
 }
 
 /// Dequantize a tensor using MLX's dequantize op, threading the quant `mode`.
@@ -627,5 +790,104 @@ mod tests {
             got_v, prev_v,
             "dense as_linear must EQUAL x @ get_weight()^T"
         );
+    }
+
+    /// Sharded gather must be BYTE-IDENTICAL to a dense `take(weight, ids, 0)`,
+    /// including for special bf16 bit patterns (NaN / ±0 / ±Inf) that any
+    /// value-domain op (e.g. a mask-multiply-sum) would perturb. Stresses shard
+    /// boundaries, repeats, out-of-order ids, and a short final shard.
+    ///
+    /// bf16 denormals are intentionally excluded: Metal's `where_` flushes them
+    /// to zero (see `forward_sharded`), they don't occur in real weights, and
+    /// the PLE forward's `* sqrt(ple_dim)` would flush them anyway.
+    #[test]
+    fn sharded_forward_matches_dense_take_byte_identical() {
+        const V: usize = 7;
+        const C: usize = 3;
+        // Row-major [V, C] bf16 bit patterns; rows 3 and 5 carry NaN/±Inf/-0 so
+        // a bitwise mistake (e.g. mask-multiply-sum) would show up.
+        let w: Vec<u16> = vec![
+            0x3f00, 0x3f80, 0x4000, // row 0: 0.5, 1.0, 2.0
+            0x4040, 0x40a0, 0xc080, // row 1
+            0x4110, 0x4150, 0x4190, // row 2
+            0x7fc0, 0x7f80, 0xff80, // row 3: NaN, +Inf, -Inf
+            0x41f0, 0x4210, 0x4230, // row 4
+            0x8000, 0x3e80, 0xbf80, // row 5: -0, 0.25, -1.0
+            0x4310, 0x4330, 0x4350, // row 6
+        ];
+        let full = MxArray::from_bfloat16(&w, &[V as i64, C as i64]).expect("full");
+
+        // Shard along axis 0 with stride 2: rows [0,1] [2,3] [4,5] [6].
+        let rows_per_shard = 2usize;
+        let mut shards = Vec::new();
+        let mut base = 0usize;
+        while base < V {
+            let rows_s = (V - base).min(rows_per_shard);
+            let slice = &w[base * C..(base + rows_s) * C];
+            shards.push(MxArray::from_bfloat16(slice, &[rows_s as i64, C as i64]).expect("shard"));
+            base += rows_s;
+        }
+        assert_eq!(shards.len(), 4, "expected 4 shards (last short)");
+
+        let mut emb = Embedding::new(V as u32, C as u32).expect("emb");
+        emb.set_sharded(shards, rows_per_shard as i64)
+            .expect("set_sharded");
+
+        // Cover every shard, both boundary rows of each, repeats, reverse order,
+        // and the special-pattern rows 3 and 5.
+        let ids_i32: Vec<i32> = vec![0, 6, 3, 5, 2, 1, 4, 6, 0, 3, 5];
+        let ids = MxArray::from_int32(&ids_i32, &[ids_i32.len() as i64]).expect("ids");
+
+        let dense = full.take(&ids, 0).expect("dense take");
+        let got = emb.forward(&ids).expect("sharded forward");
+
+        let dense_u16 = dense.to_uint16_native().expect("dense bytes");
+        let got_u16 = got.to_uint16_native().expect("sharded bytes");
+        assert_eq!(
+            got_u16, dense_u16,
+            "sharded gather must be byte-identical to dense take"
+        );
+    }
+
+    /// `set_sharded` must reject shards that don't reconstruct the configured
+    /// `[num_embeddings, embedding_dim]` table — the dense `load_weight` shape
+    /// check is skipped on the sharded path, so a drifted checkpoint would
+    /// otherwise install silently and gather wrong rows.
+    #[test]
+    fn set_sharded_rejects_shape_mismatch() {
+        let z =
+            |rows: i64, cols: i64| MxArray::zeros(&[rows, cols], Some(DType::BFloat16)).expect("z");
+
+        // Row count short of num_embeddings (2 + 2 = 4, expected 7).
+        let mut emb = Embedding::new(7, 3).expect("emb");
+        let err = emb.set_sharded(vec![z(2, 3), z(2, 3)], 2).unwrap_err();
+        assert!(
+            err.reason.contains("rows sum to 4"),
+            "row-coverage mismatch must error, got: {}",
+            err.reason
+        );
+
+        // Wrong column width (4 != embedding_dim 3).
+        let mut emb = Embedding::new(4, 3).expect("emb");
+        let err = emb.set_sharded(vec![z(2, 4), z(2, 4)], 2).unwrap_err();
+        assert!(
+            err.reason.contains("columns, expected 3"),
+            "column mismatch must error, got: {}",
+            err.reason
+        );
+
+        // Non-final shard not equal to the stride breaks the base-row math.
+        let mut emb = Embedding::new(5, 3).expect("emb");
+        let err = emb.set_sharded(vec![z(3, 3), z(2, 3)], 2).unwrap_err();
+        assert!(
+            err.reason.contains("non-final shard 0 has 3 rows"),
+            "non-final stride mismatch must error, got: {}",
+            err.reason
+        );
+
+        // The well-formed [2,2,1] partition of 5 rows still passes.
+        let mut emb = Embedding::new(5, 3).expect("emb");
+        emb.set_sharded(vec![z(2, 3), z(2, 3), z(1, 3)], 2)
+            .expect("well-formed shards must install");
     }
 }

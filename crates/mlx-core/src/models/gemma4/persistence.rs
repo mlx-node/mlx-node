@@ -621,6 +621,57 @@ pub fn sanitize_weights(
     Ok(sanitized)
 }
 
+/// Per-buffer byte budget for sharding the oversized PLE embedding. Defaults to
+/// 1 GiB — comfortably under the smallest real Metal per-buffer cap (~3.5 GiB on
+/// memory-constrained CI runners) — and is overridable via
+/// `MLX_GEMMA4_PLE_SHARD_BYTES` (tests force a tiny budget to exercise the
+/// sharded gather; a huge value disables sharding on roomy devices).
+fn ple_shard_byte_budget() -> usize {
+    const DEFAULT: usize = 1 << 30; // 1 GiB
+    std::env::var("MLX_GEMMA4_PLE_SHARD_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&b| b > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// If `embed_tokens_per_layer.weight` is a dense bf16 tensor larger than the
+/// shard budget, load it as sub-cap row shards (streamed from file) and install
+/// them on the PLE embedding, then drop the key from `params` so neither the
+/// dense apply path nor the whole-tensor materialize pass touches the oversized
+/// array. Keyed on this one tensor only — `embed_tokens` (the tied lm_head) is
+/// never sharded (it needs the dense table for `as_linear`).
+fn maybe_shard_ple_embedding(
+    inner: &mut Gemma4Inner,
+    params: &mut HashMap<String, MxArray>,
+    model_dir: &Path,
+) -> Result<()> {
+    const KEY: &str = "embed_tokens_per_layer.weight";
+    // Quantized PLE (scales present) uses a separate load path — leave it alone.
+    if params.contains_key("embed_tokens_per_layer.scales") {
+        return Ok(());
+    }
+    let budget = ple_shard_byte_budget();
+    let needs_shard = match params.get(KEY) {
+        Some(w) => w.dtype()? == DType::BFloat16 && w.nbytes() > budget,
+        None => false,
+    };
+    if !needs_shard {
+        return Ok(());
+    }
+    let Some(ple) = inner.ple.as_mut() else {
+        return Ok(());
+    };
+    let (shards, rows_per_shard) =
+        crate::utils::safetensors::load_bf16_tensor_sharded(model_dir, KEY, budget)?;
+    let n = shards.len();
+    ple.embed_tokens_per_layer
+        .set_sharded(shards, rows_per_shard)?;
+    params.remove(KEY);
+    info!("PLE embed_tokens_per_layer loaded (sharded into {n} sub-cap arrays)");
+    Ok(())
+}
+
 /// Apply sanitized weights to a Gemma4Inner.
 fn apply_weights(
     inner: &mut Gemma4Inner,
@@ -1563,6 +1614,14 @@ impl Gemma4Inner {
             merge_split_experts_into_fused(&mut per_layer_quant, config.num_hidden_layers as usize);
         }
 
+        // gemma-4-E2B's `embed_tokens_per_layer.weight` is a single ~4GB tensor
+        // that can exceed the Metal per-buffer cap on memory-constrained
+        // devices, where the whole-tensor materialize eval below would fail to
+        // allocate one buffer. Shard it across sub-cap arrays (streamed from the
+        // file) before apply_weights so the dense PLE-load branch is skipped and
+        // the forward gathers across shards.
+        maybe_shard_ple_embedding(&mut inner, &mut params, path)?;
+
         // Apply weights
         apply_weights(
             &mut inner,
@@ -1589,7 +1648,13 @@ impl Gemma4Inner {
         // timeouts on large models. Without this, weights remain as lazy mmap
         // references and every decode step re-reads ~48GB from disk.
         {
-            let weight_refs: Vec<&MxArray> = params.values().collect();
+            let mut weight_refs: Vec<&MxArray> = params.values().collect();
+            // PLE shards live outside `params` (their oversized source key was
+            // removed); materialize them too. Each shard is sub-cap, so the
+            // chunked eval allocates fine.
+            if let Some(ple) = inner.ple.as_ref() {
+                weight_refs.extend(ple.embed_tokens_per_layer.shard_arrays());
+            }
             crate::array::memory::materialize_weights(&weight_refs)?;
         }
 
@@ -1636,10 +1701,20 @@ impl Gemma4Inner {
         // before it is dropped at end-of-function.
         // `saturating_add` guards against overflow on a corrupted
         // checkpoint.
-        let weight_bytes: u64 = params
+        let mut weight_bytes: u64 = params
             .values()
             .map(|a| a.nbytes() as u64)
             .fold(0u64, |acc, v| acc.saturating_add(v));
+        // The PLE shards were removed from `params` (their oversized source key
+        // is gone) but are still model-owned resident weights. Count them too,
+        // mirroring the materialize pass above; omitting their ~4GB would
+        // under-report the footprint and inflate the cache cap on exactly the
+        // constrained devices this sharding targets.
+        if let Some(ple) = inner.ple.as_ref() {
+            for shard in ple.embed_tokens_per_layer.shard_arrays() {
+                weight_bytes = weight_bytes.saturating_add(shard.nbytes() as u64);
+            }
+        }
 
         Ok((inner, weight_bytes))
     }
