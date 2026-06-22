@@ -17,6 +17,7 @@ use crate::engine::params::ChatParams;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
+use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::sampling::{SamplingConfig, sample};
@@ -347,7 +348,7 @@ pub(crate) struct Gemma4Inner {
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Gemma4DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
-    pub(crate) lm_head: Option<Linear>,
+    pub(crate) lm_head: Option<LinearProj>,
     /// Pre-transposed embedding weight for tied lm_head: [hidden_size, vocab_size].
     /// Only populated when tie_word_embeddings=true.
     pub(crate) embed_weight_t: Option<MxArray>,
@@ -691,7 +692,11 @@ impl Gemma4Inner {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(Linear::new(hidden_size, vocab_size, Some(false))?)
+            Some(LinearProj::Standard(Linear::new(
+                hidden_size,
+                vocab_size,
+                Some(false),
+            )?))
         };
 
         let mut layers = Vec::with_capacity(num_layers);
@@ -5257,7 +5262,7 @@ fn forward_inner(
     layers: &[Gemma4DecoderLayer],
     caches: &mut [Gemma4LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
@@ -7064,7 +7069,7 @@ mod tests {
         inner.final_norm.set_weight(&cast(&w)).expect("final_norm");
         if let Some(ref mut head) = inner.lm_head {
             let w = head.get_weight();
-            head.set_weight(&cast(&w)).expect("lm_head");
+            head.set_weight(&cast(&w), "lm_head").expect("lm_head");
         }
         for layer in inner.layers.iter_mut() {
             // Norms.

@@ -825,17 +825,15 @@ fn apply_weights(
         inner.final_norm.set_weight(w)?;
     }
 
-    // LM head (when not tied)
+    // LM head (when not tied): install quantized or dense weights.
     if !config.tie_word_embeddings
         && let Some(ref mut head) = inner.lm_head
     {
-        if try_build_ql("lm_head")?.is_some() {
-            return Err(Error::from_reason(
-                "Quantized lm_head not yet supported for Gemma4",
-            ));
+        if let Some(ql) = try_build_ql("lm_head")? {
+            head.set_quantized(ql);
         } else if let Some(w) = params.get("lm_head.weight") {
             ensure_dense_weight_floating("lm_head.weight", w)?;
-            head.set_weight(w)?;
+            head.set_weight(w, "lm_head")?;
         }
     }
 
@@ -2234,6 +2232,118 @@ mod tests {
         );
         params.insert("layers.0.router.proj.weight".into(), bf16_w(&[2, 16]));
         run(&params).expect("dense bf16 MoE weights must keep loading");
+    }
+
+    /// A quantized `lm_head` (2-bit affine, untied) must be installed as
+    /// `LinearProj::Quantized`; the dense fallback (no `.scales`) must produce
+    /// `LinearProj::Standard`; the tied path (`tie_word_embeddings=true`) must
+    /// leave `lm_head` as `None` (regression).
+    #[test]
+    fn lm_head_quantized_and_dense_install() {
+        use super::super::quantized_linear::LinearProj;
+
+        let base_json = |tied: bool| {
+            serde_json::json!({
+                "vocab_size": 8,
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 64,
+                "intermediate_size": 64,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": tied,
+                "max_position_embeddings": 64,
+                "use_block_paged_cache": false,
+            })
+        };
+
+        // Helpers for building a 2-bit affine quantized lm_head fixture:
+        //   weight: Uint32 [vocab=8, hidden*bits/32 = 64*2/32 = 4]
+        //   scales: BFloat16 [vocab=8, hidden/group_size = 64/64 = 1]
+        //   biases: BFloat16 [vocab=8, 1]
+        let u32_w = || {
+            MxArray::from_float32(&[0.0f32; 8 * 4], &[8, 4])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let bf16_sidecar = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+
+        // Per-layer override: 2-bit affine for lm_head.
+        let mut plq_map: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq_map.insert(
+            "lm_head".to_string(),
+            PerLayerQuant {
+                bits: 2,
+                group_size: 64,
+                mode: PerLayerMode::Affine,
+            },
+        );
+
+        // (a) Quantized path: lm_head.weight (Uint32) + .scales + .biases
+        //     with the per-layer affine override → must install Quantized.
+        {
+            let config: Gemma4Config =
+                serde_json::from_value(base_json(false)).expect("Gemma4Config (untied)");
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u32_w());
+            params.insert("lm_head.scales".into(), bf16_sidecar(&[8, 1]));
+            params.insert("lm_head.biases".into(), bf16_sidecar(&[8, 1]));
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, &params, &config, 4, 64, None, &plq_map)
+                .expect("quantized lm_head must load");
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+                "quantized lm_head must install as LinearProj::Quantized"
+            );
+        }
+
+        // (b) Dense fallback: lm_head.weight (BFloat16), no .scales, empty
+        //     per-layer map → must install Standard.
+        {
+            let config: Gemma4Config =
+                serde_json::from_value(base_json(false)).expect("Gemma4Config (untied)");
+            let bf16_dense = {
+                let n = 8i64 * 64;
+                MxArray::from_float32(&vec![0.01f32; n as usize], &[8, 64])
+                    .expect("from_float32")
+                    .astype(DType::BFloat16)
+                    .expect("bf16")
+            };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), bf16_dense);
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, &params, &config, 4, 64, None, &HashMap::new())
+                .expect("dense lm_head must load");
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Standard(_))),
+                "dense lm_head must install as LinearProj::Standard"
+            );
+        }
+
+        // (c) Tied-embedding regression: tie_word_embeddings=true → lm_head
+        //     must remain None regardless of params.
+        {
+            let config: Gemma4Config =
+                serde_json::from_value(base_json(true)).expect("Gemma4Config (tied)");
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u32_w());
+            params.insert("lm_head.scales".into(), bf16_sidecar(&[8, 1]));
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            apply_weights(&mut inner, &params, &config, 4, 64, None, &plq_map)
+                .expect("tied lm_head must load without error");
+            assert!(
+                inner.lm_head.is_none(),
+                "tied lm_head must remain None when tie_word_embeddings=true"
+            );
+        }
     }
 
     #[test]
