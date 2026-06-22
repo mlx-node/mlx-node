@@ -136,6 +136,132 @@ pub fn repack_symmetric_to_mlx_affine(
     (weight, scales, biases)
 }
 
+/// Lossless repack of Google gemma-QAT **per-group** symmetric weights into MLX
+/// group-wise affine form, replicating each source group's scale across the
+/// `src_group_size / dst_group_size` MLX sub-groups it spans.
+///
+/// This is the per-group sibling of [`repack_symmetric_to_mlx_affine`]. It exists
+/// for the per-layer embedding `embed_tokens_per_layer`, whose `embedding_scale`
+/// has shape `[rows, num_src_groups]` (one f32 per `src_group_size`-wide block of
+/// the logical input dim) rather than one scale per row. MLX affine only accepts
+/// `group_size ∈ {32, 64, 128}`, so a 256-wide source group is emitted as two
+/// adjacent 128-wide MLX groups carrying the same (constant-within-the-block)
+/// scale — lossless.
+///
+/// # Arguments
+/// * `packed` — row-major `[rows, in/(8/bits)]` Google packed bytes
+/// * `group_scale` — row-major `[rows, num_src_groups]` per-source-group scale
+/// * `rows` — number of output rows (vocab entries for the PLE embedding)
+/// * `in_features` — logical input channels per row
+/// * `bits` — 2 or 4
+/// * `src_group_size` — width of a source scale block (e.g. 256)
+/// * `dst_group_size` — MLX affine group size (e.g. 128); must divide `src_group_size`
+///
+/// # Returns
+/// `(weight, scales, biases)` as raw Vecs:
+/// * `weight` — uint32, row-major `[rows, in*bits/32]`
+/// * `scales` — f32, row-major `[rows, in/dst_group_size]`
+/// * `biases` — f32, row-major `[rows, in/dst_group_size]`
+///
+/// # Panics
+/// Panics on inconsistent inputs (wrong `bits`, mismatched lengths, or dimensions
+/// that violate the packing / group constraints). These are programmer errors in
+/// the caller (the converter), not runtime data.
+pub fn repack_symmetric_per_group_to_mlx_affine(
+    packed: &[u8],
+    group_scale: &[f32],
+    rows: usize,
+    in_features: usize,
+    bits: u32,
+    src_group_size: usize,
+    dst_group_size: usize,
+) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+    assert!(bits == 2 || bits == 4, "bits must be 2 or 4, got {bits}");
+    assert!(dst_group_size > 0, "dst_group_size must be > 0");
+    assert_eq!(
+        src_group_size % dst_group_size,
+        0,
+        "src_group_size ({src_group_size}) must be divisible by dst_group_size ({dst_group_size})"
+    );
+
+    let values_per_byte = 8 / bits as usize; // 4-bit → 2, 2-bit → 4
+    let values_per_u32 = 32 / bits as usize; // 4-bit → 8, 2-bit → 16
+
+    assert_eq!(
+        in_features % values_per_byte,
+        0,
+        "in_features ({in_features}) must be divisible by values_per_byte ({values_per_byte})"
+    );
+    assert_eq!(
+        in_features % values_per_u32,
+        0,
+        "in_features ({in_features}) must be divisible by values_per_u32 ({values_per_u32})"
+    );
+    assert_eq!(
+        in_features % src_group_size,
+        0,
+        "in_features ({in_features}) must be divisible by src_group_size ({src_group_size})"
+    );
+    assert_eq!(
+        in_features % dst_group_size,
+        0,
+        "in_features ({in_features}) must be divisible by dst_group_size ({dst_group_size})"
+    );
+
+    let num_src_groups = in_features / src_group_size;
+    assert_eq!(
+        group_scale.len(),
+        rows * num_src_groups,
+        "group_scale length ({}) must equal rows * num_src_groups ({})",
+        group_scale.len(),
+        rows * num_src_groups
+    );
+
+    let bytes_per_row = in_features / values_per_byte;
+    assert_eq!(
+        packed.len(),
+        rows * bytes_per_row,
+        "packed length ({}) must equal rows * bytes_per_row ({})",
+        packed.len(),
+        rows * bytes_per_row
+    );
+
+    let u32_per_row = in_features * bits as usize / 32;
+    let dst_groups_per_row = in_features / dst_group_size;
+    let sub_per_src = src_group_size / dst_group_size; // 256/128 = 2
+    let zero_point = (1u32 << (bits - 1)) as f32; // 8 @ 4-bit, 2 @ 2-bit
+    let nibble_mask: u32 = (1u32 << bits) - 1;
+
+    let mut weight = vec![0u32; rows * u32_per_row];
+    let mut scales = vec![0f32; rows * dst_groups_per_row];
+    let mut biases = vec![0f32; rows * dst_groups_per_row];
+
+    for o in 0..rows {
+        // Replicate each source-group scale across the dst sub-groups it spans.
+        for dg in 0..dst_groups_per_row {
+            let src_g = dg / sub_per_src;
+            let s = group_scale[o * num_src_groups + src_g];
+            scales[o * dst_groups_per_row + dg] = s;
+            biases[o * dst_groups_per_row + dg] = -zero_point * s;
+        }
+
+        let row_bytes = &packed[o * bytes_per_row..(o + 1) * bytes_per_row];
+        let row_out = &mut weight[o * u32_per_row..(o + 1) * u32_per_row];
+
+        for col in 0..in_features {
+            let byte = row_bytes[col / values_per_byte];
+            let slot_in_byte = col % values_per_byte;
+            let q_unsigned = (u32::from(byte) >> (slot_in_byte * bits as usize)) & nibble_mask;
+
+            let word = col / values_per_u32;
+            let slot_in_word = col % values_per_u32;
+            row_out[word] |= q_unsigned << (slot_in_word * bits as usize);
+        }
+    }
+
+    (weight, scales, biases)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +504,87 @@ mod tests {
                         "2-bit mismatch at [{o},{c}]: got {got}, expected {expected}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Per-group repack: two adjacent 256-wide source blocks with DIFFERENT
+    /// scales must land the correct scale in each of their two 128-wide MLX
+    /// sub-groups, and dequant must equal `q_signed * scale`.
+    #[test]
+    fn test_per_group_roundtrip_different_block_scales() {
+        let bits = 4u32;
+        let rows = 3;
+        let src_group_size = 256;
+        let dst_group_size = 128;
+        let in_features = 512; // 2 source groups → 4 dst groups
+        let num_src_groups = in_features / src_group_size; // 2
+
+        // Distinct q_signed per (row, col) in [-8, 7].
+        let mut q_signed = vec![0i32; rows * in_features];
+        for o in 0..rows {
+            for c in 0..in_features {
+                q_signed[o * in_features + c] = ((o * 5 + c * 3) % 16) as i32 - 8;
+            }
+        }
+
+        // Two source blocks per row with DIFFERENT scales.
+        let mut group_scale = vec![0f32; rows * num_src_groups];
+        for o in 0..rows {
+            group_scale[o * num_src_groups] = 0.002 * (o as f32 + 1.0); // block 0
+            group_scale[o * num_src_groups + 1] = 0.05 * (o as f32 + 1.0); // block 1 (different)
+        }
+
+        let mut packed = Vec::new();
+        for o in 0..rows {
+            packed.extend(google_byte_pack(
+                &q_signed[o * in_features..(o + 1) * in_features],
+                bits,
+            ));
+        }
+
+        let (weight, scales, biases) = repack_symmetric_per_group_to_mlx_affine(
+            &packed,
+            &group_scale,
+            rows,
+            in_features,
+            bits,
+            src_group_size,
+            dst_group_size,
+        );
+
+        // Witness scale placement: dst groups 0,1 carry block-0 scale; 2,3 block-1.
+        let dst_groups_per_row = in_features / dst_group_size; // 4
+        for o in 0..rows {
+            let s0 = group_scale[o * num_src_groups];
+            let s1 = group_scale[o * num_src_groups + 1];
+            assert_eq!(scales[o * dst_groups_per_row], s0);
+            assert_eq!(scales[o * dst_groups_per_row + 1], s0);
+            assert_eq!(scales[o * dst_groups_per_row + 2], s1);
+            assert_eq!(scales[o * dst_groups_per_row + 3], s1);
+            assert!((biases[o * dst_groups_per_row] - (-8.0 * s0)).abs() < 1e-9);
+            assert!((biases[o * dst_groups_per_row + 3] - (-8.0 * s1)).abs() < 1e-9);
+        }
+
+        let dequant = mlx_affine_dequant(
+            &weight,
+            &scales,
+            &biases,
+            rows,
+            in_features,
+            bits,
+            dst_group_size,
+        );
+        for o in 0..rows {
+            for c in 0..in_features {
+                let src_g = c / src_group_size;
+                let expected =
+                    q_signed[o * in_features + c] as f32 * group_scale[o * num_src_groups + src_g];
+                let got = dequant[o * in_features + c];
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "per-group mismatch at [{o},{c}]: got {got}, expected {expected}"
+                );
             }
         }
     }
