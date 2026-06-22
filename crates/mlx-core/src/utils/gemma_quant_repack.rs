@@ -1,13 +1,23 @@
 //! Lossless repack of Google "gemma-QAT" per-output-channel **symmetric**
 //! packed weights into MLX group-wise **affine** quantized form.
 //!
-//! Google stores each quantized linear as byte-packed `{m}.weight` plus a
-//! per-row scale `{m}.weight_scale` of shape `[out, 1]` (one f32 scale per
-//! output row, no zero-point). Dequant is `w = q_signed * weight_scale[row]`.
+//! ## Scope
+//!
+//! This helper handles tensors with **one scale per output row**: linear
+//! projections, `lm_head`, and the vocabulary `embed_tokens` embedding.
+//! `weight_scale` has shape `[out, 1]` (one f32 per output row, no zero-point).
+//! Dequant is `w = q_signed * weight_scale[row]`.
+//!
+//! Tensors with **per-group** scales — such as the per-layer embedding
+//! `embed_tokens_per_layer` whose scale shape is `[vocab, num_groups]` (one
+//! scale per 256-element block) — are NOT in scope for this helper and are
+//! handled by a separate conversion path.
+//!
+//! ## Mapping onto MLX affine
 //!
 //! The unsigned stored value (the raw nibble/crumb, BEFORE subtracting the
 //! symmetric offset 2^(bits-1)) is exactly MLX's `q_unsigned ∈ [0, 2^bits-1]`.
-//! So the symmetric form maps losslessly onto MLX affine:
+//! So the per-output-channel symmetric form maps losslessly onto MLX affine:
 //!
 //! ```text
 //! MLX affine:  w[o, c] = q_unsigned[o,c] * scales[o,g] + biases[o,g]   (g = c / group_size)
@@ -32,7 +42,7 @@
 /// * `out_features` — number of output channels (rows)
 /// * `in_features` — number of input channels (logical columns per row)
 /// * `bits` — 2 or 4
-/// * `group_size` — MLX affine group size (64 for linears, 256 for the PLE embedding)
+/// * `group_size` — MLX affine group size (e.g. 64 for linear projections)
 ///
 /// # Returns
 /// `(weight, scales, biases)` as raw Vecs:
@@ -238,6 +248,34 @@ mod tests {
                 group_size,
             );
 
+            // ── CPU oracle: unpack weight back to q_unsigned, recompute dequant
+            //    without touching MLX, and verify against q_signed * scale.
+            {
+                let values_per_u32 = 32 / bits as usize;
+                let nibble_mask = (1u32 << bits) - 1;
+                let zero_point = (1u32 << (bits - 1)) as f64;
+                let groups_per_row = in_features / group_size;
+                for o in 0..out_features {
+                    for c in 0..in_features {
+                        let word = c / values_per_u32;
+                        let slot = c % values_per_u32;
+                        let q_u = ((weight[o * (in_features * bits as usize / 32) + word]
+                            >> (slot * bits as usize))
+                            & nibble_mask) as f64;
+                        let g = c / group_size;
+                        let s = scales[o * groups_per_row + g] as f64;
+                        let b = biases[o * groups_per_row + g] as f64;
+                        let got_cpu = q_u * s + b;
+                        let expected =
+                            q_signed[o * in_features + c] as f64 * scales_per_row[o] as f64;
+                        assert!(
+                            (got_cpu - expected).abs() < 1e-6,
+                            "4-bit CPU oracle mismatch at [{o},{c}]: got {got_cpu}, expected {expected} (q_u={q_u}, zero_point={zero_point})"
+                        );
+                    }
+                }
+            }
+
             let dequant = mlx_affine_dequant(
                 &weight,
                 &scales,
@@ -294,6 +332,32 @@ mod tests {
                 bits,
                 group_size,
             );
+
+            // ── CPU oracle for 2-bit ───────────────────────────────────────
+            {
+                let values_per_u32 = 32 / bits as usize;
+                let nibble_mask = (1u32 << bits) - 1;
+                let groups_per_row = in_features / group_size;
+                for o in 0..out_features {
+                    for c in 0..in_features {
+                        let word = c / values_per_u32;
+                        let slot = c % values_per_u32;
+                        let q_u = ((weight[o * (in_features * bits as usize / 32) + word]
+                            >> (slot * bits as usize))
+                            & nibble_mask) as f64;
+                        let g = c / group_size;
+                        let s = scales[o * groups_per_row + g] as f64;
+                        let b = biases[o * groups_per_row + g] as f64;
+                        let got_cpu = q_u * s + b;
+                        let expected =
+                            q_signed[o * in_features + c] as f64 * scales_per_row[o] as f64;
+                        assert!(
+                            (got_cpu - expected).abs() < 1e-6,
+                            "2-bit CPU oracle mismatch at [{o},{c}]: got {got_cpu}, expected {expected}"
+                        );
+                    }
+                }
+            }
 
             let dequant = mlx_affine_dequant(
                 &weight,
