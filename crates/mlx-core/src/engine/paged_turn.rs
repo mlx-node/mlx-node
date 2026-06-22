@@ -9,8 +9,8 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
-    DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, StreamEmitter, TurnOutput,
-    WholeTurnArgs,
+    DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, StreamEmitter,
+    TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
@@ -318,10 +318,20 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // save (same keep_all rule), so the paged cached_token_history matches
     // what save_cache_state would persist. ----
     // Fallible: a family's post-history checkpoint (MoE GDN warm-continue)
-    // can fail; propagate so the turn aborts rather than returning a result
-    // backed by an un-checkpointed cache. The request is already finalized
-    // (kept-live) above, so this `?` aborts after finalize.
-    backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache)?;
+    // can fail. On failure the request was ALREADY finalized keep-live and
+    // `save_paged_history` already advanced `cached_token_history` for this
+    // turn, but the caller treats an Err turn as failed and does not append
+    // it. Reset the session to a cold, non-live state (release the kept-live
+    // request, purge the prefix cache, null the caches + history) before
+    // propagating, so the next delta restarts from a fresh prefill instead of
+    // warm-continuing onto a native cache that holds a turn the conversation
+    // omits. Mirrors the VLM image cores' save-failure rollback.
+    if let Err(e) =
+        backend.save_paged_history(args.tokens, &generated_tokens, keep_all, reuse_cache)
+    {
+        let _ = backend.reset_caches(ResetScope::Command);
+        return Err(e);
+    }
 
     // ---- finalize (== chat_turn_core tail) ----
     // The `prefill_tokens_per_second` numerator is family-controlled: standard-KV
@@ -615,6 +625,7 @@ mod tests {
             &[]
         }
         fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+            self.ledger.push("reset_caches");
             Ok(())
         }
         fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
@@ -1321,19 +1332,23 @@ mod tests {
         );
     }
 
-    /// Abort path (c): `save_paged_history` returns `Err` AFTER the decode
-    /// loop succeeded and `finalize_paged_turn` already kept the request
-    /// LIVE (the real MoE GDN warm-continue checkpoint failing). Unlike the
-    /// prime/prefill/mid-decode aborts, the SUCCESS lifecycle (decode +
-    /// `finalize_paged_turn`) DID run, so the request is intentionally
-    /// retained — the save `Err` must NOT additionally call
-    /// `abort_paged_turn`. The teardown is:
-    /// `finalize_turn_keep_live_per_block` → set history →
-    /// `remember_moe_gdn_history_checkpoint()?` returns `Err` with the
-    /// request still kept-live, and the turn propagates. The error short-
-    /// circuits BEFORE the result-building `finalize_turn`.
+    /// Save-error path (c): `save_paged_history` returns `Err` AFTER the
+    /// decode loop succeeded and `finalize_paged_turn` already kept the
+    /// request LIVE (the real MoE GDN warm-continue checkpoint failing).
+    /// Unlike the prime/prefill/mid-decode aborts, the SUCCESS lifecycle
+    /// (decode + `finalize_paged_turn`) DID run, and `save_paged_history`
+    /// already advanced `cached_token_history` for this turn. Because the
+    /// caller treats the Err turn as failed and does not append it, the
+    /// engine must roll the session back to a cold, non-live state via
+    /// `reset_caches(ResetScope::Command)` (release the kept-live request,
+    /// purge the prefix cache, null caches + history) BEFORE propagating —
+    /// otherwise the next delta would warm-continue onto a native cache that
+    /// holds a turn the conversation omits. The reset replaces the
+    /// mid-decode `abort_paged_turn` (a full Command reset, not a bare
+    /// release), and the error still short-circuits BEFORE the
+    /// result-building `finalize_turn`.
     #[test]
-    fn run_paged_turn_propagates_save_error_keeps_request_live() {
+    fn run_paged_turn_save_error_resets_session_to_non_live() {
         let ledger = Arc::new(Ledger::default());
         let (out, seq) = run_failing_turn(
             ledger, /* fail_prime */ false, /* fail_prefill */ false,
@@ -1353,15 +1368,19 @@ mod tests {
             seq.contains(&"save_paged_history"),
             "save_paged_history must have been attempted; got {seq:?}"
         );
-        // THE CONTRACT: a save-Err does NOT release the request. The request
-        // was finalized-keep-live; releasing it here would propagate the
-        // checkpoint `?` while leaving the request live for the session
-        // caller to tear down.
+        // THE CONTRACT: a save-Err rolls the session back to non-live via the
+        // full Command reset, so the next delta cold-restarts instead of
+        // warm-continuing onto the failed turn's native cache.
+        assert!(
+            seq.contains(&"reset_caches"),
+            "save-Err after finalize must reset the session to non-live; got {seq:?}"
+        );
+        // The reset is the full Command reset, NOT the mid-decode bare release.
         assert!(
             !seq.contains(&"abort_paged_turn"),
-            "save-Err after finalize must NOT release the kept-live request; got {seq:?}"
+            "save-Err uses reset_caches, not the mid-decode abort_paged_turn; got {seq:?}"
         );
-        // The `?` short-circuits before the result-building finalize_turn.
+        // The error short-circuits before the result-building finalize_turn.
         assert!(
             !seq.contains(&"finalize_turn"),
             "finalize_turn must not run after a save failure; got {seq:?}"
