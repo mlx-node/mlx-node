@@ -1178,11 +1178,11 @@ export declare class Qwen35Model {
    *
    * `true` iff `Qwen35Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
-   * inference; image-bearing chat turns are rejected at runtime by
-   * the chat-entry sites. Surfaced through this NAPI method so
+   * `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
+   * checkpoints because parity is pending real-weights validation, and
+   * default-ON for VLM checkpoints). On VLM checkpoints dense image turns
+   * ONLY run on the paged-vision core; a vision turn that reaches a None
+   * adapter errors at dispatch. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
@@ -3844,13 +3844,18 @@ export interface Qwen35Config {
    * when unset, they run the eager flat decode. Either way the forward
    * is pure-Rust eager.
    *
-   * **VLM is rejected**: when both `vision_encoder.is_some()` and
-   * this flag is `Some(true)`, `Qwen35Inner::new_with_paged` returns
-   * a descriptive error. Paged dispatch through M-RoPE / vision
-   * features is deferred.
+   * **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+   * dense image turns ONLY run on the paged-vision core. A fresh single-turn
+   * image-bearing prompt prefills through the paged adapter (M-RoPE positions
+   * feed the rotary; the merged vision embeddings feed the forward) and
+   * decodes plain AR — MTP weights are ignored on image turns. Warm
+   * image-bearing session continues / cache-hit reuse are still rejected at
+   * runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
+   * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
+   * a sym8 checkpoint) errors at dispatch.
    *
-   * Default: `None` / `false` (use the eager flat decode path).
-   * Default-flip pending real-weights parity verification.
+   * Default: `None` for text-only checkpoints (eager flat decode);
+   * `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
    */
   useBlockPagedCache?: boolean | undefined;
   /**
@@ -3938,8 +3943,12 @@ export interface Qwen35MoeConfig {
    * either way. When disabled, full-attention layers run the eager flat
    * decode instead.
    *
-   * VLM (vision encoder present) is rejected with an error in
-   * `Qwen35MoeInner::new`.
+   * **VLM under paged**: a VLM checkpoint loads with this flag set, and a
+   * fresh single-turn image-bearing prompt prefills through the paged
+   * adapter (M-RoPE positions feed the rotary; the merged vision embeddings
+   * feed the forward). Image-bearing MTP turns are still rejected at
+   * runtime; warm image-bearing session continues / cache-hit reuse are
+   * cold-started (no warm GDN two-pass prefix).
    *
    * Default: `None` / `false`.
    */
