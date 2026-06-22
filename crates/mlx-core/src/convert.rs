@@ -1920,6 +1920,28 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         info!("Model uses tied embeddings - will skip lm_head.weight");
     }
 
+    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
+    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
+    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
+    // than re-quantizing. Detected from the config; the runtime never reads
+    // Google's native quant metadata.
+    let is_gemma_prequantized = model_type.as_deref() == Some("gemma4")
+        && config
+            .get("quantization_config")
+            .and_then(|qc| qc.get("quant_method"))
+            .and_then(|m| m.as_str())
+            == Some("gemma");
+    if is_gemma_prequantized
+        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
+    {
+        return Err(Error::from_reason(
+            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
+             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
+             to MLX affine)"
+                .to_string(),
+        ));
+    }
+
     // Load tensors - handle both single file and sharded models
     let tensors: HashMap<String, MxArray>;
     let num_tensors: usize;
@@ -2104,144 +2126,167 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }
 
-    let mut converted_tensors: HashMap<String, MxArray> = HashMap::new();
-    let mut tensor_names = Vec::new();
-
-    for (name, array) in tensors.into_iter() {
-        // Skip lm_head.weight if embeddings are tied
-        // When tied, the model should use embed_tokens.weight via as_linear()
-        if tie_word_embeddings && name == "lm_head.weight" {
-            if verbose {
-                info!("  Skipping {} (tied embeddings)", name);
+    let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
+    let converted_tensors = if is_gemma_prequantized {
+        let dtype = match target_dtype.as_str() {
+            "float32" | "f32" => DType::Float32,
+            "float16" | "f16" => DType::Float16,
+            "bfloat16" | "bf16" => DType::BFloat16,
+            other => {
+                return Err(Error::from_reason(format!(
+                    "Unsupported target dtype: {other}. Supported: float32, float16, bfloat16"
+                )));
             }
-            continue;
-        }
+        };
+        let (w, ov) =
+            crate::convert_gemma_import::import_gemma_prequantized(tensors, &config, dtype)?;
+        info!(
+            "gemma-QAT prequantized import: {} output tensors, {} per-layer overrides",
+            w.len(),
+            ov.len()
+        );
+        gemma_pre_overrides = Some(ov);
+        w
+    } else {
+        let mut converted_tensors: HashMap<String, MxArray> = HashMap::new();
+        let mut tensor_names = Vec::new();
 
-        // If a custom sanitizer handles dtype conversion, pass tensors through as-is
-        if has_custom_sanitizer {
-            converted_tensors.insert(name.clone(), array);
-            tensor_names.push(name);
-            continue;
-        }
+        for (name, array) in tensors.into_iter() {
+            // Skip lm_head.weight if embeddings are tied
+            // When tied, the model should use embed_tokens.weight via as_linear()
+            if tie_word_embeddings && name == "lm_head.weight" {
+                if verbose {
+                    info!("  Skipping {} (tied embeddings)", name);
+                }
+                continue;
+            }
 
-        let current_dtype = array.dtype()?;
-
-        if verbose {
-            let shape = array.shape()?;
-            info!("  {} {:?} {:?}", name, shape.as_ref(), current_dtype);
-        }
-
-        // FLOAT-ONLY cast rule: quantized-storage dtypes (sym8 Int8 weights,
-        // packed Uint32 weights, Uint8 FP8/MXFP scales) must NEVER be astype'd
-        // — a numeric cast corrupts the packed/quantized bit layout. Pass them
-        // through unchanged.
-        if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8) {
-            converted_tensors.insert(name.clone(), array);
-            tensor_names.push(name);
-            continue;
-        }
-
-        // sym8 loader contract: the float 1-D [N] `.scales` sidecar next to
-        // an Int8 `.weight` must end up Float32 —
-        // `try_build_sym8_quantized_linear` hard-rejects any other scales
-        // dtype, so casting it to the target dtype (default bfloat16) would
-        // emit an unloadable checkpoint. Float32 sidecars pass through
-        // unchanged; Float16/BFloat16 sidecars are NORMALIZED to Float32
-        // (lossless upcast — also repairs sym8-shaped input whose scales were
-        // stored at half precision, which no target dtype could fix before);
-        // malformed sidecars already failed loud in the precompute above.
-        match sym8_scales_actions.get(&name) {
-            Some(Sym8ScalesCastAction::PreserveF32) => {
+            // If a custom sanitizer handles dtype conversion, pass tensors through as-is
+            if has_custom_sanitizer {
                 converted_tensors.insert(name.clone(), array);
                 tensor_names.push(name);
                 continue;
             }
-            Some(Sym8ScalesCastAction::NormalizeToF32) => {
-                if verbose {
-                    info!("    Normalizing sym8 scales {:?} -> Float32", current_dtype);
-                }
-                converted_tensors.insert(name.clone(), array.astype(DType::Float32)?);
+
+            let current_dtype = array.dtype()?;
+
+            if verbose {
+                let shape = array.shape()?;
+                info!("  {} {:?} {:?}", name, shape.as_ref(), current_dtype);
+            }
+
+            // FLOAT-ONLY cast rule: quantized-storage dtypes (sym8 Int8 weights,
+            // packed Uint32 weights, Uint8 FP8/MXFP scales) must NEVER be astype'd
+            // — a numeric cast corrupts the packed/quantized bit layout. Pass them
+            // through unchanged.
+            if matches!(current_dtype, DType::Int8 | DType::Uint32 | DType::Uint8) {
+                converted_tensors.insert(name.clone(), array);
                 tensor_names.push(name);
                 continue;
             }
-            Some(Sym8ScalesCastAction::NotSym8Scales) | None => {}
+
+            // sym8 loader contract: the float 1-D [N] `.scales` sidecar next to
+            // an Int8 `.weight` must end up Float32 —
+            // `try_build_sym8_quantized_linear` hard-rejects any other scales
+            // dtype, so casting it to the target dtype (default bfloat16) would
+            // emit an unloadable checkpoint. Float32 sidecars pass through
+            // unchanged; Float16/BFloat16 sidecars are NORMALIZED to Float32
+            // (lossless upcast — also repairs sym8-shaped input whose scales were
+            // stored at half precision, which no target dtype could fix before);
+            // malformed sidecars already failed loud in the precompute above.
+            match sym8_scales_actions.get(&name) {
+                Some(Sym8ScalesCastAction::PreserveF32) => {
+                    converted_tensors.insert(name.clone(), array);
+                    tensor_names.push(name);
+                    continue;
+                }
+                Some(Sym8ScalesCastAction::NormalizeToF32) => {
+                    if verbose {
+                        info!("    Normalizing sym8 scales {:?} -> Float32", current_dtype);
+                    }
+                    converted_tensors.insert(name.clone(), array.astype(DType::Float32)?);
+                    tensor_names.push(name);
+                    continue;
+                }
+                Some(Sym8ScalesCastAction::NotSym8Scales) | None => {}
+            }
+
+            // Convert to target dtype if needed
+            let converted = match target_dtype.as_str() {
+                "float32" | "f32" => {
+                    if current_dtype != DType::Float32 {
+                        if verbose {
+                            info!("    Converting {:?} -> Float32", current_dtype);
+                        }
+                        array.astype(DType::Float32)?
+                    } else {
+                        array
+                    }
+                }
+                "float16" | "f16" => {
+                    if current_dtype != DType::Float16 {
+                        if verbose {
+                            info!("    Converting {:?} -> Float16", current_dtype);
+                        }
+                        array.astype(DType::Float16)?
+                    } else {
+                        array
+                    }
+                }
+                "bfloat16" | "bf16" => {
+                    if current_dtype != DType::BFloat16 {
+                        if verbose {
+                            info!("    Converting {:?} -> BFloat16", current_dtype);
+                        }
+                        array.astype(DType::BFloat16)?
+                    } else {
+                        array
+                    }
+                }
+                _ => {
+                    return Err(Error::from_reason(format!(
+                        "Unsupported target dtype: {}. Supported: float32, float16, bfloat16",
+                        target_dtype
+                    )));
+                }
+            };
+
+            converted_tensors.insert(name.clone(), converted);
+            tensor_names.push(name);
         }
 
-        // Convert to target dtype if needed
-        let converted = match target_dtype.as_str() {
-            "float32" | "f32" => {
-                if current_dtype != DType::Float32 {
-                    if verbose {
-                        info!("    Converting {:?} -> Float32", current_dtype);
-                    }
-                    array.astype(DType::Float32)?
-                } else {
-                    array
+        // Apply model-specific weight sanitization. Every convertible family is a
+        // `ConversionRecipe` in the registry, so this is one dispatch: resolve the
+        // recipe for the model_type and run its `sanitize`. An unrecognized
+        // model_type resolves to no recipe and is rejected; a `None` model_type
+        // (raw dtype conversion with no family) passes through untouched.
+        //
+        // NOTE: privacy-filter quantization is handled below in the dedicated
+        // sanitizer-managed quantize block (gated by `is_privacy_filter`), because
+        // it needs access to the bits/group_size/mode from the outer scope and we
+        // want to suppress the generic quantize pass for it.
+        match model_type.as_deref() {
+            Some(mt) => match recipe::recipe_for(mt) {
+                Some(recipe) => {
+                    info!("Applying {mt} weight sanitization via conversion recipe...");
+                    recipe.sanitize(
+                        converted_tensors,
+                        &config,
+                        &target_dtype,
+                        tie_word_embeddings,
+                        verbose,
+                    )?
                 }
-            }
-            "float16" | "f16" => {
-                if current_dtype != DType::Float16 {
-                    if verbose {
-                        info!("    Converting {:?} -> Float16", current_dtype);
-                    }
-                    array.astype(DType::Float16)?
-                } else {
-                    array
+                None => {
+                    return Err(Error::from_reason(format!(
+                        "Unknown model type: '{mt}'. Supported: {}",
+                        recipe::CONVERTIBLE_MODEL_TYPES.join(", ")
+                    )));
                 }
-            }
-            "bfloat16" | "bf16" => {
-                if current_dtype != DType::BFloat16 {
-                    if verbose {
-                        info!("    Converting {:?} -> BFloat16", current_dtype);
-                    }
-                    array.astype(DType::BFloat16)?
-                } else {
-                    array
-                }
-            }
-            _ => {
-                return Err(Error::from_reason(format!(
-                    "Unsupported target dtype: {}. Supported: float32, float16, bfloat16",
-                    target_dtype
-                )));
-            }
-        };
-
-        converted_tensors.insert(name.clone(), converted);
-        tensor_names.push(name);
-    }
-
-    // Apply model-specific weight sanitization. Every convertible family is a
-    // `ConversionRecipe` in the registry, so this is one dispatch: resolve the
-    // recipe for the model_type and run its `sanitize`. An unrecognized
-    // model_type resolves to no recipe and is rejected; a `None` model_type
-    // (raw dtype conversion with no family) passes through untouched.
-    //
-    // NOTE: privacy-filter quantization is handled below in the dedicated
-    // sanitizer-managed quantize block (gated by `is_privacy_filter`), because
-    // it needs access to the bits/group_size/mode from the outer scope and we
-    // want to suppress the generic quantize pass for it.
-    let converted_tensors = match model_type.as_deref() {
-        Some(mt) => match recipe::recipe_for(mt) {
-            Some(recipe) => {
-                info!("Applying {mt} weight sanitization via conversion recipe...");
-                recipe.sanitize(
-                    converted_tensors,
-                    &config,
-                    &target_dtype,
-                    tie_word_embeddings,
-                    verbose,
-                )?
-            }
-            None => {
-                return Err(Error::from_reason(format!(
-                    "Unknown model type: '{mt}'. Supported: {}",
-                    recipe::CONVERTIBLE_MODEL_TYPES.join(", ")
-                )));
-            }
-        },
-        None => converted_tensors,
-    };
+            },
+            None => converted_tensors,
+        }
+    }; // end is_gemma_prequantized else branch
 
     // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
@@ -2252,7 +2297,8 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
 
     // Apply quantization if requested
-    let mut per_layer_overrides: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut per_layer_overrides: HashMap<String, serde_json::Value> =
+        gemma_pre_overrides.unwrap_or_default();
     // Effective mode/group_size recorded in config.json. The no-recipe path
     // updates these when --q-mxfp upgrades the global mode to mxfp4/mxfp8 so
     // downstream loaders dispatch to the correct builder.
@@ -2593,7 +2639,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let mut output_config = config.clone();
 
     // Inject quantization metadata if quantized
-    if do_quantize {
+    if do_quantize || is_gemma_prequantized {
         // sym8 has NO quant group (one f32 scale per output channel), so the
         // top-level group_size is written as `null` — the loader must dispatch
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
@@ -9732,6 +9778,262 @@ mod tests {
         // No sidecars present → must succeed without error and touch nothing.
         remove_stale_legacy_mtp_artifacts(&tmp).expect("noop must succeed");
         assert!(tmp.join("config.json").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Integration test: convert a real Google gemma-QAT checkpoint through the
+    /// full `convert_model` pipeline and verify the output config + tensor shapes.
+    ///
+    /// Skipped automatically when the checkpoint is absent so CI stays green on
+    /// machines without the model file.
+    #[tokio::test]
+    #[ignore]
+    #[allow(clippy::excessive_precision)]
+    async fn convert_model_gemma_qat_integration() {
+        let ckpt = std::path::PathBuf::from(
+            "/Users/brooklyn/.mlx-node/models/gemma-4-e2b-it-qat-mobile-transformers",
+        );
+        if !ckpt.exists() {
+            eprintln!("SKIP: gemma-QAT checkpoint not found at {}", ckpt.display());
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "gemma_qat_convert_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let result = convert_model(ConversionOptions {
+            input_dir: ckpt.to_string_lossy().to_string(),
+            output_dir: tmp.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4".to_string()),
+            quantize: None,
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("convert_model must succeed for gemma-QAT checkpoint");
+
+        eprintln!(
+            "Converted {} tensors from gemma-QAT checkpoint",
+            result.num_tensors
+        );
+
+        // --- Config block checks ---
+        let config_path = tmp.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path).expect("config.json must exist");
+        let config: serde_json::Value =
+            serde_json::from_str(&config_str).expect("config.json must be valid JSON");
+        assert!(
+            config.get("quantization").is_some(),
+            "output config.json must have a 'quantization' block"
+        );
+        let quant = &config["quantization"];
+        assert_eq!(
+            quant["mode"].as_str(),
+            Some("affine"),
+            "top-level quantization.mode must be 'affine'"
+        );
+
+        // lm_head: 2-bit affine
+        let lm_head_key = "language_model.model.lm_head";
+        let lm = quant.get(lm_head_key).unwrap_or_else(|| {
+            panic!("quantization block must contain per-layer override for {lm_head_key}")
+        });
+        assert_eq!(lm["bits"].as_i64(), Some(2), "{lm_head_key} bits must be 2");
+        assert_eq!(
+            lm["mode"].as_str(),
+            Some("affine"),
+            "{lm_head_key} mode must be 'affine'"
+        );
+
+        // embed_tokens: 2-bit affine, group_size=64
+        let et_key = "language_model.model.embed_tokens";
+        let et = quant.get(et_key).unwrap_or_else(|| {
+            panic!("quantization block must contain per-layer override for {et_key}")
+        });
+        assert_eq!(et["bits"].as_i64(), Some(2), "{et_key} bits must be 2");
+        assert_eq!(
+            et["group_size"].as_i64(),
+            Some(64),
+            "{et_key} group_size must be 64"
+        );
+        assert_eq!(
+            et["mode"].as_str(),
+            Some("affine"),
+            "{et_key} mode must be 'affine'"
+        );
+
+        // embed_tokens_per_layer: 4-bit affine, group_size=128
+        let ple_key = "language_model.model.embed_tokens_per_layer";
+        let ple = quant.get(ple_key).unwrap_or_else(|| {
+            panic!("quantization block must contain per-layer override for {ple_key}")
+        });
+        assert_eq!(ple["bits"].as_i64(), Some(4), "{ple_key} bits must be 4");
+        assert_eq!(
+            ple["group_size"].as_i64(),
+            Some(128),
+            "{ple_key} group_size must be 128"
+        );
+        assert_eq!(
+            ple["mode"].as_str(),
+            Some("affine"),
+            "{ple_key} mode must be 'affine'"
+        );
+
+        // layers.0.self_attn.q_proj: 4-bit affine
+        let q_proj_key = "language_model.model.layers.0.self_attn.q_proj";
+        let qp = quant.get(q_proj_key).unwrap_or_else(|| {
+            panic!("quantization block must contain per-layer override for {q_proj_key}")
+        });
+        assert_eq!(qp["bits"].as_i64(), Some(4), "{q_proj_key} bits must be 4");
+        assert_eq!(
+            qp["mode"].as_str(),
+            Some("affine"),
+            "{q_proj_key} mode must be 'affine'"
+        );
+
+        // layers.20.mlp.down_proj: 2-bit affine (layer >= 15 → 2-bit MLP)
+        let down_key = "language_model.model.layers.20.mlp.down_proj";
+        let dp = quant.get(down_key).unwrap_or_else(|| {
+            panic!("quantization block must contain per-layer override for {down_key}")
+        });
+        assert_eq!(dp["bits"].as_i64(), Some(2), "{down_key} bits must be 2");
+        assert_eq!(
+            dp["mode"].as_str(),
+            Some("affine"),
+            "{down_key} mode must be 'affine'"
+        );
+
+        // All per-layer entries (objects) must have mode == "affine"
+        if let Some(obj) = quant.as_object() {
+            for (k, v) in obj {
+                if v.is_object() {
+                    assert_eq!(
+                        v["mode"].as_str(),
+                        Some("affine"),
+                        "per-layer entry {k} mode must be 'affine', got {:?}",
+                        v["mode"]
+                    );
+                }
+            }
+        }
+
+        // --- Dequant spot-check: layers.0.self_attn.q_proj ---
+        // Load the output shard containing the q_proj triplet, dequantize, and
+        // assert that scales[0,0] equals the source weight_scale[0] golden value
+        // verified in the Task-1 unit test.
+        let index_path = tmp.join("model.safetensors.index.json");
+        let (w_arr, s_arr, b_arr) = if index_path.exists() {
+            // Sharded output: find which shard holds the q_proj weight.
+            let index_str =
+                std::fs::read_to_string(&index_path).expect("index.json must be readable");
+            let index: serde_json::Value =
+                serde_json::from_str(&index_str).expect("index.json must be valid JSON");
+            let weight_map = index["weight_map"]
+                .as_object()
+                .expect("weight_map must be an object");
+            let shard_name = weight_map
+                .get("language_model.model.layers.0.self_attn.q_proj.weight")
+                .and_then(|v| v.as_str())
+                .expect("q_proj.weight must appear in weight_map");
+            let shard_path = tmp.join(shard_name);
+            let shard_tensors = load_safetensors_lazy(&shard_path).expect("shard must load");
+            (
+                shard_tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.weight")
+                    .expect("q_proj.weight must be in shard")
+                    .clone(),
+                shard_tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.scales")
+                    .expect("q_proj.scales must be in shard")
+                    .clone(),
+                shard_tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.biases")
+                    .expect("q_proj.biases must be in shard")
+                    .clone(),
+            )
+        } else {
+            let single = tmp.join("model.safetensors");
+            let tensors = load_safetensors_lazy(&single).expect("model.safetensors must load");
+            (
+                tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.weight")
+                    .expect("q_proj.weight")
+                    .clone(),
+                tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.scales")
+                    .expect("q_proj.scales")
+                    .clone(),
+                tensors
+                    .get("language_model.model.layers.0.self_attn.q_proj.biases")
+                    .expect("q_proj.biases")
+                    .clone(),
+            )
+        };
+        // scales[0, 0] must equal the source weight_scale[0] golden: 0.001944516087.
+        // This verifies the lossless repack: the affine per-group scale in row-0,
+        // group-0 must match the original per-row weight_scale (all groups in row 0
+        // share the same symmetric-per-row scale after the repack).
+        let scales_f32 = s_arr.to_float32().expect("scales must be f32");
+        let scale_00 = scales_f32.first().expect("scales must be non-empty");
+        assert!(
+            (scale_00 - 0.001944516087_f32).abs() < 1e-6,
+            "q_proj scales[0,0] = {scale_00} != golden 0.001944516087"
+        );
+        eprintln!("q_proj scales[0,0] = {scale_00} (golden 0.001944516087) ✓");
+        // Suppress unused-variable warnings for the weight and biases arrays we
+        // loaded alongside scales (loaded to confirm they exist; scale is the check).
+        let _ = (&w_arr, &b_arr);
+
+        // --- Vision tensor is floating/dense (no .scales sibling) ---
+        // Find a vision_tower weight key in the output shards and confirm there
+        // is no adjacent .scales key (I8 modules were dequanted to bf16).
+        let (found_vision_weight, found_vision_scales) = if index_path.exists() {
+            let index_str =
+                std::fs::read_to_string(&index_path).expect("index.json must be readable");
+            let index: serde_json::Value = serde_json::from_str(&index_str).unwrap();
+            let weight_map = index["weight_map"].as_object().unwrap();
+            let has_weight = weight_map
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") && k.ends_with(".weight"));
+            let has_scales = weight_map
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") && k.ends_with(".scales"));
+            (has_weight, has_scales)
+        } else {
+            let single = tmp.join("model.safetensors");
+            let tensors = load_safetensors_lazy(&single).expect("model.safetensors must load");
+            let has_weight = tensors
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") && k.ends_with(".weight"));
+            let has_scales = tensors
+                .keys()
+                .any(|k| k.starts_with("vision_tower.") && k.ends_with(".scales"));
+            (has_weight, has_scales)
+        };
+        assert!(
+            found_vision_weight,
+            "output must contain at least one vision_tower.*.weight tensor"
+        );
+        assert!(
+            !found_vision_scales,
+            "vision_tower tensors must be floating/dense: no .scales sidecar expected"
+        );
+        eprintln!("vision_tower tensors are dense (no .scales) ✓");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

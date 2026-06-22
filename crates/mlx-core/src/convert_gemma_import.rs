@@ -40,11 +40,8 @@
 //! emit the `vision_tower.….linear.weight` key verbatim. F32 scales are never
 //! cast to bf16.
 //!
-//! The public entry point `import_gemma_prequantized` is not yet wired into the
-//! `mlx convert` CLI driver (that is Task 2b), so the transform + its helpers are
-//! exercised only by this module's tests for now. The `dead_code` allow keeps the
-//! standalone module green until the driver consumes it.
-#![allow(dead_code)]
+//! The public entry point `import_gemma_prequantized` is wired into the
+//! `mlx convert` CLI driver via `convert_model_inner` in `convert.rs`.
 
 use std::collections::HashMap;
 
