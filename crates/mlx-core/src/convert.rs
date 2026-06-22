@@ -1924,6 +1924,11 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let tensors: HashMap<String, MxArray>;
     let num_tensors: usize;
     let num_parameters: usize;
+    // Absolute paths of every source safetensors file actually loaded. Used to
+    // build passthrough provenance (source on-disk byte ranges) so an oversized
+    // unmodified bf16/f16 tensor can be written by direct source file read,
+    // bypassing the Metal per-buffer cap.
+    let mut source_files: Vec<PathBuf> = Vec::new();
 
     let index_path = input_dir.join("model.safetensors.index.json");
     let single_weights_path = input_dir.join("model.safetensors");
@@ -1936,6 +1941,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             single_weights_path.display()
         );
         tensors = load_safetensors_lazy(&single_weights_path)?;
+        source_files.push(single_weights_path.clone());
         num_parameters = tensors
             .values()
             .map(|a| a.size().unwrap_or(0) as usize)
@@ -1952,6 +1958,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             alt_weights_path.display()
         );
         tensors = load_safetensors_lazy(&alt_weights_path)?;
+        source_files.push(alt_weights_path.clone());
         num_parameters = tensors
             .values()
             .map(|a| a.size().unwrap_or(0) as usize)
@@ -1990,6 +1997,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
             info!("  Loading shard (lazy): {}", shard_name);
             let shard_tensors = load_safetensors_lazy(&shard_path)?;
+            source_files.push(shard_path.clone());
             // Count parameters from shapes (lazy arrays have shape but no data yet)
             for arr in shard_tensors.values() {
                 total_params += arr.size()? as usize;
@@ -2012,6 +2020,29 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             "No model weights found in input directory.\nExpected: model.safetensors, weights.safetensors, or model.safetensors.index.json\nPath: {}",
             input_dir.display()
         )));
+    }
+
+    // Snapshot source-file provenance for every loaded bf16/f16 tensor, keyed by
+    // the loaded MLX array's raw handle pointer. A dest tensor that still carries
+    // one of these handles after sanitize/quant is a proven unmodified
+    // passthrough, and its oversized bytes can be written by reading the source
+    // file directly — see `record_passthrough_sources` and the writer's
+    // raw-passthrough path. Best-effort: any per-file parse error is logged and
+    // skipped (the affected tensors simply fall back to the MLX writer path).
+    let mut source_by_handle: HashMap<usize, crate::utils::safetensors::SourceProvenance> =
+        HashMap::new();
+    for source_file in &source_files {
+        if let Err(e) = crate::utils::safetensors::record_passthrough_sources(
+            source_file,
+            &tensors,
+            &mut source_by_handle,
+        ) {
+            warn!(
+                "  Passthrough provenance skipped for {}: {} (tensors fall back to MLX writer)",
+                source_file.display(),
+                e
+            );
+        }
     }
 
     // For models with a sanitizer that handles FP8 dequant + dtype conversion
@@ -2514,8 +2545,31 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         "starting sharded save"
     );
 
+    // Resolve dest tensors that are unmodified passthroughs of a source tensor:
+    // their current MLX handle pointer still matches a recorded source handle
+    // (any transform — astype/quant/slice/stack — would have allocated a new
+    // handle). For these the writer may read the bytes straight from the source
+    // file, bypassing the Metal per-buffer cap on oversized tensors.
+    let mut dest_passthrough: HashMap<String, crate::utils::safetensors::PassthroughSource> =
+        HashMap::new();
+    if !source_by_handle.is_empty() {
+        for (dest_name, array) in converted_tensors.iter() {
+            if let Some(prov) = source_by_handle.get(&(array.as_raw_ptr() as usize)) {
+                dest_passthrough.insert(dest_name.clone(), prov.source.clone());
+            }
+        }
+    }
+    // Release the pinned source handles before the streaming save drains
+    // `converted_tensors` — `dest_passthrough` carries only file locations, no
+    // arrays, so the keep-alive clones are no longer needed.
+    drop(source_by_handle);
+
     let save_start = std::time::Instant::now();
-    crate::utils::safetensors::save_safetensors_sharded(&output_dir, &mut converted_tensors)?;
+    crate::utils::safetensors::save_safetensors_sharded(
+        &output_dir,
+        &mut converted_tensors,
+        Some(&dest_passthrough),
+    )?;
     info!(
         target = "mlx_core::convert",
         save_seconds = save_start.elapsed().as_secs_f64(),

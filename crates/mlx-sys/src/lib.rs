@@ -288,6 +288,17 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_to_uint8(handle: *mut mlx_array, out: *mut u8, len: usize) -> bool;
     pub fn mlx_array_to_int8(handle: *mut mlx_array, out: *mut i8, len: usize) -> bool;
     pub fn mlx_array_to_uint16(handle: *mut mlx_array, out: *mut u16, len: usize) -> bool;
+    /// Read a raw byte range straight from a safetensors file into `out`,
+    /// bypassing MLX (no array constructed). `file_offset` is the absolute byte
+    /// offset of the tensor data within the file; `out_len` is the tensor byte
+    /// length. The read is chunked internally. Returns false on any I/O error,
+    /// short read, or out-of-range request.
+    pub fn mlx_safetensor_read_raw(
+        file_path: *const std::os::raw::c_char,
+        file_offset: u64,
+        out: *mut u8,
+        out_len: usize,
+    ) -> bool;
     pub fn mlx_array_delete(arr: *mut mlx_array);
     pub fn mlx_synchronize();
     pub fn mlx_clear_cache();

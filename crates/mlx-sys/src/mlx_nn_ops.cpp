@@ -317,6 +317,75 @@ bool mlx_array_to_uint16(mlx_array* handle, uint16_t* out, size_t len) {
   }
 }
 
+// Read a raw byte range straight from a safetensors file into a host buffer,
+// bypassing MLX entirely. Used by the convert serializer for tensors whose
+// on-disk bytes are a verified unmodified passthrough of a source tensor (e.g.
+// gemma4's ~4.7 GB `embed_tokens_per_layer.weight`). Routing such a tensor
+// through any whole-tensor `array::eval()` allocates one Metal buffer that
+// trips the GPU per-buffer cap (3.5 GB on memory-constrained runners),
+// regardless of stream/device. A plain host file read has no per-buffer cap.
+//
+// `file_offset` is the ABSOLUTE byte offset of the tensor's data within the
+// file (i.e. `8 + header_len + data_offsets[begin]`); the caller computes it
+// from the parsed safetensors header. `out_len` must equal the tensor's byte
+// length; the read is performed in bounded chunks so no single read call sizes
+// to the full tensor. Returns false on any I/O error, short read, or if the
+// file is smaller than `file_offset + out_len`.
+bool mlx_safetensor_read_raw(const char* file_path,
+                             uint64_t file_offset,
+                             uint8_t* out,
+                             size_t out_len) {
+  if (!file_path || !out) {
+    return false;
+  }
+  try {
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: cannot open " << file_path << std::endl;
+      return false;
+    }
+
+    // Bound the read against the real file size so a bad offset/length can
+    // never over-read or silently return uninitialized bytes.
+    file.seekg(0, std::ios::end);
+    const std::streamoff file_size = file.tellg();
+    if (file_size < 0) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: tellg failed for " << file_path << std::endl;
+      return false;
+    }
+    const uint64_t end = file_offset + static_cast<uint64_t>(out_len);
+    if (end < file_offset /* overflow */ || end > static_cast<uint64_t>(file_size)) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: range [" << file_offset << ", " << end
+                << ") exceeds file size " << file_size << " for " << file_path << std::endl;
+      return false;
+    }
+
+    file.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+    if (!file) {
+      std::cerr << "[MLX] mlx_safetensor_read_raw: seek failed for " << file_path << std::endl;
+      return false;
+    }
+
+    constexpr size_t kChunk = static_cast<size_t>(256) << 20;  // 256 MiB
+    size_t remaining = out_len;
+    uint8_t* cursor = out;
+    while (remaining > 0) {
+      const size_t this_read = remaining < kChunk ? remaining : kChunk;
+      file.read(reinterpret_cast<char*>(cursor), static_cast<std::streamsize>(this_read));
+      if (static_cast<size_t>(file.gcount()) != this_read) {
+        std::cerr << "[MLX] mlx_safetensor_read_raw: short read on " << file_path << std::endl;
+        return false;
+      }
+      cursor += this_read;
+      remaining -= this_read;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] mlx_safetensor_read_raw: " << e.what() << std::endl;
+    return false;
+  }
+}
+
 void mlx_array_delete(mlx_array* arr) {
   try {
     delete reinterpret_cast<array*>(arr);
