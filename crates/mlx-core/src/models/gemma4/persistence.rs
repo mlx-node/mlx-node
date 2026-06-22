@@ -390,8 +390,14 @@ fn validate_required_weights(
             }
         }
 
-        // Q/K norms (always required)
-        for norm in &["q_norm.weight", "k_norm.weight"] {
+        // Q norm always required. K norm only for non-shared layers: KV-shared
+        // layers reuse the anchor layer's K (and its k_norm), so the checkpoint
+        // legitimately ships no k_norm.weight for them.
+        let mut required_norms: Vec<&str> = vec!["q_norm.weight"];
+        if !config.is_kv_shared_layer(i) {
+            required_norms.push("k_norm.weight");
+        }
+        for norm in &required_norms {
             let key = format!("{}.{}", attn, norm);
             if !has(&key) {
                 return Err(Error::from_reason(format!(
