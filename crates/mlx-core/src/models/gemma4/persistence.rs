@@ -479,6 +479,15 @@ fn validate_required_weights(
         }
     }
 
+    // Untied lm_head always ships with a .weight key (dense or quantized-packed).
+    // A checkpoint that carries only .scales/.biases but no .weight would silently
+    // keep constructor-random weights — catch it here.
+    if !config.tie_word_embeddings && !has("lm_head.weight") {
+        return Err(Error::from_reason(
+            "Missing required weight: lm_head.weight",
+        ));
+    }
+
     Ok(())
 }
 
@@ -834,6 +843,11 @@ fn apply_weights(
         } else if let Some(w) = params.get("lm_head.weight") {
             ensure_dense_weight_floating("lm_head.weight", w)?;
             head.set_weight(w, "lm_head")?;
+        } else {
+            return Err(Error::from_reason(
+                "Untied lm_head has neither a quantized group (lm_head.weight + lm_head.scales) \
+                 nor a dense lm_head.weight — model would silently use constructor-random weights",
+            ));
         }
     }
 
@@ -1867,8 +1881,13 @@ mod tests {
             p.insert(format!("{base}.scales"), bf16_w(&[4, 1]));
         };
         let run = |params: &HashMap<String, MxArray>| {
+            // lm_head.weight is required for untied configs; inject a valid bf16
+            // dummy so this loader-seam test can reach the MLP path under test.
+            let mut p = params.clone();
+            p.entry("lm_head.weight".to_string())
+                .or_insert_with(|| bf16_w(&[8, 16]));
             let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
-            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+            apply_weights(&mut inner, &p, &config, 4, 64, None, &HashMap::new())
         };
 
         // (a) gate quantized, up/down dense → Err naming up_proj + down_proj.
@@ -1943,8 +1962,13 @@ mod tests {
                 .expect("bf16")
         };
         let run = |params: &HashMap<String, MxArray>| {
+            // lm_head.weight is required for untied configs; inject a valid bf16
+            // dummy so this loader-seam test can reach the MLP path under test.
+            let mut p = params.clone();
+            p.entry("lm_head.weight".to_string())
+                .or_insert_with(|| bf16_w(&[8, 16]));
             let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
-            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+            apply_weights(&mut inner, &p, &config, 4, 64, None, &HashMap::new())
         };
 
         // (a) ALL THREE projections scales-only (no `.weight` anywhere) →
@@ -2090,6 +2114,7 @@ mod tests {
             for key in [
                 "embed_tokens.weight",
                 "norm.weight",
+                "lm_head.weight",
                 "layers.0.self_attn.q_proj.weight",
                 "layers.0.self_attn.k_proj.weight",
                 "layers.0.self_attn.v_proj.weight",
@@ -2133,6 +2158,128 @@ mod tests {
         );
     }
 
+    /// An untied Gemma4 checkpoint that carries `lm_head.scales` (and
+    /// `.biases`) but NO `lm_head.weight` must be rejected by both
+    /// `validate_required_weights` and `apply_weights`; a tied checkpoint
+    /// (tie_word_embeddings=true) has no lm_head.weight by design and must
+    /// still pass validation.
+    #[test]
+    fn validate_rejects_untied_lm_head_missing_weight() {
+        // Compact config for validate_required_weights (no Gemma4Inner::new).
+        let make_validate_config = |tied: bool| -> Gemma4Config {
+            serde_json::from_value(serde_json::json!({
+                "vocab_size": 8,
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "intermediate_size": 16,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": tied,
+                "max_position_embeddings": 64,
+            }))
+            .expect("minimal Gemma4Config")
+        };
+        // Valid config for apply_weights (head_dim must be accepted by KV pool).
+        let apply_config_untied: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+        }))
+        .expect("apply Gemma4Config (untied)");
+
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+
+        // Build a param map with all required layer weights but no lm_head.weight.
+        let base_params = || -> HashMap<String, MxArray> {
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            for key in [
+                "embed_tokens.weight",
+                "norm.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+            ] {
+                p.insert(key.to_string(), dummy());
+            }
+            p
+        };
+
+        // Untied + scales-only lm_head (no .weight) → validate must reject.
+        {
+            let config = make_validate_config(false);
+            let mut p = base_params();
+            p.insert("lm_head.scales".into(), dummy());
+            p.insert("lm_head.biases".into(), dummy());
+            let err = validate_required_weights(&p, &config)
+                .expect_err("untied lm_head with only .scales must fail validation");
+            assert!(
+                format!("{err}").contains("lm_head.weight"),
+                "error must name lm_head.weight, got: {err}"
+            );
+        }
+
+        // Untied + scales-only lm_head → apply_weights defensive else must also reject.
+        // apply_weights loads embed_tokens before lm_head, so embed_tokens.weight
+        // must be correctly shaped (vocab=8, hidden=64) to reach the lm_head block.
+        {
+            let bf16 = |shape: &[i64]| {
+                let n: i64 = shape.iter().product();
+                MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                    .expect("from_float32")
+                    .astype(DType::BFloat16)
+                    .expect("bf16")
+            };
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            p.insert("embed_tokens.weight".into(), bf16(&[8, 64]));
+            p.insert("lm_head.scales".into(), dummy());
+            let mut inner =
+                Gemma4Inner::new(apply_config_untied.clone()).expect("Gemma4Inner::new");
+            let err = apply_weights(
+                &mut inner,
+                &p,
+                &apply_config_untied,
+                4,
+                64,
+                None,
+                &HashMap::new(),
+            )
+            .expect_err("apply_weights must fail closed on untied lm_head with no .weight");
+            assert!(
+                format!("{err}").contains("lm_head"),
+                "error must mention lm_head, got: {err}"
+            );
+        }
+
+        // Tied path: no lm_head.weight is expected and must still validate.
+        {
+            let config = make_validate_config(true);
+            let p = base_params();
+            validate_required_weights(&p, &config)
+                .expect("tied model without lm_head.weight must still validate");
+        }
+    }
+
     /// MoE expert dense fallback: `try_build_qsl` returns
     /// `Ok(None)` when `.scales` is absent, so a stripped expert quant group
     /// reaches the dense fallback — including the BARE HF fused key form
@@ -2168,9 +2315,21 @@ mod tests {
                 .astype(DType::Int8)
                 .expect("astype int8")
         };
+        let bf16_w = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
         let run = |params: &HashMap<String, MxArray>| {
+            // lm_head.weight is required for untied configs; inject a valid bf16
+            // dummy so this loader-seam test can reach the MoE path under test.
+            let mut p = params.clone();
+            p.entry("lm_head.weight".to_string())
+                .or_insert_with(|| bf16_w(&[8, 16]));
             let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
-            apply_weights(&mut inner, params, &config, 4, 64, None, &HashMap::new())
+            apply_weights(&mut inner, &p, &config, 4, 64, None, &HashMap::new())
         };
         // Either guard is a valid fail-loud outcome: the `.weight`-suffixed
         // form trips `ensure_int8_storage_resolves_sym8` first ("is int8
@@ -2214,13 +2373,6 @@ mod tests {
         assert_int8_rejected(&params, key);
 
         // Control: dense bf16 fused experts + router keep loading.
-        let bf16_w = |shape: &[i64]| {
-            let n: i64 = shape.iter().product();
-            MxArray::from_float32(&vec![0.01f32; n as usize], shape)
-                .expect("from_float32")
-                .astype(DType::BFloat16)
-                .expect("bf16")
-        };
         let mut params: HashMap<String, MxArray> = HashMap::new();
         params.insert(
             "layers.0.experts.gate_up_proj.weight".into(),
