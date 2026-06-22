@@ -480,6 +480,35 @@ fn read_passthrough_bytes(src: &PassthroughSource) -> Result<Vec<u8>> {
 /// the full `[vocab, cols]` table; `rows_per_shard` is the uniform axis-0 stride
 /// (every shard but the last has exactly this many rows). Used for tables like
 /// gemma-4-E2B's ~4GB `embed_tokens_per_layer.weight` that exceed the cap.
+/// The canonical checkpoint `.safetensors` under `dir`, matching exactly what
+/// the main loader (`crate::engine::persistence::load_all_safetensors`) reads:
+/// a single `weights.safetensors`/`model.safetensors` when present, otherwise
+/// the sorted `model-*-of-*.safetensors` shards. Stray or auxiliary
+/// `.safetensors` files in the directory are deliberately ignored so a sharded
+/// lookup resolves against the same files that produced the sanitized params.
+fn checkpoint_safetensors_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    for single in ["weights.safetensors", "model.safetensors"] {
+        let p = dir.join(single);
+        if p.exists() {
+            return vec![p];
+        }
+    }
+    let mut shards: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_shard = (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                && name.ends_with(".safetensors")
+                && name.contains("-of-");
+            if is_shard {
+                shards.push(entry.path());
+            }
+        }
+    }
+    shards.sort();
+    shards
+}
+
 pub(crate) fn load_bf16_tensor_sharded(
     model_dir: &std::path::Path,
     key: &str,
@@ -487,27 +516,55 @@ pub(crate) fn load_bf16_tensor_sharded(
 ) -> Result<(Vec<MxArray>, i64)> {
     use mlx_sys as sys;
 
-    // Locate the safetensors file holding `key` (single-file or sharded layout)
-    // and read only its header to get the data offset + shape + dtype.
-    let mut found: Option<(std::path::PathBuf, TensorInfo, usize)> = None;
-    let entries = std::fs::read_dir(model_dir)
-        .map_err(|e| Error::from_reason(format!("read_dir {model_dir:?} failed: {e}")))?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("safetensors") {
-            continue;
-        }
+    // Locate the file holding `key`, reading only each file's header for the
+    // data offset + shape + dtype, and only over the canonical checkpoint files
+    // (`checkpoint_safetensors_files`) so a stray `.safetensors` can neither win
+    // the lookup nor abort it. `key` is the sanitized (prefix-stripped) name,
+    // but checkpoints store tensors under their raw names (gemma-4 wraps
+    // everything in `model.language_model.`). Resolution is decided GLOBALLY
+    // across the shard files rather than file-by-file — file order is
+    // unspecified and a tensor lives in exactly one shard:
+    //   * an exact `key` match anywhere wins over any `*.{key}` suffix match;
+    //   * a `*.{key}` suffix match is taken only when no exact match exists;
+    //   * 2+ exact matches, or 2+ suffix matches with no exact, is a loud error
+    //     rather than silently gathering the wrong tensor.
+    let suffix = format!(".{key}");
+    let mut exact: Vec<(std::path::PathBuf, TensorInfo, usize)> = Vec::new();
+    let mut suffixed: Vec<(std::path::PathBuf, String, TensorInfo, usize)> = Vec::new();
+    for p in checkpoint_safetensors_files(model_dir) {
         let st = SafeTensorsFile::load(&p)?;
         if let Some(info) = st.tensors.get(key) {
-            found = Some((p, info.clone(), st.data_offset));
-            break;
+            exact.push((p.clone(), info.clone(), st.data_offset));
+        }
+        for (name, info) in &st.tensors {
+            if name != key && name.ends_with(&suffix) {
+                suffixed.push((p.clone(), name.clone(), info.clone(), st.data_offset));
+            }
         }
     }
-    let (file_path, info, data_offset) = found.ok_or_else(|| {
-        Error::from_reason(format!(
-            "tensor {key} not found in any safetensors under {model_dir:?}"
-        ))
-    })?;
+    let (file_path, info, data_offset) = if exact.len() > 1 {
+        return Err(Error::from_reason(format!(
+            "tensor {key} appears as an exact key in {} safetensors under {model_dir:?}; refusing to guess",
+            exact.len()
+        )));
+    } else if let Some(hit) = exact.pop() {
+        hit
+    } else if suffixed.len() > 1 {
+        let names: Vec<&str> = suffixed
+            .iter()
+            .map(|(_, name, _, _)| name.as_str())
+            .collect();
+        return Err(Error::from_reason(format!(
+            "ambiguous `*.{key}` suffix matched {} tensors under {model_dir:?}: {names:?}; refusing to guess",
+            names.len()
+        )));
+    } else if let Some((p, _name, info, off)) = suffixed.pop() {
+        (p, info, off)
+    } else {
+        return Err(Error::from_reason(format!(
+            "tensor {key} (or a `*.{key}` suffix) not found in any safetensors under {model_dir:?}"
+        )));
+    };
 
     if !matches!(info.dtype, SafeTensorDType::BF16) {
         return Err(Error::from_reason(format!(
@@ -1199,6 +1256,218 @@ mod tests {
             got, bits,
             "sharded load must reconstruct the source tensor rows exactly"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Checkpoints store tensors under their raw, prefixed names (gemma-4 wraps
+    /// everything in `model.language_model.`), but callers pass the sanitized
+    /// bare key. The loader must resolve the bare key against the unique
+    /// `*.{key}` suffix in the file — without this, the gemma-4-E2B PLE shard
+    /// load fails with "tensor not found".
+    #[test]
+    fn load_bf16_tensor_sharded_resolves_prefixed_key() {
+        let dir = std::env::temp_dir().join(format!("st_shard_prefixed_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        const V: usize = 5;
+        const C: usize = 3;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let arr = MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap();
+        let mut tensors = HashMap::new();
+        // Stored under the raw prefixed name, exactly as gemma-4 ships it.
+        tensors.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            arr,
+        );
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        // Requested by the sanitized bare key — must resolve via the suffix.
+        let budget = 2 * C * 2;
+        let (shards, rows_per_shard) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        assert_eq!(rows_per_shard, 2);
+        assert_eq!(shards.len(), 3); // [2, 2, 1]
+
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, bits,
+            "prefixed-key resolution must reconstruct the source tensor exactly"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Resolution is global, not per-file: when one shard file holds the exact
+    /// bare key and another holds a `*.{key}` suffix, the exact key must win
+    /// regardless of `read_dir` order — a per-file break could otherwise pick
+    /// the suffix from whichever file the OS happened to list first.
+    #[test]
+    fn load_bf16_tensor_sharded_exact_key_wins_across_files() {
+        let dir = std::env::temp_dir().join(format!("st_shard_exact_wins_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        // Two distinct tensors in two separate files: a prefixed suffix-match
+        // and the exact bare key. The loader must return the exact one.
+        let suffix_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x5000 + i).collect();
+        let exact_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        // Canonical shard names so both files are in the checkpoint's file set.
+        let mut a = HashMap::new();
+        a.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&suffix_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00001-of-00002.safetensors"), &mut a, None).unwrap();
+
+        let mut b = HashMap::new();
+        b.insert(
+            "embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&exact_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00002-of-00002.safetensors"), &mut b, None).unwrap();
+
+        let budget = V * C * 2; // single shard
+        let (shards, _) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, exact_bits,
+            "an exact key in any shard must win over a `*.{{key}}` suffix in another"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `*.{key}` suffix that matches different tensors in different shard
+    /// files (with no exact key anywhere) is ambiguous and must be a loud Err,
+    /// never a silent pick of whichever file was listed first.
+    #[test]
+    fn load_bf16_tensor_sharded_ambiguous_suffix_across_files_errors() {
+        let dir = std::env::temp_dir().join(format!("st_shard_ambig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        // Canonical shard names so both files are in the checkpoint's file set.
+        let mut a = HashMap::new();
+        a.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00001-of-00002.safetensors"), &mut a, None).unwrap();
+
+        let mut b = HashMap::new();
+        b.insert(
+            "vision_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model-00002-of-00002.safetensors"), &mut b, None).unwrap();
+
+        let budget = V * C * 2;
+        match load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget) {
+            Ok(_) => panic!("cross-file suffix ambiguity must fail loudly, not pick one"),
+            Err(e) => assert!(
+                e.reason.contains("ambiguous"),
+                "error must name the ambiguity, got: {}",
+                e.reason
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Resolution is scoped to the canonical checkpoint files only. A stray,
+    /// non-canonically-named `.safetensors` that happens to hold the exact bare
+    /// key must NOT win over (or abort) the real prefixed tensor in
+    /// `model.safetensors` — it is invisible to the main loader, so it must be
+    /// invisible here too.
+    #[test]
+    fn load_bf16_tensor_sharded_ignores_stray_non_checkpoint_file() {
+        let dir = std::env::temp_dir().join(format!("st_shard_stray_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let real_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+        let stray_bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x5000 + i).collect();
+
+        // The real tensor lives prefixed in the canonical model.safetensors.
+        let mut real = HashMap::new();
+        real.insert(
+            "model.language_model.embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&real_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("model.safetensors"), &mut real, None).unwrap();
+
+        // A stray file holds the exact bare key with different values; it is not
+        // a canonical checkpoint file and must be ignored entirely.
+        let mut stray = HashMap::new();
+        stray.insert(
+            "embed_tokens_per_layer.weight".to_string(),
+            MxArray::from_bfloat16(&stray_bits, &[V as i64, C as i64]).unwrap(),
+        );
+        save_safetensors(dir.join("extra.safetensors"), &mut stray, None).unwrap();
+
+        let budget = V * C * 2;
+        let (shards, _) =
+            load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget).unwrap();
+        let mut got: Vec<u16> = Vec::new();
+        for shard in &shards {
+            got.extend(shard.to_uint16_native().unwrap());
+        }
+        assert_eq!(
+            got, real_bits,
+            "must resolve the real prefixed tensor, not the stray exact-key file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same exact bare key in two canonical shard files is a malformed
+    /// checkpoint (a single tensor lives in exactly one shard), so it must fail
+    /// loudly rather than silently picking one.
+    #[test]
+    fn load_bf16_tensor_sharded_duplicate_exact_key_across_files_errors() {
+        let dir = std::env::temp_dir().join(format!("st_shard_dupexact_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        const V: usize = 4;
+        const C: usize = 2;
+        let bits: Vec<u16> = (0..(V * C) as u16).map(|i| 0x4000 + i).collect();
+
+        for shard in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ] {
+            let mut t = HashMap::new();
+            t.insert(
+                "embed_tokens_per_layer.weight".to_string(),
+                MxArray::from_bfloat16(&bits, &[V as i64, C as i64]).unwrap(),
+            );
+            save_safetensors(dir.join(shard), &mut t, None).unwrap();
+        }
+
+        let budget = V * C * 2;
+        match load_bf16_tensor_sharded(&dir, "embed_tokens_per_layer.weight", budget) {
+            Ok(_) => panic!("duplicate exact key across shards must fail loudly, not pick one"),
+            Err(e) => assert!(
+                e.reason.contains("exact key"),
+                "error must name the duplicate exact key, got: {}",
+                e.reason
+            ),
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
