@@ -356,6 +356,17 @@ jobs:
     needs:
       - test
       - lint
+      - model-test
+    # Don't publish a release when the e2e model-test matrix fails. `always()`
+    # keeps publish running when model-test is SKIPPED (non-release PRs without
+    # the `model-e2e` label, where the publish step is a no-op) instead of
+    # cascading the skip onto publish; test + lint must still have succeeded.
+    if: >-
+      always() &&
+      needs.test.result == 'success' &&
+      needs.lint.result == 'success' &&
+      needs.model-test.result != 'failure' &&
+      needs.model-test.result != 'cancelled'
     steps:
       - uses: actions/checkout@v6
         with:
