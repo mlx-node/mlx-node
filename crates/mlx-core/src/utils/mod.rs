@@ -8,6 +8,7 @@
 
 pub mod foreign_weights;
 pub mod functional;
+pub mod gemma_quant_repack;
 pub mod gguf;
 pub mod imatrix;
 pub mod pickle;
