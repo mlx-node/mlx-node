@@ -313,6 +313,33 @@ pub(crate) fn snapshot_all(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5La
     caches.iter().map(|c| c.snapshot()).collect()
 }
 
+/// Snapshot every layer for the eager-MTP rollback, paged-backend aware.
+///
+/// Identical to [`snapshot_all`] on the flat path. On the **paged** path the
+/// FullAttention K/V lives in the `PagedKVCacheAdapter` pool rather than in
+/// `caches`, so each `Qwen3_5LayerCache::FullAttention` slot is a vestigial
+/// shell (empty K/V buffer, offset 0). The paged MTP rollback rewinds those
+/// slots via `adapter.rollback_last_tokens` and never reads their snapshot
+/// (see `DenseMtpStepper::rollback`), so this emits a benign
+/// `FullAttention { offset: 0 }` placeholder for them instead of calling
+/// [`Qwen3_5LayerCache::snapshot`] — which would trip that method's flat-only
+/// empty-buffer `debug_assert!`. Linear (GDN) slots, whose recurrent state
+/// lives in `caches` on both paths, are snapshotted normally.
+pub(crate) fn snapshot_all_mtp(
+    caches: &[Qwen3_5LayerCache],
+    paged: bool,
+) -> Result<Vec<Qwen3_5LayerSnapshot>> {
+    caches
+        .iter()
+        .map(|c| match c {
+            Qwen3_5LayerCache::FullAttention(_) if paged => {
+                Ok(Qwen3_5LayerSnapshot::FullAttention { offset: 0 })
+            }
+            _ => c.snapshot(),
+        })
+        .collect()
+}
+
 /// Restore every layer's cache from a matching slice of snapshots.
 ///
 /// Returns an error if the slice lengths differ or if any variant pair is
@@ -630,6 +657,35 @@ mod tests {
                 vec![7.0, 8.0]
             );
         }
+    }
+
+    #[test]
+    fn snapshot_all_mtp_skips_empty_fullattention_shell_on_paged() {
+        // Mirror the paged-MTP layout: a FullAttention slot is a vestigial
+        // shell (empty K/V, offset 0) because its real K/V lives in the paged
+        // adapter pool, alongside a Linear (GDN) slot whose recurrent state
+        // DOES live in `caches` on both backends.
+        let mut caches = vec![
+            Qwen3_5LayerCache::new_full_attention(), // empty shell, offset 0
+            Qwen3_5LayerCache::new_linear(),
+        ];
+        if let Some(arrays) = caches[1].as_arrays_cache_mut() {
+            arrays.set(0, MxArray::from_float32(&[7.0, 8.0], &[1, 2]).unwrap());
+        }
+
+        // The paged-aware snapshot must NOT call `snapshot()` on the empty
+        // shell (that trips its flat-only debug-assert in dev builds); it
+        // emits a placeholder instead and snapshots the Linear slot normally.
+        let snaps = snapshot_all_mtp(&caches, true).expect("paged snapshot must not panic");
+        assert_eq!(snaps.len(), 2);
+        assert!(
+            matches!(snaps[0], Qwen3_5LayerSnapshot::FullAttention { offset: 0 }),
+            "paged FullAttention shell must snapshot as an offset-0 placeholder",
+        );
+        assert!(
+            matches!(snaps[1], Qwen3_5LayerSnapshot::Linear { .. }),
+            "Linear (GDN) slot must be snapshotted normally even on the paged path",
+        );
     }
 
     #[test]

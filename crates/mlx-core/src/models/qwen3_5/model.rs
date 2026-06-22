@@ -7334,9 +7334,15 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // Snapshot the main caches before verify mutates them. Stash the fallible
     // result; surfaced in `rollback` / `restore_and_replay_main`.
     fn snapshot_main_linear(&mut self) {
+        // On the paged backend the FullAttention K/V lives in the paged pool,
+        // not `inner.caches`, so its flat slot is an empty shell. Snapshot
+        // paged-aware so we capture only the GDN (Linear) state and skip the
+        // shells — `rollback` rewinds those via the adapter and never reads
+        // their snapshot.
+        let paged = matches!(self.mode, MtpStepMode::Paged(_));
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
-            Some(caches) => super::layer_cache::snapshot_all(caches),
+            Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
             None => Err(Error::from_reason(
                 "eager MTP snapshot_main_linear: inner.caches is None",
             )),
