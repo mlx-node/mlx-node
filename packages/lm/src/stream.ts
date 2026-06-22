@@ -358,6 +358,35 @@ interface StreamingModelOptions {
 export type StreamingModel = SessionCapableModel;
 
 /**
+ * The effective `applyTemplate` flag resolved from the options literal:
+ * an explicit `applyTemplate` wins, otherwise it defaults to `recordModelPath`
+ * — mirroring the runtime `opts.applyTemplate ?? recordPath`. Requires the
+ * options to be inferred as a literal (the `const` type parameter below), so
+ * `{ recordModelPath: true }` yields `true`, not `boolean`.
+ */
+type ResolvedApplyTemplate<O extends StreamingModelOptions> = O extends {
+  applyTemplate: boolean;
+}
+  ? O['applyTemplate']
+  : O['recordModelPath'];
+
+/**
+ * Instance surface of a generated streaming wrapper: the native instance (minus
+ * its native callback chat methods) plus the `SessionCapableModel` generator
+ * overrides. When the wrapper installs `applyChatTemplate` (the templating
+ * variants — `applyTemplate` resolves truthy), it is re-added as a REQUIRED
+ * member instead of the optional one `SessionCapableModel` declares, so
+ * `model.applyChatTemplate(...)` is not a possibly-undefined call after
+ * `load()` in strict TS.
+ */
+type StreamingInstance<C extends NativeStreamingCtor, O extends StreamingModelOptions> = Omit<
+  InstanceType<C>,
+  keyof SessionCapableModel
+> &
+  SessionCapableModel &
+  (ResolvedApplyTemplate<O> extends true ? Required<Pick<SessionCapableModel, 'applyChatTemplate'>> : object);
+
+/**
  * Build the streaming-model subclass for a native chat model class.
  *
  * The returned class:
@@ -374,9 +403,9 @@ export type StreamingModel = SessionCapableModel;
  * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) builds its
  * `QianfanOCRModel` from the same factory. Not part of the public API.
  */
-export function makeStreamingModel<C extends NativeStreamingCtor>(
+export function makeStreamingModel<C extends NativeStreamingCtor, const O extends StreamingModelOptions>(
   NativeClass: C,
-  opts: StreamingModelOptions,
+  opts: O,
 ): {
   // Preserve the native instance surface (`generate`, `batchGenerate`,
   // `saveModel`, `numParameters`, `hasMtpWeights`, …) by re-deriving it
@@ -384,13 +413,14 @@ export function makeStreamingModel<C extends NativeStreamingCtor>(
   // streaming overrides (AsyncGenerator chat methods + `resetCaches`,
   // etc.) win. `Omit<…, keyof SessionCapableModel>` drops the native
   // callback-style chat methods so the re-added `SessionCapableModel`
-  // generator signatures take precedence.
+  // generator signatures take precedence. `applyChatTemplate` is required on
+  // templating variants (see `StreamingInstance`).
   //
   // `ConstructorParameters<C>` (not `never[]`) keeps each native config
   // constructor — e.g. `new Gemma4Model(config)` / `new QianfanOCRModel(config)`
   // — visible on the generated wrapper for TypeScript consumers.
-  new (...args: ConstructorParameters<C>): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
-  load(modelPath: string): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+  new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
+  load(modelPath: string): Promise<StreamingInstance<C, O>>;
 } {
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
@@ -491,8 +521,8 @@ export function makeStreamingModel<C extends NativeStreamingCtor>(
   }
 
   return StreamingModelImpl as unknown as {
-    new (...args: ConstructorParameters<C>): Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel;
-    load(modelPath: string): Promise<Omit<InstanceType<C>, keyof SessionCapableModel> & SessionCapableModel>;
+    new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
+    load(modelPath: string): Promise<StreamingInstance<C, O>>;
   };
 }
 
