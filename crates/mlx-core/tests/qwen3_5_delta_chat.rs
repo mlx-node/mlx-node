@@ -17,12 +17,76 @@
 //! Without `MLX_TEST_MODEL_PATH` the test early-returns and passes
 //! trivially so it still compiles as part of `cargo test`.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
+
+/// Clone `src` into a fresh `target/`-rooted dir with the weight files
+/// symlinked and `config.json` patched to `use_block_paged_cache=false`,
+/// returning the new path. The path is leaked — these run a couple of times
+/// per session and `target/` is already a build artifact, so cleanup is
+/// best-effort and not needed for correctness.
+///
+/// The vision-capable MTP checkpoint the MTP-vs-AR oracles run against defaults
+/// to the block-paged KV backend at load (its config carries a `vision_config`).
+/// The "MTP byte-matches AR" property only holds on the FLAT backend: paged
+/// full-attention decode differs from flat by ~1 bf16 ULP, and streaming MTP on
+/// a paged model routes through the flat-dense path while AR stays paged — a
+/// cross-backend mix that is not byte-comparable. Pin flat so both paths run the
+/// same backend.
+fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let manifest = std::env::var("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
+            let mut p = PathBuf::from(manifest);
+            p.pop();
+            p.pop();
+            p.join("target")
+        });
+
+    let dst = workspace_target.join(format!("delta-chat-flat-{pid}-{suffix}"));
+    if dst.exists() {
+        let _ = fs::remove_dir_all(&dst);
+    }
+    fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
+
+    // Symlink the (multi-GB) weight files; only config.json is copied + patched.
+    for entry in fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))? {
+        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
+        let from = entry.path();
+        if !from.is_file() {
+            continue;
+        }
+        let to = dst.join(entry.file_name());
+        if entry.file_name() == "config.json" {
+            fs::copy(&from, &to)
+                .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
+        } else {
+            std::os::unix::fs::symlink(&from, &to)
+                .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
+        }
+    }
+
+    let cfg_path = dst.join("config.json");
+    let raw = fs::read_to_string(&cfg_path)
+        .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
+    let mut cfg: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
+    cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+    let pretty =
+        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
+    fs::write(&cfg_path, pretty)
+        .map_err(|e| format!("write config.json: {e} (path={})", cfg_path.display()))?;
+
+    Ok(dst)
+}
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
@@ -777,7 +841,8 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let flat_dir = flat_clone_model_dir(model_dir, "nonpos").expect("flat clone failed");
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -989,7 +1054,8 @@ async fn cancel_midcycle_then_continue_mtp_matches_ar() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let flat_dir = flat_clone_model_dir(model_dir, "cancel").expect("flat clone failed");
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -1025,21 +1091,26 @@ async fn cancel_midcycle_then_continue_mtp_matches_ar() {
         return;
     }
 
-    // One cancel->continue scenario, parametrised by MTP on/off. Returns the
-    // (pre-cancel partial turn-1 reply, full turn-2 reply) streamed text.
-    async fn scenario(
-        model: &Qwen3_5Model,
-        enable_mtp: bool,
-        cancel_after_chunks: usize,
-    ) -> (String, String) {
-        // Turn 1: stream a counting reply, cancel after `cancel_after_chunks`
-        // streamed tokens. The streaming emit loop fires the callback once per
-        // accepted token on BOTH paths, so this caps turn-1's saved history at
-        // the same token count for MTP and AR.
+    // Turn-1 stop policy. The MTP path cancels mid-cycle (the desync trigger);
+    // the AR ground truth instead stops cleanly at a fixed new-token budget so
+    // it never races the cancel and commits a deterministic history.
+    #[derive(Clone, Copy)]
+    enum Turn1Stop {
+        CancelAfter(usize),
+        Budget(usize),
+    }
+
+    // Runs turn 1 under `stop`, then a fixed turn-2 follow-up on the resulting
+    // caches. Returns (turn-1 streamed-token count, full turn-2 reply text).
+    async fn scenario(model: &Qwen3_5Model, enable_mtp: bool, stop: Turn1Stop) -> (usize, String) {
+        let max_new = match stop {
+            Turn1Stop::Budget(n) => n as i32,
+            Turn1Stop::CancelAfter(_) => 64,
+        };
         let turn1_cfg = ChatConfig {
             enable_mtp: Some(enable_mtp),
             include_reasoning: Some(true),
-            ..chat_config_default(64)
+            ..chat_config_default(max_new)
         };
         let (handle, mut rx) = model
             .chat_stream_session_start_for_test(
@@ -1049,16 +1120,19 @@ async fn cancel_midcycle_then_continue_mtp_matches_ar() {
                 Some(turn1_cfg),
             )
             .expect("turn 1 stream dispatch failed");
-        let mut partial = String::new();
-        let mut collected = 0usize;
+        // The streaming emit loop fires the callback once per accepted token on
+        // BOTH paths, so `emitted` is the saved-history token count (pre
+        // drop-last) for either a cancel or a length stop.
+        let mut emitted = 0usize;
         while let Some(result) = rx.recv().await {
             let chunk = result.expect("turn 1 stream error");
             if chunk.done {
                 break;
             }
-            partial.push_str(&chunk.text);
-            collected += 1;
-            if collected == cancel_after_chunks {
+            emitted += 1;
+            if let Turn1Stop::CancelAfter(k) = stop
+                && emitted == k
+            {
                 handle.cancel();
             }
         }
@@ -1079,32 +1153,39 @@ async fn cancel_midcycle_then_continue_mtp_matches_ar() {
         let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
         assert!(done2, "turn 2 (enable_mtp={enable_mtp}) didn't reach done");
         let full2: String = chunks2.iter().map(|c| c.text.as_str()).collect();
-        (partial, full2)
+        (emitted, full2)
     }
 
-    let cancel_after = 3usize;
-    let (mtp_partial, mtp_turn2) = scenario(&model, true, cancel_after).await;
-    let (ar_partial, ar_turn2) = scenario(&model, false, cancel_after).await;
+    // MTP path: cancel mid-cycle to strand drafted-but-unemitted tokens, the
+    // condition the desync heal must repair. Capture its exact emitted count.
+    let (n_mtp, mtp_turn2) = scenario(&model, true, Turn1Stop::CancelAfter(3)).await;
+    assert!(
+        n_mtp >= 3,
+        "MTP turn-1 emitted fewer tokens ({n_mtp}) than the cancel point; cannot \
+         exercise a mid-cycle cancel"
+    );
 
-    println!("MTP turn1 partial = {mtp_partial:?}");
-    println!("AR  turn1 partial = {ar_partial:?}");
+    // AR ground truth: stop turn 1 cleanly at the SAME emitted count (no cancel,
+    // no host-timing race). A length stop and a cancel both drop the last,
+    // unforwarded token, so a HEALED MTP cancel and this AR run commit the
+    // identical turn-1 history (n_mtp-1 tokens). T=0 greedy makes the token
+    // sequences identical, so turn 2 is directly comparable on every host with
+    // no vacuous skip.
+    let (n_ar, ar_turn2) = scenario(&model, false, Turn1Stop::Budget(n_mtp)).await;
+    assert_eq!(
+        n_ar, n_mtp,
+        "AR length stop should emit exactly the MTP emitted-token budget \
+         (n_mtp={n_mtp}, n_ar={n_ar}); a short AR stop would skew the histories"
+    );
+
+    println!("turn1 emitted (MTP = AR budget) = {n_mtp}");
     println!("MTP turn2 = {mtp_turn2:?}");
     println!("AR  turn2 = {ar_turn2:?}");
 
-    // Precondition: T=0 greedy -> MTP and AR emit the identical token
-    // sequence, and one chunk per token means the same `cancel_after` tokens
-    // were saved as turn-1 history. If this fails the two turn-2 prompts would
-    // build on different histories and the comparison below isn't
-    // apples-to-apples, so surface it explicitly rather than mis-attribute.
-    assert_eq!(
-        mtp_partial, ar_partial,
-        "precondition: MTP and AR must emit the same pre-cancel partial reply \
-         (T=0 byte-identity); got MTP={mtp_partial:?} AR={ar_partial:?}"
-    );
-
     // KEY: with the desync healed, the follow-up reply is identical to the AR
     // ground truth. Under the bug the MTP flat caches were advanced past the
-    // emitted history and this follow-up diverges.
+    // emitted history (stranded drafted tokens never rolled back) and this
+    // follow-up diverges. Asserted unconditionally — no host-dependent skip.
     assert_eq!(
         mtp_turn2, ar_turn2,
         "MTP follow-up after a mid-cycle cancel diverged from the AR ground \
