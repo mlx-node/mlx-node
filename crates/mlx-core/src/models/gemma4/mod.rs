@@ -15,6 +15,7 @@ pub mod unified_vision_config;
 pub mod vision;
 pub mod vision_config;
 pub mod vision_embedder;
+pub mod vision_mask;
 pub mod vision_rope;
 
 pub use config::Gemma4Config;
