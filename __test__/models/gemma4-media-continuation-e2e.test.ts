@@ -195,6 +195,11 @@ describe.skipIf(!imageModelPath || !imageExists)(
 
       // eslint-disable-next-line no-console
       console.log('[gemma4-cont-image] observed:', JSON.stringify(observed.parsedText));
+      // Cold-restart signal: the vision cold prefill primes with skip_lookup +
+      // max_cache_hit_tokens=0, so a correct cold-restart reports cachedTokens=0.
+      // A regression that wrongly re-armed the marker would warm-continue and
+      // report cachedTokens>0 — so this fails loud on accidental warm reuse.
+      expect(observed.cachedTokens ?? 0).toBe(0);
       expect(observed.finishReason === 'stop' || observed.finishReason === 'length').toBe(true);
       expect(observed.numTokens).toBeGreaterThan(0);
       const words = observed.parsedText.trim().split(/\s+/).filter(Boolean);
@@ -279,6 +284,9 @@ describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — UNIFIED image cont
 
     // eslint-disable-next-line no-console
     console.log('[gemma4-cont-unified] observed:', JSON.stringify(observed.parsedText));
+    // Cold-restart signal (single-shot): cachedTokens=0 proves the follow-up did
+    // not warm-continue (the vision cold prefill primes max_cache_hit_tokens=0).
+    expect(observed.cachedTokens ?? 0).toBe(0);
     expect(observed.finishReason === 'stop' || observed.finishReason === 'length').toBe(true);
     expect(observed.numTokens).toBeGreaterThan(0);
     const words = observed.parsedText.trim().split(/\s+/).filter(Boolean);

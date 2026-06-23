@@ -1990,14 +1990,15 @@ impl Gemma4Inner {
                 let _logits = self.run_paged_decode_step(last_token)?;
             }
 
-            let keep_live_ok = match self.paged_adapter.as_mut() {
+            let (keep_live_ok, live_for_continue) = match self.paged_adapter.as_mut() {
                 Some(adapter) => {
                     let total = adapter.request_tokens().len();
                     let bs = adapter.block_size();
                     let extra = engine::build_paged_extra_keys(total, bs, &[]);
-                    adapter.finalize_turn_keep_live_per_block(&extra, 0).is_ok()
+                    let ok = adapter.finalize_turn_keep_live_per_block(&extra, 0).is_ok();
+                    (ok, adapter.is_live_for_continue())
                 }
-                None => false,
+                None => (false, false),
             };
 
             if keep_live_ok {
@@ -2023,7 +2024,14 @@ impl Gemma4Inner {
                 // media-position sliding K/V from raw token embeddings —
                 // numerically wrong. Downgrade to a clean non-continuable state
                 // so the follow-up delta cold-restarts instead.
-                if stored {
+                //
+                // `live_for_continue` guards a second gap: a keep-live with zero
+                // FULL blocks (a media turn shorter than `block_size`) returns
+                // Ok without registering the request, so the next delta could
+                // not take the live-continue path and would re-prefill the media
+                // placeholders as text. Unreachable on shipped configs (media
+                // turns far exceed the 16-token block), but cheap to gate.
+                if stored && live_for_continue {
                     self.media_session_continuable = true;
                     return Ok(());
                 }
