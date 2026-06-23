@@ -92,6 +92,7 @@ function stubConfig(overrides: Partial<Gemma4Config> = {}): Gemma4Config {
     ropeLocalBaseFreq: 10_000,
     partialRotaryFactor: 0.25,
     attentionKEqV: false,
+    isUnified: false,
     perLayerInputEmbeds: false,
     padTokenId: 0,
     eosTokenIds: [1],

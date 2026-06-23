@@ -94,8 +94,12 @@ export async function detectModelType(modelPath: string): Promise<ModelType> {
     const config = JSON.parse(raw);
     const rawModelType: string = config.model_type ?? 'qwen3';
 
-    // Normalize model_type: gemma4_text → gemma4
-    let modelType: ModelType = (rawModelType === 'gemma4_text' ? 'gemma4' : rawModelType) as ModelType;
+    // Normalize Gemma 4 text-family variants onto the single `gemma4` registry
+    // key: `gemma4_text` (31B/E2B/26B) and `gemma4_unified` (12B multimodal,
+    // loaded text-only) both drive the shared `gemma4` decoder.
+    let modelType: ModelType = (
+      rawModelType === 'gemma4_text' || rawModelType === 'gemma4_unified' ? 'gemma4' : rawModelType
+    ) as ModelType;
 
     // Detect embedding models: Qwen3 backbone with base architecture (no ForCausalLM)
     if (modelType === 'qwen3') {
