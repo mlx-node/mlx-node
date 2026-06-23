@@ -5,38 +5,40 @@ import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 import { beforeAll, describe, expect, it } from 'vite-plus/test';
 
 /**
- * Phase-2 WARM media -> text continuation golden parity (Gemma 4).
+ * Phase-2 media -> text continuation parity (Gemma 4).
  *
  * A text follow-up after a pure-causal media turn (AUDIO, or a NON-UNIFIED
- * image) warm-continues on the live media KV: the vision-core finalize keeps
- * the global paged KV registered for reuse and arms `media_session_continuable`,
- * so the native `chatSessionContinue` succeeds instead of throwing the
- * media-held restart prefix. The next delta restores the prefix via REPLAY
- * (re-walking the matched prefix over the live content-addressed global KV) —
- * exactly the mechanism a TEXT warm-continue uses on the same checkpoint. (On
- * KV-shared checkpoints like e2b, the sliding-history fast-path checkpoint is a
- * structural no-op for both text and vision; continuation rides the replay
- * path, which is byte-exact, just not free.)
+ * image) MAY warm-continue on the live media KV, but only when the warm restore
+ * is numerically FAITHFUL. The vision-core finalize keeps the global paged KV
+ * registered for reuse and arms `media_session_continuable` ONLY when the
+ * sliding-history checkpoint actually STORED. That gate splits the two
+ * checkpoint classes:
  *
- * ## What is byte-exact vs not, and why
+ *  - NON-KV-SHARED (12B audio, `num_kv_shared_layers=0`): every sliding layer is
+ *    a plain `Sliding` anchor that physically wrote real audio/image-feature K/V
+ *    during the media prefill, so the sliding checkpoint STORES, the marker
+ *    arms, and the next delta hits `state="live"` — reusing the in-place
+ *    faithful K/V. This is the canonical FAITHFUL warm path.
+ *  - KV-SHARED (e2b image, `num_kv_shared_layers=20`): the `SharedOnSliding`
+ *    layers never wrote their own flat K/V, so the sliding checkpoint stores
+ *    NOTHING (`stored=false`). A warm restore would fall to `state="replay"`,
+ *    which rebuilds media-position sliding K/V from `embed_tokens.forward(id)` =
+ *    RAW `<|image|>` special-token embeddings, NOT the scattered SigLIP/audio
+ *    features — numerically UNFAITHFUL. So the marker is left OFF; the text
+ *    follow-up cleanly COLD-RESTARTS through the `ChatSession` Phase-1 catch.
  *
- *  - NON-UNIFIED image (e2b): turn-1 emits NO `<|channel>thought…<channel|>`
- *    block, so re-rendering turn-1 through the chat template is lossless. The
- *    WARM 2-turn run is therefore TOKEN-EXACT (identical `rawText` +
- *    `numTokens`) to a COLD full-prompt replay. This is the load-bearing R1
- *    proof: warm == cold byte-for-byte.
- *  - AUDIO (unified 12B): turn-1 emits a `<|channel>thought…<channel|>` block.
- *    The WARM KV holds that raw block; a COLD replay through `chatSessionStart`
- *    re-renders turn-1 via jinja, whose `strip_thinking` macro DROPS prior-turn
- *    reasoning by design. So the cold turn-2 sees a shorter prefix and re-derives
- *    a longer reasoning trace — a TEMPLATE-RENDERING artifact, not a warm-path
- *    bug (both reach the same FINAL answer). There is no raw-token-prefill API
- *    and no strip-disable, so a token-exact warm==cold golden is ill-posed for a
- *    thinking checkpoint. The audio case therefore asserts (a) the warm path
- *    actually continued (cachedTokens > 0) and (b) the warm FINAL answer equals
- *    the cold FINAL answer. The shared warm-path code is the SAME as the image
- *    case (gated only on has_audio vs has_image), so the image byte-exactness
- *    transitively covers the audio numerics.
+ *  (REPLAY is faithful for TEXT positions because a text token's true embedding
+ *  IS `embed_tokens.forward(id)`; it cannot reconstruct a MEDIA position's true
+ *  embedding, which is a scattered feature.)
+ *
+ * ## What this file asserts
+ *
+ *  - AUDIO (12B, non-KV-shared): the warm path actually continued
+ *    (cachedTokens > 0) and the warm FINAL answer equals the cold FINAL answer.
+ *    This is the load-bearing FAITHFUL-warm proof.
+ *  - NON-UNIFIED image (e2b, KV-shared): the follow-up cold-restarts; the test
+ *    is a single-shot/cold-restart COHERENCE check (coherent, non-degenerate
+ *    answer), mirroring the unified block.
  *
  * Greedy T=0 throughout. Presence-gated on the converted checkpoints + fixtures,
  * mirroring the existing gemma4 e2e tests.
@@ -159,9 +161,11 @@ async function coldReplayTurn2(
   return { rawText: r.rawText, text: r.text, numTokens: r.numTokens };
 }
 
-// -- NON-UNIFIED image continuation: BYTE-EXACT golden (no thinking -> faithful) --
+// -- NON-UNIFIED image continuation (e2b, KV-shared): the media->text follow-up
+//    COLD-RESTARTS (the sliding checkpoint does not store -> warm restore would
+//    be unfaithful -> the marker is left off). Coherence check only. --
 describe.skipIf(!imageModelPath || !imageExists)(
-  'Gemma 4 — WARM non-unified image->text continuation parity (byte-exact)',
+  'Gemma 4 — non-unified image->text continue cold-restarts (KV-shared)',
   () => {
     let model: SessionCapableModel;
 
@@ -170,7 +174,7 @@ describe.skipIf(!imageModelPath || !imageExists)(
       model = (await loadModel(imageModelPath)) as unknown as SessionCapableModel;
     }, 300_000);
 
-    it('warm text delta after a non-unified image turn == cold full-prompt replay (token-exact)', async () => {
+    it('image -> text continue cold-restarts and still answers coherently', async () => {
       const images = [readBytes(imagePath)];
       const prompt1 = 'Describe this image.';
       const prompt2 = 'What is the main color?';
@@ -179,29 +183,34 @@ describe.skipIf(!imageModelPath || !imageExists)(
       const session = new ChatSession(model, { system: SYSTEM });
       const turn1 = await streamTurn(session, prompt1, { images }, 48);
       expect(turn1.rawText.length).toBeGreaterThan(0);
-      // Faithfulness precondition: a thinking block would make the cold replay
-      // (which strips prior reasoning) diverge. e2b image turns are clean.
-      expect(turn1.rawText.includes('<|channel>')).toBe(false);
 
-      const warm = await streamTurn(session, prompt2, {}, maxNew);
+      // e2b is KV-shared (`num_kv_shared_layers=20`): the sliding-history
+      // checkpoint stores nothing, so the finalize leaves the marker false. The
+      // native continue throws the IMAGE restart prefix and the TS send()
+      // absorbs it into a cold replay. The observable contract is that the
+      // follow-up still produces a coherent, non-degenerate answer (the
+      // single-shot cold-restart fallback works) — NOT that it warm-continued.
+      const observed = await streamTurn(session, prompt2, {}, maxNew);
       await session.reset();
 
-      // The warm delta must have actually continued (reused the media KV).
-      expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
-
-      const cold = await coldReplayTurn2(imageModelPath!, { images }, prompt1, turn1.rawText, prompt2, maxNew);
-
       // eslint-disable-next-line no-console
-      console.log('[gemma4-cont-image] warm:', JSON.stringify(warm.rawText), 'cold:', JSON.stringify(cold.rawText));
-      // Byte-exact: identical rawText + numTokens == identical generated ids.
-      expect(warm.rawText).toBe(cold.rawText);
-      expect(warm.numTokens).toBe(cold.numTokens);
+      console.log('[gemma4-cont-image] observed:', JSON.stringify(observed.parsedText));
+      expect(observed.finishReason === 'stop' || observed.finishReason === 'length').toBe(true);
+      expect(observed.numTokens).toBeGreaterThan(0);
+      const words = observed.parsedText.trim().split(/\s+/).filter(Boolean);
+      expect(words.length).toBeGreaterThan(3);
+      // No degenerate single-token loop.
+      const counts = new Map<string, number>();
+      for (const w of words) counts.set(w, (counts.get(w) ?? 0) + 1);
+      expect(Math.max(...counts.values())).toBeLessThan(words.length * 0.8);
     });
   },
 );
 
 // -- AUDIO continuation: warm continues + final-answer parity (thinking -> cold
-//    strips it, so a byte-exact golden is ill-posed; see header). --
+//    strips it, so a byte-exact golden is ill-posed; see header). This is the
+//    canonical FAITHFUL warm path: 12B is non-KV-shared (`num_kv_shared_layers=0`)
+//    so the sliding caches store -> the next delta hits `state="live"`. --
 describe.skipIf(!audioModelPath || !audioExists)('Gemma 4 — WARM audio->text continuation parity', () => {
   let model: SessionCapableModel;
 

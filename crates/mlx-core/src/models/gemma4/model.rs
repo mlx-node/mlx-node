@@ -2006,22 +2006,31 @@ impl Gemma4Inner {
                 self.cached_token_history = full_history;
                 self.cached_image_key = new_image_key;
                 self.cached_audio_key = new_audio_key;
-                // Try to store the sliding history checkpoint (the fast-path
-                // restore). On KV-shared models (e2b: SharedOnSliding layers
-                // never physically store flat K/V) this is a structural no-op
-                // and `stored == false` — EXACTLY as for a TEXT warm-continue on
-                // the same checkpoint (`save_paged_history` discards the trace).
-                // The next delta then restores via REPLAY: it re-walks the
-                // matched prefix over the live (content-addressed) global KV
-                // (`state="replay"`, `continued_live=true`), which is correct,
-                // just not free. So continuation does NOT depend on the
-                // checkpoint storing — only on the global KV being kept live.
                 let history_for_ckpt = self.cached_token_history.clone();
-                let _stored = self
+                let stored = self
                     .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt)
                     .map(|trace| trace.stored)
                     .unwrap_or(false);
-                self.media_session_continuable = true;
+                // Warm continuation is only faithful when the sliding state is
+                // restorable from a stored checkpoint (or the in-place live
+                // caches it implies). A text position's true embedding IS
+                // `embed_tokens.forward(id)`, so REPLAY rebuilds it exactly. A
+                // MEDIA position's true embedding is a scattered SigLIP/audio
+                // feature that replay cannot reconstruct from the raw
+                // `<|image|>`/`<|audio|>` special-token id. On KV-shared
+                // checkpoints (e2b) the shared-on-sliding layers hold no flat
+                // K/V, so `stored == false` and the next delta would rebuild
+                // media-position sliding K/V from raw token embeddings —
+                // numerically wrong. Downgrade to a clean non-continuable state
+                // so the follow-up delta cold-restarts instead.
+                if stored {
+                    self.media_session_continuable = true;
+                    return Ok(());
+                }
+                if let Some(adapter) = self.paged_adapter.as_mut() {
+                    let _ = adapter.release_request();
+                }
+                self.media_session_continuable = false;
                 return Ok(());
             }
             // keep-live failed: fall through to the non-continuable teardown.
@@ -2114,6 +2123,11 @@ impl Gemma4Inner {
         // Cold-start the paged adapter on the expanded sequence.
         let seq_id: u32 = 0;
         let total_budget = tokens.len() as u32;
+        // A new media set is non-continuable until its own finalize re-arms the
+        // marker. Reset BEFORE the side-effecting prepare below, which releases
+        // any prior kept-live request and can then fail (block exhaustion) via
+        // `?` — a stale `true` would wrongly admit a later text delta.
+        self.media_session_continuable = false;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
@@ -2140,8 +2154,6 @@ impl Gemma4Inner {
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
-        // A new media set starts non-continuable; the finalize re-arms it.
-        self.media_session_continuable = false;
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
@@ -2343,6 +2355,11 @@ impl Gemma4Inner {
 
         let seq_id: u32 = 0;
         let total_budget = tokens.len() as u32;
+        // A new media set is non-continuable until its own finalize re-arms the
+        // marker. Reset BEFORE the side-effecting prepare below, which releases
+        // any prior kept-live request and can then fail (block exhaustion) via
+        // `?` — a stale `true` would wrongly admit a later text delta.
+        self.media_session_continuable = false;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
@@ -2367,8 +2384,6 @@ impl Gemma4Inner {
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
-        // A new media set starts non-continuable; the finalize re-arms it.
-        self.media_session_continuable = false;
 
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
