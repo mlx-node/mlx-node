@@ -86,7 +86,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
       expect(first.numTokens).toBeGreaterThan(0);
 
       // Turn 2: continue with the same session
-      const second = await model.chatSessionContinue('Follow-up question', null, {
+      const second = await model.chatSessionContinue('Follow-up question', null, null, {
         maxNewTokens: 10,
       });
       expect(second).toBeDefined();
@@ -298,7 +298,7 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
       // After the tool result, the next user continue should still work —
       // proves the cache is consistent across delta turns.
-      const r3 = await model.chatSessionContinue('ok, thanks', null, {
+      const r3 = await model.chatSessionContinue('ok, thanks', null, null, {
         maxNewTokens: 16,
         temperature: 0,
       });

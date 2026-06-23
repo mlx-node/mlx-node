@@ -141,7 +141,7 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatSessionContinue('hi', null, null)).rejects.toThrow(/not initialized/i);
+    await expect(stub.chatSessionContinue('hi', null, null, null)).rejects.toThrow(/not initialized/i);
   });
 
   it('rejects chatSessionContinueTool with a "not initialized" error', async () => {
@@ -162,7 +162,7 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
 
   it('rejects chatStreamSessionContinue with a "not initialized" error', async () => {
     const stub = new Gemma4ModelNative(stubConfig());
-    await expect(stub.chatStreamSessionContinue('hi', null, null, () => {})).rejects.toThrow(/not initialized/i);
+    await expect(stub.chatStreamSessionContinue('hi', null, null, null, () => {})).rejects.toThrow(/not initialized/i);
   });
 
   it('rejects chatStreamSessionContinueTool with a "not initialized" error', async () => {

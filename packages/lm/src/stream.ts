@@ -466,6 +466,7 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
     async *chatStreamSessionContinue(
       userMessage: string,
       images: Uint8Array[] | null,
+      audio: Uint8Array[] | null,
       config?: ChatConfig | null,
       signal?: AbortSignal,
     ): AsyncGenerator<ChatStreamEvent> {
@@ -475,6 +476,7 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
             this,
             userMessage as never,
             images as never,
+            audio as never,
             (config ?? null) as never,
             callback as never,
           ),

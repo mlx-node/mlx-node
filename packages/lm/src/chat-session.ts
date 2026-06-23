@@ -196,6 +196,7 @@ export interface SessionCapableModel {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null,
+    audio: Uint8Array[] | null,
     config?: ChatConfig | null,
   ): Promise<ChatResult>;
   chatSessionContinueTool(
@@ -221,6 +222,7 @@ export interface SessionCapableModel {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null,
+    audio: Uint8Array[] | null,
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
@@ -330,6 +332,13 @@ export interface SendOptions {
    */
   images?: Uint8Array[];
   /**
+   * Optional audio bytes (encoded WAV) attached to this user turn. When
+   * the audio set differs from the session's current `lastAudioKey`, the
+   * session forcibly restarts via `chatSessionStart` (mirrors `images`).
+   * Only the unified Gemma 4 audio checkpoint consumes this.
+   */
+  audio?: Uint8Array[];
+  /**
    * Per-call `ChatConfig` overlay applied on top of the session's
    * `defaultConfig`. `reuseCache` is always forced on regardless of
    * what the caller passes. The overlay is shallow-merged on top of
@@ -402,6 +411,26 @@ export interface ChatSessionOptions {
  * and the existing stream bridge.
  */
 function computeImagesKey(images: Uint8Array[] | undefined): string | null {
+  return computeByteListKey(images);
+}
+
+/**
+ * Audio counterpart of {@link computeImagesKey}: a stable, order-sensitive
+ * byte-identity key for a list of encoded audio buffers. Used by `send()` /
+ * `sendStream()` to decide whether a new audio set must cold-restart the
+ * server-side session. Shares the exact FNV-1a framing as the image key.
+ */
+function computeAudioKey(audio: Uint8Array[] | undefined): string | null {
+  return computeByteListKey(audio);
+}
+
+/**
+ * FNV-1a 64-bit byte-identity key for a length-framed list of byte buffers.
+ * Returns `null` for an empty/absent list so callers can distinguish
+ * "no media" from "media changed". Shared by the image and audio keys.
+ */
+function computeByteListKey(buffers: Uint8Array[] | undefined): string | null {
+  const images = buffers;
   if (!images || images.length === 0) return null;
   // FNV-1a 64-bit. Split into two 32-bit halves because JavaScript
   // doesn't have a native 64-bit integer type and BigInt ops are
@@ -497,6 +526,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    */
   private lastImagesKey: string | null = null;
 
+  /**
+   * Hex-encoded byte-identity key of the audio set currently bound to the
+   * server's KV cache (see {@link computeAudioKey}). `null` when no audio is
+   * cached. A `send()` whose new key differs triggers a full
+   * `chatSessionStart` restart — the audio counterpart of `lastImagesKey`.
+   */
+  private lastAudioKey: string | null = null;
+
   private turnCount = 0;
   private inFlight = false;
 
@@ -578,24 +615,33 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const mergedConfig = this.mergeConfig(opts.config);
       const newImagesKey = computeImagesKey(opts.images);
-      // Only an explicit NEW image set can trigger a restart. Omitting
-      // `images` (newImagesKey === null) is interpreted as "keep the
-      // current image cache state" — the server-side cache already
-      // holds any prior image context, so a text-only follow-up like
-      // "what about the top-right?" can stay on the cheap delta path
-      // even after an image turn.
+      const newAudioKey = computeAudioKey(opts.audio);
+      // Only an explicit NEW image/audio set can trigger a restart. Omitting
+      // `images`/`audio` (key === null) is interpreted as "keep the current
+      // media cache state" — the server-side cache already holds any prior
+      // media context, so a text-only follow-up like "what about the
+      // top-right?" can stay on the cheap delta path even after a media turn.
       const imageChanged = newImagesKey !== null && newImagesKey !== this.lastImagesKey;
+      const audioChanged = newAudioKey !== null && newAudioKey !== this.lastAudioKey;
       const isFirstTurn = this.turnCount === 0;
 
-      if (isFirstTurn || imageChanged) {
-        return await this.runStartPath(userMessage, opts.images, newImagesKey, imageChanged, isFirstTurn, mergedConfig);
+      if (isFirstTurn || imageChanged || audioChanged) {
+        return await this.runStartPath(
+          userMessage,
+          opts.images,
+          opts.audio,
+          newImagesKey,
+          newAudioKey,
+          imageChanged || audioChanged,
+          isFirstTurn,
+          mergedConfig,
+        );
       }
 
-      // Delta continue: text-only, images always null. The server
-      // cache already holds all prior turns (including any images
-      // from an earlier restart), so we only need to ship the new
-      // user string.
-      const result = await this.model.chatSessionContinue(userMessage, null, mergedConfig);
+      // Delta continue: text-only, images/audio always null. The server
+      // cache already holds all prior turns (including any media from an
+      // earlier restart), so we only need to ship the new user string.
+      const result = await this.model.chatSessionContinue(userMessage, null, null, mergedConfig);
       this.history.push({ role: 'user', content: userMessage });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
@@ -626,21 +672,24 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const mergedConfig = this.mergeConfig(opts.config);
       const newImagesKey = computeImagesKey(opts.images);
-      // Only an explicit NEW image set can trigger a restart. Omitting
-      // `images` (newImagesKey === null) is interpreted as "keep the
-      // current image cache state" — the server-side cache already
-      // holds any prior image context, so a text-only follow-up like
-      // "what about the top-right?" can stay on the cheap delta path
-      // even after an image turn.
+      const newAudioKey = computeAudioKey(opts.audio);
+      // Only an explicit NEW image/audio set can trigger a restart. Omitting
+      // `images`/`audio` (key === null) is interpreted as "keep the current
+      // media cache state" — the server-side cache already holds any prior
+      // media context, so a text-only follow-up like "what about the
+      // top-right?" can stay on the cheap delta path even after a media turn.
       const imageChanged = newImagesKey !== null && newImagesKey !== this.lastImagesKey;
+      const audioChanged = newAudioKey !== null && newAudioKey !== this.lastAudioKey;
       const isFirstTurn = this.turnCount === 0;
 
-      if (isFirstTurn || imageChanged) {
+      if (isFirstTurn || imageChanged || audioChanged) {
         yield* this.runStartStreamPath(
           userMessage,
           opts.images,
+          opts.audio,
           newImagesKey,
-          imageChanged,
+          newAudioKey,
+          imageChanged || audioChanged,
           isFirstTurn,
           mergedConfig,
           opts.signal,
@@ -654,7 +703,13 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
-        for await (const event of this.model.chatStreamSessionContinue(userMessage, null, mergedConfig, opts.signal)) {
+        for await (const event of this.model.chatStreamSessionContinue(
+          userMessage,
+          null,
+          null,
+          mergedConfig,
+          opts.signal,
+        )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
               sawFinal = true;
@@ -835,6 +890,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.model.resetCaches();
     this.history = [];
     this.lastImagesKey = null;
+    this.lastAudioKey = null;
     this.turnCount = 0;
     this.unresolvedOkToolCallCount = null;
   }
@@ -908,6 +964,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.lastImagesKey = this.computeTrailingImagesKey();
+      this.lastAudioKey = this.computeTrailingAudioKey();
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } finally {
@@ -966,6 +1023,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
           this.lastImagesKey = this.computeTrailingImagesKey();
+          this.lastAudioKey = this.computeTrailingAudioKey();
           this.recordToolCallFanout(finalToolCalls);
         }
       }
@@ -1116,22 +1174,24 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private async runStartPath(
     userMessage: string,
     images: Uint8Array[] | undefined,
+    audio: Uint8Array[] | undefined,
     newImagesKey: string | null,
-    imageChanged: boolean,
+    newAudioKey: string | null,
+    mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
   ): Promise<ChatResult> {
     // Capture pre-state so the restart can be rolled back if the
-    // native call fails. The image-change branch resets caches BEFORE
+    // native call fails. The media-change branch resets caches BEFORE
     // we know whether the new prefill will succeed, so on failure we
-    // also have to drop turnCount + lastImagesKey to force the next
-    // call to re-route through the start path (rather than a delta
-    // continue against wiped caches).
-    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    // also have to drop turnCount + lastImagesKey/lastAudioKey to force
+    // the next call to re-route through the start path (rather than a
+    // delta continue against wiped caches).
+    const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    this.prepareStartPath(imageChanged, isFirstTurn);
-    const userMsg = this.buildUserMessage(userMessage, images);
+    this.prepareStartPath(mediaChanged, isFirstTurn);
+    const userMsg = this.buildUserMessage(userMessage, images, audio);
     this.history.push(userMsg);
     try {
       // Pass a shallow snapshot so later pushes to `this.history`
@@ -1142,18 +1202,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
       this.lastImagesKey = newImagesKey;
+      this.lastAudioKey = newAudioKey;
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } catch (err) {
       // Roll back: drop the tentative user push so history stays
       // consistent with turnCount.
       this.history.length = historyLenBefore;
-      if (wasImageChangeRestart) {
+      if (wasMediaChangeRestart) {
         // Caches were wiped by prepareStartPath() but the new prefill
         // failed. Force the next call to re-route through the start
         // path with the (preserved) prior history.
         this.turnCount = 0;
         this.lastImagesKey = null;
+        this.lastAudioKey = null;
       }
       throw err;
     }
@@ -1163,19 +1225,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private async *runStartStreamPath(
     userMessage: string,
     images: Uint8Array[] | undefined,
+    audio: Uint8Array[] | undefined,
     newImagesKey: string | null,
-    imageChanged: boolean,
+    newAudioKey: string | null,
+    mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ChatStreamEvent> {
     // Capture pre-state so any non-successful exit can roll back.
     // See `runStartPath` for the full rationale.
-    const wasImageChangeRestart = imageChanged && !isFirstTurn;
+    const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    this.prepareStartPath(imageChanged, isFirstTurn);
-    const userMsg = this.buildUserMessage(userMessage, images);
+    this.prepareStartPath(mediaChanged, isFirstTurn);
+    const userMsg = this.buildUserMessage(userMessage, images, audio);
     // Stage the user message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
     // `model.chatStreamSessionStart(history, config)`.
@@ -1214,18 +1278,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
         this.turnCount++;
         this.lastImagesKey = newImagesKey;
+        this.lastAudioKey = newAudioKey;
         this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays
         // consistent with turnCount.
         this.history.length = historyLenBefore;
-        if (wasImageChangeRestart) {
+        if (wasMediaChangeRestart) {
           // Caches were wiped by prepareStartPath() but the new
           // prefill never reached a successful done:true. Force the
           // next call to re-route through the start path with the
           // preserved prior history.
           this.turnCount = 0;
           this.lastImagesKey = null;
+          this.lastAudioKey = null;
         }
       }
     }
@@ -1246,8 +1312,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
-  private prepareStartPath(imageChanged: boolean, isFirstTurn: boolean): void {
-    if (imageChanged && !isFirstTurn) {
+  private prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): void {
+    if (mediaChanged && !isFirstTurn) {
       this.model.resetCaches();
     }
     if (this.history.length === 0 && this.system != null) {
@@ -1255,12 +1321,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
   }
 
-  /** Build a user `ChatMessage` with or without attached images. */
-  private buildUserMessage(userMessage: string, images: Uint8Array[] | undefined): ChatMessage {
-    if (images && images.length > 0) {
-      return { role: 'user', content: userMessage, images };
-    }
-    return { role: 'user', content: userMessage };
+  /** Build a user `ChatMessage` with or without attached images/audio. */
+  private buildUserMessage(
+    userMessage: string,
+    images: Uint8Array[] | undefined,
+    audio: Uint8Array[] | undefined,
+  ): ChatMessage {
+    const msg: ChatMessage = { role: 'user', content: userMessage };
+    if (images && images.length > 0) msg.images = images;
+    if (audio && audio.length > 0) msg.audio = audio;
+    return msg;
   }
 
   /**
@@ -1275,6 +1345,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const msg = this.history[i];
       if (msg?.role === 'user' && msg.images && msg.images.length > 0) {
         return computeImagesKey(msg.images);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Audio counterpart of {@link computeTrailingImagesKey}: walk history
+   * backward to the most recent user message carrying audio and return its
+   * FNV-1a key, so a cold replay hydrates `lastAudioKey` correctly.
+   */
+  private computeTrailingAudioKey(): string | null {
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const msg = this.history[i];
+      if (msg?.role === 'user' && msg.audio && msg.audio.length > 0) {
+        return computeAudioKey(msg.audio);
       }
     }
     return null;

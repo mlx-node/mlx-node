@@ -91,8 +91,12 @@ function makeMockModel() {
     async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('start-reply'),
   );
   const chatSessionContinue = vi.fn(
-    async (_userMessage: string, _images: Uint8Array[] | null, _config?: ChatConfig | null): Promise<ChatResult> =>
-      makeChatResult('continue-reply'),
+    async (
+      _userMessage: string,
+      _images: Uint8Array[] | null,
+      _audio: Uint8Array[] | null,
+      _config?: ChatConfig | null,
+    ): Promise<ChatResult> => makeChatResult('continue-reply'),
   );
   const chatSessionContinueTool = vi.fn(
     async (
@@ -113,6 +117,7 @@ function makeMockModel() {
   const chatStreamSessionContinue = vi.fn(async function* (
     _userMessage: string,
     _images: Uint8Array[] | null,
+    _audio: Uint8Array[] | null,
     _config?: ChatConfig | null,
   ): AsyncGenerator<ChatStreamEvent> {
     yield { text: 'cont', done: false };
@@ -200,11 +205,14 @@ describe('ChatSession', () => {
 
       expect(chatSessionContinue.mock.calls[0][0]).toBe('Second');
       expect(chatSessionContinue.mock.calls[0][1]).toBeNull();
+      // arg[2] is the new audio param; delta continues never carry audio.
+      expect(chatSessionContinue.mock.calls[0][2]).toBeNull();
       expect(chatSessionContinue.mock.calls[1][0]).toBe('Third');
       expect(chatSessionContinue.mock.calls[1][1]).toBeNull();
+      expect(chatSessionContinue.mock.calls[1][2]).toBeNull();
 
       for (const call of chatSessionContinue.mock.calls) {
-        expect(call[2]?.reuseCache).toBe(true);
+        expect(call[3]?.reuseCache).toBe(true);
       }
     });
 
@@ -216,7 +224,7 @@ describe('ChatSession', () => {
       await session.send('Second', { config: { reuseCache: false } });
 
       expect(chatSessionStart.mock.calls[0][1]?.reuseCache).toBe(true);
-      expect(chatSessionContinue.mock.calls[0][2]?.reuseCache).toBe(true);
+      expect(chatSessionContinue.mock.calls[0][3]?.reuseCache).toBe(true);
     });
 
     it('merges defaultConfig and per-call config (per-call wins)', async () => {
