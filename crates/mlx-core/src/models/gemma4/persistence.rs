@@ -888,14 +888,24 @@ fn apply_weights(
                     )
                 })?;
                 let biases = params.get("embed_tokens_per_layer.biases");
-                ple.embed_tokens_per_layer.load_quantized(
+                // Keep the PLE table PACKED (gather-then-dequant only the looked-up
+                // rows in `forward`) instead of pre-dequantizing the whole table into
+                // one ~3.75 GiB dense bf16 buffer. That dense buffer fits big-RAM
+                // hosts but exceeds the Metal per-buffer cap on constrained devices
+                // and OOMs small CI runners; it also bypasses the dense-PLE sharding
+                // guard (which early-returns when `.scales` is present). The PLE is
+                // never tied and never read via `get_weight()` — only `forward()` —
+                // so the packed path is byte-identical here. Mode is guaranteed
+                // affine by the guard above.
+                ple.embed_tokens_per_layer.load_quantized_packed(
                     w,
                     scales,
                     biases,
                     ple_embed_plq.group_size,
                     ple_embed_plq.bits,
+                    "affine",
                 )?;
-                info!("PLE embed_tokens_per_layer loaded (quantized)");
+                info!("PLE embed_tokens_per_layer loaded (quantized, packed)");
             } else if let Some(w) = params.get("embed_tokens_per_layer.weight") {
                 // Dense PLE-embedding fallback — same stripped-quant-group
                 // dtype guard as embed_tokens.
