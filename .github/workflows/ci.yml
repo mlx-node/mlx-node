@@ -5,10 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # `labeled` lets a PR opt into the heavy model-test leg by carrying the
-    # `model-e2e` label; an unrelated label add no-ops (every job gates off
-    # below). GitHub can't filter label events by name at the trigger level.
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 env:
@@ -18,14 +15,10 @@ env:
 jobs:
   build:
     name: Build
-    # Skip only label events that aren't adding `model-e2e`; every push / sync /
-    # reopen / dispatch still builds normally. Keyed on github.event.label.name
-    # (the label that fired THIS event) — not the PR's full label set — so adding
-    # an unrelated label to an already-labeled PR does NOT rebuild. model-test
-    # reuses the artifacts this job uploads — no second native build.
-    if: >-
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'model-e2e'
+    # The PR `model-e2e` label no longer triggers this workflow (see
+    # .github/workflows/model-e2e.yml), so build runs unconditionally on every
+    # push / PR sync / dispatch. The label-triggered e2e run reuses the .node +
+    # metallib artifacts this job uploads — it never rebuilds.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -92,8 +85,6 @@ jobs:
     name: ${{ matrix.test }}
     runs-on: macos-latest
     needs: build
-    # Label events skip the regular suite — it already ran on the PR's push.
-    if: github.event.action != 'labeled'
     strategy:
       fail-fast: false
       matrix:
@@ -165,33 +156,29 @@ jobs:
   # reset/replay determinism, session warm-reuse, greedy MTP==AR). They assert
   # WITHIN a single run, so they need no host-specific golden and stay CI-robust.
   #
-  # Opt-in only (heavy): runs on push to main, manual dispatch, or a PR carrying
-  # the `model-e2e` label. Excluded families:
+  # This copy is the PUSH-to-main / dispatch release-gate path (publish `needs`
+  # it). The PR opt-in path is the mirror job in .github/workflows/model-e2e.yml
+  # (triggered by the `model-e2e` label); KEEP THE MATRIX IN SYNC across both.
+  #
+  # Excluded families on this release-gate copy:
   #   * qwen3_5 MoE — smallest published checkpoint is 35B-A3B (~70GB); there is
   #     no small option, and it would not fit a standard macOS runner's RAM.
-  #   * gemma4 (`google/gemma-4-E2B-it`, HF-gated; CI's HUGGINGFACE_TOKEN has
-  #     access) — bf16 E2B is ~9.6GB on disk, and the paged-vs-flat parity test
-  #     holds a flat AND a paged instance resident at once (measured ~20GB peak
-  #     RSS; one instance alone ~10GB), so it SIGKILL/jetsam OOMs the 7GB standard
-  #     runner. To re-enable: run this leg on a `macos-*-xlarge` (~14GB) runner
-  #     with the parity test restructured to load the two models sequentially
-  #     (drop flat before loading paged), or convert the checkpoint quantized so
-  #     both instances fit. The PLE buffer-cap sharding fix that lets E2B load at
-  #     all is already in place.
+  #   * gemma4 — the QAT (wNa8o8) checkpoint is small enough (~2.9GB, single
+  #     instance) to run, and it IS wired up in model-e2e.yml (PR opt-in). It is
+  #     deliberately kept OFF this push/release gate until CI's HUGGINGFACE_TOKEN
+  #     is confirmed to have access to the gated
+  #     `google/gemma-4-E2B-it-qat-mobile-transformers` repo — otherwise a
+  #     download failure here would block releases. To promote: add the `gemma4`
+  #     leg from model-e2e.yml once it is green on a labeled PR.
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
-    # push-to-main and manual dispatch always run. For PRs: a `labeled` event
-    # runs ONLY when the just-added label is `model-e2e` (github.event.label.name)
-    # — so unrelated label churn on an already-labeled PR is a no-op; a later
-    # `synchronize` keeps re-running while the PR still carries the label
-    # (full-set contains, gated to non-label actions).
+    # Release-gate path: push-to-main + manual dispatch only. PRs opt in via the
+    # `model-e2e` label, which triggers .github/workflows/model-e2e.yml instead
+    # (so labeling never spawns a second full CI run or a redundant native build).
     if: >-
       github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.label.name == 'model-e2e' ||
-      (github.event.action != 'labeled' &&
-       contains(github.event.pull_request.labels.*.name, 'model-e2e'))
+      github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -201,12 +188,14 @@ jobs:
             model: Qwen/Qwen3-0.6B
             slug: qwen3-0.6b
             mtype: ''
+            kind: cargo
             env: MLX_TEST_MODEL_PATH
             tests: --test qwen3_paged_vs_flat_parity
           - name: qwen3_5-dense
             model: Qwen/Qwen3.5-0.8B
             slug: qwen3.5-0.8b
             mtype: qwen3_5
+            kind: cargo
             env: MLX_TEST_MODEL_PATH
             tests: >-
               --test qwen3_5_paged_vs_flat_parity
@@ -217,6 +206,7 @@ jobs:
             model: LiquidAI/LFM2.5-1.2B-Thinking
             slug: lfm2.5-1.2b-thinking
             mtype: lfm2
+            kind: cargo
             env: MLX_TEST_MODEL_PATH MLX_TEST_LFM2_MODEL_PATH
             tests: >-
               --test lfm2_paged_vs_flat_parity
@@ -280,16 +270,21 @@ jobs:
             yarn mlx convert --input "$src" -d bf16 --output "$out"
           fi
           ckpt="$PWD/$out"
-          # Point this family's gating env var(s) at the converted checkpoint so
-          # the #[ignore]'d tests un-skip; `-- --ignored` runs only those.
-          for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
-          cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --nocapture
+          if [ "${{ matrix.kind }}" = "ts" ]; then
+            # TS e2e leg (gemma4 QAT): point the presence gate at the converted
+            # checkpoint and run the single test file through Vitest.
+            yarn build:ts
+            GEMMA4_QAT_MODEL_PATH="$ckpt" yarn test ${{ matrix.tests }}
+          else
+            # cargo leg: point this family's gating env var(s) at the converted
+            # checkpoint so the #[ignore]'d tests un-skip; `-- --ignored` runs only those.
+            for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
+            cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --nocapture
+          fi
 
   lint:
     name: Rust Lint
     runs-on: macos-latest
-    # Label events skip lint — it already ran on the PR's push.
-    if: github.event.action != 'labeled'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -356,9 +351,10 @@ jobs:
       - lint
       - model-test
     # Don't publish a release when the e2e model-test matrix fails. `always()`
-    # keeps publish running when model-test is SKIPPED (non-release PRs without
-    # the `model-e2e` label, where the publish step is a no-op) instead of
-    # cascading the skip onto publish; test + lint must still have succeeded.
+    # keeps publish running when model-test is SKIPPED (on PRs, where model-test
+    # does not run — it is the push/release-gate path; PR e2e lives in
+    # model-e2e.yml) instead of cascading the skip onto publish; test + lint must
+    # still have succeeded.
     if: >-
       always() &&
       needs.test.result == 'success' &&

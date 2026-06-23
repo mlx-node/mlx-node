@@ -1,0 +1,161 @@
+name: model-e2e
+
+# Dedicated, opt-in real-model end-to-end suite for pull requests.
+#
+# Adding the `model-e2e` label to a PR triggers THIS workflow (a `labeled`
+# event), not CI. It reuses the .node + metallib artifacts the PR's existing
+# `CI / Build` run already produced — it never re-runs that native build — so a
+# label add no longer spawns a second full CI pipeline.
+#
+# The matrix mirrors the `model-test` job in .github/workflows/ci.yml (which is
+# the push-to-main / release-gate copy). KEEP THE TWO MATRICES IN SYNC.
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  workflow_dispatch:
+
+concurrency:
+  # Coalesce rapid re-labels / re-dispatches on the same PR.
+  group: model-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 1
+
+jobs:
+  model-test:
+    name: e2e ${{ matrix.name }}
+    # A `labeled` event fires for every label; run only when the added label is
+    # `model-e2e`. Manual dispatch always runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: qwen3
+            model: Qwen/Qwen3-0.6B
+            slug: qwen3-0.6b
+            mtype: ''
+            kind: cargo
+            env: MLX_TEST_MODEL_PATH
+            tests: --test qwen3_paged_vs_flat_parity
+          - name: qwen3_5-dense
+            model: Qwen/Qwen3.5-0.8B
+            slug: qwen3.5-0.8b
+            mtype: qwen3_5
+            kind: cargo
+            env: MLX_TEST_MODEL_PATH
+            tests: >-
+              --test qwen3_5_paged_vs_flat_parity
+              --test qwen3_5_session
+              --test qwen3_5_delta_chat
+              --test p2_paged_thinking_honors_enable
+          - name: lfm2
+            model: LiquidAI/LFM2.5-1.2B-Thinking
+            slug: lfm2.5-1.2b-thinking
+            mtype: lfm2
+            kind: cargo
+            env: MLX_TEST_MODEL_PATH MLX_TEST_LFM2_MODEL_PATH
+            tests: >-
+              --test lfm2_paged_vs_flat_parity
+              --test lfm2_session
+          # gemma4 QAT (wNa8o8): convert the prequantized source and run the
+          # single-instance TS e2e coherence test (text + vision on examples/ocr.png).
+          - name: gemma4
+            model: google/gemma-4-E2B-it-qat-mobile-transformers
+            slug: gemma-4-e2b-qat
+            mtype: gemma4
+            kind: ts
+            env: ''
+            tests: __test__/models/gemma4-qat-e2e.test.ts
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          # Match the commit whose build artifacts we download below.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'yarn'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-apple-darwin
+          cache: false
+          rustflags: ''
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # Reuse the PR's existing native build instead of rebuilding it. Find the
+      # most recent CI run for this exact commit and pull its addon + metallib.
+      - name: Reuse CI build artifacts (no native rebuild)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass through env (not inline ${{ }}) — branch names are untrusted.
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "Locating a CI build for $SHA on $BRANCH"
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch "$BRANCH" --limit 40 \
+            --json databaseId,headSha \
+            --jq "[.[] | select(.headSha == \"$SHA\")][0].databaseId")"
+          if [ -z "${run_id:-}" ] || [ "$run_id" = "null" ]; then
+            echo "::error::No CI run found for $sha. Let CI finish (or push a commit), then re-add the model-e2e label."
+            exit 1
+          fi
+          echo "Downloading mlx-node + mlx-metallib from CI run $run_id"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            -n mlx-node -n mlx-metallib -D packages/core/
+
+      - name: Download + convert ${{ matrix.name }} checkpoint and run its tests
+        env:
+          RUST_BACKTRACE: 1
+          CARGO_INCREMENTAL: 1
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          set -euo pipefail
+          src=".cache/models/${{ matrix.slug }}"
+          out=".cache/models/${{ matrix.slug }}-mlx-bf16"
+          yarn mlx download model -m "${{ matrix.model }}" --output "$src"
+          if [ -n "${{ matrix.mtype }}" ]; then
+            yarn mlx convert --input "$src" -d bf16 -m "${{ matrix.mtype }}" --output "$out"
+          else
+            yarn mlx convert --input "$src" -d bf16 --output "$out"
+          fi
+          ckpt="$PWD/$out"
+          if [ "${{ matrix.kind }}" = "ts" ]; then
+            # TS e2e leg (gemma4 QAT): point the presence gate at the converted
+            # checkpoint and run the single test file through Vitest.
+            yarn build:ts
+            GEMMA4_QAT_MODEL_PATH="$ckpt" yarn test ${{ matrix.tests }}
+          else
+            # cargo leg: point this family's gating env var(s) at the converted
+            # checkpoint so the #[ignore]'d tests un-skip; `-- --ignored` runs only those.
+            for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
+            cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --nocapture
+          fi
