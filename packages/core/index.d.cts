@@ -1109,10 +1109,19 @@ export declare class QianfanOCRModel {
    * model backends. Qianfan-OCR is a VLM but the continue path cannot
    * splice new vision features into a live KV cache — image changes
    * always require a fresh session start.
+   *
+   * `audio` exists only to keep this method's positional ABI aligned
+   * with the shared chat surface every other family exposes (the
+   * `chat_napi_surface!` macro inserts `audio` between `images` and
+   * `config`). Qianfan-OCR has no audio support, so a non-empty
+   * `audio` is rejected at the boundary with the shared no-audio
+   * error; `None` / empty is a complete no-op and audio is never
+   * threaded into the model thread.
    */
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1144,10 +1153,18 @@ export declare class QianfanOCRModel {
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
-  /** Streaming variant of `chatSessionContinue`. */
+  /**
+   * Streaming variant of `chatSessionContinue`.
+   *
+   * `audio` mirrors the non-streaming entry point: it exists only to
+   * keep the positional ABI aligned with the shared chat surface, and
+   * a non-empty value is rejected at the boundary with the shared
+   * no-audio error. `None` / empty is a complete no-op.
+   */
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;

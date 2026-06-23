@@ -227,6 +227,66 @@ describe('ChatSession', () => {
       expect(chatSessionContinue.mock.calls[0][3]?.reuseCache).toBe(true);
     });
 
+    // Regression guard for the Phase 3b audio-surface ABI shift. The
+    // shared chat surface inserts an `audio` positional argument between
+    // `images` and `config`. A QianfanOCR-shaped model (handwritten NAPI
+    // methods, not the `chat_napi_surface!` macro) must carry the SAME
+    // positional ABI as the macro families, or the delta path would push
+    // the caller's `config` into the audio slot and silently drop it. We
+    // model the native binding as a positional recorder (it only knows
+    // arguments by index) and assert `config` lands in slot 3, never the
+    // audio slot.
+    it('delivers (userMessage, images, audio, config) to a Qianfan-shaped continue without dropping config', async () => {
+      const continueArgs: unknown[][] = [];
+      const qianfanShaped: SessionCapableModel = {
+        chatSessionStart: vi.fn(
+          async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+            makeChatResult('start-reply'),
+        ),
+        // Positional recorder: a native NAPI binding sees its arguments by
+        // index only, so capturing `arguments` here detects any slot shift.
+        chatSessionContinue: vi.fn(async function (this: unknown, ...args: unknown[]): Promise<ChatResult> {
+          continueArgs.push(args);
+          return makeChatResult('continue-reply');
+        }) as unknown as SessionCapableModel['chatSessionContinue'],
+        chatSessionContinueTool: vi.fn(
+          async (): Promise<ChatResult> => makeChatResult('tool-reply'),
+        ) as unknown as SessionCapableModel['chatSessionContinueTool'],
+        chatStreamSessionStart: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('start-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionStart'],
+        chatStreamSessionContinue: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('cont-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionContinue'],
+        chatStreamSessionContinueTool: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+          yield finalChunk('tool-reply');
+        }) as unknown as SessionCapableModel['chatStreamSessionContinueTool'],
+        resetCaches: vi.fn(() => undefined),
+      };
+
+      const session = new ChatSession(qianfanShaped, {
+        defaultConfig: { maxNewTokens: 7 },
+      });
+
+      // Turn 0 routes through start; turn 1 takes the cheap delta path.
+      await session.send('First');
+      await session.send('Second');
+
+      expect(continueArgs).toHaveLength(1);
+      const [userMessage, images, audio, config] = continueArgs[0];
+      expect(userMessage).toBe('Second');
+      expect(images).toBeNull();
+      // audio MUST be the third positional argument and null on a delta —
+      // if the ABI were the pre-fix shape, `config` would land here.
+      expect(audio).toBeNull();
+      // config MUST land in slot 3, fully intact (not shifted into audio).
+      expect(config).toBeDefined();
+      expect((config as ChatConfig | undefined)?.maxNewTokens).toBe(7);
+      expect((config as ChatConfig | undefined)?.reuseCache).toBe(true);
+      // No stray fifth positional argument.
+      expect(continueArgs[0]).toHaveLength(4);
+    });
+
     it('merges defaultConfig and per-call config (per-call wins)', async () => {
       const { model, chatSessionStart } = makeMockModel();
       const session = new ChatSession(model, {

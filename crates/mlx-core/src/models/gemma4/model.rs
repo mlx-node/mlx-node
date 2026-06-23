@@ -7293,6 +7293,75 @@ mod tests {
         }
     }
 
+    /// Contract: a text delta after an AUDIO turn must be rejected by
+    /// `text_delta_image_guard` with the `IMAGE_CHANGE_RESTART_PREFIX`,
+    /// exactly like a text delta after an IMAGE turn. Gemma4 sessions are
+    /// single-shot for media: once the cache holds expanded image / audio
+    /// tokens, a cheap text-only delta on top would prefill against
+    /// positions the history bookkeeping does not model, so both branches
+    /// route the TS `ChatSession` back through a fresh start. This locks
+    /// the existing behaviour; it is NOT a behaviour change.
+    ///
+    /// Constructs a `Gemma4Inner` (needs Metal — gracefully skips on a
+    /// no-Metal sandbox) and drives the guard directly by toggling the
+    /// cached media keys.
+    #[test]
+    fn test_text_delta_after_audio_turn_rejected_like_image_turn() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Clean session: no media held, guard passes (None).
+        inner.cached_image_key = None;
+        inner.cached_audio_key = None;
+        assert!(
+            inner
+                .text_delta_image_guard("chat_session_continue")
+                .is_none(),
+            "clean session must not reject a text delta"
+        );
+
+        // Image turn held: text delta rejected with the restart prefix.
+        inner.cached_image_key = Some(42);
+        inner.cached_audio_key = None;
+        let image_reject = inner
+            .text_delta_image_guard("chat_session_continue")
+            .expect("text delta after image turn must reject");
+        assert!(
+            image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "image-turn rejection must carry the restart prefix, got: {image_reject}"
+        );
+        assert!(
+            image_reject.contains("image state"),
+            "image-turn rejection must mention image state, got: {image_reject}"
+        );
+
+        // Audio turn held (no image): the audio branch must reject the SAME
+        // way as the image branch — same restart prefix, single-shot media.
+        inner.cached_image_key = None;
+        inner.cached_audio_key = Some(7);
+        let audio_reject = inner
+            .text_delta_image_guard("chat_session_continue")
+            .expect("text delta after audio turn must reject");
+        assert!(
+            audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "audio-turn rejection must carry the restart prefix, got: {audio_reject}"
+        );
+        assert!(
+            audio_reject.contains("audio state"),
+            "audio-turn rejection must mention audio state, got: {audio_reject}"
+        );
+    }
+
     /// All-global config: every layer must route through `GlobalPaged`
     /// with paged_idx == absolute index, no shared layers.
     #[test]
