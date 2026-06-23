@@ -530,6 +530,51 @@ fn validate_required_weights(
         ));
     }
 
+    // Unified encoder-free vision embedder. When the checkpoint declares a
+    // unified vision config, the loader (`apply_unified_vision_embedder_weights`
+    // + `apply_embed_vision_projection`) installs each tensor only `if let
+    // Some(...)`, so a missing key silently keeps the constructor default
+    // (pos_embedding stays mx.zeros, LayerNorms/Linear stay constructor-init).
+    // That loads "successfully" with random/zero vision weights → coherent-looking
+    // but image-WRONG output. Fail closed here, on the same load path that already
+    // validates the text weights, before any apply runs.
+    //
+    // The real `gemma-4-12b-it` checkpoint ships patch_dense and all three
+    // LayerNorms (patch_ln1/patch_ln2/pos_norm) with BOTH `.weight` and `.bias`,
+    // plus a single `vision_embedder.pos_embedding` tensor.
+    if config.unified_vision_config.is_some() {
+        let vision_keys = [
+            "vision_embedder.patch_ln1.weight",
+            "vision_embedder.patch_ln1.bias",
+            "vision_embedder.patch_ln2.weight",
+            "vision_embedder.patch_ln2.bias",
+            "vision_embedder.pos_norm.weight",
+            "vision_embedder.pos_norm.bias",
+            "vision_embedder.patch_dense.weight",
+            "vision_embedder.patch_dense.bias",
+            "vision_embedder.pos_embedding",
+        ];
+        for key in &vision_keys {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // embed_vision.embedding_projection: a dense group ships `.weight`; an
+        // affine-quantized group ships `.weight` (packed) + `.scales`. Either
+        // way the `.weight` key must be present — a scales-only group (stripped
+        // `.weight`) would otherwise load as constructor-random weights, like
+        // the lm_head check above.
+        if !has("embed_vision.embedding_projection.weight") {
+            return Err(Error::from_reason(
+                "Missing required weight: embed_vision.embedding_projection.weight",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -2799,5 +2844,143 @@ mod tests {
         );
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
+    }
+
+    /// Unified vision loader must fail closed. The encoder-free vision path
+    /// (`apply_unified_vision_embedder_weights` + `apply_embed_vision_projection`)
+    /// installs each tensor only `if let Some(...)`, so a missing key silently
+    /// keeps the constructor default (pos_embedding stays mx.zeros, LayerNorms
+    /// stay constructor-init) → a truncated shard loads "successfully" with
+    /// random/zero vision weights. When `unified_vision_config` is populated,
+    /// `validate_required_weights` must reject a params map that is missing any
+    /// required `vision_embedder.*` / `embed_vision.embedding_projection.weight`
+    /// key, naming the missing key (matching the bias requirement the real
+    /// `gemma-4-12b-it` checkpoint ships: patch_dense + all 3 LayerNorms carry
+    /// both `.weight` and `.bias`).
+    #[test]
+    fn validate_required_weights_unified_vision_fails_closed() {
+        // Minimal text config PLUS a unified_vision_config sub-dict so the
+        // vision branch in validate_required_weights is exercised.
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "unified_vision_config": {
+                "model_patch_size": 48,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "num_soft_tokens": 280,
+                "output_proj_dims": 3840,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "rms_norm_eps": 1e-6
+            }
+        }))
+        .expect("unified-vision Gemma4Config");
+        assert!(
+            config.unified_vision_config.is_some(),
+            "test config must populate unified_vision_config"
+        );
+
+        // The validator only checks key presence, so a 1-element dummy works.
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+
+        // The full required key set: all text keys plus every required unified
+        // vision key.
+        let full = || -> HashMap<String, MxArray> {
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            for key in [
+                // Text weights (already validated by the text path).
+                "embed_tokens.weight",
+                "norm.weight",
+                "lm_head.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+                // Unified vision weights — patch_dense + all 3 LayerNorms carry
+                // BOTH weight and bias in the real checkpoint.
+                "vision_embedder.patch_ln1.weight",
+                "vision_embedder.patch_ln1.bias",
+                "vision_embedder.patch_ln2.weight",
+                "vision_embedder.patch_ln2.bias",
+                "vision_embedder.pos_norm.weight",
+                "vision_embedder.pos_norm.bias",
+                "vision_embedder.patch_dense.weight",
+                "vision_embedder.patch_dense.bias",
+                "vision_embedder.pos_embedding",
+                "embed_vision.embedding_projection.weight",
+            ] {
+                p.insert(key.to_string(), dummy());
+            }
+            p
+        };
+
+        // Happy path: the complete set (text + unified vision) validates.
+        validate_required_weights(&full(), &config)
+            .expect("complete unified-vision key set must validate");
+
+        // Negative: each required unified vision key, when absent, must fail
+        // validation with an error that names the missing key (the documented
+        // example, pos_embedding, included).
+        for missing in [
+            "vision_embedder.pos_embedding",
+            "vision_embedder.patch_ln1.weight",
+            "vision_embedder.patch_ln1.bias",
+            "vision_embedder.patch_ln2.weight",
+            "vision_embedder.patch_ln2.bias",
+            "vision_embedder.pos_norm.weight",
+            "vision_embedder.pos_norm.bias",
+            "vision_embedder.patch_dense.weight",
+            "vision_embedder.patch_dense.bias",
+            "embed_vision.embedding_projection.weight",
+        ] {
+            let mut p = full();
+            p.remove(missing);
+            let err = validate_required_weights(&p, &config).unwrap_err();
+            assert!(
+                format!("{err}").contains(missing),
+                "missing unified vision key '{missing}' must fail closed and name the key, got: {err}"
+            );
+        }
+
+        // A plain text config (no unified_vision_config) must NOT require any
+        // vision key — the unified gate must not leak into the text path.
+        let text_only: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+        }))
+        .expect("text-only Gemma4Config");
+        assert!(text_only.unified_vision_config.is_none());
+        let mut p = full();
+        // Strip every vision key — a text-only model still validates.
+        p.retain(|k, _| !k.starts_with("vision_embedder.") && !k.starts_with("embed_vision."));
+        validate_required_weights(&p, &text_only)
+            .expect("text-only config must not require unified vision keys");
     }
 }
