@@ -1941,6 +1941,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 .to_string(),
         ));
     }
+    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
+    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
+    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
+    if is_gemma_prequantized {
+        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
+    }
 
     // Load tensors - handle both single file and sharded models
     let tensors: HashMap<String, MxArray>;

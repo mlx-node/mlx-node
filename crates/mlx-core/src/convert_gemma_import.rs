@@ -60,6 +60,59 @@ const PLE_GROUP_SIZE: usize = 128;
 /// Width of a source scale block in the PLE embedding (`8960 / 35 = 256`).
 const PLE_SRC_GROUP_SIZE: usize = 256;
 
+/// The Gemma 4 **E2B** QAT (wNa8o8) per-module bit schedule this importer is
+/// hardcoded for, keyed by the source `quantization_config.module_quant_configs`
+/// regex (language + `lm_head` modules only — audio is dropped; vision and the
+/// I8 per-layer gates are routed by source dtype, not by this schedule). The
+/// importer derives nothing from the checkpoint, so it can only repack a source
+/// that declares exactly this schedule; any other gemma4 QAT variant ships a
+/// different `module_quant_configs` (e.g. a different MLP bit-width boundary)
+/// and would be silently mis-repacked.
+const E2B_QAT_LANGUAGE_SCHEDULE: &[(&str, u64)] = &[
+    ("^lm_head$", 2),
+    (r"language_model\.embed_tokens$", 2),
+    (r"language_model\.embed_tokens_per_layer$", 4),
+    (r"language_model\.layers\.(\d|1[0-4])\.mlp\.", 4),
+    (r"language_model\.layers\.\d+\.mlp\.", 2),
+    (r"language_model\.layers\.\d+\.self_attn\.", 4),
+];
+
+/// Reject any gemma4 QAT checkpoint whose declared per-module bit schedule does
+/// not match the E2B layout `import_gemma_prequantized` hardcodes. The detection
+/// gate in `convert.rs` (`model_type == "gemma4" && quant_method == "gemma"`) is
+/// intentionally broad, so this is the narrowing guard: it turns a wrong-variant
+/// import into a clear error up front instead of a downstream shape-assert abort
+/// or a silent wrong-bit repack.
+pub(crate) fn validate_e2b_qat_schedule(config: &serde_json::Value) -> Result<()> {
+    let map = config
+        .get("quantization_config")
+        .and_then(|qc| qc.get("module_quant_configs"))
+        .and_then(|m| m.as_object())
+        .ok_or_else(|| {
+            Error::from_reason(
+                "gemma-QAT import: config.quantization_config.module_quant_configs is missing; \
+                 only the Gemma 4 E2B QAT (mobile-transformers) checkpoint is supported"
+                    .to_string(),
+            )
+        })?;
+    for (regex, expected_bits) in E2B_QAT_LANGUAGE_SCHEDULE {
+        let got = map
+            .get(*regex)
+            .and_then(|v| v.get("num_bits"))
+            .and_then(|b| b.as_u64());
+        if got != Some(*expected_bits) {
+            return Err(Error::from_reason(format!(
+                "gemma-QAT import: unsupported checkpoint. This importer only supports the \
+                 Gemma 4 E2B QAT (mobile-transformers) schedule, which declares module \
+                 `{regex}` = {expected_bits}-bit, but the source declares num_bits={got:?}. \
+                 Other gemma4 QAT variants (e.g. a different depth / bit schedule) would be \
+                 mis-repacked and are not supported."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Strip the HF wrapper prefix the same way `Gemma4Recipe::sanitize` does,
 /// returning the bare module key.
 fn strip_hf_prefix(key: &str) -> &str {
@@ -491,6 +544,73 @@ pub(crate) fn import_gemma_prequantized(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn validate_e2b_qat_schedule_accepts_e2b() {
+        // The exact E2B mobile-transformers language module_quant_configs.
+        let config = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.per_layer_input_gate$": { "num_bits": 8 },
+                    "vision_tower": { "num_bits": 8 }
+                }
+            }
+        });
+        assert!(validate_e2b_qat_schedule(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_e2b_qat_schedule_rejects_wrong_mlp_boundary() {
+        // E4B-like: a different MLP 4-bit boundary (\d|1[0-9]) means the E2B
+        // (\d|1[0-4]) key is absent, so the importer's hardcoded `layer <= 14`
+        // schedule would be wrong. Must be rejected, not silently mis-repacked.
+        let config = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-9])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                }
+            }
+        });
+        assert!(validate_e2b_qat_schedule(&config).is_err());
+    }
+
+    #[test]
+    fn validate_e2b_qat_schedule_rejects_wrong_bits() {
+        // Right keys, wrong bit width (lm_head 4-bit instead of 2-bit).
+        let config = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 4 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                }
+            }
+        });
+        assert!(validate_e2b_qat_schedule(&config).is_err());
+    }
+
+    #[test]
+    fn validate_e2b_qat_schedule_rejects_missing_map() {
+        let config = serde_json::json!({ "quantization_config": { "quant_method": "gemma" } });
+        assert!(validate_e2b_qat_schedule(&config).is_err());
+    }
 
     /// Byte-pack a row of `q_signed` the way Google does (low bits first).
     fn google_byte_pack(q_signed: &[i32], bits: u32) -> Vec<u8> {
