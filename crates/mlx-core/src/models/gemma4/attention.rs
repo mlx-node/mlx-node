@@ -468,7 +468,6 @@ impl Gemma4Attention {
     /// Output: `[1, seq_len, hidden_size]` so the decoder layer's
     /// `apply_ffn_ple_scalar` tail can consume it unchanged.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
         x: &MxArray,

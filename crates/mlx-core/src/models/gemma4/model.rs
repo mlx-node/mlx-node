@@ -3377,6 +3377,18 @@ impl Gemma4Inner {
             None
         };
         let overlay_active = overlay_full_type_ids.is_some();
+        // The overlay only reaches GlobalPaged/Sliding layers. KV-shared layers
+        // (SharedOnGlobal/SharedOnSliding) run forward_paged_shared, which takes
+        // no mask and would silently stay causal — a half-applied overlay across
+        // the stack. The 12B unified checkpoint has num_kv_shared_layers==0, so
+        // this never fires; fail loudly rather than corrupt attention if a shared
+        // unified checkpoint is ever loaded.
+        if overlay_active && self.config.num_kv_shared_layers.is_some_and(|n| n > 0) {
+            return Err(Error::from_reason(
+                "Gemma4 unified-vision bidirectional overlay is unsupported with KV-shared layers \
+                 (num_kv_shared_layers > 0): forward_paged_shared does not carry the overlay mask",
+            ));
+        }
 
         // Pass 1: tokens [0..prompt_len-1] in bounded chunks. Pass 2: the
         // FINAL token, run with cached_prefix_len_for_chunk > 0 so global
