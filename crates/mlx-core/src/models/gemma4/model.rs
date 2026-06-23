@@ -407,6 +407,15 @@ pub(crate) struct Gemma4Inner {
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
+    /// True only while a media (audio / non-unified image) turn left its
+    /// global paged KV live AND a sliding history checkpoint remembered at the
+    /// full kept-live prefix, so a follow-up text delta can warm-continue on
+    /// the live media KV causally. Set exclusively by
+    /// `finalize_vision_turn_media_state` on the continuable branch; reset to
+    /// `false` at every non-continuable point (`clear_reuse_state`, both vision
+    /// prefill-start blocks, the non-continuable finalize). When `false`, the
+    /// `text_delta_image_guard` rejects a media-session delta as today.
+    media_session_continuable: bool,
     pub(crate) model_id: u64,
 }
 
@@ -984,6 +993,7 @@ impl Gemma4Inner {
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
+            media_session_continuable: false,
             model_id,
         })
     }
@@ -1054,6 +1064,9 @@ impl Gemma4Inner {
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
+        // Covers both reset paths (init_caches_sync + reset_caches_sync): a
+        // session that just dropped its media KV can no longer warm-continue.
+        self.media_session_continuable = false;
     }
 
     fn find_gemma4_sliding_history_checkpoint(
@@ -1893,6 +1906,160 @@ impl Gemma4Inner {
         ))
     }
 
+    /// Terminal media-state finalize shared by both vision cores (sync +
+    /// stream), so the two stay byte-identical. Resolves the session into
+    /// exactly ONE of two states, never partial:
+    ///
+    /// - **Continuable** (only when `no_overlay_continuable` — i.e. AUDIO or
+    ///   NON-UNIFIED image, no bidirectional overlay — AND `reuse_cache`): the
+    ///   global paged KV is kept live (`finalize_turn_keep_live_per_block`,
+    ///   registering the full blocks for content-addressed reuse) and the marker
+    ///   is set so `text_delta_image_guard` lets the next text delta through. The
+    ///   delta then restores the prefix the SAME way a TEXT warm-continue does:
+    ///   it REPLAYS (re-walks) the matched prefix over the live global KV
+    ///   (`state="replay"`, `continued_live=true`). Mirrors the qwen3_5_moe
+    ///   two-state finalize. We also attempt the sliding history checkpoint as a
+    ///   fast-path, but continuation does NOT depend on it storing — see below.
+    /// - **Non-continuable** (overlay/unified-image, `reuse_cache=false`, or a
+    ///   keep-live failure): today's behavior — `release_request` only, keep
+    ///   history + media keys live so the guard is reachable and REJECTS (marker
+    ///   stays false). The vision core does NOT `reset_caches_sync` here, unlike
+    ///   the text/MoE path.
+    ///
+    /// ## Why the sliding checkpoint is best-effort (the KV-shared reality)
+    /// `gemma4_sliding_caches_ready_at` requires EVERY `is_sliding_layer` flat
+    /// cache populated. On KV-shared checkpoints (e2b: `SharedOnSliding` layers
+    /// physically store no flat K/V — they read the anchor's), that is never
+    /// satisfiable, so the checkpoint is a structural no-op (`stored == false`)
+    /// for BOTH text and vision turns. A TEXT warm-continue already tolerates
+    /// this: `save_paged_history` discards the store trace and the next turn
+    /// restores via replay. So the vision finalize arms the marker on keep-live
+    /// success regardless of `stored`; an earlier draft hard-downgraded on
+    /// `stored == false`, which wrongly made every KV-shared media session
+    /// single-shot. On NON-shared checkpoints the checkpoint stores and the next
+    /// delta takes the faster checkpoint restore instead of replay.
+    ///
+    /// ## R1 sliding-offset reconciliation (the length-finish materialize)
+    /// The vision decode loop never forwards the final sampled token, so after
+    /// the loop the live (non-shared) sliding caches AND the global paged KV sit
+    /// at offset `prefill_len + G - 1`. The drop-last history rule yields
+    /// `cached_token_history.len() == prefill_len + G - 1` on
+    /// stop/repetition/cancelled (offsets MATCH) but `prefill_len + G` on a
+    /// `"length"` finish (one short). On the continuable+`"length"` path we
+    /// forward that final token once via `run_paged_decode_step` — exactly what
+    /// the text path's `materialize_final` does (`paged_turn.rs` length gate →
+    /// `Gemma4PagedDecode::materialize_final` → `run_paged_decode_step`) —
+    /// advancing both caches to `prefill_len + G` so the kept-live global KV
+    /// content-addresses against the saved history for the next delta's replay
+    /// restore. (Verified byte-exact by the non-unified-image warm==cold golden.)
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_vision_turn_media_state(
+        &mut self,
+        expanded_tokens: &[u32],
+        generated_tokens: &[u32],
+        finish_reason: &str,
+        new_image_key: Option<u64>,
+        new_audio_key: Option<u64>,
+        no_overlay_continuable: bool,
+        reuse_cache: bool,
+    ) -> Result<()> {
+        let continuable_eligible = reuse_cache && no_overlay_continuable;
+        let is_length = finish_reason == "length";
+
+        // Drop-last history (mirrors the non-continuable save the vision cores
+        // do today and the text path's `save_paged_history`): keep all tokens on
+        // a `"length"` finish, otherwise drop the terminal token.
+        let history_tokens: &[u32] = if !is_length && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            generated_tokens
+        };
+        let mut full_history = Vec::with_capacity(expanded_tokens.len() + history_tokens.len());
+        full_history.extend_from_slice(expanded_tokens);
+        full_history.extend_from_slice(history_tokens);
+
+        if continuable_eligible {
+            // R1: align the sliding caches with the keep-all history before any
+            // checkpoint. On a `"length"` finish the loop left the final token
+            // unforwarded (offset == history.len() - 1); forward it now so both
+            // the global paged KV and the sliding caches reach history.len().
+            if is_length && let Some(&last_token) = generated_tokens.last() {
+                // Forwards the token through the paged adapter + sliding caches.
+                // A failure here aborts the turn before any state is published
+                // (the request is still live; the caller's Err path releases it).
+                let _logits = self.run_paged_decode_step(last_token)?;
+            }
+
+            let keep_live_ok = match self.paged_adapter.as_mut() {
+                Some(adapter) => {
+                    let total = adapter.request_tokens().len();
+                    let bs = adapter.block_size();
+                    let extra = engine::build_paged_extra_keys(total, bs, &[]);
+                    adapter.finalize_turn_keep_live_per_block(&extra, 0).is_ok()
+                }
+                None => false,
+            };
+
+            if keep_live_ok {
+                // Publish history FIRST: the checkpoint reads its length, and
+                // the next delta's prefix restore matches against it.
+                self.cached_token_history = full_history;
+                self.cached_image_key = new_image_key;
+                self.cached_audio_key = new_audio_key;
+                // Try to store the sliding history checkpoint (the fast-path
+                // restore). On KV-shared models (e2b: SharedOnSliding layers
+                // never physically store flat K/V) this is a structural no-op
+                // and `stored == false` — EXACTLY as for a TEXT warm-continue on
+                // the same checkpoint (`save_paged_history` discards the trace).
+                // The next delta then restores via REPLAY: it re-walks the
+                // matched prefix over the live (content-addressed) global KV
+                // (`state="replay"`, `continued_live=true`), which is correct,
+                // just not free. So continuation does NOT depend on the
+                // checkpoint storing — only on the global KV being kept live.
+                let history_for_ckpt = self.cached_token_history.clone();
+                let _stored = self
+                    .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt)
+                    .map(|trace| trace.stored)
+                    .unwrap_or(false);
+                self.media_session_continuable = true;
+                return Ok(());
+            }
+            // keep-live failed: fall through to the non-continuable teardown.
+        }
+
+        // Non-continuable: release the global KV but keep history + media keys so
+        // a follow-up text delta reaches `text_delta_image_guard`, which rejects
+        // it (marker is false). Matches the vision core's prior behavior.
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            let _ = adapter.release_request();
+        }
+        self.cached_token_history = full_history;
+        self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
+        self.media_session_continuable = false;
+        Ok(())
+    }
+
+    /// Compute the Phase-2 no-overlay continuable gate from the expanded prompt
+    /// and config, recomputed the same way `run_paged_vlm_prefill` derives the
+    /// overlay (so the two cannot drift). Continuable when the turn is purely
+    /// causal media: AUDIO, or a NON-UNIFIED image — never when the unified
+    /// bidirectional vision overlay is active.
+    fn gemma4_no_overlay_continuable(&self, expanded_tokens: &[u32]) -> bool {
+        let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
+        let has_image = expanded_tokens.contains(&image_token_id);
+        let has_audio = expanded_tokens.contains(&audio_token_id);
+        let overlay_active = super::vision_mask::vision_overlay_active(
+            self.config.is_unified,
+            self.config.use_bidirectional_attention.as_deref() == Some("vision"),
+            has_image,
+            has_audio,
+            expanded_tokens.len(),
+        );
+        !overlay_active && (has_audio || (has_image && !self.config.is_unified))
+    }
+
     /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
     /// non-streaming.
     ///
@@ -1973,6 +2140,8 @@ impl Gemma4Inner {
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
+        // A new media set starts non-continuable; the finalize re-arms it.
+        self.media_session_continuable = false;
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
@@ -2035,13 +2204,11 @@ impl Gemma4Inner {
             Ok((generated_tokens, finish_reason))
         })();
 
+        // The Ok branch does NOT release the request here — the media-state
+        // finalize decides between keep-live (continuable) and release
+        // (non-continuable). The Err branch still releases fully.
         let (generated_tokens, finish_reason) = match forward_result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                t
-            }
+            Ok(t) => t,
             Err(e) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let _ = adapter.release_request();
@@ -2054,23 +2221,28 @@ impl Gemma4Inner {
 
         let raw_text = tokenizer.decode_sync(&generated_tokens, false)?;
 
-        // Image turns are single-shot; the paged request is released above and
-        // no warm prefix survives. Save a non-empty history (prompt plus the
-        // generated tokens, dropping the last when the turn ended on a
-        // terminator) so `has_live_session()` stays true and a follow-up text
-        // delta reaches `text_delta_image_guard`, which rejects it because the
-        // session holds image state. Mirrors the flat vision core.
-        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
-            &generated_tokens[..generated_tokens.len() - 1]
-        } else {
-            &generated_tokens[..]
-        };
-        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
-        new_history.extend(tokens.iter().copied());
-        new_history.extend_from_slice(history_tokens);
-        self.cached_token_history = new_history;
-        self.cached_image_key = new_image_key;
-        self.cached_audio_key = new_audio_key;
+        // Two-state media finalize: keep the global paged KV live + remember a
+        // sliding history checkpoint when this is a pure-causal media turn
+        // (audio / non-unified image) under reuse, so a follow-up text delta
+        // warm-continues; otherwise release + keep history/keys so the guard
+        // rejects (single-shot, as today). A finalize Err means the live
+        // request must be released before returning.
+        let no_overlay_continuable = self.gemma4_no_overlay_continuable(&tokens);
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        if let Err(e) = self.finalize_vision_turn_media_state(
+            &tokens,
+            &generated_tokens,
+            &finish_reason,
+            new_image_key,
+            new_audio_key,
+            no_overlay_continuable,
+            reuse_cache,
+        ) {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(e);
+        }
 
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
@@ -2195,6 +2367,8 @@ impl Gemma4Inner {
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
+        // A new media set starts non-continuable; the finalize re-arms it.
+        self.media_session_continuable = false;
 
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
@@ -2275,13 +2449,11 @@ impl Gemma4Inner {
             Ok((generated_tokens, finish_reason))
         })();
 
+        // The Ok branch does NOT release the request here — the media-state
+        // finalize decides between keep-live (continuable) and release
+        // (non-continuable). The Err branch still releases fully.
         let (generated_tokens, finish_reason) = match forward_result {
-            Ok(t) => {
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
-                }
-                t
-            }
+            Ok(t) => t,
             Err(e) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let _ = adapter.release_request();
@@ -2306,22 +2478,25 @@ impl Gemma4Inner {
         }
         stream_dispatch.finish(&cb);
 
-        // Save a non-empty history (prompt plus the generated tokens, dropping
-        // the last when the turn ended on a terminator) so `has_live_session()`
-        // stays true and a follow-up text delta reaches `text_delta_image_guard`,
-        // which rejects it because the session holds image state. Mirrors the
-        // flat vision core.
-        let history_tokens: &[u32] = if finish_reason != "length" && !generated_tokens.is_empty() {
-            &generated_tokens[..generated_tokens.len() - 1]
-        } else {
-            &generated_tokens[..]
-        };
-        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
-        new_history.extend(tokens.iter().copied());
-        new_history.extend_from_slice(history_tokens);
-        self.cached_token_history = new_history;
-        self.cached_image_key = new_image_key;
-        self.cached_audio_key = new_audio_key;
+        // Two-state media finalize (identical to the sync core via the shared
+        // helper): keep-live + sliding checkpoint for a continuable pure-causal
+        // media turn, else release + keep history/keys so the guard rejects.
+        let no_overlay_continuable = self.gemma4_no_overlay_continuable(&tokens);
+        let reuse_cache = config.reuse_cache.unwrap_or(true);
+        if let Err(e) = self.finalize_vision_turn_media_state(
+            &tokens,
+            &generated_tokens,
+            &finish_reason,
+            new_image_key,
+            new_audio_key,
+            no_overlay_continuable,
+            reuse_cache,
+        ) {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
+                let _ = adapter.release_request();
+            }
+            return Err(e);
+        }
 
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
@@ -4806,10 +4981,12 @@ impl ChatBackend for Gemma4Inner {
             return 0;
         }
         // Text-only prefix reuse: force a miss whenever the cached
-        // session holds image state. This keeps prefix reuse strictly
-        // aligned with text-only sessions and sidesteps the image-key
-        // coordination the Qwen3.5 shared helper handles.
-        if self.cached_image_key.is_some() {
+        // session holds image state UNLESS the media turn is continuable
+        // (kept-live + sliding checkpoint at the full prefix). This keeps
+        // prefix reuse strictly aligned with text-only sessions and sidesteps
+        // the image-key coordination the Qwen3.5 shared helper handles, while
+        // letting a continuable media session reuse an exactly-cached prefix.
+        if self.cached_image_key.is_some() && !self.media_session_continuable {
             return 0;
         }
         // The live KV caches must exist — `cached_token_history` can
@@ -5042,6 +5219,13 @@ impl ChatBackend for Gemma4Inner {
     /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
     /// state"`.
     fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
+        // Warm-continue: a continuable media turn (audio / non-unified image)
+        // kept its global paged KV live + a sliding history checkpoint at the
+        // full prefix, so a text delta restores causally on the live media KV.
+        // The marker — not the raw media key — governs the guard.
+        if self.media_session_continuable {
+            return None;
+        }
         if self.cached_image_key.is_some() {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds image state",
@@ -7293,18 +7477,20 @@ mod tests {
         }
     }
 
-    /// Contract: a text delta after an AUDIO turn must be rejected by
-    /// `text_delta_image_guard` with the `IMAGE_CHANGE_RESTART_PREFIX`,
-    /// exactly like a text delta after an IMAGE turn. Gemma4 sessions are
-    /// single-shot for media: once the cache holds expanded image / audio
-    /// tokens, a cheap text-only delta on top would prefill against
-    /// positions the history bookkeeping does not model, so both branches
-    /// route the TS `ChatSession` back through a fresh start. This locks
-    /// the existing behaviour; it is NOT a behaviour change.
+    /// Contract (Phase-2 FLIP, deliberate): a text delta on a media session is
+    /// governed by the `media_session_continuable` marker, NOT the raw media
+    /// key. When a media turn left its global paged KV live + a sliding history
+    /// checkpoint (audio / non-unified image, continuable), the guard ALLOWS the
+    /// delta (returns `None`) so it warm-continues causally. When the marker is
+    /// false (single-shot: unified image, `reuse_cache=false`, or a downgraded
+    /// finalize), the guard still REJECTS with the `IMAGE_CHANGE_RESTART_PREFIX`
+    /// exactly as before. This intentionally replaces the prior
+    /// "audio/image always reject" pin — it is a CONTRACT FLIP, not a weakened
+    /// test: the reject path is preserved for every non-continuable case.
     ///
     /// Constructs a `Gemma4Inner` (needs Metal — gracefully skips on a
-    /// no-Metal sandbox) and drives the guard directly by toggling the
-    /// cached media keys.
+    /// no-Metal sandbox) and drives the guard directly by toggling the cached
+    /// media keys + the continuable marker.
     #[test]
     fn test_text_delta_after_audio_turn_rejected_like_image_turn() {
         let cfg = paged_tiny_config(Some(false));
@@ -7320,9 +7506,10 @@ mod tests {
             }
         };
 
-        // Clean session: no media held, guard passes (None).
+        // Clean session: no media held, marker false, guard passes (None).
         inner.cached_image_key = None;
         inner.cached_audio_key = None;
+        inner.media_session_continuable = false;
         assert!(
             inner
                 .text_delta_image_guard("chat_session_continue")
@@ -7330,12 +7517,14 @@ mod tests {
             "clean session must not reject a text delta"
         );
 
-        // Image turn held: text delta rejected with the restart prefix.
+        // Image turn held, NOT continuable (single-shot): text delta rejected
+        // with the restart prefix.
         inner.cached_image_key = Some(42);
         inner.cached_audio_key = None;
+        inner.media_session_continuable = false;
         let image_reject = inner
             .text_delta_image_guard("chat_session_continue")
-            .expect("text delta after image turn must reject");
+            .expect("text delta after non-continuable image turn must reject");
         assert!(
             image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
             "image-turn rejection must carry the restart prefix, got: {image_reject}"
@@ -7345,13 +7534,14 @@ mod tests {
             "image-turn rejection must mention image state, got: {image_reject}"
         );
 
-        // Audio turn held (no image): the audio branch must reject the SAME
-        // way as the image branch — same restart prefix, single-shot media.
+        // Audio turn held, NOT continuable: the audio branch must reject the
+        // SAME way as the image branch — same restart prefix.
         inner.cached_image_key = None;
         inner.cached_audio_key = Some(7);
+        inner.media_session_continuable = false;
         let audio_reject = inner
             .text_delta_image_guard("chat_session_continue")
-            .expect("text delta after audio turn must reject");
+            .expect("text delta after non-continuable audio turn must reject");
         assert!(
             audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
             "audio-turn rejection must carry the restart prefix, got: {audio_reject}"
@@ -7359,6 +7549,139 @@ mod tests {
         assert!(
             audio_reject.contains("audio state"),
             "audio-turn rejection must mention audio state, got: {audio_reject}"
+        );
+
+        // CONTRACT FLIP: audio turn held AND continuable → guard ALLOWS (None).
+        inner.cached_image_key = None;
+        inner.cached_audio_key = Some(7);
+        inner.media_session_continuable = true;
+        assert!(
+            inner
+                .text_delta_image_guard("chat_session_continue")
+                .is_none(),
+            "continuable audio session must ALLOW a warm text delta"
+        );
+
+        // CONTRACT FLIP: non-unified image turn held AND continuable → ALLOW.
+        inner.cached_image_key = Some(42);
+        inner.cached_audio_key = None;
+        inner.media_session_continuable = true;
+        assert!(
+            inner
+                .text_delta_image_guard("chat_session_continue")
+                .is_none(),
+            "continuable (non-unified) image session must ALLOW a warm text delta"
+        );
+    }
+
+    /// Marker reset matrix: `media_session_continuable` must return to `false`
+    /// at every session-reset entry point so a dropped-media session can never
+    /// wrongly warm-continue. Covers `clear_reuse_state` and `reset_caches_sync`
+    /// (both clear via `clear_reuse_state`).
+    #[test]
+    fn test_media_session_continuable_reset_matrix() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Fresh construction: marker defaults to false.
+        assert!(
+            !inner.media_session_continuable,
+            "marker must default to false on construction"
+        );
+
+        // clear_reuse_state resets the marker.
+        inner.media_session_continuable = true;
+        inner.clear_reuse_state();
+        assert!(
+            !inner.media_session_continuable,
+            "clear_reuse_state must reset the continuable marker"
+        );
+
+        // reset_caches_sync (which calls clear_reuse_state) resets the marker
+        // AND nulls caches → has_live_session() false → a delta cannot continue.
+        inner.media_session_continuable = true;
+        inner.cached_audio_key = Some(9);
+        inner
+            .reset_caches_sync()
+            .expect("reset_caches_sync must succeed");
+        assert!(
+            !inner.media_session_continuable,
+            "reset_caches_sync must reset the continuable marker"
+        );
+        assert!(
+            inner.cached_audio_key.is_none(),
+            "reset_caches_sync must clear the media key"
+        );
+        // After reset, even toggling the marker can't allow a delta: the
+        // session is dead (no live caches), and the reset already cleared it.
+        assert!(
+            inner
+                .text_delta_image_guard("chat_session_continue")
+                .is_none(),
+            "post-reset session holds no media key → guard returns None (no media to reject)"
+        );
+    }
+
+    /// Phase-2 scope gate (`gemma4_no_overlay_continuable`): a media turn is
+    /// continuable ONLY when it is purely causal — AUDIO, or a NON-UNIFIED image
+    /// — never a UNIFIED bidirectional-vision image (overlay active) and never a
+    /// text-only turn. Locks the Phase-2/Phase-3 boundary at the gate.
+    #[test]
+    fn test_gemma4_no_overlay_continuable_gate() {
+        let mut inner = match super::Gemma4Inner::new(paged_tiny_config(Some(false))) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let image_id = inner.config.image_token_id.unwrap_or(258880) as u32;
+        let audio_id = inner.config.audio_token_id.unwrap_or(258881) as u32;
+        let text_tokens: Vec<u32> = vec![10, 11, 12, 13];
+        let image_tokens: Vec<u32> = vec![10, image_id, image_id, 13];
+        let audio_tokens: Vec<u32> = vec![10, audio_id, audio_id, 13];
+
+        // Text-only: never continuable as a media turn.
+        assert!(!inner.gemma4_no_overlay_continuable(&text_tokens));
+
+        // Audio is always causal → continuable, regardless of is_unified.
+        inner.config.is_unified = false;
+        inner.config.use_bidirectional_attention = None;
+        assert!(inner.gemma4_no_overlay_continuable(&audio_tokens));
+        inner.config.is_unified = true;
+        inner.config.use_bidirectional_attention = Some("vision".to_string());
+        assert!(
+            inner.gemma4_no_overlay_continuable(&audio_tokens),
+            "audio is causal (overlay disabled when audio present) even on a unified ckpt"
+        );
+
+        // Non-unified image: causal SigLIP → continuable.
+        inner.config.is_unified = false;
+        inner.config.use_bidirectional_attention = None;
+        assert!(inner.gemma4_no_overlay_continuable(&image_tokens));
+
+        // Unified image with bidirectional vision: overlay ACTIVE → NOT
+        // continuable in Phase 2 (Phase 3 owns this behind its own golden).
+        inner.config.is_unified = true;
+        inner.config.use_bidirectional_attention = Some("vision".to_string());
+        assert!(
+            !inner.gemma4_no_overlay_continuable(&image_tokens),
+            "unified bidirectional-vision image must stay single-shot in Phase 2"
         );
     }
 
