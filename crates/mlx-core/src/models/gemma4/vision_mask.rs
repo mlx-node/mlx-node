@@ -110,7 +110,9 @@ mod tests {
         let n = arr.shape_at(1).unwrap();
         let a = arr.astype(DType::Int32).unwrap();
         a.eval();
-        (0..n).map(|i| a.item_at_int32(i as usize).unwrap()).collect()
+        (0..n)
+            .map(|i| a.item_at_int32(i as usize).unwrap())
+            .collect()
     }
 
     /// Read a `[1,1,L,L]` boolean mask into a flat `Vec<bool>` of length L*L
@@ -155,10 +157,7 @@ mod tests {
         // Two separate image runs → group ids 0 and 1.
         let mm = MxArray::from_int32(&[0, 1, 1, 0, 1, 1, 1, 0], &[1, 8]).unwrap();
         let block = block_sequence_ids(&mm).unwrap();
-        assert_eq!(
-            read_2d_block_ids(&block),
-            vec![-1, 0, 0, -1, 1, 1, 1, -1]
-        );
+        assert_eq!(read_2d_block_ids(&block), vec![-1, 0, 0, -1, 1, 1, 1, -1]);
     }
 
     #[test]
@@ -176,11 +175,20 @@ mod tests {
             }
         }
         // Specifically the upper-triangle image entry 2→4 (future key) is now kept.
-        assert!(keep(&mask, l, 2, 4), "image query 2 must attend forward to key 4");
+        assert!(
+            keep(&mask, l, 2, 4),
+            "image query 2 must attend forward to key 4"
+        );
 
         // (b) text positions stay causal: text query 0 cannot see future text key 1.
-        assert!(!keep(&mask, l, 0, 1), "text query 0 must NOT see future text key 1");
-        assert!(keep(&mask, l, 6, 0), "text query 6 sees past text key 0 (causal)");
+        assert!(
+            !keep(&mask, l, 0, 1),
+            "text query 0 must NOT see future text key 1"
+        );
+        assert!(
+            keep(&mask, l, 6, 0),
+            "text query 6 sees past text key 0 (causal)"
+        );
 
         // (c) an image query cannot attend to a FUTURE text key (block -1).
         assert!(

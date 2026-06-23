@@ -6,6 +6,7 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 
+use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
@@ -33,6 +34,7 @@ use crate::transformer::{
 use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
 use super::vision_embedder::Gemma4UnifiedVisionEmbedder;
+use super::vision_mask::apply_bidirectional_vision_overlay;
 
 /// Convert a JSON value to Gemma4's tool-call DSL format.
 /// Strings → <|"|>str<|"|>, numbers/bools → bare, objects/arrays → recursive.
@@ -3118,6 +3120,7 @@ impl Gemma4Inner {
     /// `chunk_token_ids` is the expanded token slice for this chunk (drives the
     /// PLE image mask and the sliding-mask sequence length).
     /// `chunk_embeds` is `[1, chunk_len, hidden]`.
+    #[allow(clippy::too_many_arguments)]
     fn run_paged_vlm_prefill_layer_loop(
         &mut self,
         chunk_token_ids: &[u32],
@@ -3125,6 +3128,7 @@ impl Gemma4Inner {
         first_logical_position: u32,
         cached_prefix_len_for_chunk: u32,
         layer_kinds: &[Gemma4LayerKind],
+        overlay_type_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
         let chunk_len = chunk_token_ids.len() as u32;
         if chunk_len == 0 {
@@ -3172,9 +3176,32 @@ impl Gemma4Inner {
         let sliding_window = self.config.sliding_window as i64;
         let sliding_mask_offset =
             sliding_mask_offset_for_chunk(seq_len, sliding_offset, sliding_window);
-        let sliding_mask = sliding_mask_offset
+        let mut sliding_mask = sliding_mask_offset
             .map(|offset| create_sliding_mask(seq_len, offset, sliding_window))
             .transpose()?;
+
+        // Unified-vision bidirectional overlay. Active only on the cold-start
+        // single-chunk prefill (`overlay_type_ids` is Some and
+        // `cached_prefix_len_for_chunk == 0`), where every mask key dimension
+        // equals `seq_len`. Both layer types get an EXPLICIT materialized
+        // boolean keep-mask (true=keep): the global layer's normal None/causal
+        // fast path and the sliding layer's possibly-None window mask are
+        // replaced by `base | same_image_block`.
+        let overlay_active = overlay_type_ids.is_some() && cached_prefix_len_for_chunk == 0;
+        let overlay_global_mask: Option<MxArray> = if overlay_active {
+            let type_ids = overlay_type_ids.unwrap();
+            let base = create_causal_mask(seq_len as i32, None, None)?;
+            let base = base.reshape(&[1, 1, seq_len, seq_len])?;
+            Some(apply_bidirectional_vision_overlay(&base, type_ids)?)
+        } else {
+            None
+        };
+        if overlay_active {
+            let type_ids = overlay_type_ids.unwrap();
+            let base = create_causal_mask(seq_len as i32, None, Some(sliding_window as i32))?;
+            let base = base.reshape(&[1, 1, seq_len, seq_len])?;
+            sliding_mask = Some(apply_bidirectional_vision_overlay(&base, type_ids)?);
+        }
 
         let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
@@ -3191,7 +3218,11 @@ impl Gemma4Inner {
             let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
                 sliding_mask.as_ref()
             } else {
-                None
+                // Global/full layers normally pass None (internal causal). When
+                // the overlay is active they receive the explicit bidirectional
+                // keep-mask, which `forward_paged` applies in the fresh-prefill
+                // branch.
+                overlay_global_mask.as_ref()
             };
 
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -3323,6 +3354,30 @@ impl Gemma4Inner {
         crate::models::gemma4::diagnostic::set_path("paged");
         crate::models::gemma4::diagnostic::set_step(-1);
 
+        // Unified-vision bidirectional overlay gate: is_unified +
+        // use_bidirectional_attention=="vision" + image tokens present +
+        // prefill (seq_len>1). Audio is Phase 3 and never enters the expanded
+        // stream here, so "no audio" holds structurally. When active, the whole
+        // image block must live in ONE prefill chunk so bidirectionality is not
+        // severed by chunk boundaries.
+        let overlay_full_type_ids: Option<MxArray> = if self.config.is_unified
+            && self.config.use_bidirectional_attention.as_deref() == Some("vision")
+            && prompt_len > 1
+        {
+            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+            if expanded_tokens.contains(&image_token_id) {
+                Some(super::vision_mask::build_image_token_type_ids(
+                    expanded_tokens,
+                    image_token_id,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let overlay_active = overlay_full_type_ids.is_some();
+
         // Pass 1: tokens [0..prompt_len-1] in bounded chunks. Pass 2: the
         // FINAL token, run with cached_prefix_len_for_chunk > 0 so global
         // layers take the same cache-hit reduction order decode uses.
@@ -3330,7 +3385,10 @@ impl Gemma4Inner {
         if prompt_len > 1 {
             let pass1_len = (prompt_len - 1) as usize;
             let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-            let chunk_size = if configured_chunk_size <= 0 {
+            // Force a single chunk when the overlay is active: a split would put
+            // part of the image block in a later (cache-hit) chunk that no
+            // longer carries the bidirectional mask.
+            let chunk_size = if overlay_active || configured_chunk_size <= 0 {
                 pass1_len
             } else {
                 (configured_chunk_size as usize).max(1)
@@ -3342,6 +3400,13 @@ impl Gemma4Inner {
                 let chunk_len = (end - offset) as i64;
                 let chunk_embeds =
                     inputs_embeds.slice_axis(1, offset as i64, offset as i64 + chunk_len)?;
+                // Per-chunk type-ids slice. With the forced single chunk this is
+                // the whole pass-1 span; the explicit slice keeps the code
+                // correct even if a future chunking path is added.
+                let chunk_type_ids: Option<MxArray> = match &overlay_full_type_ids {
+                    Some(ids) => Some(ids.slice_axis(1, offset as i64, end as i64)?),
+                    None => None,
+                };
                 {
                     let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                         Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
@@ -3356,6 +3421,7 @@ impl Gemma4Inner {
                     pass1_position,
                     pass1_position,
                     layer_kinds,
+                    chunk_type_ids.as_ref(),
                 )?;
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     adapter
@@ -3393,6 +3459,9 @@ impl Gemma4Inner {
             pass1_position,
             pass1_position,
             layer_kinds,
+            // Pass 2 is the single final token (seq_len==1); the overlay never
+            // applies to a single-token query.
+            None,
         )?;
         if let Some(adapter) = self.paged_adapter.as_mut() {
             adapter

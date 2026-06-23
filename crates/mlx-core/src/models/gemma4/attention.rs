@@ -468,6 +468,7 @@ impl Gemma4Attention {
     /// Output: `[1, seq_len, hidden_size]` so the decoder layer's
     /// `apply_ffn_ple_scalar` tail can consume it unchanged.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
         x: &MxArray,
@@ -476,6 +477,7 @@ impl Gemma4Attention {
         first_logical_position: u32,
         cached_prefix_len: u32,
         is_prefill: bool,
+        explicit_prefill_mask: Option<&MxArray>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -628,21 +630,38 @@ impl Gemma4Attention {
         // compounds into an argmax flip on the first decode step.
         let attn_bhtd = if is_prefill && seq_len > 1 {
             if cached_prefix_len == 0 {
-                // Fresh multi-token prefill: SDPA over in-flight Q/K/V
-                // with internal causal mask.
+                // Fresh multi-token prefill: SDPA over in-flight Q/K/V with
+                // internal causal mask — UNLESS an explicit prefill mask is
+                // supplied (Gemma 4 unified-vision bidirectional overlay), in
+                // which case the boolean keep-mask is applied directly. The
+                // explicit-mask kernel differs from the causal kernel in BF16
+                // reduction order, so it is taken only when an overlay is
+                // actually present (text/SigLIP/31B keep the causal fast path).
                 let sdpa_trace_start = trace_enabled.then(std::time::Instant::now);
                 if trace_enabled {
                     write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 attention_paged_sdpa_causal_start paged_idx={} seq_len={} cached_prefix=0",
-                        paged_idx, seq_len
+                        "[MLX_TRACE] gemma4 attention_paged_sdpa_causal_start paged_idx={} seq_len={} cached_prefix=0 explicit_mask={}",
+                        paged_idx,
+                        seq_len,
+                        explicit_prefill_mask.is_some()
                     ));
                 }
-                let out = scaled_dot_product_attention_causal(
-                    &queries_bhtd,
-                    &keys_bhtd,
-                    &values_bhtd,
-                    1.0,
-                )?;
+                let out = if let Some(mask) = explicit_prefill_mask {
+                    scaled_dot_product_attention(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        1.0,
+                        Some(mask),
+                    )?
+                } else {
+                    scaled_dot_product_attention_causal(
+                        &queries_bhtd,
+                        &keys_bhtd,
+                        &values_bhtd,
+                        1.0,
+                    )?
+                };
                 if trace_enabled {
                     write_inference_trace(format_args!(
                         "[MLX_TRACE] gemma4 attention_paged_sdpa_causal_done paged_idx={} seq_len={} elapsed_ms={:.1}",

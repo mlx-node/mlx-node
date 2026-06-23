@@ -308,9 +308,12 @@ impl Gemma4DecoderLayer {
             }
             Gemma4LayerKind::GlobalPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for global layers
-                let _ = mask; // paged path uses internal causal/explicit masks
                 let _ = needs_stash;
                 let _ = shared_kv;
+                // `mask` is normally None for global layers (the paged path uses
+                // an internal causal mask). During a unified-vision prefill the
+                // caller passes the explicit bidirectional-overlay keep-mask,
+                // which `forward_paged` applies in the fresh-prefill branch.
                 let normed = self.input_layernorm.forward(x)?;
                 diagnostic::dump_norm_current_layer("hin", &normed, None);
                 let attn_out = self.self_attn.forward_paged(
@@ -320,6 +323,7 @@ impl Gemma4DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
+                    mask,
                 )?;
                 diagnostic::dump_norm_current_layer(
                     "attn",
