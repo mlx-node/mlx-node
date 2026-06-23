@@ -6762,6 +6762,8 @@ mod tests {
             global_num_key_value_heads: None,
             global_head_dim: None,
             attention_k_eq_v: false,
+            is_unified: false,
+            use_bidirectional_attention: None,
             final_logit_softcapping: None,
             per_layer_input_embeds: false,
             hidden_size_per_layer_input: None,

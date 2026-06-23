@@ -90,6 +90,25 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
 
+    // Unified multimodal checkpoint: `model_type == "gemma4_unified"` or the
+    // unified conditional-generation architecture. The text decoder is shared
+    // with the dense `gemma4` family; this flag drives the load-time skip of
+    // the vision/audio embedder weights the unified checkpoint carries.
+    let is_unified = raw.get("model_type").and_then(|v| v.as_str()) == Some("gemma4_unified")
+        || raw
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            == Some("Gemma4UnifiedForConditionalGeneration");
+
+    // `text_config.use_bidirectional_attention` (unified: "vision"). Parsed for
+    // a stable struct surface; the text-only decode path does not read it.
+    let use_bidirectional_attention = text_cfg
+        .and_then(|tc| tc.get("use_bidirectional_attention"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     // Helper to read EOS token IDs (can be int or array)
     let eos_token_ids = if let Some(tc) = text_cfg {
         parse_eos_token_ids(&tc["eos_token_id"])
@@ -164,6 +183,8 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
         },
         // HF config uses `attention_k_eq_v` (not `k_is_v`)
         attention_k_eq_v: get_config_bool(&raw, text_cfg, &["attention_k_eq_v"], false),
+        is_unified,
+        use_bidirectional_attention,
         final_logit_softcapping: {
             let v = get_config_f64(&raw, text_cfg, &["final_logit_softcapping"], 0.0);
             if v > 0.0 { Some(v) } else { None }
@@ -200,10 +221,16 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             if v > 0 { Some(v) } else { None }
         },
 
-        // Vision fields — only present when config.json contains a vision_config sub-dict
-        vision_config: raw
-            .get("vision_config")
-            .map(super::vision_config::Gemma4VisionConfig::from_json),
+        // Vision fields — only present when config.json contains a vision_config sub-dict.
+        // The unified checkpoint's `vision_config` has a different (non-SigLIP) shape that
+        // the dense `Gemma4VisionConfig` parser would mis-read and wrongly enable a vision
+        // tower for, so we leave it unset and load the unified model as text-only.
+        vision_config: if is_unified {
+            None
+        } else {
+            raw.get("vision_config")
+                .map(super::vision_config::Gemma4VisionConfig::from_json)
+        },
         image_token_id: raw
             .get("image_token_id")
             .and_then(|v| v.as_i64())
@@ -543,10 +570,14 @@ pub fn sanitize_weights(
             continue;
         }
 
-        // Skip vision weights only when vision_config is absent (text-only mode)
+        // Skip vision weights only when vision_config is absent (text-only mode).
+        // `vision_embedder.` is the unified checkpoint's image embedder block; it
+        // has no text-decoder counterpart, so a text-only load drops it like the
+        // other vision prefixes instead of erroring on an unexpected weight.
         if config.vision_config.is_none()
             && (clean_key.starts_with("vision_tower.")
                 || clean_key.starts_with("vision_encoder.")
+                || clean_key.starts_with("vision_embedder.")
                 || clean_key.starts_with("multi_modal_projector.")
                 || clean_key.starts_with("embed_vision."))
         {
@@ -1818,6 +1849,92 @@ impl Gemma4Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a `config.json` into a fresh temp dir and run `parse_config` on it.
+    /// Returns the parsed config plus the temp dir path so the caller can clean up.
+    fn parse_config_from_json(json: serde_json::Value) -> (Gemma4Config, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_parse_config_test_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp config dir");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&json).expect("serialize config json"),
+        )
+        .expect("write config.json");
+        let cfg = parse_config(&dir).expect("parse_config");
+        (cfg, dir)
+    }
+
+    /// The unified 12B checkpoint advertises `model_type == "gemma4_unified"`
+    /// (and the unified conditional-generation architecture) plus a
+    /// `text_config.use_bidirectional_attention == "vision"`. `parse_config`
+    /// must flag it `is_unified` and surface that field, while a plain `gemma4`
+    /// checkpoint stays `is_unified == false`.
+    #[test]
+    fn parse_config_detects_unified_text_model() {
+        let unified = serde_json::json!({
+            "model_type": "gemma4_unified",
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 3840,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 256,
+                "intermediate_size": 15360,
+                "use_bidirectional_attention": "vision"
+            },
+            "vision_config": { "model_type": "gemma4_unified_vision" },
+            "audio_config": { "model_type": "gemma4_unified_audio" }
+        });
+        let (cfg, dir) = parse_config_from_json(unified);
+        assert!(cfg.is_unified, "gemma4_unified must set is_unified=true");
+        assert_eq!(
+            cfg.use_bidirectional_attention.as_deref(),
+            Some("vision"),
+            "use_bidirectional_attention must round-trip from text_config"
+        );
+        // Unified vision_config must NOT enable the dense SigLIP vision tower.
+        assert!(
+            cfg.vision_config.is_none(),
+            "unified checkpoint must load text-only (vision_config None)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_unified_via_architecture_only() {
+        let unified = serde_json::json!({
+            "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(unified);
+        assert!(
+            cfg.is_unified,
+            "architecture alone must set is_unified=true"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_plain_gemma4_is_not_unified() {
+        let plain = serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(plain);
+        assert!(!cfg.is_unified, "plain gemma4 must keep is_unified=false");
+        assert_eq!(cfg.use_bidirectional_attention, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     /// sym8's mandatory f32 `[N]` `.scales` (sibling `.weight` is Int8) must
     /// survive `sanitize_weights`' blanket f32->bf16 cast — the exemption is

@@ -2788,6 +2788,20 @@ export interface Gemma4Config {
   /** Head dimension for global layers. If None, uses head_dim. */
   globalHeadDim?: number;
   attentionKEqV: boolean;
+  /**
+   * True for the unified multimodal Gemma 4 checkpoint
+   * (`model_type == "gemma4_unified"` or
+   * `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`).
+   * The text decoder is shared, but the unified checkpoint carries
+   * vision/audio embedder weights that must be dropped in a text-only load.
+   */
+  isUnified: boolean;
+  /**
+   * `text_config.use_bidirectional_attention` from the unified checkpoint
+   * (e.g. `"vision"`). Parsed for a stable struct surface; the text-only
+   * decode path does not consume it.
+   */
+  useBidirectionalAttention?: string;
   finalLogitSoftcapping?: number;
   perLayerInputEmbeds: boolean;
   hiddenSizePerLayerInput?: number;

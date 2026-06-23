@@ -48,6 +48,20 @@ pub struct Gemma4Config {
     #[serde(default)]
     pub attention_k_eq_v: bool,
 
+    /// True for the unified multimodal Gemma 4 checkpoint
+    /// (`model_type == "gemma4_unified"` or
+    /// `architectures[0] == "Gemma4UnifiedForConditionalGeneration"`).
+    /// The text decoder is shared, but the unified checkpoint carries
+    /// vision/audio embedder weights that must be dropped in a text-only load.
+    #[serde(default)]
+    pub is_unified: bool,
+
+    /// `text_config.use_bidirectional_attention` from the unified checkpoint
+    /// (e.g. `"vision"`). Parsed for a stable struct surface; the text-only
+    /// decode path does not consume it.
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<String>,
+
     // Logit softcapping: tanh(logits / cap) * cap
     #[serde(default)]
     pub final_logit_softcapping: Option<f64>,
