@@ -811,17 +811,39 @@ fn apply_weights(
             Error::from_reason("Missing embed_tokens.scales for quantized embedding")
         })?;
         let biases = params.get("embed_tokens.biases");
-        inner.embed_tokens.load_quantized(
-            w,
-            scales,
-            biases,
-            embed_plq.group_size,
-            embed_plq.bits,
-        )?;
         if config.tie_word_embeddings {
+            // Tied lm_head reads the whole table as a dense matmul weight
+            // (`embed_weight_t` below), so it must be dequantized into one dense
+            // bf16 buffer up front.
+            inner.embed_tokens.load_quantized(
+                w,
+                scales,
+                biases,
+                embed_plq.group_size,
+                embed_plq.bits,
+            )?;
             let dequant = inner.embed_tokens.get_weight();
             let w_t = dequant.transpose(Some(&[1, 0]))?;
             inner.embed_weight_t = Some(w_t);
+        } else {
+            // Untied: the table is only ever gathered one row at a time in
+            // `forward()` (never tied, never read via `get_weight()` on the hot
+            // path), so keep it PACKED and dequantize only the looked-up rows.
+            // Byte-identical to the dense path — affine dequant is per-element,
+            // so gather-then-dequant == dequant-then-gather — but the 2-bit
+            // `[vocab, hidden]` table stays packed instead of materializing a
+            // dense bf16 copy (measured ~0.63 GiB resident reclaimed for E2B:
+            // a 262144x1536 2-bit table is 0.75 GiB dense vs 0.12 GiB packed).
+            // Mirrors the PLE `embed_tokens_per_layer` packed load below; mode
+            // is guaranteed affine by the guard above.
+            inner.embed_tokens.load_quantized_packed(
+                w,
+                scales,
+                biases,
+                embed_plq.group_size,
+                embed_plq.bits,
+                "affine",
+            )?;
         }
     } else if let Some(w) = params.get("embed_tokens.weight") {
         // Dense embedding fallback (no `.scales`): a stripped quant group

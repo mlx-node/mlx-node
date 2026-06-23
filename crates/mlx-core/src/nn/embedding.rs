@@ -634,6 +634,55 @@ mod tests {
         );
     }
 
+    /// Gemma4 untied `embed_tokens` footprint optimization: loading the quantized
+    /// table via `load_quantized_packed` (gather-then-dequant, ~168 MiB packed)
+    /// instead of the legacy dense `load_quantized` (dequant-whole-table-then-
+    /// gather, ~1.34 GiB bf16) must be BYTE-IDENTICAL at the lookup — at gemma4's
+    /// 2-bit affine `embed_tokens` shape class. Unlike
+    /// `packed_affine_forward_matches_dequant_full_then_gather` (max_err < 1e-3),
+    /// this asserts EXACT equality: affine dequant is per-element with no
+    /// cross-row reduction, so gather-then-dequant equals dequant-then-gather
+    /// bit-for-bit. Guards the `persistence.rs` untied embed_tokens packed-load
+    /// change.
+    #[test]
+    fn packed_affine_2bit_lookup_byte_identical_to_legacy_dense() {
+        let vocab = 16i64;
+        let hidden = 64i64; // one affine group of 64 at 2-bit (gemma4 embed_tokens class)
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+        let dense = MxArray::from_float32(&data, &[vocab, hidden])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs, qb) = quantize_affine(&dense, 64, 2);
+
+        let idx = MxArray::from_int32(&[0, 5, 15, 3, 8], &[5]).expect("idx");
+
+        // Legacy dense path: load_quantized dequantizes the whole table, then forward gathers.
+        let mut emb_dense = Embedding::new(vocab as u32, hidden as u32).expect("new dense");
+        emb_dense
+            .load_quantized(&qw, &qs, Some(&qb), 64, 2)
+            .expect("load dense");
+        let out_dense = emb_dense.forward(&idx).expect("forward dense");
+
+        // Packed path: load_quantized_packed keeps it packed; forward gathers rows then dequantizes.
+        let mut emb_packed = Embedding::new(vocab as u32, hidden as u32).expect("new packed");
+        emb_packed
+            .load_quantized_packed(&qw, &qs, Some(&qb), 64, 2, "affine")
+            .expect("load packed");
+        assert!(emb_packed.is_packed_quantized());
+        let out_packed = emb_packed.forward(&idx).expect("forward packed");
+
+        let a = to_f32_vec(&out_dense);
+        let b = to_f32_vec(&out_packed);
+        assert_eq!(a.len(), b.len(), "lookup shape mismatch");
+        let max_err = max_abs_err(&a, &b);
+        assert_eq!(
+            max_err, 0.0,
+            "packed 2-bit affine lookup must be byte-identical to legacy dense: max_err={max_err}"
+        );
+    }
+
     /// PACKED embedding must NOT keep the full `[vocab, hidden]` dense table from
     /// `new()` resident: `load_quantized_packed` replaces `self.weight` with a
     /// tiny placeholder, and `get_weight()` dequantizes the FULL table on demand
