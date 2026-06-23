@@ -88,6 +88,38 @@ import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, Too
 import type { ChatStreamEvent } from './stream.js';
 
 /**
+ * Typed prefix the native delta path uses to reject a text-only
+ * continuation while the session still holds image/audio KV state
+ * (gemma4 raises this after a media turn). The native session refuses
+ * to advance the cheap delta on top of media KV, so the session layer
+ * recognizes this exact prefix and transparently replays the whole
+ * conversation through the cold start path instead of surfacing the
+ * raw error to the caller.
+ *
+ * MUST stay byte-for-byte identical to the Rust constant
+ * `IMAGE_CHANGE_RESTART_PREFIX` in
+ * `crates/mlx-core/src/engine/cache.rs` — it is not exported across the
+ * NAPI boundary, so the two literals are kept in sync by hand. The
+ * native message starts with this prefix and is delivered as the
+ * `Error.message`: on the sync delta path as a rejected promise, and on
+ * the streaming delta path as a thrown error on the generator's first
+ * iteration (the native worker-thread sink error is re-thrown by the
+ * `packages/lm/src/stream.ts` bridge before any chunk is yielded).
+ */
+const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
+
+/**
+ * Whether `err` is the native media-held delta rejection (see
+ * {@link IMAGE_CHANGE_RESTART_PREFIX}). The native message begins with
+ * the literal prefix and reaches both the sync and streaming bridges
+ * unwrapped (NAPI surfaces `Error.from_reason` as `Error.message`
+ * verbatim), so a `startsWith` match is exact.
+ */
+function isMediaHeldRestartError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith(IMAGE_CHANGE_RESTART_PREFIX);
+}
+
+/**
  * Convert the parsed `ToolCallResult[]` emitted by the native chat
  * pipeline into the `ToolCall[]` shape expected by
  * `ChatMessage.toolCalls` (and, by extension, the jinja chat
@@ -641,7 +673,31 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // Delta continue: text-only, images/audio always null. The server
       // cache already holds all prior turns (including any media from an
       // earlier restart), so we only need to ship the new user string.
-      const result = await this.model.chatSessionContinue(userMessage, null, null, mergedConfig);
+      let result: ChatResult;
+      try {
+        result = await this.model.chatSessionContinue(userMessage, null, null, mergedConfig);
+      } catch (err) {
+        if (!isMediaHeldRestartError(err)) {
+          throw err;
+        }
+        // The native session holds media KV (gemma4 after an image/audio
+        // turn) and refused the text delta. Transparently replay the full
+        // conversation through the cold start path. The earlier media turn
+        // already lives in `this.history`, so the start path re-renders it;
+        // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
+        // consistent across the replay. The delta path has NOT pushed
+        // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
+        return await this.runStartPath(
+          userMessage,
+          undefined,
+          undefined,
+          this.computeTrailingImagesKey(),
+          this.computeTrailingAudioKey(),
+          true,
+          false,
+          mergedConfig,
+        );
+      }
       this.history.push({ role: 'user', content: userMessage });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
@@ -702,24 +758,56 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       let accumulated = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
+      // Set when the media-held rejection re-routes this turn through the
+      // cold start stream. The replay path owns the history push, turnCount
+      // increment, and media-key rehydration, so the commit `finally` below
+      // must NOT also fire.
+      let delegated = false;
       try {
-        for await (const event of this.model.chatStreamSessionContinue(
-          userMessage,
-          null,
-          null,
-          mergedConfig,
-          opts.signal,
-        )) {
-          if (event.done) {
-            if (event.finishReason !== 'error') {
-              sawFinal = true;
-              finalRaw = event.text;
-              finalToolCalls = event.toolCalls;
+        try {
+          for await (const event of this.model.chatStreamSessionContinue(
+            userMessage,
+            null,
+            null,
+            mergedConfig,
+            opts.signal,
+          )) {
+            if (event.done) {
+              if (event.finishReason !== 'error') {
+                sawFinal = true;
+                finalRaw = event.text;
+                finalToolCalls = event.toolCalls;
+              }
+            } else {
+              accumulated += event.text;
             }
-          } else {
-            accumulated += event.text;
+            yield event;
           }
-          yield event;
+        } catch (err) {
+          // The native session holds media KV (gemma4 after an image/audio
+          // turn) and refused the text delta. The streaming bridge re-throws
+          // that rejection on the first iteration, BEFORE any chunk is
+          // emitted — the native guard fires ahead of any prefill, so
+          // `!sawFinal && accumulated === ''` is guaranteed here. Replay the
+          // full conversation through the cold start stream. Any non-prefix
+          // error, or any error after tokens were already emitted, must
+          // propagate unchanged.
+          if (!isMediaHeldRestartError(err) || sawFinal || accumulated !== '') {
+            throw err;
+          }
+          delegated = true;
+          yield* this.runStartStreamPath(
+            userMessage,
+            undefined,
+            undefined,
+            this.computeTrailingImagesKey(),
+            this.computeTrailingAudioKey(),
+            true,
+            false,
+            mergedConfig,
+            opts.signal,
+          );
+          return;
         }
       } finally {
         // finally runs for normal completion, mid-stream throw,
@@ -728,8 +816,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // chunks alike. The delta path doesn't push to history until
         // commit, so the rollback branch is a no-op: nothing to
         // undo, and the native cache state is managed by the Rust
-        // save_cache_state path on its own.
-        if (sawFinal) {
+        // save_cache_state path on its own. When the media-held
+        // rejection delegated to the replay stream, that path already
+        // committed (or rolled back) — so this commit must stay off.
+        if (sawFinal && !delegated) {
           this.history.push({ role: 'user', content: userMessage });
           this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
           this.turnCount++;
