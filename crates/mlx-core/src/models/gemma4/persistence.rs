@@ -231,6 +231,15 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             raw.get("vision_config")
                 .map(super::vision_config::Gemma4VisionConfig::from_json)
         },
+        // The unified checkpoint's encoder-free vision path is parsed from the
+        // same `vision_config` sub-dict, but into its own struct so the SigLIP
+        // parser above stays untouched for the dense gemma4 family.
+        unified_vision_config: if is_unified {
+            raw.get("vision_config")
+                .map(super::unified_vision_config::UnifiedVisionConfig::from_json)
+        } else {
+            None
+        },
         image_token_id: raw
             .get("image_token_id")
             .and_then(|v| v.as_i64())
@@ -570,11 +579,15 @@ pub fn sanitize_weights(
             continue;
         }
 
-        // Skip vision weights only when vision_config is absent (text-only mode).
-        // `vision_embedder.` is the unified checkpoint's image embedder block; it
-        // has no text-decoder counterpart, so a text-only load drops it like the
-        // other vision prefixes instead of erroring on an unexpected weight.
+        // Skip vision weights only when neither vision path is active. The
+        // SigLIP tower keys (`vision_tower.`/`vision_encoder.`/
+        // `multi_modal_projector.`) belong to the dense gemma4 family; the
+        // unified checkpoint instead ships `vision_embedder.` + `embed_vision.`.
+        // `embed_vision.` is shared by both paths. When a text-only load has
+        // neither config, every vision prefix is dropped so the load does not
+        // error on an unexpected weight.
         if config.vision_config.is_none()
+            && config.unified_vision_config.is_none()
             && (clean_key.starts_with("vision_tower.")
                 || clean_key.starts_with("vision_encoder.")
                 || clean_key.starts_with("vision_embedder.")
@@ -1289,14 +1302,30 @@ fn apply_vision_weights(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
-    let vc = match &config.vision_config {
-        Some(c) => c,
-        None => return Ok(()), // No vision — nothing to do
-    };
-
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
     let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    // --- Unified encoder-free vision embedder ---
+    // The unified checkpoint ships `vision_embedder.*` (patch LayerNorms +
+    // dense + 2D pos embedding + pos_norm) instead of a SigLIP tower. Load
+    // those into the dedicated embedder; the shared `embed_vision.*`
+    // projection is loaded by the block below.
+    if let Some(ref mut ve) = inner.unified_vision_embedder {
+        apply_unified_vision_embedder_weights(ve, params)?;
+    }
+
+    // The remaining SigLIP-tower logic only runs for the dense gemma4 family.
+    // Skip it (but keep the `embed_vision.` projection handling below) when the
+    // checkpoint has no SigLIP `vision_config`.
+    let vc = match &config.vision_config {
+        Some(c) => c,
+        None => {
+            apply_embed_vision_projection(inner, params, per_layer_quant, default_plq)?;
+            info!("Vision weights applied successfully");
+            return Ok(());
+        }
+    };
 
     // --- Vision Tower ---
     if let Some(ref mut vision_tower) = inner.vision_tower {
@@ -1437,55 +1466,110 @@ fn apply_vision_weights(
         }
     }
 
-    // --- Multimodal Embedder ---
-    // Affine-quantized checkpoints (e.g. Q8) ship this projection in packed
-    // form, so route through `Linear::load_quantized` when `.scales` is
-    // present. The dense `set_weight` path otherwise trips the shape guard.
-    if let Some(ref mut embedder) = inner.embed_vision {
-        let proj_prefix = "embed_vision.embedding_projection";
-        let vision_plq = per_layer_quant
-            .get(proj_prefix)
-            .copied()
-            .unwrap_or(default_plq);
-        if vision_plq.mode != PerLayerMode::Affine
-            && params.contains_key(&format!("{}.scales", proj_prefix))
-        {
-            return Err(Error::from_reason(format!(
-                "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
-                proj_prefix, vision_plq.mode
-            )));
-        }
-        if params.contains_key(&format!("{}.scales", proj_prefix))
-            && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
-        {
-            let scales = params
-                .get(&format!("{}.scales", proj_prefix))
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Missing {}.scales for quantized vision embedding projection",
-                        proj_prefix
-                    ))
-                })?;
-            let biases = params.get(&format!("{}.biases", proj_prefix));
-            embedder.embedding_projection.load_quantized(
-                w,
-                scales,
-                biases,
-                vision_plq.group_size,
-                vision_plq.bits,
-            )?;
-        } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
-            // Dense fallback — dtype-guarded: a packed/int8 `.weight` whose
-            // `.scales` sidecar was stripped lands here (the quantized branch
-            // above keys on `.scales` presence), and an unguarded
-            // `set_weight` would install non-float storage into the dense
-            // linear (the shape can validate while the dtype is garbage).
-            ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
-            embedder.embedding_projection.set_weight(w)?;
-        }
-    }
+    apply_embed_vision_projection(inner, params, per_layer_quant, default_plq)?;
 
     info!("Vision weights applied successfully");
+    Ok(())
+}
+
+/// Load the shared `embed_vision.embedding_projection` weight. Used by both the
+/// SigLIP tower path and the unified encoder-free path.
+///
+/// Affine-quantized checkpoints (e.g. Q8) ship this projection in packed form,
+/// so route through `Linear::load_quantized` when `.scales` is present. The
+/// dense `set_weight` path otherwise trips the shape guard.
+fn apply_embed_vision_projection(
+    inner: &mut Gemma4Inner,
+    params: &HashMap<String, MxArray>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    let Some(embedder) = inner.embed_vision.as_mut() else {
+        return Ok(());
+    };
+    let proj_prefix = "embed_vision.embedding_projection";
+    let vision_plq = per_layer_quant
+        .get(proj_prefix)
+        .copied()
+        .unwrap_or(default_plq);
+    if vision_plq.mode != PerLayerMode::Affine
+        && params.contains_key(&format!("{}.scales", proj_prefix))
+    {
+        return Err(Error::from_reason(format!(
+            "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+            proj_prefix, vision_plq.mode
+        )));
+    }
+    if params.contains_key(&format!("{}.scales", proj_prefix))
+        && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
+    {
+        let scales = params
+            .get(&format!("{}.scales", proj_prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Missing {}.scales for quantized vision embedding projection",
+                    proj_prefix
+                ))
+            })?;
+        let biases = params.get(&format!("{}.biases", proj_prefix));
+        embedder.embedding_projection.load_quantized(
+            w,
+            scales,
+            biases,
+            vision_plq.group_size,
+            vision_plq.bits,
+        )?;
+    } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+        // Dense fallback — dtype-guarded: a packed/int8 `.weight` whose
+        // `.scales` sidecar was stripped lands here (the quantized branch
+        // above keys on `.scales` presence), and an unguarded `set_weight`
+        // would install non-float storage into the dense linear (the shape
+        // can validate while the dtype is garbage).
+        ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
+        embedder.embedding_projection.set_weight(w)?;
+    }
+    Ok(())
+}
+
+/// Load the unified encoder-free vision embedder weights:
+/// `vision_embedder.{patch_ln1,patch_ln2,pos_norm}.{weight,bias}`,
+/// `vision_embedder.patch_dense.{weight,bias}`, and
+/// `vision_embedder.pos_embedding`. All are dense bf16 in the checkpoint.
+fn apply_unified_vision_embedder_weights(
+    ve: &mut super::vision_embedder::Gemma4UnifiedVisionEmbedder,
+    params: &HashMap<String, MxArray>,
+) -> Result<()> {
+    use crate::nn::LayerNorm;
+
+    let eps = ve.eps();
+    let load_layernorm = |name: &str| -> Result<Option<LayerNorm>> {
+        let w = params.get(&format!("vision_embedder.{name}.weight"));
+        let b = params.get(&format!("vision_embedder.{name}.bias"));
+        match (w, b) {
+            (Some(w), b) => Ok(Some(LayerNorm::from_weights(w, b, Some(eps))?)),
+            _ => Ok(None),
+        }
+    };
+
+    if let Some(ln) = load_layernorm("patch_ln1")? {
+        ve.patch_ln1 = ln;
+    }
+    if let Some(ln) = load_layernorm("patch_ln2")? {
+        ve.patch_ln2 = ln;
+    }
+    if let Some(ln) = load_layernorm("pos_norm")? {
+        ve.pos_norm = ln;
+    }
+
+    if let Some(w) = params.get("vision_embedder.patch_dense.weight") {
+        ve.patch_dense.set_weight(w)?;
+    }
+    if let Some(b) = params.get("vision_embedder.patch_dense.bias") {
+        ve.patch_dense.set_bias(Some(b))?;
+    }
+    if let Some(w) = params.get("vision_embedder.pos_embedding") {
+        ve.pos_embedding = w.clone();
+    }
     Ok(())
 }
 
@@ -1892,7 +1976,17 @@ mod tests {
                 "intermediate_size": 15360,
                 "use_bidirectional_attention": "vision"
             },
-            "vision_config": { "model_type": "gemma4_unified_vision" },
+            "vision_config": {
+                "model_type": "gemma4_unified_vision",
+                "model_patch_size": 48,
+                "mm_embed_dim": 3840,
+                "mm_posemb_size": 1120,
+                "num_soft_tokens": 280,
+                "output_proj_dims": 3840,
+                "patch_size": 16,
+                "pooling_kernel_size": 3,
+                "rms_norm_eps": 1e-6
+            },
             "audio_config": { "model_type": "gemma4_unified_audio" }
         });
         let (cfg, dir) = parse_config_from_json(unified);
@@ -1906,6 +2000,34 @@ mod tests {
         assert!(
             cfg.vision_config.is_none(),
             "unified checkpoint must load text-only (vision_config None)"
+        );
+        // The encoder-free unified vision config must be populated instead.
+        let uvc = cfg
+            .unified_vision_config
+            .as_ref()
+            .expect("unified checkpoint must populate unified_vision_config");
+        assert_eq!(uvc.model_patch_size, 48);
+        assert_eq!(uvc.mm_embed_dim, 3840);
+        assert_eq!(uvc.mm_posemb_size, 1120);
+        assert_eq!(uvc.num_soft_tokens, 280);
+        assert_eq!(uvc.output_proj_dims, 3840);
+        assert_eq!(uvc.patch_size, 16);
+        assert_eq!(uvc.pooling_kernel_size, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A plain gemma4 checkpoint must never populate `unified_vision_config`,
+    /// even if it carries a (SigLIP) `vision_config`.
+    #[test]
+    fn parse_config_plain_gemma4_has_no_unified_vision_config() {
+        let plain = serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 3840 }
+        });
+        let (cfg, dir) = parse_config_from_json(plain);
+        assert!(
+            cfg.unified_vision_config.is_none(),
+            "plain gemma4 must leave unified_vision_config None"
         );
         let _ = fs::remove_dir_all(&dir);
     }

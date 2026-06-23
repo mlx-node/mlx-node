@@ -32,6 +32,7 @@ use crate::transformer::{
 
 use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
 use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
+use super::vision_embedder::Gemma4UnifiedVisionEmbedder;
 
 /// Convert a JSON value to Gemma4's tool-call DSL format.
 /// Strings → <|"|>str<|"|>, numbers/bools → bare, objects/arrays → recursive.
@@ -355,6 +356,10 @@ pub(crate) struct Gemma4Inner {
     pub(crate) ple: Option<PleComponents>,
     // Vision components (None for text-only models)
     pub(crate) vision_tower: Option<Gemma4VisionModel>,
+    /// Encoder-free unified vision embedder. `Some` only for the unified
+    /// multimodal checkpoint (`unified_vision_config.is_some()`); mutually
+    /// exclusive with `vision_tower` (the SigLIP path).
+    pub(crate) unified_vision_embedder: Option<Gemma4UnifiedVisionEmbedder>,
     pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
     pub(crate) image_processor: Option<Gemma4ImageProcessor>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
@@ -734,22 +739,40 @@ impl Gemma4Inner {
             None
         };
 
-        // Initialize vision components if vision_config is present
-        let (vision_tower, embed_vision, image_processor) = if let Some(ref vc) =
-            config.vision_config
-        {
-            let vt = Gemma4VisionModel::new(vc)?;
-            let ev =
-                Gemma4MultimodalEmbedder::new(vc.hidden_size, config.hidden_size, vc.rms_norm_eps)?;
-            let ip = Gemma4ImageProcessor::new(
-                vc.patch_size,
-                vc.default_output_length,
-                vc.pooling_kernel_size,
-            );
-            (Some(vt), Some(ev), Some(ip))
-        } else {
-            (None, None, None)
-        };
+        // Initialize vision components. Two disjoint paths:
+        //  - SigLIP vision tower (dense gemma4 family), driven by `vision_config`.
+        //  - Encoder-free unified embedder, driven by `unified_vision_config`.
+        let (vision_tower, unified_vision_embedder, embed_vision, image_processor) =
+            if let Some(ref vc) = config.vision_config {
+                let vt = Gemma4VisionModel::new(vc)?;
+                let ev = Gemma4MultimodalEmbedder::new(
+                    vc.hidden_size,
+                    config.hidden_size,
+                    vc.rms_norm_eps,
+                )?;
+                let ip = Gemma4ImageProcessor::new(
+                    vc.patch_size,
+                    vc.default_output_length,
+                    vc.pooling_kernel_size,
+                );
+                (Some(vt), None, Some(ev), Some(ip))
+            } else if let Some(ref uvc) = config.unified_vision_config {
+                let embedder = Gemma4UnifiedVisionEmbedder::new(uvc)?;
+                let ev = Gemma4MultimodalEmbedder::new(
+                    uvc.output_proj_dims,
+                    config.hidden_size,
+                    uvc.rms_norm_eps,
+                )?;
+                let ip = Gemma4ImageProcessor::new_unified(
+                    uvc.patch_size,
+                    uvc.num_soft_tokens,
+                    uvc.pooling_kernel_size,
+                    uvc.model_patch_size,
+                );
+                (None, Some(embedder), Some(ev), Some(ip))
+            } else {
+                (None, None, None, None)
+            };
 
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -914,6 +937,7 @@ impl Gemma4Inner {
             embed_weight_t: None,
             ple,
             vision_tower,
+            unified_vision_embedder,
             embed_vision,
             image_processor,
             tokenizer: None,
@@ -1636,14 +1660,33 @@ impl Gemma4Inner {
         prompt: &MxArray,
         processed_images: &[ProcessedGemma4Image],
     ) -> Result<Option<MxArray>> {
-        let (Some(vt), Some(ev)) = (self.vision_tower.as_ref(), self.embed_vision.as_ref()) else {
+        let Some(ev) = self.embed_vision.as_ref() else {
             return Ok(None);
         };
+        // Two disjoint encoders feed the same projection: the SigLIP tower
+        // (dense family) or the unified encoder-free embedder. Exactly one is
+        // present per checkpoint.
         let image_token_id = self.config.image_token_id.unwrap_or(258880);
 
         let mut all_features: Vec<MxArray> = Vec::new();
         for proc in processed_images {
-            let features = vt.forward(&proc.pixel_values)?;
+            let features = if let Some(vt) = self.vision_tower.as_ref() {
+                vt.forward(&proc.pixel_values)?
+            } else if let Some(ve) = self.unified_vision_embedder.as_ref() {
+                let positions = proc.position_ids.as_ref().ok_or_else(|| {
+                    Error::from_reason(
+                        "Unified vision embedder requires per-patch position ids, but none were \
+                         produced by the image processor.",
+                    )
+                })?;
+                let embedded = ve.forward(&proc.pixel_values, positions)?;
+                // Unified features have no batch dim ([n, D]); the SigLIP path
+                // yields [1, n, D]. Add the batch dim so the downstream
+                // concatenate(axis=1) + scaled-text merge is shape-uniform.
+                embedded.expand_dims(0)?
+            } else {
+                return Ok(None);
+            };
             let projected = ev.forward(&features)?;
             all_features.push(projected);
         }
@@ -4850,7 +4893,7 @@ impl Gemma4Model {
     /// `__test__/models/model-loader-gemma4.test.ts`.
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Self {
-        let has_vision = config.vision_config.is_some();
+        let has_vision = config.vision_config.is_some() || config.unified_vision_config.is_some();
         Self {
             thread: None,
             model_id: 0,
@@ -6782,6 +6825,7 @@ mod tests {
             top_k_experts: None,
             moe_intermediate_size: None,
             vision_config: None,
+            unified_vision_config: None,
             image_token_id: None,
             boi_token_id: None,
             eoi_token_id: None,
