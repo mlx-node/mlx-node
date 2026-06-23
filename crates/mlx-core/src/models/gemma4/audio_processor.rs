@@ -181,4 +181,20 @@ mod tests {
         let out = expand_audio_tokens(&tokens, &[], 258881, 256000, 258883).unwrap();
         assert_eq!(out, tokens);
     }
+
+    #[test]
+    fn expand_audio_zero_frames_placeholder() {
+        // Empty audio (0 frames) expands to BOA+EOA with NO audio-token positions.
+        // Paired with `frames_empty_waveform_zero_frames` (features [0,640]), this
+        // gives mask_count == feature_count == 0, which `build_gemma4_audio_embeds`
+        // short-circuits before the (modulo-zero) masked_scatter.
+        let tokens: Vec<u32> = vec![10, 258881, 11];
+        let out = expand_audio_tokens(&tokens, &[0], 258881, 256000, 258883).unwrap();
+        assert_eq!(out, vec![10, 256000, 258883, 11]);
+        assert_eq!(
+            out.iter().filter(|&&t| t == 258881).count(),
+            0,
+            "zero-frame audio yields no audio-token positions"
+        );
+    }
 }

@@ -1804,6 +1804,13 @@ impl Gemma4Inner {
             ));
         }
 
+        // Zero-frame audio has no scatter targets; `masked_scatter` would divide
+        // by an empty source (`indices.remainder(0)`). The scaled text stream is
+        // already correct, so return it unchanged.
+        if feature_count == 0 {
+            return Ok(Some(text_embeds));
+        }
+
         let audio_mask_expanded = audio_mask.expand_dims(-1)?;
         let audio_mask_expanded = audio_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
         Ok(Some(masked_scatter(

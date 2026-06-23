@@ -102,6 +102,14 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .and_then(|v| v.as_str())
             == Some("Gemma4UnifiedForConditionalGeneration");
 
+    // Audio is enabled ONLY for a unified checkpoint whose `audio_config` is a
+    // real (non-null) sub-dict. Keying on mere key-presence regresses every
+    // non-unified gemma4: E2B ships a LEGACY mel `audio_config` dict (model_type
+    // `gemma4`) and 26B/31B ship `audio_config: null` — both yield
+    // `get("audio_config").is_some() == true`, which would wrongly keep+require
+    // `embed_audio.*` and break their loads. Gate on `is_unified` + non-null.
+    let has_audio = is_unified && raw.get("audio_config").is_some_and(|ac| !ac.is_null());
+
     // `text_config.use_bidirectional_attention` (unified: "vision"). Parsed for
     // a stable struct surface; the text-only decode path does not read it.
     let use_bidirectional_attention = text_cfg
@@ -257,29 +265,41 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
 
-        // Audio fields — only meaningful for the unified checkpoint that ships an
-        // `audio_config` sub-dict. Non-unified gemma4 has no `audio_config`, so
-        // `has_audio` stays false and all ids stay None (audio purely additive).
-        has_audio: raw.get("audio_config").is_some(),
-        audio_token_id: raw
-            .get("audio_token_id")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        boa_token_id: raw
-            .get("boa_token_id")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
+        // Audio fields — gated on `has_audio` (unified + non-null `audio_config`)
+        // so every non-unified gemma4 stays inert (all None), even when it carries
+        // a legacy or null `audio_config`.
+        has_audio,
+        audio_token_id: if has_audio {
+            raw.get("audio_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        boa_token_id: if has_audio {
+            raw.get("boa_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
         // The end-of-audio token is stored under `eoa_token_index` but is a real
         // appended token id (parallel to `eoi_token_id`).
-        eoa_token_id: raw
-            .get("eoa_token_index")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        audio_samples_per_token: raw
-            .get("audio_config")
-            .and_then(|ac| ac.get("audio_samples_per_token"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
+        eoa_token_id: if has_audio {
+            raw.get("eoa_token_index")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        audio_samples_per_token: if has_audio {
+            raw.get("audio_config")
+                .and_then(|ac| ac.get("audio_samples_per_token"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
 
         // Paged-attention knobs — opt-in, default to None so existing
         // checkpoints without these keys load unchanged.
@@ -2239,6 +2259,40 @@ mod tests {
         assert_eq!(cfg.eoa_token_id, None);
         assert_eq!(cfg.audio_samples_per_token, None);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_config_non_unified_audio_config_stays_inert() {
+        // Real non-unified gemma4 checkpoints DO carry an `audio_config` key:
+        // E2B ships a legacy mel dict, 26B/31B ship `audio_config: null`. Keying
+        // `has_audio` on mere presence would wrongly enable the unified raw-window
+        // audio path and break their loads. All must stay inert.
+        for audio_config in [
+            // E2B-shape: legacy mel `audio_config` object (would mis-load a
+            // [1536,1536] projection into a 640→hidden embedder).
+            serde_json::json!({ "model_type": "gemma4_unified_audio", "audio_embed_dim": 1536 }),
+            // 26B/31B-shape: explicit null.
+            serde_json::Value::Null,
+        ] {
+            let plain = serde_json::json!({
+                "model_type": "gemma4",
+                "text_config": { "hidden_size": 3840 },
+                "audio_config": audio_config,
+                // Even a stray top-level audio_token_id must not leak in.
+                "audio_token_id": 258881,
+            });
+            let (cfg, dir) = parse_config_from_json(plain);
+            assert!(!cfg.is_unified, "model_type gemma4 must stay non-unified");
+            assert!(
+                !cfg.has_audio,
+                "non-unified gemma4 must keep has_audio=false regardless of audio_config"
+            );
+            assert_eq!(cfg.audio_token_id, None, "audio ids must stay None");
+            assert_eq!(cfg.boa_token_id, None);
+            assert_eq!(cfg.eoa_token_id, None);
+            assert_eq!(cfg.audio_samples_per_token, None);
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// sym8's mandatory f32 `[N]` `.scales` (sibling `.weight` is Int8) must
