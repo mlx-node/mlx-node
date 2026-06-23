@@ -363,6 +363,11 @@ pub(crate) struct Gemma4Inner {
     /// exclusive with `vision_tower` (the SigLIP path).
     pub(crate) unified_vision_embedder: Option<Gemma4UnifiedVisionEmbedder>,
     pub(crate) embed_vision: Option<Gemma4MultimodalEmbedder>,
+    /// Encoder-free unified AUDIO embedder. `Some` only when the checkpoint
+    /// declares an `audio_config` (`config.has_audio`). Structurally identical
+    /// to `embed_vision` (RMSNormNoScale + Linear), but projects raw
+    /// 640-sample audio windows (`audio_embed_dim` → `hidden_size`).
+    pub(crate) embed_audio: Option<Gemma4MultimodalEmbedder>,
     pub(crate) image_processor: Option<Gemma4ImageProcessor>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     /// Lazily-initialized KV caches that persist across chat turns.
@@ -776,6 +781,22 @@ impl Gemma4Inner {
                 (None, None, None, None)
             };
 
+        // Encoder-free unified audio embedder. Built only when the checkpoint
+        // declares an `audio_config` (`has_audio`). The raw-window projection is
+        // Linear(audio_samples_per_token → hidden_size); the embedder's
+        // `set_weight` later validates the [hidden, in] shape against the loaded
+        // [3840, 640] tensor.
+        let embed_audio = if config.has_audio {
+            let in_dim = config.audio_samples_per_token.unwrap_or(640);
+            Some(Gemma4MultimodalEmbedder::new(
+                in_dim,
+                config.hidden_size,
+                config.rms_norm_eps,
+            )?)
+        } else {
+            None
+        };
+
         let model_id = MODEL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Block-paged KV adapter — default-on; opt out via
@@ -941,6 +962,7 @@ impl Gemma4Inner {
             vision_tower,
             unified_vision_embedder,
             embed_vision,
+            embed_audio,
             image_processor,
             tokenizer: None,
             caches: None,
@@ -1726,6 +1748,68 @@ impl Gemma4Inner {
             &text_embeds,
             &image_mask_expanded,
             &image_features,
+        )?))
+    }
+
+    /// Build the residual-stream embeddings for an audio turn: project the raw
+    /// `[n_frames, 640]` audio windows through `embed_audio` and `masked_scatter`
+    /// them into the (scaled) text embedding stream at every `audio_token`
+    /// position.
+    ///
+    /// Mirrors [`build_gemma4_vision_embeds`] but is CAUSAL — audio spans are
+    /// sequential and get NO bidirectional overlay. Only the text embeddings are
+    /// scaled by `sqrt(hidden_size)`; the audio features are inserted unscaled
+    /// (same convention as vision). Returns `None` when the checkpoint has no
+    /// `embed_audio` (text-only / non-unified fallback).
+    ///
+    /// `prompt` is the `[1, prompt_len]` int32 expanded token array (post
+    /// `expand_audio_tokens`); `audio_frames` is the `[n_frames, 640]` f32 tensor
+    /// from `audio_processor::frames_from_pcm`.
+    ///
+    /// The public audio turn dispatch (raw-PCM decode + cores) consumes this; it
+    /// is built and validated ahead of that wiring, so it is intentionally not
+    /// yet called from a production path.
+    #[allow(dead_code)]
+    fn build_gemma4_audio_embeds(
+        &self,
+        prompt: &MxArray,
+        audio_frames: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let Some(ea) = self.embed_audio.as_ref() else {
+            return Ok(None);
+        };
+        let audio_token_id = self.config.audio_token_id.unwrap_or(258881);
+
+        // [n_frames, 640] → [n_frames, hidden_size].
+        let audio_features = ea.forward(audio_frames)?;
+
+        let text_embeds = self.embed_tokens.forward(prompt)?;
+        let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+        let embed_dtype = text_embeds.dtype()?;
+        let audio_features = audio_features.astype(embed_dtype)?;
+
+        let audio_token = MxArray::scalar_int(audio_token_id)?;
+        let audio_mask = prompt.equal(&audio_token)?;
+        let mask_count_arr = audio_mask.astype(DType::Int32)?.sum(None, None)?;
+        mask_count_arr.eval();
+        let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+        let feature_count = audio_features.shape_at(0)?;
+        if mask_count != feature_count {
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!(
+                    "Audio token count ({mask_count}) does not match audio frame count ({feature_count}). \
+                     Check that audio token expansion produced the correct number of frames."
+                ),
+            ));
+        }
+
+        let audio_mask_expanded = audio_mask.expand_dims(-1)?;
+        let audio_mask_expanded = audio_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
+        Ok(Some(masked_scatter(
+            &text_embeds,
+            &audio_mask_expanded,
+            &audio_features,
         )?))
     }
 
@@ -3355,24 +3439,26 @@ impl Gemma4Inner {
         crate::models::gemma4::diagnostic::set_step(-1);
 
         // Unified-vision bidirectional overlay gate: is_unified +
-        // use_bidirectional_attention=="vision" + image tokens present +
-        // prefill (seq_len>1). Audio is Phase 3 and never enters the expanded
-        // stream here, so "no audio" holds structurally. When active, the whole
-        // image block must live in ONE prefill chunk so bidirectionality is not
-        // severed by chunk boundaries.
-        let overlay_full_type_ids: Option<MxArray> = if self.config.is_unified
-            && self.config.use_bidirectional_attention.as_deref() == Some("vision")
-            && prompt_len > 1
-        {
-            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
-            if expanded_tokens.contains(&image_token_id) {
-                Some(super::vision_mask::build_image_token_type_ids(
-                    expanded_tokens,
-                    image_token_id,
-                )?)
-            } else {
-                None
-            }
+        // use_bidirectional_attention=="vision" + image tokens present + no audio
+        // tokens + prefill (seq_len>1). Mixed image+audio prompts stay causal
+        // (audio wins) — see `vision_overlay_active`. When active, the whole image
+        // block must live in ONE prefill chunk so bidirectionality is not severed
+        // by chunk boundaries.
+        let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
+        let has_image = expanded_tokens.contains(&image_token_id);
+        let has_audio = expanded_tokens.contains(&audio_token_id);
+        let overlay_full_type_ids: Option<MxArray> = if super::vision_mask::vision_overlay_active(
+            self.config.is_unified,
+            self.config.use_bidirectional_attention.as_deref() == Some("vision"),
+            has_image,
+            has_audio,
+            prompt_len as usize,
+        ) {
+            Some(super::vision_mask::build_image_token_type_ids(
+                expanded_tokens,
+                image_token_id,
+            )?)
         } else {
             None
         };
@@ -6911,6 +6997,11 @@ mod tests {
             boi_token_id: None,
             eoi_token_id: None,
             vision_soft_tokens_per_image: None,
+            has_audio: false,
+            audio_token_id: None,
+            boa_token_id: None,
+            eoa_token_id: None,
+            audio_samples_per_token: None,
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: use_block_paged,

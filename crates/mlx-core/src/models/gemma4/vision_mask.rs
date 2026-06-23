@@ -15,6 +15,26 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 
+/// Whether the unified-vision bidirectional overlay should be applied for a
+/// prefill.
+///
+/// Ports the mlx-vlm gate (`gemma4/language.py::_make_masks`): the vision block
+/// overlay is enabled only for a unified checkpoint trained with
+/// `use_bidirectional_attention == "vision"`, on a real prefill (`seq_len > 1`),
+/// when image tokens are present AND no audio tokens are present. Mixed
+/// image+audio prompts stay PURELY causal — audio spans are sequential and the
+/// vision block overlay would otherwise dominate. With audio never in the stream
+/// today this only narrows on `has_audio`; it is wired now for correctness.
+pub fn vision_overlay_active(
+    is_unified: bool,
+    use_bidirectional_vision: bool,
+    has_image: bool,
+    has_audio: bool,
+    seq_len: usize,
+) -> bool {
+    is_unified && use_bidirectional_vision && has_image && !has_audio && seq_len > 1
+}
+
 /// Per-position image-token indicator for the expanded prompt: `1` where the
 /// token equals `image_token_id`, else `0`. Shaped `[1, seq_len]` int32.
 ///
@@ -232,6 +252,65 @@ mod tests {
         let mask = read_mask(&out, l);
         let base_flat = read_mask(&base, l);
         assert_eq!(mask, base_flat, "length mismatch must be a no-op");
+    }
+
+    #[test]
+    fn overlay_active_image_only_unified_prefill() {
+        // Unified + bidir-vision + image present + no audio + seq>1 → active.
+        assert!(vision_overlay_active(true, true, true, false, 7));
+    }
+
+    #[test]
+    fn overlay_disabled_when_audio_present() {
+        // Same image-bearing unified prefill, but with audio tokens also present
+        // → overlay OFF (mixed image+audio is causal, audio wins).
+        assert!(!vision_overlay_active(true, true, true, true, 7));
+    }
+
+    #[test]
+    fn overlay_disabled_for_non_image_or_non_unified_or_decode() {
+        assert!(
+            !vision_overlay_active(true, true, false, false, 7),
+            "no image"
+        );
+        assert!(
+            !vision_overlay_active(false, true, true, false, 7),
+            "not unified"
+        );
+        assert!(
+            !vision_overlay_active(true, false, true, false, 7),
+            "not bidir-vision"
+        );
+        assert!(
+            !vision_overlay_active(true, true, true, false, 1),
+            "decode step"
+        );
+    }
+
+    /// An image block that WOULD be bidirectional under image-only becomes
+    /// causal when audio tokens are also present, because the gate returns false
+    /// so no overlay type-ids are built (the prefill keeps the pure causal mask).
+    #[test]
+    fn overlay_gate_keeps_image_block_causal_when_audio_present() {
+        let l = 7;
+        // Image-only: gate active → overlay applied → image block bidirectional.
+        assert!(vision_overlay_active(true, true, true, false, l as usize));
+        let mm = MxArray::from_int32(&[0, 0, 1, 1, 1, 0, 0], &[1, l]).unwrap();
+        let base = causal_keep_mask(l);
+        let with_overlay = apply_bidirectional_vision_overlay(&base, &mm).unwrap();
+        assert!(
+            keep(&read_mask(&with_overlay, l), l, 2, 4),
+            "image-only: query 2 attends forward to key 4"
+        );
+
+        // Image+audio: gate inactive → no overlay built → base causal mask wins,
+        // so the same image-block forward edge is NOT kept.
+        assert!(!vision_overlay_active(true, true, true, true, l as usize));
+        let base_flat = read_mask(&base, l);
+        assert!(
+            !keep(&base_flat, l, 2, 4),
+            "image+audio: query 2 must NOT attend forward to key 4 (causal)"
+        );
     }
 
     #[test]

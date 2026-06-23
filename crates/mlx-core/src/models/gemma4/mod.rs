@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod audio_processor;
 pub mod clippable_linear;
 pub mod config;
 pub mod decoder_layer;

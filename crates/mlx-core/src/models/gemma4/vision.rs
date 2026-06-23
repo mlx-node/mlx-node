@@ -713,3 +713,26 @@ impl Gemma4MultimodalEmbedder {
         self.embedding_projection.forward(&normed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The embedder is input-dim-agnostic (driven by the constructed Linear's
+    /// in/out features). Audio reuses it with a 640→3840 projection, mirroring
+    /// vision's 3840→3840. A synthetic [3840, 640] weight on `[n, 640]` input
+    /// must yield `[n, 3840]` — no real checkpoint needed.
+    #[test]
+    fn multimodal_embedder_audio_dims_project_640_to_3840() {
+        let mut embedder = Gemma4MultimodalEmbedder::new(640, 3840, 1e-6).unwrap();
+        // Synthetic projection weight [out=3840, in=640].
+        let weight = MxArray::from_float32(&vec![0.01f32; 3840 * 640], &[3840, 640]).unwrap();
+        embedder.embedding_projection.set_weight(&weight).unwrap();
+
+        let frames = MxArray::from_float32(&vec![0.5f32; 2 * 640], &[2, 640]).unwrap();
+        let out = embedder.forward(&frames).unwrap();
+        assert_eq!(out.ndim().unwrap(), 2);
+        assert_eq!(out.shape_at(0).unwrap(), 2);
+        assert_eq!(out.shape_at(1).unwrap(), 3840);
+    }
+}
