@@ -93,20 +93,26 @@ pub(crate) fn session_start<B: ChatBackend>(
 /// continue-delta via [`ChatBackend::render_continue_delta`] and run it
 /// through the delta path.
 ///
-/// `images` is the opt-in guard parameter shared by every family:
-/// non-empty input is rejected with the
+/// `images` / `audio` are the opt-in guard parameters shared by every
+/// family: non-empty input is rejected with the
 /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix so the TS
-/// `ChatSession` layer can route image changes back through a fresh
-/// session start.
+/// `ChatSession` layer can route an image/audio change back through a
+/// fresh session start (the continue/delta path is text-only).
 pub(crate) fn session_continue<B: ChatBackend>(
     backend: &mut B,
     user_message: String,
     images: Option<Vec<Uint8Array>>,
+    audio: Option<Vec<Uint8Array>>,
     config: ChatConfig,
 ) -> Result<ChatResult> {
     if images.as_ref().is_some_and(|v| !v.is_empty()) {
         return Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} chat_session_continue is text-only; start a new session with chat_session_start to change the image",
+        )));
+    }
+    if audio.as_ref().is_some_and(|v| !v.is_empty()) {
+        return Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} chat_session_continue is text-only; start a new session with chat_session_start to change the audio",
         )));
     }
     let tokenizer = backend.tokenizer()?;
@@ -189,6 +195,7 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
     backend: &mut B,
     user_message: String,
     images: Option<Vec<Uint8Array>>,
+    audio: Option<Vec<Uint8Array>>,
     config: ChatConfig,
     sink: &dyn ChunkSink,
     cancelled: &AtomicBool,
@@ -202,6 +209,12 @@ pub(crate) fn session_continue_stream<B: ChatBackend>(
     if images.as_ref().is_some_and(|v| !v.is_empty()) {
         sink.send(Err(Error::from_reason(format!(
             "{IMAGE_CHANGE_RESTART_PREFIX} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the image",
+        ))));
+        return;
+    }
+    if audio.as_ref().is_some_and(|v| !v.is_empty()) {
+        sink.send(Err(Error::from_reason(format!(
+            "{IMAGE_CHANGE_RESTART_PREFIX} chat_stream_session_continue is text-only; start a new session with chat_stream_session_start to change the audio",
         ))));
         return;
     }
@@ -420,6 +433,20 @@ fn extract_images_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
     all_images
 }
 
+/// Collect every audio payload from the turn's messages, in order. Mirrors
+/// [`extract_images_from_messages`] for the unified Gemma 4 audio path.
+fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
+    let mut all_audio: Vec<Vec<u8>> = Vec::new();
+    for msg in messages {
+        if let Some(ref audio) = msg.audio {
+            for clip in audio {
+                all_audio.push(clip.to_vec());
+            }
+        }
+    }
+    all_audio
+}
+
 // =====================================================================
 // The turn core
 // =====================================================================
@@ -459,7 +486,7 @@ fn chat_turn_core<B: ChatBackend>(
     // gemma4 adds its manual `<|turn>` fallback). Delta: cached history +
     // delta (the delta paths skip the template entirely — the caller owns
     // cache coherence by construction).
-    let (tokens, images, is_delta, prior_cached_len) = match &input {
+    let (tokens, images, audio, is_delta, prior_cached_len) = match &input {
         TurnInput::Fresh { messages } => {
             // Pre-render image guard — TS `ChatSession` restart-routing
             // contract: a text-only backend MUST reject an image-bearing
@@ -482,14 +509,25 @@ fn chat_turn_core<B: ChatBackend>(
                     "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
                 )));
             }
+            // Audio mirrors the image guard: a fresh audio-bearing turn against
+            // a model with no audio support is rejected with the typed
+            // restart prefix before `render_prompt`. `supports_audio()`
+            // defaults to `false`, so every non-audio family rejects here and
+            // image-only / text-only flows stay byte-identical.
+            let audio = extract_audio_from_messages(messages);
+            if !audio.is_empty() && !backend.supports_audio() {
+                return Err(Error::from_reason(format!(
+                    "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
+                )));
+            }
             let tokens = backend.render_prompt(&tokenizer, messages, &config)?;
-            (tokens, images, false, 0usize)
+            (tokens, images, audio, false, 0usize)
         }
         TurnInput::Delta { delta_tokens } => {
             let prior = backend.cached_token_history().len();
             let mut full = backend.cached_token_history().to_vec();
             full.extend_from_slice(delta_tokens);
-            (full, Vec::new(), true, prior)
+            (full, Vec::new(), Vec::new(), true, prior)
         }
     };
 
@@ -506,6 +544,7 @@ fn chat_turn_core<B: ChatBackend>(
             sink: streaming.as_ref().map(|s| s.sink),
             cancelled: streaming.as_ref().map(|s| s.cancelled),
             images: &images,
+            audio: &audio,
         };
 
         // Vision probe. Text-only families were already rejected by the
@@ -515,11 +554,11 @@ fn chat_turn_core<B: ChatBackend>(
         // and they MUST take the override (the generic flow below is
         // text-only, so silently falling through would drop the
         // images).
-        if !images.is_empty() {
+        if !images.is_empty() || !audio.is_empty() {
             return match backend.vision_turn(&mut wt_args) {
                 Some(out) => whole_turn_outcome(out, streaming.is_some()),
                 None => Err(Error::from_reason(
-                    "model reports supports_images() but provided no vision_turn override",
+                    "model reports supports_images()/supports_audio() but provided no vision_turn override",
                 )),
             };
         }

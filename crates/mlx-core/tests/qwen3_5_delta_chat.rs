@@ -125,6 +125,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -203,7 +204,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let result = model
-            .chat_session_continue((*next_user).to_string(), None, Some(cfg))
+            .chat_session_continue((*next_user).to_string(), None, None, Some(cfg))
             .await
             .expect("delta chat failed");
         let ttft = result
@@ -657,7 +658,7 @@ async fn session_continue_rejects_images_with_restart_prefix() {
 
     let cfg = chat_config_default(32);
     let err = model
-        .chat_session_continue("What now?".to_string(), images, Some(cfg))
+        .chat_session_continue("What now?".to_string(), images, None, Some(cfg))
         .await
         .expect_err("chat_session_continue with images should error");
     let msg = err.reason.clone();
@@ -764,6 +765,7 @@ async fn session_start_accepts_images_for_vlm() {
         is_error: None,
         reasoning_content: None,
         images: Some(vec![image_uint8]),
+        audio: None,
     };
 
     let cfg = chat_config_default(32);

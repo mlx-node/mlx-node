@@ -424,6 +424,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }
     }
 
@@ -437,6 +438,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: Some(images),
+            audio: None,
         }
     }
 
@@ -453,6 +455,7 @@ mod tests {
             is_error: None,
             reasoning_content: Some(reasoning.to_string()),
             images: None,
+            audio: None,
         }
     }
 
@@ -475,6 +478,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }
     }
 
@@ -487,6 +491,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }
     }
 

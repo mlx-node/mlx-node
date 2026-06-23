@@ -1570,6 +1570,7 @@ impl GRPOTrainingEngine {
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None, // Images not used in training
+                        audio: None,  // Audio not used in training
                     })
                     .collect()
             })

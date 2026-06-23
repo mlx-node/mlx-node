@@ -143,6 +143,10 @@ pub struct ChatMessage {
     #[napi(ts_type = "Array<Uint8Array> | undefined")]
     #[serde(skip)]
     pub images: Option<Vec<Uint8Array>>,
+    /// Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer)
+    #[napi(ts_type = "Array<Uint8Array> | undefined")]
+    #[serde(skip)]
+    pub audio: Option<Vec<Uint8Array>>,
 }
 
 impl std::fmt::Debug for ChatMessage {
@@ -160,6 +164,13 @@ impl std::fmt::Debug for ChatMessage {
                     .images
                     .as_ref()
                     .map(|imgs| imgs.iter().map(|i| i.len()).collect::<Vec<_>>()),
+            )
+            .field(
+                "audio",
+                &self
+                    .audio
+                    .as_ref()
+                    .map(|clips| clips.iter().map(|a| a.len()).collect::<Vec<_>>()),
             )
             .finish()
     }
@@ -990,6 +1001,12 @@ impl Qwen3Tokenizer {
                         .map(|img| Uint8Array::with_data_copied(img.as_ref()))
                         .collect()
                 }),
+                audio: msg.audio.as_ref().map(|clips| {
+                    clips
+                        .iter()
+                        .map(|clip| Uint8Array::with_data_copied(clip.as_ref()))
+                        .collect()
+                }),
             })
             .collect()
     }
@@ -1633,6 +1650,7 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
     obj.insert("role".to_string(), serde_json::json!(msg.role));
 
     let has_images = msg.images.as_ref().is_some_and(|imgs| !imgs.is_empty());
+    let has_audio = msg.audio.as_ref().is_some_and(|clips| !clips.is_empty());
 
     // For tool-role messages flagged with the structured `is_error`
     // field, prepend the model-facing error marker to the wire content
@@ -1645,14 +1663,26 @@ pub(crate) fn serialize_message_for_jinja(msg: &ChatMessage) -> serde_json::Valu
         std::borrow::Cow::Borrowed(msg.content.as_str())
     };
 
-    if has_images && msg.role == "user" {
+    if (has_images || has_audio) && msg.role == "user" {
         let mut parts: Vec<serde_json::Value> = Vec::new();
         if !rendered_content.is_empty() {
             parts.push(serde_json::json!({ "type": "text", "text": rendered_content.as_ref() }));
         }
-        // SAFETY: `is_some_and` above ensured this is Some and non-empty.
-        for _ in msg.images.as_ref().unwrap() {
-            parts.push(serde_json::json!({ "type": "image" }));
+        // Image parts first, then audio parts — matching mlx-vlm's
+        // `_format_list_with_image` ordering (image content followed by
+        // appended audio messages). The Gemma 4 chat template emits a single
+        // `<|image|>` / `<|audio|>` placeholder per part; the per-modality
+        // token expanders (`expand_image_tokens` / `expand_audio_tokens`)
+        // grow them into their full spans during prefill.
+        if let Some(images) = msg.images.as_ref() {
+            for _ in images {
+                parts.push(serde_json::json!({ "type": "image" }));
+            }
+        }
+        if let Some(clips) = msg.audio.as_ref() {
+            for _ in clips {
+                parts.push(serde_json::json!({ "type": "audio" }));
+            }
         }
         obj.insert("content".to_string(), serde_json::Value::Array(parts));
     } else {
@@ -1745,6 +1775,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images,
+            audio: None,
         }
     }
 
@@ -1758,6 +1789,65 @@ mod tests {
         assert_eq!(v["role"], "user");
         assert!(v["content"].is_string());
         assert_eq!(v["content"], "Hello");
+    }
+
+    /// Build a user turn carrying `num_images` images and `num_audio` audio
+    /// clips, mirroring `user_msg` for the multimodal serializer tests.
+    fn user_mm_msg(content: &str, num_images: usize, num_audio: usize) -> ChatMessage {
+        let images = (num_images > 0).then(|| {
+            (0..num_images)
+                .map(|i| Uint8Array::new(vec![i as u8; 4]))
+                .collect()
+        });
+        let audio = (num_audio > 0).then(|| {
+            (0..num_audio)
+                .map(|i| Uint8Array::new(vec![i as u8; 8]))
+                .collect()
+        });
+        ChatMessage {
+            role: "user".to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            images,
+            audio,
+        }
+    }
+
+    #[test]
+    fn user_with_one_audio_emits_text_and_audio_part() {
+        let msg = user_mm_msg("Transcribe.", 0, 1);
+        let v = serialize_message_for_jinja(&msg);
+        let parts = v["content"].as_array().expect("content is an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "Transcribe.");
+        assert_eq!(parts[1]["type"], "audio");
+    }
+
+    #[test]
+    fn user_with_image_and_audio_orders_image_then_audio() {
+        // Mixed image+audio user turn: text, then every image part, then every
+        // audio part (matches mlx-vlm `_format_list_with_image` ordering).
+        let msg = user_mm_msg("Look and listen.", 2, 1);
+        let v = serialize_message_for_jinja(&msg);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[2]["type"], "image");
+        assert_eq!(parts[3]["type"], "audio");
+    }
+
+    #[test]
+    fn user_audio_without_text_omits_text_part() {
+        let msg = user_mm_msg("", 0, 1);
+        let v = serialize_message_for_jinja(&msg);
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "audio");
     }
 
     #[test]
@@ -1901,6 +1991,7 @@ mod tests {
                     Uint8Array::new(vec![0x01, 0x02, 0x03, 0x04]),
                     Uint8Array::new(vec![0xaa, 0xbb, 0xcc]),
                 ]),
+                audio: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -1910,6 +2001,7 @@ mod tests {
                 is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             },
         ];
 
@@ -1964,6 +2056,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: Some(vec![Uint8Array::new(vec![0; 4])]),
+            audio: None,
         }];
 
         let sanitized = Qwen3Tokenizer::sanitize_messages_public(&msgs);
@@ -2146,6 +2239,7 @@ mod tests {
                 is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -2155,6 +2249,7 @@ mod tests {
                 is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             },
         ];
 
@@ -2204,6 +2299,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         };
         let with_prompt = Qwen3Tokenizer::render_chat_template_jinja2(
             template,
@@ -2379,6 +2475,7 @@ mod tests {
                 is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -2388,6 +2485,7 @@ mod tests {
                 is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             },
         ];
 
@@ -2451,6 +2549,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }];
         let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
             &tmpl, &msgs, None, true, None, "<bos>", "<eos>",
@@ -2502,6 +2601,7 @@ mod tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }];
         let tools = vec![ToolDefinition {
             r#type: "function".to_string(),
@@ -2561,6 +2661,7 @@ mod tests {
             is_error: None,
             reasoning_content: Some("because".to_string()),
             images: None,
+            audio: None,
         };
         // Minimal template that drives the fixture map through `.get()`
         // three different ways — hit, miss (no default), miss (with
@@ -2604,6 +2705,7 @@ mod tests {
             is_error: None,
             reasoning_content: Some("think".to_string()),
             images: None,
+            audio: None,
         };
         let v = serialize_message_for_jinja(&msg);
 
@@ -2724,6 +2826,7 @@ mod tests {
                     is_error: None,
                     reasoning_content: None,
                     images: None,
+                    audio: None,
                 },
                 ChatMessage {
                     role: "assistant".to_string(),
@@ -2737,6 +2840,7 @@ mod tests {
                     is_error: None,
                     reasoning_content: Some(reasoning.to_string()),
                     images: None,
+                    audio: None,
                 },
             ]
         };
@@ -2799,6 +2903,7 @@ mod tests {
             is_error,
             reasoning_content: None,
             images: None,
+            audio: None,
         }
     }
 

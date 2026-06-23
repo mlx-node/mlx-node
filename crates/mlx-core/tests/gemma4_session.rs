@@ -57,6 +57,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -110,6 +111,7 @@ async fn gemma4_session_start_prefix_reuse_append_hit() {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         },
         user_message("And another one?"),
     ];

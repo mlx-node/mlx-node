@@ -138,6 +138,7 @@ fn user_message_with_image(content: &str, image: &[u8]) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: Some(vec![Uint8Array::new(image.to_vec())]),
+        audio: None,
     }
 }
 
@@ -150,6 +151,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -302,6 +304,7 @@ async fn gemma4_paged_vlm_continue_is_rejected() {
     let cont = paged_model
         .chat_session_continue(
             "Answer in one word: is there text?".to_string(),
+            None,
             None,
             Some(correctness_chat_config(48)),
         )

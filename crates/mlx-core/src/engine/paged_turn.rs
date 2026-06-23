@@ -934,6 +934,7 @@ mod tests {
             sink: None,
             cancelled: None,
             images: &[],
+            audio: &[],
         };
 
         let out = run_paged_turn(&mut backend, &mut args)
@@ -1084,6 +1085,7 @@ mod tests {
             sink: Some(&sink),
             cancelled: Some(&cancelled),
             images: &[],
+            audio: &[],
         };
 
         let out = run_paged_turn(&mut backend, &mut args)
@@ -1215,6 +1217,7 @@ mod tests {
             sink: None,
             cancelled: None,
             images: &[],
+            audio: &[],
         };
 
         let out = run_paged_turn(&mut backend, &mut args);
@@ -1478,6 +1481,7 @@ mod tests {
             sink: None,
             cancelled: None,
             images: &[],
+            audio: &[],
         };
 
         let out = run_paged_turn(&mut backend, &mut args)

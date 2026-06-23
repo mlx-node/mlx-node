@@ -116,12 +116,13 @@ macro_rules! chat_napi_surface {
             /// `ChatSession` layer can route image-changes back through a
             /// fresh `chatSessionStart`.
             #[napi(
-                ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
+                ts_args_type = "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined"
             )]
             pub async fn chat_session_continue(
                 &self,
                 user_message: String,
                 images: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
+                audio: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
             ) -> ::napi::Result<$crate::engine::types::ChatResult> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
@@ -131,6 +132,7 @@ macro_rules! chat_napi_surface {
                         $crate::engine::cmd::ChatCmd::SessionContinue {
                             user_message,
                             images,
+                            audio,
                             config,
                             reply,
                         },
@@ -207,6 +209,7 @@ macro_rules! chat_napi_surface {
                 &self,
                 user_message: String,
                 images: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
+                audio: ::std::option::Option<::std::vec::Vec<::napi::bindgen_prelude::Uint8Array>>,
                 config: ::std::option::Option<$crate::engine::types::ChatConfig>,
                 callback: ::napi::threadsafe_function::ThreadsafeFunction<
                     $crate::engine::types::ChatStreamChunk,
@@ -221,6 +224,7 @@ macro_rules! chat_napi_surface {
                     $crate::engine::cmd::ChatCmd::StreamSessionContinue {
                         user_message,
                         images,
+                        audio,
                         config,
                         stream_tx: plumbing.stream_tx,
                         cancelled: plumbing.cancelled,
@@ -326,7 +330,7 @@ macro_rules! chat_napi_image_guard {
             )));
         }
     };
-    ($messages:ident, $self:ident, { vision: $has_vision:ident }) => {
+    ($messages:ident, $self:ident, { vision: $has_vision:ident, audio: $has_audio:ident }) => {
         if !$self.$has_vision
             && $messages
                 .iter()
@@ -334,6 +338,15 @@ macro_rules! chat_napi_image_guard {
         {
             return Err(::napi::Error::from_reason(
                 "Images provided but model has no vision support (no vision_config in config.json)",
+            ));
+        }
+        if !$self.$has_audio
+            && $messages
+                .iter()
+                .any(|m| m.audio.as_ref().is_some_and(|clips| !clips.is_empty()))
+        {
+            return Err(::napi::Error::from_reason(
+                "Audio provided but model has no audio support (no audio_config in config.json)",
             ));
         }
     };

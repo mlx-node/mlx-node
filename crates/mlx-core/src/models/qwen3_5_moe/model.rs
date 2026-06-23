@@ -7273,6 +7273,7 @@ impl Qwen3_5MoeModel {
             .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinue {
                 user_message,
                 images,
+                audio: None,
                 config,
                 stream_tx,
                 cancelled: cancelled_inner,
@@ -7368,7 +7369,7 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: none,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 

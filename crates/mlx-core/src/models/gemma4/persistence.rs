@@ -2082,23 +2082,32 @@ impl Gemma4Model {
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
+                let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.paged_adapter.is_some();
                 Ok((
                     inner,
-                    (model_id, has_vision, cache_limit_guard, paged_active),
+                    (
+                        model_id,
+                        has_vision,
+                        has_audio,
+                        cache_limit_guard,
+                        paged_active,
+                    ),
                 ))
             },
             crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
-        let (model_id, has_vision, cache_limit_guard, paged_active) = init_rx
-            .await
-            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active) =
+            init_rx
+                .await
+                .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
             thread: Some(thread),
             model_id,
             has_vision,
+            has_audio,
             initialized: true,
             paged_active,
             _cache_limit_guard: Some(cache_limit_guard),

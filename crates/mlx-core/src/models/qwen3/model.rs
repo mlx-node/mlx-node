@@ -1135,6 +1135,7 @@ impl Qwen3Inner {
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None,
+                        audio: None,
                     })
                     .collect()
             })
@@ -1162,6 +1163,7 @@ impl Qwen3Inner {
                         is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None,
+                        audio: None,
                     })
                     .collect();
                 let result = self.generate_sync(msgs, config.clone())?;
@@ -3675,7 +3677,7 @@ crate::models::chat_napi::chat_napi_surface! {
     thread: direct,
     image_guard: text_only,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 

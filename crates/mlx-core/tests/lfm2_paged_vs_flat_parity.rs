@@ -146,6 +146,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn assistant_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -681,11 +683,11 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 
     let user2 = "And in another word?";
     let r2_flat = flat_model
-        .chat_session_continue(user2.to_string(), None, Some(parity_chat_config(32)))
+        .chat_session_continue(user2.to_string(), None, None, Some(parity_chat_config(32)))
         .await
         .expect("turn 2 flat chat_session_continue failed");
     let r2_paged = paged_model
-        .chat_session_continue(user2.to_string(), None, Some(parity_chat_config(32)))
+        .chat_session_continue(user2.to_string(), None, None, Some(parity_chat_config(32)))
         .await
         .expect("turn 2 paged chat_session_continue failed");
 

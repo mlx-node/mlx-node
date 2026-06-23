@@ -387,6 +387,12 @@ pub(crate) struct Gemma4Inner {
     /// full session restart). `None` when no session is active or the
     /// session is text-only.
     pub(crate) cached_image_key: Option<u64>,
+    /// Content hash of the audio set associated with the live cache. Audio
+    /// counterpart of `cached_image_key`: set after an audio prefill so a
+    /// follow-up text delta is rejected (the continue path is text-only) and
+    /// a follow-up audio turn cold-restarts. `None` for text-only / image-only
+    /// sessions.
+    pub(crate) cached_audio_key: Option<u64>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
     /// **Opt-in via `Gemma4Config::use_block_paged_cache`**. Gemma4's
@@ -431,6 +437,11 @@ pub struct Gemma4Model {
     /// without round-tripping to the model thread. The actual image
     /// processor lives on `Gemma4Inner` and runs on the model thread.
     pub(crate) has_vision: bool,
+    /// Whether the loaded config declares an `audio_config` (unified Gemma 4
+    /// audio support, `Gemma4Config::has_audio`). Mirrored here so the NAPI
+    /// image-guard can fail fast on audio inputs to a model with no audio
+    /// support without round-tripping to the model thread.
+    pub(crate) has_audio: bool,
     /// Whether the model was loaded with real weights. `false` for
     /// `new Gemma4Model(config)` calls that never called `load()`.
     /// Session methods check this and refuse to dispatch when false,
@@ -968,6 +979,7 @@ impl Gemma4Inner {
             caches: None,
             cached_token_history: Vec::new(),
             cached_image_key: None,
+            cached_audio_key: None,
             paged_adapter,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
@@ -1038,6 +1050,7 @@ impl Gemma4Inner {
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_audio_key = None;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
@@ -1670,163 +1683,224 @@ impl Gemma4Inner {
         Ok((expanded, processed_images, new_image_key))
     }
 
-    /// Build the merged image+text input embeddings for a vision prefill.
+    /// Decode raw (encoded) audio bytes and expand the rendered prompt's
+    /// per-clip `<|audio|>` placeholders into `boa + audio×n_frames + eoa`
+    /// spans. The audio counterpart of [`Self::prepare_vision_tokens`].
     ///
-    /// Runs the vision tower on each processed image, projects features, then
-    /// `masked_scatter`s them into the scaled text embeddings at the
-    /// `image_token` positions. Returns `None` when the checkpoint lacks a
-    /// vision tower (text-only fallback). Shared by the flat and paged vision
-    /// cores so the merge math is identical across cache topologies.
+    /// Each clip is decoded (`decode_wav_to_pcm`) into a mono 16 kHz f32
+    /// waveform and framed (`frames_from_pcm`) into `[n_frames, 640]` raw
+    /// windows; the per-clip frame counts drive `expand_audio_tokens`. All
+    /// clips' frames are concatenated (axis 0) into a single
+    /// `[total_frames, 640]` tensor so the merge scatter feeds them in order.
+    /// `tokens` is the (possibly image-expanded) token stream; the audio
+    /// expansion runs on top of it, leaving image spans untouched.
+    fn prepare_audio_tokens(
+        &self,
+        tokens: &[u32],
+        raw_audio: &[Vec<u8>],
+    ) -> Result<(Vec<u32>, MxArray, Option<u64>)> {
+        let spt = self.config.audio_samples_per_token.unwrap_or(640) as usize;
+        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
+        let boa_token_id = self.config.boa_token_id.unwrap_or(256000) as u32;
+        let eoa_token_id = self.config.eoa_token_id.unwrap_or(258883) as u32;
+
+        let mut per_clip_frames: Vec<MxArray> = Vec::with_capacity(raw_audio.len());
+        let mut n_frames_per_clip: Vec<usize> = Vec::with_capacity(raw_audio.len());
+        for bytes in raw_audio {
+            let pcm = super::audio_processor::decode_wav_to_pcm(bytes)?;
+            let frames = super::audio_processor::frames_from_pcm(&pcm, spt)?;
+            let n = frames.shape_at(0)? as usize;
+            n_frames_per_clip.push(n);
+            per_clip_frames.push(frames);
+        }
+
+        let audio_frames = if per_clip_frames.len() == 1 {
+            per_clip_frames.remove(0)
+        } else {
+            let refs: Vec<&MxArray> = per_clip_frames.iter().collect();
+            MxArray::concatenate_many(refs, Some(0))?
+        };
+
+        let expanded = super::audio_processor::expand_audio_tokens(
+            tokens,
+            &n_frames_per_clip,
+            audio_token_id,
+            boa_token_id,
+            eoa_token_id,
+        )?;
+
+        // Audio uses the same byte-identity cache key as images so an
+        // audio-change cold-restarts the session server-side.
+        let new_audio_key = Some(engine::compute_image_cache_key(raw_audio));
+
+        Ok((expanded, audio_frames, new_audio_key))
+    }
+
+    /// Build the merged multimodal+text input embeddings for a prefill.
     ///
-    /// `prompt` is the `[1, prompt_len]` int32 expanded token array.
-    fn build_gemma4_vision_embeds(
+    /// Scatters image features (`@image_token_id`) AND audio features
+    /// (`@audio_token_id`) into the SAME `sqrt(hidden)`-scaled text stream
+    /// via chained `masked_scatter`s. Image-only turns skip the audio scatter
+    /// (the image scatter math matches the prior vision-only prefill exactly);
+    /// audio-only turns skip the image scatter. Returns `None` only when
+    /// neither modality contributes features (text-only fallback).
+    fn build_gemma4_multimodal_embeds(
         &self,
         prompt: &MxArray,
         processed_images: &[ProcessedGemma4Image],
+        audio_frames: Option<&MxArray>,
     ) -> Result<Option<MxArray>> {
-        let Some(ev) = self.embed_vision.as_ref() else {
+        let has_image_features = !processed_images.is_empty() && self.embed_vision.is_some();
+        let has_audio_features = audio_frames.is_some() && self.embed_audio.is_some();
+        if !has_image_features && !has_audio_features {
             return Ok(None);
-        };
-        // Two disjoint encoders feed the same projection: the SigLIP tower
-        // (dense family) or the unified encoder-free embedder. Exactly one is
-        // present per checkpoint.
-        let image_token_id = self.config.image_token_id.unwrap_or(258880);
-
-        let mut all_features: Vec<MxArray> = Vec::new();
-        for proc in processed_images {
-            let features = if let Some(vt) = self.vision_tower.as_ref() {
-                vt.forward(&proc.pixel_values)?
-            } else if let Some(ve) = self.unified_vision_embedder.as_ref() {
-                let positions = proc.position_ids.as_ref().ok_or_else(|| {
-                    Error::from_reason(
-                        "Unified vision embedder requires per-patch position ids, but none were \
-                         produced by the image processor.",
-                    )
-                })?;
-                let embedded = ve.forward(&proc.pixel_values, positions)?;
-                // Unified features have no batch dim ([n, D]); the SigLIP path
-                // yields [1, n, D]. Add the batch dim so the downstream
-                // concatenate(axis=1) + scaled-text merge is shape-uniform.
-                embedded.expand_dims(0)?
-            } else {
-                return Ok(None);
-            };
-            let projected = ev.forward(&features)?;
-            all_features.push(projected);
         }
-        let image_features = if all_features.len() == 1 {
-            all_features.remove(0)
-        } else {
-            let refs: Vec<&MxArray> = all_features.iter().collect();
-            MxArray::concatenate_many(refs, Some(1))?
-        };
 
+        // Base scaled text stream (built once; both scatters write into it).
         let text_embeds = self.embed_tokens.forward(prompt)?;
-        let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-        let embed_dtype = text_embeds.dtype()?;
-        let image_features = image_features.astype(embed_dtype)?;
+        let mut merged = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+        let embed_dtype = merged.dtype()?;
 
-        let image_token = MxArray::scalar_int(image_token_id)?;
-        let image_mask = prompt.equal(&image_token)?;
-        let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
-        mask_count_arr.eval();
-        let mask_count = mask_count_arr.item_at_int32(0)? as i64;
-        let feature_count = image_features.shape_at(1)?;
-        if mask_count != feature_count {
-            return Err(Error::new(
-                Status::GenericFailure,
-                format!(
-                    "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
-                     Check that image token expansion produced the correct number of tokens."
-                ),
-            ));
+        // Image scatter @ image_token_id.
+        if has_image_features {
+            let ev = self.embed_vision.as_ref().unwrap();
+            let image_token_id = self.config.image_token_id.unwrap_or(258880);
+            let mut all_features: Vec<MxArray> = Vec::new();
+            for proc in processed_images {
+                let features = if let Some(vt) = self.vision_tower.as_ref() {
+                    vt.forward(&proc.pixel_values)?
+                } else if let Some(ve) = self.unified_vision_embedder.as_ref() {
+                    let positions = proc.position_ids.as_ref().ok_or_else(|| {
+                        Error::from_reason(
+                            "Unified vision embedder requires per-patch position ids, but none \
+                             were produced by the image processor.",
+                        )
+                    })?;
+                    ve.forward(&proc.pixel_values, positions)?.expand_dims(0)?
+                } else {
+                    return Err(Error::from_reason(
+                        "Image features requested but no vision tower / unified embedder present",
+                    ));
+                };
+                all_features.push(ev.forward(&features)?);
+            }
+            let image_features = if all_features.len() == 1 {
+                all_features.remove(0)
+            } else {
+                let refs: Vec<&MxArray> = all_features.iter().collect();
+                MxArray::concatenate_many(refs, Some(1))?
+            };
+            let image_features = image_features.astype(embed_dtype)?;
+
+            let image_token = MxArray::scalar_int(image_token_id)?;
+            let image_mask = prompt.equal(&image_token)?;
+            let mask_count_arr = image_mask.astype(DType::Int32)?.sum(None, None)?;
+            mask_count_arr.eval();
+            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+            let feature_count = image_features.shape_at(1)?;
+            if mask_count != feature_count {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Image token count ({mask_count}) does not match vision feature count ({feature_count}). \
+                         Check that image token expansion produced the correct number of tokens."
+                    ),
+                ));
+            }
+            let image_mask_expanded = image_mask.expand_dims(-1)?.broadcast_to(&merged.shape()?)?;
+            merged = masked_scatter(&merged, &image_mask_expanded, &image_features)?;
         }
 
-        let image_mask_expanded = image_mask.expand_dims(-1)?;
-        let image_mask_expanded = image_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
-        Ok(Some(masked_scatter(
-            &text_embeds,
-            &image_mask_expanded,
-            &image_features,
-        )?))
+        // Audio scatter @ audio_token_id (CAUSAL; audio features unscaled).
+        if has_audio_features {
+            let ea = self.embed_audio.as_ref().unwrap();
+            let audio_token_id = self.config.audio_token_id.unwrap_or(258881);
+            let audio_features = ea.forward(audio_frames.unwrap())?.astype(embed_dtype)?;
+
+            let audio_token = MxArray::scalar_int(audio_token_id)?;
+            let audio_mask = prompt.equal(&audio_token)?;
+            let mask_count_arr = audio_mask.astype(DType::Int32)?.sum(None, None)?;
+            mask_count_arr.eval();
+            let mask_count = mask_count_arr.item_at_int32(0)? as i64;
+            let feature_count = audio_features.shape_at(0)?;
+            if mask_count != feature_count {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    format!(
+                        "Audio token count ({mask_count}) does not match audio frame count ({feature_count}). \
+                         Check that audio token expansion produced the correct number of frames."
+                    ),
+                ));
+            }
+            // Zero-frame audio has no scatter targets; leave the stream as-is
+            // (a `masked_scatter` over an empty source would divide by zero).
+            if feature_count > 0 {
+                let audio_mask_expanded =
+                    audio_mask.expand_dims(-1)?.broadcast_to(&merged.shape()?)?;
+                merged = masked_scatter(&merged, &audio_mask_expanded, &audio_features)?;
+            }
+        }
+
+        Ok(Some(merged))
     }
 
-    /// Build the residual-stream embeddings for an audio turn: project the raw
-    /// `[n_frames, 640]` audio windows through `embed_audio` and `masked_scatter`
-    /// them into the (scaled) text embedding stream at every `audio_token`
-    /// position.
+    /// Prepare the merged multimodal prompt for a paged prefill: expand image
+    /// placeholders (when images present) then audio placeholders (when audio
+    /// present) on the rendered token stream, and decode/frame the audio.
     ///
-    /// Mirrors [`build_gemma4_vision_embeds`] but is CAUSAL — audio spans are
-    /// sequential and get NO bidirectional overlay. Only the text embeddings are
-    /// scaled by `sqrt(hidden_size)`; the audio features are inserted unscaled
-    /// (same convention as vision). Returns `None` when the checkpoint has no
-    /// `embed_audio` (text-only / non-unified fallback).
-    ///
-    /// `prompt` is the `[1, prompt_len]` int32 expanded token array (post
-    /// `expand_audio_tokens`); `audio_frames` is the `[n_frames, 640]` f32 tensor
-    /// from `audio_processor::frames_from_pcm`.
-    ///
-    /// The public audio turn dispatch (raw-PCM decode + cores) consumes this; it
-    /// is built and validated ahead of that wiring, so it is intentionally not
-    /// yet called from a production path.
-    #[allow(dead_code)]
-    fn build_gemma4_audio_embeds(
+    /// Returns `(tokens, processed_images, audio_frames, new_image_key,
+    /// new_audio_key)`. Image-only turns never touch the audio path and leave
+    /// `audio_frames`/`new_audio_key` as `None` (byte-identical to the old
+    /// vision-only flow); audio-only turns never run the image processor and
+    /// leave `processed_images` empty + `new_image_key` `None`.
+    #[allow(clippy::type_complexity)]
+    fn prepare_multimodal_tokens(
         &self,
-        prompt: &MxArray,
-        audio_frames: &MxArray,
-    ) -> Result<Option<MxArray>> {
-        let Some(ea) = self.embed_audio.as_ref() else {
-            return Ok(None);
+        rendered_tokens: &[u32],
+        raw_images: &[Vec<u8>],
+        raw_audio: &[Vec<u8>],
+    ) -> Result<(
+        Vec<u32>,
+        Vec<ProcessedGemma4Image>,
+        Option<MxArray>,
+        Option<u64>,
+        Option<u64>,
+    )> {
+        // Image expansion (only when images present — keeps audio-only turns
+        // off the image processor and leaves `new_image_key` None).
+        let (mut tokens, processed_images, new_image_key) = if raw_images.is_empty() {
+            (rendered_tokens.to_vec(), Vec::new(), None)
+        } else {
+            self.prepare_vision_tokens(rendered_tokens, raw_images)?
         };
-        let audio_token_id = self.config.audio_token_id.unwrap_or(258881);
 
-        // [n_frames, 640] → [n_frames, hidden_size].
-        let audio_features = ea.forward(audio_frames)?;
-
-        let text_embeds = self.embed_tokens.forward(prompt)?;
-        let text_embeds = text_embeds.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-        let embed_dtype = text_embeds.dtype()?;
-        let audio_features = audio_features.astype(embed_dtype)?;
-
-        let audio_token = MxArray::scalar_int(audio_token_id)?;
-        let audio_mask = prompt.equal(&audio_token)?;
-        let mask_count_arr = audio_mask.astype(DType::Int32)?.sum(None, None)?;
-        mask_count_arr.eval();
-        let mask_count = mask_count_arr.item_at_int32(0)? as i64;
-        let feature_count = audio_features.shape_at(0)?;
-        if mask_count != feature_count {
-            return Err(Error::new(
-                Status::GenericFailure,
-                format!(
-                    "Audio token count ({mask_count}) does not match audio frame count ({feature_count}). \
-                     Check that audio token expansion produced the correct number of frames."
-                ),
-            ));
+        // Audio expansion on top of the (possibly image-expanded) stream.
+        let mut audio_frames: Option<MxArray> = None;
+        let mut new_audio_key: Option<u64> = None;
+        if !raw_audio.is_empty() {
+            let (expanded, frames, audio_key) = self.prepare_audio_tokens(&tokens, raw_audio)?;
+            tokens = expanded;
+            audio_frames = Some(frames);
+            new_audio_key = audio_key;
         }
 
-        // Zero-frame audio has no scatter targets; `masked_scatter` would divide
-        // by an empty source (`indices.remainder(0)`). The scaled text stream is
-        // already correct, so return it unchanged.
-        if feature_count == 0 {
-            return Ok(Some(text_embeds));
-        }
-
-        let audio_mask_expanded = audio_mask.expand_dims(-1)?;
-        let audio_mask_expanded = audio_mask_expanded.broadcast_to(&text_embeds.shape()?)?;
-        Ok(Some(masked_scatter(
-            &text_embeds,
-            &audio_mask_expanded,
-            &audio_features,
-        )?))
+        Ok((
+            tokens,
+            processed_images,
+            audio_frames,
+            new_image_key,
+            new_audio_key,
+        ))
     }
 
     /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
     /// non-streaming.
     ///
-    /// Shared image-prep (`prepare_vision_tokens` to expand `<|image|>`
-    /// tokens, `build_gemma4_vision_embeds` to `masked_scatter` features
-    /// into the residual) writes full-attention K/V into the paged adapter
-    /// pool. Sliding layers still use the flat rotating caches.
+    /// Shared multimodal prep (`prepare_multimodal_tokens` to expand
+    /// `<|image|>` / `<|audio|>` placeholders, `build_gemma4_multimodal_embeds`
+    /// to `masked_scatter` image+audio features into the residual) writes
+    /// full-attention K/V into the paged adapter pool. Sliding layers still use
+    /// the flat rotating caches.
     ///
     /// Single-image-turn-only and cold-start by construction: the adapter is
     /// reset with `max_cache_hit_tokens = 0` and the sliding caches are rebuilt
@@ -1836,13 +1910,14 @@ impl Gemma4Inner {
         &mut self,
         rendered_tokens: &[u32],
         raw_images: &[Vec<u8>],
+        raw_audio: &[Vec<u8>],
         tokenizer: &Arc<Qwen3Tokenizer>,
         config: &ChatConfig,
         eos_token_id: u32,
     ) -> Result<ChatResult> {
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, new_image_key) =
-            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
+        let (tokens, processed_images, audio_frames, new_image_key, new_audio_key) =
+            self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
@@ -1860,7 +1935,8 @@ impl Gemma4Inner {
 
         let generation_start = std::time::Instant::now();
 
-        let vision_embeds = self.build_gemma4_vision_embeds(&prompt, &processed_images)?;
+        let vision_embeds =
+            self.build_gemma4_multimodal_embeds(&prompt, &processed_images, audio_frames.as_ref())?;
 
         // Derive layer kinds before acquiring the paged request. This reads
         // only `self.config` (no adapter/cache dependency) and is fallible, so
@@ -1893,6 +1969,7 @@ impl Gemma4Inner {
         self.caches = Some(init_caches_for_config(&self.config));
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_audio_key = None;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
@@ -1993,6 +2070,7 @@ impl Gemma4Inner {
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
 
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
@@ -2055,6 +2133,7 @@ impl Gemma4Inner {
         &mut self,
         rendered_tokens: &[u32],
         raw_images: &[Vec<u8>],
+        raw_audio: &[Vec<u8>],
         tokenizer: &Arc<Qwen3Tokenizer>,
         config: &ChatConfig,
         eos_token_id: u32,
@@ -2063,8 +2142,8 @@ impl Gemma4Inner {
     ) -> Result<()> {
         let cb = StreamSender(sink);
         let max_new_tokens = config.max_new_tokens.unwrap_or(2048);
-        let (tokens, processed_images, new_image_key) =
-            self.prepare_vision_tokens(rendered_tokens, raw_images)?;
+        let (tokens, processed_images, audio_frames, new_image_key, new_audio_key) =
+            self.prepare_multimodal_tokens(rendered_tokens, raw_images, raw_audio)?;
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
@@ -2082,7 +2161,8 @@ impl Gemma4Inner {
 
         let generation_start = std::time::Instant::now();
 
-        let vision_embeds = self.build_gemma4_vision_embeds(&prompt, &processed_images)?;
+        let vision_embeds =
+            self.build_gemma4_multimodal_embeds(&prompt, &processed_images, audio_frames.as_ref())?;
 
         // Derive layer kinds before acquiring the paged request (fallible, but
         // depends only on `self.config`). Hoisting it ahead of the request
@@ -2111,6 +2191,7 @@ impl Gemma4Inner {
         self.caches = Some(init_caches_for_config(&self.config));
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        self.cached_audio_key = None;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
@@ -2240,6 +2321,7 @@ impl Gemma4Inner {
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
 
         let generation_end = std::time::Instant::now();
         let ttft_ms = first_token_instant
@@ -4148,6 +4230,7 @@ impl Gemma4Inner {
                 self.vision_paged_turn_stream_core(
                     args.tokens,
                     args.images,
+                    args.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4160,6 +4243,7 @@ impl Gemma4Inner {
                 let result = self.vision_paged_turn_sync_core(
                     args.tokens,
                     args.images,
+                    args.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4767,11 +4851,12 @@ impl ChatBackend for Gemma4Inner {
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         if !args.is_delta {
-            // Fresh text-only turn: clear any stale image key (a text-only
-            // turn has no image key to set). Delta turns leave it
-            // untouched — text-only by the delta image guard, so it is
+            // Fresh text-only turn: clear any stale image/audio key (a
+            // text-only turn has no multimodal key to set). Delta turns leave
+            // them untouched — text-only by the delta image guard, so they are
             // structurally `None`.
             self.cached_image_key = None;
+            self.cached_audio_key = None;
         }
     }
 
@@ -4913,6 +4998,17 @@ impl ChatBackend for Gemma4Inner {
         true
     }
 
+    /// Audio support is gated on the unified `embed_audio` projection being
+    /// built at load time (`config.has_audio`). Unlike `supports_images`
+    /// (which is unconditionally `true` so the "no vision support" error
+    /// surfaces from inside the turn), audio is rejected at the pre-render
+    /// guard for non-audio checkpoints: there is no audio entry inside the
+    /// turn to surface a clearer message, and the engine's typed restart
+    /// prefix is the correct contract.
+    fn supports_audio(&self) -> bool {
+        self.embed_audio.is_some()
+    }
+
     fn extra_eos_ids(&self) -> Vec<u32> {
         // The MODEL-config eos list (`<eos>` / `<end_of_turn>`) honored
         // alongside the session `<turn|>` id. A negative config id can
@@ -4949,6 +5045,11 @@ impl ChatBackend for Gemma4Inner {
         if self.cached_image_key.is_some() {
             Some(format!(
                 "{}{entry_fn} is text-only; session currently holds image state",
+                engine::IMAGE_CHANGE_RESTART_PREFIX
+            ))
+        } else if self.cached_audio_key.is_some() {
+            Some(format!(
+                "{}{entry_fn} is text-only; session currently holds audio state",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             ))
         } else {
@@ -5068,10 +5169,12 @@ impl Gemma4Model {
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Self {
         let has_vision = config.vision_config.is_some() || config.unified_vision_config.is_some();
+        let has_audio = config.has_audio;
         Self {
             thread: None,
             model_id: 0,
             has_vision,
+            has_audio,
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
@@ -5116,9 +5219,9 @@ crate::models::chat_napi::chat_napi_surface! {
     class: Gemma4Model,
     thread_cmd: crate::engine::cmd::ChatCmd,
     thread: { option: "Model not initialized. Call Gemma4Model.load() first." },
-    image_guard: { vision: has_vision },
+    image_guard: { vision: has_vision, audio: has_audio },
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
-    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "userMessage: string, images: Uint8Array[] | null | undefined, audio: Uint8Array[] | null | undefined, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "toolCallId: string, content: string, config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void, isError?: boolean | null | undefined",
 }
 

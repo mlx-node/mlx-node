@@ -200,6 +200,7 @@ export declare class Gemma4Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -230,6 +231,7 @@ export declare class Gemma4Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -556,6 +558,7 @@ export declare class Lfm2Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -586,6 +589,7 @@ export declare class Lfm2Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1109,6 +1113,7 @@ export declare class QianfanOCRModel {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1144,6 +1149,7 @@ export declare class QianfanOCRModel {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1254,6 +1260,7 @@ export declare class Qwen35Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1284,6 +1291,7 @@ export declare class Qwen35Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1389,6 +1397,7 @@ export declare class Qwen35MoeModel {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1419,6 +1428,7 @@ export declare class Qwen35MoeModel {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -1588,6 +1598,7 @@ export declare class Qwen3Model {
   chatSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null | undefined,
   ): Promise<ChatResult>;
   /**
@@ -1618,6 +1629,7 @@ export declare class Qwen3Model {
   chatStreamSessionContinue(
     userMessage: string,
     images: Uint8Array[] | null | undefined,
+    audio: Uint8Array[] | null | undefined,
     config: ChatConfig | null,
     callback: (err: Error | null, chunk: ChatStreamChunk) => void,
   ): Promise<ChatStreamHandle>;
@@ -2360,6 +2372,8 @@ export interface ChatMessage {
   reasoningContent?: string;
   /** Image data for VLM models (encoded image bytes: PNG/JPEG, passed as Uint8Array/Buffer) */
   images?: Array<Uint8Array> | undefined;
+  /** Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer) */
+  audio?: Array<Uint8Array> | undefined;
 }
 
 /** Unified chat result shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */

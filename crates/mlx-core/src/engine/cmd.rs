@@ -52,6 +52,7 @@ pub(crate) enum ChatCmd {
     SessionContinue {
         user_message: String,
         images: Option<Vec<Uint8Array>>,
+        audio: Option<Vec<Uint8Array>>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
     },
@@ -83,6 +84,7 @@ pub(crate) enum ChatCmd {
     StreamSessionContinue {
         user_message: String,
         images: Option<Vec<Uint8Array>>,
+        audio: Option<Vec<Uint8Array>>,
         config: ChatConfig,
         stream_tx: StreamTx<ChatStreamChunk>,
         cancelled: Arc<AtomicBool>,
@@ -213,6 +215,7 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
         ChatCmd::SessionContinue {
             user_message,
             images,
+            audio,
             config,
             reply,
         } => {
@@ -220,6 +223,7 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
                 backend,
                 user_message,
                 images,
+                audio,
                 config,
             ));
         }
@@ -249,6 +253,7 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
         ChatCmd::StreamSessionContinue {
             user_message,
             images,
+            audio,
             config,
             stream_tx,
             cancelled,
@@ -257,6 +262,7 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
                 backend,
                 user_message,
                 images,
+                audio,
                 config,
                 &stream_tx,
                 &cancelled,
@@ -893,6 +899,7 @@ mod mock_backend_tests {
             is_error: None,
             reasoning_content: None,
             images: None,
+            audio: None,
         }]
     }
 
@@ -982,6 +989,7 @@ mod mock_backend_tests {
         let r2 = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
             user_message: "again".to_string(),
             images: None,
+            audio: None,
             config: greedy_config(),
             reply,
         })
@@ -1228,6 +1236,7 @@ mod mock_backend_tests {
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
             user_message: "hi".to_string(),
             images: None,
+            audio: None,
             config: greedy_config(),
             reply,
         })
@@ -1256,10 +1265,27 @@ mod mock_backend_tests {
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
             user_message: "hi".to_string(),
             images: Some(vec![Uint8Array::new(vec![1, 2, 3])]),
+            audio: None,
             config: greedy_config(),
             reply,
         })
         .expect_err("image-bearing continue must fail on a text-only backend");
+        assert!(
+            err.reason
+                .starts_with("IMAGE_CHANGE_REQUIRES_SESSION_RESTART:"),
+            "got: {}",
+            err.reason
+        );
+
+        // Audio-bearing continue → typed restart-prefix error (mirrors images).
+        let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            user_message: "hi".to_string(),
+            images: None,
+            audio: Some(vec![Uint8Array::new(vec![1, 2, 3])]),
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("audio-bearing continue must fail on a text-only backend");
         assert!(
             err.reason
                 .starts_with("IMAGE_CHANGE_REQUIRES_SESSION_RESTART:"),
@@ -1671,6 +1697,7 @@ mod mock_backend_tests {
             ChatCmd::StreamSessionContinue {
                 user_message: "again".to_string(),
                 images: None,
+                audio: None,
                 config: greedy_config(),
                 stream_tx,
                 cancelled,
@@ -1710,6 +1737,7 @@ mod mock_backend_tests {
             ChatCmd::StreamSessionContinue {
                 user_message: "hi".to_string(),
                 images: None,
+                audio: None,
                 config: greedy_config(),
                 stream_tx,
                 cancelled,

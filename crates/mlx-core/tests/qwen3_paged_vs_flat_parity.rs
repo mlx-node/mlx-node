@@ -176,6 +176,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -376,6 +377,7 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
         .chat_session_continue(
             user2.to_string(),
             None,
+            None,
             Some(parity_chat_config(WARM_MAX_NEW)),
         )
         .await
@@ -383,6 +385,7 @@ async fn qwen3_paged_vs_flat_prefix_reuse_parity() {
     let r2_paged = paged_model
         .chat_session_continue(
             user2.to_string(),
+            None,
             None,
             Some(parity_chat_config(WARM_MAX_NEW)),
         )

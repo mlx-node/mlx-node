@@ -598,6 +598,9 @@ pub(crate) struct WholeTurnArgs<'a> {
     pub cancelled: Option<&'a AtomicBool>,
     /// Raw image bytes for `vision_turn`; empty for text-only turns.
     pub images: &'a [Vec<u8>],
+    /// Raw (encoded) audio bytes for the multimodal `vision_turn`; empty for
+    /// turns with no audio. Only the unified Gemma 4 audio path consumes this.
+    pub audio: &'a [Vec<u8>],
 }
 
 /// Per-family backend the session cores drive.
@@ -987,6 +990,18 @@ pub(crate) trait ChatBackend {
     /// image-bearing message array could trigger; see the fresh-turn
     /// image guard in `chat_turn_core`).
     fn supports_images(&self) -> bool {
+        false
+    }
+
+    /// Whether the family can consume audio inputs (routes audio-bearing
+    /// turns to `vision_turn`, the shared multimodal entry). Audio mirrors
+    /// the image guard: an audio-bearing fresh turn against a family that
+    /// returns `false` is rejected with the typed
+    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix BEFORE
+    /// `render_prompt`. Default `false` keeps every non-audio family — and
+    /// every image-only / text-only flow — byte-identical; only the unified
+    /// Gemma 4 (`has_audio`) checkpoint overrides to `true`.
+    fn supports_audio(&self) -> bool {
         false
     }
 

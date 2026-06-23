@@ -27,6 +27,7 @@ pub(crate) fn build_synthetic_user_message(user: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 

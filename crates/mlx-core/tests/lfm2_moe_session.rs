@@ -61,6 +61,7 @@ fn user_message(content: &str) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -125,7 +126,7 @@ async fn lfm2_moe_session_keeps_ttft_flat_across_turns() {
         let turn_idx = idx + 2;
         let cfg = chat_config_default(64);
         let result = model
-            .chat_session_continue((*next_user).to_string(), None, Some(cfg))
+            .chat_session_continue((*next_user).to_string(), None, None, Some(cfg))
             .await
             .expect("delta chat failed");
         let ttft = result

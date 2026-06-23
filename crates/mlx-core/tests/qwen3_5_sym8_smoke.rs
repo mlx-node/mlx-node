@@ -75,6 +75,7 @@ async fn sym8_checkpoint_loads_and_generates_coherent_text() {
         is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }];
 
     let result = model

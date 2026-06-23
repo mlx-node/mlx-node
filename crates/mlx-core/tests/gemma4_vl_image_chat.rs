@@ -69,6 +69,7 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
+        audio: None,
     }
 }
 
@@ -184,6 +185,7 @@ async fn gemma4_vl_image_chat_t0_capture() {
     let cont = model
         .chat_session_continue(
             "Answer in one word: is there text?".to_string(),
+            None,
             None,
             Some(cfg(48)),
         )

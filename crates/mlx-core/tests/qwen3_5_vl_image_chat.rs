@@ -80,6 +80,7 @@ fn user_msg(content: &str, image: Option<&[u8]>) -> ChatMessage {
         is_error: None,
         reasoning_content: None,
         images: image.map(|b| vec![Uint8Array::new(b.to_vec())]),
+        audio: None,
     }
 }
 
@@ -137,6 +138,7 @@ async fn run_two_turns(m: &Qwen3_5Model, image: &[u8]) -> (Digest, String, Diges
     let t2 = m
         .chat_session_continue(
             "Answer in one word: is there text?".to_string(),
+            None,
             None,
             Some(cfg(48)),
         )
