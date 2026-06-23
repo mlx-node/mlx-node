@@ -2832,6 +2832,30 @@ export interface Gemma4Config {
   eoiTokenId?: number;
   visionSoftTokensPerImage?: number;
   /**
+   * True when the checkpoint declares an `audio_config` sub-dict. Parallels
+   * `unified_vision_config.is_some()`; gates the un-drop + load of
+   * `embed_audio` weights and the audio merge path.
+   */
+  hasAudio: boolean;
+  /**
+   * Audio placeholder token id (258881). Each `<audio>` placeholder expands to
+   * `boa + audio_token × n_frames + eoa`.
+   */
+  audioTokenId?: number;
+  /** Begin-of-audio token id (256000), emitted before the audio token run. */
+  boaTokenId?: number;
+  /**
+   * End-of-audio token id, parsed from the config's `eoa_token_index` (258883).
+   * A real appended token (like `eoi`), despite the "index" name.
+   */
+  eoaTokenId?: number;
+  /**
+   * Raw audio samples per audio token (640 = 40 ms @ 16 kHz), from
+   * `audio_config.audio_samples_per_token`. Frame size for the encoder-free
+   * pad+reshape feature extractor.
+   */
+  audioSamplesPerToken?: number;
+  /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
    * Default: auto-sized to cover `max_position_embeddings` for the

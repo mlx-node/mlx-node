@@ -11,10 +11,12 @@ import { beforeAll, describe, expect, it } from 'vite-plus/test';
  *
  * Exercises the public `loadSession` + `ChatSession.sendStream` greedy path
  * against the real 24GB checkpoint. It guards the unified→`gemma4` dispatch,
- * the `is_unified` config detection, and the load-time skip of the
- * `vision_embedder.*` / `embed_vision.*` / `embed_audio.*` weights: a
- * regression in any of them either fails to load or collapses greedy decode
- * to a degenerate repeat, which the assertions below reject.
+ * the `is_unified` config detection, and the load-time handling of the
+ * multimodal embedder weights — the unified checkpoint KEEPS `vision_embedder.*`
+ * / `embed_vision.*` / `embed_audio.*` (validated, then loaded into the
+ * embedders) while text decode ignores them. A regression in any of them either
+ * fails to load or collapses greedy decode to a degenerate repeat, which the
+ * assertions below reject.
  *
  * Presence-gated: the suite runs only when the checkpoint directory is found,
  * so CI without the (multi-gigabyte) weights auto-skips.

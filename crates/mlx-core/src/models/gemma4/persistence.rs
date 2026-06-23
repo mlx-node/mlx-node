@@ -257,6 +257,30 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
 
+        // Audio fields — only meaningful for the unified checkpoint that ships an
+        // `audio_config` sub-dict. Non-unified gemma4 has no `audio_config`, so
+        // `has_audio` stays false and all ids stay None (audio purely additive).
+        has_audio: raw.get("audio_config").is_some(),
+        audio_token_id: raw
+            .get("audio_token_id")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        boa_token_id: raw
+            .get("boa_token_id")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        // The end-of-audio token is stored under `eoa_token_index` but is a real
+        // appended token id (parallel to `eoi_token_id`).
+        eoa_token_id: raw
+            .get("eoa_token_index")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+        audio_samples_per_token: raw
+            .get("audio_config")
+            .and_then(|ac| ac.get("audio_samples_per_token"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32),
+
         // Paged-attention knobs — opt-in, default to None so existing
         // checkpoints without these keys load unchanged.
         paged_cache_memory_mb: raw
@@ -575,6 +599,17 @@ fn validate_required_weights(
         }
     }
 
+    // Encoder-free audio projection. Same fail-closed contract as the vision
+    // embedder above: the loader installs `embed_audio.*` only `if let Some`, so
+    // a missing key would silently keep the constructor-random Linear and emit
+    // coherent-but-audio-WRONG output. Require the projection `.weight` whenever
+    // the checkpoint declares an `audio_config`.
+    if config.has_audio && !has("embed_audio.embedding_projection.weight") {
+        return Err(Error::from_reason(
+            "Missing required weight: embed_audio.embedding_projection.weight",
+        ));
+    }
+
     Ok(())
 }
 
@@ -616,11 +651,17 @@ pub fn sanitize_weights(
                 clean_key
             };
 
-        // Skip audio encoder weights (always — not supported yet)
-        if clean_key.starts_with("audio_tower.")
-            || clean_key.starts_with("audio_encoder.")
-            || clean_key.starts_with("embed_audio.")
-        {
+        // Skip audio ENCODER weights (always — the unified audio path is
+        // encoder-free, so a real `audio_tower.`/`audio_encoder.` would be a
+        // non-unified mel encoder we do not implement).
+        if clean_key.starts_with("audio_tower.") || clean_key.starts_with("audio_encoder.") {
+            continue;
+        }
+        // The unified checkpoint ships `embed_audio.*` (the raw-window
+        // projection). Keep it only when the checkpoint declares an
+        // `audio_config`; otherwise drop it so non-unified loads stay
+        // byte-identical and do not error on an unexpected weight.
+        if !config.has_audio && clean_key.starts_with("embed_audio.") {
             continue;
         }
 
@@ -1576,6 +1617,66 @@ fn apply_embed_vision_projection(
     Ok(())
 }
 
+/// Load the encoder-free unified `embed_audio.embedding_projection` weight.
+///
+/// Mirrors [`apply_embed_vision_projection`]: dense bf16 `.weight` in the real
+/// `gemma-4-12b-it` checkpoint, routed through `load_quantized` if an affine
+/// `.scales` sidecar is present. No-op when the model has no audio embedder.
+fn apply_audio_weights(
+    inner: &mut Gemma4Inner,
+    params: &HashMap<String, MxArray>,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<()> {
+    let Some(embedder) = inner.embed_audio.as_mut() else {
+        return Ok(());
+    };
+    let is_mxfp8 = is_mxfp8_checkpoint(params);
+    let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
+    let default_plq = default_per_layer_quant(quant_bits, quant_group_size, default_mode);
+
+    let proj_prefix = "embed_audio.embedding_projection";
+    let audio_plq = per_layer_quant
+        .get(proj_prefix)
+        .copied()
+        .unwrap_or(default_plq);
+    if audio_plq.mode != PerLayerMode::Affine
+        && params.contains_key(&format!("{}.scales", proj_prefix))
+    {
+        return Err(Error::from_reason(format!(
+            "gemma4 {} load: Non-affine FP mode {:?} is not supported; affine only",
+            proj_prefix, audio_plq.mode
+        )));
+    }
+    if params.contains_key(&format!("{}.scales", proj_prefix))
+        && let Some(w) = params.get(&format!("{}.weight", proj_prefix))
+    {
+        let scales = params
+            .get(&format!("{}.scales", proj_prefix))
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Missing {}.scales for quantized audio embedding projection",
+                    proj_prefix
+                ))
+            })?;
+        let biases = params.get(&format!("{}.biases", proj_prefix));
+        embedder.embedding_projection.load_quantized(
+            w,
+            scales,
+            biases,
+            audio_plq.group_size,
+            audio_plq.bits,
+        )?;
+    } else if let Some(w) = params.get(&format!("{}.weight", proj_prefix)) {
+        ensure_dense_weight_floating(&format!("{}.weight", proj_prefix), w)?;
+        embedder.embedding_projection.set_weight(w)?;
+    }
+    info!("Audio weights applied successfully");
+    Ok(())
+}
+
 /// Load the unified encoder-free vision embedder weights:
 /// `vision_embedder.{patch_ln1,patch_ln2,pos_norm}.{weight,bias}`,
 /// `vision_embedder.patch_dense.{weight,bias}`, and
@@ -1854,6 +1955,16 @@ impl Gemma4Inner {
             &per_layer_quant,
         )?;
 
+        // Apply the encoder-free audio projection (unified checkpoints only).
+        apply_audio_weights(
+            &mut inner,
+            &params,
+            quant_bits,
+            quant_group_size,
+            top_level_mode,
+            &per_layer_quant,
+        )?;
+
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts on large models. Without this, weights remain as lazy mmap
         // references and every decode step re-reads ~48GB from disk.
@@ -2032,10 +2143,31 @@ mod tests {
                 "pooling_kernel_size": 3,
                 "rms_norm_eps": 1e-6
             },
-            "audio_config": { "model_type": "gemma4_unified_audio" }
+            "image_token_id": 258880,
+            "audio_token_id": 258881,
+            "boa_token_id": 256000,
+            "eoa_token_index": 258883,
+            "audio_config": {
+                "model_type": "gemma4_unified_audio",
+                "audio_embed_dim": 640,
+                "audio_samples_per_token": 640,
+                "output_proj_dims": 640,
+                "hidden_size": 640,
+                "rms_norm_eps": 1e-6
+            }
         });
         let (cfg, dir) = parse_config_from_json(unified);
         assert!(cfg.is_unified, "gemma4_unified must set is_unified=true");
+        // Audio fields parse from the unified config (top-level ids + audio_config).
+        assert!(cfg.has_audio, "audio_config presence must set has_audio");
+        assert_eq!(cfg.audio_token_id, Some(258881));
+        assert_eq!(cfg.boa_token_id, Some(256000));
+        assert_eq!(
+            cfg.eoa_token_id,
+            Some(258883),
+            "eoa_token_id must parse from eoa_token_index"
+        );
+        assert_eq!(cfg.audio_samples_per_token, Some(640));
         assert_eq!(
             cfg.use_bidirectional_attention.as_deref(),
             Some("vision"),
@@ -2100,6 +2232,12 @@ mod tests {
         let (cfg, dir) = parse_config_from_json(plain);
         assert!(!cfg.is_unified, "plain gemma4 must keep is_unified=false");
         assert_eq!(cfg.use_bidirectional_attention, None);
+        // No audio_config → audio stays inert (purely additive for unified).
+        assert!(!cfg.has_audio, "plain gemma4 must keep has_audio=false");
+        assert_eq!(cfg.audio_token_id, None);
+        assert_eq!(cfg.boa_token_id, None);
+        assert_eq!(cfg.eoa_token_id, None);
+        assert_eq!(cfg.audio_samples_per_token, None);
         let _ = fs::remove_dir_all(&dir);
     }
 

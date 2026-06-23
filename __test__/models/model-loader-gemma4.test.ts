@@ -93,6 +93,7 @@ function stubConfig(overrides: Partial<Gemma4Config> = {}): Gemma4Config {
     partialRotaryFactor: 0.25,
     attentionKEqV: false,
     isUnified: false,
+    hasAudio: false,
     perLayerInputEmbeds: false,
     padTokenId: 0,
     eosTokenIds: [1],
