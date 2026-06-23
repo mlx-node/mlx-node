@@ -125,7 +125,7 @@ jobs:
             --json databaseId,headSha \
             --jq "[.[] | select(.headSha == \"$SHA\")][0].databaseId")"
           if [ -z "${run_id:-}" ] || [ "$run_id" = "null" ]; then
-            echo "::error::No CI run found for $sha. Let CI finish (or push a commit), then re-add the model-e2e label."
+            echo "::error::No CI run found for $SHA. Let CI finish (or push a commit), then re-add the model-e2e label."
             exit 1
           fi
           echo "Downloading mlx-node + mlx-metallib from CI run $run_id"
