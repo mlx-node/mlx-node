@@ -55,6 +55,26 @@ describe.sequential('Gemma4 unified model detection', () => {
     expect(modelType).toBe('gemma4');
   });
 
+  it('routes architecture-only unified checkpoints (no model_type) to gemma4', async () => {
+    // Arch-only unified checkpoint: `model_type` is absent, so `rawModelType`
+    // defaults to `qwen3`. Detection must still route to `gemma4` off the
+    // `Gemma4UnifiedForConditionalGeneration` architecture, matching the native
+    // loader (gemma4/persistence.rs is_unified), instead of misrouting to Qwen3.
+    await writeFile(
+      join(tempDir, 'config.json'),
+      JSON.stringify({
+        architectures: ['Gemma4UnifiedForConditionalGeneration'],
+        tie_word_embeddings: true,
+        text_config: { model_type: 'gemma4_unified_text', hidden_size: 3840 },
+        vision_config: { model_type: 'gemma4_unified_vision' },
+        audio_config: { model_type: 'gemma4_unified_audio' },
+      }),
+    );
+
+    const modelType = await detectModelType(tempDir);
+    expect(modelType).toBe('gemma4');
+  });
+
   it('passes through plain gemma4 unchanged', async () => {
     await writeFile(
       join(tempDir, 'config.json'),

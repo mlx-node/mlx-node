@@ -109,6 +109,17 @@ export async function detectModelType(modelPath: string): Promise<ModelType> {
       }
     }
 
+    // Route architecture-only unified Gemma 4 checkpoints to `gemma4` even when
+    // `model_type` is absent (and thus qwen3-defaulted above). The native loader
+    // (gemma4/persistence.rs parse_config) flags `is_unified` on EITHER
+    // `model_type == "gemma4_unified"` OR this architecture; mirror that here so
+    // a unified checkpoint carrying only `architectures` is not misrouted to
+    // Qwen3Model.
+    const architectures: string[] = config.architectures ?? [];
+    if (architectures.includes('Gemma4UnifiedForConditionalGeneration')) {
+      modelType = 'gemma4';
+    }
+
     if (!SUPPORTED_MODEL_TYPES.has(modelType)) {
       throw new Error(`Unsupported model_type "${modelType}" in ${modelPath}/config.json`);
     }
