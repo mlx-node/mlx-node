@@ -113,6 +113,12 @@ pub struct Gemma4Config {
 
     // Vision fields (None when no vision_config in config.json — text-only model)
     pub vision_config: Option<super::vision_config::Gemma4VisionConfig>,
+    /// Encoder-free vision config for the unified multimodal checkpoint.
+    /// `Some` only when `is_unified` and the checkpoint carries a
+    /// `vision_config` sub-dict. Disjoint from `vision_config` (the SigLIP
+    /// path) — the unified vision embedder is built from this instead.
+    #[serde(default)]
+    pub unified_vision_config: Option<super::unified_vision_config::UnifiedVisionConfig>,
     pub image_token_id: Option<i32>,               // 258880
     pub boi_token_id: Option<i32>,                 // 255999
     pub eoi_token_id: Option<i32>,                 // 258882

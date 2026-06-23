@@ -7,11 +7,21 @@ pub struct Gemma4ImageProcessor {
     pub patch_size: i32,
     pub max_soft_tokens: i32,
     pub pooling_kernel_size: i32,
+    /// Encoder-free unified path. When set, `process_bytes` patchifies at
+    /// `model_patch_size` (= patch_size × pooling_kernel_size) and returns
+    /// flattened `[n, model_patch_size^2 * 3]` patches plus `[n, 2]` position
+    /// ids, with `num_soft_tokens = n` (no pooling division). The SigLIP path
+    /// (when `None`) is unchanged.
+    pub unified_model_patch_size: Option<i32>,
 }
 
 pub struct ProcessedGemma4Image {
     pub pixel_values: MxArray,
     pub num_soft_tokens: i32,
+    /// `[n, 2]` int32 `(x, y)` patch grid coordinates. `Some` only for the
+    /// unified encoder-free path; `None` for the SigLIP vision tower (which
+    /// computes its own patch grid inside the encoder).
+    pub position_ids: Option<MxArray>,
 }
 
 impl Gemma4ImageProcessor {
@@ -20,6 +30,22 @@ impl Gemma4ImageProcessor {
             patch_size,
             max_soft_tokens,
             pooling_kernel_size,
+            unified_model_patch_size: None,
+        }
+    }
+
+    /// Construct the encoder-free unified image processor.
+    pub fn new_unified(
+        patch_size: i32,
+        max_soft_tokens: i32,
+        pooling_kernel_size: i32,
+        model_patch_size: i32,
+    ) -> Self {
+        Self {
+            patch_size,
+            max_soft_tokens,
+            pooling_kernel_size,
+            unified_model_patch_size: Some(model_patch_size),
         }
     }
 
@@ -42,6 +68,10 @@ impl Gemma4ImageProcessor {
                 .to_rgb8()
         };
 
+        if let Some(model_patch_size) = self.unified_model_patch_size {
+            return self.process_unified(&resized, model_patch_size);
+        }
+
         let pixel_values = rgb_to_mx_array(&resized)?;
         let num_soft_tokens =
             self.compute_num_soft_tokens(target_height as i32, target_width as i32);
@@ -49,6 +79,67 @@ impl Gemma4ImageProcessor {
         Ok(ProcessedGemma4Image {
             pixel_values,
             num_soft_tokens,
+            position_ids: None,
+        })
+    }
+
+    /// Encoder-free patchify: turn a resized RGB image into `[n, p^2 * 3]`
+    /// flattened patches and `[n, 2]` `(x, y)` position ids, matching
+    /// `_convert_image_to_model_patches` (reshape → transpose(1,3,2,4,0) →
+    /// flatten, with a meshgrid(arange(pw), arange(ph), indexing="xy")).
+    fn process_unified(
+        &self,
+        rgb_img: &RgbImage,
+        model_patch_size: i32,
+    ) -> Result<ProcessedGemma4Image> {
+        let p = model_patch_size as usize;
+        let width = rgb_img.width() as usize;
+        let height = rgb_img.height() as usize;
+        let patch_h = height / p;
+        let patch_w = width / p;
+        let num_patches = patch_h * patch_w;
+        let patch_dim = p * p * 3;
+
+        // Build patches in (patch_row, patch_col, py, px, channel) order, which
+        // is the layout produced by reshaping channel-first pixels to
+        // (C, ph, p, pw, p) and transposing to (ph, pw, p, p, C).
+        let mut patch_data = vec![0.0f32; num_patches * patch_dim];
+        for pr in 0..patch_h {
+            for pc in 0..patch_w {
+                let patch_idx = pr * patch_w + pc;
+                let base = patch_idx * patch_dim;
+                for py in 0..p {
+                    for px in 0..p {
+                        let y = pr * p + py;
+                        let x = pc * p + px;
+                        let pixel = rgb_img.get_pixel(x as u32, y as u32);
+                        for c in 0..3usize {
+                            // flatten order within a patch: (py, px, c)
+                            let offset = (py * p + px) * 3 + c;
+                            patch_data[base + offset] = pixel[c] as f32 / 255.0;
+                        }
+                    }
+                }
+            }
+        }
+        let pixel_values =
+            MxArray::from_float32(&patch_data, &[num_patches as i64, patch_dim as i64])?;
+
+        // position_ids: meshgrid(arange(pw), arange(ph), indexing="xy")
+        // → row-major over (ph, pw) with each entry (x=col, y=row).
+        let mut pos_data: Vec<i32> = Vec::with_capacity(num_patches * 2);
+        for pr in 0..patch_h {
+            for pc in 0..patch_w {
+                pos_data.push(pc as i32); // x
+                pos_data.push(pr as i32); // y
+            }
+        }
+        let position_ids = MxArray::from_int32(&pos_data, &[num_patches as i64, 2])?;
+
+        Ok(ProcessedGemma4Image {
+            pixel_values,
+            num_soft_tokens: num_patches as i32,
+            position_ids: Some(position_ids),
         })
     }
 

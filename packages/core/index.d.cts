@@ -2820,6 +2820,13 @@ export interface Gemma4Config {
   topKExperts?: number;
   moeIntermediateSize?: number;
   visionConfig?: Gemma4VisionConfig;
+  /**
+   * Encoder-free vision config for the unified multimodal checkpoint.
+   * `Some` only when `is_unified` and the checkpoint carries a
+   * `vision_config` sub-dict. Disjoint from `vision_config` (the SigLIP
+   * path) — the unified vision embedder is built from this instead.
+   */
+  unifiedVisionConfig?: UnifiedVisionConfig;
   imageTokenId?: number;
   boiTokenId?: number;
   eoiTokenId?: number;
@@ -4437,6 +4444,35 @@ export interface TrainStepResultWithOutputs {
   outputsJson?: string;
   /** Actual token counts for each completion (for accurate TUI display) */
   completionLengths: Array<number>;
+}
+
+/**
+ * Encoder-free vision configuration for the Gemma 4 unified multimodal model.
+ *
+ * Parsed from the `vision_config` sub-dict of a `gemma4_unified` checkpoint
+ * (`model_type == "gemma4_unified_vision"`). This is a different shape from the
+ * SigLIP-style [`super::vision_config::Gemma4VisionConfig`] used by the dense
+ * gemma4 family: the unified vision path has no transformer encoder, only a
+ * patch embedder (LayerNorm + Linear + 2D positional embedding) feeding the
+ * multimodal projection.
+ */
+export interface UnifiedVisionConfig {
+  /** Pixel side length of a single image patch (48 = patch_size 16 × pooling 3). */
+  modelPatchSize: number;
+  /** Embedding width inside the vision embedder (3840, == text hidden_size). */
+  mmEmbedDim: number;
+  /** Number of rows in the 2D positional-embedding table (1120). */
+  mmPosembSize: number;
+  /** Maximum soft tokens (patches) per image after resize (280). */
+  numSoftTokens: number;
+  /** Output projection width of `embed_vision` (3840, == text hidden_size). */
+  outputProjDims: number;
+  /** Pixel-grid patch size used by the resize math (16). */
+  patchSize: number;
+  /** Pooling kernel size used by the resize math (3). */
+  poolingKernelSize: number;
+  /** Epsilon for the embedder LayerNorms and the projection RMSNorm. */
+  rmsNormEps: number;
 }
 
 /** Result from document unwarping. */
