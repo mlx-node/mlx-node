@@ -129,8 +129,13 @@ jobs:
             exit 1
           fi
           echo "Downloading mlx-node + mlx-metallib from CI run $run_id"
-          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-            -n mlx-node -n mlx-metallib -D packages/core/
+          # One artifact per call: a single -n extracts directly into -D, but
+          # passing multiple -n names makes gh nest each under its own subdir
+          # (packages/core/mlx-node/, packages/core/mlx-metallib/), where neither
+          # require('./mlx-core.darwin-arm64.node') nor the dladdr-relative
+          # metallib lookup can find them.
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-node -D packages/core/
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-metallib -D packages/core/
 
       - name: Download + convert ${{ matrix.name }} checkpoint and run its tests
         env:
