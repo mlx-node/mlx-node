@@ -5,7 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    # `labeled` lets a PR opt into the heavy model-test leg by carrying the
+    # `model-e2e` label; an unrelated label add no-ops (every job gates off
+    # github.event.label.name below). GitHub can't filter label events by name
+    # at the trigger level.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
 env:
@@ -15,10 +19,15 @@ env:
 jobs:
   build:
     name: Build
-    # The PR `model-e2e` label no longer triggers this workflow (see
-    # .github/workflows/model-e2e.yml), so build runs unconditionally on every
-    # push / PR sync / dispatch. The label-triggered e2e run reuses the .node +
-    # metallib artifacts this job uploads — it never rebuilds.
+    # Build on every push / PR sync / reopen / dispatch. Skip only label events
+    # that aren't adding `model-e2e` (keyed on github.event.label.name — the
+    # label that fired THIS event — so unrelated label churn on an already-labeled
+    # PR does NOT rebuild). When the `model-e2e` label DOES fire this run, the
+    # "Reuse existing build" step below pulls the head SHA's already-uploaded
+    # artifacts instead of recompiling, and model-test reuses them via needs.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -59,7 +68,41 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      # On a `model-e2e` label opt-in the head SHA was already built by its
+      # push/sync CI run — download those artifacts instead of spending ~16 min
+      # recompiling. Runs ONLY on label events (never on push/sync, so normal CI
+      # always builds natively). One artifact per `gh run download` call: a single
+      # -n extracts flat into -D, but multiple -n names each nest into their own
+      # subdir. Falls through to a native build if no prior success exists yet.
+      - name: Reuse existing build on model-e2e opt-in (no native rebuild)
+        id: reuse
+        if: github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass through env (not inline ${{ }}) — branch names are untrusted.
+          SHA: ${{ github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch "$BRANCH" --limit 40 \
+            --json databaseId,headSha,conclusion \
+            --jq "[.[] | select(.headSha == \"$SHA\" and .conclusion == \"success\")][0].databaseId")"
+          # The downloads sit INSIDE the `if` condition so a missing / expired /
+          # partial artifact does NOT abort under `set -e` — it falls through to the
+          # native build below instead of failing the run (a partial mlx-node left
+          # in packages/core/ is harmless: `yarn build` regenerates it).
+          if [ -n "${run_id:-}" ] && [ "$run_id" != "null" ] \
+            && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-node -D packages/core/ \
+            && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-metallib -D packages/core/; then
+            echo "Reused native artifacts from CI run $run_id for $SHA (no rebuild)"
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No reusable build for $SHA; building natively."
+          fi
+
       - name: Build native module
+        if: steps.reuse.outputs.reused != 'true'
         run: yarn build
         env:
           CARGO_INCREMENTAL: 1
@@ -83,6 +126,9 @@ jobs:
             packages/core/paged_attn.metallib
   test:
     name: ${{ matrix.test }}
+    # Unit/integration tests don't depend on the label; skip the redundant re-run
+    # a `labeled` event would otherwise spawn (build artifacts are unchanged).
+    if: github.event.action != 'labeled'
     runs-on: macos-latest
     needs: build
     strategy:
@@ -156,29 +202,31 @@ jobs:
   # reset/replay determinism, session warm-reuse, greedy MTP==AR). They assert
   # WITHIN a single run, so they need no host-specific golden and stay CI-robust.
   #
-  # This copy is the PUSH-to-main / dispatch release-gate path (publish `needs`
-  # it). The PR opt-in path is the mirror job in .github/workflows/model-e2e.yml
-  # (triggered by the `model-e2e` label); KEEP THE MATRIX IN SYNC across both.
+  # Runs on push-to-main + dispatch (release gate; publish `needs` it) AND on PRs
+  # carrying the `model-e2e` label — opting in on the label add and re-running on
+  # every later commit while the label is present. The PR opt-in reuses the
+  # `build` artifacts (no native rebuild; see the build job's reuse step).
   #
-  # Excluded families on this release-gate copy:
-  #   * qwen3_5 MoE — smallest published checkpoint is 35B-A3B (~70GB); there is
-  #     no small option, and it would not fit a standard macOS runner's RAM.
-  #   * gemma4 — the QAT (wNa8o8) checkpoint is small enough (~2.9GB, single
-  #     instance) to run, and it IS wired up in model-e2e.yml (PR opt-in). It is
-  #     deliberately kept OFF this push/release gate until CI's HUGGINGFACE_TOKEN
-  #     is confirmed to have access to the gated
-  #     `google/gemma-4-E2B-it-qat-mobile-transformers` repo — otherwise a
-  #     download failure here would block releases. To promote: add the `gemma4`
-  #     leg from model-e2e.yml once it is green on a labeled PR.
+  # Excluded family: qwen3_5 MoE — smallest published checkpoint is 35B-A3B
+  # (~70GB), no small option, won't fit a standard macOS runner's RAM. The gemma4
+  # QAT (wNa8o8) leg (~2.9GB) runs on PR opt-in but is SKIPPED on the push/release
+  # gate (its run step early-exits) until CI's HUGGINGFACE_TOKEN is confirmed to
+  # reach the gated google/gemma-4-E2B-it-qat-mobile-transformers repo — otherwise
+  # a download failure would block releases.
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
-    # Release-gate path: push-to-main + manual dispatch only. PRs opt in via the
-    # `model-e2e` label, which triggers .github/workflows/model-e2e.yml instead
-    # (so labeling never spawns a second full CI run or a redundant native build).
+    # push-to-main and manual dispatch always run. For PRs: a `labeled` event
+    # runs ONLY when the just-added label is `model-e2e` (github.event.label.name)
+    # — so unrelated label churn on an already-labeled PR is a no-op; a later
+    # `synchronize` keeps re-running while the PR still carries the label
+    # (full-set contains, gated to non-label actions).
     if: >-
       github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch'
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'model-e2e' ||
+      (github.event.action != 'labeled' &&
+       contains(github.event.pull_request.labels.*.name, 'model-e2e'))
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -211,6 +259,16 @@ jobs:
             tests: >-
               --test lfm2_paged_vs_flat_parity
               --test lfm2_session
+          # gemma4 QAT (wNa8o8): convert the prequantized source and run the
+          # single-instance TS e2e coherence test (text + vision on examples/ocr.png).
+          # PR-opt-in only — the run step skips it on the push/release gate.
+          - name: gemma4
+            model: google/gemma-4-E2B-it-qat-mobile-transformers
+            slug: gemma-4-e2b-qat
+            mtype: gemma4
+            kind: ts
+            env: ''
+            tests: __test__/models/gemma4-qat-e2e.test.ts
     steps:
       - uses: actions/checkout@v6
         with:
@@ -261,6 +319,14 @@ jobs:
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
         run: |
           set -euo pipefail
+          # The gemma4 QAT leg pulls a GATED HF repo; until CI's token is confirmed
+          # to reach it, run it on the PR opt-in path ONLY — skip on push AND
+          # workflow_dispatch (both release-gate paths) so a download failure can't
+          # block releases.
+          if [ "${{ matrix.name }}" = "gemma4" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
+            exit 0
+          fi
           src=".cache/models/${{ matrix.slug }}"
           out=".cache/models/${{ matrix.slug }}-mlx-bf16"
           yarn mlx download model -m "${{ matrix.model }}" --output "$src"
@@ -284,6 +350,9 @@ jobs:
 
   lint:
     name: Rust Lint
+    # Lint doesn't depend on the label; skip the redundant re-run a `labeled`
+    # event would otherwise spawn.
+    if: github.event.action != 'labeled'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
@@ -351,10 +420,9 @@ jobs:
       - lint
       - model-test
     # Don't publish a release when the e2e model-test matrix fails. `always()`
-    # keeps publish running when model-test is SKIPPED (on PRs, where model-test
-    # does not run — it is the push/release-gate path; PR e2e lives in
-    # model-e2e.yml) instead of cascading the skip onto publish; test + lint must
-    # still have succeeded.
+    # keeps publish running when model-test is SKIPPED (on PRs without the
+    # `model-e2e` label) instead of cascading the skip onto publish; test + lint
+    # must still have succeeded.
     if: >-
       always() &&
       needs.test.result == 'success' &&
