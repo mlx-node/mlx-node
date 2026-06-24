@@ -1912,34 +1912,39 @@ impl Gemma4Inner {
     ///
     /// - **Continuable** (when `media_continuable` — i.e. ANY image or audio
     ///   turn, including the unified bidirectional-vision image — AND
-    ///   `reuse_cache`, AND the keep-live + sliding checkpoint actually stored a
-    ///   live continue): the global paged KV is kept live
-    ///   (`finalize_turn_keep_live_per_block`, registering the full blocks for
-    ///   content-addressed reuse) and the marker is set so `text_delta_image_guard`
-    ///   lets the next text delta through. The
-    ///   delta then restores the prefix the SAME way a TEXT warm-continue does:
-    ///   it REPLAYS (re-walks) the matched prefix over the live global KV
-    ///   (`state="replay"`, `continued_live=true`). Mirrors the qwen3_5_moe
-    ///   two-state finalize. We also attempt the sliding history checkpoint as a
-    ///   fast-path, but continuation does NOT depend on it storing — see below.
-    /// - **Non-continuable** (overlay/unified-image, `reuse_cache=false`, or a
-    ///   keep-live failure): today's behavior — `release_request` only, keep
-    ///   history + media keys live so the guard is reachable and REJECTS (marker
-    ///   stays false). The vision core does NOT `reset_caches_sync` here, unlike
-    ///   the text/MoE path.
+    ///   `reuse_cache`, AND `finalize_turn_keep_live_per_block` succeeds, AND the
+    ///   sliding-history checkpoint actually `stored`, AND the adapter is
+    ///   `live_for_continue`): the global paged KV is kept live (full blocks
+    ///   registered for content-addressed reuse) and the marker is set so
+    ///   `text_delta_image_guard` lets the next text delta through. On that delta
+    ///   the global prefix is reused IN-PLACE (`continue_turn` keeps the block
+    ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
+    ///   re-walked) and the sliding caches resolve to `state="live"`
+    ///   (`continued_live_prefix && gemma4_sliding_caches_ready_at`), so
+    ///   `run_sliding_only_prefill` is skipped and no media position is ever
+    ///   re-embedded from a raw `<|image|>`/`<|audio|>` id. Mirrors the
+    ///   qwen3_5_moe two-state finalize.
+    /// - **Non-continuable** (`reuse_cache=false`, a keep-live failure, or the
+    ///   sliding checkpoint did not store / the adapter is not
+    ///   `live_for_continue`): `release_request` only, keep history + media keys
+    ///   live so the guard is reachable and REJECTS (marker stays false) and the
+    ///   follow-up text delta cold-restarts. The vision core does NOT
+    ///   `reset_caches_sync` here, unlike the text/MoE path.
     ///
-    /// ## Why the sliding checkpoint is best-effort (the KV-shared reality)
+    /// ## Why `stored && live_for_continue` is the faithfulness gate
     /// `gemma4_sliding_caches_ready_at` requires EVERY `is_sliding_layer` flat
     /// cache populated. On KV-shared checkpoints (e2b: `SharedOnSliding` layers
     /// physically store no flat K/V — they read the anchor's), that is never
-    /// satisfiable, so the checkpoint is a structural no-op (`stored == false`)
-    /// for BOTH text and vision turns. A TEXT warm-continue already tolerates
-    /// this: `save_paged_history` discards the store trace and the next turn
-    /// restores via replay. So the vision finalize arms the marker on keep-live
-    /// success regardless of `stored`; an earlier draft hard-downgraded on
-    /// `stored == false`, which wrongly made every KV-shared media session
-    /// single-shot. On NON-shared checkpoints the checkpoint stores and the next
-    /// delta takes the faster checkpoint restore instead of replay.
+    /// satisfiable, so the checkpoint is a structural no-op (`stored == false`).
+    /// A warm media→text continue is only numerically faithful when the media
+    /// positions' sliding K/V can be reused IN PLACE: a text token's true
+    /// embedding IS `embed_tokens.forward(id)` (replay-safe), but a media
+    /// position's is a scattered SigLIP/audio feature that replay CANNOT rebuild
+    /// from the raw special-token id. So the marker is armed ONLY when
+    /// `stored && live_for_continue`: non-KV-shared checkpoints (12B audio AND
+    /// unified image, `num_kv_shared_layers=0`) store real K/V and warm-continue
+    /// via `state="live"`; KV-shared checkpoints (e2b) store nothing, leave the
+    /// marker off, and cleanly cold-restart.
     ///
     /// ## R1 sliding-offset reconciliation (the length-finish materialize)
     /// The vision decode loop never forwards the final sampled token, so after
@@ -1952,7 +1957,7 @@ impl Gemma4Inner {
     /// the text path's `materialize_final` does (`paged_turn.rs` length gate →
     /// `Gemma4PagedDecode::materialize_final` → `run_paged_decode_step`) —
     /// advancing both caches to `prefill_len + G` so the kept-live global KV
-    /// content-addresses against the saved history for the next delta's replay
+    /// content-addresses against the saved history for the next delta's live
     /// restore. (Verified byte-exact by the non-unified-image warm==cold golden.)
     #[allow(clippy::too_many_arguments)]
     fn finalize_vision_turn_media_state(
