@@ -787,15 +787,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             throw err;
           }
           delegated = true;
-          yield* this.runStartStreamPath(
-            userMessage,
-            undefined,
-            undefined,
-            true,
-            false,
-            mergedConfig,
-            opts.signal,
-          );
+          yield* this.runStartStreamPath(userMessage, undefined, undefined, true, false, mergedConfig, opts.signal);
           return;
         }
       } finally {

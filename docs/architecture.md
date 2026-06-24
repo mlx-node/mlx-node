@@ -76,13 +76,13 @@ mlx-node/
 
 ## Build flow
 
-| Command                            | Output                                                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `yarn build`                       | `yarn build:native && yarn build:ts`                                                           |
+| Command                            | Output                                                                                                                                                            |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `yarn build`                       | `yarn build:native && yarn build:ts`                                                                                                                              |
 | `yarn build:native`                | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
-| `yarn build:ts`                    | `packages/*/dist/` via `tsc -b` (project references)                                           |
-| `yarn typecheck`                   | TypeScript type-check only                                                                     |
-| `cargo build --release -p mlx-tui` | `mlx-train` TUI binary                                                                         |
+| `yarn build:ts`                    | `packages/*/dist/` via `tsc -b` (project references)                                                                                                              |
+| `yarn typecheck`                   | TypeScript type-check only                                                                                                                                        |
+| `cargo build --release -p mlx-tui` | `mlx-train` TUI binary                                                                                                                                            |
 
 `yarn build:native` is the **canonical native build** — runs the napi-rs pipeline through `packages/core/build.ts` (executed via `oxnode`). Running `cargo build` directly does **not** produce the `.node` addon.
 

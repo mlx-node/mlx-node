@@ -48,6 +48,7 @@ Cards have no prefill numbers, so this is GB10-only.
 ```
 
 Two findings:
+
 1. **Prefill is flat vs length** → bottleneck is the GDN (gated-delta linear
    attention) recurrence, run **one timestep at a time** in the device-agnostic
    fallback (no CUDA GDN kernel). The quantized matmuls are the minority term.
@@ -66,7 +67,7 @@ Two findings:
 
 NVFP4 only wins when native FP4 tensor cores drive the GEMM. The device-agnostic
 PoC falls back to dequant, so on GB10 NVFP4 is pure overhead. (Note: on Apple,
-MoE-NVFP4 *does* edge out Q4 — different code path.)
+MoE-NVFP4 _does_ edge out Q4 — different code path.)
 
 ## Next perf levers (in impact order)
 

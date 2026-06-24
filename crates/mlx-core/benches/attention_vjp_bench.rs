@@ -6,9 +6,10 @@
 //!
 //! Run with: cargo bench --package mlx-core --bench attention_vjp_bench
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mlx_core::array::{DType, MxArray, scaled_dot_product_attention};
 use mlx_core::autograd::value_and_grad;
+use std::hint::black_box;
 
 /// Helper to create a random tensor with given shape and dtype
 fn random_tensor(shape: &[i64], dtype: DType) -> MxArray {

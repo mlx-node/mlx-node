@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use serde_json::json;
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{AssertSqlSafe, QueryBuilder, Sqlite, SqlitePool};
 
 use crate::error::DbError;
 use crate::types::*;
@@ -273,7 +273,7 @@ pub async fn get_generations_by_reward(
             step_filter
         );
 
-        let rows: Vec<GenerationRow> = sqlx::query_as(&sql)
+        let rows: Vec<GenerationRow> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(run_id)
             .bind(n)
             .fetch_all(pool)
@@ -303,7 +303,7 @@ pub async fn get_generations_by_reward(
             step_filter
         );
 
-        let rows: Vec<GenerationRow> = sqlx::query_as(&sql)
+        let rows: Vec<GenerationRow> = sqlx::query_as(AssertSqlSafe(sql))
             .bind(run_id)
             .bind(n)
             .fetch_all(pool)
@@ -370,7 +370,7 @@ pub async fn get_generations_by_finish_reason(
         limit_clause
     );
 
-    let rows: Vec<GenerationRow> = sqlx::query_as(&sql)
+    let rows: Vec<GenerationRow> = sqlx::query_as(AssertSqlSafe(sql))
         .bind(run_id)
         .bind(finish_reason)
         .fetch_all(pool)
@@ -470,14 +470,14 @@ pub async fn search_generations(
 
     let rows: Vec<GenerationRow> = match search_in {
         Some("prompt") | Some("completion") | Some("thinking") => {
-            sqlx::query_as(&sql)
+            sqlx::query_as(AssertSqlSafe(sql))
                 .bind(run_id)
                 .bind(&search_pattern)
                 .fetch_all(pool)
                 .await?
         }
         _ => {
-            sqlx::query_as(&sql)
+            sqlx::query_as(AssertSqlSafe(sql))
                 .bind(run_id)
                 .bind(&search_pattern)
                 .bind(&search_pattern)
@@ -539,7 +539,10 @@ pub async fn get_reward_stats(
         step_filter
     );
 
-    let row: RewardStatsRow = sqlx::query_as(&sql).bind(run_id).fetch_one(pool).await?;
+    let row: RewardStatsRow = sqlx::query_as(AssertSqlSafe(sql))
+        .bind(run_id)
+        .fetch_one(pool)
+        .await?;
 
     let count = row.count;
     let mean = row.mean.unwrap_or(0.0);
@@ -559,7 +562,7 @@ pub async fn get_reward_stats(
         step_filter
     );
 
-    let rewards: Vec<f64> = sqlx::query_scalar(&sql)
+    let rewards: Vec<f64> = sqlx::query_scalar(AssertSqlSafe(sql))
         .bind(run_id)
         .fetch_all(pool)
         .await?;
@@ -681,7 +684,7 @@ pub async fn query_raw(pool: &SqlitePool, sql: &str) -> Result<String, DbError> 
     // by fetching rows as raw sqlite rows
     use sqlx::Row;
 
-    let rows = sqlx::query(sql).fetch_all(pool).await?;
+    let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(pool).await?;
 
     let mut results = Vec::new();
     for row in rows {

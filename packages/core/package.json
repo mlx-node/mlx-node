@@ -31,7 +31,7 @@
     "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.6.2",
+    "@napi-rs/cli": "^3.7.2",
     "@oxc-node/cli": "^0.1.0",
     "vite-plus": "catalog:"
   },

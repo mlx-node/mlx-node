@@ -36,7 +36,7 @@ workspace = true
 features = ["skip_collect_on_exit", "v3"]
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { workspace = true }
 
 [build-dependencies]
 napi-build = { workspace = true }

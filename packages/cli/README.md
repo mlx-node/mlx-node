@@ -120,21 +120,21 @@ mlx convert \
 
 #### Options
 
-| Flag             | Short | Default       | Description                                    |
-| ---------------- | ----- | ------------- | ---------------------------------------------- |
-| `--input`        | `-i`  | _required_    | Input model directory or `.gguf` file          |
-| `--output`       | `-o`  | _required_    | Output directory                               |
-| `--dtype`        | `-d`  | `bfloat16`    | Target dtype: `float32`, `float16`, `bfloat16` |
-| `--model-type`   | `-m`  | auto-detected | Model type override                            |
-| `--verbose`      | `-v`  | `false`       | Verbose logging                                |
-| `--quantize`     | `-q`  | `false`       | Enable quantization                            |
-| `--q-bits`       |       | `4`           | Quantization bits (4 or 8)                     |
-| `--q-group-size` |       | `64`          | Quantization group size                        |
-| `--q-mode`       |       | `affine`      | Mode: `affine` or `mxfp8`                      |
-| `--q-recipe`     |       |               | Per-layer mixed-bit recipe                     |
+| Flag             | Short | Default       | Description                                                            |
+| ---------------- | ----- | ------------- | ---------------------------------------------------------------------- |
+| `--input`        | `-i`  | _required_    | Input model directory or `.gguf` file                                  |
+| `--output`       | `-o`  | _required_    | Output directory                                                       |
+| `--dtype`        | `-d`  | `bfloat16`    | Target dtype: `float32`, `float16`, `bfloat16`                         |
+| `--model-type`   | `-m`  | auto-detected | Model type override                                                    |
+| `--verbose`      | `-v`  | `false`       | Verbose logging                                                        |
+| `--quantize`     | `-q`  | `false`       | Enable quantization                                                    |
+| `--q-bits`       |       | `4`           | Quantization bits (4 or 8)                                             |
+| `--q-group-size` |       | `64`          | Quantization group size                                                |
+| `--q-mode`       |       | `affine`      | Mode: `affine` or `mxfp8`                                              |
+| `--q-recipe`     |       |               | Per-layer mixed-bit recipe                                             |
 | `--q-mtp`        |       | `off`         | Qwen MTP-quant policy: `cyankiwi`, `all`, or `split` (alias `drafter`) |
-| `--imatrix-path` |       |               | imatrix GGUF for AWQ pre-scaling               |
-| `--mmproj`       |       |               | mmproj GGUF for vision encoder weights         |
+| `--imatrix-path` |       |               | imatrix GGUF for AWQ pre-scaling                                       |
+| `--mmproj`       |       |               | mmproj GGUF for vision encoder weights                                 |
 
 #### Model Types
 

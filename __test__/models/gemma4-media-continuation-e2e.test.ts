@@ -69,9 +69,7 @@ interface UserMessage {
 }
 
 function hasWeights(dir: string): boolean {
-  return (
-    existsSync(resolve(dir, 'model.safetensors')) || existsSync(resolve(dir, 'model.safetensors.index.json'))
-  );
+  return existsSync(resolve(dir, 'model.safetensors')) || existsSync(resolve(dir, 'model.safetensors.index.json'));
 }
 
 function findFirst(dirs: string[]): string | null {

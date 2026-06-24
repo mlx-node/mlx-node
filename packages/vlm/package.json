@@ -30,7 +30,7 @@
   "dependencies": {
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
-    "@napi-rs/image": "^1.12.0"
+    "@napi-rs/image": "^1.13.0"
   },
   "devDependencies": {
     "@types/node": "catalog:"

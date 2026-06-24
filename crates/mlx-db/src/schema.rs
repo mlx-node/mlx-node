@@ -3,7 +3,7 @@
 //! Defines tables for storing training runs, steps, generations, and tool calls.
 
 use crate::error::DbError;
-use sqlx::SqlitePool;
+use sqlx::{AssertSqlSafe, SqlitePool};
 
 /// SQL statements for creating the schema
 pub const CREATE_TABLES_SQL: &str = r#"
@@ -105,7 +105,7 @@ pub async fn init_schema(pool: &SqlitePool) -> Result<(), DbError> {
         let cleaned = cleaned.trim();
 
         if !cleaned.is_empty() {
-            sqlx::query(cleaned)
+            sqlx::query(AssertSqlSafe(cleaned))
                 .execute(pool)
                 .await
                 .map_err(|e| DbError::Schema(format!("Failed to execute statement: {}", e)))?;
@@ -156,7 +156,7 @@ async fn check_column_exists(
     column: &str,
 ) -> Result<bool, DbError> {
     let sql = format!("PRAGMA table_info({})", table);
-    let rows: Vec<TableInfo> = sqlx::query_as(&sql)
+    let rows: Vec<TableInfo> = sqlx::query_as(AssertSqlSafe(sql))
         .fetch_all(pool)
         .await
         .map_err(|e| DbError::Query(format!("PRAGMA failed: {}", e)))?;

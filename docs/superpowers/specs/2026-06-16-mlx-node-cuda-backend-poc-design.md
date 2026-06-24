@@ -7,7 +7,7 @@
 
 ## 1. Problem & Goal
 
-mlx-node is currently **macOS/Metal/Apple-Silicon only**. Upstream MLX (the C++ core vendored as a git submodule at `crates/mlx-sys/mlx`) now ships a mature **CUDA backend** (`mlx/backend/cuda/`, 198 files). The goal of *this milestone* is a **proof-of-concept + performance benchmark**, not a production backend:
+mlx-node is currently **macOS/Metal/Apple-Silicon only**. Upstream MLX (the C++ core vendored as a git submodule at `crates/mlx-sys/mlx`) now ships a mature **CUDA backend** (`mlx/backend/cuda/`, 198 files). The goal of _this milestone_ is a **proof-of-concept + performance benchmark**, not a production backend:
 
 - Build mlx-node's native NAPI addon on `aarch64-unknown-linux-gnu` against MLX's CUDA backend.
 - Run **real Qwen3.6 inference on the GB10 GPU** through MLX's stock ops and mlx-node's existing **device-agnostic fallbacks** — **no custom Metal-kernel ports** this milestone.
@@ -16,6 +16,7 @@ mlx-node is currently **macOS/Metal/Apple-Silicon only**. Upstream MLX (the C++ 
 - Keep the macOS build **provably unchanged**.
 
 ### Non-goals (this milestone)
+
 - Porting custom Metal kernels to CUDA (paged attention, GDN / gated-delta, int8/W8A8).
 - Fixing MLX's MoE-prefill tiled-GEMM gap.
 - x86_64 Linux, CI, prebuilt/published binaries, distribution.
@@ -30,15 +31,15 @@ mlx-node is currently **macOS/Metal/Apple-Silicon only**. Upstream MLX (the C++ 
 
 ## 3. Decisions (locked)
 
-| Axis | Decision |
-|---|---|
-| Scope | PoC + perf benchmark; device-agnostic fallbacks; no kernel ports |
-| Models | Qwen3.6 27B dense → then Qwen3.6 35B-A3B MoE (Qwen3.5/3.6 arch path) |
-| Precision | Staged: bf16 (first light) → nvfp4 (perf comparison) |
+| Axis           | Decision                                                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Scope          | PoC + perf benchmark; device-agnostic fallbacks; no kernel ports                                                           |
+| Models         | Qwen3.6 27B dense → then Qwen3.6 35B-A3B MoE (Qwen3.5/3.6 arch path)                                                       |
+| Precision      | Staged: bf16 (first light) → nvfp4 (perf comparison)                                                                       |
 | Build approach | A+B hybrid: cfg-gate the existing crates + a `cuda` selection so macOS can't regress; preceded by an MLX-core sm_121 spike |
-| Baseline | vs M5 Max, re-measured fresh same-harness (don't trust stored numbers; cross-session variance ~10–15%) |
-| MTP | OFF for the first benchmark (follow-up) |
-| cuDNN | Install lazily — only if the model trips MLX's cuDNN-fused SDPA path |
+| Baseline       | vs M5 Max, re-measured fresh same-harness (don't trust stored numbers; cross-session variance ~10–15%)                     |
+| MTP            | OFF for the first benchmark (follow-up)                                                                                    |
+| cuDNN          | Install lazily — only if the model trips MLX's cuDNN-fused SDPA path                                                       |
 
 ## 4. Architecture — Five Layers
 
@@ -87,16 +88,16 @@ install toolchain → clone repo+submodule → yarn build:native (linux/cuda bra
 
 ## 6. Risks → Mitigations
 
-| Risk | Mitigation |
-|---|---|
-| sm_121 unproven on MLX (no public MLX-on-GB10 report) | Phase 0 gate (MLX-core spike) before any porting |
-| MLX op missing → **hard crash** (MLX has no silent CPU fallback) | Enumerate ops each model hits; CPU-route or fallback; install cuDNN if SDPA needs it |
-| MoE prefill slow (`GatherQMM` uses `gather_qmv` only, no tiled GEMM) | Expected — measure & report, do NOT fix this milestone |
-| Custom-kernel fallback correctness drift | T=0 parity vs M5 gates it |
-| Fork submodule commit unreachable from Spark | Verify in Phase 2 (upstream `ls-remote` already works; fork may need creds) |
+| Risk                                                                  | Mitigation                                                                                                     |
+| --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| sm_121 unproven on MLX (no public MLX-on-GB10 report)                 | Phase 0 gate (MLX-core spike) before any porting                                                               |
+| MLX op missing → **hard crash** (MLX has no silent CPU fallback)      | Enumerate ops each model hits; CPU-route or fallback; install cuDNN if SDPA needs it                           |
+| MoE prefill slow (`GatherQMM` uses `gather_qmv` only, no tiled GEMM)  | Expected — measure & report, do NOT fix this milestone                                                         |
+| Custom-kernel fallback correctness drift                              | T=0 parity vs M5 gates it                                                                                      |
+| Fork submodule commit unreachable from Spark                          | Verify in Phase 2 (upstream `ls-remote` already works; fork may need creds)                                    |
 | CUDA 13.0 only on GB10; MLX CMake **rejects 13.1**; nvfp4 needs ≥12.8 | We have 13.0 — inside the window; pin arch `121a` and force `-DMLX_CUDA_ARCHITECTURES` if auto-detect misfires |
-| macOS regression | feature/cfg gating + macOS build check after the diff |
-| Billing ($0.65/hr, spans create→delete) | Keep instance alive; be efficient; log build times |
+| macOS regression                                                      | feature/cfg gating + macOS build check after the diff                                                          |
+| Billing ($0.65/hr, spans create→delete)                               | Keep instance alive; be efficient; log build times                                                             |
 
 ## 7. Testing
 
