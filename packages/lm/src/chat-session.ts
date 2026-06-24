@@ -876,6 +876,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config } = opts;
       const mergedConfig = this.mergeConfig(config);
+      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
+      // A cold native session (turnCount===0) has no live KV to delta
+      // against — the typical cause is an interrupted media-held replay
+      // whose rollback wiped the cache and reset the counter while
+      // leaving the unresolved tool-call flag set. Mirror `send()`'s
+      // turn-0 routing: replay the preserved history through the cold
+      // start path instead of dispatching a delta that the native side
+      // would reject with an un-prefixed "requires an initialized
+      // session" error. A normal tool result always follows a prior
+      // tool-call turn (turnCount>=1), so this never fires on the happy
+      // path.
+      if (this.turnCount === 0) {
+        return await this.replayToolResultThroughStartPath(toolMsg, mergedConfig);
+      }
       try {
         const result = await this.model.chatSessionContinueTool(toolCallId, content, mergedConfig, isError ?? null);
         this.history.push({ role: 'tool', content, toolCallId, isError });
@@ -897,19 +911,33 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // restart core pushes it — `isError` rides on that message so the
         // wire-format error marker is re-rendered, and a tool result
         // always follows >=1 prior turn so `isFirstTurn` is false.
-        const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
-        return await this.runStartPathWithMessage(
-          toolMsg,
-          this.computeTrailingImagesKey(),
-          this.computeTrailingAudioKey(),
-          true,
-          false,
-          mergedConfig,
-        );
+        return await this.replayToolResultThroughStartPath(toolMsg, mergedConfig);
       }
     } finally {
       this.inFlight = false;
     }
+  }
+
+  /**
+   * Cold-replay a tool result through the start path: re-render the
+   * full preserved history (including the prior media turn and the
+   * unresolved tool-call assistant turn) plus this tool message. Used
+   * when the native session is cold (turnCount===0 — e.g. after an
+   * interrupted media-held replay rolled the cache back) and by the
+   * media-held rejection catch. `mediaChanged=true` forces a
+   * resetCaches so the prefill always starts from a guaranteed-clean
+   * cache; `isFirstTurn=false` because a tool result always follows a
+   * prior tool-call turn.
+   */
+  private async replayToolResultThroughStartPath(toolMsg: ChatMessage, config: ChatConfig): Promise<ChatResult> {
+    return await this.runStartPathWithMessage(
+      toolMsg,
+      this.computeTrailingImagesKey(),
+      this.computeTrailingAudioKey(),
+      true,
+      false,
+      config,
+    );
   }
 
   /**
@@ -935,6 +963,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     try {
       const { isError, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
+      const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
+      // A cold native session (turnCount===0) has no live KV to delta
+      // against — typically the residue of an interrupted media-held
+      // replay whose rollback wiped the cache and reset the counter
+      // while leaving the unresolved tool-call flag set. Mirror
+      // `sendStream()`'s turn-0 routing: replay the preserved history
+      // through the cold start stream and return before the
+      // delta/commit machinery so the start path owns the history push,
+      // turnCount increment, and media-key rehydration. A normal tool
+      // result always follows a prior tool-call turn (turnCount>=1), so
+      // this never fires on the happy path.
+      if (this.turnCount === 0) {
+        yield* this.replayToolResultThroughStartStreamPath(toolMsg, mergedConfig, signal);
+        return;
+      }
       let sawFinal = false;
       let accumulated = '';
       let accumulatedVisible = '';
@@ -983,16 +1026,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             throw err;
           }
           delegated = true;
-          const toolMsg: ChatMessage = { role: 'tool', content, toolCallId, isError };
-          yield* this.runStartStreamPathWithMessage(
-            toolMsg,
-            this.computeTrailingImagesKey(),
-            this.computeTrailingAudioKey(),
-            true,
-            false,
-            mergedConfig,
-            signal,
-          );
+          yield* this.replayToolResultThroughStartStreamPath(toolMsg, mergedConfig, signal);
           return;
         }
       } finally {
@@ -1013,6 +1047,31 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     } finally {
       this.inFlight = false;
     }
+  }
+
+  /**
+   * Streaming counterpart of {@link replayToolResultThroughStartPath}:
+   * cold-replay a tool result through the start stream. Used by the
+   * turn-0 precheck and the media-held rejection catch in
+   * {@link sendToolResultStream}. The start stream owns the history
+   * push, turnCount increment, and media-key rehydration; callers keep
+   * `delegated`/early-return semantics so the commit `finally` stays
+   * off.
+   */
+  private async *replayToolResultThroughStartStreamPath(
+    toolMsg: ChatMessage,
+    config: ChatConfig,
+    signal: AbortSignal | undefined,
+  ): AsyncGenerator<ChatStreamEvent> {
+    yield* this.runStartStreamPathWithMessage(
+      toolMsg,
+      this.computeTrailingImagesKey(),
+      this.computeTrailingAudioKey(),
+      true,
+      false,
+      config,
+      signal,
+    );
   }
 
   /**

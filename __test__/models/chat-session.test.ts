@@ -2129,6 +2129,137 @@ describe('ChatSession', () => {
       expect(startCalls).toBe(1);
       expect(session.turns).toBe(1);
     });
+
+    it('sendToolResultStream(): an interrupted media-held replay leaves a cold session that the next sendToolResult self-heals through the start path', async () => {
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        // The media-held tool delta: throw before any chunk, as
+        // stream.ts surfaces the native sink error on the first
+        // iteration.
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      // Streamed start drives both the turn-1 image start (one ok tool
+      // call) and the interrupted turn-2 replay (one delta, never
+      // reaches done → caller breaks → rollback to turnCount 0).
+      let startStreamCalls = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startStreamCalls++;
+        if (startStreamCalls === 1) {
+          yield { text: 'A', done: false };
+          yield finalChunkWithSingleToolCall('describe-reply', 'c1');
+          return;
+        }
+        // The replay stream: emit one partial delta, never reach done.
+        yield { text: 'partial-replay', done: false };
+      });
+      const chatSessionStart = vi.fn(
+        async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+          makeChatResult('recovered-reply'),
+      );
+      const model: SessionCapableModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: streamed image start emits a single ok tool call.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: media-held rejection → replay stream, but the
+      // caller BREAKS after the first partial delta, before done:true.
+      // The replay was a media-change restart (caches wiped up front),
+      // so the runStartStreamPath rollback resets turnCount → 0 and
+      // clears the media keys, leaving the session cold while the
+      // unresolved tool-call flag is still set.
+      let seen = 0;
+      for await (const _e of session.sendToolResultStream('c1', 'tool-out')) {
+        seen++;
+        break;
+      }
+      expect(seen).toBe(1);
+      expect(session.turns).toBe(0);
+      expect(session.hasImages).toBe(false);
+      // The tool-call flag survives the rollback — the bug is that the
+      // delta path would now hard-error against the wiped cache.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // The natural retry must self-heal: route through the cold start
+      // path (chatSessionStart), NOT a second tool delta, and resolve
+      // with the replayed reply.
+      const retry = await session.sendToolResult('c1', 'tool-out');
+      expect(retry.text).toBe('recovered-reply');
+      // The tool delta was attempted exactly once (the interrupted
+      // replay); the retry never re-dispatched it.
+      expect(chatStreamSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The retry resolved through the start path.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(session.turns).toBe(1);
+
+      // The replay history includes the prior media turn, the assistant
+      // tool-call turn, and the pending tool message.
+      expect(chatSessionStart.mock.calls[0][0]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+    });
+
+    it('sendToolResult(): a media-held replay that THROWS before success leaves a cold session that the next sendToolResult self-heals', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start whose assistant reply carries one ok tool
+      // call — the legal pre-state for a tool-result dispatch.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: the delta rejects with the media-held prefix, and
+      // the replay's chatSessionStart ALSO rejects once — the cold
+      // start prefill fails before success, so the runStartPath
+      // rollback resets turnCount → 0 (media-change restart) and the
+      // first call throws.
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      chatSessionStart.mockRejectedValueOnce(new Error('replay-prefill-fail'));
+      await expect(session.sendToolResult('c1', 'tool-out')).rejects.toThrow('replay-prefill-fail');
+      expect(session.turns).toBe(0);
+      // The tool-call flag survives the rollback.
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // The retry must self-heal through the cold start path now that
+      // chatSessionStart succeeds — NOT a second doomed tool delta.
+      const retry = await session.sendToolResult('c1', 'tool-out');
+      expect(retry.text).toBe('start-reply');
+      // The delta was attempted exactly once (the original media-held
+      // try); the retry routed straight through the start path.
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // chatSessionStart: turn-1 start + the failed replay + the
+      // successful retry replay = 3 total.
+      expect(chatSessionStart).toHaveBeenCalledTimes(3);
+      expect(session.turns).toBe(1);
+
+      // The retry replay re-rendered the full preserved history plus the
+      // pending tool message.
+      expect(chatSessionStart.mock.calls[2][0]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+    });
   });
 
   // -------------------------------------------------------------------
