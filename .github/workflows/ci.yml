@@ -14,13 +14,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Release CI builds must NOT use incremental compilation. With the restored
-  # rust-cache on the macOS runners, incremental produced a non-deterministically
-  # miscompiled native addon that aborted at napi module registration
-  # (mlx_core::_napi_rs_internal_register_init) on dlopen — even though the
-  # generated register glue is byte-identical to the passing base commit. A clean,
-  # non-incremental build is deterministic and the addon loads.
-  CARGO_INCREMENTAL: 0
+  CARGO_INCREMENTAL: 1
 
 jobs:
   build:
@@ -61,10 +55,9 @@ jobs:
           # rustup proxy installed by setup-rust-toolchain and leaves
           # cargo resolving to rustup-init's usage screen.
           cache-bin: false
-          # Bumped to v2 to orphan the v1 archives poisoned by the prior
-          # incremental builds (see the CARGO_INCREMENTAL note in top-level env);
-          # forces a clean, non-incremental cache.
-          prefix-key: v2-rust
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -112,7 +105,7 @@ jobs:
         if: steps.reuse.outputs.reused != 'true'
         run: yarn build
         env:
-          CARGO_INCREMENTAL: 0
+          CARGO_INCREMENTAL: 1
 
       - uses: actions/upload-artifact@v6
         with:
@@ -170,10 +163,9 @@ jobs:
           # rustup proxy installed by setup-rust-toolchain and leaves
           # cargo resolving to rustup-init's usage screen.
           cache-bin: false
-          # Bumped to v2 to orphan the v1 archives poisoned by the prior
-          # incremental builds (see the CARGO_INCREMENTAL note in top-level env);
-          # forces a clean, non-incremental cache.
-          prefix-key: v2-rust
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -200,7 +192,7 @@ jobs:
           ${{ matrix.test }}
         env:
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 0
+          CARGO_INCREMENTAL: 1
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
 
   # Heavy real-model end-to-end leg — reuses the `build` job's native addon +
@@ -300,7 +292,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-          prefix-key: v2-rust
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -323,7 +315,7 @@ jobs:
       - name: Download + convert ${{ matrix.name }} checkpoint and run its tests
         env:
           RUST_BACKTRACE: 1
-          CARGO_INCREMENTAL: 0
+          CARGO_INCREMENTAL: 1
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
         run: |
           set -euo pipefail
@@ -389,10 +381,9 @@ jobs:
           # rustup proxy installed by setup-rust-toolchain and leaves
           # cargo resolving to rustup-init's usage screen.
           cache-bin: false
-          # Bumped to v2 to orphan the v1 archives poisoned by the prior
-          # incremental builds (see the CARGO_INCREMENTAL note in top-level env);
-          # forces a clean, non-incremental cache.
-          prefix-key: v2-rust
+          # Bumped after switching toolchain action; forces fresh
+          # caches and orphans the poisoned v0-rust archives.
+          prefix-key: v1-rust
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -415,7 +406,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
         env:
-          CARGO_INCREMENTAL: 0
+          CARGO_INCREMENTAL: 1
 
   publish:
     name: Publish

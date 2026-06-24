@@ -38,22 +38,13 @@ pub mod transformer;
 pub mod utils;
 pub mod vision;
 
-use std::sync::LazyLock;
-use stream::{DeviceType, Stream};
-
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
 static GLOBAL: mimalloc_safe::MiMalloc = mimalloc_safe::MiMalloc;
 
-/// Global generation stream, created once at module load (matches mlx-lm)
-/// This is like Python's: generation_stream = mx.new_stream(mx.default_device())
-pub(crate) static GENERATION_STREAM: LazyLock<Stream> = LazyLock::new(|| {
-    // Create a dedicated stream for generation on the default device (GPU if available)
-    Stream::new(DeviceType::Gpu)
-});
-
-#[napi_derive::napi(module_exports)]
-pub fn init() {
-    // Initialize the generation stream
-    let _ = &*GENERATION_STREAM;
-}
+// No `#[napi(module_exports)]` init hook: the addon must not touch MLX/Metal
+// during `dlopen`. A module-load hook runs inside a non-unwinding boundary, so
+// creating a GPU stream there turns any Metal-init failure into a process
+// `abort` (observed as mass `register_init` aborts across concurrent test
+// workers). MLX brings up its default device/stream lazily on the first real
+// op, so there is nothing that needs to be set up at module-load time.
