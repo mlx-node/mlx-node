@@ -194,6 +194,8 @@ test-integration-output
 Cargo.lock
 *.node
 /docs/superpowers/plans/*.md
+# subagent-driven-development scratch ledger + briefs/reports
+/.superpowers/
 
 # TypeScript compiled output in packages (not NAPI-RS generated files)
 packages/*/src/**/*.js
