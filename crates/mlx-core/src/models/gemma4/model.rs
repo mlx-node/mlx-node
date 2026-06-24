@@ -4767,7 +4767,12 @@ impl PagedBackend for Gemma4Inner {
             };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
+            // A text save is text-only, so drop any stale media key — mirrors
+            // the flat `save_cache_state` fresh-turn clear. On a warm reuse the
+            // delta image guard already kept these `None`, so this is a no-op;
+            // on a fresh start it clears a key a prior media turn left behind.
             self.cached_image_key = None;
+            self.cached_audio_key = None;
             // Sliding-window warm-continue checkpoint keyed on the freshly
             // set history (post-reconcile `request_tokens()` == the trimmed
             // history). Fallible: a checkpoint/eval error aborts the turn so
@@ -4779,7 +4784,14 @@ impl PagedBackend for Gemma4Inner {
         } else {
             self.cached_token_history.clear();
             self.sliding_last_history_checkpoint = None;
+            // Fresh paged start: a text turn holds no media, so clear any media
+            // key a prior turn on this reused model left set (mirrors the flat
+            // `save_cache_state` fresh-turn clear). Without the audio clear a
+            // text-only start over a model whose last turn was audio would leave
+            // `cached_audio_key` stale and the delta image guard would wrongly
+            // force an "audio state" restart on the text-only session.
             self.cached_image_key = None;
+            self.cached_audio_key = None;
         }
         Ok(())
     }
@@ -7732,6 +7744,61 @@ mod tests {
             image_not_live_reject.contains("image state"),
             "not-live continuable image rejection must mention image state, \
              got: {image_not_live_reject}"
+        );
+    }
+
+    /// Paged/flat parity: a fresh (non-reuse) text-only `save_paged_history`
+    /// must clear `cached_audio_key`, exactly as the flat `save_cache_state`
+    /// does on a fresh turn. Without that clear, a text-only paged start over a
+    /// reused model whose prior turn was audio would leave `cached_audio_key`
+    /// stale, and the next text delta's `text_delta_image_guard` would wrongly
+    /// force an "audio state" restart on the text-only session. This pins the
+    /// fix: pre-fix the post-save key would stay `Some` and the guard would
+    /// return the audio-state restart string, failing both asserts below.
+    #[test]
+    fn test_text_only_paged_save_clears_stale_audio_key() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Simulate a completed audio turn that left the audio key set, then a
+        // fresh text-only paged START (no `reset()`): image key already None,
+        // session not continuable.
+        inner.cached_audio_key = Some(7);
+        inner.cached_image_key = None;
+        inner.media_session_continuable = false;
+
+        // Fresh (non-reuse, non-delta) text-only paged save — the same shape
+        // the engine uses to persist a fresh text turn's history.
+        let save_tokens: Vec<u32> = vec![10, 11, 12];
+        let generated: Vec<u32> = vec![20, 21];
+        inner
+            .save_paged_history(&save_tokens, &generated, false, false)
+            .expect("text-only paged save must succeed");
+
+        // The fix: the stale audio key is cleared on the text-only save.
+        assert!(
+            inner.cached_audio_key.is_none(),
+            "text-only paged save must clear the stale audio key"
+        );
+
+        // Downstream effect: the next text delta is no longer rejected with an
+        // "audio state" restart — the guard returns None on the text-only
+        // session. Pre-fix this would be `Some("…holds audio state")`.
+        assert!(
+            inner
+                .text_delta_image_guard("chat_session_continue")
+                .is_none(),
+            "after a text-only paged save the guard must not force an audio restart"
         );
     }
 
