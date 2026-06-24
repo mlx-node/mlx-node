@@ -1920,6 +1920,215 @@ describe('ChatSession', () => {
       expect(chatStreamSessionStart).toHaveBeenCalledTimes(1);
       expect(session.turns).toBe(1);
     });
+
+    it('sendToolResult(): media-held rejection replays through chatSessionStart', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: image start whose assistant reply carries exactly one ok
+      // tool call — the legal pre-state for a tool-result dispatch.
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: the native session (media held) rejects the
+      // tool-result delta with the typed prefix. The session must catch
+      // it and replay through chatSessionStart.
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      const result = await session.sendToolResult('c1', 'tool-out');
+
+      // Resolves with the replayed reply — no throw.
+      expect(result.text).toBe('start-reply');
+      // The delta path was attempted exactly once before the replay.
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      // The replay ran through the start path (turn-1 start + replay).
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+
+      // The replay re-rendered the FULL history: the prior image turn, the
+      // assistant tool-call turn, and the pending tool message (isError
+      // omitted → undefined).
+      const replayMessages = chatSessionStart.mock.calls[1][0];
+      expect(replayMessages).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+
+      // History advanced by exactly one turn.
+      expect(session.turns).toBe(2);
+      // Trailing image key rehydrated from history — cache still reflects
+      // the held image.
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up send is accepted (the replay reply
+      // had no outstanding tool calls, so the plain path is legal).
+      const followUp = await session.send('and now?');
+      expect(followUp.text).toBe('continue-reply');
+      expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResult(): preserves isError through the cold replay', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+
+      chatSessionContinueTool.mockRejectedValueOnce(mediaHeldError());
+      await session.sendToolResult('c1', '{"error":"boom"}', { isError: true });
+
+      // The pending tool message carried through the replay keeps the
+      // structured error flag so the wire-format marker re-renders.
+      const replayMessages = chatSessionStart.mock.calls[1][0];
+      expect(replayMessages[replayMessages.length - 1]).toEqual({
+        role: 'tool',
+        content: '{"error":"boom"}',
+        toolCallId: 'c1',
+        isError: true,
+      });
+    });
+
+    it('sendToolResult(): a non-prefix tool-result rejection propagates without replay', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+      const session = new ChatSession(model);
+
+      chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
+      await session.send('describe', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+
+      chatSessionContinueTool.mockRejectedValueOnce(new Error('some other native failure'));
+      await expect(session.sendToolResult('c1', 'tool-out')).rejects.toThrow('some other native failure');
+
+      // No replay — chatSessionStart not called a second time.
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      // The failed turn did not advance the counter and left the
+      // outstanding-call flag intact for a retry.
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // inFlight cleared — a retry against the same outstanding call works.
+      await session.sendToolResult('c1', 'retry');
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+    });
+
+    it('sendToolResultStream(): media-held rejection replays through chatStreamSessionStart', async () => {
+      let toolCalls = 0;
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        toolCalls++;
+        // The media-held tool delta: throw before any chunk, exactly how
+        // stream.ts surfaces the native sink error on the first iteration.
+        throw mediaHeldError();
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      let startCalls = 0;
+      const startHistories: ChatMessage[][] = [];
+      const chatStreamSessionStart = vi.fn(async function* (messages: ChatMessage[]): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        startHistories.push(messages);
+        if (startCalls === 1) {
+          // Turn-1 image start whose reply carries one ok tool call.
+          yield { text: 'A', done: false };
+          yield finalChunkWithSingleToolCall('describe-reply', 'c1');
+          return;
+        }
+        // Tool-result replay.
+        yield { text: 'replayed', done: false };
+        yield finalChunk('replayed-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model, { system: 'You are helpful.' });
+
+      // Turn 1: streamed image start emits a single ok tool call.
+      for await (const _e of session.sendStream('describe', { images: [imgA] })) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.hasImages).toBe(true);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: media-held rejection → transparent replay.
+      const events: ChatStreamEvent[] = [];
+      for await (const e of session.sendToolResultStream('c1', 'tool-out')) events.push(e);
+
+      // The replayed reply was yielded; no duplicate / partial emission of
+      // the failed delta (the failed tool continue produced no chunk).
+      expect(events.map((e) => e.text)).toEqual(['replayed', 'replayed-reply']);
+      expect(events[events.length - 1].done).toBe(true);
+      expect((events[events.length - 1] as ChatStreamFinal).finishReason).toBe('stop');
+
+      // Tool delta attempted once; replay ran through the start stream.
+      expect(toolCalls).toBe(1);
+      expect(startCalls).toBe(2);
+
+      // The replay re-rendered the FULL history incl. the prior image turn,
+      // the assistant tool-call turn, and the pending tool message.
+      expect(startHistories[1]).toEqual([
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'describe-reply', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'tool-out', toolCallId: 'c1', isError: undefined },
+      ]);
+
+      // History committed exactly once; turnCount +1.
+      expect(session.turns).toBe(2);
+      expect(session.hasImages).toBe(true);
+
+      // inFlight cleared — a follow-up streams cleanly.
+      for await (const _e of session.sendStream('and now?')) void _e;
+      expect(session.turns).toBe(3);
+    });
+
+    it('sendToolResultStream(): a non-prefix tool throw still propagates (no replay)', async () => {
+      const chatStreamSessionContinueTool = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        throw new Error('tool native failure');
+        // eslint-disable-next-line no-unreachable
+        yield finalChunk('unreachable');
+      });
+      let startCalls = 0;
+      const chatStreamSessionStart = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
+        startCalls++;
+        yield finalChunkWithSingleToolCall('turn-1-reply', 'c1');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool,
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1 via streamed start emits one ok tool call.
+      for await (const _e of session.sendStream('turn 1')) void _e;
+      expect(session.turns).toBe(1);
+      expect(session.pendingUnresolvedToolCallCount).toBe(1);
+
+      // Tool result: a non-prefix throw must NOT be swallowed into a
+      // replay — it propagates, and no replay start runs.
+      await expect(async () => {
+        for await (const _e of session.sendToolResultStream('c1', 'tool-out')) void _e;
+      }).rejects.toThrow('tool native failure');
+
+      // Only the turn-1 start stream ran; no replay was triggered.
+      expect(startCalls).toBe(1);
+      expect(session.turns).toBe(1);
+    });
   });
 
   // -------------------------------------------------------------------
