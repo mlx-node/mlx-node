@@ -756,6 +756,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // Delta continue stream: text-only.
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       // Set when the media-held rejection re-routes this turn through the
@@ -780,6 +781,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
               }
             } else {
               accumulated += event.text;
+              if (event.isReasoning !== true) {
+                accumulatedVisible += event.text;
+              }
             }
             yield event;
           }
@@ -821,7 +825,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // committed (or rolled back) — so this commit must stay off.
         if (sawFinal && !delegated) {
           this.history.push({ role: 'user', content: userMessage });
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -908,6 +912,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(config);
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
@@ -926,6 +931,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             }
           } else {
             accumulated += event.text;
+            if (event.isReasoning !== true) {
+              accumulatedVisible += event.text;
+            }
           }
           yield event;
         }
@@ -936,7 +944,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // history until commit, so the rollback branch is a no-op.
         if (sawFinal) {
           this.history.push({ role: 'tool', content, toolCallId, isError });
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.recordToolCallFanout(finalToolCalls);
         }
@@ -1088,6 +1096,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const historySnapshot = this.history.slice();
       let sawFinal = false;
       let accumulated = '';
+      let accumulatedVisible = '';
       let finalRaw: string | null = null;
       let finalToolCalls: readonly ToolCallResult[] | undefined;
       try {
@@ -1100,6 +1109,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             }
           } else {
             accumulated += event.text;
+            if (event.isReasoning !== true) {
+              accumulatedVisible += event.text;
+            }
           }
           yield event;
         }
@@ -1110,7 +1122,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // mutated on a successful commit — on any non-success exit,
         // the primed state is left intact so the caller can retry.
         if (sawFinal) {
-          this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+          this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
           this.turnCount++;
           this.lastImagesKey = this.computeTrailingImagesKey();
           this.lastAudioKey = this.computeTrailingAudioKey();
@@ -1337,6 +1349,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
     let sawFinal = false;
     let accumulated = '';
+    let accumulatedVisible = '';
     let finalRaw: string | null = null;
     let finalToolCalls: readonly ToolCallResult[] | undefined;
     // Snapshot the history before dispatch — see `runStartPath` for
@@ -1352,6 +1365,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           }
         } else {
           accumulated += event.text;
+          if (event.isReasoning !== true) {
+            accumulatedVisible += event.text;
+          }
         }
         yield event;
       }
@@ -1365,7 +1381,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // generator was wound down. Mid-stream throws still propagate
       // naturally — finally runs first, then the error continues up.
       if (sawFinal) {
-        this.history.push(buildAssistantMessage(finalRaw ?? accumulated, finalToolCalls));
+        this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
         this.turnCount++;
         this.lastImagesKey = newImagesKey;
         this.lastAudioKey = newAudioKey;

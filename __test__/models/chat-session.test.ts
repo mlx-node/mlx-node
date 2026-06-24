@@ -1557,6 +1557,103 @@ describe('ChatSession', () => {
       for await (const _e of session.sendStream('turn 2 retry')) void _e;
       expect(session.turns).toBe(2);
     });
+
+    // -----------------------------------------------------------------
+    // gemma4 empty-done-chunk history commit
+    //
+    // gemma4 is the only family whose native streaming `finish` emits a
+    // terminal chunk with `text: ''` (the visible text was already
+    // streamed as per-token deltas). The history commit must therefore
+    // fall back to the accumulated VISIBLE deltas instead of storing an
+    // empty assistant turn — otherwise any cold-restart that resends
+    // `this.history` (e.g. the media→text restart) loses the reply.
+    //
+    // History is private, so these assert through the image-change
+    // restart, which replays the full committed history into
+    // `chatStreamSessionStart`.
+    // -----------------------------------------------------------------
+
+    const gemmaImgA = new Uint8Array([91, 92, 93]);
+    const gemmaImgB = new Uint8Array([94, 95, 96]);
+
+    /**
+     * Read back the committed assistant content of the FIRST streamed
+     * turn by triggering an image-change restart and inspecting the
+     * replayed `chatStreamSessionStart` history.
+     */
+    async function committedAssistantViaRestart(firstTurnDeltas: ChatStreamEvent[]): Promise<string | undefined> {
+      let startCall = 0;
+      const chatStreamSessionStart = vi.fn(async function* (
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+      ): AsyncGenerator<ChatStreamEvent> {
+        startCall++;
+        if (startCall === 1) {
+          for (const ev of firstTurnDeltas) yield ev;
+          return;
+        }
+        // Restart stream — content does not matter for the assertion.
+        yield finalChunk('restart-reply');
+      });
+      const model: SessionCapableModel = {
+        chatSessionStart: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinue: vi.fn(async () => makeChatResult('x')),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        chatStreamSessionContinueTool: vi.fn(async function* () {
+          yield finalChunk('x');
+        }),
+        resetCaches: vi.fn(),
+      };
+      const session = new ChatSession(model);
+
+      // Turn 1: gemma4-shape stream with an image attached so the next
+      // (different-image) send is detected as an image change.
+      for await (const _e of session.sendStream('turn 1', { images: [gemmaImgA] })) void _e;
+      expect(session.turns).toBe(1);
+
+      // Turn 2: image-change restart replays the committed history.
+      for await (const _e of session.sendStream('turn 2', { images: [gemmaImgB] })) void _e;
+
+      const restartMessages = chatStreamSessionStart.mock.calls[1][0];
+      const assistant = restartMessages.find((m) => m.role === 'assistant');
+      return assistant?.content;
+    }
+
+    it('commits the accumulated visible text when the done chunk is empty (gemma4)', async () => {
+      // Visible deltas streamed, then a gemma4-shape empty final chunk.
+      const content = await committedAssistantViaRestart([
+        { text: 'Pa', done: false, isReasoning: false },
+        { text: 'ris', done: false, isReasoning: false },
+        finalChunk(''),
+      ]);
+      expect(content).toBe('Paris');
+    });
+
+    it('excludes reasoning deltas from the empty-done-chunk commit (gemma4)', async () => {
+      // Reasoning-body delta must NOT leak into stored history; only the
+      // visible delta survives when the final chunk is empty.
+      const content = await committedAssistantViaRestart([
+        { text: 'thinking…', done: false, isReasoning: true },
+        { text: 'Answer', done: false, isReasoning: false },
+        finalChunk(''),
+      ]);
+      expect(content).toBe('Answer');
+    });
+
+    it('commits the non-empty done-chunk text verbatim (non-gemma regression)', async () => {
+      // For families whose final chunk carries non-empty `text`, the
+      // commit must use that text unchanged — `||` ≡ `??` here. The
+      // accumulated visible deltas must NOT override it.
+      const content = await committedAssistantViaRestart([
+        { text: 'partial-stream-text', done: false, isReasoning: false },
+        finalChunk('cont-reply'),
+      ]);
+      expect(content).toBe('cont-reply');
+    });
   });
 
   // -------------------------------------------------------------------
