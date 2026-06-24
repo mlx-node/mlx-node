@@ -1857,9 +1857,17 @@ impl Gemma4Inner {
         Ok(Some(merged))
     }
 
-    /// Prepare the merged multimodal prompt for a paged prefill: expand image
-    /// placeholders (when images present) then audio placeholders (when audio
+    /// Prepare the merged multimodal prompt for a paged prefill: expand audio
+    /// placeholders (when audio present) then image placeholders (when images
     /// present) on the rendered token stream, and decode/frame the audio.
+    ///
+    /// Audio expansion runs FIRST so that on the manual no-placeholder fallback
+    /// (tokenizer without a chat template — neither `<|image|>` nor `<|audio|>`
+    /// is emitted) each modality's span is inserted right after BOS, and the
+    /// expansion that runs LAST lands first. Running image expansion last keeps
+    /// the serializer's canonical `BOS -> image -> audio -> text` order. On the
+    /// chat-template path each expansion replaces only its own placeholder id in
+    /// place, so content order is preserved regardless of which runs first.
     ///
     /// Returns `(tokens, processed_images, audio_frames, new_image_key,
     /// new_audio_key)`. Image-only turns never touch the audio path and leave
@@ -1879,23 +1887,32 @@ impl Gemma4Inner {
         Option<u64>,
         Option<u64>,
     )> {
-        // Image expansion (only when images present — keeps audio-only turns
-        // off the image processor and leaves `new_image_key` None).
-        let (mut tokens, processed_images, new_image_key) = if raw_images.is_empty() {
-            (rendered_tokens.to_vec(), Vec::new(), None)
-        } else {
-            self.prepare_vision_tokens(rendered_tokens, raw_images)?
-        };
-
-        // Audio expansion on top of the (possibly image-expanded) stream.
+        // Audio expansion first (only when audio present — keeps image-only
+        // turns off the audio path and leaves `new_audio_key` None). On the
+        // no-placeholder fallback each modality's span is inserted right after
+        // BOS, so whichever expansion runs LAST lands first; running image last
+        // (below) yields the canonical BOS -> image -> audio -> text order.
         let mut audio_frames: Option<MxArray> = None;
         let mut new_audio_key: Option<u64> = None;
-        if !raw_audio.is_empty() {
-            let (expanded, frames, audio_key) = self.prepare_audio_tokens(&tokens, raw_audio)?;
-            tokens = expanded;
+        let tokens_after_audio = if raw_audio.is_empty() {
+            rendered_tokens.to_vec()
+        } else {
+            let (expanded, frames, audio_key) =
+                self.prepare_audio_tokens(rendered_tokens, raw_audio)?;
             audio_frames = Some(frames);
             new_audio_key = audio_key;
-        }
+            expanded
+        };
+
+        // Image expansion on top of the (possibly audio-expanded) stream — runs
+        // LAST so its spans precede the audio spans on the fallback path. Image
+        // expansion only touches `<|image|>` ids, so the audio spans are inert
+        // to it on the chat-template path.
+        let (tokens, processed_images, new_image_key) = if raw_images.is_empty() {
+            (tokens_after_audio, Vec::new(), None)
+        } else {
+            self.prepare_vision_tokens(&tokens_after_audio, raw_images)?
+        };
 
         Ok((
             tokens,
@@ -6873,6 +6890,84 @@ mod tests {
             image_token_id,
             audio_token_id
         ));
+    }
+
+    /// Pins the composition order `prepare_multimodal_tokens` relies on: on the
+    /// manual no-placeholder fallback (tokenizer without a chat template),
+    /// audio expansion runs FIRST and image expansion runs LAST, so the image
+    /// span lands first after BOS, yielding the canonical
+    /// `BOS -> image -> audio -> text` order. If the two expansions were
+    /// composed in the old order (image first, audio last) this would produce
+    /// `BOS -> audio -> image -> text` and fail.
+    #[test]
+    fn no_placeholder_fallback_orders_image_before_audio() {
+        let image_token_id = 258880u32;
+        let audio_token_id = 258881u32;
+        let boi = 255999u32;
+        let eoi = 258882u32;
+        let boa = 256000u32;
+        let eoa = 258883u32;
+        let bos = 2u32;
+        let text = 9u32;
+
+        // No <|image|>/<|audio|> placeholders, one image (3 soft tokens) + one
+        // 2-frame audio clip. Audio expansion runs first (inserts after BOS),
+        // then image expansion on the audio-expanded stream (also inserts after
+        // BOS, so it precedes the audio span).
+        let tokens = vec![bos, text];
+        let audio_expanded = crate::models::gemma4::audio_processor::expand_audio_tokens(
+            &tokens,
+            &[2],
+            audio_token_id,
+            boa,
+            eoa,
+        )
+        .unwrap();
+        assert_eq!(
+            audio_expanded,
+            vec![bos, boa, audio_token_id, audio_token_id, eoa, text],
+            "audio fallback inserts its span right after BOS",
+        );
+
+        let image = ProcessedGemma4Image {
+            pixel_values: MxArray::zeros(&[1, 1], Some(DType::Float32)).unwrap(),
+            num_soft_tokens: 3,
+            position_ids: None,
+        };
+        let final_tokens = expand_image_tokens(
+            &audio_expanded,
+            std::slice::from_ref(&image),
+            image_token_id,
+            boi,
+            eoi,
+        );
+
+        // Image span precedes the audio span: BOS, image, audio, text.
+        assert_eq!(
+            final_tokens,
+            vec![
+                bos,
+                boi,
+                image_token_id,
+                image_token_id,
+                image_token_id,
+                eoi,
+                boa,
+                audio_token_id,
+                audio_token_id,
+                eoa,
+                text,
+            ],
+            "image runs last in the fallback so its span lands first after BOS",
+        );
+
+        // Cross-check: the image markers appear before the audio markers.
+        let boi_pos = final_tokens.iter().position(|&t| t == boi).unwrap();
+        let boa_pos = final_tokens.iter().position(|&t| t == boa).unwrap();
+        assert!(
+            boi_pos < boa_pos,
+            "image span must precede audio span (boi at {boi_pos}, boa at {boa_pos})",
+        );
     }
 
     #[test]
