@@ -482,6 +482,38 @@ describe('ChatSession', () => {
       expect(session.hasImages).toBe(true);
     });
 
+    it('an audio-change restart preserves the untouched image key and does not re-detect the same image', async () => {
+      // A restart driven by a change in only ONE modality replays the
+      // FULL history through the start path, so the post-restart sticky
+      // keys must be derived from that history — not from the single
+      // turn's literal media args (which null the untouched modality).
+      const audX = new Uint8Array([9, 9, 9]);
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      // Turn 1: image start.
+      await session.send('describe', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(session.hasImages).toBe(true);
+
+      // Turn 2: audio-only turn → audio change → full restart. Image A is
+      // still present in the replayed history, so the image key must be
+      // rehydrated from history, not nulled by the per-turn audio args.
+      await session.send('transcribe', { audio: [audX] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      // The image is still live in the native cache — hasImages must NOT
+      // lie (this assertion fails before the fix, passes after).
+      expect(session.hasImages).toBe(true);
+
+      // Turn 3: refer back to the SAME image A. Because lastImagesKey was
+      // preserved as key(A), this is NOT detected as an image change, so
+      // it routes through the cheap delta path — no spurious third start
+      // that would duplicate image A in the prompt.
+      await session.send('what was in the image?', { images: [imgA] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+
     it('hasImages stays true across text-only follow-ups and tool turns', async () => {
       const { model, chatSessionContinue } = makeMockModel();
       const session = new ChatSession(model);

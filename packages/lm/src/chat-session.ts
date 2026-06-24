@@ -662,8 +662,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           userMessage,
           opts.images,
           opts.audio,
-          newImagesKey,
-          newAudioKey,
           imageChanged || audioChanged,
           isFirstTurn,
           mergedConfig,
@@ -687,16 +685,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
         // consistent across the replay. The delta path has NOT pushed
         // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
-        return await this.runStartPath(
-          userMessage,
-          undefined,
-          undefined,
-          this.computeTrailingImagesKey(),
-          this.computeTrailingAudioKey(),
-          true,
-          false,
-          mergedConfig,
-        );
+        return await this.runStartPath(userMessage, undefined, undefined, true, false, mergedConfig);
       }
       this.history.push({ role: 'user', content: userMessage });
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
@@ -743,8 +732,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           userMessage,
           opts.images,
           opts.audio,
-          newImagesKey,
-          newAudioKey,
           imageChanged || audioChanged,
           isFirstTurn,
           mergedConfig,
@@ -804,8 +791,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             userMessage,
             undefined,
             undefined,
-            this.computeTrailingImagesKey(),
-            this.computeTrailingAudioKey(),
             true,
             false,
             mergedConfig,
@@ -930,14 +915,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * prior tool-call turn.
    */
   private async replayToolResultThroughStartPath(toolMsg: ChatMessage, config: ChatConfig): Promise<ChatResult> {
-    return await this.runStartPathWithMessage(
-      toolMsg,
-      this.computeTrailingImagesKey(),
-      this.computeTrailingAudioKey(),
-      true,
-      false,
-      config,
-    );
+    return await this.runStartPathWithMessage(toolMsg, true, false, config);
   }
 
   /**
@@ -1063,15 +1041,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     config: ChatConfig,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ChatStreamEvent> {
-    yield* this.runStartStreamPathWithMessage(
-      toolMsg,
-      this.computeTrailingImagesKey(),
-      this.computeTrailingAudioKey(),
-      true,
-      false,
-      config,
-      signal,
-    );
+    yield* this.runStartStreamPathWithMessage(toolMsg, true, false, config, signal);
   }
 
   /**
@@ -1397,21 +1367,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     userMessage: string,
     images: Uint8Array[] | undefined,
     audio: Uint8Array[] | undefined,
-    newImagesKey: string | null,
-    newAudioKey: string | null,
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
   ): Promise<ChatResult> {
     const userMsg = this.buildUserMessage(userMessage, images, audio);
-    return await this.runStartPathWithMessage(
-      userMsg,
-      newImagesKey,
-      newAudioKey,
-      mediaChanged,
-      isFirstTurn,
-      config,
-    );
+    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config);
   }
 
   /**
@@ -1424,8 +1385,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    */
   private async runStartPathWithMessage(
     pendingMessage: ChatMessage,
-    newImagesKey: string | null,
-    newAudioKey: string | null,
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
@@ -1449,8 +1408,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const result = await this.model.chatSessionStart(this.history.slice(), config);
       this.history.push(buildAssistantMessage(result.text, result.toolCalls));
       this.turnCount++;
-      this.lastImagesKey = newImagesKey;
-      this.lastAudioKey = newAudioKey;
+      // The start path always re-renders the FULL preserved history, so the
+      // post-restart sticky keys are the trailing media keys of that history,
+      // not the single-turn literal args. A restart driven by a change in only
+      // one modality (e.g. an audio-only turn after an earlier image turn)
+      // would otherwise null the untouched modality's key even though that
+      // media is still live in the native cache, causing a later same-media
+      // turn to be mis-detected as a change and replayed twice.
+      this.lastImagesKey = this.computeTrailingImagesKey();
+      this.lastAudioKey = this.computeTrailingAudioKey();
       this.recordToolCallFanout(result.toolCalls);
       return result;
     } catch (err) {
@@ -1474,23 +1440,13 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     userMessage: string,
     images: Uint8Array[] | undefined,
     audio: Uint8Array[] | undefined,
-    newImagesKey: string | null,
-    newAudioKey: string | null,
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
     signal: AbortSignal | undefined,
   ): AsyncGenerator<ChatStreamEvent> {
     const userMsg = this.buildUserMessage(userMessage, images, audio);
-    yield* this.runStartStreamPathWithMessage(
-      userMsg,
-      newImagesKey,
-      newAudioKey,
-      mediaChanged,
-      isFirstTurn,
-      config,
-      signal,
-    );
+    yield* this.runStartStreamPathWithMessage(userMsg, mediaChanged, isFirstTurn, config, signal);
   }
 
   /**
@@ -1501,8 +1457,6 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    */
   private async *runStartStreamPathWithMessage(
     pendingMessage: ChatMessage,
-    newImagesKey: string | null,
-    newAudioKey: string | null,
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
@@ -1555,8 +1509,15 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       if (sawFinal) {
         this.history.push(buildAssistantMessage(finalRaw || accumulatedVisible, finalToolCalls));
         this.turnCount++;
-        this.lastImagesKey = newImagesKey;
-        this.lastAudioKey = newAudioKey;
+        // The start path always re-renders the FULL preserved history, so the
+        // post-restart sticky keys are the trailing media keys of that history,
+        // not the single-turn literal args. A restart driven by a change in only
+        // one modality (e.g. an audio-only turn after an earlier image turn)
+        // would otherwise null the untouched modality's key even though that
+        // media is still live in the native cache, causing a later same-media
+        // turn to be mis-detected as a change and replayed twice.
+        this.lastImagesKey = this.computeTrailingImagesKey();
+        this.lastAudioKey = this.computeTrailingAudioKey();
         this.recordToolCallFanout(finalToolCalls);
       } else {
         // Roll back: drop the tentative user push so history stays
