@@ -2689,6 +2689,10 @@ impl Gemma4Inner {
         seq_id: u32,
         trace_enabled: bool,
     ) -> Result<Gemma4PagedTurnPreparation> {
+        let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
+        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
+        let prompt_holds_media =
+            prompt_holds_media_placeholders(tokens, image_token_id, audio_token_id);
         let plan = {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason(format!(
@@ -2713,6 +2717,12 @@ impl Gemma4Inner {
                 ));
             }
             let max_cache_hit_tokens = total_budget.saturating_sub(1);
+            // skip_lookup is on when the prompt still carries media placeholders:
+            // any fallback that drops to a content-address prefix lookup (e.g. a
+            // continue-turn-failure reset) then re-prefills the placeholders as
+            // text instead of matching the token-only block hash of media K/V
+            // registered by another session, so it can never consume that
+            // session's stale media features.
             let plan = adapter
                 .prepare_turn_with_max_cache_hit_tokens(
                     seq_id,
@@ -2721,7 +2731,7 @@ impl Gemma4Inner {
                     reuse_cache,
                     &[],
                     0,
-                    false,
+                    prompt_holds_media,
                     max_cache_hit_tokens,
                 )
                 .map_err(Error::from_reason)?;
@@ -6776,10 +6786,53 @@ fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<M
     result.reshape(&input_shape)
 }
 
+/// Reports whether `tokens` carry an image or audio placeholder id.
+///
+/// Used to decide whether a paged text turn may run a content-address prefix
+/// lookup. Per-block prefix-cache hashes cover only token ids, not media
+/// feature K/V, so a prompt that still holds media placeholders must skip the
+/// lookup: otherwise a continue-turn-failure fallback could match the
+/// token-only hash of media blocks registered by another session and reuse
+/// that session's stale media K/V.
+fn prompt_holds_media_placeholders(
+    tokens: &[u32],
+    image_token_id: u32,
+    audio_token_id: u32,
+) -> bool {
+    tokens.contains(&image_token_id) || tokens.contains(&audio_token_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+
+    #[test]
+    fn prompt_holds_media_placeholders_detects_image_audio_and_text() {
+        let image_token_id = 258880u32;
+        let audio_token_id = 258881u32;
+
+        let image_prompt = [1u32, 2, image_token_id, 3];
+        assert!(prompt_holds_media_placeholders(
+            &image_prompt,
+            image_token_id,
+            audio_token_id
+        ));
+
+        let audio_prompt = [4u32, audio_token_id, 5];
+        assert!(prompt_holds_media_placeholders(
+            &audio_prompt,
+            image_token_id,
+            audio_token_id
+        ));
+
+        let text_prompt = [6u32, 7, 8, 9];
+        assert!(!prompt_holds_media_placeholders(
+            &text_prompt,
+            image_token_id,
+            audio_token_id
+        ));
+    }
 
     #[test]
     fn stream_dispatch_promotes_channel_only_output_to_visible_text() {
