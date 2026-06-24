@@ -3526,14 +3526,23 @@ impl Gemma4Inner {
         let input_ids = MxArray::from_uint32(chunk_token_ids, &[1, chunk_len as i64])?;
         let mut hidden_states = chunk_embeds.clone();
 
-        // PLE over image-masked token ids: image positions hold vision
-        // features (not token embeddings), so their PLE residual must be zero.
+        // PLE over media-masked token ids: image AND audio positions hold
+        // projected media features (not token embeddings), so their PLE
+        // residual must be zero.
         let projected_ple: Option<MxArray> = if let Some(ref ple) = self.ple {
             let image_token_id = self.config.image_token_id.unwrap_or(258880);
             let image_token = MxArray::scalar_int(image_token_id)?;
-            let image_mask = input_ids.equal(&image_token)?;
+            let mut media_mask = input_ids.equal(&image_token)?;
+            if let Some(audio_token_id) = self.config.audio_token_id {
+                let audio_token = MxArray::scalar_int(audio_token_id)?;
+                let audio_mask = input_ids.equal(&audio_token)?;
+                media_mask = media_mask.logical_or(&audio_mask)?;
+            }
             let zero = MxArray::scalar_int(0)?;
-            let masked_ids = image_mask.where_(&zero, &input_ids)?;
+            // Media positions (image and audio) are excluded from the PLE
+            // residual because their embedding is the projected media feature,
+            // not a learned token.
+            let masked_ids = media_mask.where_(&zero, &input_ids)?;
             let pre_layer_h = hidden_states.clone();
             Some(compute_ple(
                 &masked_ids,
@@ -5278,6 +5287,23 @@ impl ChatBackend for Gemma4Inner {
                 .is_some_and(|adapter| adapter.is_live_for_continue())
         {
             return None;
+        }
+        // A continuable media session whose paged request is no longer live
+        // must cold-restart, not warm-continue against a released request.
+        // A warm text delta clears `cached_image_key` but leaves the marker
+        // armed, so the key checks below would silently fall through to `None`;
+        // gate on the marker (the true media-held signal) and emit the audio /
+        // image restart message that matches whichever media key still remains.
+        if self.media_session_continuable {
+            let media_state = if self.cached_audio_key.is_some() {
+                "audio"
+            } else {
+                "image"
+            };
+            return Some(format!(
+                "{}{entry_fn} is text-only; session currently holds {media_state} state",
+                engine::IMAGE_CHANGE_RESTART_PREFIX
+            ));
         }
         if self.cached_image_key.is_some() {
             Some(format!(
