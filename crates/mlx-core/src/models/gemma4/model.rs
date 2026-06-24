@@ -5250,8 +5250,23 @@ impl ChatBackend for Gemma4Inner {
         // Warm-continue: a continuable media turn (audio / non-unified image)
         // kept its global paged KV live + a sliding history checkpoint at the
         // full prefix, so a text delta restores causally on the live media KV.
-        // The marker — not the raw media key — governs the guard.
-        if self.media_session_continuable {
+        // The marker ALONE is insufficient: the live paged request must STILL
+        // exist (`is_live_for_continue()`), because the warm continue reads the
+        // adapter's live `block_table` directly. On a shared cross-session
+        // adapter another session may have run `reset_for_new_request` and
+        // released the request after this session armed the marker; then the
+        // text path would instead do a content-address prefix lookup over
+        // `[media-prefix + delta]` — which can hit stale media-feature K/V or
+        // unfaithfully re-prefill the media placeholders. Require both the
+        // marker AND a live request; otherwise fall through to the restart
+        // rejection so the TS floor cold-restarts (resend full history →
+        // faithful vision/audio prefill, no media-placeholder content lookup).
+        if self.media_session_continuable
+            && self
+                .paged_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.is_live_for_continue())
+        {
             return None;
         }
         if self.cached_image_key.is_some() {
@@ -7505,16 +7520,30 @@ mod tests {
         }
     }
 
-    /// Contract (Phase-2 FLIP, deliberate): a text delta on a media session is
-    /// governed by the `media_session_continuable` marker, NOT the raw media
-    /// key. When a media turn left its global paged KV live + a sliding history
-    /// checkpoint (audio / non-unified image, continuable), the guard ALLOWS the
-    /// delta (returns `None`) so it warm-continues causally. When the marker is
-    /// false (single-shot: unified image, `reuse_cache=false`, or a downgraded
-    /// finalize), the guard still REJECTS with the `IMAGE_CHANGE_RESTART_PREFIX`
-    /// exactly as before. This intentionally replaces the prior
-    /// "audio/image always reject" pin — it is a CONTRACT FLIP, not a weakened
-    /// test: the reject path is preserved for every non-continuable case.
+    /// Contract: a text delta on a media session is governed by BOTH the
+    /// `media_session_continuable` marker AND a still-live paged request
+    /// (`is_live_for_continue()`), not the raw media key and not the marker
+    /// alone. A continuable media turn warm-continues by reading the adapter's
+    /// live `block_table`; if the live request is gone (no adapter, or a
+    /// shared-adapter `reset_for_new_request` from another session), there is
+    /// no live block table to continue and the guard REJECTS with
+    /// `IMAGE_CHANGE_RESTART_PREFIX` so the TS floor cold-restarts. When the
+    /// marker is false (single-shot: unified image, `reuse_cache=false`, or a
+    /// downgraded finalize), the guard also REJECTS exactly as before. The
+    /// reject path is preserved for every non-continuable case.
+    ///
+    /// This test uses a `paged_tiny_config(Some(false))` `Gemma4Inner`, whose
+    /// `paged_adapter` is `None` (see the construction-gate test), so
+    /// `is_live_for_continue()` is `false`. It therefore exercises:
+    ///   - clean session (no media, marker false) → ALLOW,
+    ///   - media held + marker false → REJECT (both modalities),
+    ///   - media held + marker true but NOT live (the cross-session-released
+    ///     hazard) → REJECT, the leak-closing path.
+    ///
+    /// The marker-true AND live → ALLOW (warm-continue) path needs a live paged
+    /// request, which requires real Metal block allocation + a finalized turn
+    /// and is not cheaply constructible in a unit test; the single-session 12B
+    /// media-continuation e2e proves it instead.
     ///
     /// Constructs a `Gemma4Inner` (needs Metal — gracefully skips on a
     /// no-Metal sandbox) and drives the guard directly by toggling the cached
@@ -7533,6 +7562,14 @@ mod tests {
                 panic!("unexpected Gemma4Inner::new failure: {msg}");
             }
         };
+
+        // `paged_tiny_config(Some(false))` builds no paged adapter, so the
+        // session is never live-for-continue — the precondition for the
+        // not-live reject assertions below.
+        assert!(
+            inner.paged_adapter.is_none(),
+            "paged_tiny_config(Some(false)) must leave paged_adapter None"
+        );
 
         // Clean session: no media held, marker false, guard passes (None).
         inner.cached_image_key = None;
@@ -7579,26 +7616,43 @@ mod tests {
             "audio-turn rejection must mention audio state, got: {audio_reject}"
         );
 
-        // CONTRACT FLIP: audio turn held AND continuable → guard ALLOWS (None).
+        // Marker armed but NOT live (no live paged request — here no adapter
+        // at all; on a shared adapter this is the cross-session-released case):
+        // a continuable AUDIO session must REJECT, not warm-continue, because
+        // there is no live block_table to read. This is the leak-closing path.
         inner.cached_image_key = None;
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = true;
+        let audio_not_live_reject = inner
+            .text_delta_image_guard("chat_session_continue")
+            .expect("continuable audio session with no live request must REJECT");
         assert!(
-            inner
-                .text_delta_image_guard("chat_session_continue")
-                .is_none(),
-            "continuable audio session must ALLOW a warm text delta"
+            audio_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "not-live continuable audio rejection must carry the restart prefix, \
+             got: {audio_not_live_reject}"
+        );
+        assert!(
+            audio_not_live_reject.contains("audio state"),
+            "not-live continuable audio rejection must mention audio state, \
+             got: {audio_not_live_reject}"
         );
 
-        // CONTRACT FLIP: non-unified image turn held AND continuable → ALLOW.
+        // Same for a continuable non-unified IMAGE session with no live request.
         inner.cached_image_key = Some(42);
         inner.cached_audio_key = None;
         inner.media_session_continuable = true;
+        let image_not_live_reject = inner
+            .text_delta_image_guard("chat_session_continue")
+            .expect("continuable image session with no live request must REJECT");
         assert!(
-            inner
-                .text_delta_image_guard("chat_session_continue")
-                .is_none(),
-            "continuable (non-unified) image session must ALLOW a warm text delta"
+            image_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
+            "not-live continuable image rejection must carry the restart prefix, \
+             got: {image_not_live_reject}"
+        );
+        assert!(
+            image_not_live_reject.contains("image state"),
+            "not-live continuable image rejection must mention image state, \
+             got: {image_not_live_reject}"
         );
     }
 
