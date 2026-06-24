@@ -5040,12 +5040,15 @@ impl ChatBackend for Gemma4Inner {
             return 0;
         }
         // Text-only prefix reuse: force a miss whenever the cached
-        // session holds image state UNLESS the media turn is continuable
-        // (kept-live + sliding checkpoint at the full prefix). This keeps
-        // prefix reuse strictly aligned with text-only sessions and sidesteps
-        // the image-key coordination the Qwen3.5 shared helper handles, while
-        // letting a continuable media session reuse an exactly-cached prefix.
-        if self.cached_image_key.is_some() && !self.media_session_continuable {
+        // session holds image or audio state UNLESS the media turn is
+        // continuable (kept-live + sliding checkpoint at the full prefix). This
+        // keeps prefix reuse strictly aligned with text-only sessions and
+        // sidesteps the media-key coordination the Qwen3.5 shared helper
+        // handles, while letting a continuable media session reuse an
+        // exactly-cached prefix.
+        if (self.cached_image_key.is_some() || self.cached_audio_key.is_some())
+            && !self.media_session_continuable
+        {
             return 0;
         }
         // The live KV caches must exist — `cached_token_history` can
@@ -7799,6 +7802,72 @@ mod tests {
                 .text_delta_image_guard("chat_session_continue")
                 .is_none(),
             "after a text-only paged save the guard must not force an audio restart"
+        );
+    }
+
+    /// Image/audio symmetry in `verify_cache_prefix`: a non-continuable session
+    /// that still holds a cached AUDIO key must MISS (return `0`), exactly as it
+    /// already does for a cached IMAGE key, so stale media KV is reset instead
+    /// of being reused as a token-id prefix hit. With an otherwise-hitting
+    /// prefix (live caches + matching `cached_token_history`), the audio guard
+    /// must override the would-be hit. A continuable audio session (warm-
+    /// continue) must NOT be forced to miss by this guard.
+    ///
+    /// Pre-fix (image-only guard) this would return `cached.len()` for the
+    /// non-continuable audio case — a HIT — because the audio key was ignored,
+    /// so the first assertion below would fail.
+    #[test]
+    fn test_verify_cache_prefix_audio_key_forces_miss() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        // Build an otherwise-hitting state: live caches + a non-empty cached
+        // history that the incoming tokens match as a prefix. `init_caches_sync`
+        // also clears reuse state, so the keys/marker/history are set AFTER.
+        inner
+            .init_caches_sync()
+            .expect("init_caches_sync must succeed");
+        inner.cached_token_history = vec![100, 101, 102];
+        let tokens: Vec<u32> = vec![100, 101, 102, 103];
+
+        // Non-continuable session holding only an AUDIO key: must MISS.
+        inner.cached_image_key = None;
+        inner.cached_audio_key = Some(7);
+        inner.media_session_continuable = false;
+        assert_eq!(
+            inner.verify_cache_prefix(&tokens, true),
+            0,
+            "a non-continuable session holding audio state must force a cache miss"
+        );
+
+        // Continuable audio session (warm-continue): the guard must NOT force a
+        // miss, so the otherwise-hitting prefix returns `cached.len()`.
+        inner.media_session_continuable = true;
+        assert_eq!(
+            inner.verify_cache_prefix(&tokens, true),
+            inner.cached_token_history.len(),
+            "a continuable audio session must not be forced to miss by the media guard"
+        );
+
+        // Parity check: the same shape with an IMAGE key (already guarded) also
+        // misses when non-continuable — the audio branch mirrors it exactly.
+        inner.cached_image_key = Some(42);
+        inner.cached_audio_key = None;
+        inner.media_session_continuable = false;
+        assert_eq!(
+            inner.verify_cache_prefix(&tokens, true),
+            0,
+            "a non-continuable session holding image state must force a cache miss"
         );
     }
 
