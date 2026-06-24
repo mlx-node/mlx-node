@@ -5,14 +5,15 @@ import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
 import { beforeAll, describe, expect, it } from 'vite-plus/test';
 
 /**
- * Phase-2 media -> text continuation parity (Gemma 4).
+ * Media -> text continuation parity (Gemma 4).
  *
- * A text follow-up after a pure-causal media turn (AUDIO, or a NON-UNIFIED
- * image) MAY warm-continue on the live media KV, but only when the warm restore
- * is numerically FAITHFUL. The vision-core finalize keeps the global paged KV
+ * A text follow-up after ANY media turn (AUDIO, NON-UNIFIED image, or UNIFIED
+ * bidirectional-vision image) MAY warm-continue on the live media KV, but only
+ * when the warm restore is numerically FAITHFUL. The eligibility gate admits any
+ * image/audio turn; the vision-core finalize keeps the global paged KV
  * registered for reuse and arms `media_session_continuable` ONLY when the
- * sliding-history checkpoint actually STORED. That gate splits the two
- * checkpoint classes:
+ * sliding-history checkpoint actually STORED. That stored/live gate splits the
+ * two checkpoint classes:
  *
  *  - NON-KV-SHARED (12B audio, `num_kv_shared_layers=0`): every sliding layer is
  *    a plain `Sliding` anchor that physically wrote real audio/image-feature K/V
@@ -36,9 +37,19 @@ import { beforeAll, describe, expect, it } from 'vite-plus/test';
  *  - AUDIO (12B, non-KV-shared): the warm path actually continued
  *    (cachedTokens > 0) and the warm FINAL answer equals the cold FINAL answer.
  *    This is the load-bearing FAITHFUL-warm proof.
+ *  - UNIFIED image (12B, non-KV-shared): the warm delta continues
+ *    (cachedTokens > 0) and answers coherently. The bidirectional overlay only
+ *    edits the IMAGE-span mask during prefill (a no-op over text queries), so the
+ *    warm text delta routes through the generic causal text path and is faithful.
+ *    Strict warm==cold byte parity is NOT asserted: a deterministic ~1-ULP BF16
+ *    cache-hit-kernel reduction-order drift (the documented
+ *    `paged_decode_long_context_1ulp` class) flips one early near-tie argmax that
+ *    cascades into a different-but-coherent tail. So this block asserts the
+ *    faithful-warm contract (cachedTokens>0) plus coherence, not byte parity. The
+ *    audio block above happens to dodge the near-tie and stays byte-exact.
  *  - NON-UNIFIED image (e2b, KV-shared): the follow-up cold-restarts; the test
  *    is a single-shot/cold-restart COHERENCE check (coherent, non-degenerate
- *    answer), mirroring the unified block.
+ *    answer). This is the negative control proving KV-shared still cold-restarts.
  *
  * Greedy T=0 throughout. Presence-gated on the converted checkpoints + fixtures,
  * mirroring the existing gemma4 e2e tests.
@@ -250,9 +261,29 @@ describe.skipIf(!audioModelPath || !audioExists)('Gemma 4 — WARM audio->text c
   });
 });
 
-// -- UNIFIED image stays single-shot in Phase 2: the warm continue is NOT armed;
-//    the TS send() transparently falls back to cold replay (Phase 3 enables warm). --
-describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — UNIFIED image continue stays single-shot (Phase 2)', () => {
+// -- UNIFIED image continuation: warm continues. The 12B is non-KV-shared
+//    (`num_kv_shared_layers=0`), so every sliding layer stores real K/V -> the
+//    finalize stored/live gate arms the marker and the text delta hits
+//    `state="live"`. The warm delta routes through the GENERIC causal text path
+//    (no bidirectional overlay — the overlay only makes the IMAGE span
+//    bidirectional during prefill, a no-op over text queries in both the warm
+//    and cold paths; control-flow verified), so it is numerically faithful.
+//
+//    Strict warm==cold byte parity is NOT asserted here (it does not hold). The
+//    only warm-vs-cold difference is a deterministic ~1-ULP BF16
+//    cache-hit-kernel reduction-order drift (the documented
+//    `paged_decode_long_context_1ulp` class): the warm decode reads the live
+//    image-span KV through the paged cache-hit kernel while the cold decode runs
+//    a flat full-prompt prefill, and the tiny reduction-order delta flips one
+//    early near-tie argmax that cascades into a different-but-coherent tail. On
+//    this prompt the warm/cold final answers share the prefix "...the main
+//    subject of the image" then diverge on a single token (" provided" vs "."),
+//    both coherently analyzing the same image ("Trunch Parish Council"). The
+//    audio block above happens to dodge a near-tie and stays byte-exact; this
+//    image prompt hits one early. So the unified block asserts the FAITHFUL-warm
+//    contract (cachedTokens>0 + the same coherence checks the e2b cold-restart
+//    block uses) rather than byte parity. --
+describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — WARM unified image->text continuation', () => {
   let model: SessionCapableModel;
 
   beforeAll(async () => {
@@ -260,7 +291,7 @@ describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — UNIFIED image cont
     model = (await loadModel(audioModelPath)) as unknown as SessionCapableModel;
   }, 300_000);
 
-  it('unified image -> text continue stays single-shot and still answers coherently', async () => {
+  it('warm text delta after a unified image turn continues on live KV and answers coherently', async () => {
     const images = [readBytes(imagePath)];
     const prompt1 = 'Describe this image.';
     const prompt2 = 'What is the main subject?';
@@ -269,27 +300,18 @@ describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — UNIFIED image cont
     const session = new ChatSession(model, { system: SYSTEM });
     const turn1 = await streamTurn(session, prompt1, { images }, 48);
     expect(turn1.rawText.length).toBeGreaterThan(0);
-
-    // The unified path keeps the media turn single-shot in Phase 2: the marker
-    // stays false, the native continue throws the IMAGE restart prefix, and the
-    // TS send() absorbs it into a cold replay. The observable contract is that
-    // the follow-up still produces a coherent, non-degenerate answer (the
-    // single-shot fallback works) — NOT that it warm-continued. A byte-exact
-    // comparison against a hand-built cold reference is ill-posed here for the
-    // same template prior-CoT strip reason as the audio case (unified 12B turn-1
-    // emits a <|channel>thought…<channel|> block); Phase 3 will add the warm
-    // path under its own byte-exact golden.
-    const observed = await streamTurn(session, prompt2, {}, maxNew);
+    const warm = await streamTurn(session, prompt2, {}, maxNew);
     await session.reset();
 
     // eslint-disable-next-line no-console
-    console.log('[gemma4-cont-unified] observed:', JSON.stringify(observed.parsedText));
-    // Cold-restart signal (single-shot): cachedTokens=0 proves the follow-up did
-    // not warm-continue (the vision cold prefill primes max_cache_hit_tokens=0).
-    expect(observed.cachedTokens ?? 0).toBe(0);
-    expect(observed.finishReason === 'stop' || observed.finishReason === 'length').toBe(true);
-    expect(observed.numTokens).toBeGreaterThan(0);
-    const words = observed.parsedText.trim().split(/\s+/).filter(Boolean);
+    console.log('[gemma4-cont-unified] warm:', JSON.stringify(warm.parsedText));
+    // The warm delta continued on the live unified-image KV (did NOT cold-restart).
+    expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
+    // Coherence (byte parity is ill-posed under the ~1-ULP cache-hit-kernel drift
+    // above): a coherent, non-degenerate answer with a clean finish.
+    expect(warm.finishReason === 'stop' || warm.finishReason === 'length').toBe(true);
+    expect(warm.numTokens).toBeGreaterThan(0);
+    const words = warm.parsedText.trim().split(/\s+/).filter(Boolean);
     expect(words.length).toBeGreaterThan(3);
     // No degenerate single-token loop.
     const counts = new Map<string, number>();

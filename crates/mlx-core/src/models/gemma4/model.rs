@@ -1910,11 +1910,13 @@ impl Gemma4Inner {
     /// stream), so the two stay byte-identical. Resolves the session into
     /// exactly ONE of two states, never partial:
     ///
-    /// - **Continuable** (only when `no_overlay_continuable` — i.e. AUDIO or
-    ///   NON-UNIFIED image, no bidirectional overlay — AND `reuse_cache`): the
-    ///   global paged KV is kept live (`finalize_turn_keep_live_per_block`,
-    ///   registering the full blocks for content-addressed reuse) and the marker
-    ///   is set so `text_delta_image_guard` lets the next text delta through. The
+    /// - **Continuable** (when `media_continuable` — i.e. ANY image or audio
+    ///   turn, including the unified bidirectional-vision image — AND
+    ///   `reuse_cache`, AND the keep-live + sliding checkpoint actually stored a
+    ///   live continue): the global paged KV is kept live
+    ///   (`finalize_turn_keep_live_per_block`, registering the full blocks for
+    ///   content-addressed reuse) and the marker is set so `text_delta_image_guard`
+    ///   lets the next text delta through. The
     ///   delta then restores the prefix the SAME way a TEXT warm-continue does:
     ///   it REPLAYS (re-walks) the matched prefix over the live global KV
     ///   (`state="replay"`, `continued_live=true`). Mirrors the qwen3_5_moe
@@ -1960,10 +1962,10 @@ impl Gemma4Inner {
         finish_reason: &str,
         new_image_key: Option<u64>,
         new_audio_key: Option<u64>,
-        no_overlay_continuable: bool,
+        media_continuable: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        let continuable_eligible = reuse_cache && no_overlay_continuable;
+        let continuable_eligible = reuse_cache && media_continuable;
         let is_length = finish_reason == "length";
 
         // Drop-last history (mirrors the non-continuable save the vision cores
@@ -2057,24 +2059,22 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Compute the Phase-2 no-overlay continuable gate from the expanded prompt
-    /// and config, recomputed the same way `run_paged_vlm_prefill` derives the
-    /// overlay (so the two cannot drift). Continuable when the turn is purely
-    /// causal media: AUDIO, or a NON-UNIFIED image — never when the unified
-    /// bidirectional vision overlay is active.
-    fn gemma4_no_overlay_continuable(&self, expanded_tokens: &[u32]) -> bool {
+    /// Whether this expanded prompt is a media turn eligible to warm-continue a
+    /// follow-up text delta. Eligibility is broad: ANY image or audio turn,
+    /// including the unified bidirectional-vision image. Faithfulness is NOT
+    /// decided here — the `stored && live_for_continue` gate in
+    /// `finalize_vision_turn_media_state` is the real safety net: a non-KV-shared
+    /// checkpoint (12B, `num_kv_shared_layers=0`) physically stores sliding K/V
+    /// so the delta hits `state="live"` and warm-continues; a KV-shared
+    /// checkpoint (e2b) stores nothing so the delta cold-restarts. A warm text
+    /// delta routes through the generic causal text path (no overlay), so it is
+    /// numerically faithful regardless of how the media turn built its K/V.
+    fn gemma4_media_continuable(&self, expanded_tokens: &[u32]) -> bool {
         let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
         let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
         let has_image = expanded_tokens.contains(&image_token_id);
         let has_audio = expanded_tokens.contains(&audio_token_id);
-        let overlay_active = super::vision_mask::vision_overlay_active(
-            self.config.is_unified,
-            self.config.use_bidirectional_attention.as_deref() == Some("vision"),
-            has_image,
-            has_audio,
-            expanded_tokens.len(),
-        );
-        !overlay_active && (has_audio || (has_image && !self.config.is_unified))
+        has_audio || has_image
     }
 
     /// Vision (VLM) whole-turn core over the BLOCK-PAGED backend,
@@ -2247,7 +2247,7 @@ impl Gemma4Inner {
         // warm-continues; otherwise release + keep history/keys so the guard
         // rejects (single-shot, as today). A finalize Err means the live
         // request must be released before returning.
-        let no_overlay_continuable = self.gemma4_no_overlay_continuable(&tokens);
+        let media_continuable = self.gemma4_media_continuable(&tokens);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         if let Err(e) = self.finalize_vision_turn_media_state(
             &tokens,
@@ -2255,7 +2255,7 @@ impl Gemma4Inner {
             &finish_reason,
             new_image_key,
             new_audio_key,
-            no_overlay_continuable,
+            media_continuable,
             reuse_cache,
         ) {
             if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -2504,7 +2504,7 @@ impl Gemma4Inner {
         // Two-state media finalize (identical to the sync core via the shared
         // helper): keep-live + sliding checkpoint for a continuable pure-causal
         // media turn, else release + keep history/keys so the guard rejects.
-        let no_overlay_continuable = self.gemma4_no_overlay_continuable(&tokens);
+        let media_continuable = self.gemma4_media_continuable(&tokens);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         if let Err(e) = self.finalize_vision_turn_media_state(
             &tokens,
@@ -2512,7 +2512,7 @@ impl Gemma4Inner {
             &finish_reason,
             new_image_key,
             new_audio_key,
-            no_overlay_continuable,
+            media_continuable,
             reuse_cache,
         ) {
             if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -7655,12 +7655,13 @@ mod tests {
         );
     }
 
-    /// Phase-2 scope gate (`gemma4_no_overlay_continuable`): a media turn is
-    /// continuable ONLY when it is purely causal — AUDIO, or a NON-UNIFIED image
-    /// — never a UNIFIED bidirectional-vision image (overlay active) and never a
-    /// text-only turn. Locks the Phase-2/Phase-3 boundary at the gate.
+    /// Eligibility gate (`gemma4_media_continuable`): ANY image or audio turn is
+    /// eligible to warm-continue a text follow-up — audio, non-unified image, AND
+    /// the unified bidirectional-vision image. A text-only turn is never a media
+    /// turn. Faithfulness is enforced downstream by the `stored && live_for_continue`
+    /// gate in `finalize_vision_turn_media_state`, not here.
     #[test]
-    fn test_gemma4_no_overlay_continuable_gate() {
+    fn test_gemma4_media_continuable_gate() {
         let mut inner = match super::Gemma4Inner::new(paged_tiny_config(Some(false))) {
             Ok(i) => i,
             Err(err) => {
@@ -7679,32 +7680,34 @@ mod tests {
         let image_tokens: Vec<u32> = vec![10, image_id, image_id, 13];
         let audio_tokens: Vec<u32> = vec![10, audio_id, audio_id, 13];
 
-        // Text-only: never continuable as a media turn.
-        assert!(!inner.gemma4_no_overlay_continuable(&text_tokens));
+        // Text-only: never eligible as a media turn.
+        assert!(!inner.gemma4_media_continuable(&text_tokens));
 
-        // Audio is always causal → continuable, regardless of is_unified.
+        // Audio is eligible regardless of is_unified / bidirectional config.
         inner.config.is_unified = false;
         inner.config.use_bidirectional_attention = None;
-        assert!(inner.gemma4_no_overlay_continuable(&audio_tokens));
+        assert!(inner.gemma4_media_continuable(&audio_tokens));
         inner.config.is_unified = true;
         inner.config.use_bidirectional_attention = Some("vision".to_string());
         assert!(
-            inner.gemma4_no_overlay_continuable(&audio_tokens),
-            "audio is causal (overlay disabled when audio present) even on a unified ckpt"
+            inner.gemma4_media_continuable(&audio_tokens),
+            "audio is eligible even on a unified ckpt"
         );
 
-        // Non-unified image: causal SigLIP → continuable.
+        // Non-unified image: eligible.
         inner.config.is_unified = false;
         inner.config.use_bidirectional_attention = None;
-        assert!(inner.gemma4_no_overlay_continuable(&image_tokens));
+        assert!(inner.gemma4_media_continuable(&image_tokens));
 
-        // Unified image with bidirectional vision: overlay ACTIVE → NOT
-        // continuable in Phase 2 (Phase 3 owns this behind its own golden).
+        // Unified bidirectional-vision image: now ALSO eligible. The warm text
+        // delta routes through the causal text path (no overlay), so it is
+        // faithful; the finalize stored/live gate decides whether the checkpoint
+        // can actually keep KV live (12B non-shared → warm; e2b KV-shared → cold).
         inner.config.is_unified = true;
         inner.config.use_bidirectional_attention = Some("vision".to_string());
         assert!(
-            !inner.gemma4_no_overlay_continuable(&image_tokens),
-            "unified bidirectional-vision image must stay single-shot in Phase 2"
+            inner.gemma4_media_continuable(&image_tokens),
+            "unified bidirectional-vision image is eligible; faithfulness gated downstream"
         );
     }
 
