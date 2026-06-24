@@ -591,45 +591,6 @@ fn compute_gemma4_paged_prefix_block_hash(
     Some(parent_hash)
 }
 
-/// Build the `(absolute_token_position, content_hash)` pairs that isolate a
-/// media turn's registered paged blocks by image/audio CONTENT rather than by
-/// placeholder token id alone.
-///
-/// For each position `i` in `tokens`, an `<|image|>` placeholder
-/// (`tokens[i] == image_token_id`) contributes `(i, new_image_key)` when an
-/// image key is present, and an `<|audio|>` placeholder contributes
-/// `(i, new_audio_key)` when an audio key is present. Positions are emitted in
-/// ascending order (natural iteration), which is the sorted order
-/// `compute_per_block_image_extra_keys` expects for deterministic per-block
-/// hashes.
-///
-/// A text-only prompt (or one whose keys are `None`) yields an empty vector,
-/// which is bit-equal to passing `&[]` to `build_paged_extra_keys`. Two turns
-/// with the same placeholder tokens but different image/audio content produce
-/// different vectors, so their registered blocks no longer collide in the
-/// shared cross-session prefix cache.
-fn gemma4_media_token_positions(
-    tokens: &[u32],
-    image_token_id: u32,
-    audio_token_id: u32,
-    new_image_key: Option<u64>,
-    new_audio_key: Option<u64>,
-) -> Vec<(u32, u64)> {
-    let mut positions = Vec::new();
-    for (i, &tok) in tokens.iter().enumerate() {
-        if tok == image_token_id
-            && let Some(key) = new_image_key
-        {
-            positions.push((i as u32, key));
-        } else if tok == audio_token_id
-            && let Some(key) = new_audio_key
-        {
-            positions.push((i as u32, key));
-        }
-    }
-    positions
-}
-
 fn gemma4_sliding_caches_ready_at(
     config: &Gemma4Config,
     caches: Option<&[Gemma4LayerCache]>,
@@ -2036,30 +1997,11 @@ impl Gemma4Inner {
                 let _logits = self.run_paged_decode_step(last_token)?;
             }
 
-            // Isolate the registered media blocks by image/audio CONTENT, not
-            // by placeholder token id alone. `finalize_turn_keep_live_per_block`
-            // publishes these blocks into the model's SHARED, cross-session
-            // content-addressed prefix cache; without the content keys, two
-            // requests with the same surrounding prompt + same `<|image|>` /
-            // `<|audio|>` placeholder count but DIFFERENT media would hash
-            // identically and a later lookup could hit stale media-feature K/V
-            // from another session. Media tokens live in the prompt prefix, so
-            // their absolute positions within `expanded_tokens` are valid
-            // against the full registered range.
-            let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
-            let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
-            let media_positions = gemma4_media_token_positions(
-                expanded_tokens,
-                image_token_id,
-                audio_token_id,
-                new_image_key,
-                new_audio_key,
-            );
             let (keep_live_ok, live_for_continue) = match self.paged_adapter.as_mut() {
                 Some(adapter) => {
                     let total = adapter.request_tokens().len();
                     let bs = adapter.block_size();
-                    let extra = engine::build_paged_extra_keys(total, bs, &media_positions);
+                    let extra = engine::build_paged_extra_keys(total, bs, &[]);
                     let ok = adapter.finalize_turn_keep_live_per_block(&extra, 0).is_ok();
                     (ok, adapter.is_live_for_continue())
                 }
@@ -6823,64 +6765,6 @@ fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<M
 mod tests {
     use super::*;
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
-
-    const IMG: u32 = 258880;
-    const AUD: u32 = 258881;
-
-    #[test]
-    fn media_token_positions_image_only() {
-        // text <|image|> <|image|> text — both image slots keyed by content.
-        let tokens = [10u32, IMG, IMG, 11];
-        let got = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0xABCD), Some(0x9999));
-        assert_eq!(got, vec![(1, 0xABCD), (2, 0xABCD)]);
-    }
-
-    #[test]
-    fn media_token_positions_audio_only() {
-        let tokens = [AUD, 12u32, AUD];
-        let got = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0xABCD), Some(0x9999));
-        assert_eq!(got, vec![(0, 0x9999), (2, 0x9999)]);
-    }
-
-    #[test]
-    fn media_token_positions_mixed_image_and_audio_ascending() {
-        let tokens = [IMG, 5u32, AUD, IMG, 6u32, AUD];
-        let got = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0xABCD), Some(0x9999));
-        // Positions ascending (natural iteration), each keyed by its modality.
-        assert_eq!(
-            got,
-            vec![(0, 0xABCD), (2, 0x9999), (3, 0xABCD), (5, 0x9999)]
-        );
-    }
-
-    #[test]
-    fn media_token_positions_text_only_is_empty() {
-        let tokens = [10u32, 11, 12];
-        let got = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0xABCD), Some(0x9999));
-        assert!(got.is_empty(), "text-only must be &[]-equivalent");
-    }
-
-    #[test]
-    fn media_token_positions_none_keys_skip_present_placeholders() {
-        // Placeholders present but no content key → no entry (cannot isolate).
-        let tokens = [IMG, AUD];
-        assert!(gemma4_media_token_positions(&tokens, IMG, AUD, None, None).is_empty());
-        // Image key only → audio placeholder still skipped.
-        assert_eq!(
-            gemma4_media_token_positions(&tokens, IMG, AUD, Some(0xABCD), None),
-            vec![(0, 0xABCD)]
-        );
-    }
-
-    #[test]
-    fn media_token_positions_different_image_keys_differ() {
-        let tokens = [IMG, 7u32, IMG];
-        let a = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0x1111), None);
-        let b = gemma4_media_token_positions(&tokens, IMG, AUD, Some(0x2222), None);
-        assert_ne!(a, b, "different image content must yield different keys");
-        assert_eq!(a, vec![(0, 0x1111), (2, 0x1111)]);
-        assert_eq!(b, vec![(0, 0x2222), (2, 0x2222)]);
-    }
 
     #[test]
     fn stream_dispatch_promotes_channel_only_output_to_visible_text() {
