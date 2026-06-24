@@ -99,7 +99,7 @@ Auto-detected by the `.gguf` extension. Supports BF16, F16, F32, Q4_0, Q4_1, Q8_
 The converter auto-detects model families and applies family-specific sanitization passes:
 
 - `qwen3_5`, `qwen3_5_moe`
-- `gemma4`
+- `gemma4`, `gemma4_unified`
 - `paddleocr-vl`, `qianfan-ocr`
 - `pp-lcnet-ori`, `uvdoc`
 

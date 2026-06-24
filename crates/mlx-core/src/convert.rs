@@ -1344,7 +1344,7 @@ pub(crate) mod recipe {
 
     impl ConversionRecipe for Gemma4Recipe {
         fn model_types(&self) -> &'static [&'static str] {
-            &["gemma4"]
+            &["gemma4", "gemma4_unified"]
         }
 
         fn sanitize(
@@ -1407,6 +1407,7 @@ pub(crate) mod recipe {
                     || stripped.starts_with("audio_encoder.")
                     || stripped.starts_with("embed_audio.")
                     || stripped.starts_with("embed_vision.")
+                    || stripped.starts_with("vision_embedder.")
                     || stripped.starts_with("multi_modal_projector.")
                 {
                     // Apply PyTorch→MLX layout conversions for conv weights
@@ -1500,6 +1501,7 @@ pub(crate) mod recipe {
         "qianfan-ocr",
         "privacy-filter",
         "gemma4",
+        "gemma4_unified",
     ];
 
     /// Resolve a [`ConversionRecipe`] for an exact HuggingFace `model_type`
@@ -1513,7 +1515,7 @@ pub(crate) mod recipe {
             "paddleocr-vl" => Some(Box::new(PaddleOcrVlRecipe)),
             "qianfan-ocr" => Some(Box::new(QianfanOcrRecipe)),
             "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
-            "gemma4" => Some(Box::new(Gemma4Recipe)),
+            "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),
             _ => None,
         }
     }
@@ -2859,6 +2861,13 @@ fn should_quantize(key: &str, embed_quantizable: bool) -> bool {
 
     // Exclude vision encoder weights (keep bf16 for quality)
     if key.contains("vision_tower") || key.contains("visual.") {
+        return false;
+    }
+
+    // Encoder-free unified vision patch projection (`vision_embedder.patch_dense`).
+    // The loader installs `vision_embedder.*` as dense bf16 only (no quantized
+    // branch), so quantizing it would corrupt the unified vision path. Keep bf16.
+    if key.contains("vision_embedder") {
         return false;
     }
 
@@ -5473,9 +5482,13 @@ mod tests {
             );
 
             // sym8_supported == old sym8 allowlist (NOTE qwen3_5_moe excluded).
+            // gemma4_unified routes to Gemma4Recipe and supports sym8 like gemma4.
             assert_eq!(
                 r.sym8_supported(),
-                matches!(mt, "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4"),
+                matches!(
+                    mt,
+                    "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );
 
@@ -5615,6 +5628,103 @@ mod tests {
                 "language_model.model.layers.0.mlp.experts.switch_glu.down_proj.weight"
             ),
             "down_proj must be renamed to switch_glu.down_proj.weight"
+        );
+    }
+
+    /// The encoder-free `gemma4_unified` loader installs `vision_embedder.*` as
+    /// dense bf16 only (`apply_unified_vision_embedder_weights`, no `.scales`
+    /// branch), so `should_quantize` must refuse it under any wrapper depth or
+    /// the quantized checkpoint corrupts the unified vision path. The sibling
+    /// `embed_vision.embedding_projection` DOES have an affine loader branch and
+    /// must keep quantizing — this pins the exclusion to `vision_embedder` only.
+    #[test]
+    fn should_quantize_excludes_unified_vision_embedder() {
+        // vision_embedder patch projection → never quantized (bf16-only loader).
+        assert!(!should_quantize(
+            "language_model.model.vision_embedder.patch_dense.weight",
+            false
+        ));
+        assert!(!should_quantize(
+            "vision_embedder.patch_dense.weight",
+            false
+        ));
+
+        // Positive controls: ordinary text MLP weight quantizes, and the
+        // affine-loadable embed_vision projection must NOT be caught by the
+        // exclusion (guards against an over-broad `vision` substring match).
+        assert!(should_quantize(
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            false
+        ));
+        assert!(should_quantize(
+            "embed_vision.embedding_projection.weight",
+            false
+        ));
+    }
+
+    /// `gemma4_unified` must be a first-class convertible model_type: it resolves
+    /// to a recipe (the shared `Gemma4Recipe`) and appears in the registry's
+    /// single source of truth. Explicit guard alongside the registry-consistency
+    /// test in `recipe_registry_reproduces_inline_flags`.
+    #[test]
+    fn gemma4_unified_is_convertible() {
+        assert!(recipe::recipe_for("gemma4_unified").is_some());
+        assert!(recipe::CONVERTIBLE_MODEL_TYPES.contains(&"gemma4_unified"));
+        // Routes to the same recipe family as gemma4, and self-declares coverage.
+        assert!(
+            recipe::recipe_for("gemma4_unified")
+                .unwrap()
+                .model_types()
+                .contains(&"gemma4_unified")
+        );
+    }
+
+    /// `vision_embedder.*` must be written at its BARE key (sibling of
+    /// `embed_vision.*`), not mis-prefixed under `language_model.model.`. The
+    /// loader installs it from the bare key; the multimodal-keep block in
+    /// `Gemma4Recipe::sanitize` must route it there instead of falling through to
+    /// the text re-prefix step.
+    #[test]
+    fn gemma4_recipe_sanitize_keeps_vision_embedder_bare() {
+        let f32 = |numel: usize, shape: &[i64]| {
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            "model.vision_embedder.patch_dense.weight".into(),
+            f32(4 * 4, &[4, 4]),
+        );
+        weights.insert(
+            "model.vision_embedder.pos_embedding".into(),
+            f32(4 * 4, &[4, 4]),
+        );
+
+        let out = recipe::Gemma4Recipe
+            .sanitize(
+                weights,
+                &serde_json::json!({}),
+                "bfloat16",
+                /* tie_word_embeddings */ true,
+                /* verbose */ false,
+            )
+            .expect("gemma4 sanitize");
+
+        assert!(
+            out.contains_key("vision_embedder.patch_dense.weight"),
+            "vision_embedder.patch_dense.weight must be kept bare; got {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            out.contains_key("vision_embedder.pos_embedding"),
+            "vision_embedder.pos_embedding must be kept bare; got {:?}",
+            out.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !out.keys()
+                .any(|k| k.contains("language_model.model.vision_embedder")),
+            "vision_embedder must NOT be re-prefixed under language_model.model.; got {:?}",
+            out.keys().collect::<Vec<_>>()
         );
     }
 

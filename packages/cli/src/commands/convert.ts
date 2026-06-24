@@ -434,7 +434,11 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
+      } else if (
+        config.model_type === 'gemma4' ||
+        config.model_type === 'gemma4_text' ||
+        config.model_type === 'gemma4_unified'
+      ) {
         modelType = 'gemma4';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'lfm2_moe' || config.model_type === 'lfm2') {
