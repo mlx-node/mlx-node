@@ -18,12 +18,12 @@ import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test';
 
 vi.mock('@mlx-node/core', () => ({
-  convertModel: vi.fn(async () => ({})),
+  convertModel: vi.fn(async () => ({ numTensors: 0, numParameters: 0, outputPath: '', tensorNames: [] })),
   convertForeignWeights: vi.fn(() => ({})),
   convertGgufToSafetensors: vi.fn(async () => ({})),
 }));
 
-import { convertGgufToSafetensors } from '@mlx-node/core';
+import { convertModel, convertGgufToSafetensors } from '@mlx-node/core';
 
 import { run as runConvert } from '../src/commands/convert.js';
 
@@ -58,5 +58,44 @@ describe('mlx convert GGUF validation', () => {
     expect(errors).toContain('--q-mode sym8 is not supported for GGUF input');
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+});
+
+describe('mlx convert model-type auto-detection', () => {
+  // Drive run() against a synthetic config.json (no --model-type) and read back
+  // the modelType handed to the mocked native convertModel. This guards the
+  // gemma4_unified pass-through: collapsing it to 'gemma4' would dead-code the
+  // native recipe_for("gemma4_unified") arm and misroute gemma-QAT unified
+  // checkpoints into the E2B-only prequantized importer.
+  const detectModelType = async (configModelType: string): Promise<unknown> => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    const inputDir = mkdtempSync(join(tmpdir(), 'mlx-convert-detect-in-'));
+    writeFileSync(join(inputDir, 'config.json'), JSON.stringify({ model_type: configModelType }));
+    const outputDir = join(tmp, 'out');
+
+    await runConvert(['--input', inputDir, '--output', outputDir]);
+
+    const mock = vi.mocked(convertModel);
+    expect(mock).toHaveBeenCalledTimes(1);
+    const opts = mock.mock.calls[0]![0] as { modelType?: unknown };
+    rmSync(inputDir, { recursive: true, force: true });
+    return opts.modelType;
+  };
+
+  it("passes 'gemma4_unified' through unchanged (does NOT collapse to 'gemma4')", async () => {
+    expect(await detectModelType('gemma4_unified')).toBe('gemma4_unified');
+  });
+
+  it("collapses 'gemma4' to 'gemma4'", async () => {
+    expect(await detectModelType('gemma4')).toBe('gemma4');
+  });
+
+  it("collapses 'gemma4_text' to 'gemma4'", async () => {
+    expect(await detectModelType('gemma4_text')).toBe('gemma4');
   });
 });

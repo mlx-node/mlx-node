@@ -434,12 +434,21 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (
-        config.model_type === 'gemma4' ||
-        config.model_type === 'gemma4_text' ||
-        config.model_type === 'gemma4_unified'
-      ) {
+      } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
         modelType = 'gemma4';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'gemma4_unified') {
+        // Pass the raw 'gemma4_unified' string through unchanged. Native
+        // recipe_for resolves it to the shared Gemma4Recipe, so every
+        // recipe-keyed code path (sym8_supported, sanitizer, embed_quantizable,
+        // mtp_policy, etc.) behaves identically to 'gemma4'. Collapsing it to
+        // 'gemma4' here would (a) make the native recipe_for("gemma4_unified")
+        // arm dead code, and (b) misroute a unified checkpoint that carries
+        // gemma-QAT metadata into the E2B-only prequantized importer, whose
+        // gate keys on the exact string "gemma4" (and which then hard-errors in
+        // validate_e2b_qat_schedule). The exact-"gemma4" gate must not match
+        // unified, so the raw string has to reach the native side.
+        modelType = 'gemma4_unified';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'lfm2_moe' || config.model_type === 'lfm2') {
         modelType = config.model_type;
