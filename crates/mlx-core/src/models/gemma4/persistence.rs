@@ -21,12 +21,12 @@ use crate::tokenizer::Qwen3Tokenizer;
 use super::config::Gemma4Config;
 use super::model::{Gemma4Inner, Gemma4Model, warmup_forward};
 use super::quantized_linear::{
-    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint,
-    is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
-    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
-    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
-    try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
-    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
+    DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+    PerLayerMode, PerLayerQuant, is_mxfp8_checkpoint, is_quantized_checkpoint,
+    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
+    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
+    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
+    try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 
 // Quantization-block parsing now lives in `crate::models::quant_dispatch`,
@@ -837,6 +837,88 @@ fn maybe_shard_ple_embedding(
     Ok(())
 }
 
+/// Packing parameters for a quantized embedding/tied-lm_head load: the
+/// `(group_size, bits, mode_str, biases)` tuple handed to
+/// `Embedding::load_quantized_packed`.
+struct PackedEmbedParams<'a> {
+    group_size: i32,
+    bits: i32,
+    mode_str: &'static str,
+    biases: Option<&'a MxArray>,
+}
+
+/// Resolve the packed-embedding parameters so `(mode, bits, group_size, biases)`
+/// are mutually consistent before they reach `load_quantized_packed` →
+/// `mlx_quantized_matmul`/`mlx_dequantize`.
+///
+/// The on-disk tensors are the ground truth: affine packing ships a per-group
+/// `.biases` companion with floating `.scales`; MXFP8 ships uint8 (E8M0)
+/// `.scales` and NO `.biases`. We discriminate off that unambiguous tensor
+/// evidence and force the matching pack constants, so a config that disagrees
+/// with the tensors can never silently mis-lay-out the table:
+///   * mxfp8 → force `(MXFP8_GROUP_SIZE, MXFP8_BITS, "mxfp8")` (the affine 4/64
+///     default that `default_plq` carries is wrong for an E8M0 table; MLX's
+///     `quantized_matmul` honors the passed bits/group_size rather than
+///     re-deriving them, so 4/64 would mis-unpack) and drop biases.
+///   * affine → take `bits`/`group_size` from the resolved PLQ and pass the
+///     `.biases` tensor through.
+///
+/// Any other mode at this key, or a mode that contradicts the tensor evidence
+/// (mxfp8 mode with `.biases`/non-uint8 scales, or affine mode with uint8
+/// scales), is rejected loud rather than producing garbage logits.
+///
+/// Mirrors lfm2's `plq_to_packed_params` and `try_build_mxfp8_quantized_linear`,
+/// which likewise force the MX constants and null biases for mxfp8.
+fn resolve_packed_embed_params<'a>(
+    key: &str,
+    plq: PerLayerQuant,
+    scales: &MxArray,
+    biases: Option<&'a MxArray>,
+) -> Result<PackedEmbedParams<'a>> {
+    let scales_uint8 = scales.dtype().ok() == Some(DType::Uint8);
+    match plq.mode {
+        PerLayerMode::Mxfp8 => {
+            if biases.is_some() {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to mxfp8 but a '{key}.biases' tensor \
+                     is present — mxfp8 has no biases (its E8M0 scales fully describe the \
+                     dequant); config/tensor disagreement, refusing to load"
+                )));
+            }
+            if !scales_uint8 {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to mxfp8 but '{key}.scales' is not \
+                     uint8 (E8M0) — config/tensor disagreement, refusing to load"
+                )));
+            }
+            Ok(PackedEmbedParams {
+                group_size: MXFP8_GROUP_SIZE,
+                bits: MXFP8_BITS,
+                mode_str: MXFP8_MODE,
+                biases: None,
+            })
+        }
+        PerLayerMode::Affine => {
+            if scales_uint8 {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolves to affine but '{key}.scales' is uint8 \
+                     (an E8M0/MX-format dtype) — config/tensor disagreement, refusing to load"
+                )));
+            }
+            Ok(PackedEmbedParams {
+                group_size: plq.group_size,
+                bits: plq.bits,
+                mode_str: "affine",
+                biases,
+            })
+        }
+        other => Err(Error::from_reason(format!(
+            "gemma4 {key} load: quant mode {other:?} is not supported for the embedding/tied \
+             lm_head; only affine and mxfp8 are supported"
+        ))),
+    }
+}
+
 /// Apply sanitized weights to a Gemma4Inner.
 fn apply_weights(
     inner: &mut Gemma4Inner,
@@ -945,30 +1027,18 @@ fn apply_weights(
         .get("embed_tokens")
         .copied()
         .unwrap_or(default_plq);
-    // Runtime quant-mode string fed to the packed backend. Only the modes the
-    // tied/untied embedding path is validated against are accepted.
-    let embed_mode_str = match embed_plq.mode {
-        PerLayerMode::Affine => "affine",
-        PerLayerMode::Mxfp8 => "mxfp8",
-        other => {
-            if embed_quantized {
-                return Err(Error::from_reason(format!(
-                    "gemma4 embed_tokens load: quant mode {other:?} is not supported for the \
-                     embedding/tied lm_head; only affine and mxfp8 are supported"
-                )));
-            }
-            "affine"
-        }
-    };
     if embed_quantized && let Some(w) = params.get("embed_tokens.weight") {
         let scales = params.get("embed_tokens.scales").ok_or_else(|| {
             Error::from_reason("Missing embed_tokens.scales for quantized embedding")
         })?;
-        // Affine packing carries a per-group `.biases` companion; MXFP8 has none
-        // (its E8M0 scales fully describe the dequant). Drive the biases-present
-        // decision off the actual tensor key, not the mode alone, so a config
-        // that disagrees with the on-disk tensors still loads the correct shape.
         let biases = params.get("embed_tokens.biases");
+        // Make `(mode, bits, group_size, biases)` mutually consistent before the
+        // packed backend feeds `mlx_quantized_matmul`/`mlx_dequantize`. The
+        // helper forces the MX pack constants for mxfp8 (the affine 4/64 carried
+        // by `default_plq` would mis-unpack an E8M0 table, since MLX honors the
+        // passed bits/group_size) and drops biases, takes bits/group_size from
+        // the PLQ for affine, and fails loud on any mode/tensor contradiction.
+        let packed = resolve_packed_embed_params("embed_tokens", embed_plq, scales, biases)?;
         // Tied (12B/27B) and untied embeddings both keep the table PACKED and
         // dequantize only the gathered rows in `forward()`; the tied lm_head
         // projects through `as_linear` (`mlx_quantized_matmul`) without ever
@@ -981,10 +1051,10 @@ fn apply_weights(
         inner.embed_tokens.load_quantized_packed(
             w,
             scales,
-            biases,
-            embed_plq.group_size,
-            embed_plq.bits,
-            embed_mode_str,
+            packed.biases,
+            packed.group_size,
+            packed.bits,
+            packed.mode_str,
         )?;
     } else if let Some(w) = params.get("embed_tokens.weight") {
         // Dense embedding fallback (no `.scales`): a stripped quant group
@@ -3174,5 +3244,92 @@ mod tests {
         p.retain(|k, _| !k.starts_with("vision_embedder.") && !k.starts_with("embed_vision."));
         validate_required_weights(&p, &text_only)
             .expect("text-only config must not require unified vision keys");
+    }
+
+    /// An mxfp8-mode embedding whose resolved PLQ still carries the affine
+    /// 4-bit / group_size-64 defaults (e.g. `default_plq` fallback, or an
+    /// override missing explicit bits/group_size) must NOT thread 4/64 into the
+    /// packed backend: MLX honors the passed bits/group_size, so 4/64 would
+    /// mis-unpack the E8M0 table. The resolver forces the MX pack constants
+    /// (8 / 32) and nulls biases.
+    #[test]
+    fn resolve_packed_embed_mxfp8_forces_mx_constants() {
+        let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
+        let plq = PerLayerQuant {
+            bits: 4,
+            group_size: 64,
+            mode: PerLayerMode::Mxfp8,
+        };
+        let packed = resolve_packed_embed_params("embed_tokens", plq, &scales, None)
+            .expect("mxfp8 with affine-default bits must resolve, not error");
+        assert_eq!(packed.bits, MXFP8_BITS, "mxfp8 bits must be forced to 8");
+        assert_eq!(
+            packed.group_size, MXFP8_GROUP_SIZE,
+            "mxfp8 group_size must be forced to 32"
+        );
+        assert_eq!(packed.mode_str, MXFP8_MODE);
+        assert!(packed.biases.is_none(), "mxfp8 carries no biases");
+    }
+
+    /// Affine mode threads the PLQ's own bits/group_size through and passes the
+    /// `.biases` tensor (asymmetric affine has per-group biases).
+    #[test]
+    fn resolve_packed_embed_affine_passes_plq_params_and_biases() {
+        let scales = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 scales");
+        let biases = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 biases");
+        let plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+        };
+        let packed = resolve_packed_embed_params("embed_tokens", plq, &scales, Some(&biases))
+            .expect("affine embedding must resolve");
+        assert_eq!(packed.bits, 8);
+        assert_eq!(packed.group_size, 32);
+        assert_eq!(packed.mode_str, "affine");
+        assert!(packed.biases.is_some(), "affine biases must pass through");
+    }
+
+    /// Mode/tensor contradiction is rejected loud: mxfp8 mode never coexists
+    /// with a `.biases` tensor (mxfp8 has none).
+    #[test]
+    fn resolve_packed_embed_mxfp8_with_biases_fails_loud() {
+        let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
+        let biases = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 biases");
+        let plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Mxfp8,
+        };
+        // `.err()` (not `expect_err`) so the success type needs no `Debug` bound
+        // (`PackedEmbedParams` holds `Option<&MxArray>`, and `MxArray: !Debug`).
+        let err = resolve_packed_embed_params("embed_tokens", plq, &scales, Some(&biases))
+            .err()
+            .expect("mxfp8 + biases must fail loud");
+        assert!(
+            err.reason.contains("mxfp8"),
+            "error mentions mxfp8: {}",
+            err.reason
+        );
+    }
+
+    /// Affine mode with uint8 (E8M0/MX) scales is a contradiction — reject loud
+    /// rather than feed an MX-format table to the affine dequant.
+    #[test]
+    fn resolve_packed_embed_affine_with_uint8_scales_fails_loud() {
+        let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
+        let plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &scales, None)
+            .err()
+            .expect("affine + uint8 scales must fail loud");
+        assert!(
+            err.reason.contains("affine"),
+            "error mentions affine: {}",
+            err.reason
+        );
     }
 }
