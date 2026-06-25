@@ -437,7 +437,10 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
         modelType = 'gemma4';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'gemma4_unified') {
+      } else if (
+        config.model_type === 'gemma4_unified' ||
+        (Array.isArray(config.architectures) && config.architectures.includes('Gemma4UnifiedForConditionalGeneration'))
+      ) {
         // Pass the raw 'gemma4_unified' string through unchanged. Native
         // recipe_for resolves it to the shared Gemma4Recipe, so every
         // recipe-keyed code path (sym8_supported, sanitizer, embed_quantizable,
@@ -448,6 +451,16 @@ export async function run(argv: string[]) {
         // gate keys on the exact string "gemma4" (and which then hard-errors in
         // validate_e2b_qat_schedule). The exact-"gemma4" gate must not match
         // unified, so the raw string has to reach the native side.
+        //
+        // The architecture-only arm (no `model_type`, only
+        // `architectures: ['Gemma4UnifiedForConditionalGeneration']`) mirrors
+        // the runtime loader, which also flags this shape as unified
+        // (model-loader.ts maps it to gemma4; persistence.rs parse_config sets
+        // is_unified on EITHER model_type == "gemma4_unified" OR that
+        // architecture). Without this, an architecture-only config would leave
+        // modelType undefined and skip Gemma4Recipe::sanitize, producing
+        // unloadable output. It maps to 'gemma4_unified' (not 'gemma4') so the
+        // E2B-importer gate above still cannot match it.
         modelType = 'gemma4_unified';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'lfm2_moe' || config.model_type === 'lfm2') {

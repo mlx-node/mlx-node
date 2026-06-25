@@ -67,7 +67,7 @@ describe('mlx convert model-type auto-detection', () => {
   // gemma4_unified pass-through: collapsing it to 'gemma4' would dead-code the
   // native recipe_for("gemma4_unified") arm and misroute gemma-QAT unified
   // checkpoints into the E2B-only prequantized importer.
-  const detectModelType = async (configModelType: string): Promise<unknown> => {
+  const detectModelTypeFromConfig = async (config: Record<string, unknown>): Promise<unknown> => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
@@ -75,7 +75,7 @@ describe('mlx convert model-type auto-detection', () => {
     }) as never);
 
     const inputDir = mkdtempSync(join(tmpdir(), 'mlx-convert-detect-in-'));
-    writeFileSync(join(inputDir, 'config.json'), JSON.stringify({ model_type: configModelType }));
+    writeFileSync(join(inputDir, 'config.json'), JSON.stringify(config));
     const outputDir = join(tmp, 'out');
 
     await runConvert(['--input', inputDir, '--output', outputDir]);
@@ -87,6 +87,9 @@ describe('mlx convert model-type auto-detection', () => {
     return opts.modelType;
   };
 
+  const detectModelType = async (configModelType: string): Promise<unknown> =>
+    detectModelTypeFromConfig({ model_type: configModelType });
+
   it("passes 'gemma4_unified' through unchanged (does NOT collapse to 'gemma4')", async () => {
     expect(await detectModelType('gemma4_unified')).toBe('gemma4_unified');
   });
@@ -97,5 +100,16 @@ describe('mlx convert model-type auto-detection', () => {
 
   it("collapses 'gemma4_text' to 'gemma4'", async () => {
     expect(await detectModelType('gemma4_text')).toBe('gemma4');
+  });
+
+  it("detects an architecture-only unified config (no model_type) as 'gemma4_unified'", async () => {
+    // Mirrors the runtime loader: a config with no `model_type` but with
+    // `architectures: ['Gemma4UnifiedForConditionalGeneration']` must resolve
+    // to 'gemma4_unified' so Gemma4Recipe::sanitize runs. Without the
+    // converter arm, modelType would stay undefined and the output would be
+    // unloadable.
+    expect(await detectModelTypeFromConfig({ architectures: ['Gemma4UnifiedForConditionalGeneration'] })).toBe(
+      'gemma4_unified',
+    );
   });
 });
