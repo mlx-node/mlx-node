@@ -867,11 +867,24 @@ struct PackedEmbedParams<'a> {
 /// (mxfp8 mode with `.biases`/non-uint8 scales, or affine mode with uint8
 /// scales), is rejected loud rather than producing garbage logits.
 ///
+/// uint8 scales are NOT exclusive to mxfp8: mxfp4 (4-bit, group_size 32) and
+/// nvfp4 (4-bit, group_size 16) also carry uint8 scales and no biases. A
+/// mode-less / stale `config.json` makes `is_mxfp8_checkpoint` resolve ANY
+/// uint8-scale table to mxfp8, so an mxfp4/nvfp4 embedding can reach this arm.
+/// Forcing 8/32 onto such a table would mis-describe it; we additionally verify
+/// the packed weight and scales shapes are self-consistent with 8-bit / gs32
+/// before accepting (8-bit packs `32/8 = 4` values per `u32`, so a genuine
+/// mxfp8 table satisfies `weight_last * 4 == scales_last * 32`, both equal to
+/// the hidden width). A 4-bit mxfp4/nvfp4 table packs 8 values per `u32`, so
+/// `weight_last` is half what mxfp8 expects and the equality fails — we reject
+/// loud at load instead of forcing 8/32 onto it.
+///
 /// Mirrors lfm2's `plq_to_packed_params` and `try_build_mxfp8_quantized_linear`,
 /// which likewise force the MX constants and null biases for mxfp8.
 fn resolve_packed_embed_params<'a>(
     key: &str,
     plq: PerLayerQuant,
+    weight: &MxArray,
     scales: &MxArray,
     biases: Option<&'a MxArray>,
 ) -> Result<PackedEmbedParams<'a>> {
@@ -889,6 +902,31 @@ fn resolve_packed_embed_params<'a>(
                 return Err(Error::from_reason(format!(
                     "gemma4 {key} load: quant mode resolves to mxfp8 but '{key}.scales' is not \
                      uint8 (E8M0) — config/tensor disagreement, refusing to load"
+                )));
+            }
+            // The mxfp8 resolution can come from a mode-less config that only saw
+            // uint8 scales (shared by mxfp4/nvfp4). Confirm the packed weight and
+            // scales last-dims are consistent with 8-bit packing at group_size 32
+            // before forcing those constants: 8-bit packs `32/MXFP8_BITS` values
+            // per u32, so a genuine mxfp8 table has
+            // `weight_last * (32 / MXFP8_BITS) == scales_last * MXFP8_GROUP_SIZE`.
+            // mxfp4/nvfp4 (4-bit) halve `weight_last`, so the equality fails and
+            // we reject rather than mis-unpack.
+            let weight_last = *weight.shape()?.to_vec().last().ok_or_else(|| {
+                Error::from_reason(format!("gemma4 {key} load: weight is 0-rank"))
+            })?;
+            let scales_last = *scales.shape()?.to_vec().last().ok_or_else(|| {
+                Error::from_reason(format!("gemma4 {key} load: scales is 0-rank"))
+            })?;
+            let weight_cols = weight_last * i64::from(32 / MXFP8_BITS);
+            let scales_cols = scales_last * i64::from(MXFP8_GROUP_SIZE);
+            if weight_cols != scales_cols {
+                return Err(Error::from_reason(format!(
+                    "gemma4 {key} load: quant mode resolved to mxfp8 but the packed weight \
+                     ({weight_last} u32 cols) and scales ({scales_last} groups) are not consistent \
+                     with 8-bit / group_size-{MXFP8_GROUP_SIZE} packing ({weight_cols} != \
+                     {scales_cols}); the table is most likely mxfp4/nvfp4 mis-resolved to mxfp8 \
+                     from a mode-less config — refusing to load with forced mxfp8 constants"
                 )));
             }
             Ok(PackedEmbedParams {
@@ -1038,7 +1076,7 @@ fn apply_weights(
         // by `default_plq` would mis-unpack an E8M0 table, since MLX honors the
         // passed bits/group_size) and drops biases, takes bits/group_size from
         // the PLQ for affine, and fails loud on any mode/tensor contradiction.
-        let packed = resolve_packed_embed_params("embed_tokens", embed_plq, scales, biases)?;
+        let packed = resolve_packed_embed_params("embed_tokens", embed_plq, w, scales, biases)?;
         // Tied (12B/27B) and untied embeddings both keep the table PACKED and
         // dequantize only the gathered rows in `forward()`; the tied lm_head
         // projects through `as_linear` (`mlx_quantized_matmul`) without ever
@@ -3254,13 +3292,18 @@ mod tests {
     /// (8 / 32) and nulls biases.
     #[test]
     fn resolve_packed_embed_mxfp8_forces_mx_constants() {
+        // Genuine mxfp8 table for hidden=64, vocab=4: 8-bit packs 4 vals/u32 so
+        // the packed weight has 64/4 = 16 u32 cols; group_size 32 gives 64/32 = 2
+        // scale groups. weight_last(16)*4 == scales_last(2)*32 == 64, so the
+        // 8-bit/gs32 self-consistency guard accepts it.
+        let weight = MxArray::zeros(&[4, 16], Some(DType::Uint32)).expect("packed weight");
         let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
         let plq = PerLayerQuant {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Mxfp8,
         };
-        let packed = resolve_packed_embed_params("embed_tokens", plq, &scales, None)
+        let packed = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .expect("mxfp8 with affine-default bits must resolve, not error");
         assert_eq!(packed.bits, MXFP8_BITS, "mxfp8 bits must be forced to 8");
         assert_eq!(
@@ -3271,10 +3314,39 @@ mod tests {
         assert!(packed.biases.is_none(), "mxfp8 carries no biases");
     }
 
+    /// A uint8-scale table whose packed-weight / scales shapes match mxfp4
+    /// (4-bit, group_size 32) rather than mxfp8 — but which a mode-less config
+    /// mis-resolved to `Mxfp8` via `is_mxfp8_checkpoint` (uint8 scales only) —
+    /// must be rejected loud, NOT loaded with forced 8/32 mxfp8 constants.
+    ///
+    /// hidden=64, vocab=4: 4-bit packs 8 vals/u32 so the packed weight has
+    /// 64/8 = 8 u32 cols; group_size 32 gives 64/32 = 2 scale groups. Under the
+    /// forced 8-bit reading, weight_last(8)*4 = 32 != scales_last(2)*32 = 64, so
+    /// the shapes are inconsistent with 8-bit/gs32 and the guard fires.
+    #[test]
+    fn resolve_packed_embed_mxfp4_shapes_resolved_to_mxfp8_fails_loud() {
+        let weight = MxArray::zeros(&[4, 8], Some(DType::Uint32)).expect("mxfp4-packed weight");
+        let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
+        let plq = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Mxfp8,
+        };
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
+            .err()
+            .expect("mxfp4-shaped table mis-resolved to mxfp8 must fail loud");
+        assert!(
+            err.reason.contains("mxfp8") && err.reason.contains("mxfp4"),
+            "error names the mxfp8/mxfp4 mismatch: {}",
+            err.reason
+        );
+    }
+
     /// Affine mode threads the PLQ's own bits/group_size through and passes the
     /// `.biases` tensor (asymmetric affine has per-group biases).
     #[test]
     fn resolve_packed_embed_affine_passes_plq_params_and_biases() {
+        let weight = MxArray::zeros(&[4, 16], Some(DType::Uint32)).expect("packed weight");
         let scales = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 scales");
         let biases = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 biases");
         let plq = PerLayerQuant {
@@ -3282,8 +3354,9 @@ mod tests {
             group_size: 32,
             mode: PerLayerMode::Affine,
         };
-        let packed = resolve_packed_embed_params("embed_tokens", plq, &scales, Some(&biases))
-            .expect("affine embedding must resolve");
+        let packed =
+            resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
+                .expect("affine embedding must resolve");
         assert_eq!(packed.bits, 8);
         assert_eq!(packed.group_size, 32);
         assert_eq!(packed.mode_str, "affine");
@@ -3294,6 +3367,7 @@ mod tests {
     /// with a `.biases` tensor (mxfp8 has none).
     #[test]
     fn resolve_packed_embed_mxfp8_with_biases_fails_loud() {
+        let weight = MxArray::zeros(&[4, 16], Some(DType::Uint32)).expect("packed weight");
         let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
         let biases = MxArray::zeros(&[4, 2], Some(DType::BFloat16)).expect("bf16 biases");
         let plq = PerLayerQuant {
@@ -3303,7 +3377,7 @@ mod tests {
         };
         // `.err()` (not `expect_err`) so the success type needs no `Debug` bound
         // (`PackedEmbedParams` holds `Option<&MxArray>`, and `MxArray: !Debug`).
-        let err = resolve_packed_embed_params("embed_tokens", plq, &scales, Some(&biases))
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
             .err()
             .expect("mxfp8 + biases must fail loud");
         assert!(
@@ -3317,13 +3391,14 @@ mod tests {
     /// rather than feed an MX-format table to the affine dequant.
     #[test]
     fn resolve_packed_embed_affine_with_uint8_scales_fails_loud() {
+        let weight = MxArray::zeros(&[4, 16], Some(DType::Uint32)).expect("packed weight");
         let scales = MxArray::zeros(&[4, 2], Some(DType::Uint8)).expect("uint8 scales");
         let plq = PerLayerQuant {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Affine,
         };
-        let err = resolve_packed_embed_params("embed_tokens", plq, &scales, None)
+        let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
             .expect("affine + uint8 scales must fail loud");
         assert!(
