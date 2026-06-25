@@ -344,8 +344,14 @@ jobs:
           else
             # cargo leg: point this family's gating env var(s) at the converted
             # checkpoint so the #[ignore]'d tests un-skip; `-- --ignored` runs only those.
+            # `--test-threads=1` serializes them: each ignored test loads 2-4 full
+            # models, and libtest's default per-test thread pool would otherwise run
+            # several at once, oversubscribing the single shared Metal GPU until a
+            # command buffer trips the GPU watchdog (kIOGPUCommandBufferCallbackErrorTimeout
+            # -> SIGABRT) on the shared CI runner. One shared GPU means parallelism
+            # never sped these up anyway, so serializing costs ~nothing.
             for v in ${{ matrix.env }}; do export "$v=$ckpt"; done
-            cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --nocapture
+            cargo test -p mlx-core ${{ matrix.tests }} -- --ignored --test-threads=1 --nocapture
           fi
 
   lint:
