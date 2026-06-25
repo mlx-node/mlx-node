@@ -3214,6 +3214,10 @@ impl Gemma4Inner {
         crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
+        } else if self.embed_tokens.is_packed_quantized() {
+            // Packed tied lm_head: project through the quantized matmul without
+            // materializing the dense table.
+            self.embed_tokens.as_linear(&hidden_states)?
         } else if let Some(ref w_t) = self.embed_weight_t {
             hidden_states.matmul(w_t)?
         } else {
@@ -3899,6 +3903,10 @@ impl Gemma4Inner {
         crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
+        } else if self.embed_tokens.is_packed_quantized() {
+            // Packed tied lm_head: project through the quantized matmul without
+            // materializing the dense table.
+            self.embed_tokens.as_linear(&hidden_states)?
         } else if let Some(ref w_t) = self.embed_weight_t {
             hidden_states.matmul(w_t)?
         } else {
@@ -4065,6 +4073,10 @@ impl Gemma4Inner {
         crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
+        } else if self.embed_tokens.is_packed_quantized() {
+            // Packed tied lm_head: project through the quantized matmul without
+            // materializing the dense table.
+            self.embed_tokens.as_linear(&hidden_states)?
         } else if let Some(ref w_t) = self.embed_weight_t {
             hidden_states.matmul(w_t)?
         } else {
@@ -5567,6 +5579,10 @@ pub(crate) fn warmup_forward(inner: &Gemma4Inner) -> Result<()> {
         h = inner.final_norm.forward(&h)?;
         let logits = if let Some(ref head) = inner.lm_head {
             head.forward(&h)?
+        } else if inner.embed_tokens.is_packed_quantized() {
+            // Packed tied lm_head: project through the quantized matmul without
+            // materializing the dense table.
+            inner.embed_tokens.as_linear(&h)?
         } else if let Some(ref w_t) = inner.embed_weight_t {
             h.matmul(w_t)?
         } else {
@@ -5899,6 +5915,10 @@ fn forward_inner(
     // LM head or tied embeddings
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embedding.is_packed_quantized() {
+        // Packed tied lm_head: project through the quantized matmul without
+        // materializing the dense table.
+        embedding.as_linear(&h)?
     } else if let Some(w_t) = embed_weight_t {
         h.matmul(w_t)?
     } else {

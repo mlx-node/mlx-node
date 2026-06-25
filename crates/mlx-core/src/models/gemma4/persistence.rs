@@ -925,76 +925,67 @@ fn apply_weights(
     // Embedding. Q8 / Q4 affine checkpoints carry `.scales` (+ `.biases`)
     // companions alongside `.weight` with a packed-last-dim shape, so the
     // dense `load_weight` path trips its shape guard. Route quantized
-    // embeddings through `load_quantized`, which pre-dequantizes the full
-    // table for the forward lookup and (when tied) for the lm_head matmul.
+    // embeddings through `load_quantized_packed`, which keeps the table PACKED:
+    // `forward()` dequantizes only the gathered rows, and the tied lm_head
+    // projects through `as_linear` (`mlx_quantized_matmul`) without ever
+    // materializing the dense bf16 table.
     //
-    // Defense-in-depth: `Embedding::load_quantized` calls
-    // `mlx_dequantize(..., "affine")` unconditionally, so MXFP4/MXFP8 metadata
-    // at this key would silently mis-dequantize. The convert path already
-    // forces `embed_tokens` to affine (see `apply_mxfp_upgrade` and the
-    // no-recipe path), but if a future regression or hand-edited
-    // checkpoint claims otherwise we want to fail loud rather than emit
-    // garbage outputs.
+    // Defense-in-depth: the packed backend feeds `mlx_dequantize`/
+    // `mlx_quantized_matmul` with the mode string passed below, so the mode
+    // must match the on-disk packing. Affine (Q4/Q8 with `.scales` + `.biases`)
+    // and MXFP8 (E8M0 `.scales`, no `.biases`) are both supported here; any
+    // other quant mode at this key is rejected so a regression or hand-edited
+    // checkpoint fails loud instead of silently mis-dequantizing into garbage.
     let embed_quantized = params.contains_key("embed_tokens.scales");
-    // Only enforce the affine-only guard when the embedding is actually
-    // quantized (has .scales). Dense bf16 embeddings have no tensor-side
-    // mode, so metadata claiming MXFP at the top level is irrelevant —
-    // there is nothing to mis-dequantize.
-    if embed_quantized {
-        let embed_plq = per_layer_quant
-            .get("embed_tokens")
-            .copied()
-            .unwrap_or(default_plq);
-        if embed_plq.mode != PerLayerMode::Affine {
-            return Err(Error::from_reason(format!(
-                "gemma4 embed_tokens load: Non-affine FP mode {:?} is not supported; affine only",
-                embed_plq.mode
-            )));
+    // Resolve the embedding's quant mode once, defaulting to the checkpoint
+    // default when no per-layer override is present. Only consult this when the
+    // embedding is actually quantized (has `.scales`) — a dense bf16 embedding
+    // has no tensor-side mode, so top-level MXFP metadata is irrelevant.
+    let embed_plq = per_layer_quant
+        .get("embed_tokens")
+        .copied()
+        .unwrap_or(default_plq);
+    // Runtime quant-mode string fed to the packed backend. Only the modes the
+    // tied/untied embedding path is validated against are accepted.
+    let embed_mode_str = match embed_plq.mode {
+        PerLayerMode::Affine => "affine",
+        PerLayerMode::Mxfp8 => "mxfp8",
+        other => {
+            if embed_quantized {
+                return Err(Error::from_reason(format!(
+                    "gemma4 embed_tokens load: quant mode {other:?} is not supported for the \
+                     embedding/tied lm_head; only affine and mxfp8 are supported"
+                )));
+            }
+            "affine"
         }
-    }
+    };
     if embed_quantized && let Some(w) = params.get("embed_tokens.weight") {
-        let embed_plq = per_layer_quant
-            .get("embed_tokens")
-            .copied()
-            .unwrap_or(default_plq);
         let scales = params.get("embed_tokens.scales").ok_or_else(|| {
             Error::from_reason("Missing embed_tokens.scales for quantized embedding")
         })?;
+        // Affine packing carries a per-group `.biases` companion; MXFP8 has none
+        // (its E8M0 scales fully describe the dequant). Drive the biases-present
+        // decision off the actual tensor key, not the mode alone, so a config
+        // that disagrees with the on-disk tensors still loads the correct shape.
         let biases = params.get("embed_tokens.biases");
-        if config.tie_word_embeddings {
-            // Tied lm_head reads the whole table as a dense matmul weight
-            // (`embed_weight_t` below), so it must be dequantized into one dense
-            // bf16 buffer up front.
-            inner.embed_tokens.load_quantized(
-                w,
-                scales,
-                biases,
-                embed_plq.group_size,
-                embed_plq.bits,
-            )?;
-            let dequant = inner.embed_tokens.get_weight();
-            let w_t = dequant.transpose(Some(&[1, 0]))?;
-            inner.embed_weight_t = Some(w_t);
-        } else {
-            // Untied: the table is only ever gathered one row at a time in
-            // `forward()` (never tied, never read via `get_weight()` on the hot
-            // path), so keep it PACKED and dequantize only the looked-up rows.
-            // Byte-identical to the dense path — affine dequant is per-element,
-            // so gather-then-dequant == dequant-then-gather — but the 2-bit
-            // `[vocab, hidden]` table stays packed instead of materializing a
-            // dense bf16 copy (measured ~0.63 GiB resident reclaimed for E2B:
-            // a 262144x1536 2-bit table is 0.75 GiB dense vs 0.12 GiB packed).
-            // Mirrors the PLE `embed_tokens_per_layer` packed load below; mode
-            // is guaranteed affine by the guard above.
-            inner.embed_tokens.load_quantized_packed(
-                w,
-                scales,
-                biases,
-                embed_plq.group_size,
-                embed_plq.bits,
-                "affine",
-            )?;
-        }
+        // Tied (12B/27B) and untied embeddings both keep the table PACKED and
+        // dequantize only the gathered rows in `forward()`; the tied lm_head
+        // projects through `as_linear` (`mlx_quantized_matmul`) without ever
+        // materializing the dense table (~2 GiB bf16 for the 262144x3840 12B
+        // vocab). The hot-path logits sites in `model.rs` detect the packed
+        // backend via `Embedding::is_packed_quantized()` and call `as_linear`,
+        // so `embed_weight_t` stays None and those sites take the packed branch.
+        // Mirrors LFM2's tied/quantized embedding load and the PLE packed load
+        // below; the mode string is threaded through to the dequant/matmul.
+        inner.embed_tokens.load_quantized_packed(
+            w,
+            scales,
+            biases,
+            embed_plq.group_size,
+            embed_plq.bits,
+            embed_mode_str,
+        )?;
     } else if let Some(w) = params.get("embed_tokens.weight") {
         // Dense embedding fallback (no `.scales`): a stripped quant group
         // must never reach the dense lookup / tied-lm_head matmul.
