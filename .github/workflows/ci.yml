@@ -28,7 +28,7 @@ jobs:
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
         with:
@@ -129,7 +129,7 @@ jobs:
     # Unit/integration tests don't depend on the label; skip the redundant re-run
     # a `labeled` event would otherwise spawn (build artifacts are unchanged).
     if: github.event.action != 'labeled'
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: build
     strategy:
       fail-fast: false
@@ -227,7 +227,7 @@ jobs:
       github.event.label.name == 'model-e2e' ||
       (github.event.action != 'labeled' &&
        contains(github.event.pull_request.labels.*.name, 'model-e2e'))
-    runs-on: macos-latest
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -359,7 +359,7 @@ jobs:
     # Lint doesn't depend on the label; skip the redundant re-run a `labeled`
     # event would otherwise spawn.
     if: github.event.action != 'labeled'
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
         with:
