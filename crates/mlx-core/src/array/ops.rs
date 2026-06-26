@@ -103,9 +103,16 @@ impl MxArray {
         MxArray::from_handle(handle, "array_matmul")
     }
 
-    /// Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-    /// where self is A. More efficient than separate matmul and add operations.
-    /// Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+    /// Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+    /// Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+    ///
+    /// The vendored `mlx::core::addmm` in this build silently ignores the `C`
+    /// term — it returns only `alpha * (A @ B)`, dropping `beta * C`. That was
+    /// invisible for bias-free linears (the LM Q/K/V/O/MLP and the bias-free MoE
+    /// router gate all pass a zero `C`), but it corrupted every biased linear —
+    /// most visibly the vision tower, whose `qkv`, `proj`, `fc1`, `fc2` and
+    /// merger projections all carry a bias. Compute the result explicitly so the
+    /// `C` term is actually applied.
     #[napi]
     pub fn addmm(
         &self,
@@ -114,11 +121,18 @@ impl MxArray {
         alpha: Option<f64>,
         beta: Option<f64>,
     ) -> Result<MxArray> {
-        let alpha = alpha.unwrap_or(1.0) as f32;
-        let beta = beta.unwrap_or(1.0) as f32;
-        let handle =
-            unsafe { sys::mlx_array_addmm(c.handle.0, self.handle.0, b.handle.0, alpha, beta) };
-        MxArray::from_handle(handle, "array_addmm")
+        let alpha = alpha.unwrap_or(1.0);
+        let beta = beta.unwrap_or(1.0);
+
+        let mut mm = self.matmul(b)?;
+        if alpha != 1.0 {
+            mm = mm.mul_scalar(alpha)?;
+        }
+        if beta != 1.0 {
+            mm.add(&c.mul_scalar(beta)?)
+        } else {
+            mm.add(c)
+        }
     }
 
     /// Indexed matrix multiply for MoE expert selection.

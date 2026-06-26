@@ -238,3 +238,76 @@ impl Linear {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn addmm_bias_broadcast_rank() {
+        // a [2,3] @ b [3,4] -> [2,4]; add c. Test 1D c[4] vs 2D c[1,4] vs c[2,4].
+        let a = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let b = MxArray::from_float32(
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0],
+            &[3, 4],
+        )
+        .unwrap();
+        // a@b row0 = [1, 2, 3, 1+2+3=6]; row1 = [4, 5, 6, 15]
+        let probe = |c: &MxArray, label: &str| {
+            let out = a.addmm(c, &b, None, None).unwrap();
+            let got = out.to_float32().unwrap();
+            eprintln!("[addmm c={label}] out[0]={:?}", &got[..4]);
+            got
+        };
+        let c1d = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[4]).unwrap();
+        let c2d_row = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 4]).unwrap();
+        let c2d_full =
+            MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0, 10.0, 20.0, 30.0, 40.0], &[2, 4])
+                .unwrap();
+        let g1 = probe(&c1d, "[4]");
+        let g2 = probe(&c2d_row, "[1,4]");
+        let g3 = probe(&c2d_full, "[2,4]");
+        // matmul + add (candidate fix)
+        let add_out = a
+            .matmul(&b)
+            .unwrap()
+            .add(&c1d)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        eprintln!("[matmul+add c=[4]] out[0]={:?}", &add_out[..4]);
+        // a@b[0] = [1,2,3,6]; +c = [11,22,33,46]
+        eprintln!(
+            "applies bias -> 1D-c:{} 2D-row-c:{} 2D-full-c:{} matmul+add:{}",
+            (g1[0] - 11.0).abs() < 1e-3,
+            (g2[0] - 11.0).abs() < 1e-3,
+            (g3[0] - 11.0).abs() < 1e-3,
+            (add_out[0] - 11.0).abs() < 1e-3
+        );
+    }
+
+    #[test]
+    fn linear_forward_applies_bias() {
+        // weight [out=4, in=3], bias [4], input [2,3].
+        // expected = input @ weight.T + bias
+        let weight = MxArray::from_float32(
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            &[4, 3],
+        )
+        .unwrap();
+        let bias = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[4]).unwrap();
+        let lin = Linear::from_weights(&weight, Some(&bias)).unwrap();
+
+        let input = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let out = lin.forward(&input).unwrap();
+        let got = out.to_float32().unwrap();
+        let want = [11.0, 22.0, 33.0, 46.0, 14.0, 25.0, 36.0, 55.0];
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-3,
+                "bias not applied at {i}: got {g}, want {w} (no-bias would be {})",
+                w - [10.0, 20.0, 30.0, 40.0][i % 4]
+            );
+        }
+    }
+}
