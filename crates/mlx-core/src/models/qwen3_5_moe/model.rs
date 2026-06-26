@@ -2266,12 +2266,14 @@ impl Qwen35MoeInner {
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        // Reset the cross-turn M-RoPE delta only on a fresh/miss turn; preserve
-        // it on a warm continuation so the image prefill's compressed-position
-        // rotation carries into the text suffix prefill + decode.
-        if cached_prefix_len == 0 {
-            self.cached_rope_deltas = None;
-        }
+        // Carry the cross-turn M-RoPE delta only when this turn extends the live
+        // image sequence (continued_live_prefix); a cold start or a non-live
+        // prefix-cache hit (text-only prefix) drops a stale image delta so the
+        // text suffix prefill + decode rotate at the raw physical slot.
+        self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -2635,12 +2637,14 @@ impl Qwen35MoeInner {
         let gdn_prefix_state = gdn_prefix_preparation.state;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        // Reset the cross-turn M-RoPE delta only on a fresh/miss turn; preserve
-        // it on a warm continuation so the image prefill's compressed-position
-        // rotation carries into the text suffix prefill + decode.
-        if cached_prefix_len == 0 {
-            self.cached_rope_deltas = None;
-        }
+        // Carry the cross-turn M-RoPE delta only when this turn extends the live
+        // image sequence (continued_live_prefix); a cold start or a non-live
+        // prefix-cache hit (text-only prefix) drops a stale image delta so the
+        // text suffix prefill + decode rotate at the raw physical slot.
+        self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -6305,15 +6309,17 @@ impl PagedBackend for Qwen35MoeInner {
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // Clear the per-turn session state here (history is re-set in
         // `save_paged_history`; image key is reset because the paged path does
-        // not carry it across turns). The cross-turn M-RoPE delta IS carried on
-        // a warm continuation: a text turn that warm-continues an image prefill
-        // must keep rotating at the compressed position, so the delta is reset
-        // only on a fresh/miss turn (cached_prefix_len == 0).
+        // not carry it across turns). The cross-turn M-RoPE delta is carried
+        // only when this turn extends the live image sequence
+        // (continued_live_prefix); a cold start or a non-live prefix-cache hit
+        // (text-only prefix) drops a stale image delta so the text suffix
+        // rotates at the raw physical slot.
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        if cached_prefix_len == 0 {
-            self.cached_rope_deltas = None;
-        }
+        self.cached_rope_deltas = crate::models::qwen3_5::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
             Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")

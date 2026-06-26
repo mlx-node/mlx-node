@@ -70,6 +70,36 @@ pub(crate) fn paged_rope_offset(physical_position: u32, cached_rope_deltas: i32)
     physical_position as i32 + cached_rope_deltas
 }
 
+/// Decide the cross-turn M-RoPE delta to carry into the next paged turn.
+///
+/// `cached_rope_deltas` is shared model state: an image prefill bakes in a
+/// compressed-position delta (negative) that only aligns with the image's
+/// physically-resident K/V. The delta is meaningful for exactly ONE outcome of
+/// the paged turn planner — `continued_live_prefix`, where the live image
+/// sequence is being extended and its K/V is re-attended. Every other outcome
+/// must drop it:
+/// * a cold/fresh turn carries no cross-turn delta;
+/// * a NON-live prefix-cache hit (`cached_prefix_len > 0` but
+///   `continued_live_prefix == false`) can only restore pure-text prefix blocks
+///   — image requests prefill with `skip_lookup` and never publish a hashable
+///   text stream that collides with their expanded-placeholder blocks — so the
+///   suffix must rotate at the raw physical slot (delta 0), not at the stale
+///   negative delta a prior image turn left on the shared model.
+///
+/// Keying the reset on `cached_prefix_len == 0` is therefore too weak: it leaks
+/// a stale image delta into unrelated text requests that merely share a cached
+/// text prefix.
+pub(crate) fn rope_delta_for_paged_turn(
+    cached_rope_deltas: Option<i32>,
+    continued_live_prefix: bool,
+) -> Option<i32> {
+    if continued_live_prefix {
+        cached_rope_deltas
+    } else {
+        None
+    }
+}
+
 fn trace_memory_mib() -> (f64, f64, f64) {
     (
         bytes_to_mib(crate::array::get_active_memory()),
@@ -1076,7 +1106,39 @@ mod rope_offset_tests {
     //! the text-turn identity (`delta == 0`) that keeps text decode
     //! byte-identical. They construct no model, so they run on any host.
 
-    use super::paged_rope_offset;
+    use super::{paged_rope_offset, rope_delta_for_paged_turn};
+
+    #[test]
+    fn live_continuation_preserves_image_delta() {
+        // A live continuation re-attends the image request's physically-resident
+        // compressed-position K/V, so the negative delta MUST survive to keep the
+        // text suffix rotating at the compressed position.
+        assert_eq!(rope_delta_for_paged_turn(Some(-726), true), Some(-726));
+        // Suffix at physical slot 754 then rotates at the compressed position 28.
+        let delta = rope_delta_for_paged_turn(Some(-726), true).unwrap_or(0);
+        assert_eq!(paged_rope_offset(754, delta), 28);
+    }
+
+    #[test]
+    fn cold_start_clears_delta() {
+        // A fresh/miss turn (no reused prefix) carries no cross-turn delta.
+        assert_eq!(rope_delta_for_paged_turn(Some(-726), false), None);
+        assert_eq!(rope_delta_for_paged_turn(None, false), None);
+    }
+
+    #[test]
+    fn non_live_prefix_cache_hit_clears_stale_image_delta() {
+        // Regression: a prior image turn leaves a stale negative delta on the
+        // shared model. A later TEXT request that merely HITS the cross-request
+        // prefix cache (cached_prefix_len > 0) is NOT a live image continuation
+        // (continued_live_prefix == false) — its restored blocks can only be the
+        // pure-text prefix. The stale delta must be dropped so text rotates at
+        // the raw physical slot, NOT at physical + stale_negative_delta.
+        let stale_image_delta = Some(-726);
+        let after_text_hit = rope_delta_for_paged_turn(stale_image_delta, false);
+        assert_eq!(after_text_hit, None);
+        assert_eq!(paged_rope_offset(42, after_text_hit.unwrap_or(0)), 42);
+    }
 
     #[test]
     fn text_turn_zero_delta_is_identity() {
