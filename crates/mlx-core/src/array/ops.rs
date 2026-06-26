@@ -106,13 +106,17 @@ impl MxArray {
     /// Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
     /// Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
     ///
-    /// The vendored `mlx::core::addmm` in this build silently ignores the `C`
-    /// term — it returns only `alpha * (A @ B)`, dropping `beta * C`. That was
-    /// invisible for bias-free linears (the LM Q/K/V/O/MLP and the bias-free MoE
-    /// router gate all pass a zero `C`), but it corrupted every biased linear —
-    /// most visibly the vision tower, whose `qkv`, `proj`, `fc1`, `fc2` and
-    /// merger projections all carry a bias. Compute the result explicitly so the
-    /// `C` term is actually applied.
+    /// Computed explicitly (matmul, optional alpha scale, then add beta*C)
+    /// rather than via the fused `mlx::core::addmm` primitive. The fused
+    /// primitive is correct on a well-formed metallib, but this project's local
+    /// release build is known to non-deterministically miscompile fused GEMM
+    /// kernels (see the metallib-corruption notes), which manifested as the
+    /// fused addmm dropping `beta*C` and corrupting every biased linear — most
+    /// visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+    /// bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+    /// explicit form keeps the `C` term robust to that build hazard; the
+    /// `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+    /// as a canary if a future build corrupts the matmul kernel too.
     #[napi]
     pub fn addmm(
         &self,
