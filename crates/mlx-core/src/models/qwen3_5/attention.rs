@@ -7,7 +7,9 @@ use crate::array::mask::create_causal_mask;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::models::paddleocr_vl::language::{MultimodalRoPE, apply_multimodal_rotary_pos_emb};
+use crate::models::paddleocr_vl::language::{
+    MultimodalRoPE, apply_multimodal_rotary_pos_emb_interleaved,
+};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -187,12 +189,14 @@ impl Qwen3_5Attention {
 
         // Apply RoPE: either M-RoPE (VLM) or standard scalar offset (text-only)
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
-            // M-RoPE: compute cos/sin from 3D position IDs [3, B, T]
+            // M-RoPE: compute cos/sin from 3D position IDs [3, B, T].
+            // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
+            // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
             let (cos, sin) = mrope.forward(&queries, pos_ids)?;
-            // Transpose to [B, H, T, D] for apply_multimodal_rotary_pos_emb
+            // Transpose to [B, H, T, D] for the rotary apply.
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
+            let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
                 &q_t,
                 &k_t,
                 &cos,
@@ -335,10 +339,12 @@ impl Qwen3_5Attention {
         // the `None` (text-only) arm matches the flat path's scalar-offset
         // behaviour.
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
+            // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
+            // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
             let (cos, sin) = mrope.forward(&queries, pos_ids)?;
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb(
+            let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
                 &q_t,
                 &k_t,
                 &cos,
