@@ -294,6 +294,7 @@ impl Qwen3_5Attention {
         cached_prefix_len: u32,
         is_prefill: bool,
         position_ids: Option<&MxArray>,
+        rope_position_offset: i32,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -355,7 +356,14 @@ impl Qwen3_5Attention {
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)
         } else {
-            let rope_offset = first_logical_position as i32;
+            // Scalar-offset RoPE. `rope_position_offset` decouples the
+            // rotation position from the physical KV slot: a turn that
+            // warm-continues an image prefill rotates at the compressed
+            // M-RoPE position (physical slot + a negative cross-turn delta)
+            // while K/V still writes at the physical slot below. Text turns
+            // pass `rope_position_offset == first_logical_position as i32`,
+            // so this stays byte-identical to the prior behaviour.
+            let rope_offset = rope_position_offset;
             let queries = self.rope.forward(&queries, Some(rope_offset))?;
             let keys = self.rope.forward(&keys, Some(rope_offset))?;
             (queries, keys)

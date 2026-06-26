@@ -1539,7 +1539,10 @@ impl Qwen35MoeInner {
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Store the image prefill's compressed-position delta so a later text
+        // warm-continuation rotates its queries at the same compressed M-RoPE
+        // positions the image keys were written with.
+        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
 
         // Fresh per-layer caches (GDN linear slots + empty full-attention slots).
         self.caches = Some(fresh_moe_layer_caches(&self.config));
@@ -1632,6 +1635,7 @@ impl Qwen35MoeInner {
                         &embedding_weight,
                         &layer_kinds,
                         adapter,
+                        self.cached_rope_deltas.unwrap_or(0),
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -1847,7 +1851,10 @@ impl Qwen35MoeInner {
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Store the image prefill's compressed-position delta so a later text
+        // warm-continuation rotates its queries at the same compressed M-RoPE
+        // positions the image keys were written with.
+        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
 
         self.caches = Some(fresh_moe_layer_caches(&self.config));
 
@@ -1974,6 +1981,7 @@ impl Qwen35MoeInner {
                         &embedding_weight,
                         &layer_kinds,
                         adapter,
+                        self.cached_rope_deltas.unwrap_or(0),
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -2258,7 +2266,12 @@ impl Qwen35MoeInner {
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Reset the cross-turn M-RoPE delta only on a fresh/miss turn; preserve
+        // it on a warm continuation so the image prefill's compressed-position
+        // rotation carries into the text suffix prefill + decode.
+        if cached_prefix_len == 0 {
+            self.cached_rope_deltas = None;
+        }
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -2405,6 +2418,7 @@ impl Qwen35MoeInner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -2473,6 +2487,7 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -2620,7 +2635,12 @@ impl Qwen35MoeInner {
         let gdn_prefix_state = gdn_prefix_preparation.state;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Reset the cross-turn M-RoPE delta only on a fresh/miss turn; preserve
+        // it on a warm continuation so the image prefill's compressed-position
+        // rotation carries into the text suffix prefill + decode.
+        if cached_prefix_len == 0 {
+            self.cached_rope_deltas = None;
+        }
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -2877,6 +2897,7 @@ impl Qwen35MoeInner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -3006,6 +3027,7 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 if let Some(start) = forward_trace_start {
                     decode_forward_ms += elapsed_ms(start);
@@ -6116,6 +6138,7 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.inner.cached_rope_deltas.unwrap_or(0),
             )?
             .squeeze(Some(&[1]))?
         };
@@ -6281,11 +6304,16 @@ impl PagedBackend for Qwen35MoeInner {
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // Clear the per-turn session state here (history is re-set in
-        // `save_paged_history`; rope deltas + image key are reset because the
-        // paged path does not carry them across turns).
+        // `save_paged_history`; image key is reset because the paged path does
+        // not carry it across turns). The cross-turn M-RoPE delta IS carried on
+        // a warm continuation: a text turn that warm-continues an image prefill
+        // must keep rotating at the compressed position, so the delta is reset
+        // only on a fresh/miss turn (cached_prefix_len == 0).
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        if cached_prefix_len == 0 {
+            self.cached_rope_deltas = None;
+        }
 
         let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
             Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")
@@ -6318,6 +6346,10 @@ impl PagedBackend for Qwen35MoeInner {
         );
         let embed = self.embedding.clone();
         let embedding_weight = embed.get_weight();
+        // Cross-turn M-RoPE delta (0 unless this engine-driven text turn warm-
+        // continues an image prefill); aligns the suffix keys with the
+        // compressed-position image keys.
+        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let caches_ref = self
             .caches
             .as_mut()
@@ -6339,6 +6371,7 @@ impl PagedBackend for Qwen35MoeInner {
             &embedding_weight,
             &layer_kinds,
             adapter,
+            rope_deltas,
         )
     }
 

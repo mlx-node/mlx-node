@@ -96,6 +96,7 @@ pub(crate) fn run_paged_prefill_chunk(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_size(
@@ -112,6 +113,7 @@ pub(crate) fn run_paged_prefill_chunk(
         layer_kinds,
         paged_adapter,
         chunk_size,
+        cached_rope_deltas,
     )
 }
 
@@ -166,6 +168,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -189,6 +192,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             embedding_weight,
             layer_kinds,
             paged_adapter,
+            cached_rope_deltas,
         );
     }
 
@@ -250,6 +254,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             paged_adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
+            cached_rope_deltas,
         )?;
 
         if is_last_chunk {
@@ -353,6 +358,7 @@ pub(crate) fn run_paged_prefill_single_shot(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     paged_adapter
         .record_tokens(suffix_tokens)
@@ -373,6 +379,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         paged_adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
+        cached_rope_deltas,
     )?;
     project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
 }
@@ -428,6 +435,10 @@ pub(crate) fn run_paged_vlm_prefill_moe(
         paged_adapter,
         Some(&merge.inputs_embeds),
         Some(&merge.position_ids),
+        // Image prefill drives full-attention layers through the 3-row M-RoPE
+        // arm (`position_ids` is `Some`), so the scalar offset is unused here.
+        /* cached_rope_deltas */
+        0,
     )?;
 
     project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
@@ -478,6 +489,7 @@ fn run_paged_prefill_one_chunk_moe(
     paged_adapter: &mut PagedKVCacheAdapter,
     inputs_embeds: Option<&MxArray>,
     position_ids: Option<&MxArray>,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -490,6 +502,16 @@ fn run_paged_prefill_one_chunk_moe(
             embed.forward(&input_ids)?
         }
     };
+
+    // Scalar-offset RoPE position for this chunk: a text suffix that warm-
+    // continues an image prefill rotates at the physical slot plus the negative
+    // cross-turn delta so it stays consistent with the compressed-M-RoPE image
+    // keys. Text-only prefill carries `cached_rope_deltas == 0`; image prefill
+    // uses the M-RoPE arm, so this is ignored there.
+    let rope_position_offset = crate::models::qwen3_5::paged_forward::paged_rope_offset(
+        chunk_first_position,
+        cached_rope_deltas,
+    );
 
     // Layer loop. Safe-by-construction via `iter_mut().zip(...)` —
     // each iteration takes disjoint `&mut DecoderLayer` and `&mut
@@ -518,6 +540,7 @@ fn run_paged_prefill_one_chunk_moe(
             Some(cache_slot),
             layer_positions,
             true,
+            rope_position_offset,
         )?;
         // Smooth the prefill memory peak: every K layers, materialize the
         // residual stream so MLX can release the upstream graph nodes
@@ -571,6 +594,7 @@ pub(crate) fn run_paged_decode_step(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     let first_logical_position = paged_adapter.current_token_count();
     paged_adapter
@@ -579,6 +603,13 @@ pub(crate) fn run_paged_decode_step(
 
     let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
     let mut hidden_states = embed.forward(&input_ids)?;
+
+    // Decode rotates the query at the physical slot plus the cross-turn M-RoPE
+    // delta (0 for text turns) while K/V still writes at the physical slot.
+    let rope_position_offset = crate::models::qwen3_5::paged_forward::paged_rope_offset(
+        first_logical_position,
+        cached_rope_deltas,
+    );
 
     let num_layers = layers.len();
     #[allow(clippy::needless_range_loop)]
@@ -603,6 +634,7 @@ pub(crate) fn run_paged_decode_step(
             Some(cache_slot),
             None,
             true,
+            rope_position_offset,
         )?;
     }
 
@@ -913,6 +945,7 @@ mod tests {
                 &layer_kinds,
                 adapter,
                 chunk_size,
+                /* cached_rope_deltas */ 0,
             ) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1286,6 +1319,7 @@ mod tests {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                /* cached_rope_deltas */ 0,
             ) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1347,6 +1381,7 @@ mod tests {
                 &layer_kinds,
                 adapter,
                 0,
+                /* cached_rope_deltas */ 0,
             )
             .expect("explicit chunk_size=0 prefill")
         };

@@ -172,6 +172,7 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
         use_kernel: bool,
+        rope_position_offset: i32,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -179,6 +180,7 @@ impl DecoderLayer {
                 let _ = first_logical_position;
                 let _ = cached_prefix_len;
                 let _ = is_prefill;
+                let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
                         "Qwen3_5MoeDecoderLayer::forward_paged_or_flat: kind=Linear applied to a \
@@ -211,6 +213,7 @@ impl DecoderLayer {
                     cached_prefix_len,
                     is_prefill,
                     position_ids,
+                    rope_position_offset,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
