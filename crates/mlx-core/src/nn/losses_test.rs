@@ -614,7 +614,10 @@ mod tests {
     #[test]
     fn test_cross_entropy_qwen3_vocab() {
         // Full Qwen3 vocabulary size
-        let batch_size = 2;
+        // Large batch so the mean-reduced loss concentrates near log(vocab):
+        // random_normal/randint are unseeded, and batch=2 was flaky — one high
+        // random target logit could pull the mean below the 10.0 lower bound.
+        let batch_size = 64;
         let vocab_size = 151936;
 
         let logits =
