@@ -253,3 +253,91 @@ async fn qwen3_5_vl_image_chat_t0_capture() {
     assert_eq!(d1, d1b, "turn 1 digest is not deterministic at T=0");
     assert_eq!(d2, d2b, "turn 2 digest is not deterministic at T=0");
 }
+
+/// Keywords from `examples/ocr.png` — a "TRUNCH PARISH COUNCIL — BANK
+/// RECONCILIATION AS AT 31ST OCTOBER 2019" financial table. A model that
+/// actually READS the image transcribes several of these; a model with broken
+/// vision features hallucinates an unrelated scene (e.g. "stone/fabric") and
+/// matches none.
+const DOC_KEYWORDS: &[&str] = &[
+    "reconciliation",
+    "bank",
+    "council",
+    "trunch",
+    "october",
+    "2019",
+    "balance",
+];
+
+/// Vision-CORRECTNESS gate (distinct from the `_t0_capture` parity digest, which
+/// asserts paged==flat byte-identity and so passes even when the vision features
+/// are garbage). Sends ONE image+prompt turn at T=0 and requires the model to
+/// actually READ the document: the lowercased output must contain at least two
+/// of `DOC_KEYWORDS`. This is the TDD ground-truth gate for the qwen3.5 VL image
+/// fix — the shared vision path (qwen3_5 / qwen3_5_moe / Qwen3.6-35B-A3B)
+/// currently fails it (describes the financial table as "stone/fabric").
+///
+/// CI note: the qwen3_5 MoE checkpoint (35B-A3B, ~70GB) is excluded from the CI
+/// model-e2e matrix by size (see the `.github/workflows/ci.yml` model-test
+/// comment); like the sibling `#[ignore]` gates this runs only via the env vars
+/// locally / on opt-in, never under a plain `cargo test`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_QWEN35_VL_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH for a Qwen3.5-VL dense checkpoint + test image"]
+async fn qwen3_5_vl_reads_document_text() {
+    let Ok(model_path) = std::env::var("MLX_TEST_QWEN35_VL_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_QWEN35_VL_MODEL_PATH unset");
+        return;
+    };
+    assert!(
+        Path::new(&model_path).exists(),
+        "MLX_TEST_QWEN35_VL_MODEL_PATH does not exist: {model_path}"
+    );
+    let Some(image_path) = resolve_image_path() else {
+        eprintln!("skipping: no test image (set MLX_TEST_VLM_IMAGE_PATH or add examples/ocr.png)");
+        return;
+    };
+    let image = std::fs::read(&image_path).expect("failed to read test image");
+
+    let model = Qwen3_5Model::load(model_path.clone())
+        .await
+        .expect("failed to load Qwen3.5-VL model");
+
+    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+
+    // ONE image+text turn at T=0 (greedy/deterministic). max_new_tokens (512) is
+    // well past the small thinking budget so the transcription answer is emitted.
+    let turn = model
+        .chat_session_start(
+            vec![user_msg(
+                "Transcribe the text in this document. List the title and any headings you can read.",
+                Some(&image),
+            )],
+            Some(cfg(512)),
+        )
+        .await
+        .expect("document-transcription chat_session_start failed");
+
+    // Match against raw_text (thinking + answer) so a transcription counts
+    // whether the model reasons about the document or answers directly.
+    let out = turn.raw_text.to_lowercase();
+    let hits: Vec<&str> = DOC_KEYWORDS
+        .iter()
+        .copied()
+        .filter(|kw| out.contains(kw))
+        .collect();
+
+    println!(
+        "READS-DOC ntok={} finish={} hits={:?} :: {}",
+        turn.num_tokens,
+        turn.finish_reason,
+        hits,
+        oneline(&turn.raw_text)
+    );
+
+    assert!(
+        hits.len() >= 2,
+        "model did not READ the document: expected >=2 of {DOC_KEYWORDS:?}, \
+         matched {hits:?} (broken vision features?). Full output:\n{}",
+        turn.raw_text
+    );
+}
