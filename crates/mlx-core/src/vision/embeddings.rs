@@ -29,11 +29,12 @@ impl PatchEmbedding {
     /// * `in_channels` - Number of input channels (3 for RGB)
     /// * `embed_dim` - Embedding dimension
     /// * `weight` - Convolution weights [embed_dim, patch_size, patch_size, in_channels]
-    pub fn new(patch_size: u32, weight: &MxArray) -> Result<Self> {
+    /// * `bias` - Optional convolution bias [embed_dim]
+    pub fn new(patch_size: u32, weight: &MxArray, bias: Option<&MxArray>) -> Result<Self> {
         // Create conv layer with stride = kernel_size = patch_size
         let conv = Conv2d::new(
             weight,
-            None,
+            bias,
             Some(vec![patch_size, patch_size]), // stride
             Some(vec![0, 0]),                   // padding
             None,                               // dilation
@@ -75,6 +76,11 @@ impl PatchEmbedding {
     /// Get the convolution weight
     pub fn weight(&self) -> MxArray {
         self.patch_conv.weight()
+    }
+
+    /// Get the convolution bias if present
+    pub fn bias(&self) -> Option<MxArray> {
+        self.patch_conv.bias()
     }
 }
 
@@ -181,7 +187,7 @@ mod tests {
         )
         .unwrap();
 
-        let patch_embed = PatchEmbedding::new(patch_size, &weight).unwrap();
+        let patch_embed = PatchEmbedding::new(patch_size, &weight, None).unwrap();
 
         // Input: [1, 8, 8, 3] -> [1, 4, 16] (2x2 patches, 16 dim)
         let input_data: Vec<f32> = (0..(8 * 8 * 3) as usize)
@@ -194,6 +200,58 @@ mod tests {
 
         // 8/4 = 2 patches per dimension, 2*2 = 4 total patches
         assert_eq!(shape, vec![1, 4, 16]);
+    }
+
+    #[test]
+    fn test_patch_embedding_applies_bias() {
+        // With zero conv weights, the patch-embed output equals the bias,
+        // broadcast over every patch. This proves the bias is plumbed into
+        // the underlying Conv2d (previously hardcoded to None).
+        let patch_size = 4u32;
+        let in_c = 3i64;
+        let embed_dim = 5i64;
+
+        let weight = MxArray::zeros(
+            &[embed_dim, patch_size as i64, patch_size as i64, in_c],
+            None,
+        )
+        .unwrap();
+
+        let bias_data: Vec<f32> = vec![0.5, -1.0, 2.0, 3.5, -0.25];
+        let bias = MxArray::from_float32(&bias_data, &[embed_dim]).unwrap();
+
+        // Input: [1, 8, 8, 3] -> 2x2 = 4 patches.
+        let input_data: Vec<f32> = (0..(8 * 8 * 3) as usize)
+            .map(|i| (i % 256) as f32 / 255.0)
+            .collect();
+        let input = MxArray::from_float32(&input_data, &[1, 8, 8, 3]).unwrap();
+
+        // Without bias: zero weights -> all-zero output.
+        let no_bias = PatchEmbedding::new(patch_size, &weight, None).unwrap();
+        let out_no_bias = no_bias.forward(&input).unwrap();
+        out_no_bias.eval();
+        let data_no_bias: Vec<f32> = out_no_bias.to_float32().unwrap().to_vec();
+        assert!(
+            data_no_bias.iter().all(|&v| v.abs() < 1e-6),
+            "zero-weight, no-bias output must be all zeros"
+        );
+
+        // With bias: every patch equals the bias vector.
+        let with_bias = PatchEmbedding::new(patch_size, &weight, Some(&bias)).unwrap();
+        let out = with_bias.forward(&input).unwrap();
+        out.eval();
+        let shape: Vec<i64> = out.shape().unwrap().as_ref().to_vec();
+        assert_eq!(shape, vec![1, 4, 5]);
+        let data: Vec<f32> = out.to_float32().unwrap().to_vec();
+        for patch in 0..4usize {
+            for (c, &expected) in bias_data.iter().enumerate() {
+                let got = data[patch * embed_dim as usize + c];
+                assert!(
+                    (got - expected).abs() < 1e-5,
+                    "patch {patch} channel {c}: expected bias {expected}, got {got}"
+                );
+            }
+        }
     }
 
     #[test]

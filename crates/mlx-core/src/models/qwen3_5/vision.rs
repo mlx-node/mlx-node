@@ -76,7 +76,7 @@ impl Qwen3_5VisionEncoder {
             ],
             None,
         )?;
-        let patch_embed = PatchEmbedding::new(patch_size, &dummy_weight)?;
+        let patch_embed = PatchEmbedding::new(patch_size, &dummy_weight, None)?;
 
         Ok(Self {
             config,
@@ -88,9 +88,13 @@ impl Qwen3_5VisionEncoder {
         })
     }
 
-    /// Set patch embedding weights
-    pub fn set_patch_embed(&mut self, weight: &MxArray) -> Result<()> {
-        self.patch_embed = Arc::new(PatchEmbedding::new(self.config.patch_size as u32, weight)?);
+    /// Set patch embedding weights (and optional Conv bias)
+    pub fn set_patch_embed(&mut self, weight: &MxArray, bias: Option<&MxArray>) -> Result<()> {
+        self.patch_embed = Arc::new(PatchEmbedding::new(
+            self.config.patch_size as u32,
+            weight,
+            bias,
+        )?);
         Ok(())
     }
 
@@ -123,6 +127,9 @@ impl Qwen3_5VisionEncoder {
             "visual.patch_embed.proj.weight".to_string(),
             self.patch_embed.weight(),
         );
+        if let Some(b) = self.patch_embed.bias() {
+            params.insert("visual.patch_embed.proj.bias".to_string(), b);
+        }
 
         // Position embedding
         if let Some(ref pe) = self.pos_embed {
