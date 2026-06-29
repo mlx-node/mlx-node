@@ -325,6 +325,29 @@ async function handleStreamingNative(
   const stopBuffer = new StopSequenceBuffer(stopSequences);
   let matchedStopSequence: string | null = null;
 
+  // Route terminal / recovered visible text through the SAME stop-sequence
+  // detector that gated the streamed deltas. The done-path recovery branches
+  // can re-emit visible bytes the stream never surfaced — text the tag buffer
+  // suppressed after a structural marker, or native final / recovered text
+  // that diverges from what streamed — and a stop string living there would
+  // otherwise leak. The stream is ending, so push then flush: no later delta
+  // can complete a held partial. On a match `matchedStopSequence` is recorded
+  // (forcing the `stop_sequence` terminal) and only the safe prefix is
+  // returned, so the caller emits nothing past the stop. With an empty
+  // `stopSequences` the detector is a pass-through, returning the input
+  // verbatim.
+  const scanTerminalText = (candidate: string): string => {
+    const pushed = stopBuffer.push(candidate);
+    if (pushed.matched !== null) {
+      matchedStopSequence = pushed.matched;
+    }
+    const residue = stopBuffer.flush();
+    if (residue.matched !== null) {
+      matchedStopSequence = residue.matched;
+    }
+    return pushed.safeText + residue.safeText;
+  };
+
   // Terminal emission is deferred until after the loop drains so `wasCommitted()`
   // reads an authoritative `session.turns`. On a committed done chunk we emit
   // `message_delta` + `message_stop`; on an uncommitted terminal (finishReason=error,
@@ -466,7 +489,15 @@ async function handleStreamingNative(
           containsToolCallMarkup(event.rawText)
             ? recoverSuppressedToolCallText(event.rawText)
             : event.text;
-        const okToolCalls = allowToolUse ? parsedToolCalls : [];
+        // A stop matched in the pre-tool visible text (the `tagFound`
+        // `cleanPrefix` path, or any streamed delta) halts generation at its
+        // position, so a tool call whose tag followed the stop boundary must
+        // not be emitted. `matchedStopSequence` here reflects only matches
+        // seen up to this point — the recovered-tail scan (below) runs after
+        // this gate, so a stop that lives only after a fully-formed tool call
+        // does not retroactively suppress that tool (tool-use precedence is
+        // left intact there).
+        const okToolCalls = allowToolUse && matchedStopSequence === null ? parsedToolCalls : [];
         const hasToolCalls = okToolCalls.length > 0;
 
         // Recovery: suppression triggered but no tool calls parsed — emit final text as a text block.
@@ -479,26 +510,32 @@ async function handleStreamingNative(
         // branch off in that case (`matchedStopSequence === null`) — the
         // truncated `emittedText` is authoritative.
         if (matchedStopSequence === null && tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
-          // Thinking block (if any) was already closed above.
-          hasEmittedText = true;
-          writeSSEEvent(
-            res,
-            'content_block_start',
-            buildContentBlockStart(contentBlockIndex, {
-              type: 'text',
-              text: '',
-            }),
-          );
-          emittedText += finalText;
-          emittedTextLength += finalText.length;
-          writeSSEEvent(
-            res,
-            'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, {
-              type: 'text_delta',
-              text: finalText,
-            }),
-          );
+          // Route the recovered final text through the stop detector before
+          // emission so a stop string the tag buffer suppressed is honored,
+          // not leaked. `safe` is `finalText` verbatim when no stop matches.
+          const safe = scanTerminalText(finalText);
+          if (safe) {
+            // Thinking block (if any) was already closed above.
+            hasEmittedText = true;
+            writeSSEEvent(
+              res,
+              'content_block_start',
+              buildContentBlockStart(contentBlockIndex, {
+                type: 'text',
+                text: '',
+              }),
+            );
+            emittedText += safe;
+            emittedTextLength += safe.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: safe,
+              }),
+            );
+          }
         } else if (
           matchedStopSequence === null &&
           tagBuffer.suppressed &&
@@ -531,15 +568,19 @@ async function handleStreamingNative(
           // misclassify case (b) when the streamed whitespace is long.
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
-          if (unsent) {
-            emittedText += unsent;
-            emittedTextLength += unsent.length;
+          // Route the recovered suffix through the stop detector so a stop
+          // string in the previously-suppressed tail is honored. `safe` is
+          // `unsent` verbatim when no stop matches.
+          const safe = scanTerminalText(unsent);
+          if (safe) {
+            emittedText += safe;
+            emittedTextLength += safe.length;
             writeSSEEvent(
               res,
               'content_block_delta',
               buildContentBlockDelta(contentBlockIndex, {
                 type: 'text_delta',
-                text: unsent,
+                text: safe,
               }),
             );
           }
@@ -557,21 +598,52 @@ async function handleStreamingNative(
           // companion comment above for the case-distinction rationale.
           const overlap = longestSuffixPrefixOverlap(emittedText, finalText);
           const unsent = finalText.slice(overlap);
-          if (unsent) {
-            emittedText += unsent;
-            emittedTextLength += unsent.length;
+          // Route the unsent suffix through the stop detector before emission.
+          // `safe` is `unsent` verbatim when no stop matches.
+          const safe = scanTerminalText(unsent);
+          if (safe) {
+            emittedText += safe;
+            emittedTextLength += safe.length;
             writeSSEEvent(
               res,
               'content_block_delta',
               buildContentBlockDelta(contentBlockIndex, {
                 type: 'text_delta',
-                text: unsent,
+                text: safe,
               }),
             );
           }
         }
 
         if (hasEmittedText) {
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+          contentBlockIndex++;
+          pendingLeadingWhitespace = '';
+        } else if (matchedStopSequence !== null && pendingLeadingWhitespace) {
+          // The push that cleared this leading whitespace also matched the
+          // stop, so it is the entire safe truncated prefix: there is no later
+          // text delta to join it with, and no tool_use frame will follow (a
+          // match suppresses tools). Emit it as the turn's text block so the
+          // streamed body equals the non-streaming truncated prefix instead of
+          // dropping the parked whitespace.
+          writeSSEEvent(
+            res,
+            'content_block_start',
+            buildContentBlockStart(contentBlockIndex, {
+              type: 'text',
+              text: '',
+            }),
+          );
+          emittedText += pendingLeadingWhitespace;
+          emittedTextLength += pendingLeadingWhitespace.length;
+          writeSSEEvent(
+            res,
+            'content_block_delta',
+            buildContentBlockDelta(contentBlockIndex, {
+              type: 'text_delta',
+              text: pendingLeadingWhitespace,
+            }),
+          );
           writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
           contentBlockIndex++;
           pendingLeadingWhitespace = '';
@@ -586,28 +658,32 @@ async function handleStreamingNative(
           // `pendingLeadingWhitespace` from intermediate whitespace-only
           // deltas is already part of `finalText`, so prepending the
           // buffer here would double-emit those bytes. Drop the buffer
-          // and emit `finalText` verbatim.
+          // and emit the detector-safe `finalText` (a stop string present
+          // only in this final-event text is honored, not leaked).
           pendingLeadingWhitespace = '';
-          writeSSEEvent(
-            res,
-            'content_block_start',
-            buildContentBlockStart(contentBlockIndex, {
-              type: 'text',
-              text: '',
-            }),
-          );
-          emittedText += finalText;
-          emittedTextLength += finalText.length;
-          writeSSEEvent(
-            res,
-            'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, {
-              type: 'text_delta',
-              text: finalText,
-            }),
-          );
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-          contentBlockIndex++;
+          const safe = scanTerminalText(finalText);
+          if (safe) {
+            writeSSEEvent(
+              res,
+              'content_block_start',
+              buildContentBlockStart(contentBlockIndex, {
+                type: 'text',
+                text: '',
+              }),
+            );
+            emittedText += safe;
+            emittedTextLength += safe.length;
+            writeSSEEvent(
+              res,
+              'content_block_delta',
+              buildContentBlockDelta(contentBlockIndex, {
+                type: 'text_delta',
+                text: safe,
+              }),
+            );
+            writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
+            contentBlockIndex++;
+          }
         } else {
           // No text emission at all this turn — drop the buffer.
           pendingLeadingWhitespace = '';

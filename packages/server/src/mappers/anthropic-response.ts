@@ -90,7 +90,11 @@ export function recoverSuppressedToolCallText(rawText: string): string {
     .replace(/<turn\|>/g, '');
 }
 
-export function buildAnthropicContent(result: ChatResult, allowToolUse = true): AnthropicResponseContent[] {
+export function buildAnthropicContent(
+  result: ChatResult,
+  allowToolUse = true,
+  stopMatched = false,
+): AnthropicResponseContent[] {
   const content: AnthropicResponseContent[] = [];
 
   if (result.thinking) {
@@ -98,9 +102,18 @@ export function buildAnthropicContent(result: ChatResult, allowToolUse = true): 
   }
 
   const parsedToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
-  const okToolCalls = allowToolUse ? parsedToolCalls : [];
+  // A matched stop sequence halts generation at its position, so any tool call
+  // whose tag would have followed the stop boundary is dropped and the
+  // truncated visible text (`result.text`, already cut at the stop) is emitted
+  // verbatim — the suppressed-markup recovery is skipped because it would
+  // re-introduce text that lived after the stop.
+  const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
   const text =
-    !allowToolUse && result.text.length === 0 && parsedToolCalls.length > 0 && containsToolCallMarkup(result.rawText)
+    !stopMatched &&
+    !allowToolUse &&
+    result.text.length === 0 &&
+    parsedToolCalls.length > 0 &&
+    containsToolCallMarkup(result.rawText)
       ? recoverSuppressedToolCallText(result.rawText)
       : result.text;
 
@@ -134,7 +147,11 @@ export function buildAnthropicResponse(
   serverTiming?: ServerTimingForUsage,
   matchedStopSequence?: string | null,
 ): AnthropicMessagesResponse {
-  const okToolCalls = allowToolUse ? result.toolCalls.filter((t) => t.status === 'ok') : [];
+  // A matched stop sequence takes precedence over tool_use: suppress the tool
+  // calls so `stop_reason: 'stop_sequence'` is never emitted alongside a
+  // tool_use block whose tag followed the stop boundary.
+  const stopMatched = Boolean(matchedStopSequence);
+  const okToolCalls = allowToolUse && !stopMatched ? result.toolCalls.filter((t) => t.status === 'ok') : [];
   const hasToolCalls = okToolCalls.length > 0;
 
   // Cache accounting (Anthropic Messages API spec):
@@ -181,7 +198,7 @@ export function buildAnthropicResponse(
     type: 'message',
     role: 'assistant',
     model: req.model,
-    content: buildAnthropicContent(result, allowToolUse),
+    content: buildAnthropicContent(result, allowToolUse, stopMatched),
     stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence),
     stop_sequence: matchedStopSequence ?? null,
     usage,
