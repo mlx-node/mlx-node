@@ -2234,6 +2234,167 @@ describe('handleCreateMessage', () => {
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
     });
+
+    it('streaming: honors a stop sequence that lands in the visible text before a tool-call tag', async () => {
+      // Finding 1: the `tagFound` emit path used to write the visible text
+      // before a structural marker (`cleanPrefix`) straight to the wire
+      // without consulting the stop-sequence detector, so a stop string in
+      // that prefix leaked and `stop_reason` stayed `tool_use`. The model
+      // emits "keep this HALT " immediately followed by a `<tool_call>` in
+      // the SAME delta, so the tag buffer reports `tagFound` with
+      // `cleanPrefix === "keep this HALT "`.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT <tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w1', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT <tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('<tool_call>');
+
+      // The stop match wins over the tool call: `stop_reason` is
+      // `stop_sequence`, not `tool_use`.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+    });
+
+    it('streaming: releases a benign held partial when a tool-call tag interrupts it', async () => {
+      // Finding 1 (consequence 2): when the detector holds a benign partial
+      // (a prefix of a stop sequence, e.g. "H" of "HALT") and the next delta
+      // is a structural marker, the partial used to be stranded in the
+      // detector and dropped by the suppressed-terminal residue gate. The
+      // `tagFound` path now flushes the detector, releasing the partial as
+      // visible text. Here "keep H" holds "H"; the next delta is a bare
+      // `<tool_call>` (cleanPrefix === ""), and "H" can never become "HALT".
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep H', done: false, isReasoning: false },
+        { text: '<tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w2', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'keep H<tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      // The benign "H" is preserved, not dropped.
+      expect(streamedText).toBe('keep H');
+
+      // No stop matched, so the tool call drives the terminal as before.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: leaves the pre-tag visible text untouched when no stop_sequences are configured', async () => {
+      // Finding 2: with `stop_sequences` absent the detector is a pass-through,
+      // so the `tagFound` path stays byte-identical — the full visible prefix
+      // (here "keep this HALT ", stop string and all) reaches the wire and
+      // `stop_sequence` is null. Same stream as the honor test above, minus
+      // `stop_sequences`.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT <tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w3', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT <tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this HALT ');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
   });
 
   // -----------------------------------------------------------------------

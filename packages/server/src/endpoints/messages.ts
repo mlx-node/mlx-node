@@ -691,20 +691,39 @@ async function handleStreamingNative(
         // markers are transport structure, not user-visible text.
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
-          // A structural tag (`<tool_call>` etc.) follows. When the
-          // chunk has visible text BEFORE the tag (`cleanPrefix.trim()`
-          // non-empty), the buffered leading whitespace semantically
-          // belongs to that visible text — they were one logical text
-          // run that just happened to land split across deltas. Combine
-          // them and emit as a single text_delta so the wire preserves
-          // exactly what the model produced. When the chunk is a pure
-          // tag transition (no visible prefix), the buffered whitespace
-          // is dropped so the wire never carries a stray
-          // whitespace-only `content_block_start`/`_stop` pair before
-          // the tool_use frame.
-          if (cleanPrefix.trim()) {
-            const combined = pendingLeadingWhitespace + cleanPrefix;
-            pendingLeadingWhitespace = '';
+          // A structural tag (`<tool_call>` etc.) follows, so the visible
+          // text before it (`cleanPrefix`, plus any buffered leading
+          // whitespace that belongs to the same logical run) terminates
+          // here. Route that text through the stop-sequence detector before
+          // emitting: a configured stop string landing in `cleanPrefix`
+          // (e.g. "...HALT " right before a `<tool_call>`) must be honored,
+          // not leaked. The tag suppresses everything after it, so no later
+          // delta can complete a held partial — flush the detector too so a
+          // benign partial it was holding (e.g. "H" of "HALT") is released
+          // as visible text instead of being stranded for the
+          // suppressed-terminal residue gate to drop. Emit only the
+          // detector's safe text; on a match `matchedStopSequence` is
+          // recorded so the terminal reports `stop_sequence`. With an empty
+          // `stopSequences` the detector is a pass-through (`push` returns
+          // its input, `flush` returns ''), so `visibleText === combined`
+          // and the wire is byte-identical to today.
+          const combined = pendingLeadingWhitespace + cleanPrefix;
+          pendingLeadingWhitespace = '';
+          const stopPushed = stopBuffer.push(combined);
+          if (stopPushed.matched !== null) {
+            matchedStopSequence = stopPushed.matched;
+          }
+          const stopResidue = stopBuffer.flush();
+          if (stopResidue.matched !== null) {
+            matchedStopSequence = stopResidue.matched;
+          }
+          const visibleText = stopPushed.safeText + stopResidue.safeText;
+          // Mirror the original `cleanPrefix.trim()` gate, now on the
+          // detector's safe text: emit only when there is non-whitespace to
+          // show, so a pure-whitespace prefix (or a stop match that leaves
+          // only whitespace) never ratifies a stray whitespace-only text
+          // block before the tool_use frame.
+          if (visibleText.trim().length > 0) {
             if (!hasEmittedText) {
               if (hasEmittedThinking) {
                 writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
@@ -719,18 +738,16 @@ async function handleStreamingNative(
                 }),
               );
             }
-            emittedText += combined;
-            emittedTextLength += combined.length;
+            emittedText += visibleText;
+            emittedTextLength += visibleText.length;
             writeSSEEvent(
               res,
               'content_block_delta',
               buildContentBlockDelta(contentBlockIndex, {
                 type: 'text_delta',
-                text: combined,
+                text: visibleText,
               }),
             );
-          } else {
-            pendingLeadingWhitespace = '';
           }
         } else if (safeText) {
           // Run the tag-buffer's visible text through the stop-sequence
