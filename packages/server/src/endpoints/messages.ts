@@ -692,24 +692,27 @@ async function handleStreamingNative(
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
           // A structural tag (`<tool_call>` etc.) follows, so the visible
-          // text before it (`cleanPrefix`, plus any buffered leading
-          // whitespace that belongs to the same logical run) terminates
-          // here. Route that text through the stop-sequence detector before
-          // emitting: a configured stop string landing in `cleanPrefix`
-          // (e.g. "...HALT " right before a `<tool_call>`) must be honored,
-          // not leaked. The tag suppresses everything after it, so no later
-          // delta can complete a held partial — flush the detector too so a
-          // benign partial it was holding (e.g. "H" of "HALT") is released
-          // as visible text instead of being stranded for the
-          // suppressed-terminal residue gate to drop. Emit only the
-          // detector's safe text; on a match `matchedStopSequence` is
-          // recorded so the terminal reports `stop_sequence`. With an empty
-          // `stopSequences` the detector is a pass-through (`push` returns
-          // its input, `flush` returns ''), so `visibleText === combined`
-          // and the wire is byte-identical to today.
-          const combined = pendingLeadingWhitespace + cleanPrefix;
-          pendingLeadingWhitespace = '';
-          const stopPushed = stopBuffer.push(combined);
+          // text before it terminates here. Only `cleanPrefix` is fresh
+          // model text — route it through the stop-sequence detector so a
+          // configured stop string landing in it (e.g. "...HALT " right
+          // before a `<tool_call>`) is honored, not leaked. The tag
+          // suppresses everything after it, so no later delta can complete a
+          // held partial — flush the detector too so a benign partial it was
+          // holding (e.g. "H" of "HALT") is released as visible text instead
+          // of being stranded for the suppressed-terminal residue gate to
+          // drop. `pendingLeadingWhitespace` is whitespace the detector
+          // already cleared on an earlier delta (held back only because no
+          // text block was open yet), so it is prepended OUTSIDE the buffer:
+          // re-pushing it would double-scan it AND, because the buffer queues
+          // it after any partial it is still holding, invert stream order
+          // (e.g. held "H" + buffered " " emits as "H ") or even forge a
+          // false match (held "H" + " " -> "H " matching a "H " stop). On a
+          // match `matchedStopSequence` is recorded so the terminal reports
+          // `stop_sequence`. With an empty `stopSequences` the detector is a
+          // pass-through (`push` returns its input, `flush` returns ''), so
+          // `visibleText === pendingLeadingWhitespace + cleanPrefix` and the
+          // wire is byte-identical to today.
+          const stopPushed = stopBuffer.push(cleanPrefix);
           if (stopPushed.matched !== null) {
             matchedStopSequence = stopPushed.matched;
           }
@@ -717,7 +720,8 @@ async function handleStreamingNative(
           if (stopResidue.matched !== null) {
             matchedStopSequence = stopResidue.matched;
           }
-          const visibleText = stopPushed.safeText + stopResidue.safeText;
+          const visibleText = pendingLeadingWhitespace + stopPushed.safeText + stopResidue.safeText;
+          pendingLeadingWhitespace = '';
           // Mirror the original `cleanPrefix.trim()` gate, now on the
           // detector's safe text: emit only when there is non-whitespace to
           // show, so a pure-whitespace prefix (or a stop match that leaves

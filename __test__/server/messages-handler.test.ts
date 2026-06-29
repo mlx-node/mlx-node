@@ -2348,6 +2348,62 @@ describe('handleCreateMessage', () => {
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
     });
 
+    it('streaming: preserves order of buffered leading whitespace and a held stop-prefix before a tool-call tag', async () => {
+      // Re-review of the `tagFound` fix: a turn-leading whitespace-only delta
+      // (" ") and a stop-prefix ("H" of "HALT") arrive together as " H", then a
+      // bare `<tool_call>` follows. The detector clears the leading " " (visible)
+      // and holds "H"; the " " parks in `pendingLeadingWhitespace` because no
+      // text block is open yet. At the tag, `pendingLeadingWhitespace` is text
+      // that ALREADY passed the detector, so it must be prepended OUTSIDE the
+      // buffer. Re-pushing it would queue it after the held "H" and emit "H "
+      // (order inverted). The visible run is " H" and "H" can never become
+      // "HALT", so no stop matches and the tool call drives the terminal.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        { text: '<tool_call>{"name":"get_weather"}', done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'toolu_w4', name: 'get_weather', arguments: '{"location":"NYC"}' }],
+          thinking: null,
+          numTokens: 9,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: ' H<tool_call>{"name":"get_weather"}',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      // Order preserved (" H", not "H "), nothing leaked, nothing dropped.
+      expect(streamedText).toBe(' H');
+
+      // No stop matched, so the tool call drives the terminal.
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
     it('streaming: leaves the pre-tag visible text untouched when no stop_sequences are configured', async () => {
       // Finding 2: with `stop_sequences` absent the detector is a pass-through,
       // so the `tagFound` path stays byte-identical — the full visible prefix
