@@ -111,4 +111,34 @@ describe('StopSequenceBuffer', () => {
     expect(buffer.flush()).toEqual({ safeText: '', matched: 'ab' });
     expect(buffer.matched).toBe('ab');
   });
+
+  it('holds a short tail match while an EARLIER-index longer stop could still complete', () => {
+    // Finding A: "xab" contains the short stop "ab" at index 1, but it is also
+    // a viable prefix of the longer stop "xabc" beginning at the EARLIER index
+    // 0. Earliest-match-wins means the short "ab" must be HELD (not committed)
+    // until the earlier "xabc" either completes or is broken.
+    const buffer = new StopSequenceBuffer(['xabc', 'ab']);
+
+    expect(buffer.push('xab')).toEqual({ safeText: '', matched: null });
+    // The next char completes the earlier/longer "xabc", which wins.
+    expect(buffer.push('c')).toEqual({ safeText: '', matched: 'xabc' });
+    expect(buffer.matched).toBe('xabc');
+  });
+
+  it('commits the short stop when the earlier longer stop can no longer complete', () => {
+    const buffer = new StopSequenceBuffer(['xabc', 'ab']);
+
+    expect(buffer.push('xab')).toEqual({ safeText: '', matched: null });
+    // "z" breaks "xabc" (it needed "c"); the short "ab" at index 1 commits
+    // promptly, emitting the safe "x" before it — no hang, no dropped text.
+    expect(buffer.push('z')).toEqual({ safeText: 'x', matched: 'ab' });
+    expect(buffer.matched).toBe('ab');
+  });
+
+  it('matches the earlier longer stop in a single chunk', () => {
+    const buffer = new StopSequenceBuffer(['xabc', 'ab']);
+
+    expect(buffer.push('xabc')).toEqual({ safeText: '', matched: 'xabc' });
+    expect(buffer.matched).toBe('xabc');
+  });
 });

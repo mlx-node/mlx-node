@@ -8,7 +8,7 @@
 export class StopSequenceBuffer {
   private readonly stopSequences: string[];
   private readonly maxLength: number;
-  private pending = '';
+  private pending_ = '';
   private _matched: string | null = null;
 
   constructor(stopSequences: string[]) {
@@ -29,7 +29,7 @@ export class StopSequenceBuffer {
     let matchIdx = -1;
     let matchSeq: string | null = null;
     for (const seq of this.stopSequences) {
-      const idx = this.pending.indexOf(seq);
+      const idx = this.pending_.indexOf(seq);
       if (idx < 0) {
         continue;
       }
@@ -47,6 +47,40 @@ export class StopSequenceBuffer {
   }
 
   /**
+   * The text currently held back (received but neither emitted nor matched).
+   * The streaming done-path reads this so it can scan the terminal/recovered
+   * text on the SAME buffer with the held partial still in place, and so it
+   * can reconstruct the full received-but-unemitted prefix for overlap math.
+   */
+  get pending(): string {
+    return this.pending_;
+  }
+
+  /**
+   * The earliest start index `j` in `[0, limit]` such that `pending.slice(j)`
+   * is a non-empty STRICT prefix of some configured stop — i.e. a partial that
+   * a later push could still grow into that stop. Returns -1 when no pending
+   * suffix at or before `limit` is viable. Scanning from the front yields the
+   * earliest start index, which is the one whose completed stop would win the
+   * earliest-index tiebreak. A suffix longer than `maxLength - 1` can never be
+   * a strict prefix of any stop, so the search starts no earlier than that.
+   */
+  private earliestViablePrefixIndex(limit: number): number {
+    if (this.pending_.length === 0) {
+      return -1;
+    }
+    const lowerBound = Math.max(0, this.pending_.length - (this.maxLength - 1));
+    const upper = Math.min(limit, this.pending_.length - 1);
+    for (let j = lowerBound; j <= upper; j++) {
+      const suffix = this.pending_.slice(j);
+      if (this.stopSequences.some((seq) => suffix.length < seq.length && seq.startsWith(suffix))) {
+        return j;
+      }
+    }
+    return -1;
+  }
+
+  /**
    * Feed text in. Returns `safeText` (emit as delta) and `matched` (the stop
    * sequence that has been matched, or `null`). After a match every push
    * returns empty `safeText` and keeps reporting the matched sequence.
@@ -61,46 +95,41 @@ export class StopSequenceBuffer {
       return { safeText: text, matched: null };
     }
 
-    this.pending += text;
+    this.pending_ += text;
 
     const { idx: matchIdx, seq: matchSeq } = this.findMatch();
+
+    // Earliest start index of a still-growable stop prefix. When a full match
+    // exists we only look at or before it (`limit = matchIdx`): a viable prefix
+    // beginning AFTER the match would complete at a later index and lose the
+    // earliest-index tiebreak, and the bytes from the match onward are
+    // suppressed anyway. A viable prefix at or before the match could still
+    // complete into a stop that WINS (earlier index, or longer at the same
+    // index), so the match must be held. With no full match we consider the
+    // whole pending text.
+    const limit = matchIdx >= 0 ? matchIdx : this.pending_.length - 1;
+    const holdIdx = this.earliestViablePrefixIndex(limit);
+
     if (matchIdx >= 0 && matchSeq !== null) {
-      // A full match sits at `matchIdx`. Commit it only when no LONGER stop
-      // sharing the same start index could still complete from a later push —
-      // otherwise longest-on-tie (C4) would pick that longer stop once it
-      // arrives. `fromMatch` is the text from the match index to the tail; if
-      // it is still a strict prefix of a longer stop, a future push could
-      // finish that stop, so we hold the match (emit only the safe text before
-      // `matchIdx`) and let a later push or `flush()` resolve the tie.
-      const fromMatch = this.pending.slice(matchIdx);
-      const longerStillViable = this.stopSequences.some(
-        (seq) => seq.length > fromMatch.length && seq.startsWith(fromMatch),
-      );
-      const safeText = this.pending.slice(0, matchIdx);
-      if (longerStillViable) {
-        this.pending = fromMatch;
+      if (holdIdx >= 0) {
+        // A longer/earlier stop could still complete from `holdIdx`; emit only
+        // the bytes before it and keep the rest pending for a later push or
+        // `flush()` to resolve.
+        const safeText = this.pending_.slice(0, holdIdx);
+        this.pending_ = this.pending_.slice(holdIdx);
         return { safeText, matched: null };
       }
+      const safeText = this.pending_.slice(0, matchIdx);
       this._matched = matchSeq;
-      this.pending = '';
+      this.pending_ = '';
       return { safeText, matched: matchSeq };
     }
 
-    // Hold back the longest suffix that is a proper prefix of any stop
-    // sequence, since a later push could complete it.
-    let holdLen = 0;
-    const maxHold = Math.min(this.pending.length, this.maxLength - 1);
-    for (let i = maxHold; i >= 1; i--) {
-      const suffix = this.pending.slice(-i);
-      if (this.stopSequences.some((seq) => suffix.length < seq.length && seq.startsWith(suffix))) {
-        holdLen = i;
-        break;
-      }
-    }
-
-    const safeLen = this.pending.length - holdLen;
-    const safeText = this.pending.slice(0, safeLen);
-    this.pending = this.pending.slice(safeLen);
+    // No full match: release everything before the earliest viable prefix and
+    // hold that suffix back, since a later push could complete it.
+    const safeLen = holdIdx >= 0 ? holdIdx : this.pending_.length;
+    const safeText = this.pending_.slice(0, safeLen);
+    this.pending_ = this.pending_.slice(safeLen);
     return { safeText, matched: null };
   }
 
@@ -120,13 +149,13 @@ export class StopSequenceBuffer {
     // released verbatim.
     const { idx: matchIdx, seq: matchSeq } = this.findMatch();
     if (matchIdx >= 0 && matchSeq !== null) {
-      const safeText = this.pending.slice(0, matchIdx);
+      const safeText = this.pending_.slice(0, matchIdx);
       this._matched = matchSeq;
-      this.pending = '';
+      this.pending_ = '';
       return { safeText, matched: matchSeq };
     }
-    const safeText = this.pending;
-    this.pending = '';
+    const safeText = this.pending_;
+    this.pending_ = '';
     return { safeText, matched: null };
   }
 }
