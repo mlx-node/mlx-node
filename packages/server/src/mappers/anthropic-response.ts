@@ -52,7 +52,14 @@ export function anthropicToolUseIdToInternal(id: string): string {
   return id.startsWith('toolu_') ? `call_${id.slice('toolu_'.length)}` : id;
 }
 
-export function mapStopReason(finishReason: string, hasToolCalls: boolean): 'end_turn' | 'max_tokens' | 'tool_use' {
+export function mapStopReason(
+  finishReason: string,
+  hasToolCalls: boolean,
+  matchedStopSequence?: string | null,
+): 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' {
+  if (matchedStopSequence) {
+    return 'stop_sequence';
+  }
   if (finishReason === 'length') {
     return 'max_tokens';
   }
@@ -125,6 +132,7 @@ export function buildAnthropicResponse(
   performance?: PerformanceMetricsForUsage,
   allowToolUse = true,
   serverTiming?: ServerTimingForUsage,
+  matchedStopSequence?: string | null,
 ): AnthropicMessagesResponse {
   const okToolCalls = allowToolUse ? result.toolCalls.filter((t) => t.status === 'ok') : [];
   const hasToolCalls = okToolCalls.length > 0;
@@ -174,8 +182,8 @@ export function buildAnthropicResponse(
     role: 'assistant',
     model: req.model,
     content: buildAnthropicContent(result, allowToolUse),
-    stop_reason: mapStopReason(result.finishReason, hasToolCalls),
-    stop_sequence: null,
+    stop_reason: mapStopReason(result.finishReason, hasToolCalls, matchedStopSequence),
+    stop_sequence: matchedStopSequence ?? null,
     usage,
   };
 }
@@ -239,6 +247,7 @@ export function buildMessageDelta(
   cachedTokens?: number,
   performance?: PerformanceMetricsForUsage,
   serverTiming?: ServerTimingForUsage,
+  stopSequence?: string | null,
 ): AnthropicMessageDeltaEvent {
   // Streaming `message_delta` mirrors the non-streaming response's
   // cache accounting: when `cachedTokens > 0` we emit
@@ -267,7 +276,7 @@ export function buildMessageDelta(
     type: 'message_delta',
     delta: {
       stop_reason: stopReason,
-      stop_sequence: null,
+      stop_sequence: stopSequence ?? null,
     },
     usage,
   };
