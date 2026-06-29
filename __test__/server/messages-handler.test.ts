@@ -2025,6 +2025,218 @@ describe('handleCreateMessage', () => {
   });
 
   // -----------------------------------------------------------------------
+  // Stop sequences (honoring Anthropic `stop_sequences`)
+  // -----------------------------------------------------------------------
+
+  describe('stop sequences', () => {
+    it('non-streaming: truncates text at the stop sequence and reports stop_sequence', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep this HALT drop this',
+          rawText: 'keep this HALT drop this',
+          finishReason: 'stop',
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.type).toBe('message');
+      expect(parsed.content).toHaveLength(1);
+      expect(parsed.content[0].type).toBe('text');
+      expect(parsed.content[0].text).toBe('keep this ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: suppresses the stop sequence + tail and reports stop_sequence', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep this HALT drop this', done: false, isReasoning: false },
+        {
+          text: 'keep this HALT drop this',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 12,
+          promptTokens: 6,
+          reasoningTokens: 0,
+          rawText: 'keep this HALT drop this',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('drop this');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect(msgDelta).toBeDefined();
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+
+      const msgStop = events.find((e) => e.event === 'message_stop');
+      expect(msgStop).toBeDefined();
+    });
+
+    it('streaming: detects a stop sequence split across two deltas', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep HA', done: false, isReasoning: false },
+        { text: 'LTdrop', done: false, isReasoning: false },
+        {
+          text: 'keep HALTdrop',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 0,
+          rawText: 'keep HALTdrop',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep ');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('drop');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: leaves text and stop_reason untouched when no stop sequence matches', async () => {
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep this whole thing',
+          rawText: 'keep this whole thing',
+          finishReason: 'stop',
+          numTokens: 9,
+          promptTokens: 4,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('keep this whole thing');
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.stop_sequence).toBe(null);
+    });
+
+    it('streaming: leaves text and stop_reason untouched when no stop sequence matches', async () => {
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'keep ', done: false, isReasoning: false },
+        { text: 'this whole thing', done: false, isReasoning: false },
+        {
+          text: 'keep this whole thing',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 9,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: 'keep this whole thing',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe('keep this whole thing');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Error handling
   // -----------------------------------------------------------------------
 

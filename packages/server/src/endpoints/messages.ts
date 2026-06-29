@@ -88,6 +88,7 @@ import { genId } from '../mappers/response.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
 import { QueueFullError, type SessionRegistry } from '../session-registry.js';
+import { StopSequenceBuffer } from '../stop-sequence-buffer.js';
 import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
@@ -206,9 +207,30 @@ async function handleNonStreaming(
   result: ChatResult,
   body: AnthropicMessagesRequest,
   visibility: TransportVisibility,
+  stopSequences: string[],
   serverTiming?: ServerTimingForUsage,
 ): Promise<void> {
   const messageId = genId('msg_');
+
+  // Honor client-supplied `stop_sequences`: scan the model's final text for
+  // the earliest configured stop string. On a match we truncate the text the
+  // response is built from at the match (dropping the stop string and
+  // everything after it) and report `stop_reason: 'stop_sequence'` +
+  // `stop_sequence: '<matched>'`. The native `ChatResult` is left untouched —
+  // only the response builder sees the truncated text. An empty
+  // `stopSequences` constructs a pass-through buffer that never matches, so
+  // behavior is byte-identical to a request without `stop_sequences`.
+  let matchedStopSequence: string | null = null;
+  let responseResult = result;
+  if (stopSequences.length > 0) {
+    const stopBuffer = new StopSequenceBuffer(stopSequences);
+    const { safeText, matched } = stopBuffer.push(result.text);
+    if (matched !== null) {
+      matchedStopSequence = matched;
+      responseResult = { ...result, text: safeText };
+    }
+  }
+
   // `result.performance` is only populated when `reportPerformance: true`
   // rides on the underlying `ChatConfig`; otherwise the field is
   // `undefined` and the mapper elides the wire-extension fields. The
@@ -216,12 +238,13 @@ async function handleNonStreaming(
   // by default, matching how `cachedTokens` is treated through
   // `buildAnthropicResponse`.
   const response = buildAnthropicResponse(
-    result,
+    responseResult,
     body,
     messageId,
     result.performance,
     requestAllowsToolUse(body),
     serverTiming,
+    matchedStopSequence,
   );
 
   // Native `chatSession*` has no AbortSignal surface yet, so a client that
@@ -256,6 +279,7 @@ async function handleStreamingNative(
   httpReq: IncomingMessage | undefined,
   visibility: TransportVisibility,
   emitReasoning: boolean,
+  stopSequences: string[],
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
@@ -290,6 +314,16 @@ async function handleStreamingNative(
   // suffix instead of a length-based slice that would chop characters.
   let emittedText = '';
   const tagBuffer = new ToolCallTagBuffer();
+  // Client-supplied `stop_sequences` detector. Feeds on the visible text that
+  // survives `tagBuffer` (structural-marker stripping) so it never sees tool
+  // markup. An empty `stopSequences` constructs a pass-through buffer
+  // (`push` returns its input verbatim, `flush` returns ''), so the wire is
+  // byte-identical to a request without `stop_sequences`. When a stop string
+  // matches, `matchedStopSequence` is recorded, all later visible text is
+  // suppressed, and the text-recovery branches in the terminal block are
+  // gated off so the suppressed tail is never re-emitted.
+  const stopBuffer = new StopSequenceBuffer(stopSequences);
+  let matchedStopSequence: string | null = null;
 
   // Terminal emission is deferred until after the loop drains so `wasCommitted()`
   // reads an authoritative `session.turns`. On a committed done chunk we emit
@@ -364,7 +398,22 @@ async function handleStreamingNative(
           break;
         }
 
-        const remainingText = tagBuffer.flush();
+        // Run the tag-buffer's residual text through the stop-sequence
+        // detector (push any held-back tail, then flush the detector's own
+        // held-back suffix). When a stop string already matched (or matches
+        // here) both calls contribute empty `safeText`, so the suppressed
+        // tail never reaches the wire. With an empty `stopSequences` the
+        // buffer is a pass-through: `push` returns its input and `flush`
+        // returns '', so `remainingText === tagBuffer.flush()` as before.
+        const stopTail = stopBuffer.push(tagBuffer.flush());
+        if (stopTail.matched !== null) {
+          matchedStopSequence = stopTail.matched;
+        }
+        const stopResidue = stopBuffer.flush();
+        if (stopResidue.matched !== null) {
+          matchedStopSequence = stopResidue.matched;
+        }
+        const remainingText = stopTail.safeText + stopResidue.safeText;
         if (!tagBuffer.suppressed && remainingText) {
           // Flush any pending leading whitespace alongside the residual
           // text — once a real text block opens, its declared content
@@ -421,7 +470,15 @@ async function handleStreamingNative(
         const hasToolCalls = okToolCalls.length > 0;
 
         // Recovery: suppression triggered but no tool calls parsed — emit final text as a text block.
-        if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
+        //
+        // All three recovery branches below reconcile `emittedText` against
+        // the model's final text and may RE-EMIT text the stream "missed".
+        // When a stop sequence matched, `emittedText` is intentionally a
+        // truncated prefix and `finalText` still carries the suppressed tail,
+        // so re-emitting would leak exactly what we suppressed. Gate every
+        // branch off in that case (`matchedStopSequence === null`) — the
+        // truncated `emittedText` is authoritative.
+        if (matchedStopSequence === null && tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedText) {
           // Thinking block (if any) was already closed above.
           hasEmittedText = true;
           writeSSEEvent(
@@ -443,6 +500,7 @@ async function handleStreamingNative(
             }),
           );
         } else if (
+          matchedStopSequence === null &&
           tagBuffer.suppressed &&
           !hasToolCalls &&
           finalText &&
@@ -485,7 +543,7 @@ async function handleStreamingNative(
               }),
             );
           }
-        } else if (hasEmittedText && finalText && !emittedText.includes(finalText)) {
+        } else if (matchedStopSequence === null && hasEmittedText && finalText && !emittedText.includes(finalText)) {
           // Emit any unsent suffix when final text extends past what was
           // streamed. Same divergence concern as above (post-</think> trim
           // can leave `emittedText` longer than the matching prefix of
@@ -521,7 +579,7 @@ async function handleStreamingNative(
           // Pure tool-call turn — no text block. Drop any leading
           // whitespace we had buffered before the `<tool_call>` tag.
           pendingLeadingWhitespace = '';
-        } else if (finalText) {
+        } else if (finalText && matchedStopSequence === null) {
           // All text arrived in the final event; emit it as a single
           // block. `finalText` is the FULL accumulated text from the
           // native side, NOT a delta — any whitespace we buffered in
@@ -593,7 +651,7 @@ async function handleStreamingNative(
         // Capture terminal state and break — actual `message_delta` / `message_stop` /
         // `error` emission is deferred until after the loop so `wasCommitted()` reads
         // an authoritative `session.turns` (the producer's finally runs on break).
-        terminalStopReason = mapStopReason(event.finishReason, hasToolCalls);
+        terminalStopReason = mapStopReason(event.finishReason, hasToolCalls, matchedStopSequence);
         terminalNumTokens = event.numTokens;
         terminalPromptTokens = event.promptTokens;
         terminalCachedTokens = event.cachedTokens;
@@ -675,55 +733,69 @@ async function handleStreamingNative(
             pendingLeadingWhitespace = '';
           }
         } else if (safeText) {
-          if (!hasEmittedText) {
-            // Hold back leading whitespace-only text so a `\n\n` emitted
-            // right before a `<tool_call>` tag never gets ratified into a
-            // standalone text content block. We can't open the block now
-            // because we don't yet know whether the next event is a real
-            // text delta (in which case the buffered prefix is flushed
-            // together with it) or a structural tag (in which case the
-            // buffer is dropped silently at tag-found / done time). When
-            // any non-whitespace arrives we ratify the block exactly
-            // once with `pendingLeadingWhitespace + safeText`.
-            const combined = pendingLeadingWhitespace + safeText;
-            if (combined.trim().length === 0) {
-              pendingLeadingWhitespace = combined;
-            } else {
-              if (hasEmittedThinking) {
-                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+          // Run the tag-buffer's visible text through the stop-sequence
+          // detector. `visibleText` is what survives suppression: the buffer
+          // holds back a trailing suffix that could be the start of a stop
+          // string (released on a later push or at flush), and once a full
+          // stop string matches it returns empty `safeText` for the rest of
+          // the stream. We record the match and keep consuming so the native
+          // `done` chunk still fires the commit gate and history commit.
+          const stopResult = stopBuffer.push(safeText);
+          if (stopResult.matched !== null) {
+            matchedStopSequence = stopResult.matched;
+          }
+          const visibleText = stopResult.safeText;
+          if (visibleText) {
+            if (!hasEmittedText) {
+              // Hold back leading whitespace-only text so a `\n\n` emitted
+              // right before a `<tool_call>` tag never gets ratified into a
+              // standalone text content block. We can't open the block now
+              // because we don't yet know whether the next event is a real
+              // text delta (in which case the buffered prefix is flushed
+              // together with it) or a structural tag (in which case the
+              // buffer is dropped silently at tag-found / done time). When
+              // any non-whitespace arrives we ratify the block exactly
+              // once with `pendingLeadingWhitespace + visibleText`.
+              const combined = pendingLeadingWhitespace + visibleText;
+              if (combined.trim().length === 0) {
+                pendingLeadingWhitespace = combined;
+              } else {
+                if (hasEmittedThinking) {
+                  writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
+                }
+                hasEmittedText = true;
+                writeSSEEvent(
+                  res,
+                  'content_block_start',
+                  buildContentBlockStart(contentBlockIndex, {
+                    type: 'text',
+                    text: '',
+                  }),
+                );
+                pendingLeadingWhitespace = '';
+                emittedText += combined;
+                emittedTextLength += combined.length;
+                writeSSEEvent(
+                  res,
+                  'content_block_delta',
+                  buildContentBlockDelta(contentBlockIndex, {
+                    type: 'text_delta',
+                    text: combined,
+                  }),
+                );
               }
-              hasEmittedText = true;
-              writeSSEEvent(
-                res,
-                'content_block_start',
-                buildContentBlockStart(contentBlockIndex, {
-                  type: 'text',
-                  text: '',
-                }),
-              );
-              pendingLeadingWhitespace = '';
-              emittedText += combined;
-              emittedTextLength += combined.length;
+            } else {
+              emittedText += visibleText;
+              emittedTextLength += visibleText.length;
               writeSSEEvent(
                 res,
                 'content_block_delta',
                 buildContentBlockDelta(contentBlockIndex, {
                   type: 'text_delta',
-                  text: combined,
+                  text: visibleText,
                 }),
               );
             }
-          } else {
-            emittedText += safeText;
-            emittedTextLength += safeText.length;
-            writeSSEEvent(
-              res,
-              'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, {
-                type: 'text_delta',
-                text: safeText,
-              }),
-            );
           }
         }
       }
@@ -765,6 +837,7 @@ async function handleStreamingNative(
         terminalCachedTokens,
         terminalPerformance,
         serverTiming,
+        matchedStopSequence,
       ),
     );
     // HTTP/1.1 chunked-encoding trailer: report the engine's cache-hit
@@ -984,8 +1057,17 @@ export async function handleCreateMessage(
   // resolveModel and use as a cheap pre-flight gate.
   let mappedMessages: ChatMessage[];
   let mappedConfig: ChatConfig;
+  // Client-supplied `stop_sequences`, normalized by the mapper (absent/empty
+  // dropped). Threaded into the streaming + non-streaming handlers, which own
+  // the detection/truncation. `ChatConfig` has no native stop field, so this
+  // rides alongside `config` from the mapper.
+  let mappedStopSequences: string[];
   try {
-    ({ messages: mappedMessages, config: mappedConfig } = mapAnthropicRequest(body));
+    ({
+      messages: mappedMessages,
+      config: mappedConfig,
+      stopSequences: mappedStopSequences,
+    } = mapAnthropicRequest(body));
   } catch (err) {
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;
@@ -1123,6 +1205,7 @@ export async function handleCreateMessage(
     // trigger a multi-second model load just to 400 a moment later.
     const messages: ChatMessage[] = mappedMessages;
     const config: ChatConfig = mappedConfig;
+    const stopSequences: string[] = mappedStopSequences;
 
     // Canonicalize every assistant fan-out's trailing tool block against its
     // declared sibling order. Several native session backends pair tool results
@@ -1354,6 +1437,7 @@ export async function handleCreateMessage(
                 httpReq,
                 visibility,
                 config.includeReasoning !== false,
+                stopSequences,
                 serverTiming,
               );
               // Warm-slot adopt/drop only applies to the non-paged
@@ -1429,7 +1513,7 @@ export async function handleCreateMessage(
               if (result.cachedTokens > 0) {
                 res.setHeader('X-Cached-Tokens', String(result.cachedTokens));
               }
-              await handleNonStreaming(res, result, body, visibility, serverTiming);
+              await handleNonStreaming(res, result, body, visibility, stopSequences, serverTiming);
               // Non-paged success: adopt the warm slot only when the
               // dispatch actually committed. Mirrors the streaming-side
               // dual-gate at `streamResult.ok && outcome.wasCommitted()`
