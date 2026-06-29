@@ -421,12 +421,17 @@ async function handleStreamingNative(
             ? recoverSuppressedToolCallText(event.rawText)
             : event.text;
 
-        // The visible text the stream already RECEIVED through the stop buffer
-        // — what reached the wire, plus the still-held partial, plus the tag
-        // residue about to be scanned. Used as the overlap basis so the
-        // recovered terminal text is the suffix of `finalText` the stream has
-        // not already accounted for.
-        const streamedReceived = emittedText + heldPartial + tagResidual;
+        // The visible text the stream already RECEIVED, in stream order: what
+        // reached the wire (`emittedText`), the parked leading whitespace the
+        // detector already cleared but no block has shown yet
+        // (`pendingLeadingWhitespace`), the still-held detector partial
+        // (`heldPartial`), and the tag residue about to be scanned
+        // (`tagResidual`). Every parked/held byte is counted exactly once so the
+        // recovered terminal text is only the suffix of `finalText` the stream
+        // has not already accounted for — omitting the parked whitespace would
+        // make a full-text `finalText` look entirely unsent and replay the
+        // already-received prefix.
+        const streamedReceived = emittedText + pendingLeadingWhitespace + heldPartial + tagResidual;
         let recoveredTail = '';
         if (finalText) {
           if (!hasEmittedText && heldPartial.length === 0 && tagResidual.length === 0) {

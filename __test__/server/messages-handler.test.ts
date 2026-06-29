@@ -2849,6 +2849,154 @@ describe('handleCreateMessage', () => {
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
     });
+
+    it('streaming: counts parked leading whitespace in the terminal overlap so a held stop never replays it', async () => {
+      // Wave #3 regression: the streamed delta " H" parks " " in
+      // `pendingLeadingWhitespace` (whitespace-only, no block open yet) and holds
+      // "H" in the stop detector (prefix of "HALT"). The native done text
+      // " HALTtail" carries the full visible text. The terminal overlap basis must
+      // include the parked " " so the recovered tail is only "ALTtail" (which
+      // completes the held "HALT") instead of the whole " HALTtail" — otherwise the
+      // already-received " H" gets replayed and the "H" of the stop leaks. Correct:
+      // emit exactly the pre-stop whitespace " ", matching the non-streaming result.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        {
+          text: ' HALTtail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 8,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: ' HALTtail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' ');
+      expect(streamedText).not.toContain('H');
+      expect(streamedText).not.toContain('HALT');
+      expect(streamedText).not.toContain('tail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    it('streaming: no-op with no stop_sequences never replays parked whitespace + tag residue', async () => {
+      // Wave #3 regression (C8 no-op): with NO stop_sequences the streamed delta
+      // " <" parks " " in `pendingLeadingWhitespace` and holds "<" in the tag
+      // buffer (possible tag start). The native done text " <x" carries the full
+      // visible text. The terminal overlap basis must include the parked " " and
+      // the held "<" so the recovered tail is only "x" — otherwise " <x" replays
+      // and the wire shows the duplicated " < <x". Correct: emit " <x" exactly once.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' <', done: false, isReasoning: false },
+        {
+          text: ' <x',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 4,
+          promptTokens: 2,
+          reasoningTokens: 0,
+          rawText: ' <x',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' <x');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
+
+    it('streaming: no-op control recovers only the unsent suffix after parked whitespace (no stop_sequences)', async () => {
+      // Wave #3 control: with NO stop_sequences the streamed delta " H" opens a
+      // text block immediately (non-whitespace), and the native done text " Htail"
+      // recovers only the unsent "tail". The combined stream is exactly " Htail" —
+      // byte-identical to the no-stop behavior, no duplication, no drop.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: ' H', done: false, isReasoning: false },
+        {
+          text: ' Htail',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 6,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: ' Htail',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      const streamedText = textDeltas.map((d) => (d.data['delta'] as any).text as string).join('');
+      expect(streamedText).toBe(' Htail');
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('end_turn');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe(null);
+    });
   });
 
   // -----------------------------------------------------------------------
