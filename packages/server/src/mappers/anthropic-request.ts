@@ -441,10 +441,13 @@ export function mapAnthropicRequest(
   }
 
   // `stop_sequences` has no `ChatConfig` field to map onto, so it rides out on
-  // the widened return instead. Normalize to drop absent/null entries and any
-  // empty strings (which would match at every position and stop generation
-  // immediately). A downstream consumer honours the result.
-  const stopSequences = (req.stop_sequences ?? []).filter((s) => typeof s === 'string' && s.length > 0);
+  // the widened return instead. Normalize to drop absent/null entries, empty
+  // strings (which would match at every position and stop generation
+  // immediately), and whitespace-only entries (which would truncate normal
+  // output at the first space/newline; the real Anthropic API rejects these
+  // with a 400, so making them a no-op is the lowest-risk resolution). A
+  // downstream consumer honours the result.
+  const stopSequences = (req.stop_sequences ?? []).filter((s) => typeof s === 'string' && s.trim().length > 0);
 
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;

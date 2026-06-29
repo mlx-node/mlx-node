@@ -1032,6 +1032,29 @@ describe('mapAnthropicRequest', () => {
     expect(stopSequences).toEqual(['X']);
   });
 
+  it('filters whitespace-only strings out of stop_sequences', () => {
+    // The real Anthropic API rejects whitespace-only stops with a 400, and
+    // keeping them live would silently truncate normal output at the first
+    // space/newline. Dropping them makes such entries a no-op.
+    const { stopSequences } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: [' ', '\n', '\t', '  ', 'X'],
+    });
+    expect(stopSequences).toEqual(['X']);
+  });
+
+  it('treats an all-whitespace stop_sequences array as no stop strings', () => {
+    const { stopSequences } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: [' ', '\n'],
+    });
+    expect(stopSequences).toEqual([]);
+  });
+
   it('maps max_tokens to maxNewTokens in config', () => {
     const { config } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',

@@ -12,8 +12,33 @@ export class StopSequenceBuffer {
   private _matched: string | null = null;
 
   constructor(stopSequences: string[]) {
-    this.stopSequences = stopSequences.filter((s) => s.length > 0);
+    // Drop empty AND whitespace-only entries: a whitespace-only stop would
+    // truncate normal output at the first space/newline, and the real
+    // Anthropic API rejects such stops outright. Mirrors the same trim filter
+    // in the request mapper so a whitespace-only configuration is a no-op.
+    this.stopSequences = stopSequences.filter((s) => s.trim().length > 0);
     this.maxLength = this.stopSequences.reduce((max, s) => Math.max(max, s.length), 0);
+  }
+
+  /**
+   * Earliest index wins; on a tie at the same index the longest wins. Returns
+   * `{ idx, seq }` for the winning stop, or `{ idx: -1, seq: null }` when none
+   * is present in `pending`.
+   */
+  private findMatch(): { idx: number; seq: string | null } {
+    let matchIdx = -1;
+    let matchSeq: string | null = null;
+    for (const seq of this.stopSequences) {
+      const idx = this.pending.indexOf(seq);
+      if (idx < 0) {
+        continue;
+      }
+      if (matchIdx < 0 || idx < matchIdx || (idx === matchIdx && seq.length > (matchSeq?.length ?? 0))) {
+        matchIdx = idx;
+        matchSeq = seq;
+      }
+    }
+    return { idx: matchIdx, seq: matchSeq };
   }
 
   /** The stop sequence that has matched so far, or `null` if none has. */
@@ -38,21 +63,24 @@ export class StopSequenceBuffer {
 
     this.pending += text;
 
-    // Earliest index wins; on a tie at the same index the longest wins.
-    let matchIdx = -1;
-    let matchSeq: string | null = null;
-    for (const seq of this.stopSequences) {
-      const idx = this.pending.indexOf(seq);
-      if (idx < 0) {
-        continue;
-      }
-      if (matchIdx < 0 || idx < matchIdx || (idx === matchIdx && seq.length > (matchSeq?.length ?? 0))) {
-        matchIdx = idx;
-        matchSeq = seq;
-      }
-    }
+    const { idx: matchIdx, seq: matchSeq } = this.findMatch();
     if (matchIdx >= 0 && matchSeq !== null) {
+      // A full match sits at `matchIdx`. Commit it only when no LONGER stop
+      // sharing the same start index could still complete from a later push —
+      // otherwise longest-on-tie (C4) would pick that longer stop once it
+      // arrives. `fromMatch` is the text from the match index to the tail; if
+      // it is still a strict prefix of a longer stop, a future push could
+      // finish that stop, so we hold the match (emit only the safe text before
+      // `matchIdx`) and let a later push or `flush()` resolve the tie.
+      const fromMatch = this.pending.slice(matchIdx);
+      const longerStillViable = this.stopSequences.some(
+        (seq) => seq.length > fromMatch.length && seq.startsWith(fromMatch),
+      );
       const safeText = this.pending.slice(0, matchIdx);
+      if (longerStillViable) {
+        this.pending = fromMatch;
+        return { safeText, matched: null };
+      }
       this._matched = matchSeq;
       this.pending = '';
       return { safeText, matched: matchSeq };
@@ -84,6 +112,18 @@ export class StopSequenceBuffer {
   flush(): { safeText: string; matched: string | null } {
     if (this._matched !== null) {
       return { safeText: '', matched: this._matched };
+    }
+    // The stream has ended, so any match `push()` held back for a possible
+    // longer same-index stop can no longer be extended — resolve it now.
+    // Re-scan `pending` for the earliest match (longest on tie) and commit it
+    // if present; otherwise the residue could not complete any sequence and is
+    // released verbatim.
+    const { idx: matchIdx, seq: matchSeq } = this.findMatch();
+    if (matchIdx >= 0 && matchSeq !== null) {
+      const safeText = this.pending.slice(0, matchIdx);
+      this._matched = matchSeq;
+      this.pending = '';
+      return { safeText, matched: matchSeq };
     }
     const safeText = this.pending;
     this.pending = '';

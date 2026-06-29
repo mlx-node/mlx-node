@@ -74,4 +74,41 @@ describe('StopSequenceBuffer', () => {
     // The withheld suffix is only released by flush when it cannot complete.
     expect(buffer.flush()).toEqual({ safeText: 'ST', matched: null });
   });
+
+  it('treats whitespace-only stop sequences as no configuration', () => {
+    const buffer = new StopSequenceBuffer([' ', '\n', '\t']);
+
+    expect(buffer.push('one two\nthree')).toEqual({ safeText: 'one two\nthree', matched: null });
+    expect(buffer.flush()).toEqual({ safeText: '', matched: null });
+    expect(buffer.matched).toBeNull();
+  });
+
+  it('holds a tail match when a longer same-index stop could still complete on a later push', () => {
+    const buffer = new StopSequenceBuffer(['ab', 'abc']);
+
+    // "ab" is complete at the tail, but "abc" (same start index) is still
+    // viable, so the match must be held rather than committed early.
+    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
+    // The next push completes the longer stop, which wins on the tie.
+    expect(buffer.push('c tail')).toEqual({ safeText: '', matched: 'abc' });
+    expect(buffer.matched).toBe('abc');
+  });
+
+  it('commits the short stop when the longer same-index stop is broken on a later push', () => {
+    const buffer = new StopSequenceBuffer(['ab', 'abc']);
+
+    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
+    // No "c" arrives, so the longer "abc" can never complete and "ab" wins.
+    expect(buffer.push(' x')).toEqual({ safeText: '', matched: 'ab' });
+    expect(buffer.matched).toBe('ab');
+  });
+
+  it('resolves a held tail match at flush when no longer stop completes', () => {
+    const buffer = new StopSequenceBuffer(['ab', 'abc']);
+
+    expect(buffer.push('xab')).toEqual({ safeText: 'x', matched: null });
+    // Stream ends with only "ab" present; the held match resolves to "ab".
+    expect(buffer.flush()).toEqual({ safeText: '', matched: 'ab' });
+    expect(buffer.matched).toBe('ab');
+  });
 });
