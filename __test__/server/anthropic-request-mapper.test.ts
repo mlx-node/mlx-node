@@ -988,31 +988,48 @@ describe('mapAnthropicRequest', () => {
     expect(config.tools).toHaveLength(2);
   });
 
-  it('rejects non-empty stop_sequences (no native ChatConfig.stopSequences yet)', () => {
-    // `stop_sequences` is parsed into the type but `ChatConfig` has no
-    // matching field. Silently dropping the field would let a client believe
-    // its stop strings are honoured. Reject explicitly until native support
-    // lands.
-    expect(() =>
-      mapAnthropicRequest({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [{ role: 'user', content: 'Hello' }],
-        stop_sequences: ['STOP'],
-      }),
-    ).toThrow(/stop_sequences.*not supported/i);
+  it('accepts non-empty stop_sequences and threads them out as stopSequences', () => {
+    // `stop_sequences` is now carried out of the mapper (on the widened
+    // return) so a downstream consumer can honour the stop strings. It must
+    // NOT be added to `ChatConfig` (that would need a native rebuild).
+    const { config, stopSequences } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: ['STOP'],
+    });
+    expect(stopSequences).toEqual(['STOP']);
+    expect(config).not.toHaveProperty('stopSequences');
+    expect(config).not.toHaveProperty('stop');
   });
 
-  it('accepts empty stop_sequences array (treated as absent)', () => {
-    // Empty array carries no semantics — accept silently rather than 400 on
-    // a no-op field.
-    const { messages } = mapAnthropicRequest({
+  it('treats empty stop_sequences array as no stop strings', () => {
+    const { stopSequences } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
       messages: [{ role: 'user', content: 'Hello' }],
       stop_sequences: [],
     });
-    expect(messages).toEqual([{ role: 'user', content: 'Hello' }]);
+    expect(stopSequences).toEqual([]);
+  });
+
+  it('treats absent stop_sequences as no stop strings', () => {
+    const { stopSequences } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    expect(stopSequences).toEqual([]);
+  });
+
+  it('filters empty strings out of stop_sequences', () => {
+    const { stopSequences } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      stop_sequences: ['', 'X'],
+    });
+    expect(stopSequences).toEqual(['X']);
   });
 
   it('maps max_tokens to maxNewTokens in config', () => {

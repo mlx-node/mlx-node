@@ -425,15 +425,12 @@ describe('handleCreateMessage', () => {
       expect(sessionReg.size).toBe(sizeBefore);
     });
 
-    it('returns 400 when stop_sequences is non-empty (no warm slot touched)', async () => {
-      // End-to-end: native `ChatConfig` has no `stopSequences` field, so the
-      // mapper rejects the field rather than silently dropping it. The 400
-      // must propagate via the outer try/catch in the handler, and the warm
-      // slot must remain untouched.
+    it('accepts non-empty stop_sequences instead of rejecting with 400', async () => {
+      // End-to-end: the mapper no longer rejects `stop_sequences`; it threads
+      // the stop strings out so a downstream consumer can honour them. The
+      // request must proceed normally rather than 400.
       const registry = new ModelRegistry();
       registry.register('test-model', createMockModel());
-      const sessionReg = registry.getSessionRegistry('test-model')!;
-      const sizeBefore = sessionReg.size;
       const { res, getStatus, getBody } = createMockRes();
 
       await handleCreateMessage(
@@ -447,12 +444,9 @@ describe('handleCreateMessage', () => {
         registry,
       );
 
-      expect(getStatus()).toBe(400);
+      expect(getStatus()).toBe(200);
       const parsed = JSON.parse(getBody());
-      expect(parsed.type).toBe('error');
-      expect(parsed.error.type).toBe('invalid_request_error');
-      expect(parsed.error.message).toContain('stop_sequences');
-      expect(sessionReg.size).toBe(sizeBefore);
+      expect(parsed.type).toBe('message');
     });
   });
 

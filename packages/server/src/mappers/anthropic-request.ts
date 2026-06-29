@@ -17,6 +17,13 @@ import { applyExtraBodyMtpOverrides } from './request.js';
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
   config: ChatConfig;
+  /**
+   * Client-supplied stop strings (Anthropic `stop_sequences`), normalized to
+   * drop absent/empty entries. Carried alongside `config` rather than on it
+   * because `ChatConfig` has no native stop field; a downstream consumer is
+   * responsible for honouring these.
+   */
+  stopSequences: string[];
 }
 
 /**
@@ -433,18 +440,11 @@ export function mapAnthropicRequest(
     config.topK = req.top_k;
   }
 
-  // `stop_sequences` is parsed into the request type but `ChatConfig` has no
-  // matching field, so wiring it through to the native model would require a
-  // Rust change (out of scope here). Reject explicitly with a 400 — silently
-  // dropping the field would let a client believe its custom stop strings are
-  // honoured when the model continues generating right past them. An empty
-  // array is treated as "not present" since it carries no semantics. Future
-  // Rust work can add `stopSequences` to `ChatConfig` and remove this guard.
-  if (req.stop_sequences != null && req.stop_sequences.length > 0) {
-    throw new Error(
-      'stop_sequences is not supported by this server. Remove the field or wait for a future release that supports it natively.',
-    );
-  }
+  // `stop_sequences` has no `ChatConfig` field to map onto, so it rides out on
+  // the widened return instead. Normalize to drop absent/null entries and any
+  // empty strings (which would match at every position and stop generation
+  // immediately). A downstream consumer honours the result.
+  const stopSequences = (req.stop_sequences ?? []).filter((s) => typeof s === 'string' && s.length > 0);
 
   if (req.tools && req.tools.length > 0) {
     const toolChoice = req.tool_choice;
@@ -474,5 +474,5 @@ export function mapAnthropicRequest(
 
   applyExtraBodyMtpOverrides(config, req.extra_body);
 
-  return { messages, config };
+  return { messages, config, stopSequences };
 }
