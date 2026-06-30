@@ -2574,6 +2574,63 @@ describe('handleCreateMessage', () => {
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
     });
 
+    it('streaming: opens an empty text block when a stop sequence consumes all visible output', async () => {
+      // Parity with the non-streaming path: when the stop matches at the very
+      // start so the visible text collapses to '', the reconstructed content
+      // must be [{type:'text', text:''}] — a text block opened and closed with
+      // no body, exactly like buildAnthropicContent. The old `body.length > 0`
+      // guard skipped the block entirely, so a client rebuilding from SSE saw
+      // `content: []` while the non-streaming sibling returned an empty block.
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'STOPhello', done: false, isReasoning: false },
+        {
+          text: 'STOPhello',
+          done: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          thinking: null,
+          numTokens: 5,
+          promptTokens: 3,
+          reasoningTokens: 0,
+          rawText: 'STOPhello',
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+
+      // Exactly one text block, opened with empty text — the empty-collapse block.
+      const textStarts = events.filter(
+        (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'text',
+      );
+      expect(textStarts).toHaveLength(1);
+      expect((textStarts[0].data['content_block'] as any).text).toBe('');
+
+      // The stop ate everything: no visible text leaked and no empty text_delta.
+      const textDeltas = events.filter(
+        (e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta',
+      );
+      expect(textDeltas).toHaveLength(0);
+
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('STOP');
+    });
+
     it('non-streaming: returns the leading whitespace prefix when a stop matches right after it', async () => {
       // Non-streaming counterpart of the parked-whitespace streaming case:
       // the result text " HALTtail" truncates to " " (the safe prefix).
@@ -2606,6 +2663,41 @@ describe('handleCreateMessage', () => {
       expect(parsed.content).toEqual([{ type: 'text', text: ' ' }]);
       expect(parsed.stop_reason).toBe('stop_sequence');
       expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: returns an empty text block when a stop sequence consumes all visible output', async () => {
+      // Sibling/parity anchor of the streaming empty-collapse case: the result
+      // text "STOPhello" truncates to '' and the content is a single empty text
+      // block — the target the streaming path now matches.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'STOPhello',
+          rawText: 'STOPhello',
+          finishReason: 'stop',
+          numTokens: 5,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content).toEqual([{ type: 'text', text: '' }]);
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('STOP');
     });
 
     it('streaming: releases a benign held partial when a tool-call tag interrupts it', async () => {

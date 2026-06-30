@@ -529,9 +529,12 @@ async function handleStreamingNative(
           // Open a text block for non-whitespace content, for a stop-truncated
           // prefix (so the streamed body equals the non-streaming one), or for
           // pure native `finalText` recovery (mirrors emitting recovered text
-          // verbatim). Whitespace-only released held content opens no block.
+          // verbatim). A stop-matched turn always opens a text block — empty if
+          // the stop consumed all visible output — so the reconstructed content
+          // matches the non-streaming `[{type:'text', text:''}]`. Whitespace-only
+          // released held content opens no block.
           const openTextBlock =
-            body.length > 0 && (body.trim().length > 0 || matchedStopSequence !== null || !prependParked);
+            matchedStopSequence !== null || (body.length > 0 && (body.trim().length > 0 || !prependParked));
           if (openTextBlock) {
             hasEmittedText = true;
             writeSSEEvent(
@@ -542,16 +545,18 @@ async function handleStreamingNative(
                 text: '',
               }),
             );
-            emittedText += body;
-            emittedTextLength += body.length;
-            writeSSEEvent(
-              res,
-              'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, {
-                type: 'text_delta',
-                text: body,
-              }),
-            );
+            if (body.length > 0) {
+              emittedText += body;
+              emittedTextLength += body.length;
+              writeSSEEvent(
+                res,
+                'content_block_delta',
+                buildContentBlockDelta(contentBlockIndex, {
+                  type: 'text_delta',
+                  text: body,
+                }),
+              );
+            }
             writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
             contentBlockIndex++;
           }
