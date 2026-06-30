@@ -103,9 +103,20 @@ impl MxArray {
         MxArray::from_handle(handle, "array_matmul")
     }
 
-    /// Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-    /// where self is A. More efficient than separate matmul and add operations.
-    /// Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+    /// Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+    /// Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+    ///
+    /// Computed explicitly (matmul, optional alpha scale, then add beta*C)
+    /// rather than via the fused `mlx::core::addmm` primitive. The fused
+    /// primitive is correct on a well-formed metallib, but this project's local
+    /// release build is known to non-deterministically miscompile fused GEMM
+    /// kernels (see the metallib-corruption notes), which manifested as the
+    /// fused addmm dropping `beta*C` and corrupting every biased linear — most
+    /// visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+    /// bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+    /// explicit form keeps the `C` term robust to that build hazard; the
+    /// `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+    /// as a canary if a future build corrupts the matmul kernel too.
     #[napi]
     pub fn addmm(
         &self,
@@ -114,11 +125,18 @@ impl MxArray {
         alpha: Option<f64>,
         beta: Option<f64>,
     ) -> Result<MxArray> {
-        let alpha = alpha.unwrap_or(1.0) as f32;
-        let beta = beta.unwrap_or(1.0) as f32;
-        let handle =
-            unsafe { sys::mlx_array_addmm(c.handle.0, self.handle.0, b.handle.0, alpha, beta) };
-        MxArray::from_handle(handle, "array_addmm")
+        let alpha = alpha.unwrap_or(1.0);
+        let beta = beta.unwrap_or(1.0);
+
+        let mut mm = self.matmul(b)?;
+        if alpha != 1.0 {
+            mm = mm.mul_scalar(alpha)?;
+        }
+        if beta != 1.0 {
+            mm.add(&c.mul_scalar(beta)?)
+        } else {
+            mm.add(c)
+        }
     }
 
     /// Indexed matrix multiply for MoE expert selection.

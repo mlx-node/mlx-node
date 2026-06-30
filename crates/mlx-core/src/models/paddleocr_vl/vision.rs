@@ -37,7 +37,7 @@ impl PaddleOCRVisionEmbeddings {
         patch_weight: &MxArray,
         position_weight: &MxArray,
     ) -> Result<Self> {
-        let patch_embedding = PatchEmbedding::new(patch_size, patch_weight)?;
+        let patch_embedding = PatchEmbedding::new(patch_size, patch_weight, None)?;
 
         let num_patches = (image_size / patch_size).pow(2);
         let position_embedding =

@@ -2419,7 +2419,15 @@ impl Qwen35Inner {
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Carry the cross-turn M-RoPE delta only when this turn extends the live
+        // image sequence (continued_live_prefix). A cold start OR a non-live
+        // prefix-cache hit (cached_prefix_len > 0 but not a live continuation)
+        // can only restore pure-text prefix blocks, so a stale image delta is
+        // dropped and the text suffix rotates at the raw physical slot.
+        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -2589,6 +2597,10 @@ impl Qwen35Inner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("paged_turn_sync_core_inner: paged_adapter dropped")
             })?;
+            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
+            // an image prefill). Feeds the scalar-offset RoPE so the suffix
+            // keys stay aligned with the compressed-position image keys.
+            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
             if want_prompt_hidden {
                 let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
                     tokens,
@@ -2604,6 +2616,7 @@ impl Qwen35Inner {
                     &layer_kinds,
                     adapter,
                     Some(mtp_prompt_history.keep_tokens),
+                    rope_deltas,
                 )?;
                 prompt_hidden = Some(ph);
                 logits
@@ -2621,6 +2634,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    rope_deltas,
                 )?
             }
         };
@@ -2778,6 +2792,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -2809,8 +2824,10 @@ impl Qwen35Inner {
     /// autoregressive decode loop.
     ///
     /// SINGLE-TURN ONLY: the adapter is cold-started (no cache-hit, no warm
-    /// continue) and decode uses the scalar-offset RoPE path (the physical
-    /// token count), matching the flat path's decode RoPE. This core runs plain
+    /// continue) and decode rotates at the physical token count plus the
+    /// cached M-RoPE delta (`cached_rope_deltas`), i.e. the compressed M-RoPE
+    /// position for image turns; text turns carry a delta of 0 and stay
+    /// byte-identical to the flat path's decode RoPE. This core runs plain
     /// autoregressive decode with no draft/verify; MTP weights are ignored, so
     /// an MTP-enabled session's image turns route here and decode as AR.
     #[allow(clippy::too_many_arguments)]
@@ -2908,7 +2925,10 @@ impl Qwen35Inner {
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Store the image prefill's compressed-position delta so a later text
+        // warm-continuation rotates its queries at the same compressed M-RoPE
+        // positions the image keys were written with.
+        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
 
         // Fresh per-layer caches (GDN linear slots + empty full-attention slots).
         let new_caches = (0..self.config.num_layers as usize)
@@ -3010,6 +3030,7 @@ impl Qwen35Inner {
                         &embedding_weight,
                         &layer_kinds,
                         adapter,
+                        self.cached_rope_deltas.unwrap_or(0),
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -3234,7 +3255,10 @@ impl Qwen35Inner {
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Store the image prefill's compressed-position delta so a later text
+        // warm-continuation rotates its queries at the same compressed M-RoPE
+        // positions the image keys were written with.
+        self.cached_rope_deltas = Some(merge.rope_deltas as i32);
 
         let new_caches = (0..self.config.num_layers as usize)
             .map(|i| {
@@ -3370,6 +3394,7 @@ impl Qwen35Inner {
                         &embedding_weight,
                         &layer_kinds,
                         adapter,
+                        self.cached_rope_deltas.unwrap_or(0),
                     )?;
                     logits.squeeze(Some(&[1]))?
                 };
@@ -3668,7 +3693,14 @@ impl Qwen35Inner {
         let gdn_prefix_state = gdn_prefix_preparation.state;
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        // Carry the cross-turn M-RoPE delta only when this turn extends the live
+        // image sequence (continued_live_prefix); a cold start or a non-live
+        // prefix-cache hit (text-only prefix) drops a stale image delta so the
+        // text suffix prefill + decode rotate at the raw physical slot.
+        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = prompt_token_count
             .checked_sub(cached_prefix_len)
@@ -3905,6 +3937,9 @@ impl Qwen35Inner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("paged_turn_stream_core_inner: paged_adapter dropped")
             })?;
+            // Cross-turn M-RoPE delta (0 unless this text turn warm-continues
+            // an image prefill); feeds the scalar-offset RoPE for the suffix.
+            let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
             if want_prompt_hidden {
                 let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
                     tokens,
@@ -3920,6 +3955,7 @@ impl Qwen35Inner {
                     &layer_kinds,
                     adapter,
                     Some(mtp_prompt_history.keep_tokens),
+                    rope_deltas,
                 )?;
                 prompt_hidden = Some(ph);
                 logits
@@ -3937,6 +3973,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    rope_deltas,
                 )?
             }
         };
@@ -4115,6 +4152,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -6524,6 +6562,7 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.inner.cached_rope_deltas.unwrap_or(0),
             )?
             .squeeze(Some(&[1]))?
         };
@@ -6690,11 +6729,18 @@ impl PagedBackend for Qwen35Inner {
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // Clear the per-turn session state here (history is re-set in
-        // `save_paged_history`; rope deltas + image key are reset because the
-        // paged path does not carry them across turns).
+        // `save_paged_history`; image key is reset because the paged path does
+        // not carry it across turns). The cross-turn M-RoPE delta is carried
+        // only when this turn extends the live image sequence
+        // (continued_live_prefix); a cold start or a non-live prefix-cache hit
+        // (text-only prefix) drops a stale image delta so the text suffix
+        // rotates at the raw physical slot.
         self.cached_token_history.clear();
         self.cached_image_key = None;
-        self.cached_rope_deltas = None;
+        self.cached_rope_deltas = super::paged_forward::rope_delta_for_paged_turn(
+            self.cached_rope_deltas,
+            continued_live_prefix,
+        );
 
         let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
             Error::from_reason("prime_prefix_state: cached_prefix_len > total_prompt_tokens")
@@ -6728,6 +6774,10 @@ impl PagedBackend for Qwen35Inner {
             });
         let embed = self.embedding.clone();
         let embedding_weight = embed.get_weight();
+        // Cross-turn M-RoPE delta (0 unless this engine-driven text turn warm-
+        // continues an image prefill); aligns the suffix keys with the
+        // compressed-position image keys.
+        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let caches_ref = self
             .caches
             .as_mut()
@@ -6749,6 +6799,7 @@ impl PagedBackend for Qwen35Inner {
             &embedding_weight,
             &layer_kinds,
             adapter,
+            rope_deltas,
         )
     }
 
@@ -7217,6 +7268,9 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 ids.eval();
                 let token_id = ids.item_at_int32(0)? as u32;
                 let inner = &mut *self.inner;
+                // Cross-turn M-RoPE delta carried by a text turn that warm-
+                // continues an image prefill; 0 for pure-text sessions.
+                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
                 let caches = inner.caches.as_mut().ok_or_else(|| {
                     Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
                 })?;
@@ -7231,6 +7285,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     Some(&self.embedding_weight_t),
                     &self.layer_kinds,
                     adapter,
+                    rope_deltas,
                 )?;
                 Ok((logits, hidden, true))
             }
@@ -7307,6 +7362,9 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
                 let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
                 let inner = &mut *self.inner;
+                // Cross-turn M-RoPE delta carried by a text turn that warm-
+                // continues an image prefill; 0 for pure-text sessions.
+                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
                 let caches = inner.caches.as_mut().ok_or_else(|| {
                     Error::from_reason("eager paged MTP verify_step: caches is None")
                 })?;
@@ -7323,6 +7381,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     &self.layer_kinds,
                     adapter,
                     tape,
+                    rope_deltas,
                 )
             }
         }
@@ -9170,7 +9229,16 @@ pub(crate) fn get_rope_index(
 
     let position_ids = MxArray::stack(vec![&t_arr, &h_arr, &w_arr], Some(0))?;
 
-    let max_position = *all_position_ids[0].iter().max().unwrap_or(&0);
+    // Decode offset must reference the GLOBAL max M-RoPE position, i.e. the max
+    // over all three (t, h, w) axes — matching mlx-vlm's `llm_positions.max()`.
+    // For an image the spatial (h, w) axes exceed the temporal one, so an
+    // image-final prompt (no trailing text) would get a too-small delta if only
+    // axis 0 were considered.
+    let max_position = all_position_ids
+        .iter()
+        .flat_map(|axis| axis.iter().copied())
+        .max()
+        .unwrap_or(0);
     let rope_deltas = max_position + 1 - seq_len;
 
     Ok((position_ids, rope_deltas))
@@ -9338,6 +9406,7 @@ pub(crate) fn vlm_prepare_vision_features(
     Ok(VisionMerge {
         inputs_embeds,
         position_ids,
+        rope_deltas,
     })
 }
 
@@ -9488,7 +9557,7 @@ mod rope_index_tests {
             .copied()
             .collect();
         let (ids, grid) = mk_inputs(&tokens, &[(2, 4, 4)]);
-        let (pos, _) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (pos, rope_deltas) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
         let (t, h, w) = extract_positions(&pos);
         // Leading text
         assert_eq!(&t[..2], &[0, 1]);
@@ -9499,6 +9568,61 @@ mod rope_index_tests {
         assert_eq!(&t[10..], &[4, 5]);
         assert_eq!(&h[10..], &[4, 5]);
         assert_eq!(&w[10..], &[4, 5]);
+
+        // The image run compresses 8 placeholder tokens into 4 distinct
+        // temporal positions, so the running M-RoPE counter lags the physical
+        // sequence length: `rope_deltas = max_position + 1 - seq_len` MUST be
+        // negative. This is the per-session delta the paged decode/warm-
+        // continuation path adds to the physical KV slot to recover the
+        // compressed rotation position; previously it was dropped, leaving
+        // image-turn decode rotating ~|delta| positions too far ahead.
+        let max_position = *t.iter().max().unwrap() as i64; // temporal axis (axis 0)
+        let seq_len = tokens.len() as i64;
+        assert_eq!(rope_deltas, max_position + 1 - seq_len);
+        assert!(
+            rope_deltas < 0,
+            "image prefill must compress positions (rope_deltas={rope_deltas})"
+        );
+        // 2 text + 8 image (compressed to positions 2..=3) + 2 text → max
+        // temporal position 5 over 12 tokens → delta = 5 + 1 - 12 = -6.
+        assert_eq!(rope_deltas, -6);
+    }
+
+    #[test]
+    fn image_final_prompt_delta_uses_global_max_axis() {
+        // An image-FINAL prompt (no trailing text) exposes which axis feeds the
+        // decode delta: the spatial (h, w) axes outrun the temporal one, so the
+        // global max M-RoPE position lives on a spatial axis. The delta must use
+        // that global max (mlx-vlm `llm_positions.max()`), NOT the temporal axis
+        // alone — otherwise the first generated token rotates at a position
+        // INSIDE the image's spatial range instead of at global_max + 1.
+        let _g = mlx_lock().lock().unwrap();
+        // 1 text + (grid 1x4x4, spatial_merge=2 → llm grid t=1,h=2,w=2 = 4 image
+        // tokens) and NOTHING after the image.
+        let tokens: Vec<i32> = std::iter::once(TEXT_A)
+            .chain(std::iter::repeat_n(IMG, 4))
+            .collect();
+        let (ids, grid) = mk_inputs(&tokens, &[(1, 4, 4)]);
+        let (pos, rope_deltas) = get_rope_index(&ids, grid.as_ref(), 2, IMG).unwrap();
+        let (t, h, w) = extract_positions(&pos);
+
+        let t_max = *t.iter().max().unwrap() as i64;
+        let global_max = *t.iter().chain(&h).chain(&w).max().unwrap() as i64;
+        let seq_len = tokens.len() as i64;
+
+        // The spatial axes must outrun the temporal one here, else the test
+        // would not distinguish the global-max fix from the axis-0 regression.
+        assert!(
+            global_max > t_max,
+            "test grid is not asymmetric: global_max={global_max} t_max={t_max}"
+        );
+        // The delta references the GLOBAL max, not the temporal-axis max.
+        assert_eq!(rope_deltas, global_max + 1 - seq_len);
+        assert_ne!(
+            rope_deltas,
+            t_max + 1 - seq_len,
+            "delta must not use the temporal axis alone (axis-0 regression)"
+        );
     }
 
     #[test]
@@ -9944,6 +10068,7 @@ mod paged_construction_tests {
             &layer_kinds,
             adapter,
             chunk_size,
+            /* cached_rope_deltas */ 0,
         )
     }
 

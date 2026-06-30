@@ -1996,6 +1996,16 @@ pub(crate) fn parse_vision_config(raw: &Value) -> Qwen3_5VisionConfig {
     }
 }
 
+/// Collapse a 5D Conv3d patch-embed weight `[out, kD, kH, kW, in]` into a 2D
+/// Conv2d kernel `[out, kH, kW, in]` by summing over the temporal axis.
+///
+/// The image processor duplicates the static frame across the temporal axis, so
+/// the effective 2D kernel is the sum of the temporal slices (matches mlx-vlm
+/// `qwen3_vl/vision.py`). Summing all `kD` slices keeps this robust if `kD != 2`.
+fn collapse_patch_embed_conv3d(pe_weight: &MxArray) -> Result<MxArray> {
+    pe_weight.sum(Some(&[1]), None)
+}
+
 /// Load vision encoder weights from params.
 pub(crate) fn load_vision_weights(
     encoder: &mut Qwen3_5VisionEncoder,
@@ -2011,21 +2021,17 @@ pub(crate) fn load_vision_weights(
     let get_opt = |key: &str| -> Option<&MxArray> { params.get(key) };
 
     // Patch embedding: handle both 4D Conv2d [out, kH, kW, in] and
-    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, extract
-    // temporal slice 0 for our Conv2d PatchEmbedding.
+    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, the static frame is
+    // duplicated across the temporal axis, so the effective 2D kernel is the
+    // sum of the temporal slices (not a single slice).
     if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
+        let pe_bias = get_opt("patch_embed.proj.bias");
         let ndim = pe_weight.ndim()?;
         if ndim == 5 {
-            // Conv3d [out, kD, kH, kW, in] → take slice [:, 0, :, :, :]
-            let out_c = pe_weight.shape_at(0)?;
-            let kh = pe_weight.shape_at(2)?;
-            let kw = pe_weight.shape_at(3)?;
-            let in_c = pe_weight.shape_at(4)?;
-            let slice0 = pe_weight.slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])?;
-            let conv2d_weight = slice0.squeeze(Some(&[1]))?;
-            encoder.set_patch_embed(&conv2d_weight)?;
+            let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
+            encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
         } else {
-            encoder.set_patch_embed(pe_weight)?;
+            encoder.set_patch_embed(pe_weight, pe_bias)?;
         }
     }
 
@@ -2145,6 +2151,50 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn collapse_patch_embed_conv3d_sums_temporal_slices() {
+        // Synthetic Conv3d weight [out=2, kD=2, kH=2, kW=2, in=3] with distinct
+        // values per temporal slice. The collapse must SUM over the temporal
+        // axis (slice0 + slice1), not drop slice1.
+        let out_c = 2i64;
+        let kd = 2i64;
+        let kh = 2i64;
+        let kw = 2i64;
+        let in_c = 3i64;
+        let n = (out_c * kd * kh * kw * in_c) as usize;
+        let data: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let pe_weight = MxArray::from_float32(&data, &[out_c, kd, kh, kw, in_c]).unwrap();
+
+        let collapsed = collapse_patch_embed_conv3d(&pe_weight).unwrap();
+        collapsed.eval();
+        let shape: Vec<i64> = collapsed.shape().unwrap().as_ref().to_vec();
+        assert_eq!(shape, vec![out_c, kh, kw, in_c]);
+
+        // Expected = slice[:,0,:,:,:] + slice[:,1,:,:,:].
+        let slice0 = pe_weight
+            .slice(&[0, 0, 0, 0, 0], &[out_c, 1, kh, kw, in_c])
+            .unwrap()
+            .squeeze(Some(&[1]))
+            .unwrap();
+        let slice1 = pe_weight
+            .slice(&[0, 1, 0, 0, 0], &[out_c, 2, kh, kw, in_c])
+            .unwrap()
+            .squeeze(Some(&[1]))
+            .unwrap();
+        let expected = slice0.add(&slice1).unwrap();
+        expected.eval();
+
+        let got: Vec<f32> = collapsed.to_float32().unwrap().to_vec();
+        let exp: Vec<f32> = expected.to_float32().unwrap().to_vec();
+        assert_eq!(got.len(), exp.len());
+        for (i, (g, e)) in got.iter().zip(exp.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "element {i}: collapsed {g} != slice0+slice1 {e}"
+            );
+        }
+    }
 
     #[test]
     fn mtp_sidecar_candidates_match_mtplx_order() {

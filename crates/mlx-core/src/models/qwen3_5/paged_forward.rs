@@ -52,6 +52,54 @@ fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
 }
 
+/// Compute the scalar RoPE rotation offset for a paged forward step, decoupling
+/// the rotation position from the physical KV slot.
+///
+/// Image turns compress their ~hundreds of placeholder tokens into far fewer
+/// M-RoPE positions, so the running M-RoPE position trails the physical token
+/// count by `cached_rope_deltas` (negative). The paged pool still writes K/V at
+/// the PHYSICAL slot, but the query/key rotation must use the compressed
+/// position so a warm-continuation query lines up with the image-compressed
+/// keys it attends over. Text-only turns carry `cached_rope_deltas == 0`, so
+/// the result is the physical position unchanged (byte-identical to the prior
+/// behaviour).
+///
+/// `physical_position` is cast to `i32` BEFORE adding the (possibly negative)
+/// delta so the arithmetic never underflows a `u32`.
+pub(crate) fn paged_rope_offset(physical_position: u32, cached_rope_deltas: i32) -> i32 {
+    physical_position as i32 + cached_rope_deltas
+}
+
+/// Decide the cross-turn M-RoPE delta to carry into the next paged turn.
+///
+/// `cached_rope_deltas` is shared model state: an image prefill bakes in a
+/// compressed-position delta (negative) that only aligns with the image's
+/// physically-resident K/V. The delta is meaningful for exactly ONE outcome of
+/// the paged turn planner — `continued_live_prefix`, where the live image
+/// sequence is being extended and its K/V is re-attended. Every other outcome
+/// must drop it:
+/// * a cold/fresh turn carries no cross-turn delta;
+/// * a NON-live prefix-cache hit (`cached_prefix_len > 0` but
+///   `continued_live_prefix == false`) can only restore pure-text prefix blocks
+///   — image requests prefill with `skip_lookup` and never publish a hashable
+///   text stream that collides with their expanded-placeholder blocks — so the
+///   suffix must rotate at the raw physical slot (delta 0), not at the stale
+///   negative delta a prior image turn left on the shared model.
+///
+/// Keying the reset on `cached_prefix_len == 0` is therefore too weak: it leaks
+/// a stale image delta into unrelated text requests that merely share a cached
+/// text prefix.
+pub(crate) fn rope_delta_for_paged_turn(
+    cached_rope_deltas: Option<i32>,
+    continued_live_prefix: bool,
+) -> Option<i32> {
+    if continued_live_prefix {
+        cached_rope_deltas
+    } else {
+        None
+    }
+}
+
 fn trace_memory_mib() -> (f64, f64, f64) {
     (
         bytes_to_mib(crate::array::get_active_memory()),
@@ -122,6 +170,7 @@ pub(crate) fn run_paged_prefill_chunk(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_size(
@@ -138,6 +187,7 @@ pub(crate) fn run_paged_prefill_chunk(
         layer_kinds,
         paged_adapter,
         chunk_size,
+        cached_rope_deltas,
     )
 }
 
@@ -163,6 +213,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -184,6 +235,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             embedding_weight,
             layer_kinds,
             paged_adapter,
+            cached_rope_deltas,
         );
     }
 
@@ -232,6 +284,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             paged_adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
+            cached_rope_deltas,
         )?;
 
         if is_last_chunk {
@@ -312,6 +365,7 @@ fn run_paged_prefill_single_shot(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     paged_adapter
         .record_tokens(suffix_tokens)
@@ -332,6 +386,7 @@ fn run_paged_prefill_single_shot(
         paged_adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
+        cached_rope_deltas,
     )?;
 
     project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
@@ -385,6 +440,10 @@ pub(crate) fn run_paged_vlm_prefill(
         paged_adapter,
         Some(&merge.inputs_embeds),
         Some(&merge.position_ids),
+        // Image prefill drives full-attention layers through the 3-row M-RoPE
+        // arm (`position_ids` is `Some`), so the scalar offset is unused here.
+        /* cached_rope_deltas */
+        0,
     )?;
 
     project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
@@ -419,6 +478,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     keep_last_hidden: Option<usize>,
+    cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
     run_paged_prefill_chunk_with_hidden_with_size(
@@ -436,6 +496,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
         paged_adapter,
         chunk_size,
         keep_last_hidden,
+        cached_rope_deltas,
     )
 }
 
@@ -455,6 +516,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
+    cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -477,6 +539,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             layer_kinds,
             paged_adapter,
             keep_last_hidden,
+            cached_rope_deltas,
         );
     }
 
@@ -517,6 +580,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             paged_adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
+            cached_rope_deltas,
         )?;
 
         let chunk_hidden = if overlaps_kept_tail || is_last_chunk {
@@ -605,6 +669,7 @@ fn run_paged_prefill_single_shot_with_hidden(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     keep_last_hidden: Option<usize>,
+    cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
     paged_adapter
         .record_tokens(suffix_tokens)
@@ -625,6 +690,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         paged_adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
+        cached_rope_deltas,
     )?;
 
     project_last_token_logits_with_full_hidden(
@@ -655,6 +721,7 @@ fn run_paged_prefill_one_chunk(
     paged_adapter: &mut PagedKVCacheAdapter,
     inputs_embeds: Option<&MxArray>,
     position_ids: Option<&MxArray>,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -667,6 +734,14 @@ fn run_paged_prefill_one_chunk(
             embed.forward(&input_ids)?
         }
     };
+
+    // Scalar-offset RoPE position for this chunk's queries/keys. For a text
+    // suffix that warm-continues an image prefill, the rotation must trail the
+    // physical slot by the negative cross-turn delta so the suffix keys stay
+    // consistent with the immutable compressed-M-RoPE image keys. Text-only
+    // prefill carries `cached_rope_deltas == 0` (offset == physical position),
+    // and image prefill uses the M-RoPE arm so this is ignored there.
+    let rope_position_offset = paged_rope_offset(chunk_first_position, cached_rope_deltas);
 
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
@@ -691,6 +766,7 @@ fn run_paged_prefill_one_chunk(
             Some(cache_slot),
             layer_positions,
             /* use_kernel */ true,
+            rope_position_offset,
         )?;
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
@@ -776,6 +852,7 @@ pub(crate) fn run_paged_decode_step(
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<MxArray> {
     // Capture logical position BEFORE record_tokens advances the
     // cursor.
@@ -786,6 +863,10 @@ pub(crate) fn run_paged_decode_step(
 
     let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
     let mut hidden_states = embed.forward(&input_ids)?;
+
+    // Decode rotates the query at the physical slot plus the cross-turn M-RoPE
+    // delta (0 for text turns) while K/V still writes at the physical slot.
+    let rope_position_offset = paged_rope_offset(first_logical_position, cached_rope_deltas);
 
     let num_layers = layers.len();
     #[allow(clippy::needless_range_loop)]
@@ -811,6 +892,7 @@ pub(crate) fn run_paged_decode_step(
             Some(cache_slot),
             /* position_ids */ None,
             /* use_kernel */ true,
+            rope_position_offset,
         )?;
     }
 
@@ -849,6 +931,7 @@ pub(crate) fn run_paged_step_with_hidden(
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
 ) -> Result<(MxArray, MxArray)> {
     let first_logical_position = paged_adapter.current_token_count();
     paged_adapter
@@ -857,6 +940,11 @@ pub(crate) fn run_paged_step_with_hidden(
 
     let input_ids = MxArray::from_uint32(&[token_id], &[1, 1])?;
     let mut hidden_states = embed.forward(&input_ids)?;
+
+    // Same cross-turn delta as `run_paged_decode_step`: a text MTP Step-A
+    // forward that warm-continues an image prefill must rotate at the
+    // compressed position.
+    let rope_position_offset = paged_rope_offset(first_logical_position, cached_rope_deltas);
 
     let num_layers = layers.len();
     #[allow(clippy::needless_range_loop)]
@@ -882,6 +970,7 @@ pub(crate) fn run_paged_step_with_hidden(
             Some(cache_slot),
             /* position_ids */ None,
             /* use_kernel */ true,
+            rope_position_offset,
         )?;
     }
 
@@ -928,6 +1017,7 @@ pub(crate) fn run_paged_verify_step(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    cached_rope_deltas: i32,
 ) -> Result<super::mtp_decode::MtpVerifyOutput> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -956,6 +1046,10 @@ pub(crate) fn run_paged_verify_step(
     let input_ids = MxArray::from_uint32(&verify_u32, &[1, verify_len as i64])?;
     let mut hidden_states = embed.forward(&input_ids)?;
 
+    // The K+1 verify ids rotate at the physical context start plus the
+    // cross-turn M-RoPE delta (0 for text turns), matching the Step-A forward.
+    let rope_position_offset = paged_rope_offset(chunk_first_position, cached_rope_deltas);
+
     let num_layers = layers.len();
     tape.clear();
     tape.resize(num_layers, None);
@@ -980,6 +1074,7 @@ pub(crate) fn run_paged_verify_step(
             /* is_prefill */ true,
             Some(cache_slot),
             Some(&mut slot),
+            rope_position_offset,
         )?;
         tape[layer_idx] = slot;
     }
@@ -996,4 +1091,96 @@ pub(crate) fn run_paged_verify_step(
     Ok(super::mtp_decode::MtpVerifyOutput::logits_only(
         logits, hiddens,
     ))
+}
+
+#[cfg(test)]
+mod rope_offset_tests {
+    //! Model-free coverage for the paged scalar-offset RoPE position helper.
+    //!
+    //! The cross-turn image-decode fix decouples the rotation position from the
+    //! physical KV slot: image prefill compresses ~hundreds of placeholder
+    //! tokens into far fewer M-RoPE positions, so a warm-continuation turn must
+    //! rotate its queries at `physical_slot + cached_rope_deltas` (the delta is
+    //! negative) while K/V still writes at the physical slot. These tests pin
+    //! that arithmetic — including the cast-before-add type-safety guard — and
+    //! the text-turn identity (`delta == 0`) that keeps text decode
+    //! byte-identical. They construct no model, so they run on any host.
+
+    use super::{paged_rope_offset, rope_delta_for_paged_turn};
+
+    #[test]
+    fn live_continuation_preserves_image_delta() {
+        // A live continuation re-attends the image request's physically-resident
+        // compressed-position K/V, so the negative delta MUST survive to keep the
+        // text suffix rotating at the compressed position.
+        assert_eq!(rope_delta_for_paged_turn(Some(-726), true), Some(-726));
+        // Suffix at physical slot 754 then rotates at the compressed position 28.
+        let delta = rope_delta_for_paged_turn(Some(-726), true).unwrap_or(0);
+        assert_eq!(paged_rope_offset(754, delta), 28);
+    }
+
+    #[test]
+    fn cold_start_clears_delta() {
+        // A fresh/miss turn (no reused prefix) carries no cross-turn delta.
+        assert_eq!(rope_delta_for_paged_turn(Some(-726), false), None);
+        assert_eq!(rope_delta_for_paged_turn(None, false), None);
+    }
+
+    #[test]
+    fn non_live_prefix_cache_hit_clears_stale_image_delta() {
+        // Regression: a prior image turn leaves a stale negative delta on the
+        // shared model. A later TEXT request that merely HITS the cross-request
+        // prefix cache (cached_prefix_len > 0) is NOT a live image continuation
+        // (continued_live_prefix == false) — its restored blocks can only be the
+        // pure-text prefix. The stale delta must be dropped so text rotates at
+        // the raw physical slot, NOT at physical + stale_negative_delta.
+        let stale_image_delta = Some(-726);
+        let after_text_hit = rope_delta_for_paged_turn(stale_image_delta, false);
+        assert_eq!(after_text_hit, None);
+        assert_eq!(paged_rope_offset(42, after_text_hit.unwrap_or(0)), 42);
+    }
+
+    #[test]
+    fn text_turn_zero_delta_is_identity() {
+        // Text-only turns store delta 0 -> the rotation offset equals the
+        // physical KV slot exactly, keeping text decode byte-identical.
+        assert_eq!(paged_rope_offset(0, 0), 0);
+        assert_eq!(paged_rope_offset(42, 0), 42);
+        assert_eq!(paged_rope_offset(1_000_000, 0), 1_000_000);
+    }
+
+    #[test]
+    fn image_turn_negative_delta_shifts_offset_down() {
+        // An image turn compressing ~754 placeholder tokens to ~28 M-RoPE
+        // positions stores delta = 28 - 754 = -726. Decode at physical slot
+        // 754 must rotate at the compressed position 28, NOT 754; the next
+        // physical slot (755) rotates at 29.
+        let delta = -726;
+        assert_eq!(paged_rope_offset(754, delta), 28);
+        assert_eq!(paged_rope_offset(755, delta), 29);
+    }
+
+    #[test]
+    fn offset_casts_to_i32_before_adding_negative_delta() {
+        // Type-safety guard: the cast to i32 happens BEFORE the add, so a small
+        // physical position with a large negative delta yields a negative i32
+        // rather than wrapping a u32 subtraction. In practice the physical
+        // position always exceeds |delta| on a warm continuation, but the
+        // helper must not underflow if it ever did not.
+        assert_eq!(paged_rope_offset(10, -726), -716);
+        // Physical position equal to |delta| collapses to exactly 0.
+        assert_eq!(paged_rope_offset(726, -726), 0);
+    }
+
+    #[test]
+    fn resetting_delta_to_zero_restores_physical_offset() {
+        // Round-trip of the stored cross-turn delta: applying a negative delta
+        // shifts the offset, and clearing it back to 0 (a fresh text turn /
+        // `Option::unwrap_or(0)`) restores the physical position unchanged.
+        let physical = 800;
+        let with_image_delta = paged_rope_offset(physical, -726);
+        assert_eq!(with_image_delta, 74);
+        let after_reset = paged_rope_offset(physical, 0);
+        assert_eq!(after_reset, physical as i32);
+    }
 }

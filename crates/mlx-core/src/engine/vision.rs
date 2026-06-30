@@ -19,4 +19,10 @@ pub(crate) struct VisionMerge {
     /// M-RoPE position ids for the mixed image+text sequence. Shape
     /// `[3, 1, seq_len]` (the temporal/height/width axes), i32.
     pub position_ids: MxArray,
+    /// `max_position + 1 - seq_len` for this image prefill. Image runs
+    /// compress their placeholder tokens into fewer M-RoPE positions, so this
+    /// is NEGATIVE; it is the per-session `cached_rope_deltas` that later
+    /// decode/warm-continuation steps add to the physical KV slot to recover
+    /// the compressed rotation position. Text-only prefills compute 0.
+    pub rope_deltas: i64,
 }

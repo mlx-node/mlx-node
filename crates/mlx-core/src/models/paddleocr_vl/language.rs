@@ -288,6 +288,118 @@ pub fn apply_multimodal_rotary_pos_emb(
     Ok((q_out, k_out))
 }
 
+/// Apply INTERLEAVED multimodal rotary position embedding to Q and K (internal).
+///
+/// Used by Qwen3.5-VL (`qwen3_5` / `qwen3_5_moe`). Unlike PaddleOCR-VL, whose
+/// multimodal RoPE assigns the head_dim to spatial axes in CONTIGUOUS chunks
+/// (see [`apply_multimodal_rotary_pos_emb`]), Qwen3.5-VL assigns each inv_freq
+/// index to a spatial axis with a STRIDE-3 INTERLEAVE. This mirrors mlx-vlm's
+/// `_interleaved_position_selector` (rope_utils.py):
+///   selector[idx] = 1 (height) for idx in 1, 4, 7, … up to `mrope_section[1] * 3`
+///   selector[idx] = 2 (width)  for idx in 2, 5, 8, … up to `mrope_section[2] * 3`
+///   selector[idx] = 0 (temporal) otherwise
+/// computed over the `half_dim` inv_freq axis, then mirrored across the doubled
+/// cos/sin (`emb = concat([freqs, freqs])`).
+///
+/// The per-frequency axis selection is performed with a `take_along_axis` gather
+/// over axis 0 (the `[temporal, height, width]` axis) of the doubled cos/sin,
+/// followed by the same `rotate_half` application as the sectioned path.
+///
+/// For TEXT tokens (temporal == height == width) every axis row of cos/sin is
+/// bit-identical, so any selector picks identical values — this produces output
+/// bit-identical to the sectioned [`apply_multimodal_rotary_pos_emb`]. See
+/// `test_interleaved_text_invariance`.
+///
+/// `cos`/`sin` shape: `[3, batch, seq_len, head_dim]` (axis 0 = t/h/w).
+/// `q`/`k` shape: `[batch, heads, seq_len, q_head_dim]` where `q_head_dim >=
+/// head_dim` (the trailing `q_head_dim - head_dim` dims pass through unrotated,
+/// matching qwen3_5's partial-rotary factor).
+///
+/// Note: Internal implementation detail, not exposed to TypeScript.
+pub fn apply_multimodal_rotary_pos_emb_interleaved(
+    q: &MxArray,
+    k: &MxArray,
+    cos: &MxArray,
+    sin: &MxArray,
+    mrope_section: Vec<i32>,
+) -> Result<(MxArray, MxArray)> {
+    let cos_shape = cos.shape()?; // 1 FFI call — cache and reuse below
+    let batch_size = cos_shape[1];
+    let seq_len = cos_shape[2];
+    let head_dim = cos_shape[3];
+    let half = head_dim / 2;
+    let half_usize = half as usize;
+
+    // Build the per-frequency axis selector over the half_dim inv_freq axis,
+    // matching mlx-vlm's `_interleaved_position_selector`, then mirror it across
+    // the doubled cos/sin (emb = concat([freqs, freqs]) => sel[j] = sel[j % half]).
+    let mut sel_half = vec![0i32; half_usize];
+    for (dim, offset) in [(1usize, 1usize), (2usize, 2usize)] {
+        let limit = std::cmp::min(mrope_section[dim] as usize * 3, half_usize);
+        let mut idx = offset;
+        while idx < limit {
+            sel_half[idx] = dim as i32;
+            idx += 3;
+        }
+    }
+    let mut sel_doubled = vec![0i32; head_dim as usize];
+    for (j, slot) in sel_doubled.iter_mut().enumerate() {
+        *slot = sel_half[j % half_usize];
+    }
+
+    // Gather the selected axis per frequency from cos/sin [3, batch, seq, head_dim].
+    // indices [1, 1, 1, head_dim] -> broadcast to [1, batch, seq, head_dim].
+    let indices = MxArray::from_int32(&sel_doubled, &[1, 1, 1, head_dim])?;
+    let indices = MxArray::broadcast_to(&indices, &[1, batch_size, seq_len, head_dim])?;
+
+    let cos_sel = cos.take_along_axis(&indices, 0)?; // [1, batch, seq, head_dim]
+    let sin_sel = sin.take_along_axis(&indices, 0)?;
+
+    // [1, batch, seq, head_dim] -> [batch, 1, seq, head_dim] (flat order preserved).
+    let cos_final = cos_sel.reshape(&[batch_size, 1, seq_len, head_dim])?;
+    let sin_final = sin_sel.reshape(&[batch_size, 1, seq_len, head_dim])?;
+
+    // Standard rotate_half application (identical to the sectioned path tail).
+    let rotary_dim = head_dim;
+    let q_shape = q.shape()?; // 1 FFI call
+    let q_dim = q_shape[3];
+    let q_ndim = q_shape.len();
+
+    let q_rot = q.slice_axis(3, 0, rotary_dim)?;
+    let q_pass = if rotary_dim < q_dim {
+        Some(q.slice_axis(3, rotary_dim, q_dim)?)
+    } else {
+        None
+    };
+
+    let k_rot = k.slice_axis(3, 0, rotary_dim)?;
+    let k_pass = if rotary_dim < q_dim {
+        Some(k.slice_axis(3, rotary_dim, q_dim)?)
+    } else {
+        None
+    };
+
+    let q_rotated = rotate_half(&q_rot, q_ndim, rotary_dim)?;
+    let k_rotated = rotate_half(&k_rot, q_ndim, rotary_dim)?;
+
+    let q_embed = q_rot.mul(&cos_final)?.add(&q_rotated.mul(&sin_final)?)?;
+    let k_embed = k_rot.mul(&cos_final)?.add(&k_rotated.mul(&sin_final)?)?;
+
+    let q_out = if let Some(q_pass) = q_pass {
+        MxArray::concatenate_many(vec![&q_embed, &q_pass], Some(-1))?
+    } else {
+        q_embed
+    };
+
+    let k_out = if let Some(k_pass) = k_pass {
+        MxArray::concatenate_many(vec![&k_embed, &k_pass], Some(-1))?
+    } else {
+        k_embed
+    };
+
+    Ok((q_out, k_out))
+}
+
 /// PaddleOCR Attention with mRoPE (internal)
 ///
 /// Note: This is an internal implementation detail used by PaddleOCRDecoderLayer.
@@ -1070,6 +1182,107 @@ mod tests {
         );
 
         assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_interleaved_selection_axis_assignment() {
+        // Interleaved selector correctness (PRIMARY qwen3_5-VL fix).
+        //
+        // rotary head_dim = 12 -> half_dim = 6; mrope_section = [3, 2, 1].
+        // mlx-vlm _interleaved_position_selector([3,2,1], freq_dim=6):
+        //   dim=1 (height) offset 1: idx 1, 4 (range(1, min(2*3,6)=6, 3))      -> 1
+        //   dim=2 (width)  offset 2: idx 2    (range(2, min(1*3,6)=3, 3))      -> 2
+        //   everything else                                                    -> 0
+        //   => sel_half = [0, 1, 2, 0, 1, 0]
+        // Doubled across emb=concat([f,f]): sel_doubled = sel_half ++ sel_half.
+        //
+        // Mark each axis row with its index (cos[axis, .., j] = axis), set sin = 0
+        // and q = ones, so q_out[j] = q_rot * cos_final = cos_final = sel_doubled[j].
+        let head_dim = 12i64;
+        let mut cos_data = Vec::with_capacity(3 * head_dim as usize);
+        for axis in 0..3 {
+            for _ in 0..head_dim {
+                cos_data.push(axis as f32);
+            }
+        }
+        let cos = MxArray::from_float32(&cos_data, &[3, 1, 1, head_dim]).unwrap();
+        let sin = MxArray::zeros(&[3, 1, 1, head_dim], Some(DType::Float32)).unwrap();
+        let q = MxArray::ones(&[1, 1, 1, head_dim], Some(DType::Float32)).unwrap();
+        let k = MxArray::ones(&[1, 1, 1, head_dim], Some(DType::Float32)).unwrap();
+
+        let (q_out, _k_out) =
+            apply_multimodal_rotary_pos_emb_interleaved(&q, &k, &cos, &sin, vec![3, 2, 1]).unwrap();
+
+        let expected: [f32; 12] = [
+            0.0, 1.0, 2.0, 0.0, 1.0, 0.0, // sel_half
+            0.0, 1.0, 2.0, 0.0, 1.0, 0.0, // mirrored
+        ];
+        let got = q_out.to_float32().unwrap();
+        assert_eq!(got.as_ref(), &expected[..]);
+    }
+
+    #[test]
+    fn test_interleaved_text_invariance() {
+        // Hard gate / safety net: for TEXT tokens (temporal == height == width)
+        // the interleaved apply MUST be bit-identical to the existing sectioned
+        // apply, proving the text path cannot regress.
+        //
+        // Realistic qwen3_5 rotary geometry: rope_dims = 64 -> half_dim = 32,
+        // mrope_section = [11, 11, 10] (sum 32). cos/sin are built from a real
+        // MultimodalRoPE forward over position_ids whose three axes are EQUAL.
+        let rope_dims = 64i32;
+        let mrope =
+            MultimodalRoPE::new(rope_dims, 4096, Some(100_000.0), vec![11, 11, 10]).unwrap();
+
+        let seq_len = 5i64;
+        // position_ids [3, 1, seq] with all three (t, h, w) rows equal.
+        let mut pos_data = Vec::with_capacity(3 * seq_len as usize);
+        for _ in 0..3 {
+            for p in 0..seq_len {
+                pos_data.push(p as f32);
+            }
+        }
+        let pos = MxArray::from_float32(&pos_data, &[3, 1, seq_len]).unwrap();
+
+        // x supplies only the target dtype.
+        let x = MxArray::zeros(&[1, seq_len, rope_dims as i64], Some(DType::Float32)).unwrap();
+        let (cos, sin) = mrope.forward(&x, &pos).unwrap();
+
+        // Q/K head_dim = 96 > rope_dims = 64 to exercise the partial-rotary
+        // pass-through path that qwen3_5 uses.
+        let head_dim = 96i64;
+        let heads = 2i64;
+        let q = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let k = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+
+        let (q_sec, k_sec) =
+            apply_multimodal_rotary_pos_emb(&q, &k, &cos, &sin, vec![11, 11, 10]).unwrap();
+        let (q_int, k_int) =
+            apply_multimodal_rotary_pos_emb_interleaved(&q, &k, &cos, &sin, vec![11, 11, 10])
+                .unwrap();
+
+        assert_eq!(
+            q_sec.to_float32().unwrap().as_ref(),
+            q_int.to_float32().unwrap().as_ref(),
+            "interleaved Q must equal sectioned Q for text tokens (t==h==w)"
+        );
+        assert_eq!(
+            k_sec.to_float32().unwrap().as_ref(),
+            k_int.to_float32().unwrap().as_ref(),
+            "interleaved K must equal sectioned K for text tokens (t==h==w)"
+        );
     }
 
     #[test]

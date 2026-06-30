@@ -275,6 +275,7 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
         use_kernel: bool,
+        rope_position_offset: i32,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -283,6 +284,7 @@ impl DecoderLayer {
                 let _ = first_logical_position;
                 let _ = cached_prefix_len;
                 let _ = is_prefill;
+                let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
                         "Qwen3_5DecoderLayer::forward_paged_or_flat: kind=Linear applied to a \
@@ -316,6 +318,7 @@ impl DecoderLayer {
                     cached_prefix_len,
                     is_prefill,
                     position_ids,
+                    rope_position_offset,
                 )?;
                 // Residual.
                 let h = x.add(&attn_out)?;
@@ -349,6 +352,7 @@ impl DecoderLayer {
         is_prefill: bool,
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        rope_position_offset: i32,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -356,6 +360,7 @@ impl DecoderLayer {
                 let _ = first_logical_position;
                 let _ = cached_prefix_len;
                 let _ = is_prefill;
+                let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
                         "Qwen3_5DecoderLayer::forward_paged_or_flat_with_tape: kind=Linear applied \
@@ -380,8 +385,12 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
-                // MTP tape forwards are text-only (image-bearing MTP+paged turns
-                // are rejected upstream), so the scalar-offset RoPE path is used.
+                // MTP tape forwards always carry M-RoPE positions as `None`
+                // (the K+1 verify ids are re-embedded, not image features), so
+                // RoPE takes the scalar-offset path. `rope_position_offset`
+                // still carries any cross-turn delta: a text turn that
+                // warm-continues an image prefill runs paged MTP and must
+                // rotate at the compressed position, not the physical slot.
                 let attn_out = attn.forward_paged(
                     &normed,
                     adapter,
@@ -390,6 +399,7 @@ impl DecoderLayer {
                     cached_prefix_len,
                     is_prefill,
                     None,
+                    rope_position_offset,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
