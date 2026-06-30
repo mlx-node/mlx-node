@@ -87,7 +87,9 @@ describe('QWEN launch-preset repetition cutoff is default-off', () => {
 
   it('injects no cutoff fields on any of the four QWEN_SAMPLING_DEFAULTS variants', () => {
     for (const key of ['thinkingCoding', 'thinkingGeneral', 'instructGeneral', 'instructReasoning'] as const) {
-      const sampling = QWEN_SAMPLING_DEFAULTS[key];
+      // Widen from the `as const` literal to ChatConfig so the now-removed
+      // cutoff fields are optional-undefined accesses, not TS2339 errors.
+      const sampling: ChatConfig = QWEN_SAMPLING_DEFAULTS[key];
       expect(sampling.maxConsecutiveTokens).toBeUndefined();
       expect(sampling.maxNgramRepeats).toBeUndefined();
       expect(sampling.ngramSize).toBeUndefined();
