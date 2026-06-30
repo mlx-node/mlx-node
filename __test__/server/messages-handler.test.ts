@@ -2346,6 +2346,130 @@ describe('handleCreateMessage', () => {
       expect(parsed.content).toEqual([{ type: 'text', text: 'keep this ' }]);
     });
 
+    it('non-streaming: resolves a held overlapping stop at flush', async () => {
+      // BUG A: `push()` holds a complete stop ('HALT') because a longer
+      // overlapping stop ('HALTED') is still viable, so it returns
+      // `matched:null`. Without a follow-up `flush()` the held stop leaks as
+      // normal text with `stop_reason: end_turn`. The non-streaming path must
+      // push+flush like the streaming done-path.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep HALT',
+          rawText: 'keep HALT',
+          finishReason: 'stop',
+          numTokens: 6,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT', 'HALTED'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content).toHaveLength(1);
+      expect(parsed.content[0].type).toBe('text');
+      expect(parsed.content[0].text).toBe('keep ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+    });
+
+    it('non-streaming: honors a stop sequence inside recovered suppressed-tool text', async () => {
+      // BUG B: the request disallows tools, but the native parser still
+      // produced a tool call and `result.text` is empty, so
+      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(rawText)`
+      // as the visible text. The stop scan must run over THAT recovered text,
+      // not the empty `result.text` — otherwise a stop inside it leaks with
+      // `stop_reason: end_turn`.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          rawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+          finishReason: 'stop',
+          toolCalls: [
+            {
+              status: 'ok',
+              id: 'call_x',
+              name: 'get_weather',
+              arguments: '{}',
+            } as ToolCallResult,
+          ],
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      const textBlock = parsed.content.find((b: any) => b.type === 'text');
+      expect(textBlock).toBeDefined();
+      expect(textBlock.text).toBe('Sure ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('STOP');
+    });
+
+    it('non-streaming: keeps a trailing incomplete partial when no stop completes', async () => {
+      // Control for the flush() addition: 'keep HAL' ends in a prefix of
+      // 'HALT' but never completes it. `flush()` must release the held partial
+      // as normal text — nothing may be dropped and no false truncation may
+      // occur.
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: 'keep HAL',
+          rawText: 'keep HAL',
+          finishReason: 'stop',
+          numTokens: 6,
+          promptTokens: 3,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content[0].text).toBe('keep HAL');
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.stop_sequence).toBe(null);
+    });
+
     it('streaming: honors a stop sequence hidden in suppressed/recovered text on a no-tools turn', async () => {
       // Finding 1: the done-path recovery branch re-emits native final text
       // that the tag buffer suppressed (here the visible bytes around a

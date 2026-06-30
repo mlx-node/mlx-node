@@ -212,22 +212,40 @@ async function handleNonStreaming(
 ): Promise<void> {
   const messageId = genId('msg_');
 
-  // Honor client-supplied `stop_sequences`: scan the model's final text for
-  // the earliest configured stop string. On a match we truncate the text the
-  // response is built from at the match (dropping the stop string and
-  // everything after it) and report `stop_reason: 'stop_sequence'` +
-  // `stop_sequence: '<matched>'`. The native `ChatResult` is left untouched —
-  // only the response builder sees the truncated text. An empty
-  // `stopSequences` constructs a pass-through buffer that never matches, so
-  // behavior is byte-identical to a request without `stop_sequences`.
+  // Honor client-supplied `stop_sequences`: scan the SAME visible text the
+  // response builder will emit for the earliest configured stop string. When
+  // the request disallows tools but the parser still produced a tool call and
+  // `result.text` is empty, `buildAnthropicContent` emits the recovered
+  // suppressed-tool text — so the scan must mirror that recovery gate and run
+  // over the recovered text, not the empty `result.text`. The scan does
+  // push+flush so a complete stop that `push()` held back (a longer
+  // overlapping stop was still viable) is resolved at end-of-text, matching
+  // the streaming done-path. On a match we truncate the text the response is
+  // built from at the match (dropping the stop string and everything after it)
+  // and report `stop_reason: 'stop_sequence'` + `stop_sequence: '<matched>'`;
+  // `buildAnthropicResponse` then suppresses tool calls and the recovery
+  // branch and emits the truncated text verbatim. The native `ChatResult` is
+  // left untouched. With no match `responseResult` stays `result` (full text
+  // retained — `flush()` releases any held incomplete partial as normal text),
+  // so behavior is byte-identical to a request without `stop_sequences`.
+  const visibleText =
+    !requestAllowsToolUse(body) &&
+    result.text.length === 0 &&
+    result.toolCalls.filter((t) => t.status === 'ok').length > 0 &&
+    containsToolCallMarkup(result.rawText)
+      ? recoverSuppressedToolCallText(result.rawText)
+      : result.text;
+
   let matchedStopSequence: string | null = null;
   let responseResult = result;
   if (stopSequences.length > 0) {
     const stopBuffer = new StopSequenceBuffer(stopSequences);
-    const { safeText, matched } = stopBuffer.push(result.text);
+    const pushed = stopBuffer.push(visibleText);
+    const flushed = stopBuffer.flush();
+    const matched = pushed.matched ?? flushed.matched;
     if (matched !== null) {
       matchedStopSequence = matched;
-      responseResult = { ...result, text: safeText };
+      responseResult = { ...result, text: pushed.safeText + flushed.safeText };
     }
   }
 
