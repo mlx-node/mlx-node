@@ -1,13 +1,13 @@
 /**
- * Coverage for the launch-preset anti-repetition cutoff values.
+ * Coverage for the launch-preset repetition handling.
  *
- * A live Claude Code session on Ornith (qwen3_5_moe) truncated an
- * ASCII box mid-diagram: a run of repeated `─` tripped the native
- * sampler's consecutive-token cutoff (`max_consecutive_tokens`
- * default 16) → finish_reason `"repetition"` → `stop_reason:"end_turn"`.
- * The Qwen launch presets loosen the cutoff so legit repeated content
- * (box borders, separators, tables) survives while a true runaway loop
- * still stops.
+ * The native anti-repetition cutoff is now disabled by default
+ * (vLLM-aligned — vLLM ships no repetition-stop heuristic), so the Qwen
+ * launch presets no longer pin `maxConsecutiveTokens` / `maxNgramRepeats`
+ * / `ngramSize`. Repetition is shaped by the sampling penalties and
+ * bounded by the per-model `maxOutputTokens`. An operator or client can
+ * still opt in by setting those fields explicitly; a per-request config
+ * value wins via `ChatSession.mergeConfig`.
  *
  * The merge-survival tests drive the REAL `ChatSession.mergeConfig`
  * through `ModelRegistry.register({ samplingDefaults }) → getOrCreate →
@@ -75,36 +75,22 @@ function createCapturingModel(): CapturingModel {
 // Static preset-value assertions
 // ---------------------------------------------------------------------------
 
-const LOOSENED_CUTOFF = {
-  maxConsecutiveTokens: 256,
-  maxNgramRepeats: 8,
-  ngramSize: 64,
-} as const;
-
-describe('QWEN launch-preset anti-repetition cutoff', () => {
-  it('loosens the cutoff on every Qwen launch entry (qwen3 / qwen3_5 / qwen3_5_moe)', () => {
+describe('QWEN launch-preset repetition cutoff is default-off', () => {
+  it('injects no cutoff fields on every Qwen launch entry (qwen3 / qwen3_5 / qwen3_5_moe)', () => {
     for (const key of ['qwen3', 'qwen3_5', 'qwen3_5_moe'] as const) {
       const sampling = LAUNCH_PRESETS[key]!.sampling;
-      expect(sampling.maxConsecutiveTokens).toBe(256);
-      expect(sampling.maxNgramRepeats).toBe(8);
-      expect(sampling.ngramSize).toBe(64);
+      expect(sampling.maxConsecutiveTokens).toBeUndefined();
+      expect(sampling.maxNgramRepeats).toBeUndefined();
+      expect(sampling.ngramSize).toBeUndefined();
     }
   });
 
-  it('sets the loosened cutoff on all four QWEN_SAMPLING_DEFAULTS variants', () => {
+  it('injects no cutoff fields on any of the four QWEN_SAMPLING_DEFAULTS variants', () => {
     for (const key of ['thinkingCoding', 'thinkingGeneral', 'instructGeneral', 'instructReasoning'] as const) {
       const sampling = QWEN_SAMPLING_DEFAULTS[key];
-      expect(sampling.maxConsecutiveTokens).toBe(256);
-      expect(sampling.maxNgramRepeats).toBe(8);
-      expect(sampling.ngramSize).toBe(64);
-    }
-  });
-
-  it('does not disable the cutoff (runaway-loop protection must remain)', () => {
-    for (const key of ['thinkingCoding', 'thinkingGeneral', 'instructGeneral', 'instructReasoning'] as const) {
-      const sampling = QWEN_SAMPLING_DEFAULTS[key];
-      expect(sampling.maxConsecutiveTokens).not.toBe(0);
-      expect(sampling.maxNgramRepeats).not.toBe(0);
+      expect(sampling.maxConsecutiveTokens).toBeUndefined();
+      expect(sampling.maxNgramRepeats).toBeUndefined();
+      expect(sampling.ngramSize).toBeUndefined();
     }
   });
 
@@ -140,7 +126,7 @@ describe('scope lock: non-Qwen presets unchanged', () => {
 // ---------------------------------------------------------------------------
 
 describe('cutoff survives ChatSession.mergeConfig', () => {
-  it('carries the loosened cutoff through when the per-request overlay omits it', async () => {
+  it('injects no repetition-cutoff fields when the per-request overlay omits them', async () => {
     const registry = new ModelRegistry();
     const model = createCapturingModel();
     registry.register('qwen35moe', model, { samplingDefaults: LAUNCH_PRESETS.qwen3_5_moe!.sampling });
@@ -151,15 +137,18 @@ describe('cutoff survives ChatSession.mergeConfig', () => {
     // Claude Code never sends these fields — overlay omits them.
     await session.send('hi');
 
-    expect(model.lastStartConfig).toMatchObject(LOOSENED_CUTOFF);
-    // Full shape: defaults + reuseCache, nothing else injected.
+    // Full shape: defaults + reuseCache, nothing else injected. The
+    // preset carries no cutoff fields, so none appear here.
     expect(model.lastStartConfig).toEqual({
       ...LAUNCH_PRESETS.qwen3_5_moe!.sampling,
       reuseCache: true,
     });
+    expect(model.lastStartConfig!.maxConsecutiveTokens).toBeUndefined();
+    expect(model.lastStartConfig!.maxNgramRepeats).toBeUndefined();
+    expect(model.lastStartConfig!.ngramSize).toBeUndefined();
   });
 
-  it('lets a per-request override win on maxConsecutiveTokens while the other cutoff fields survive', async () => {
+  it('lets a per-request override reach the model on maxConsecutiveTokens (opt-in)', async () => {
     const registry = new ModelRegistry();
     const model = createCapturingModel();
     registry.register('qwen35moe', model, { samplingDefaults: LAUNCH_PRESETS.qwen3_5_moe!.sampling });
@@ -170,8 +159,8 @@ describe('cutoff survives ChatSession.mergeConfig', () => {
     await session.send('hi', { config: { maxConsecutiveTokens: 32 } });
 
     expect(model.lastStartConfig!.maxConsecutiveTokens).toBe(32);
-    // Default n-gram fields still carried (overlay didn't touch them).
-    expect(model.lastStartConfig!.maxNgramRepeats).toBe(8);
-    expect(model.lastStartConfig!.ngramSize).toBe(64);
+    // The preset contributes no n-gram fields, so they stay undefined.
+    expect(model.lastStartConfig!.maxNgramRepeats).toBeUndefined();
+    expect(model.lastStartConfig!.ngramSize).toBeUndefined();
   });
 });

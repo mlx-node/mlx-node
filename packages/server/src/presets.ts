@@ -19,15 +19,13 @@ import type { ChatConfig } from '@mlx-node/core';
  * All modes pin `top_k = 20` and `min_p = 0.0`; they differ in
  * `temperature`, `top_p`, and `presence_penalty`.
  *
- * Every mode also loosens the native anti-repetition cutoff
- * (`maxConsecutiveTokens` / `maxNgramRepeats`, default 16 / 3). Coding
- * answers legitimately contain long single-token runs — ASCII box
- * borders (`────`), separators (`====`/`----`), table rules, repeated
- * indentation — which the default cutoff treats as a stuck loop and
- * truncates mid-diagram (finish_reason `"repetition"` → `end_turn`),
- * silently cutting the answer. 256 / 8 lets a wide box or table survive
- * while still bounding a true runaway loop; `ngramSize` is the default,
- * kept explicit. Do not set 0 — that disables runaway protection.
+ * The native anti-repetition cutoff is now disabled by default
+ * (vLLM-aligned — vLLM ships no repetition-stop heuristic), so these
+ * presets no longer pin `maxConsecutiveTokens` / `maxNgramRepeats` /
+ * `ngramSize`. Repetition is shaped by the sampling penalties above and
+ * bounded by the per-model `maxOutputTokens`. An operator or client can
+ * still opt in by setting those fields explicitly — a per-request config
+ * value wins via `ChatSession.mergeConfig`.
  */
 export const QWEN_SAMPLING_DEFAULTS = {
   /** Thinking mode for precise coding tasks: temp=0.6, top_p=0.95, pp=0.0 */
@@ -38,9 +36,6 @@ export const QWEN_SAMPLING_DEFAULTS = {
     minP: 0.0,
     presencePenalty: 0.0,
     repetitionPenalty: 1.0,
-    maxConsecutiveTokens: 256,
-    maxNgramRepeats: 8,
-    ngramSize: 64,
   } satisfies ChatConfig,
 
   /** Thinking mode for general tasks: temp=1.0, top_p=0.95, pp=1.5 */
@@ -51,9 +46,6 @@ export const QWEN_SAMPLING_DEFAULTS = {
     minP: 0.0,
     presencePenalty: 1.5,
     repetitionPenalty: 1.0,
-    maxConsecutiveTokens: 256,
-    maxNgramRepeats: 8,
-    ngramSize: 64,
   } satisfies ChatConfig,
 
   /** Instruct (non-thinking) for general tasks: temp=0.7, top_p=0.8, pp=1.5 */
@@ -64,9 +56,6 @@ export const QWEN_SAMPLING_DEFAULTS = {
     minP: 0.0,
     presencePenalty: 1.5,
     repetitionPenalty: 1.0,
-    maxConsecutiveTokens: 256,
-    maxNgramRepeats: 8,
-    ngramSize: 64,
   } satisfies ChatConfig,
 
   /** Instruct (non-thinking) for reasoning tasks: temp=1.0, top_p=0.95, pp=1.5 */
@@ -77,9 +66,6 @@ export const QWEN_SAMPLING_DEFAULTS = {
     minP: 0.0,
     presencePenalty: 1.5,
     repetitionPenalty: 1.0,
-    maxConsecutiveTokens: 256,
-    maxNgramRepeats: 8,
-    ngramSize: 64,
   } satisfies ChatConfig,
 } as const;
 
