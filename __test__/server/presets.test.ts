@@ -125,7 +125,7 @@ describe('scope lock: non-Qwen presets unchanged', () => {
 // Merge survival (real ChatSession.mergeConfig)
 // ---------------------------------------------------------------------------
 
-describe('cutoff survives ChatSession.mergeConfig', () => {
+describe('repetition-cutoff handling through ChatSession.mergeConfig', () => {
   it('injects no repetition-cutoff fields when the per-request overlay omits them', async () => {
     const registry = new ModelRegistry();
     const model = createCapturingModel();

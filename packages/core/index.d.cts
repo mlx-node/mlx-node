@@ -2288,11 +2288,11 @@ export interface ChatConfig {
   frequencyPenalty?: number | undefined;
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number | undefined;
-  /** Max consecutive identical tokens before stopping (default: 16, 0 = disabled) */
+  /** Max consecutive identical tokens before stopping (default: 0 = disabled; opt in with a positive value) */
   maxConsecutiveTokens?: number | undefined;
-  /** Max n-gram repetitions before stopping (default: 3, 0 = disabled) */
+  /** Max n-gram repetitions before stopping (default: 0 = disabled; opt in with a positive value) */
   maxNgramRepeats?: number | undefined;
-  /** Max pattern size for n-gram repetition detection (default: 64) */
+  /** Max pattern size for n-gram repetition detection (default: 0 = disabled; opt in with a positive value) */
   ngramSize?: number | undefined;
   tools?: Array<ToolDefinition>;
   /**
@@ -2988,19 +2988,19 @@ export interface GenerationConfig {
   /** Number of recent tokens to consider for frequency penalty (default: 20) */
   frequencyContextSize?: number;
   /**
-   * Stop if same token repeats this many times consecutively (default: 16)
-   * Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
+   * Stop if same token repeats this many times consecutively (default: 0 = disabled).
+   * Opt in by setting a positive value to guard against degenerate repetitive generation.
    */
   maxConsecutiveTokens?: number;
   /**
-   * Stop if a pattern repeats this many times consecutively (default: 3)
-   * Set to 0 to disable. Detects patterns like "A B A B A B".
+   * Stop if a pattern repeats this many times consecutively (default: 0 = disabled).
+   * Opt in with a positive value to detect patterns like "A B A B A B".
    * Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
    */
   maxNgramRepeats?: number;
   /**
-   * Maximum pattern size for repetition detection (default: 64)
-   * All pattern sizes from 2 up to this value are checked each decode step.
+   * Maximum pattern size for repetition detection (default: 0 = disabled).
+   * When enabled, all pattern sizes from 2 up to this value are checked each decode step.
    * Larger values catch long phrase-level repetition common in small models.
    */
   ngramSize?: number;
