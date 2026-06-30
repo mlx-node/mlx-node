@@ -390,9 +390,15 @@ pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
         presence_context_size: config.presence_context_size.unwrap_or(20),
         frequency_penalty: config.frequency_penalty.unwrap_or(0.0),
         frequency_context_size: config.frequency_context_size.unwrap_or(20),
-        max_consecutive_tokens: config.max_consecutive_tokens.unwrap_or(16),
-        max_ngram_repeats: config.max_ngram_repeats.unwrap_or(3),
-        ngram_size: config.ngram_size.unwrap_or(64),
+        max_consecutive_tokens: config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS),
+        max_ngram_repeats: config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS),
+        ngram_size: config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE),
         sampling_config: Some(SamplingConfig {
             temperature: config.temperature,
             top_k: config.top_k,
@@ -601,6 +607,41 @@ mod mtp_params_tests {
         let p = extract_chat_params(&cfg);
         assert!(!p.mtp_adaptive_depth);
         assert_eq!(p.mtp_depth, 1);
+    }
+
+    /// Repetition cutoff is OFF by default: with all three knobs unset the
+    /// resolved params are zero, which the `check_consecutive` / `check_ngram`
+    /// guards treat as disabled. This matches vLLM, which ships no
+    /// repetition-stop heuristic out of the box.
+    #[test]
+    fn repetition_cutoff_disabled_by_default() {
+        let cfg = base_config();
+        let p = extract_chat_params(&cfg);
+        assert_eq!(
+            p.max_consecutive_tokens, 0,
+            "max_consecutive_tokens must default to 0 (disabled)"
+        );
+        assert_eq!(
+            p.max_ngram_repeats, 0,
+            "max_ngram_repeats must default to 0 (disabled)"
+        );
+        assert_eq!(p.ngram_size, 0, "ngram_size must default to 0 (disabled)");
+    }
+
+    /// Opt-in still works: a positive value re-enables detection and the
+    /// per-request override wins over the disabled default.
+    #[test]
+    fn repetition_cutoff_opt_in_overrides_default() {
+        let mut cfg = base_config();
+        cfg.max_consecutive_tokens = Some(16);
+        let p = extract_chat_params(&cfg);
+        assert_eq!(
+            p.max_consecutive_tokens, 16,
+            "explicit max_consecutive_tokens must pass through"
+        );
+        // Knobs left unset stay at the disabled default.
+        assert_eq!(p.max_ngram_repeats, 0);
+        assert_eq!(p.ngram_size, 0);
     }
 }
 

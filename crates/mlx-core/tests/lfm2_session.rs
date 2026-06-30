@@ -593,12 +593,12 @@ async fn lfm2_session_continue_tool_round_trips() {
     // tool_call_id (its template identifies tool responses positionally), so a
     // minimal tool-continue on the "thinking" checkpoint enters a think block
     // immediately and, under the 32-token budget here, legitimately bottoms out
-    // via any cutoff: EOS ("stop"), the budget cap ("length"), or the
-    // repetition guard ("repetition", which is active by default —
-    // params.rs defaults max_consecutive_tokens=16 / max_ngram_repeats=3 /
-    // ngram_size=64 when the config leaves them unset). All three are valid
-    // non-cancelled terminal states. Forward correctness is covered separately
-    // by lfm2_paged_vs_flat_parity (6/6 byte-identical).
+    // via EOS ("stop") or the budget cap ("length"). The repetition guard is
+    // OFF by default (params.rs resolves max_consecutive_tokens / max_ngram_repeats
+    // / ngram_size to 0 when the config leaves them unset), so "repetition" only
+    // fires if a caller opts in; it stays an accepted terminal state here for that
+    // case. All are valid non-cancelled terminal states. Forward correctness is
+    // covered separately by lfm2_paged_vs_flat_parity (6/6 byte-identical).
     assert!(
         matches!(
             result.finish_reason.as_str(),

@@ -5650,9 +5650,15 @@ struct Gemma4RepetitionCutoff {
 
 fn repetition_cutoff_from_config(config: &ChatConfig) -> Gemma4RepetitionCutoff {
     Gemma4RepetitionCutoff {
-        max_consecutive_tokens: config.max_consecutive_tokens.unwrap_or(16),
-        max_ngram_repeats: config.max_ngram_repeats.unwrap_or(3),
-        ngram_size: config.ngram_size.unwrap_or(64),
+        max_consecutive_tokens: config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS),
+        max_ngram_repeats: config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS),
+        ngram_size: config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE),
     }
 }
 

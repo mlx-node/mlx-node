@@ -386,9 +386,15 @@ impl QianfanOCRInner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
+        let max_consecutive_tokens = config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+        let max_ngram_repeats = config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+        let ngram_size = config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
         let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
         let reuse_cache = config.reuse_cache.unwrap_or(true);
         let report_perf = config.report_performance.unwrap_or(false);
@@ -784,9 +790,15 @@ impl QianfanOCRInner {
             let presence_context_size = config.presence_context_size.unwrap_or(20);
             let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
             let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-            let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-            let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-            let ngram_size = config.ngram_size.unwrap_or(64);
+            let max_consecutive_tokens = config
+                .max_consecutive_tokens
+                .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+            let max_ngram_repeats = config
+                .max_ngram_repeats
+                .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+            let ngram_size = config
+                .ngram_size
+                .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
             let enable_thinking = crate::engine::resolve_enable_thinking(&config).unwrap_or(false);
             let reuse_cache = config.reuse_cache.unwrap_or(true);
             let report_perf = config.report_performance.unwrap_or(false);
@@ -1367,9 +1379,15 @@ impl QianfanOCRInner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
+        let max_consecutive_tokens = config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+        let max_ngram_repeats = config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+        let ngram_size = config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let generation_start = if report_perf {
@@ -1844,9 +1862,15 @@ impl QianfanOCRInner {
         let presence_context_size = config.presence_context_size.unwrap_or(20);
         let frequency_penalty = config.frequency_penalty.unwrap_or(0.0);
         let frequency_context_size = config.frequency_context_size.unwrap_or(20);
-        let max_consecutive_tokens = config.max_consecutive_tokens.unwrap_or(16);
-        let max_ngram_repeats = config.max_ngram_repeats.unwrap_or(3);
-        let ngram_size = config.ngram_size.unwrap_or(64);
+        let max_consecutive_tokens = config
+            .max_consecutive_tokens
+            .unwrap_or(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS);
+        let max_ngram_repeats = config
+            .max_ngram_repeats
+            .unwrap_or(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS);
+        let ngram_size = config
+            .ngram_size
+            .unwrap_or(crate::sampling::DEFAULT_NGRAM_SIZE);
         let report_perf = config.report_performance.unwrap_or(false);
 
         let generation_start = if report_perf {

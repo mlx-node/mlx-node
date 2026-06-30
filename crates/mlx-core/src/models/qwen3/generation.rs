@@ -47,17 +47,17 @@ pub struct GenerationConfig {
     /// Number of recent tokens to consider for frequency penalty (default: 20)
     pub frequency_context_size: Option<i32>,
 
-    /// Stop if same token repeats this many times consecutively (default: 16)
-    /// Set to 0 to disable. Prevents OOM from degenerate repetitive generation.
+    /// Stop if same token repeats this many times consecutively (default: 0 = disabled).
+    /// Opt in by setting a positive value to guard against degenerate repetitive generation.
     pub max_consecutive_tokens: Option<i32>,
 
-    /// Stop if a pattern repeats this many times consecutively (default: 3)
-    /// Set to 0 to disable. Detects patterns like "A B A B A B".
+    /// Stop if a pattern repeats this many times consecutively (default: 0 = disabled).
+    /// Opt in with a positive value to detect patterns like "A B A B A B".
     /// Uses range-based detection: checks all pattern sizes from 2 to ngram_size.
     pub max_ngram_repeats: Option<i32>,
 
-    /// Maximum pattern size for repetition detection (default: 64)
-    /// All pattern sizes from 2 up to this value are checked each decode step.
+    /// Maximum pattern size for repetition detection (default: 0 = disabled).
+    /// When enabled, all pattern sizes from 2 up to this value are checked each decode step.
     /// Larger values catch long phrase-level repetition common in small models.
     pub ngram_size: Option<i32>,
 
@@ -94,9 +94,9 @@ impl Default for GenerationConfig {
             presence_context_size: None,
             frequency_penalty: None,
             frequency_context_size: None,
-            max_consecutive_tokens: Some(16),
-            max_ngram_repeats: Some(3),
-            ngram_size: Some(64),
+            max_consecutive_tokens: Some(crate::sampling::DEFAULT_MAX_CONSECUTIVE_TOKENS),
+            max_ngram_repeats: Some(crate::sampling::DEFAULT_MAX_NGRAM_REPEATS),
+            ngram_size: Some(crate::sampling::DEFAULT_NGRAM_SIZE),
             eos_token_id: None,
             return_logprobs: Some(true),
             prefill_step_size: Some(2048),

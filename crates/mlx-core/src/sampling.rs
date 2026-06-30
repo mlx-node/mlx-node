@@ -1406,6 +1406,16 @@ pub(crate) fn apply_frequency_penalty(
     logits.put_along_axis(&indices, &penalized, ctx.last_axis)
 }
 
+/// Default repetition-cutoff parameters. All-zero = DISABLED, matching vLLM,
+/// which ships no repetition-stop heuristic out of the box and relies on
+/// `max_tokens` plus logit penalties (repetition / frequency / presence) to
+/// shape repetition. Callers opt in by setting positive `ChatConfig` /
+/// `GenerationConfig` values, which re-enable the `check_consecutive` /
+/// `check_ngram` guards in [`check_repetition_cutoff`].
+pub(crate) const DEFAULT_MAX_CONSECUTIVE_TOKENS: i32 = 0;
+pub(crate) const DEFAULT_MAX_NGRAM_REPEATS: i32 = 0;
+pub(crate) const DEFAULT_NGRAM_SIZE: i32 = 0;
+
 /// Check if generation has fallen into a repetitive loop.
 ///
 /// Detect degenerate repetitive generation and signal early termination.

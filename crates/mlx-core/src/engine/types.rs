@@ -47,13 +47,13 @@ pub struct ChatConfig {
     /// Number of recent tokens to consider for frequency penalty (default: 20)
     #[napi(ts_type = "number | undefined")]
     pub frequency_context_size: Option<i32>,
-    /// Max consecutive identical tokens before stopping (default: 16, 0 = disabled)
+    /// Max consecutive identical tokens before stopping (default: 0 = disabled; opt in with a positive value)
     #[napi(ts_type = "number | undefined")]
     pub max_consecutive_tokens: Option<i32>,
-    /// Max n-gram repetitions before stopping (default: 3, 0 = disabled)
+    /// Max n-gram repetitions before stopping (default: 0 = disabled; opt in with a positive value)
     #[napi(ts_type = "number | undefined")]
     pub max_ngram_repeats: Option<i32>,
-    /// Max pattern size for n-gram repetition detection (default: 64)
+    /// Max pattern size for n-gram repetition detection (default: 0 = disabled; opt in with a positive value)
     #[napi(ts_type = "number | undefined")]
     pub ngram_size: Option<i32>,
     #[napi(ts_type = "Array<ToolDefinition>")]
