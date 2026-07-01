@@ -17,10 +17,12 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mlx/allocator.h"
@@ -170,103 +172,198 @@ size_t dtype_byte_size(KvDtype d) {
   return 2;
 }
 
-std::string reshape_and_cache_kernel_name(
+// -----------------------------------------------------------------------
+// Kernel-name memoization.
+//
+// Every name-builder function below runs on every PagedKVWrite /
+// PagedAttention dispatch (per attention layer, per decode token /
+// prefill chunk) purely to look the resulting string up in MLX's own
+// `Device::get_kernel` cache (see `load_pipeline` below). The name is
+// fully determined by a handful of compile-time-fixed-per-model
+// parameters (dtype, head_size, block_size, alibi flag) that never
+// change between calls for a loaded model, so re-running the
+// `std::ostringstream` formatting on every call is pure repeated work.
+// Memoize on those parameters instead — same idea as the
+// `get_or_create_kernel` cache in `mlx_gated_delta.cpp`.
+//
+// The cache key is a `std::tuple` of the exact parameter values, so
+// each field is compared independently at its full width via
+// `std::tuple`'s built-in `operator<`. Distinct parameter tuples can
+// therefore never alias onto the same key regardless of magnitude —
+// there is no bit-packing, so an out-of-range field can never overflow
+// into a neighbouring field and collide with another valid key. Using
+// `std::map` gives us this field-wise ordering for free (no custom hash
+// or comparator needed); its O(log n) lookup is irrelevant here since
+// each cache holds only a handful of entries and is touched on the
+// cold, first-per-tuple path only.
+template <typename Key, typename Builder>
+const std::string& memoized_kernel_name(
+    std::map<Key, std::string>& cache,
+    std::mutex& mutex,
+    const Key& key,
+    Builder&& build) {
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  // `std::map`, like `std::unordered_map`, is node-based and never
+  // invalidates references to existing elements on insertion (only
+  // iterators), so returning a reference into the map after `mutex` is
+  // released below is safe.
+  return cache.emplace(key, build()).first->second;
+}
+
+const std::string& reshape_and_cache_kernel_name(
     KvDtype input_dtype,
     KvDtype cache_dtype,
     bool use_fp8) {
-  std::ostringstream os;
-  os << "reshape_and_cache_kv_" << dtype_string(input_dtype) << "_cache_"
-     << dtype_string(cache_dtype);
-  if (use_fp8) {
-    os << "_fp8";
-  }
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, KvDtype, bool>, std::string> cache;
+  return memoized_kernel_name(
+      cache, mutex, std::make_tuple(input_dtype, cache_dtype, use_fp8), [&] {
+    std::ostringstream os;
+    os << "reshape_and_cache_kv_" << dtype_string(input_dtype) << "_cache_"
+       << dtype_string(cache_dtype);
+    if (use_fp8) {
+      os << "_fp8";
+    }
+    return os.str();
+  });
 }
 
-std::string paged_attention_v1_kernel_name(
+const std::string& paged_attention_v1_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
     int head_size,
     int block_size,
     bool use_alibi) {
-  std::ostringstream os;
-  os << "paged_attention_" << dtype_string(io_dtype) << "_cache_"
-     << dtype_string(cache_dtype) << "_hs" << head_size << "_bs" << block_size
-     << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps0";
-  if (use_alibi) {
-    os << "_alibi";
-  }
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, KvDtype, int, int, bool>, std::string>
+      cache;
+  return memoized_kernel_name(
+      cache,
+      mutex,
+      std::make_tuple(io_dtype, cache_dtype, head_size, block_size, use_alibi),
+      [&] {
+    std::ostringstream os;
+    os << "paged_attention_" << dtype_string(io_dtype) << "_cache_"
+       << dtype_string(cache_dtype) << "_hs" << head_size << "_bs"
+       << block_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
+       << "_ps0";
+    if (use_alibi) {
+      os << "_alibi";
+    }
+    return os.str();
+  });
 }
 
-std::string paged_attention_v2_kernel_name(
+const std::string& paged_attention_v2_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
     int head_size,
     int block_size,
     bool use_alibi) {
-  std::ostringstream os;
-  os << "paged_attention_" << dtype_string(io_dtype) << "_cache_"
-     << dtype_string(cache_dtype) << "_hs" << head_size << "_bs" << block_size
-     << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps"
-     << kPartitionSize;
-  if (use_alibi) {
-    os << "_alibi";
-  }
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, KvDtype, int, int, bool>, std::string>
+      cache;
+  return memoized_kernel_name(
+      cache,
+      mutex,
+      std::make_tuple(io_dtype, cache_dtype, head_size, block_size, use_alibi),
+      [&] {
+    std::ostringstream os;
+    os << "paged_attention_" << dtype_string(io_dtype) << "_cache_"
+       << dtype_string(cache_dtype) << "_hs" << head_size << "_bs"
+       << block_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
+       << "_ps" << kPartitionSize;
+    if (use_alibi) {
+      os << "_alibi";
+    }
+    return os.str();
+  });
 }
 
-std::string paged_attention_v2_reduce_kernel_name(
+const std::string& paged_attention_v2_reduce_kernel_name(
     KvDtype io_dtype,
     int head_size) {
-  std::ostringstream os;
-  os << "paged_attention_v2_reduce_" << dtype_string(io_dtype) << "_hs"
-     << head_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps"
-     << kPartitionSize;
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, int>, std::string> cache;
+  return memoized_kernel_name(
+      cache, mutex, std::make_tuple(io_dtype, head_size), [&] {
+    std::ostringstream os;
+    os << "paged_attention_v2_reduce_" << dtype_string(io_dtype) << "_hs"
+       << head_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
+       << "_ps" << kPartitionSize;
+    return os.str();
+  });
 }
 
-std::string paged_attention_varlen_v1_kernel_name(
+const std::string& paged_attention_varlen_v1_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
     int head_size,
     int block_size,
     bool use_alibi) {
-  std::ostringstream os;
-  os << "paged_attention_varlen_" << dtype_string(io_dtype) << "_cache_"
-     << dtype_string(cache_dtype) << "_hs" << head_size << "_bs" << block_size
-     << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps0";
-  if (use_alibi) {
-    os << "_alibi";
-  }
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, KvDtype, int, int, bool>, std::string>
+      cache;
+  return memoized_kernel_name(
+      cache,
+      mutex,
+      std::make_tuple(io_dtype, cache_dtype, head_size, block_size, use_alibi),
+      [&] {
+    std::ostringstream os;
+    os << "paged_attention_varlen_" << dtype_string(io_dtype) << "_cache_"
+       << dtype_string(cache_dtype) << "_hs" << head_size << "_bs"
+       << block_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
+       << "_ps0";
+    if (use_alibi) {
+      os << "_alibi";
+    }
+    return os.str();
+  });
 }
 
-std::string paged_attention_varlen_v2_kernel_name(
+const std::string& paged_attention_varlen_v2_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
     int head_size,
     int block_size,
     bool use_alibi) {
-  std::ostringstream os;
-  os << "paged_attention_varlen_" << dtype_string(io_dtype) << "_cache_"
-     << dtype_string(cache_dtype) << "_hs" << head_size << "_bs" << block_size
-     << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps"
-     << kPartitionSize;
-  if (use_alibi) {
-    os << "_alibi";
-  }
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, KvDtype, int, int, bool>, std::string>
+      cache;
+  return memoized_kernel_name(
+      cache,
+      mutex,
+      std::make_tuple(io_dtype, cache_dtype, head_size, block_size, use_alibi),
+      [&] {
+    std::ostringstream os;
+    os << "paged_attention_varlen_" << dtype_string(io_dtype) << "_cache_"
+       << dtype_string(cache_dtype) << "_hs" << head_size << "_bs"
+       << block_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
+       << "_ps" << kPartitionSize;
+    if (use_alibi) {
+      os << "_alibi";
+    }
+    return os.str();
+  });
 }
 
-std::string paged_attention_varlen_v2_reduce_kernel_name(
+const std::string& paged_attention_varlen_v2_reduce_kernel_name(
     KvDtype io_dtype,
     int head_size) {
-  std::ostringstream os;
-  os << "paged_attention_varlen_v2_reduce_" << dtype_string(io_dtype) << "_hs"
-     << head_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes << "_ps"
-     << kPartitionSize;
-  return os.str();
+  static std::mutex mutex;
+  static std::map<std::tuple<KvDtype, int>, std::string> cache;
+  return memoized_kernel_name(
+      cache, mutex, std::make_tuple(io_dtype, head_size), [&] {
+    std::ostringstream os;
+    os << "paged_attention_varlen_v2_reduce_" << dtype_string(io_dtype)
+       << "_hs" << head_size << "_nt" << kNumThreads << "_nsl"
+       << kNumSimdLanes << "_ps" << kPartitionSize;
+    return os.str();
+  });
 }
 
 // =============================================================================
@@ -319,7 +416,7 @@ void dispatch_reshape_and_cache(
       cache_dtype == KvDtype::Fp8 ? KvDtype::Bf16 : cache_dtype;
   const bool use_fp8 = cache_dtype == KvDtype::Fp8;
 
-  std::string kernel_name =
+  const std::string& kernel_name =
       reshape_and_cache_kernel_name(input_dtype, cache_dtype, use_fp8);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
   encoder.set_compute_pipeline_state(pipeline);
@@ -391,7 +488,7 @@ void dispatch_paged_attention_v1_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  std::string kernel_name = paged_attention_v1_kernel_name(
+  const std::string& kernel_name = paged_attention_v1_kernel_name(
       io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
   encoder.set_compute_pipeline_state(pipeline);
@@ -560,7 +657,7 @@ void dispatch_paged_attention_v2_inner(
 
   // Stage 1: partitioned attention.
   {
-    std::string kernel_name = paged_attention_v2_kernel_name(
+    const std::string& kernel_name = paged_attention_v2_kernel_name(
         io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
@@ -621,7 +718,7 @@ void dispatch_paged_attention_v2_inner(
   // via `set_output_array` in stage 1 and re-set as `set_input_array`
   // here, so MLX's dependency tracking fences via `prev_outputs_`.
   {
-    std::string kernel_name =
+    const std::string& kernel_name =
         paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
@@ -798,7 +895,7 @@ void dispatch_paged_attention_varlen_v1_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  std::string kernel_name = paged_attention_varlen_v1_kernel_name(
+  const std::string& kernel_name = paged_attention_varlen_v1_kernel_name(
       io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
   encoder.set_compute_pipeline_state(pipeline);
@@ -921,7 +1018,7 @@ void dispatch_paged_attention_varlen_v2_inner(
 
   // Stage 1: partitioned varlen attention.
   {
-    std::string kernel_name = paged_attention_varlen_v2_kernel_name(
+    const std::string& kernel_name = paged_attention_varlen_v2_kernel_name(
         io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
@@ -976,7 +1073,7 @@ void dispatch_paged_attention_varlen_v2_inner(
 
   // Stage 2: reduce partitions.
   {
-    std::string kernel_name =
+    const std::string& kernel_name =
         paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
