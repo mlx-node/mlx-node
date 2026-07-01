@@ -404,6 +404,14 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
+    /// computed once here in `Gemma4Inner::new` instead of re-derived
+    /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
+    /// decode-step call. Pure function of the immutable `config`, so it
+    /// never changes for the lifetime of this instance. Empty when
+    /// `paged_adapter` is `None`: every paged-only call site that reads it
+    /// errors out on a `None` adapter before consuming the value.
+    pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
@@ -971,6 +979,27 @@ impl Gemma4Inner {
             None
         };
 
+        // Derive the per-layer paged-routing classification once here
+        // instead of on every paged prefill-chunk / decode-step call (see
+        // `compute_layer_kinds_from_kv_cache_specs`'s BTreeMap/BTreeSet
+        // grouping + sort). It's a pure function of `config`, which is
+        // immutable for the lifetime of this `Gemma4Inner`. Only meaningful
+        // when `paged_adapter` is `Some` — every caller first errors out on
+        // a `None` adapter before reading the result, so `Vec::new()` below
+        // is never read in that case. Guaranteed to succeed whenever
+        // `paged_adapter` built above, since that already validated a
+        // strictly stronger constraint (a single full-attention group) over
+        // the same specs.
+        let layer_kinds = if paged_adapter.is_some() {
+            compute_layer_kinds_from_kv_cache_specs(&config).map_err(|e| {
+                Error::from_reason(format!(
+                    "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
+                ))
+            })?
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             config,
             embed_tokens,
@@ -990,6 +1019,7 @@ impl Gemma4Inner {
             cached_image_key: None,
             cached_audio_key: None,
             paged_adapter,
+            layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
@@ -1024,17 +1054,17 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Build the per-layer routing list for the paged dispatch.
+    /// Return the per-layer routing list for the paged dispatch.
     ///
-    /// See [`compute_layer_kinds`] (free helper) for full semantics.
-    /// This wrapper is the on-`Gemma4Inner` entry point used by the
-    /// chat-session forward dispatch.
+    /// Cheap clone of `self.layer_kinds`, cached once in `Gemma4Inner::new`
+    /// instead of being re-derived (BTreeMap/BTreeSet grouping + a sort —
+    /// see [`compute_layer_kinds`] (free helper) and
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every call. It's a pure
+    /// function of the immutable `Gemma4Config`, so recomputing it from
+    /// scratch on every paged prefill-chunk / decode-step call was pure
+    /// waste.
     pub(crate) fn compute_layer_kinds(&self) -> Result<Vec<Gemma4LayerKind>> {
-        compute_layer_kinds_from_kv_cache_specs(&self.config).map_err(|e| {
-            Error::from_reason(format!(
-                "Gemma4 compute_layer_kinds: failed to derive KV routes: {e}"
-            ))
-        })
+        Ok(self.layer_kinds.clone())
     }
 
     /// Drop the live KV caches and clear reuse-tracking state.
@@ -8882,6 +8912,158 @@ mod tests {
             }
             ref other => panic!("layer 7: expected SharedOnGlobal, got {other:?}"),
         }
+    }
+
+    /// Element-wise comparison for `Gemma4LayerKind`, which intentionally
+    /// does not derive `PartialEq` (mirrors `Lfm2LayerKind`, which doesn't
+    /// either — this codebase's existing tests compare these routing enums
+    /// via `matches!`/`match`, not `assert_eq!`).
+    fn layer_kind_matches(a: &super::Gemma4LayerKind, b: &super::Gemma4LayerKind) -> bool {
+        use super::Gemma4LayerKind::*;
+        match (a, b) {
+            (Sliding, Sliding) => true,
+            (GlobalPaged { paged_idx: x }, GlobalPaged { paged_idx: y }) => x == y,
+            (
+                SharedOnGlobal {
+                    anchor_paged_idx: x,
+                },
+                SharedOnGlobal {
+                    anchor_paged_idx: y,
+                },
+            ) => x == y,
+            (
+                SharedOnSliding {
+                    anchor_layer_idx: x,
+                },
+                SharedOnSliding {
+                    anchor_layer_idx: y,
+                },
+            ) => x == y,
+            _ => false,
+        }
+    }
+
+    /// `Gemma4Inner::new` must cache `layer_kinds` once instead of
+    /// re-deriving it (BTreeMap/BTreeSet grouping + a sort, see
+    /// `compute_layer_kinds_from_kv_cache_specs`) on every paged
+    /// prefill-chunk / decode-step call. The cached field must always equal
+    /// a fresh from-scratch computation over the same config — covers
+    /// all-global, hybrid sliding+global, and KV-shared layouts (mirrors
+    /// the three `test_compute_layer_kinds_*` cases above).
+    #[test]
+    fn test_gemma4_inner_caches_layer_kinds_matching_fresh_compute() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+
+        let all_global = super::Gemma4Config {
+            num_hidden_layers: 4,
+            layer_types: vec!["full_attention".to_string(); 4],
+            ..paged_tiny_config(Some(true))
+        };
+
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let hybrid = super::Gemma4Config {
+            num_hidden_layers: 10,
+            layer_types: (0..10).map(|i| cycle[i % 5].clone()).collect(),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let shared_layer_types: Vec<String> = (0..8)
+            .map(|i| {
+                if i % 2 == 1 {
+                    "full_attention".to_string()
+                } else {
+                    "sliding_attention".to_string()
+                }
+            })
+            .collect();
+        let kv_shared = super::Gemma4Config {
+            num_hidden_layers: 8,
+            layer_types: shared_layer_types,
+            num_kv_shared_layers: Some(4),
+            ..paged_tiny_config(Some(true))
+        };
+
+        for cfg in [all_global, hybrid, kv_shared] {
+            let expected = super::compute_layer_kinds_from_kv_cache_specs(&cfg)
+                .expect("fresh layer-kind computation must succeed for a valid paged config");
+            let inner = match super::Gemma4Inner::new(cfg) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("No Metal device found") {
+                        eprintln!("skipping (no Metal device): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Gemma4Inner::new failure: {msg}");
+                }
+            };
+            assert!(
+                inner.paged_adapter.is_some(),
+                "test configs force use_block_paged_cache=true"
+            );
+            assert_eq!(
+                inner.layer_kinds.len(),
+                expected.len(),
+                "cached layer_kinds length must match a fresh compute"
+            );
+            for (i, (got, want)) in inner.layer_kinds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    layer_kind_matches(got, want),
+                    "layer {i}: cached layer_kinds diverged from fresh compute: \
+                     got {got:?}, want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Manual timing probe (not a correctness gate — `#[ignore]`d so it
+    /// never runs in CI). Measures the per-call cost this task eliminates:
+    /// re-deriving the routing table from scratch (BTreeMap/BTreeSet + sort)
+    /// vs. the cached `Vec::clone`. Pure CPU, no GPU/model weights, immune
+    /// to thermal throttling. Run with:
+    /// `cargo test -p mlx-core --release --lib -- --ignored --nocapture \
+    ///  bench_layer_kinds_manual`
+    #[test]
+    #[ignore]
+    fn bench_layer_kinds_manual() {
+        // Scaled to ~48 layers with a realistic 5:1 sliding:global cycle
+        // and KV-sharing, so the BTreeMap/BTreeSet grouping + sort has a
+        // realistic amount of work to do.
+        let cycle = ["sliding_attention"; 4]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once("full_attention".to_string()))
+            .collect::<Vec<_>>();
+        let cfg = super::Gemma4Config {
+            num_hidden_layers: 48,
+            layer_types: (0..48).map(|i| cycle[i % 5].clone()).collect(),
+            num_kv_shared_layers: Some(8),
+            ..paged_tiny_config(Some(true))
+        };
+
+        let n: u32 = 200_000;
+
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(
+                super::compute_layer_kinds_from_kv_cache_specs(std::hint::black_box(&cfg)).unwrap(),
+            );
+        }
+        eprintln!("recompute: {:?}/call", start.elapsed() / n);
+
+        let cached = super::compute_layer_kinds_from_kv_cache_specs(&cfg).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(std::hint::black_box(&cached).clone());
+        }
+        eprintln!("cached clone: {:?}/call", start.elapsed() / n);
     }
 
     #[test]
