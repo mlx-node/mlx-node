@@ -14,6 +14,8 @@
 //! 8. Decoder: iterative bbox refinement + class prediction + reading order
 //! 9. Post-processing: score thresholding + box decoding + reading order
 
+use std::sync::OnceLock;
+
 use crate::array::MxArray;
 use crate::nn::linear::Linear;
 use crate::nn::normalization::LayerNorm;
@@ -54,6 +56,12 @@ pub struct PPDocLayoutV3Model {
     mask_query_head: MLPPredictionHead,
     _denoising_class_embed: Option<MxArray>,
     image_processor: PPDocLayoutV3ImageProcessor,
+    /// Cached `(anchors, valid_mask)` from `generate_anchors`. `image_processor`
+    /// always resizes to a fixed 800x800 target (see processing.rs), so the
+    /// resulting `spatial_shapes_list` — and therefore the anchors/valid_mask —
+    /// is identical on every `detect()` call for this model instance. Computed
+    /// once on first use via `get_or_compute_anchors`.
+    anchor_cache: OnceLock<(MxArray, MxArray)>,
 }
 
 /// Generate anchor points for all feature levels.
@@ -132,6 +140,30 @@ fn generate_anchors(
     let inv_anchors = valid_mask.where_(&inv_anchors, &large_val)?;
 
     Ok((inv_anchors, valid_mask))
+}
+
+/// Return the cached `(anchors, valid_mask)` for `spatial_shapes_list`, computing
+/// and storing them on first use.
+///
+/// `generate_anchors` is a pure function of `(spatial_shapes_list, grid_size)` with
+/// no data dependence on image content, and `PPDocLayoutV3ImageProcessor` always
+/// resizes to a fixed 800x800 target, so `spatial_shapes_list` never changes across
+/// `detect()` calls for a given model instance. Caching removes ~30-40 redundant
+/// MLX op dispatches (arange/reshape/broadcast/concat/sigmoid) per call.
+fn get_or_compute_anchors(
+    cache: &OnceLock<(MxArray, MxArray)>,
+    spatial_shapes_list: &[(i64, i64)],
+    grid_size: f64,
+) -> Result<(MxArray, MxArray)> {
+    if let Some(cached) = cache.get() {
+        return Ok(cached.clone());
+    }
+    let computed = generate_anchors(spatial_shapes_list, grid_size)?;
+    // If another thread raced us here, `set` silently loses the race; both
+    // computations are equivalent since spatial_shapes_list is constant, so
+    // either value already stored is correct to keep using.
+    let _ = cache.set(computed.clone());
+    Ok(computed)
 }
 
 #[napi]
@@ -224,8 +256,9 @@ impl PPDocLayoutV3Model {
         }
         let level_start_index = MxArray::from_float32(&start_indices, &[num_levels as i64])?;
 
-        // 7. Generate anchors
-        let (anchors, valid_mask) = generate_anchors(&spatial_shapes_list, 0.05)?;
+        // 7. Generate anchors (cached across calls; see get_or_compute_anchors)
+        let (anchors, valid_mask) =
+            get_or_compute_anchors(&self.anchor_cache, &spatial_shapes_list, 0.05)?;
 
         // 8. Apply valid mask and compute encoder output
         let valid_mask_float = valid_mask.astype(crate::array::DType::Float32)?;
@@ -400,6 +433,7 @@ pub(super) fn create_model(
         mask_query_head,
         _denoising_class_embed: denoising_class_embed,
         image_processor: PPDocLayoutV3ImageProcessor::new(),
+        anchor_cache: OnceLock::new(),
     }
 }
 
@@ -418,5 +452,46 @@ mod tests {
 
         let v_shape: Vec<i64> = valid_mask.shape().unwrap().as_ref().to_vec();
         assert_eq!(v_shape, vec![1, total, 1]);
+    }
+
+    /// Regression test for the anchor cache: simulates two `detect()` calls (as
+    /// would happen for two different images, both resized to the fixed 800x800
+    /// target so `spatial_shapes_list` is identical) and asserts:
+    /// 1. The second call reuses the exact same cached MLX arrays (proving
+    ///    `generate_anchors` was not invoked again on cache hit), and
+    /// 2. The cached values are byte-for-byte identical to a fresh, uncached
+    ///    `generate_anchors` computation, so caching introduces no drift in the
+    ///    layout results.
+    #[test]
+    fn test_anchor_cache_reuses_across_calls_without_drift() {
+        let shapes = vec![(100, 100), (50, 50), (25, 25)];
+        let cache: OnceLock<(MxArray, MxArray)> = OnceLock::new();
+
+        // First "detect() call": cache is empty, computes and stores.
+        let (anchors1, valid1) = get_or_compute_anchors(&cache, &shapes, 0.05).unwrap();
+        // Second "detect() call" for a different image, same fixed target shapes.
+        let (anchors2, valid2) = get_or_compute_anchors(&cache, &shapes, 0.05).unwrap();
+
+        // Same underlying MLX array handle reused on cache hit.
+        assert_eq!(anchors1.as_raw_ptr(), anchors2.as_raw_ptr());
+        assert_eq!(valid1.as_raw_ptr(), valid2.as_raw_ptr());
+
+        // Cached values match a fresh, uncached computation exactly.
+        let (fresh_anchors, fresh_valid) = generate_anchors(&shapes, 0.05).unwrap();
+        assert_eq!(
+            anchors1.to_float32().unwrap().to_vec(),
+            fresh_anchors.to_float32().unwrap().to_vec()
+        );
+        let cached_valid_f32 = valid1
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let fresh_valid_f32 = fresh_valid
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        assert_eq!(cached_valid_f32.to_vec(), fresh_valid_f32.to_vec());
     }
 }
