@@ -61,6 +61,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use hashlink::LinkedHashSet;
+
 /// A physical block in GPU memory
 #[derive(Debug)]
 pub struct PhysicalBlock {
@@ -139,8 +141,15 @@ pub struct BlockAllocator {
     /// Reverse mapping: block_id -> hash (for cleanup during free)
     block_hashes: HashMap<u32, u64>,
 
-    /// LRU order for prefix cache eviction (oldest first)
-    lru_order: VecDeque<u64>,
+    /// LRU order for prefix cache eviction (oldest first).
+    ///
+    /// Backed by an intrusive doubly-linked hash set (`hashlink`) rather
+    /// than a `VecDeque` so that "touch" (move-to-back on cache hit) and
+    /// single-entry removal are O(1) amortized instead of an O(n)
+    /// `retain()` over the whole order. Mirrors vLLM's
+    /// `FreeKVCacheBlockQueue` / `BlockPool.touch()` intent, without a
+    /// hand-rolled unsafe intrusive list.
+    lru_order: LinkedHashSet<u64>,
 
     /// Maximum entries in prefix cache
     max_prefix_cache_entries: usize,
@@ -205,7 +214,7 @@ impl BlockAllocator {
             prefix_cache: HashMap::new(),
             prefix_cache_identities: HashMap::new(),
             block_hashes: HashMap::new(),
-            lru_order: VecDeque::new(),
+            lru_order: LinkedHashSet::new(),
             // Scale the prefix-cache capacity to `num_blocks` so the cache
             // can accommodate the full live block set. `num_blocks` is the
             // natural upper bound — no more than that many blocks can ever
@@ -253,31 +262,43 @@ impl BlockAllocator {
     /// logical ref). The block_id is NOT pushed onto `free_blocks` —
     /// `allocate` will reuse it directly via the returned id.
     fn try_evict_lru_for_allocation(&mut self) -> Option<u32> {
-        // Snapshot the LRU order so we can mutate `prefix_cache` /
-        // `block_hashes` / `allocated` without invalidating iteration.
-        let candidates: Vec<u64> = self.lru_order.iter().copied().collect();
-        for hash in candidates {
-            let Some(block) = self.prefix_cache.get(&hash) else {
-                // Desync (shouldn't happen, but defensive): entry in
-                // lru_order has no matching prefix_cache record. Skip.
-                continue;
-            };
-            if block.get_ref_count() != 1 {
-                // In use by a live request — skip and try the next.
-                continue;
+        // Scan the LRU order oldest-first for the first cache-only entry.
+        // Unlike the old approach (cloning the ENTIRE `lru_order` into a
+        // fresh `Vec` on every call), this only visits entries up to the
+        // match and remembers a single `u64` — no whole-list allocation.
+        // The scan itself still has to walk past any entries that are
+        // in-use (ref_count > 1); that's inherent to "oldest cache-only
+        // wins" eviction, not an artifact of the container type.
+        let mut evict_hash = None;
+        for &hash in self.lru_order.iter() {
+            match self.prefix_cache.get(&hash) {
+                Some(block) if block.get_ref_count() == 1 => {
+                    evict_hash = Some(hash);
+                    break;
+                }
+                // ref_count > 1: in use by a live request — keep scanning.
+                // None: desync (shouldn't happen, but defensive) — keep scanning.
+                _ => continue,
             }
-            let block_id = block.block_id;
-            // Release the cache's logical ref (1 → 0).
-            let _ = block.decref();
-            // Remove all bookkeeping for this entry.
-            self.prefix_cache.remove(&hash);
-            self.prefix_cache_identities.remove(&hash);
-            self.block_hashes.remove(&block_id);
-            self.lru_order.retain(|&h| h != hash);
-            self.allocated.remove(&block_id);
-            return Some(block_id);
         }
-        None
+        let hash = evict_hash?;
+
+        // Re-borrow now that the scan's immutable borrow of `lru_order` has
+        // ended, so we're free to mutate `prefix_cache` / `lru_order` below.
+        let block = self
+            .prefix_cache
+            .get(&hash)
+            .expect("hash found during the scan above; no mutation happened in between");
+        let block_id = block.block_id;
+        // Release the cache's logical ref (1 → 0).
+        let _ = block.decref();
+        // Remove all bookkeeping for this entry.
+        self.prefix_cache.remove(&hash);
+        self.prefix_cache_identities.remove(&hash);
+        self.block_hashes.remove(&block_id);
+        self.lru_order.remove(&hash);
+        self.allocated.remove(&block_id);
+        Some(block_id)
     }
 
     /// Free a block
@@ -461,7 +482,7 @@ impl BlockAllocator {
                 // is safe and avoids a free→re-allocate flap.
                 let _ = block.decref();
             }
-            self.lru_order.retain(|&h| h != existing_hash);
+            self.lru_order.remove(&existing_hash);
         }
 
         // Step 3 (capacity eviction, only on genuine insertion): if this
@@ -498,12 +519,14 @@ impl BlockAllocator {
             }
         }
 
-        // Step 4: LRU refresh (remove if exists, add to end) + insert.
-        // Take the cache's logical reference iff this is a genuine new
-        // insertion. An idempotent refresh leaves ref_count unchanged so
-        // the cache continues to hold exactly ONE logical ref per entry.
-        self.lru_order.retain(|&h| h != hash);
-        self.lru_order.push_back(hash);
+        // Step 4: LRU refresh (move to back if present, insert if not) +
+        // insert into `prefix_cache`. Take the cache's logical reference
+        // iff this is a genuine new insertion. An idempotent refresh leaves
+        // ref_count unchanged so the cache continues to hold exactly ONE
+        // logical ref per entry. `LinkedHashSet::insert` is an O(1)
+        // amortized move-to-back when `hash` is already present, replacing
+        // the old O(n) retain()+push_back() pair.
+        self.lru_order.insert(hash);
 
         // Track the hash for this block (for cleanup during free)
         self.block_hashes.insert(block.block_id, hash);
@@ -527,9 +550,12 @@ impl BlockAllocator {
     /// Returns the cached block if found, incrementing its ref count
     pub(crate) fn lookup_prefix(&mut self, hash: u64) -> Option<Arc<PhysicalBlock>> {
         if let Some(block) = self.prefix_cache.get(&hash) {
-            // Update LRU order
-            self.lru_order.retain(|&h| h != hash);
-            self.lru_order.push_back(hash);
+            // Update LRU order: O(1) amortized move-to-back (insert is a
+            // no-op re-link when `hash` is already present), replacing the
+            // old O(n) retain()+push_back() pair. This runs once per
+            // matched block on every prefix-cache hit, so it's the hottest
+            // of the four LRU-touch sites in this file.
+            self.lru_order.insert(hash);
 
             // Increment ref count and return
             block.incref();
@@ -2041,6 +2067,68 @@ mod tests {
         assert!(allocator.lookup_prefix(h2).is_some());
         assert!(allocator.lookup_prefix(h3).is_some());
         assert!(allocator.lookup_prefix(h4).is_some());
+    }
+
+    #[test]
+    fn test_register_prefix_refresh_moves_hash_to_mru() {
+        // Discriminating regression test for the core Task-13 semantic:
+        // `LinkedHashSet::insert` of an ALREADY-PRESENT key must move it to
+        // the back (MRU), exactly like the old `retain(..); push_back(..)`.
+        // A hypothetical broken swap (e.g. `replace`, which does NOT reposition
+        // an existing entry) would leave the refreshed hash at the front and
+        // get it wrongly evicted. This test fails under that broken variant.
+        //
+        // Unlike `test_register_prefix_idempotent_at_capacity`, this test
+        // never calls `lookup_prefix` before the final assertions (lookup also
+        // bumps LRU order and would confound the outcome). It refreshes the
+        // OLDEST entry via `register_prefix` and checks membership through the
+        // non-bumping `prefix_cache.contains_key`.
+        let mut allocator = BlockAllocator::new(8, 4);
+        allocator.max_prefix_cache_entries = 3;
+
+        let block_1 = allocator.allocate().unwrap();
+        let block_2 = allocator.allocate().unwrap();
+        let block_3 = allocator.allocate().unwrap();
+
+        let h1 = 0x1111_1111_1111_1111;
+        let h2 = 0x2222_2222_2222_2222;
+        let h3 = 0x3333_3333_3333_3333;
+
+        // Insertion order → lru_order front..back = [h1, h2, h3]. h1 is oldest.
+        allocator.register_prefix(Arc::clone(&block_1), h1);
+        allocator.register_prefix(Arc::clone(&block_2), h2);
+        allocator.register_prefix(Arc::clone(&block_3), h3);
+        assert_eq!(allocator.prefix_cache.len(), 3);
+
+        // Idempotent refresh of the OLDEST entry (block_1 under h1). Correct
+        // move-to-back → order becomes [h2, h3, h1], making h2 the new LRU.
+        // (Broken no-reposition → order stays [h1, h2, h3], h1 still LRU.)
+        allocator.register_prefix(Arc::clone(&block_1), h1);
+
+        // Force exactly one capacity eviction with a genuinely new hash.
+        let block_4 = allocator.allocate().unwrap();
+        let h4 = 0x4444_4444_4444_4444;
+        allocator.register_prefix(Arc::clone(&block_4), h4);
+
+        // Correct move-to-back: h2 (new LRU after the refresh) is evicted;
+        // the refreshed h1 survives. Under a broken swap, h1 would be gone.
+        assert!(
+            allocator.prefix_cache.contains_key(&h1),
+            "refreshing h1 must move it to MRU so it survives the next eviction"
+        );
+        assert!(
+            !allocator.prefix_cache.contains_key(&h2),
+            "h2 became the LRU after h1's refresh and must be the evicted entry"
+        );
+        assert!(
+            allocator.prefix_cache.contains_key(&h3),
+            "h3 was newer than the evicted LRU and must survive"
+        );
+        assert!(
+            allocator.prefix_cache.contains_key(&h4),
+            "h4 is the freshly inserted entry"
+        );
+        assert_eq!(allocator.prefix_cache.len(), 3);
     }
 
     #[test]
