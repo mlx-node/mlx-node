@@ -53,8 +53,14 @@ use crate::utils::gemma_quant_repack::{
     repack_symmetric_per_group_to_mlx_affine, repack_symmetric_to_mlx_affine,
 };
 
-/// MLX affine group size for 2/4-bit linears and `embed_tokens`.
-const LINEAR_GROUP_SIZE: usize = 64;
+/// MLX affine group size for 2/4-bit linears and `embed_tokens`. 128 is the
+/// largest group size MLX affine quantization accepts (`affine_quantize`
+/// only allows 32/64/128). Every group in a row already carries the same
+/// per-row scale from the Google QAT source (see
+/// `repack_symmetric_to_mlx_affine`'s module doc), so there is zero
+/// numerical difference between group sizes here — the largest legal one
+/// halves the `.scales`/`.biases` table for free.
+const LINEAR_GROUP_SIZE: usize = 128;
 /// MLX affine group size for the PLE `embed_tokens_per_layer` embedding.
 const PLE_GROUP_SIZE: usize = 128;
 /// Width of a source scale block in the PLE embedding (`8960 / 35 = 256`).
@@ -719,7 +725,7 @@ mod tests {
         assert_eq!(s.dtype().unwrap(), DType::Float32);
         assert_eq!(b.dtype().unwrap(), DType::Float32);
 
-        let deq = affine_dequant(w, s, b, bits, 64);
+        let deq = affine_dequant(w, s, b, bits, 128);
         for o in 0..out_f {
             for c in 0..in_f {
                 let expected = q[o * in_f + c] as f32 * scales[o];
@@ -729,7 +735,7 @@ mod tests {
         // override keyed by post-sanitize prefix (bare module tail).
         let route = ov.get("layers.0.self_attn.q_proj").unwrap();
         assert_eq!(route["bits"], 4);
-        assert_eq!(route["group_size"], 64);
+        assert_eq!(route["group_size"], 128);
         assert_eq!(route["mode"], "affine");
     }
 
@@ -754,7 +760,7 @@ mod tests {
         let w = out.get(&format!("{base}.weight")).unwrap();
         let s = out.get(&format!("{base}.scales")).unwrap();
         let b = out.get(&format!("{base}.biases")).unwrap();
-        let deq = affine_dequant(w, s, b, bits, 64);
+        let deq = affine_dequant(w, s, b, bits, 128);
         for o in 0..out_f {
             for c in 0..in_f {
                 let expected = q[o * in_f + c] as f32 * scales[o];
@@ -767,7 +773,7 @@ mod tests {
     #[test]
     fn test_mlp_layer_schedule_4bit_below_15() {
         // mlp on layer 14 must be 4-bit (boundary).
-        let (out_f, in_f, bits) = (2usize, 64usize, 4u32);
+        let (out_f, in_f, bits) = (2usize, 128usize, 4u32);
         let q = make_q(out_f, in_f, bits);
         let scales = per_row_scales(out_f, 0.002);
         let mut raw = HashMap::new();
@@ -825,7 +831,7 @@ mod tests {
         let w = out.get(&format!("{base}.weight")).unwrap();
         let s = out.get(&format!("{base}.scales")).unwrap();
         let b = out.get(&format!("{base}.biases")).unwrap();
-        let deq = affine_dequant(w, s, b, bits, 64);
+        let deq = affine_dequant(w, s, b, bits, 128);
         for o in 0..vocab {
             for c in 0..dim {
                 let expected = q[o * dim + c] as f32 * scales[o];
@@ -833,7 +839,7 @@ mod tests {
             }
         }
         assert_eq!(ov["embed_tokens"]["bits"], 2);
-        assert_eq!(ov["embed_tokens"]["group_size"], 64);
+        assert_eq!(ov["embed_tokens"]["group_size"], 128);
     }
 
     #[test]
@@ -1101,7 +1107,7 @@ mod tests {
         let b = out.get(&format!("{base}.biases")).unwrap();
         assert_eq!(ov["layers.0.self_attn.q_proj"]["bits"], 4);
 
-        let deq = affine_dequant(w, s, b, 4, 64);
+        let deq = affine_dequant(w, s, b, 4, 128);
         let in_f = w_shape[1] * 2; // 4-bit → 2 vals/byte
         // Row-0 golden (first 16 vals), copied from the Task-1 numpy golden.
         let golden_row0: [f32; 16] = [
@@ -1135,7 +1141,7 @@ mod tests {
     #[test]
     fn test_key_namespace_full_prefix_stripped() {
         // Feed the longest HF wrapper prefix and assert the canonical output key.
-        let (out_f, in_f, bits) = (2usize, 64usize, 4u32);
+        let (out_f, in_f, bits) = (2usize, 128usize, 4u32);
         let q = make_q(out_f, in_f, bits);
         let scales = per_row_scales(out_f, 0.001);
         let mut raw = HashMap::new();

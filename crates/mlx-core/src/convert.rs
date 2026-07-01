@@ -10119,7 +10119,7 @@ mod tests {
             "{lm_head_key} mode must be 'affine'"
         );
 
-        // embed_tokens: 2-bit affine, group_size=64
+        // embed_tokens: 2-bit affine, group_size=128
         let et_key = "language_model.model.embed_tokens";
         let et = quant.get(et_key).unwrap_or_else(|| {
             panic!("quantization block must contain per-layer override for {et_key}")
@@ -10127,8 +10127,8 @@ mod tests {
         assert_eq!(et["bits"].as_i64(), Some(2), "{et_key} bits must be 2");
         assert_eq!(
             et["group_size"].as_i64(),
-            Some(64),
-            "{et_key} group_size must be 64"
+            Some(128),
+            "{et_key} group_size must be 128"
         );
         assert_eq!(
             et["mode"].as_str(),

@@ -42,7 +42,9 @@
 /// * `out_features` — number of output channels (rows)
 /// * `in_features` — number of input channels (logical columns per row)
 /// * `bits` — 2 or 4
-/// * `group_size` — MLX affine group size (e.g. 64 for linear projections)
+/// * `group_size` — MLX affine group size (e.g. 128 for linear projections;
+///   MLX affine only accepts 32/64/128, and since every group in a row
+///   carries the same source per-row scale, 128 is always optimal here)
 ///
 /// # Returns
 /// `(weight, scales, biases)` as raw Vecs:
