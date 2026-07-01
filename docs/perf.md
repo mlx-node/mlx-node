@@ -43,6 +43,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_QWEN3_NATIVE_KV_WRITE`                          | Toggle graph-native paged KV write/decode-gather on Qwen3 (plain) dense; default on, falls back to the legacy synchronous path on error                                             |
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`                    | Weight-loading chunk size                                                                                                                                                            |
 | `MLX_GDN_KERNEL=perstep\|chunked`                    | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts) |
+| `MLX_LFM2_CONV_STATE_REUSE`                          | Opt-in (default off): reuse live conv state on warm LFM2 paged continuation instead of reconstructing it, skipping the redundant Pass-1 over the cached prefix. Materially changes warm-turn output (~40 ULP, near-tie argmax may flip); off until oracle-validated |
 
 ### Paged-attention
 
