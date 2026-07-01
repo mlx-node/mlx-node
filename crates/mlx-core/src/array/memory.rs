@@ -219,6 +219,95 @@ pub fn maybe_eval_clear_for_paged_prefill_layer(
     Ok(())
 }
 
+/// Default `PrivacyFilterModel::classify()` cache-clear cadence, in calls.
+///
+/// `classify()` is a single-shot (non-autoregressive) forward pass with no
+/// caller-supplied step counter, so unlike the paged-decode path this counts
+/// *calls* rather than *steps*. The old behavior called
+/// [`synchronize_and_clear_cache`] unconditionally after every call — a full
+/// GPU stall plus an allocator wipe on top of the actual forward pass, every
+/// single time `classify()` runs. For the module's stated use case
+/// (PII-scanning a stream of chat messages / document chunks) that tax is
+/// paid on every message.
+///
+/// Unlike the paged-decode / paged-prefill loops, `privacy_filter` model
+/// loads never register with [`crate::cache_limit::CacheLimitCoordinator`]
+/// (see `models/privacy_filter/persistence.rs::load_from_directory`), so
+/// MLX's caching allocator has no size cap of its own for this model — an
+/// aggressive cadence would let the cache grow without bound across a long
+/// classify stream. The default here is therefore deliberately far more
+/// conservative than [`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT`] (1024):
+/// 8 calls' worth of a small 8-layer/640-hidden forward pass's transients is
+/// a few tens of MB at most, while still cutting the number of forced
+/// stalls+wipes by 8× over an uninterrupted stream.
+///
+/// Override at runtime via `MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL`
+/// (positive integer). The env var is read once on first use and cached;
+/// invalid / non-positive values fall back to this default.
+pub const PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT: i32 = 8;
+
+/// Effective cadence — `MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL` env override
+/// or [`PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT`]. Read once on first
+/// call and cached; subsequent reads hit the OnceLock fast path.
+pub fn privacy_filter_cache_clear_interval() -> i32 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<i32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_privacy_filter_cache_clear_interval(
+            std::env::var("MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL").ok(),
+        )
+    })
+}
+
+/// Pure parser for the privacy-filter cache-clear-interval env value.
+/// Extracted so it can be unit tested without touching process env state
+/// (which `privacy_filter_cache_clear_interval` reads exactly once via
+/// `OnceLock` per process).
+fn parse_privacy_filter_cache_clear_interval(env_value: Option<String>) -> i32 {
+    match env_value {
+        Some(s) => s
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT),
+        None => PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT,
+    }
+}
+
+/// Pure predicate: should call number `call_number` (1-indexed count of
+/// `classify()` invocations since process start) trigger a cache clear at
+/// the given `interval`? Extracted so the cadence boundary logic is
+/// unit-testable without the process-wide atomic counter or a live MLX
+/// context.
+fn should_clear_for_privacy_filter_call(call_number: i64, interval: i32) -> bool {
+    interval > 0 && call_number % i64::from(interval) == 0
+}
+
+/// Helper: clear MLX's caching allocator on every Nth call to
+/// `PrivacyFilterModel::classify()`.
+///
+/// Unlike [`maybe_clear_cache_for_paged_step`], `classify()` has no
+/// caller-supplied step index — every call is an independent forward pass
+/// — so this keeps its own process-wide call counter (shared across every
+/// loaded `PrivacyFilterModel` instance, since MLX's caching allocator is
+/// itself process-wide).
+///
+/// Deliberately does **not** call [`synchronize`] first: `classify()`
+/// already forces the entire forward-pass graph to complete on the GPU via
+/// `probs.eval()` / `log_probs.eval()` before reaching this call (mirroring
+/// how [`maybe_clear_cache_for_paged_step`] relies on the paged loop's own
+/// per-step sync rather than synchronizing again here).
+#[inline]
+pub fn maybe_clear_cache_for_privacy_filter_call() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static CALLS: AtomicI64 = AtomicI64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_clear_for_privacy_filter_call(n, privacy_filter_cache_clear_interval()) {
+        clear_cache();
+    }
+}
+
 /// Get actively used memory in bytes (excludes cached memory).
 /// Internal Rust-only function — use memoryCleanupThreshold config for
 /// memory-based cleanup.
@@ -555,5 +644,84 @@ mod tests {
     #[test]
     fn parse_chunk_size_trims_whitespace() {
         assert_eq!(parse_chunk_size(Some("  512  ".to_string())), 512);
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_returns_default_when_env_unset() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(None),
+            PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_returns_default_when_empty_string() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("".to_string())),
+            PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_returns_default_when_non_integer() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("abc".to_string())),
+            PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_returns_default_when_zero_or_negative() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("0".to_string())),
+            PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT
+        );
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("-8".to_string())),
+            PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_positive_returns_value() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("32".to_string())),
+            32
+        );
+    }
+
+    #[test]
+    fn parse_privacy_filter_cache_clear_interval_trims_whitespace() {
+        assert_eq!(
+            parse_privacy_filter_cache_clear_interval(Some("  16  ".to_string())),
+            16
+        );
+    }
+
+    #[test]
+    fn should_clear_for_privacy_filter_call_fires_on_multiples_of_interval() {
+        let interval = 8;
+        for call in 1..8 {
+            assert!(
+                !should_clear_for_privacy_filter_call(call, interval),
+                "call {call} should not clear at interval {interval}"
+            );
+        }
+        assert!(should_clear_for_privacy_filter_call(8, interval));
+        for call in 9..16 {
+            assert!(
+                !should_clear_for_privacy_filter_call(call, interval),
+                "call {call} should not clear at interval {interval}"
+            );
+        }
+        assert!(should_clear_for_privacy_filter_call(16, interval));
+    }
+
+    #[test]
+    fn should_clear_for_privacy_filter_call_never_fires_for_nonpositive_interval() {
+        for call in 1..20 {
+            assert!(!should_clear_for_privacy_filter_call(call, 0));
+            assert!(!should_clear_for_privacy_filter_call(call, -1));
+        }
     }
 }

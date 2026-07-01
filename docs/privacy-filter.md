@@ -221,7 +221,7 @@ Quality on long-form text was validated only on a 5-fixture short-input parity s
 
 ## Memory on Apple Silicon
 
-`process.memoryUsage().rss` undercounts Metal buffer allocations because Apple's unified memory architecture charges GPU buffers to the process's **`phys_footprint`** (what Activity Monitor's "Memory" column displays) rather than the resident set. For accurate measurements use `vmmap -summary <pid> | grep "Physical footprint"` or the `footprint` CLI. Each `classify()` call clears the MLX buffer cache before returning, so steady-state footprint stays bounded; transient peaks between calls scale with input length.
+`process.memoryUsage().rss` undercounts Metal buffer allocations because Apple's unified memory architecture charges GPU buffers to the process's **`phys_footprint`** (what Activity Monitor's "Memory" column displays) rather than the resident set. For accurate measurements use `vmmap -summary <pid> | grep "Physical footprint"` or the `footprint` CLI. Every `PRIVACY_FILTER_CACHE_CLEAR_INTERVAL`-th `classify()` call (default 8; override via `MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL`) clears the MLX buffer cache, so steady-state footprint stays bounded across a cadence window rather than after every single call; transient peaks between clears scale with both input length and the configured cadence.
 
 ## Internals
 

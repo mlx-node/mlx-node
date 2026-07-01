@@ -215,17 +215,29 @@ impl PrivacyFilterModelJs {
         debug_assert_eq!(probs_flat.len(), n_tokens * num_classes);
         debug_assert_eq!(log_probs_flat.len(), n_tokens * num_classes);
 
-        // Drop GPU-side intermediates and reclaim MLX's buffer cache.
-        // Without this, repeated `classify` calls grow the cache
-        // unboundedly (one classify allocates ~per-layer hidden states,
-        // attention K/V, MLP gate/up/down for 8 layers + the [1, T, 33]
-        // logits + softmax/log-softmax tensors).
+        // Drop GPU-side intermediates. `probs.eval()` / `log_probs.eval()`
+        // above already forced the whole forward-pass graph to complete
+        // on the GPU before we pulled `probs_flat` / `log_probs_flat` to
+        // the host, so these drops just release refcounts.
         drop(probs);
         drop(log_probs);
         drop(logits_f32);
         drop(logits);
         drop(input_ids);
-        crate::array::memory::synchronize_and_clear_cache();
+
+        // Reclaim MLX's caching allocator — but on a cadence, not every
+        // call. Without *any* clearing, repeated `classify` calls grow
+        // the cache unboundedly (one classify allocates ~per-layer
+        // hidden states, attention K/V, MLP gate/up/down for 8 layers +
+        // the [1, T, 33] logits + softmax/log-softmax tensors). Clearing
+        // on *every* call pairs a full GPU stall with an allocator wipe
+        // on top of the actual forward pass, for every single
+        // invocation — worse than the paged-decode loop's old,
+        // already-rejected cadence=64 (see
+        // `crate::array::memory::PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT`).
+        // See `maybe_clear_cache_for_privacy_filter_call`'s doc comment
+        // for why no extra `synchronize()` is needed at this call site.
+        crate::array::memory::maybe_clear_cache_for_privacy_filter_call();
 
         // ---- 4. Build the emission matrix [T, num_classes] from
         //         log-softmax. ----
@@ -405,5 +417,55 @@ mod tests {
         assert_eq!(merged.transition_bias_inside_to_end, -0.25);
         // Inherited zero-default:
         assert_eq!(merged.transition_bias_end_to_start, 0.0);
+    }
+
+    fn checkpoint_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".cache/models/privacy-filter")
+    }
+
+    /// Soak test for the cadence-gated cache clear in `classify()`
+    /// (`crate::array::memory::maybe_clear_cache_for_privacy_filter_call`).
+    ///
+    /// Runs `classify()` well past several cadence boundaries (default
+    /// interval is 8; 50 calls crosses it 6 times) and asserts MLX's
+    /// cache memory does not grow monotonically call-over-call — i.e.
+    /// gating the clear to every Nth call still bounds steady-state
+    /// footprint, it just amortizes the stall+wipe cost instead of
+    /// paying it on every single call.
+    #[test]
+    #[ignore = "requires .cache/models/privacy-filter — run with --ignored"]
+    fn classify_soak_cache_bounded() {
+        use crate::array::memory::get_cache_memory;
+
+        let inner = PrivacyFilterModel::load_from_dir(&checkpoint_dir()).expect("load model");
+        let model = PrivacyFilterModelJs { inner };
+
+        let text = "Hi I am Alice Smith, email alice@example.com";
+
+        // Warm up so first-call-only costs (e.g. any one-time kernel
+        // compilation) don't skew the "unbounded growth" comparison below.
+        model
+            .classify(text.to_string(), None)
+            .expect("warmup classify");
+        let cache_after_warmup = get_cache_memory();
+
+        for _ in 0..50 {
+            model.classify(text.to_string(), None).expect("classify");
+        }
+        let cache_after_soak = get_cache_memory();
+
+        // Bound rather than assert exact equality: allocator fragmentation
+        // can shift this a little run to run, but it must not scale with
+        // the number of calls (50 calls at unconditional-clear-per-call
+        // would stay ~flat too; this guards against a regression back to
+        // "never clear" rather than proving the OLD unconditional-clear
+        // behavior specifically).
+        assert!(
+            cache_after_soak <= cache_after_warmup * 3.0 + 16.0 * 1024.0 * 1024.0,
+            "cache memory grew unboundedly over 50 classify() calls: \
+             after_warmup={cache_after_warmup} after_soak={cache_after_soak}",
+        );
     }
 }
