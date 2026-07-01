@@ -37,14 +37,16 @@ impl<'a> AttentionLayer<'a> {
     /// Input shape:  `[B, T, hidden_size]`
     /// Output shape: `[B, T, hidden_size]`
     ///
-    /// `band` is the bidirectional attention window in tokens —
-    /// `|q_pos - k_pos| <= band`. For `sliding_attention` layers pass
-    /// `config.sliding_window`; for `full_attention` layers pass an
-    /// effectively-unbounded value (use
-    /// [`PrivacyFilterConfig::band_for_layer`]). Per gpt-oss defaults,
-    /// half the layers alternate to full attention — applying the sliding
-    /// band to every layer cripples the bidirectional receptive field.
-    pub fn forward(&self, hidden: &MxArray, band: i32) -> Result<MxArray> {
+    /// `band_mask` is the precomputed `[T, T]` bidirectional band mask
+    /// (`0` where `|q_pos - k_pos| <= band`, `-inf` otherwise) for this
+    /// layer's attention window — built once via
+    /// `crate::array::banded_attention::build_band_mask` and shared by
+    /// every layer of the same type (`sliding_attention` vs
+    /// `full_attention`; see [`PrivacyFilterConfig::band_for_layer`]).
+    /// Building it once per distinct `(T, band)` pair instead of once per
+    /// layer matters here: gpt-oss alternates only 2 distinct bands
+    /// across the whole stack, so per-layer rebuilding is pure waste.
+    pub fn forward(&self, hidden: &MxArray, band_mask: &MxArray) -> Result<MxArray> {
         let batch = hidden.shape_at(0)?;
         let seq_len = hidden.shape_at(1)?;
 
@@ -130,15 +132,11 @@ impl<'a> AttentionLayer<'a> {
         let k = MxArray::from_handle(k, "privacy_filter yarn rope (k)")?;
 
         // 5. Banded attention with per-head sinks. Sliding window is
-        //    bidirectional: |q - k| <= band. `band` is supplied by the
-        //    caller because gpt-oss alternates sliding / full attention
-        //    per layer — see [`PrivacyFilterConfig::band_for_layer`].
-        if band < 0 {
-            return Err(Error::from_reason(format!(
-                "privacy_filter::AttentionLayer: band must be non-negative, got {band}",
-            )));
-        }
-        let attn = banded_attention(&q, &k, &v, &self.weights.sinks, band)?;
+        //    bidirectional: |q - k| <= band, already baked into
+        //    `band_mask` by the caller because gpt-oss alternates
+        //    sliding / full attention per layer — see
+        //    [`PrivacyFilterConfig::band_for_layer`].
+        let attn = banded_attention(&q, &k, &v, &self.weights.sinks, band_mask)?;
 
         // 6. Merge heads `[B, H, T, D]` → `[B, T, H*D]` and apply the output
         //    projection (`o_proj.weight` shape `[hidden_size, num_q_heads *
@@ -212,7 +210,12 @@ mod tests {
         .expect("random hidden");
 
         let band = loaded.config.band_for_layer(0);
-        let out = layer.forward(&hidden, band).expect("attention forward");
+        let seq_len = hidden.shape_at(1).expect("hidden seq_len");
+        let band_mask = crate::array::banded_attention::build_band_mask(seq_len, band)
+            .expect("build_band_mask");
+        let out = layer
+            .forward(&hidden, &band_mask)
+            .expect("attention forward");
 
         let shape = out.shape().unwrap().to_vec();
         assert_eq!(shape, vec![1, 8, loaded.config.hidden_size as i64]);
@@ -261,8 +264,11 @@ mod tests {
         .expect("random hidden");
 
         let band = loaded.config.band_for_layer(0);
-        let a = layer.forward(&hidden, band).expect("forward 1");
-        let b = layer.forward(&hidden, band).expect("forward 2");
+        let seq_len = hidden.shape_at(1).expect("hidden seq_len");
+        let band_mask = crate::array::banded_attention::build_band_mask(seq_len, band)
+            .expect("build_band_mask");
+        let a = layer.forward(&hidden, &band_mask).expect("forward 1");
+        let b = layer.forward(&hidden, &band_mask).expect("forward 2");
 
         let av = a.astype(DType::Float32).unwrap().to_float32().unwrap();
         let bv = b.astype(DType::Float32).unwrap().to_float32().unwrap();

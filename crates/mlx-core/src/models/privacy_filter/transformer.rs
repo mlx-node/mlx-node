@@ -42,11 +42,13 @@ pub struct Block<'a> {
     /// model load and threaded through every block — see
     /// [`super::yarn::compute_yarn_freqs`].
     pub yarn_freqs: &'a MxArray,
-    /// Index of this block within the stack (`0..num_hidden_layers`).
-    /// Drives the per-layer attention type (sliding vs full) via
-    /// [`PrivacyFilterConfig::band_for_layer`] — gpt-oss alternates
-    /// sliding/full attention by default.
-    pub layer_idx: usize,
+    /// Precomputed `[T, T]` band mask for this block's attention type
+    /// (sliding vs full — see [`PrivacyFilterConfig::band_for_layer`]).
+    /// Built once per distinct `(T, band)` pair by the caller
+    /// (`forward::PrivacyFilterModel::forward_logits`) and shared by
+    /// every layer of the same type, instead of being rebuilt here from
+    /// a raw `layer_idx` on every layer.
+    pub band_mask: &'a MxArray,
 }
 
 impl<'a> Block<'a> {
@@ -61,15 +63,14 @@ impl<'a> Block<'a> {
         let attn_in = pre_attn_norm.forward(hidden)?;
 
         // 2. Self-attention with banded mask + YaRN RoPE + sinks. The
-        //    band depends on whether this layer is `sliding_attention`
-        //    or `full_attention` per the gpt-oss default alternation.
+        //    band mask is precomputed by the caller and shared across
+        //    every layer of the same sliding/full type.
         let attn = AttentionLayer {
             weights: &self.weights.self_attn,
             config: self.config,
             yarn_freqs: self.yarn_freqs,
         };
-        let band = self.config.band_for_layer(self.layer_idx);
-        let attn_out = attn.forward(&attn_in, band)?;
+        let attn_out = attn.forward(&attn_in, self.band_mask)?;
 
         // 3. First residual.
         let hidden = hidden.add(&attn_out)?;

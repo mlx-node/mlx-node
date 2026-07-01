@@ -45,7 +45,19 @@ use napi::bindgen_prelude::*;
 ///
 /// Constructed as: `where(|q - k| <= band, 0, -inf)`. The caller is expected to
 /// reshape to `[1, 1, T, T]` and add to the (B, H, T, T) logits tensor.
-fn build_band_mask(t: i64, band: i32) -> Result<MxArray> {
+///
+/// `pub(crate)` because callers that run several layers sharing the same
+/// `(T, band)` pair (e.g. `privacy_filter::forward_logits`, which alternates
+/// between only 2 distinct bands across its transformer stack) build this
+/// once and reuse it across every such layer via [`banded_attention`],
+/// instead of paying the `arange`/`sub`/`abs`/`less_equal`/`where_` chain
+/// again on every layer.
+pub(crate) fn build_band_mask(t: i64, band: i32) -> Result<MxArray> {
+    if band < 0 {
+        return Err(Error::from_reason(format!(
+            "build_band_mask: band must be non-negative, got {band}"
+        )));
+    }
     if t <= 0 {
         return Err(Error::from_reason(format!(
             "build_band_mask: T must be positive, got {t}"
@@ -221,28 +233,32 @@ pub fn banded_attention_reference(
 /// Build the `[H_q, T, T+1]` augmented mask used by `banded_attention`.
 ///
 /// Layout:
-/// - `mask[h, q, k] = 0`         if `k < T && |q - k| <= band`
-/// - `mask[h, q, k] = -inf`      if `k < T && |q - k| >  band`
+/// - `mask[h, q, k] = 0`         if `k < T && band_mask[q, k] == 0` (in-band)
+/// - `mask[h, q, k] = -inf`      if `k < T && band_mask[q, k] == -inf` (out-of-band)
 /// - `mask[h, q, T] = sinks[h]`  for the appended virtual sink column
+///
+/// `band_mask` is the `[T, T]` band-only mask (see [`build_band_mask`]) —
+/// the caller supplies it rather than have this function rebuild it, so a
+/// stack of layers sharing the same `(T, band)` pair only pays for the
+/// `arange`/`sub`/`abs`/`less_equal`/`where_` chain once.
 ///
 /// `out_dtype` is the dtype the mask is cast to — must match the SDPA output
 /// dtype (`final_type` in MLX), otherwise SDPA rejects it because f32 does not
 /// promote to bf16/f16.
 fn build_band_plus_sink_mask(
-    t: i64,
-    band: i32,
+    band_mask: &MxArray,
     sinks: &MxArray,
     h_q: i64,
     out_dtype: DType,
 ) -> Result<MxArray> {
-    if t <= 0 {
+    let band_mask_shape = band_mask.shape()?;
+    let band_mask_shape = band_mask_shape.as_ref();
+    if band_mask_shape.len() != 2 || band_mask_shape[0] != band_mask_shape[1] {
         return Err(Error::from_reason(format!(
-            "build_band_plus_sink_mask: T must be positive, got {t}"
+            "build_band_plus_sink_mask: band_mask must be square [T, T], got {band_mask_shape:?}"
         )));
     }
-
-    // Band mask: [T, T] f32, 0 inside the band, -inf outside.
-    let band_mask = build_band_mask(t, band)?;
+    let t = band_mask_shape[0];
 
     // Broadcast to [H_q, T, T]. The band mask doesn't depend on the head index,
     // but the final mask does (sink column varies per head), so we materialise
@@ -287,20 +303,19 @@ fn build_band_plus_sink_mask(
 /// - `k`:  `[B, num_kv_heads, T, head_dim]`
 /// - `v`:  `[B, num_kv_heads, T, head_dim]`
 /// - `sinks`: `[num_q_heads]`
+/// - `band_mask`: `[T, T]` f32, `0` where `|q_pos - k_pos| <= band` else
+///   `-inf` (see [`build_band_mask`]). Callers running several layers that
+///   share the same `(T, band)` pair should build this once and reuse it
+///   across every such call instead of passing a raw `band: i32` and
+///   rebuilding the mask from scratch on every layer.
 /// - returns `[B, num_q_heads, T, head_dim]`
 pub fn banded_attention(
     q: &MxArray,
     k: &MxArray,
     v: &MxArray,
     sinks: &MxArray,
-    band: i32,
+    band_mask: &MxArray,
 ) -> Result<MxArray> {
-    if band < 0 {
-        return Err(Error::from_reason(format!(
-            "banded_attention: band must be non-negative, got {band}"
-        )));
-    }
-
     if q.ndim()? != 4 || k.ndim()? != 4 || v.ndim()? != 4 {
         return Err(Error::from_reason(
             "banded_attention: Q, K, V must be 4D [B, H, T, D]",
@@ -369,6 +384,18 @@ pub fn banded_attention(
     let t = t_q;
     let dtype = q.dtype()?;
 
+    // `band_mask` is caller-supplied (built once via `build_band_mask` and
+    // reused across every layer that shares the same `(T, band)` pair — see
+    // `privacy_filter::forward_logits`), so validate its shape against this
+    // call's Q/K sequence length instead of trusting the caller blindly.
+    let band_mask_shape = band_mask.shape()?;
+    let band_mask_shape = band_mask_shape.as_ref();
+    if band_mask_shape.len() != 2 || band_mask_shape[0] != t || band_mask_shape[1] != t {
+        return Err(Error::from_reason(format!(
+            "banded_attention: band_mask must be [T, T] with T={t}, got {band_mask_shape:?}"
+        )));
+    }
+
     // K_aug = concat([K, zeros[B, H_kv, 1, D]], axis=-2)  → [B, H_kv, T+1, D]
     // V_aug = concat([V, zeros[B, H_kv, 1, D]], axis=-2)  → [B, H_kv, T+1, D]
     //
@@ -382,7 +409,7 @@ pub fn banded_attention(
     let v_aug = MxArray::concatenate(v, &pad_v, -2)?;
 
     // Build [H_q, T, T+1] mask, cast to the SDPA output dtype (= q's dtype).
-    let mask = build_band_plus_sink_mask(t, band, sinks, h_q, dtype)?;
+    let mask = build_band_plus_sink_mask(band_mask, sinks, h_q, dtype)?;
 
     let scale = 1.0 / (d as f64).sqrt();
     scaled_dot_product_attention(q, &k_aug, &v_aug, scale, Some(&mask))
@@ -416,6 +443,18 @@ mod tests {
                 "{label}: divergence at {i}: actual={a}, expected={e}, diff={diff} > tol={tolerance}"
             );
         }
+    }
+
+    /// `build_band_mask` is the single mask-construction choke point that
+    /// callers (e.g. `privacy_filter::forward_logits`) route through with a
+    /// `band` derived from checkpoint config. A malformed config with a
+    /// negative `sliding_window` would otherwise build an all-`-inf` band mask
+    /// (sink-only attention → silently corrupted logits), so the function must
+    /// fail-fast on a negative band instead. No GPU dispatch is needed — the
+    /// guard returns before any MxArray op runs.
+    #[test]
+    fn build_band_mask_rejects_negative_band() {
+        assert!(build_band_mask(8, -1).is_err());
     }
 
     /// With `band >= T` every key is in-window, and with sinks set very
@@ -648,7 +687,8 @@ mod tests {
             // actually exercise softmax mixing, not the degenerate -inf case).
             let sinks = MxArray::random_normal(&[h_q], 0.0, 1.0, Some(DType::Float32)).unwrap();
 
-            let fast = banded_attention(&q, &k, &v, &sinks, band).unwrap();
+            let band_mask = build_band_mask(t, band).unwrap();
+            let fast = banded_attention(&q, &k, &v, &sinks, &band_mask).unwrap();
             let slow = banded_attention_reference(&q, &k, &v, &sinks, band).unwrap();
 
             let fast_shape = fast.shape().unwrap();
@@ -703,7 +743,8 @@ mod tests {
                 MxArray::random_normal(&[b, h_kv, t, d], 0.0, 1.0, Some(DType::Float32)).unwrap();
             let sinks = MxArray::random_normal(&[h_q], 0.0, 1.0, Some(DType::Float32)).unwrap();
 
-            let fast = banded_attention(&q, &k, &v, &sinks, band).unwrap();
+            let band_mask = build_band_mask(t, band).unwrap();
+            let fast = banded_attention(&q, &k, &v, &sinks, &band_mask).unwrap();
             let slow = banded_attention_reference(&q, &k, &v, &sinks, band).unwrap();
 
             let (diff, max_abs) = max_abs_diff_and_magnitude(&fast, &slow);
@@ -745,7 +786,8 @@ mod tests {
         .unwrap();
         let sinks = MxArray::from_float32(&[-1e9, -1e9], &[heads]).unwrap();
 
-        let banded = banded_attention(&q, &k, &v, &sinks, (t - 1) as i32).unwrap();
+        let band_mask = build_band_mask(t, (t - 1) as i32).unwrap();
+        let banded = banded_attention(&q, &k, &v, &sinks, &band_mask).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
         let full = crate::array::scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
@@ -756,5 +798,90 @@ mod tests {
             1e-4,
             "banded_attention(band>=T, sinks=-inf) vs SDPA",
         );
+    }
+
+    /// Microbenchmark: rebuilding the `[T, T]` band mask on every layer vs
+    /// building it once per distinct band and reusing it — the exact win this
+    /// module's `band_mask` threading buys `privacy_filter::forward_logits`.
+    ///
+    /// Env-gated (`MLX_BENCH_BAND_MASK=1`) and `#[ignore]`d so it never runs in
+    /// the normal suite. Simulates the privacy-filter stack: 8 layers, GQA
+    /// shapes (H_q=14, H_kv=2, head_dim=64), T=2048, alternating 2 distinct
+    /// bands. Interleaves the two variants per iteration (A/B/A/B) and takes
+    /// medians to blunt M-series thermal skew; drops the first (cold) iteration.
+    #[test]
+    #[ignore = "microbenchmark — run with --ignored and MLX_BENCH_BAND_MASK=1"]
+    fn bench_band_mask_reuse_vs_rebuild() {
+        if std::env::var("MLX_BENCH_BAND_MASK").is_err() {
+            eprintln!("set MLX_BENCH_BAND_MASK=1 to run this microbenchmark");
+            return;
+        }
+        use std::time::Instant;
+
+        let (b, h_q, h_kv, d, t) = (1i64, 14i64, 2i64, 64i64, 2048i64);
+        // The two distinct bands `PrivacyFilterConfig::band_for_layer` returns:
+        // a sliding window and an effectively-unbounded full-attention band.
+        let bands = [128i32, i32::MAX / 2];
+        let layer_bands: Vec<i32> = (0..8).map(|i| bands[i % 2]).collect();
+
+        let q = MxArray::random_normal(&[b, h_q, t, d], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let k = MxArray::random_normal(&[b, h_kv, t, d], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let v = MxArray::random_normal(&[b, h_kv, t, d], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+        let sinks = MxArray::random_normal(&[h_q], 0.0, 1.0, Some(DType::Float32)).unwrap();
+
+        let iters = 12;
+        let mut rebuild_ms: Vec<f64> = Vec::with_capacity(iters);
+        let mut reuse_ms: Vec<f64> = Vec::with_capacity(iters);
+        // Also time the pure mask-construction cost the reuse path eliminates.
+        let mut build_ms: Vec<f64> = Vec::with_capacity(iters);
+
+        for _ in 0..iters {
+            // Variant A: rebuild the mask inside every one of the 8 layer calls.
+            let start = Instant::now();
+            for &band in &layer_bands {
+                let mask = build_band_mask(t, band).unwrap();
+                let out = banded_attention(&q, &k, &v, &sinks, &mask).unwrap();
+                out.eval();
+            }
+            rebuild_ms.push(start.elapsed().as_secs_f64() * 1e3);
+
+            // Variant B: build the 2 distinct masks once, reuse across layers.
+            let start = Instant::now();
+            let mask0 = build_band_mask(t, bands[0]).unwrap();
+            let mask1 = build_band_mask(t, bands[1]).unwrap();
+            for &band in &layer_bands {
+                let mask = if band == bands[0] { &mask0 } else { &mask1 };
+                let out = banded_attention(&q, &k, &v, &sinks, mask).unwrap();
+                out.eval();
+            }
+            reuse_ms.push(start.elapsed().as_secs_f64() * 1e3);
+
+            // Isolated: cost of a single build_band_mask (materialized).
+            let start = Instant::now();
+            let m = build_band_mask(t, bands[0]).unwrap();
+            m.eval();
+            build_ms.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+
+        let median = |v: &[f64]| {
+            let mut s = v[1..].to_vec(); // drop first (cold) iteration
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let rb = median(&rebuild_ms);
+        let ru = median(&reuse_ms);
+        let bm = median(&build_ms);
+        println!(
+            "[bench band_mask] T={t}, 8-layer loop, medians over {} iters:",
+            iters - 1
+        );
+        println!("[bench band_mask]   rebuild-per-layer = {rb:.3} ms");
+        println!("[bench band_mask]   reuse-precomputed = {ru:.3} ms");
+        println!(
+            "[bench band_mask]   delta            = {:.3} ms ({:.1}%)",
+            rb - ru,
+            (rb - ru) / rb * 100.0
+        );
+        println!("[bench band_mask]   single build_band_mask = {bm:.3} ms (x6 saved per loop)");
     }
 }

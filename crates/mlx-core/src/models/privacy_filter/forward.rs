@@ -26,8 +26,11 @@
 //! of an LM head.
 
 use crate::array::MxArray;
+use crate::array::banded_attention::build_band_mask;
 use crate::nn::RMSNorm;
 use napi::bindgen_prelude::*;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::Path;
 
 use super::classifier::classifier_forward;
@@ -74,16 +77,31 @@ impl PrivacyFilterModel {
         //    produces `[B, T, hidden]`. Same pattern as
         //    `crate::nn::Embedding::forward`.
         let mut hidden = weights.embed_tokens.take(input_ids, 0)?;
+        let seq_len = hidden.shape_at(1)?;
 
-        // 2. Run all 8 transformer blocks. Each block needs its index to
-        //    decide whether to apply the sliding band or run full
-        //    bidirectional attention — gpt-oss alternates by default.
+        // 2. Run all 8 transformer blocks. Each block needs to know
+        //    whether to apply the sliding band or run full bidirectional
+        //    attention — gpt-oss alternates by default. `band_for_layer`
+        //    only ever returns a handful of distinct values (2 for the
+        //    default alternation), so the `[T, T]` band mask is built
+        //    once per distinct value here and reused across every layer
+        //    that shares it, instead of being rebuilt from scratch on
+        //    each of the 8 layers.
+        let mut band_mask_cache: HashMap<i32, MxArray> = HashMap::new();
         for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            let band = cfg.band_for_layer(layer_idx);
+            if let Entry::Vacant(entry) = band_mask_cache.entry(band) {
+                entry.insert(build_band_mask(seq_len, band)?);
+            }
+            let band_mask = band_mask_cache
+                .get(&band)
+                .expect("band_mask inserted above");
+
             let block = Block {
                 weights: layer,
                 config: cfg,
                 yarn_freqs: &self.yarn_freqs,
-                layer_idx,
+                band_mask,
             };
             hidden = block.forward(&hidden)?;
         }
