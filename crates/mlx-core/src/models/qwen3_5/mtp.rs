@@ -354,6 +354,10 @@ impl Qwen3_5MTPModule {
             if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
                 attn.set_o_proj_bias(Some(w))?;
             }
+            // Precompute the block-ordered q_proj weight so forward()/
+            // forward_paged() split queries/gate without a strided
+            // reshape-copy. No-op for quantized q_proj.
+            attn.finalize_q_gate_block()?;
 
             // MLP — dense or per-mode quantized via the same swap as
             // the main loop. The MTP MLP is always a `Standard` MLP at
