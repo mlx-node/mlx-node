@@ -199,7 +199,8 @@ pub(crate) struct StreamingCtx<'s, 't> {
 ///
 ///   * (d) the per-step cache-maintenance cadence is routed through
 ///     [`DecodeStep::maintain_cache`] — the default is the every-256-step
-///     `synchronize_and_clear_cache`; paged steppers override to their
+///     `clear_cache` (no `synchronize()`, matching mlx-lm's reference
+///     cadence — see the trait doc); paged steppers override to their
 ///     own cadence (`maybe_clear_cache_for_paged_step`).
 pub(crate) fn run_decode_loop<S: DecodeStep>(
     step: &mut S,
@@ -255,9 +256,9 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // Cache-maintenance cadence runs EVERY committed step, here at the
         // loop TOP — including terminal/length-exit steps that break
         // before the forward. The default `maintain_cache` is the FLAT
-        // every-256-step `synchronize_and_clear_cache` (a cache clear
-        // changes timing, not values, and the 256-cadence keys off
-        // `step_idx`); paged steppers override to their own cadence
+        // every-256-step `clear_cache` (a cache clear changes timing, not
+        // values, and the 256-cadence keys off `step_idx`); paged
+        // steppers override to their own cadence
         // (`maybe_clear_cache_for_paged_step`).
         step.maintain_cache(step_idx);
 
@@ -724,9 +725,9 @@ mod run_decode_loop_tests {
 
     #[test]
     fn long_run_completes_through_cache_clear_cadence() {
-        // >300 steps so the every-256-step synchronize_and_clear_cache
-        // branch executes at least once. Cutoffs disabled so the
-        // constant script can't trip them.
+        // >300 steps so the every-256-step `clear_cache` branch (the
+        // FLAT `DecodeStep::maintain_cache` default) executes at least
+        // once. Cutoffs disabled so the constant script can't trip them.
         let params = greedy_params(|cfg| {
             cfg.max_consecutive_tokens = Some(0);
             cfg.max_ngram_repeats = Some(0);
@@ -742,6 +743,43 @@ mod run_decode_loop_tests {
         assert_eq!(out.finish_reason, "length");
         // Last iteration skips the pipelined forward (step+1 == max).
         assert_eq!(step.forward_calls, 399);
+    }
+
+    #[test]
+    fn maintain_cache_default_clears_without_synchronize() {
+        // Proves the FLAT `DecodeStep::maintain_cache` default cadence
+        // (crates/mlx-core/src/engine/backend.rs) fires `clear_cache`
+        // and NEVER `synchronize` — the redundant-stall this fix
+        // removes. Thread-local counters (`array::memory`) so this is
+        // race-free against other tests running concurrently.
+        use crate::array::memory::{TEST_CLEAR_CACHE_CALLS, TEST_SYNCHRONIZE_CALLS};
+
+        TEST_SYNCHRONIZE_CALLS.with(|c| c.set(0));
+        TEST_CLEAR_CACHE_CALLS.with(|c| c.set(0));
+
+        let params = greedy_params(|cfg| {
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = MockStep::new(vec![1], 16);
+
+        // >256 steps so the cadence branch fires at least once.
+        drive(&mut step, 1, &params, &mut tracker, 300, 15, &[])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(
+            TEST_SYNCHRONIZE_CALLS.with(|c| c.get()),
+            0,
+            "FLAT maintain_cache default must not call the stream-less \
+             mlx_synchronize — see crate::stream::StreamContext (the \
+             generation stream is not the default stream at this point)"
+        );
+        assert!(
+            TEST_CLEAR_CACHE_CALLS.with(|c| c.get()) >= 1,
+            "FLAT maintain_cache default should still drain the allocator \
+             cache on the 256-step cadence"
+        );
     }
 
     // ---- streaming ----

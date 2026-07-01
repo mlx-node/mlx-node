@@ -128,12 +128,20 @@ pub(crate) trait DecodeStep {
     /// once per step at the END of the loop body, so the paged steppers
     /// can run their own cadence without forking the loop.
     ///
-    /// Default is the FLAT every-256-step `synchronize_and_clear_cache`.
-    /// Paged steppers override to
-    /// `crate::array::maybe_clear_cache_for_paged_step(step)`.
+    /// Default is the FLAT every-256-step `clear_cache` — no
+    /// `synchronize()`. mlx-lm's reference decode loop only calls
+    /// `mx.clear_cache()` on this cadence; a `synchronize()` here would
+    /// additionally target the WRONG stream (it blocks on the thread's
+    /// default stream, which sits idle — the actual forward runs on
+    /// `generation_stream`, only made default for the brief scope of
+    /// `StreamContext` in `crate::stream`, and restored before this call)
+    /// and would be redundant even if it targeted the right one (this
+    /// loop's own `y.eval()` at the top of every iteration already forces
+    /// full evaluation of everything scheduled so far). Paged steppers
+    /// override to `crate::array::maybe_clear_cache_for_paged_step(step)`.
     fn maintain_cache(&mut self, step: i32) {
         if (step + 1) % 256 == 0 {
-            crate::array::synchronize_and_clear_cache();
+            crate::array::clear_cache();
         }
     }
 

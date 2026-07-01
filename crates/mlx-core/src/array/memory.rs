@@ -23,10 +23,27 @@ impl std::fmt::Display for SetCacheLimitError {
 
 impl std::error::Error for SetCacheLimitError {}
 
+// Test-only call counters for `synchronize` / `clear_cache`, thread-local
+// so parallel `cargo test` threads never observe each other's counts —
+// `cargo test` runs each `#[test]` fn on its own thread, so resetting +
+// reading these from within a single test body is race-free without any
+// cross-test locking. Let `engine::decode`'s cache-cadence test assert on
+// WHICH of the two the FLAT `DecodeStep::maintain_cache` default actually
+// invokes, without adding a mockable trait seam to the FFI layer.
+#[cfg(test)]
+thread_local! {
+    /// Incremented once per [`synchronize`] call.
+    pub(crate) static TEST_SYNCHRONIZE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Incremented once per [`clear_cache`] call.
+    pub(crate) static TEST_CLEAR_CACHE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Clear the MLX memory cache to prevent memory pressure buildup
 /// Should be called periodically during long-running operations
 /// Internal Rust-only function - memory management is handled automatically by the trainer
 pub fn clear_cache() {
+    #[cfg(test)]
+    TEST_CLEAR_CACHE_CALLS.with(|c| c.set(c.get() + 1));
     unsafe {
         sys::mlx_clear_cache();
     }
@@ -34,6 +51,8 @@ pub fn clear_cache() {
 
 /// Synchronize GPU — block until all pending GPU work completes
 pub fn synchronize() {
+    #[cfg(test)]
+    TEST_SYNCHRONIZE_CALLS.with(|c| c.set(c.get() + 1));
     unsafe {
         sys::mlx_synchronize();
     }

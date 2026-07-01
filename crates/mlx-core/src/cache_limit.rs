@@ -4,8 +4,9 @@
 //! `mx.set_wired_limit(...)` at server startup and calls `mx.clear_cache()`
 //! every 256 decode steps. We already mirror both of those: `WiredLimitContext`
 //! (see `crates/mlx-core/src/stream.rs`) sets the wired limit at model load
-//! and `synchronize_and_clear_cache()` drains the pool every 256 decode steps
-//! inside each generative model. The piece that was still missing was an
+//! and the FLAT `DecodeStep::maintain_cache` default (`crates/mlx-core/src/
+//! engine/backend.rs`) drains the pool via `clear_cache()` every 256 decode
+//! steps inside each generative model. The piece that was still missing was an
 //! explicit ceiling on how large the MLX allocator's free-pool may grow
 //! between decode loops — on a 128GB M3 Max the default ceiling is the full
 //! `max_recommended_working_set_size` (~96GB), so the pool slowly climbs to
@@ -114,8 +115,8 @@
 //! model A discards reusable blocks belonging to model B's next turn.
 //! Between-turn draining now lives on the TS side (`@mlx-node/server`'s
 //! idle sweeper — drains only when the whole process is idle for
-//! `idleClearCacheMs`). The decode-loop `synchronize_and_clear_cache()`
-//! fired every 256 steps is untouched.
+//! `idleClearCacheMs`). The decode-loop `clear_cache()` fired every 256
+//! steps is untouched.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
