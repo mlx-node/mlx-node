@@ -83,6 +83,8 @@
  * await session.reset();
  * ```
  */
+import { createHash } from 'node:crypto';
+
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
 import type { ChatStreamEvent } from './stream.js';
@@ -432,15 +434,15 @@ export interface ChatSessionOptions {
  * template.
  *
  * This is a byte-identity check — callers use the key solely to
- * decide whether to restart the server-side session, so a
- * non-cryptographic hash is sufficient. We use FNV-1a 64-bit with a
- * length-prefixed framing so different image counts and different
- * byte lengths cannot collide by accident.
+ * decide whether to restart the server-side session, so any
+ * collision-resistant digest is sufficient. We use SHA-256 (native
+ * `node:crypto`) with a length-prefixed framing so different image
+ * counts and different byte lengths cannot collide by accident.
  *
  * Implementation note: kept fully sync + self-contained so
- * `send()` can stay synchronous in its routing decision and so the
- * module has no external runtime dependencies beyond `@mlx-node/core`
- * and the existing stream bridge.
+ * `send()` can stay synchronous in its routing decision. `node:crypto`
+ * is a Node built-in, so this adds no external runtime dependency
+ * beyond `@mlx-node/core` and the existing stream bridge.
  */
 function computeImagesKey(images: Uint8Array[] | undefined): string | null {
   return computeByteListKey(images);
@@ -450,83 +452,41 @@ function computeImagesKey(images: Uint8Array[] | undefined): string | null {
  * Audio counterpart of {@link computeImagesKey}: a stable, order-sensitive
  * byte-identity key for a list of encoded audio buffers. Used by `send()` /
  * `sendStream()` to decide whether a new audio set must cold-restart the
- * server-side session. Shares the exact FNV-1a framing as the image key.
+ * server-side session. Shares the exact SHA-256 framing as the image key.
  */
 function computeAudioKey(audio: Uint8Array[] | undefined): string | null {
   return computeByteListKey(audio);
 }
 
 /**
- * FNV-1a 64-bit byte-identity key for a length-framed list of byte buffers.
+ * SHA-256 byte-identity key for a length-framed list of byte buffers.
  * Returns `null` for an empty/absent list so callers can distinguish
  * "no media" from "media changed". Shared by the image and audio keys.
+ *
+ * Uses `node:crypto`'s native SHA-256 rather than a hand-rolled JS hash
+ * loop: hashing large image/audio buffers byte-at-a-time in JS is
+ * 25-60x slower than the native digest (measured: 5MB ~105ms JS loop
+ * vs ~1.8ms native) and this runs synchronously on the event loop
+ * before any `await` in `send()`/`sendStream()`, so the JS loop's cost
+ * was a real head-of-line-blocking stall for every other request
+ * handled by the same process.
  */
 function computeByteListKey(buffers: Uint8Array[] | undefined): string | null {
-  const images = buffers;
-  if (!images || images.length === 0) return null;
-  // FNV-1a 64-bit. Split into two 32-bit halves because JavaScript
-  // doesn't have a native 64-bit integer type and BigInt ops are
-  // slow on large byte streams. This emulates 64-bit FNV-1a using
-  // paired 32-bit lo/hi halves — the standard JS idiom.
-  const FNV_OFFSET_LO = 0x84222325 >>> 0;
-  const FNV_OFFSET_HI = 0xcbf29ce4 >>> 0;
-  const FNV_PRIME_LO = 0x000001b3 >>> 0;
-  const FNV_PRIME_HI = 0x00000100 >>> 0;
-
-  let lo = FNV_OFFSET_LO;
-  let hi = FNV_OFFSET_HI;
-
-  function mix(byte: number): void {
-    lo = (lo ^ byte) >>> 0;
-    // Multiply (hi:lo) by (FNV_PRIME_HI:FNV_PRIME_LO) mod 2^64.
-    // Break 32-bit halves into 16-bit quarters to keep intermediate
-    // products inside the safe-integer range.
-    const loLo = lo & 0xffff;
-    const loHi = lo >>> 16;
-    const hiLo = hi & 0xffff;
-    const hiHi = hi >>> 16;
-
-    const pLo = FNV_PRIME_LO & 0xffff;
-    const pLoH = FNV_PRIME_LO >>> 16;
-    const pHi = FNV_PRIME_HI & 0xffff;
-    const pHiH = FNV_PRIME_HI >>> 16;
-
-    const r0 = loLo * pLo;
-    const r1 = loLo * pLoH + loHi * pLo;
-    const r2 = loLo * pHi + loHi * pLoH + hiLo * pLo;
-    const r3 = loLo * pHiH + loHi * pHi + hiLo * pLoH + hiHi * pLo;
-
-    const newLo0 = r0 & 0xffff;
-    const carry1 = r0 >>> 16;
-    const sum1 = r1 + carry1;
-    const newLo1 = sum1 & 0xffff;
-    const carry2 = Math.floor(sum1 / 0x10000);
-    const sum2 = r2 + carry2;
-    const newHi0 = sum2 & 0xffff;
-    const carry3 = Math.floor(sum2 / 0x10000);
-    const sum3 = r3 + carry3;
-    const newHi1 = sum3 & 0xffff;
-
-    lo = ((newLo1 << 16) | newLo0) >>> 0;
-    hi = ((newHi1 << 16) | newHi0) >>> 0;
+  if (!buffers || buffers.length === 0) return null;
+  const hash = createHash('sha256');
+  // Frame each buffer with a 4-byte little-endian length prefix (and a
+  // leading count prefix) so `[ab, c]` and `[a, bc]` — and different
+  // buffer counts — hash to distinct values.
+  const prefix = new Uint8Array(4);
+  const prefixView = new DataView(prefix.buffer);
+  prefixView.setUint32(0, buffers.length, true);
+  hash.update(prefix);
+  for (const buf of buffers) {
+    prefixView.setUint32(0, buf.byteLength, true);
+    hash.update(prefix);
+    hash.update(buf);
   }
-
-  // Frame each image with a 4-byte little-endian length prefix so
-  // `[ab, c]` and `[a, bc]` hash to distinct values.
-  mix(images.length & 0xff);
-  mix((images.length >>> 8) & 0xff);
-  mix((images.length >>> 16) & 0xff);
-  mix((images.length >>> 24) & 0xff);
-  for (const img of images) {
-    mix(img.byteLength & 0xff);
-    mix((img.byteLength >>> 8) & 0xff);
-    mix((img.byteLength >>> 16) & 0xff);
-    mix((img.byteLength >>> 24) & 0xff);
-    for (let i = 0; i < img.byteLength; i++) {
-      mix(img[i]!);
-    }
-  }
-  return hi.toString(16).padStart(8, '0') + lo.toString(16).padStart(8, '0');
+  return hash.digest('hex');
 }
 
 /**
@@ -552,7 +512,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
   /**
    * Hex-encoded byte-identity key of the image set currently bound
-   * to the server's KV cache (FNV-1a 64-bit; see `computeImagesKey`).
+   * to the server's KV cache (SHA-256; see `computeImagesKey`).
    * `null` when no images are cached. A `send()` whose new key
    * differs triggers a full `chatSessionStart` restart.
    */
@@ -1566,7 +1526,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
   /**
    * Walk the history backward to find the most recent user message
-   * with images and return its FNV-1a key. Used by
+   * with images and return its SHA-256 key. Used by
    * {@link startFromHistory} and {@link startFromHistoryStream} to
    * hydrate `lastImagesKey` after a cold replay, so subsequent delta
    * continues correctly detect image changes.
@@ -1584,7 +1544,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Audio counterpart of {@link computeTrailingImagesKey}: walk history
    * backward to the most recent user message carrying audio and return its
-   * FNV-1a key, so a cold replay hydrates `lastAudioKey` correctly.
+   * SHA-256 key, so a cold replay hydrates `lastAudioKey` correctly.
    */
   private computeTrailingAudioKey(): string | null {
     for (let i = this.history.length - 1; i >= 0; i--) {

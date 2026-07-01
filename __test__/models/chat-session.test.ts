@@ -466,6 +466,33 @@ describe('ChatSession', () => {
       expect(chatSessionContinue).toHaveBeenCalledTimes(1);
     });
 
+    it('large image buffers: identical bytes stay on delta path, single-byte-different bytes restart', async () => {
+      // The 3-byte imgA/imgB fixtures above never exceed a single
+      // hash chunk. This exercises the image-identity hash at the
+      // byte range the native-crypto perf fix targets (multi-MB
+      // buffers), guarding against regressions in the length-prefix
+      // framing across a large `hash.update()` call.
+      const bigA = new Uint8Array(2 * 1024 * 1024);
+      for (let i = 0; i < bigA.length; i++) bigA[i] = i & 0xff;
+      const bigACopy = Uint8Array.from(bigA);
+      const bigBLastByteFlipped = Uint8Array.from(bigA);
+      bigBLastByteFlipped[bigBLastByteFlipped.length - 1] ^= 0xff;
+
+      const { model, chatSessionStart, chatSessionContinue } = makeMockModel();
+      const session = new ChatSession(model);
+
+      await session.send('describe', { images: [bigA] });
+      // Same bytes via a distinct Uint8Array instance -> cheap delta path.
+      await session.send('describe-again', { images: [bigACopy] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+
+      // Flip only the trailing byte -> must be detected as a changed
+      // image set and trigger a full restart.
+      await session.send('describe-changed', { images: [bigBLastByteFlipped] });
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+    });
+
     it('text-only follow-up after image turn stays on the delta path', async () => {
       // Semantic: omitting `images` means "keep the cache state as
       // is", not "clear images". This lets VLM users refer back to
