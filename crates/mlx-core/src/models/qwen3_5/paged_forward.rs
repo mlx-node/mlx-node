@@ -292,6 +292,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 &hidden_states,
                 final_norm,
                 lm_head,
+                embed,
                 embedding_weight,
             )?);
             if let Some(start) = chunk_trace_start {
@@ -389,7 +390,7 @@ fn run_paged_prefill_single_shot(
         cached_rope_deltas,
     )?;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Single-turn image-bearing paged prefill.
@@ -446,7 +447,7 @@ pub(crate) fn run_paged_vlm_prefill(
         0,
     )?;
 
-    project_last_token_logits(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Paged prefill variant that ALSO returns the post-`final_norm` hidden
@@ -600,6 +601,8 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
             let logits = if let Some(head) = lm_head {
                 head.forward(&last_hidden)?
+            } else if embed.is_packed_quantized() {
+                embed.as_linear(&last_hidden)?
             } else {
                 let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
                 last_hidden.matmul(&weight_t)?
@@ -697,6 +700,7 @@ fn run_paged_prefill_single_shot_with_hidden(
         &hidden_states,
         final_norm,
         lm_head,
+        embed,
         embedding_weight,
         keep_last_hidden,
     )
@@ -787,6 +791,7 @@ fn project_last_token_logits(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<Linear>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let seq_len = hidden_states.shape_at(1)?;
@@ -795,6 +800,12 @@ fn project_last_token_logits(
     let h = final_norm.forward(&last_hidden)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        // Tied + packed-quantized embedding: route through the packed
+        // `quantized_matmul` instead of a dense `[vocab, hidden]` transpose
+        // + matmul (the `embedding_weight` fallback below reads a fully
+        // pre-dequantized/on-demand-dequantized dense copy).
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -814,6 +825,7 @@ fn project_last_token_logits_with_full_hidden(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<Linear>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
     keep_last_hidden: Option<usize>,
 ) -> Result<(MxArray, MxArray)> {
@@ -823,6 +835,8 @@ fn project_last_token_logits_with_full_hidden(
     let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&last_hidden)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         last_hidden.matmul(&weight_t)?
@@ -910,6 +924,8 @@ pub(crate) fn run_paged_decode_step(
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -987,12 +1003,17 @@ pub(crate) fn run_paged_step_with_hidden(
     }
 
     let h3 = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&h3)?,
-        (None, Some(wt)) => h3.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            h3.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&h3)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h3)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => h3.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                h3.matmul(&wt)?
+            }
         }
     };
     let hidden = h3.squeeze(Some(&[1]))?;
@@ -1092,12 +1113,17 @@ pub(crate) fn run_paged_verify_step(
     }
 
     let hiddens = final_norm.forward(&hidden_states)?;
-    let logits = match (lm_head, embedding_weight_t) {
-        (Some(head), _) => head.forward(&hiddens)?,
-        (None, Some(wt)) => hiddens.matmul(wt)?,
-        (None, None) => {
-            let wt = embedding_weight.transpose(Some(&[1, 0]))?;
-            hiddens.matmul(&wt)?
+    let logits = if let Some(head) = lm_head {
+        head.forward(&hiddens)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&hiddens)?
+    } else {
+        match embedding_weight_t {
+            Some(wt) => hiddens.matmul(wt)?,
+            None => {
+                let wt = embedding_weight.transpose(Some(&[1, 0]))?;
+                hiddens.matmul(&wt)?
+            }
         }
     };
     Ok(super::mtp_decode::MtpVerifyOutput::logits_only(

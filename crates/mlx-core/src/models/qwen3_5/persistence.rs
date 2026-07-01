@@ -910,6 +910,7 @@ fn apply_weights_inner(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
+    has_vision: bool,
 ) -> Result<()> {
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
@@ -971,13 +972,54 @@ fn apply_weights_inner(
             .get("embed_tokens")
             .copied()
             .unwrap_or(default_plq);
-        inner
-            .embedding
-            .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
-        info!(
-            "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
-            plq.bits
-        );
+        // Packed-resident load (`quantized_matmul` on the tied lm_head via
+        // `Embedding::as_linear` on the paged path) is a WIN only where every
+        // per-turn `get_weight()` consumer is packed-aware. That holds for the
+        // paged, non-MTP, non-VLM turn path (input lookup already uses
+        // `embed.forward`; the only eval'd `get_weight()` was the tied-head
+        // matmul, now routed through `as_linear`). It REGRESSES under packed on:
+        // the flat/eager path (`use_block_paged_cache != Some(true)`, incl. sym8
+        // + the non-Metal preview — re-dequants input lookup AND head per turn),
+        // MTP draft (`n_mtp_layers > 0` — per-draft dequant), and VLM image turns
+        // (`has_vision` — the vision-merge text-embed re-dequants). Gate the
+        // packed load to the proven-clean case; everything else keeps the legacy
+        // full-pre-dequant load (unchanged behavior). Coverage of MTP / VLM /
+        // flat is a follow-up.
+        //
+        // `use_block_paged_cache == Some(true)` is config INTENT; the paged
+        // adapter is only created when `compiled_forward_backend_available()`
+        // is ALSO true (`Qwen35Inner::new`), so a non-Metal/CUDA build with a
+        // paged config still runs flat — the added predicate keeps those on the
+        // legacy load (no per-turn dequant regression).
+        let prefer_packed = config.use_block_paged_cache == Some(true)
+            && crate::engine::persistence::compiled_forward_backend_available()
+            && config.n_mtp_layers == 0
+            && !has_vision;
+        if prefer_packed {
+            // Mode hardcoded "affine": embed_tokens/lm_head sidecars are always
+            // affine-quantized in every checkpoint format this loader accepts,
+            // matching what `Embedding::load_quantized` already hardcodes.
+            inner.embedding.load_quantized_packed(
+                weight,
+                scales,
+                biases,
+                plq.group_size,
+                plq.bits,
+                "affine",
+            )?;
+            info!(
+                "Loaded packed-quantized embedding ({}-bit, quantized_matmul on forward + tied lm_head)",
+                plq.bits
+            );
+        } else {
+            inner
+                .embedding
+                .load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
+            info!(
+                "Loaded quantized embedding ({}-bit, quantized_matmul on forward)",
+                plq.bits
+            );
+        }
     } else if let Some(w) = params.get("embedding.weight") {
         // Dense fallback (no `.scales`): a stripped quant group must never
         // reach the dense lookup / tied-lm_head matmul.
@@ -1670,6 +1712,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     quant_group_size,
                     top_level_mode,
                     &per_layer_quant,
+                    has_vision,
                 )?;
 
                 // Materialize mmap-backed weights. Pages were pre-warmed above, so
@@ -2413,6 +2456,139 @@ mod tests {
             use_block_paged_cache: None,
             n_mtp_layers: 0,
         }
+    }
+
+    /// Persistence-level regression for the tied+quantized lm_head packed
+    /// fast-path (paged, non-MTP, non-VLM): a quantized `embedding.*` sidecar
+    /// on a paged config must load via `Embedding::load_quantized_packed`
+    /// (packed-resident: `forward()` gather-then-dequants, `as_linear()` runs
+    /// `quantized_matmul`) — NOT the legacy `Embedding::load_quantized` (eager
+    /// full-table pre-dequant into a dense bf16 `[vocab, hidden]` array). Guards
+    /// the gated `apply_weights_inner` load branch directly; the packed-vs-dense
+    /// forward/as_linear numerical equivalence itself is already covered by
+    /// `crate::nn::embedding::tests::packed_affine_2bit_lookup_byte_identical_to_legacy_dense`
+    /// and `packed_affine_as_linear_matches_dense_matmul`.
+    #[test]
+    fn tied_quantized_embedding_loads_via_packed_path() {
+        let label = "tied_quantized_embedding_loads_via_packed_path";
+        // Satisfy the packed-load gate: paged, non-MTP, non-VLM.
+        // `no_mtp_layer_cfg()` already sets `n_mtp_layers = 0` but leaves
+        // `use_block_paged_cache = None`, so opt the fixture into paged here.
+        // The block-paged `LayerKVPool` only accepts head sizes in a fixed set
+        // (`no_mtp_layer_cfg`'s `head_dim = 16` is rejected), so bump the tied
+        // head/attention dim to the smallest valid pool size (32).
+        let mut cfg = no_mtp_layer_cfg(); // tie_word_embeddings: true, vocab 1024
+        cfg.use_block_paged_cache = Some(true);
+        cfg.head_dim = 32;
+
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                // Pool allocation (`LayerKVPool`) requires Metal; skip cleanly
+                // when the GPU/device is unavailable (CI without Metal).
+                if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        // Affine-quantize a synthetic [vocab, hidden] table exactly like a
+        // tied checkpoint's `embedding.{weight,scales,biases}` sidecar
+        // (group_size 32, 4-bit — this repo's embed_tokens/lm_head sidecars
+        // are always affine regardless of the body recipe).
+        let vocab = cfg.vocab_size as i64;
+        let hidden = cfg.hidden_size as i64;
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let dense = match MxArray::from_float32(&data, &[vocab, hidden]) {
+            Ok(a) => match a.astype(DType::BFloat16) {
+                Ok(a) => a,
+                Err(err) => panic!("unexpected astype failure in {label}: {}", err.reason),
+            },
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected MxArray::from_float32 failure in {label}: {msg}");
+            }
+        };
+
+        let group_size = 32;
+        let bits = 4;
+        let mut out_q: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_quantize(
+                dense.as_raw_ptr(),
+                group_size,
+                bits,
+                c"affine".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize affine failed");
+        let qw = MxArray::from_handle(out_q, "qw").expect("qw");
+        let qs = MxArray::from_handle(out_s, "qs").expect("qs");
+        let qb = MxArray::from_handle(out_b, "qb").expect("qb");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embedding.weight".to_string(), qw);
+        params.insert("embedding.scales".to_string(), qs);
+        params.insert("embedding.biases".to_string(), qb);
+
+        // Explicit per-layer override so the loader's group_size/bits exactly
+        // match how this test quantized the tensor above (the DEFAULT_QUANT_*
+        // fallback used when no override is present may not match).
+        let mut per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        per_layer_quant.insert(
+            "embed_tokens".to_string(),
+            PerLayerQuant {
+                bits,
+                group_size,
+                mode: PerLayerMode::Affine,
+            },
+        );
+
+        // The embedding sidecar is the ONLY tensor this fixture provides.
+        // `apply_weights_inner` loads the embedding UP FRONT, then runs an
+        // end-of-function completeness gate that rejects this deliberately
+        // partial checkpoint (no final_norm / attn / mlp). That Err is expected
+        // and fires strictly AFTER the embedding backend is installed on
+        // `inner`, so the packed-load assertion below still observes the real
+        // load decision. Only tolerate that specific completeness error — any
+        // other failure means the embedding load path itself broke.
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        assert!(
+            inner.embedding.is_packed_quantized(),
+            "tied+quantized embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+        );
     }
 
     /// Build the three (never-quantized) MTP norms as bf16. Returns `None`

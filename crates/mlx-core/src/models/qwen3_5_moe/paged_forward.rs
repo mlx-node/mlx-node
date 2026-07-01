@@ -264,6 +264,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 &hidden,
                 final_norm,
                 lm_head,
+                embed,
                 embedding_weight,
             )?);
             if let Some(start) = chunk_trace_start {
@@ -381,7 +382,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         /* position_ids */ None,
         cached_rope_deltas,
     )?;
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Single-turn image-bearing paged prefill for the MoE stack.
@@ -441,7 +442,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
         0,
     )?;
 
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embedding_weight)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, embedding_weight)
 }
 
 /// Run a single prefill chunk through `embed → layer loop`. Returns
@@ -576,11 +577,16 @@ fn project_last_token_logits_moe(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
+    embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
     let h = final_norm.forward(hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        // Tied + packed-quantized embedding: route through the packed
+        // `quantized_matmul` instead of dequantizing the full dense table.
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
@@ -652,6 +658,8 @@ pub(crate) fn run_paged_decode_step(
     let h = final_norm.forward(&hidden_states)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
+    } else if embed.is_packed_quantized() {
+        embed.as_linear(&h)?
     } else {
         let weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         h.matmul(&weight_t)?
