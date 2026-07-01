@@ -40,6 +40,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_NO_COMPILE=1`                                   | Disable compiled C++ forward path (Qwen3.5)                                                                                                                                          |
 | `MLX_EVAL_ALL_CACHES=1`                              | Revert to eval-all-caches (default is token-only)                                                                                                                                    |
 | `MLX_QWEN35_NATIVE_KV_WRITE` / `MLX_NATIVE_KV_WRITE` | Toggle native KV-write optimization on Qwen3.5 attention                                                                                                                             |
+| `MLX_QWEN3_NATIVE_KV_WRITE`                          | Toggle graph-native paged KV write/decode-gather on Qwen3 (plain) dense; default on, falls back to the legacy synchronous path on error                                             |
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`                    | Weight-loading chunk size                                                                                                                                                            |
 | `MLX_GDN_KERNEL=perstep\|chunked`                    | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts) |
 

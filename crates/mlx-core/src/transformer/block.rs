@@ -1,5 +1,8 @@
 use crate::array::mask::create_causal_mask;
 use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::inference_trace::{
+    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
+};
 use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
@@ -8,6 +11,27 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::ptr;
+use std::sync::OnceLock;
+use std::time::Instant;
+
+/// When enabled (default), Qwen3's paged decode path writes K/V into the
+/// pool with the graph-native, lazily-scheduled `update_keys_values_native`
+/// (see [`PagedKVCacheAdapter::update_keys_values_native`]) so the write
+/// feeds the same-step attention read through MLX graph dependencies
+/// instead of forcing a blocking `mlx_metal_synchronize()` + command-buffer
+/// host wait on every layer/token (see
+/// [`PagedKVCacheAdapter::update_keys_values`] /
+/// `LayerKVPool::write_kv`). Falls back to the synchronous
+/// `update_keys_values` automatically when disabled (via
+/// `MLX_QWEN3_NATIVE_KV_WRITE=0`) or when the native write errors. Mirrors
+/// the default-on migration already shipped for Gemma4 / Qwen3.5 / LFM2
+/// (PR #56).
+fn native_kv_write_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default("MLX_QWEN3_NATIVE_KV_WRITE", true)
+    })
+}
 
 /// Transformer block combining self-attention and MLP with pre-normalization.
 ///
@@ -239,11 +263,19 @@ impl TransformerBlock {
     ///   The on-device zero-copy fast-path (TODO in the adapter) will replace
     ///   the read with a Metal kernel that attends in-place against the paged
     ///   buffers.
-    /// - **Decode output dtype.** `gather_kv_for_decode` currently returns
-    ///   Float32 (host-roundtrip). We `astype` it back to `x`'s dtype
-    ///   before output projection / residual so the rest of the block stays
-    ///   in BF16. The on-device zero-copy fast-path (TODO in the adapter)
-    ///   will remove this cast.
+    /// - **K/V write and decode gather default to graph-native.** The write
+    ///   prefers `update_keys_values_native` and the decode read prefers
+    ///   `gather_kv_for_decode_graph`, both falling back to their
+    ///   synchronous counterparts on error or when disabled via
+    ///   `MLX_QWEN3_NATIVE_KV_WRITE=0`. This removes the per-layer,
+    ///   per-decode-token blocking `mlx_metal_synchronize()` +
+    ///   command-buffer host wait that the synchronous path forces,
+    ///   mirroring the default-on migration already shipped for Gemma4 /
+    ///   Qwen3.5 / LFM2 (PR #56).
+    /// - **Decode output dtype.** The decode gather returns the query/pool
+    ///   dtype (BF16 for Qwen3's non-FP8 cache). We `astype` it back to
+    ///   `x`'s dtype defensively before output projection / residual so the
+    ///   rest of the block stays homogeneous.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged_adapter(
         &self,
@@ -282,9 +314,58 @@ impl TransformerBlock {
         //    read them back via gather. Note: the adapter's
         //    `record_tokens` MUST already have advanced the cursor by the
         //    chunk size before this call (see method docstring).
-        adapter
-            .update_keys_values(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
-            .map_err(napi::Error::from_reason)?;
+        //
+        //    Prefer the graph-native, lazily-scheduled
+        //    `update_keys_values_native` so the same-step attention read
+        //    stays inside MLX's dependency graph instead of forcing a
+        //    blocking `mlx_metal_synchronize()` + command-buffer host wait
+        //    on every layer/token (see
+        //    `PagedKVCacheAdapter::update_keys_values`). Falls back to the
+        //    synchronous write automatically when
+        //    `MLX_QWEN3_NATIVE_KV_WRITE=0` or when the native write errors.
+        let trace_enabled = inference_trace_enabled();
+        let write_trace_start = trace_enabled.then(Instant::now);
+        let write_path = if native_kv_write_enabled() {
+            match adapter.update_keys_values_native(
+                layer_idx,
+                &qkv.keys,
+                &qkv.values,
+                first_logical_position,
+            ) {
+                Ok(()) => "native",
+                Err(err) => {
+                    if trace_enabled {
+                        write_inference_trace(format_args!(
+                            "[MLX_TRACE] qwen3 paged_kv_write_fallback layer={} first_position={} error={}",
+                            layer_idx, first_logical_position, err
+                        ));
+                    }
+                    adapter
+                        .update_keys_values(
+                            layer_idx,
+                            &qkv.keys,
+                            &qkv.values,
+                            first_logical_position,
+                        )
+                        .map_err(napi::Error::from_reason)?;
+                    "legacy"
+                }
+            }
+        } else {
+            adapter
+                .update_keys_values(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
+                .map_err(napi::Error::from_reason)?;
+            "legacy"
+        };
+        if trace_enabled {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] qwen3 paged_kv_write_done layer={} first_position={} path={} elapsed_ms={:.1}",
+                layer_idx,
+                first_logical_position,
+                write_path,
+                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
+            ));
+        }
 
         // 4. Compute attention output.
         let attn_out_paged = if is_prefill {
@@ -351,36 +432,86 @@ impl TransformerBlock {
                 .reshape(&[num_tokens, n_heads, head_dim])?
         } else {
             // Decode: K/V at the new position has just been written to the
-            // pool by `update_keys_values` above. Dispatch the
-            // `gather_kv_for_decode` Metal kernel directly against the
-            // on-GPU paged buffers — avoids the per-step host roundtrip
-            // (~57 MB per layer per K/V on long contexts) that
-            // `read_kv_range` performs and that drives a ~40 GB memory
-            // regression in long-context decode.
+            // pool by the write step above. When that write went native,
+            // use the graph-native `gather_kv_for_decode_graph` so the
+            // native paged-kv-write output and the attention read stay in
+            // one MLX dependency graph — no per-layer host sync — falling
+            // back to the synchronous `gather_kv_for_decode` kernel only if
+            // the graph gather errors. When the write landed on the legacy
+            // branch (flag off or native-write error), use the synchronous
+            // `gather_kv_for_decode` directly so `MLX_QWEN3_NATIVE_KV_WRITE=0`
+            // fully reverts BOTH the write and the decode read.
             //
-            // The kernel returns the query/io dtype. Cast back to x's dtype
+            // Both kernels return the query/io dtype. Cast back to x's dtype
             // so the rest of the block stays homogeneous. This is a
             // zero-extra-host-buffer path — the K/V are not materialized as
             // MxArrays at all.
             //
-            // `gather_kv_for_decode` expects queries shape
-            // `[1, num_query_heads, head_size]` (3-D). `qkv.queries` from
-            // `compute_qkv` is already `[num_tokens=1, n_heads, head_dim]`
-            // for the single-token decode chunk, so it's a direct fit.
+            // Both expect queries shape `[1, num_query_heads, head_size]`
+            // (3-D). `qkv.queries` from `compute_qkv` is already
+            // `[num_tokens=1, n_heads, head_dim]` for the single-token
+            // decode chunk, so it's a direct fit.
             let scale = self.self_attn.get_scale();
 
-            let attn_3d = adapter
-                .gather_kv_for_decode(
+            let gather_trace_start = trace_enabled.then(Instant::now);
+            let attn_3d = if write_path == "native" {
+                match adapter.gather_kv_for_decode_graph(
                     layer_idx,
                     &qkv.queries,
                     scale as f32,
                     /* softcap */ 1.0,
-                )
-                .map_err(napi::Error::from_reason)?;
+                ) {
+                    Ok(attn_3d) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3 decode_gather_done layer={} path=graph elapsed_ms={:.1}",
+                                layer_idx,
+                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                            ));
+                        }
+                        attn_3d
+                    }
+                    Err(err) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3 decode_gather_fallback layer={} path=raw error={}",
+                                layer_idx, err
+                            ));
+                        }
+                        adapter
+                            .gather_kv_for_decode(
+                                layer_idx,
+                                &qkv.queries,
+                                scale as f32,
+                                /* softcap */ 1.0,
+                            )
+                            .map_err(napi::Error::from_reason)?
+                    }
+                }
+            } else {
+                // Flag off (or the native write above errored): take the
+                // synchronous gather directly, matching the legacy write.
+                let attn_3d = adapter
+                    .gather_kv_for_decode(
+                        layer_idx,
+                        &qkv.queries,
+                        scale as f32,
+                        /* softcap */ 1.0,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3 decode_gather_done layer={} path=legacy elapsed_ms={:.1}",
+                        layer_idx,
+                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                    ));
+                }
+                attn_3d
+            };
 
             // Cast back to x's dtype.
-            // `gather_kv_for_decode` returns `[1, n_heads, head_dim]`, which
-            // is exactly the layout `output_projection` expects for
+            // Both gathers return `[1, n_heads, head_dim]`, which is
+            // exactly the layout `output_projection` expects for
             // `batch * seq_len = 1`.
             let target_dtype = x.dtype()?;
             attn_3d.astype(target_dtype)?
