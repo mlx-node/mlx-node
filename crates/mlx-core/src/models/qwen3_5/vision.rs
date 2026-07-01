@@ -7,7 +7,7 @@
 /// Architecture: patch_embed → + pos_embed → 27 blocks with 2D RoPE → merger
 use crate::array::MxArray;
 use crate::vision::embeddings::PatchEmbedding;
-use crate::vision::encoder::VisionEncoderLayer;
+use crate::vision::encoder::{VisionAttention, VisionEncoderLayer};
 use crate::vision::projector::SpatialProjector;
 use crate::vision::rope_vision::VisionRotaryEmbedding;
 use napi::bindgen_prelude::*;
@@ -346,9 +346,18 @@ impl Qwen3_5VisionEncoder {
         }
         let cu_seqlens_arr = MxArray::from_int32(&cu_seqlens, &[cu_seqlens.len() as i64])?;
 
+        // Build the additive attention mask once for this forward pass and
+        // reuse it across all encoder layers: it is a pure function of
+        // cu_seqlens/seq_len/dtype, which are identical for every layer
+        // (LayerNorm preserves dtype, and no layer changes the token count).
+        let total_seq_len = h.shape()?[0];
+        let mask_dtype = h.dtype()?;
+        let attention_mask =
+            VisionAttention::build_attention_mask(&cu_seqlens_arr, total_seq_len, mask_dtype)?;
+
         // Forward through encoder layers
         for layer in &self.layers {
-            h = layer.forward(&h, &cu_seqlens_arr, Some(&rotary_pos_emb))?;
+            h = layer.forward_with_mask(&h, Some(&attention_mask), Some(&rotary_pos_emb))?;
         }
 
         // Spatial projector (reduces token count by merge_size^2)
@@ -401,5 +410,98 @@ impl Clone for Qwen3_5VisionEncoder {
             rotary_pos_emb: self.rotary_pos_emb.clone(),
             merger: self.merger.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nn::LayerNorm;
+    use crate::vision::encoder::{BUILD_ATTENTION_MASK_CALLS, VisionMLP};
+
+    fn random_array(shape: &[i64]) -> MxArray {
+        let size: usize = shape.iter().map(|&s| s as usize).product();
+        let data: Vec<f32> = (0..size)
+            .map(|i| ((i % 100) as f32 - 50.0) / 100.0)
+            .collect();
+        MxArray::from_float32(&data, shape).unwrap()
+    }
+
+    /// Build a tiny encoder (small dims, `num_layers` transformer blocks, no
+    /// spatial merge) sufficient to exercise a full `forward()` call.
+    fn tiny_encoder(num_layers: usize) -> Qwen3_5VisionEncoder {
+        let hidden = 8i64;
+        let heads = 2u32;
+        let patch = 2i64;
+        let intermediate = 16i64;
+
+        let config = Qwen3_5VisionConfig {
+            hidden_size: hidden as i32,
+            intermediate_size: intermediate as i32,
+            num_heads: heads as i32,
+            num_layers: num_layers as i32,
+            patch_size: patch as i32,
+            spatial_merge_size: 1,
+            image_size: 4,
+            out_hidden_size: hidden as i32,
+        };
+
+        let mut encoder = Qwen3_5VisionEncoder::new(config).unwrap();
+
+        let patch_weight = random_array(&[hidden, patch, patch, 3]);
+        encoder.set_patch_embed(&patch_weight, None).unwrap();
+
+        for _ in 0..num_layers {
+            let ln1 = LayerNorm::new(hidden as u32, None).unwrap();
+            let ln2 = LayerNorm::new(hidden as u32, None).unwrap();
+            let qkv_weight = random_array(&[hidden * 3, hidden]);
+            let out_weight = random_array(&[hidden, hidden]);
+            let attn =
+                VisionAttention::new(hidden as u32, heads, &qkv_weight, None, &out_weight, None)
+                    .unwrap();
+            let fc1_weight = random_array(&[intermediate, hidden]);
+            let fc2_weight = random_array(&[hidden, intermediate]);
+            let mlp = VisionMLP::new(&fc1_weight, None, &fc2_weight, None).unwrap();
+            let layer = VisionEncoderLayer::new(&ln1, &ln2, &attn, &mlp);
+            encoder.add_layer(&layer);
+        }
+
+        let merger = SpatialProjector::new(
+            1,
+            &random_array(&[hidden]),
+            &random_array(&[hidden]),
+            &random_array(&[hidden, hidden]),
+            &random_array(&[hidden]),
+            &random_array(&[hidden, hidden]),
+            &random_array(&[hidden]),
+        )
+        .unwrap();
+        encoder.set_merger(merger);
+
+        encoder
+    }
+
+    #[test]
+    fn test_forward_builds_attention_mask_once_per_call() {
+        let num_layers = 3;
+        let encoder = tiny_encoder(num_layers);
+
+        // Single image, 1x2x2 patch grid = 4 patches, each patch_size x
+        // patch_size x 3 (channels) raw pixels.
+        let hidden_states = random_array(&[1, 4, 3, 2, 2]);
+        let grid_thw = MxArray::from_int32(&[1, 2, 2], &[1, 3]).unwrap();
+
+        BUILD_ATTENTION_MASK_CALLS.with(|c| c.set(0));
+        let output = encoder.forward(&hidden_states, &grid_thw).unwrap();
+        let calls = BUILD_ATTENTION_MASK_CALLS.with(|c| c.get());
+
+        assert_eq!(
+            calls, 1,
+            "build_attention_mask should be built once per forward call and reused \
+             across all {num_layers} encoder layers, not rebuilt once per layer"
+        );
+
+        let shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
+        assert_eq!(shape, vec![4, 8]);
     }
 }
