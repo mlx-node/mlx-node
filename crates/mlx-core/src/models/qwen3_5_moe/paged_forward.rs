@@ -513,6 +513,15 @@ fn run_paged_prefill_one_chunk_moe(
         cached_rope_deltas,
     );
 
+    // Shared per-forward-pass scratch slot for the M-RoPE cos/sin precompute
+    // (see `Qwen3_5Attention::forward_paged`'s `mrope_cache` doc comment).
+    // Every `FullAttentionPaged` layer in this loop shares one `position_ids`
+    // array, so the first such layer computes the selected cos/sin and every
+    // later one reuses it instead of recomputing the cos/sin table +
+    // `take_along_axis` gather. Stays `None` (untouched) on the text-only
+    // path where `position_ids` is `None`.
+    let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+
     // Layer loop. Safe-by-construction via `iter_mut().zip(...)` —
     // each iteration takes disjoint `&mut DecoderLayer` and `&mut
     // Qwen3_5LayerCache` references, with `kind` consumed by-value
@@ -541,6 +550,7 @@ fn run_paged_prefill_one_chunk_moe(
             layer_positions,
             true,
             rope_position_offset,
+            &mut mrope_cache,
         )?;
         // Smooth the prefill memory peak: every K layers, materialize the
         // residual stream so MLX can release the upstream graph nodes
@@ -635,6 +645,7 @@ pub(crate) fn run_paged_decode_step(
             None,
             true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 

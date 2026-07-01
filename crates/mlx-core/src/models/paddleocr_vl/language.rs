@@ -315,6 +315,17 @@ pub fn apply_multimodal_rotary_pos_emb(
 /// head_dim` (the trailing `q_head_dim - head_dim` dims pass through unrotated,
 /// matching qwen3_5's partial-rotary factor).
 ///
+/// Split into [`select_interleaved_cos_sin`] (the `position_ids`/dtype-only
+/// half — independent of q/k) and [`apply_interleaved_rotary`] (the q/k
+/// half). Every full-attention layer in one Qwen3.5-VL forward pass shares
+/// byte-identical `position_ids`/`mrope_section`/dtype (`init_mrope_layers`
+/// seeds every layer from the same config), so a caller with multiple layers
+/// — e.g. `Qwen3_5Attention::forward_paged`'s per-forward-pass `mrope_cache`
+/// — computes `select_interleaved_cos_sin` ONCE and reuses it across layers
+/// instead of recomputing the cos/sin table + `take_along_axis` gather per
+/// layer. This wrapper stays byte-identical to the prior single-function
+/// implementation for callers that only ever see one (q, k) pair.
+///
 /// Note: Internal implementation detail, not exposed to TypeScript.
 pub fn apply_multimodal_rotary_pos_emb_interleaved(
     q: &MxArray,
@@ -322,6 +333,25 @@ pub fn apply_multimodal_rotary_pos_emb_interleaved(
     cos: &MxArray,
     sin: &MxArray,
     mrope_section: Vec<i32>,
+) -> Result<(MxArray, MxArray)> {
+    let (cos_final, sin_final) = select_interleaved_cos_sin(cos, sin, &mrope_section)?;
+    apply_interleaved_rotary(q, k, &cos_final, &sin_final)
+}
+
+/// Position-only half of [`apply_multimodal_rotary_pos_emb_interleaved`].
+///
+/// Builds the stride-3 per-frequency axis selector (mirroring mlx-vlm's
+/// `_interleaved_position_selector`) and gathers the selected
+/// `[batch, 1, seq_len, head_dim]` cos/sin rows out of the doubled
+/// `[3, batch, seq_len, head_dim]` cos/sin. Depends only on `cos`/`sin`
+/// (themselves a pure function of `position_ids` and dtype) and
+/// `mrope_section`/`head_dim` — NOT on q/k — so it is safe to compute ONCE
+/// per forward pass and reuse across every full-attention layer via
+/// [`apply_interleaved_rotary`].
+pub fn select_interleaved_cos_sin(
+    cos: &MxArray,
+    sin: &MxArray,
+    mrope_section: &[i32],
 ) -> Result<(MxArray, MxArray)> {
     let cos_shape = cos.shape()?; // 1 FFI call — cache and reuse below
     let batch_size = cos_shape[1];
@@ -358,9 +388,27 @@ pub fn apply_multimodal_rotary_pos_emb_interleaved(
     // [1, batch, seq, head_dim] -> [batch, 1, seq, head_dim] (flat order preserved).
     let cos_final = cos_sel.reshape(&[batch_size, 1, seq_len, head_dim])?;
     let sin_final = sin_sel.reshape(&[batch_size, 1, seq_len, head_dim])?;
+    Ok((cos_final, sin_final))
+}
 
+/// Q/K half of [`apply_multimodal_rotary_pos_emb_interleaved`]: applies
+/// `rotate_half` using an already-selected `(cos_final, sin_final)` pair from
+/// [`select_interleaved_cos_sin`]. Must be called once PER LAYER (q/k differ
+/// per layer) but does no cos/sin table build or gather work itself.
+///
+/// `cos_final`/`sin_final` shape: `[batch, 1, seq_len, head_dim]`.
+/// `q`/`k` shape: `[batch, heads, seq_len, q_head_dim]` where `q_head_dim >=
+/// head_dim` (the trailing `q_head_dim - head_dim` dims pass through
+/// unrotated, matching qwen3_5's partial-rotary factor).
+pub fn apply_interleaved_rotary(
+    q: &MxArray,
+    k: &MxArray,
+    cos_final: &MxArray,
+    sin_final: &MxArray,
+) -> Result<(MxArray, MxArray)> {
     // Standard rotate_half application (identical to the sectioned path tail).
-    let rotary_dim = head_dim;
+    let cos_shape = cos_final.shape()?; // 1 FFI call
+    let rotary_dim = cos_shape[3];
     let q_shape = q.shape()?; // 1 FFI call
     let q_dim = q_shape[3];
     let q_ndim = q_shape.len();
@@ -382,8 +430,8 @@ pub fn apply_multimodal_rotary_pos_emb_interleaved(
     let q_rotated = rotate_half(&q_rot, q_ndim, rotary_dim)?;
     let k_rotated = rotate_half(&k_rot, q_ndim, rotary_dim)?;
 
-    let q_embed = q_rot.mul(&cos_final)?.add(&q_rotated.mul(&sin_final)?)?;
-    let k_embed = k_rot.mul(&cos_final)?.add(&k_rotated.mul(&sin_final)?)?;
+    let q_embed = q_rot.mul(cos_final)?.add(&q_rotated.mul(sin_final)?)?;
+    let k_embed = k_rot.mul(cos_final)?.add(&k_rotated.mul(sin_final)?)?;
 
     let q_out = if let Some(q_pass) = q_pass {
         MxArray::concatenate_many(vec![&q_embed, &q_pass], Some(-1))?
@@ -1282,6 +1330,120 @@ mod tests {
             k_sec.to_float32().unwrap().as_ref(),
             k_int.to_float32().unwrap().as_ref(),
             "interleaved K must equal sectioned K for text tokens (t==h==w)"
+        );
+    }
+
+    #[test]
+    fn test_precomputed_cos_sin_reused_across_layers_matches_per_layer_recompute() {
+        // Regression for the M-RoPE precompute-once optimization: Qwen3.5-VL's
+        // paged prefill loop computes `select_interleaved_cos_sin` ONCE per
+        // forward pass via `Qwen3_5Attention::forward_paged`'s `mrope_cache`
+        // parameter and reuses the result across every full-attention layer,
+        // instead of recomputing the cos/sin table + axis-selector gather per
+        // layer (the pre-fix behaviour, still reachable through
+        // `apply_multimodal_rotary_pos_emb_interleaved`). This proves the
+        // precomputed pair is layer-invariant: applying it to TWO INDEPENDENT
+        // (q, k) pairs (simulating two different full-attention layers
+        // sharing one `position_ids`) must produce bit-identical results to
+        // calling the combined, per-layer-recompute wrapper independently for
+        // each layer.
+        let rope_dims = 64i32;
+        let mrope_section = vec![11i32, 11, 10];
+        let mrope =
+            MultimodalRoPE::new(rope_dims, 4096, Some(100_000.0), mrope_section.clone()).unwrap();
+
+        let seq_len = 5i64;
+        // Distinct per-axis positions (t != h != w) so this exercises genuine
+        // image-style M-RoPE, not just the text-invariant (t==h==w) case.
+        let mut pos_data = Vec::with_capacity(3 * seq_len as usize);
+        for axis in 0..3i64 {
+            for p in 0..seq_len {
+                pos_data.push((p + axis * 100) as f32);
+            }
+        }
+        let pos = MxArray::from_float32(&pos_data, &[3, 1, seq_len]).unwrap();
+        let x = MxArray::zeros(&[1, seq_len, rope_dims as i64], Some(DType::Float32)).unwrap();
+        let (cos, sin) = mrope.forward(&x, &pos).unwrap();
+
+        let head_dim = 96i64;
+        let heads = 2i64;
+        let q_layer1 = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let k_layer1 = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let q_layer2 = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let k_layer2 = MxArray::random_uniform(
+            &[1, heads, seq_len, head_dim],
+            0.0,
+            1.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+
+        // Pre-fix behaviour: every "layer" independently recomputes the full
+        // selector + gather from `cos`/`sin`.
+        let (q1_ref, k1_ref) = apply_multimodal_rotary_pos_emb_interleaved(
+            &q_layer1,
+            &k_layer1,
+            &cos,
+            &sin,
+            mrope_section.clone(),
+        )
+        .unwrap();
+        let (q2_ref, k2_ref) = apply_multimodal_rotary_pos_emb_interleaved(
+            &q_layer2,
+            &k_layer2,
+            &cos,
+            &sin,
+            mrope_section.clone(),
+        )
+        .unwrap();
+
+        // Post-fix behaviour: compute the selected cos/sin ONCE, reuse for
+        // both "layers" (mirrors `Qwen3_5Attention::forward_paged`'s
+        // `mrope_cache` reuse).
+        let (cos_final, sin_final) =
+            select_interleaved_cos_sin(&cos, &sin, &mrope_section).unwrap();
+        let (q1_opt, k1_opt) =
+            apply_interleaved_rotary(&q_layer1, &k_layer1, &cos_final, &sin_final).unwrap();
+        let (q2_opt, k2_opt) =
+            apply_interleaved_rotary(&q_layer2, &k_layer2, &cos_final, &sin_final).unwrap();
+
+        assert_eq!(
+            q1_ref.to_float32().unwrap().as_ref(),
+            q1_opt.to_float32().unwrap().as_ref(),
+            "layer 1 Q must match the pre-fix per-layer recompute"
+        );
+        assert_eq!(
+            k1_ref.to_float32().unwrap().as_ref(),
+            k1_opt.to_float32().unwrap().as_ref(),
+            "layer 1 K must match the pre-fix per-layer recompute"
+        );
+        assert_eq!(
+            q2_ref.to_float32().unwrap().as_ref(),
+            q2_opt.to_float32().unwrap().as_ref(),
+            "layer 2 Q (reused cos/sin) must match the pre-fix per-layer recompute"
+        );
+        assert_eq!(
+            k2_ref.to_float32().unwrap().as_ref(),
+            k2_opt.to_float32().unwrap().as_ref(),
+            "layer 2 K (reused cos/sin) must match the pre-fix per-layer recompute"
         );
     }
 

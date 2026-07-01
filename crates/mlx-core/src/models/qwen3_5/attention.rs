@@ -8,7 +8,8 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::models::paddleocr_vl::language::{
-    MultimodalRoPE, apply_multimodal_rotary_pos_emb_interleaved,
+    MultimodalRoPE, apply_interleaved_rotary, apply_multimodal_rotary_pos_emb_interleaved,
+    select_interleaved_cos_sin,
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
@@ -351,6 +352,16 @@ impl Qwen3_5Attention {
     /// Returns `[B, T, hidden_size]` (post-output-projection,
     /// post-gate) so the layer's residual `h = x + r` matches the flat
     /// path.
+    /// `mrope_cache` is a per-forward-pass scratch slot for the M-RoPE arm:
+    /// every full-attention layer in one Qwen3.5-VL forward pass shares
+    /// byte-identical `position_ids`/`mrope_section`/dtype
+    /// (`init_mrope_layers` seeds every layer from the same config), so the
+    /// FIRST layer to see `Some(position_ids)` computes the selected cos/sin
+    /// and stores it here; every later layer in the same forward pass reuses
+    /// it instead of recomputing the cos/sin table + `take_along_axis`
+    /// gather. Callers outside the per-layer VLM prefill loop (decode / MTP
+    /// steps, which always pass `position_ids = None`) can pass `&mut None`
+    /// — it is never touched on that path.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
@@ -362,6 +373,7 @@ impl Qwen3_5Attention {
         is_prefill: bool,
         position_ids: Option<&MxArray>,
         rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -399,16 +411,25 @@ impl Qwen3_5Attention {
         let (queries, keys) = if let (Some(pos_ids), Some(mrope)) = (position_ids, &self.mrope) {
             // Qwen3.5-VL uses the INTERLEAVED (stride-3) per-frequency axis
             // selector, NOT PaddleOCR-VL's contiguous-chunk (sectioned) one.
-            let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+            //
+            // Every full-attention layer in one forward pass shares
+            // byte-identical `pos_ids`/`mrope_section`/dtype, so the cos/sin
+            // table build + axis-selector gather only needs to run once per
+            // forward pass (see `mrope_cache`'s doc comment above), not once
+            // per full-attention layer.
+            let (cos_final, sin_final) = match mrope_cache {
+                Some(cached) => cached.clone(),
+                None => {
+                    let (cos, sin) = mrope.forward(&queries, pos_ids)?;
+                    let selected =
+                        select_interleaved_cos_sin(&cos, &sin, mrope.mrope_section_arr())?;
+                    *mrope_cache = Some(selected.clone());
+                    selected
+                }
+            };
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
-            let (q_out, k_out) = apply_multimodal_rotary_pos_emb_interleaved(
-                &q_t,
-                &k_t,
-                &cos,
-                &sin,
-                mrope.mrope_section_arr().to_vec(),
-            )?;
+            let (q_out, k_out) = apply_interleaved_rotary(&q_t, &k_t, &cos_final, &sin_final)?;
             let q_out = q_out.transpose(Some(&[0, 2, 1, 3]))?;
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)

@@ -743,6 +743,15 @@ fn run_paged_prefill_one_chunk(
     // and image prefill uses the M-RoPE arm so this is ignored there.
     let rope_position_offset = paged_rope_offset(chunk_first_position, cached_rope_deltas);
 
+    // Shared per-forward-pass scratch slot for the M-RoPE cos/sin precompute
+    // (see `Qwen3_5Attention::forward_paged`'s `mrope_cache` doc comment).
+    // Every `FullAttentionPaged` layer in this loop shares one `position_ids`
+    // array, so the first such layer computes the selected cos/sin and every
+    // later one reuses it instead of recomputing the cos/sin table +
+    // `take_along_axis` gather. Stays `None` (untouched) on the text-only
+    // path where `position_ids` is `None`.
+    let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+
     for (layer_idx, ((layer, cache_slot), kind)) in layers
         .iter_mut()
         .zip(caches.iter_mut())
@@ -767,6 +776,7 @@ fn run_paged_prefill_one_chunk(
             layer_positions,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut mrope_cache,
         )?;
         crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
     }
@@ -893,6 +903,7 @@ pub(crate) fn run_paged_decode_step(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 
@@ -971,6 +982,7 @@ pub(crate) fn run_paged_step_with_hidden(
             /* position_ids */ None,
             /* use_kernel */ true,
             rope_position_offset,
+            &mut None,
         )?;
     }
 

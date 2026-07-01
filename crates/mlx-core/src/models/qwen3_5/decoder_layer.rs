@@ -276,6 +276,7 @@ impl DecoderLayer {
         position_ids: Option<&MxArray>,
         use_kernel: bool,
         rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
     ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
@@ -319,6 +320,7 @@ impl DecoderLayer {
                     is_prefill,
                     position_ids,
                     rope_position_offset,
+                    mrope_cache,
                 )?;
                 // Residual.
                 let h = x.add(&attn_out)?;
@@ -400,6 +402,7 @@ impl DecoderLayer {
                     is_prefill,
                     None,
                     rope_position_offset,
+                    &mut None,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
