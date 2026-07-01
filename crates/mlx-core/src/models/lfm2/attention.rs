@@ -35,6 +35,41 @@ fn graph_decode_gather_enabled() -> bool {
     })
 }
 
+/// When enabled (opt-in; default OFF), cache-hit prefill (`cached_prefix_len > 0`,
+/// i.e. every multi-turn chat continuation) first tries the MLX graph-native
+/// paged-attention bridge (`PagedKVCacheAdapter::gather_kv_for_prefill_chunk`),
+/// which reads the K/V pool through MLX graph dependencies with no forced host
+/// sync. When disabled (the default), or when the bridge is unavailable for the
+/// inputs (non-Metal backend, batch > 1, an unsupported cache dtype, or an
+/// oversized auxiliary buffer), the synchronous `read_kv_range` path is used
+/// instead — a `[0, total_ctx)` host read that forces a per-layer pool eval via
+/// `eval_pending_pool_write_for_layer`.
+///
+/// The bridge reads the SAME physical KV bytes as `read_kv_range`; only the
+/// attention kernel differs (fused paged-attn vs explicit-mask SDPA), the
+/// accepted ~1-ULP class already shipped default-on for paged DECODE. It is held
+/// opt-in here — unlike `qwen3_5`/`gemma4`, which default it on — only because
+/// the divergence has no green automated parity gate on the one available LFM2
+/// checkpoint (greedy decode there is repeat-loop-degenerate, so byte-identical
+/// text parity is an unreliable oracle). Flip to default-on once a gemma4-style
+/// paged-vs-flat gate exists on a stable checkpoint.
+fn paged_prefill_paged_attention_enabled() -> bool {
+    // Without a Metal backend (CUDA/Linux build) the C++ paged-attention
+    // kernel throws, so a cache-hit prefill must NOT dispatch it. Hard-close
+    // the path here so reuse-turn prefills stay on the device-agnostic SDPA
+    // fallback (`read_kv_range` + explicit mask).
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return false;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::inference_trace::env_flag_enabled_or_default(
+            "MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION",
+            false,
+        )
+    })
+}
+
 /// LFM2 multi-head attention with QK RMSNorm and RoPE.
 ///
 /// Follows `lfm2.py:53-109` (Attention class).
@@ -310,21 +345,63 @@ impl Lfm2Attention {
                     )?
                 }
             } else {
-                // Cache-hit prefill: read full [0, total_ctx) K/V back
-                // from the pool. The suffix was just written above.
+                // Cache-hit prefill: the suffix was just written above.
+                // Prefer the MLX graph-native paged-attention bridge (reads
+                // the pool through graph dependencies, no per-layer host
+                // sync) over `read_kv_range`, which forces
+                // `eval_pending_pool_write_for_layer` on every call. Mirrors
+                // the qwen3_5 / gemma4 `forward_paged` cache-hit branch.
                 let total_ctx = cached_prefix_len + (seq_len as u32);
-                let (k_full, v_full) = adapter
-                    .read_kv_range(attn_layer_idx, 0, total_ctx)
-                    .map_err(napi::Error::from_reason)?;
-                let mask =
-                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
-                scaled_dot_product_attention(
-                    &queries_bhtd,
-                    &k_full,
-                    &v_full,
-                    self.scale,
-                    Some(&mask),
-                )?
+                let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
+                    // [B, H, T, D] -> [H, T, D] -> [T, H, D], matching
+                    // `PagedKVCacheAdapter::gather_kv_for_prefill_chunk`.
+                    let queries_paged = queries_bhtd
+                        .squeeze(Some(&[0]))?
+                        .transpose(Some(&[1, 0, 2]))?;
+                    match adapter.gather_kv_for_prefill_chunk(
+                        attn_layer_idx,
+                        &queries_paged,
+                        cached_prefix_len,
+                        self.scale as f32,
+                    ) {
+                        Ok(attn_t_h_d) => {
+                            let target_dtype = x.dtype()?;
+                            let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
+                            // [T, H, D] -> [H, T, D] -> [B, H, T, D]
+                            let attn = attn_t_h_d.transpose(Some(&[1, 0, 2]))?.reshape(&[
+                                batch,
+                                self.num_heads as i64,
+                                seq_len,
+                                self.head_dim as i64,
+                            ])?;
+                            Some(attn)
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                match maybe_paged_attn {
+                    Some(attn) => attn,
+                    None => {
+                        let (k_full, v_full) = adapter
+                            .read_kv_range(attn_layer_idx, 0, total_ctx)
+                            .map_err(napi::Error::from_reason)?;
+                        let mask = create_causal_mask(
+                            seq_len as i32,
+                            Some(cached_prefix_len as i32),
+                            None,
+                        )?;
+                        scaled_dot_product_attention(
+                            &queries_bhtd,
+                            &k_full,
+                            &v_full,
+                            self.scale,
+                            Some(&mask),
+                        )?
+                    }
+                }
             }
         } else {
             // Decode: gather full historical K/V via the paged kernel. Both

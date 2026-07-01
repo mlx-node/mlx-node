@@ -823,6 +823,77 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
 }
 
 // ---------------------------------------------------------------------------
+// A/B probe: cache-hit prefill actually reaches `forward_paged`'s
+// `cached_prefix_len > 0` branch (the graph-native paged-attention bridge this
+// change adds). Paired-process: run TWICE with
+// MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION=1 (bridge on; default is OFF) and =0 and
+// diff the printed raw_text (a single process cannot toggle the OnceLock-cached
+// env var mid-run). Text is intentionally NOT asserted byte-identical — see below.
+// ---------------------------------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint; run TWICE with \
+            MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION=1 and =0 and diff the printed raw_text \
+            (a single process cannot toggle the OnceLock-cached env var mid-run)"]
+async fn lfm2_paged_prefill_bridge_cache_hit_ab_probe() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+    let dir = match clone_model_dir(&src, "lfm2-bridge-ab-probe", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir: {e}"),
+    };
+    let model = Lfm2Model::load_from_dir(&dir.to_string_lossy())
+        .await
+        .expect("failed to load LFM2 model");
+
+    let user1 = "Name the five largest planets in our solar system, in order.";
+    let r1 = model
+        .chat_session_start(vec![user_message(user1)], Some(parity_chat_config(32)))
+        .await
+        .expect("turn 1 chat_session_start failed");
+    eprintln!(
+        "[bridge-ab] turn1: num_tokens={} finish={} raw_text={:?}",
+        r1.num_tokens, r1.finish_reason, r1.raw_text
+    );
+
+    // Turn 2: a FRESH chat_session_start (NOT chat_session_continue -- LFM2
+    // declines the delta path, see model.rs ~1041) re-submitting the growing
+    // history. The content-addressed prefix cache hits (cached_tokens>0),
+    // driving run_paged_prefill_chunk's Pass 2 through forward_paged with
+    // cached_prefix_len>0 -- the EXACT branch this fix changes.
+    let user2 = "Which of those is the closest to the sun?";
+    let r2 = model
+        .chat_session_start(
+            vec![
+                user_message(user1),
+                assistant_message(&r1.raw_text),
+                user_message(user2),
+            ],
+            Some(parity_chat_config(32)),
+        )
+        .await
+        .expect("turn 2 chat_session_start failed");
+    eprintln!(
+        "[bridge-ab] turn2: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
+        r2.num_tokens, r2.cached_tokens, r2.finish_reason, r2.raw_text
+    );
+
+    // Reachability gate only -- text is intentionally NOT asserted
+    // byte-identical here. On the one checkpoint available
+    // (lfm2.5-1.2b-thinking-mlx), greedy decode falls into degenerate repeat
+    // loops that make text-level comparison unreliable; the bridge ON vs OFF
+    // agree on the first handful of generated tokens then diverge (a small
+    // kernel-level numerical difference cascading under greedy decode on a
+    // near-tied logit distribution -- the accepted ~1-ULP paged-vs-flat class,
+    // NOT a bug). `cached_tokens > 0` proves turn 2 reused a content-addressed
+    // prefix and thus drove forward_paged's cached_prefix_len>0 branch.
+    assert!(
+        r2.cached_tokens > 0,
+        "probe precondition: turn 2 must reuse a content-addressed prefix (cached_tokens=0)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Regression: a quantized LFM2 checkpoint loaded with NO config override must
 // default to the FLAT decode path.
 //

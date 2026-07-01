@@ -44,6 +44,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_WEIGHT_MATERIALIZE_CHUNK_MB`                    | Weight-loading chunk size                                                                                                                                                            |
 | `MLX_GDN_KERNEL=perstep\|chunked`                    | Force GDN recurrence kernel (default per-step on all archs; `chunked` is A/B-only and changes generated tokens by 1–2 bf16 ULP → different greedy continuation on some long prompts) |
 | `MLX_LFM2_CONV_STATE_REUSE`                          | Opt-in (default off): reuse live conv state on warm LFM2 paged continuation instead of reconstructing it, skipping the redundant Pass-1 over the cached prefix. Materially changes warm-turn output (~40 ULP, near-tie argmax may flip); off until oracle-validated |
+| `MLX_LFM2_PAGED_PREFILL_PAGED_ATTENTION`             | Opt-in (default off): multi-turn LFM2 cache-hit prefill tries the graph-native paged-attention bridge (gather_kv_for_prefill_chunk) before read_kv_range, skipping the forced per-layer pool sync. Held opt-in pending a stable-checkpoint paged-vs-flat gate (fused-vs-masked-SDPA ~1-ULP divergence) |
 
 ### Paged-attention
 
