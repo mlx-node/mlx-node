@@ -285,8 +285,10 @@ impl Qwen3_5Attention {
             // axis instead: every token in a multi-token forward gets the
             // same angle (offset + head_index), collapsing per-token
             // positions. Transpose in, rotate, transpose back (the extra
-            // transposes are views; the rope Metal kernel handles the
-            // transposed stride pattern without a copy).
+            // transposes are views; qwen3.5's partial rotary
+            // (rope_dims < head_dim) takes the rope kernel's copying
+            // `dims_ < D` branch either way, so the transposed input costs a
+            // strided rather than vector copy — the same price mlx-lm pays).
             let offset = cache.as_ref().map_or(0, |c| c.get_offset());
             let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
             let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
