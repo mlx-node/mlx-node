@@ -276,11 +276,26 @@ impl Qwen3_5Attention {
             let k_out = k_out.transpose(Some(&[0, 2, 1, 3]))?;
             (q_out, k_out)
         } else {
-            // Standard scalar offset RoPE (text-only path, existing behavior)
+            // Standard scalar-offset RoPE (text-only path).
+            //
+            // `fast::rope` varies the rotation position along axis -2 of its
+            // input, so it must see the [B, H, T, D] layout (token axis at
+            // -2) — matching mlx-lm's `self.rope(x.transpose(0, 2, 1, 3),
+            // offset)`. Applying it on [B, T, H, D] rotates along the HEAD
+            // axis instead: every token in a multi-token forward gets the
+            // same angle (offset + head_index), collapsing per-token
+            // positions. Transpose in, rotate, transpose back (the extra
+            // transposes are views; the rope Metal kernel handles the
+            // transposed stride pattern without a copy).
             let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-            let queries = self.rope.forward(&queries, Some(offset))?;
-            let keys = self.rope.forward(&keys, Some(offset))?;
-            (queries, keys)
+            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            let q_rot = self.rope.forward(&q_t, Some(offset))?;
+            let k_rot = self.rope.forward(&k_t, Some(offset))?;
+            (
+                q_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                k_rot.transpose(Some(&[0, 2, 1, 3]))?,
+            )
         };
 
         // Transpose to [B, H, T, D] for KVCache and SDPA
@@ -439,12 +454,22 @@ impl Qwen3_5Attention {
             // warm-continues an image prefill rotates at the compressed
             // M-RoPE position (physical slot + a negative cross-turn delta)
             // while K/V still writes at the physical slot below. Text turns
-            // pass `rope_position_offset == first_logical_position as i32`,
-            // so this stays byte-identical to the prior behaviour.
+            // pass `rope_position_offset == first_logical_position as i32`.
+            //
+            // `fast::rope` varies the rotation position along axis -2 of its
+            // input, so it must see the [B, H, T, D] layout (token axis at
+            // -2) — matching mlx-lm and the flat `forward` above. Applying
+            // it on [B, T, H, D] rotates along the HEAD axis, collapsing
+            // per-token positions within any multi-token chunk.
             let rope_offset = rope_position_offset;
-            let queries = self.rope.forward(&queries, Some(rope_offset))?;
-            let keys = self.rope.forward(&keys, Some(rope_offset))?;
-            (queries, keys)
+            let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+            let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+            let q_rot = self.rope.forward(&q_t, Some(rope_offset))?;
+            let k_rot = self.rope.forward(&k_t, Some(rope_offset))?;
+            (
+                q_rot.transpose(Some(&[0, 2, 1, 3]))?,
+                k_rot.transpose(Some(&[0, 2, 1, 3]))?,
+            )
         };
 
         // Transpose to [B, H, T, D] for SDPA.
@@ -884,6 +909,102 @@ mod tests {
             use_block_paged_cache: None,
             n_mtp_layers: 0,
         }
+    }
+
+    /// RoPE token-axis regression test. Prefills one KV cache with a single
+    /// 4-token forward (chunk) and another with 4 single-token forwards
+    /// (stepwise), then runs the same probe token through both caches and
+    /// compares the outputs.
+    ///
+    /// `fast::rope` varies the rotation position along axis -2 of its
+    /// input. The scalar-offset arm used to rope on `[B, T, H, D]`, which
+    /// rotates along the HEAD axis: in the 4-token chunk every token got
+    /// the same angle (`offset + head_index`), while the stepwise path got
+    /// per-token angles — so the two caches held O(1)-different keys and
+    /// the probe outputs diverged (observed max_abs_diff 0.053 with this
+    /// setup, vs 1.4e-4 with the fix). With the rotation on `[B, H, T, D]`
+    /// the caches agree and the probe outputs match to f32-kernel noise.
+    ///
+    /// Everything is f32 on purpose: f32 matmuls take the non-NAX Metal
+    /// path on gen-17 GPUs, so this test isolates rope-layout semantics
+    /// from the half-precision NAX GEMM issues that poison bf16
+    /// chunk-vs-stepwise comparisons on M5 hosts (see cleanup-G report).
+    #[test]
+    fn scalar_rope_rotates_along_token_axis() -> Result<()> {
+        let cfg = tiny_cfg();
+        let mut attn = Qwen3_5Attention::new(&cfg)?;
+
+        let h = cfg.num_heads as i64;
+        let d = cfg.head_dim as i64;
+        let hidden = cfg.hidden_size as i64;
+        let kv = cfg.num_kv_heads as i64;
+
+        // Deterministic weights, scaled small so multi-layer products stay
+        // O(1) in f32.
+        let q_w: Vec<f32> = (0..(2 * h * d * hidden))
+            .map(|i| ((i as f32) * 0.7391).sin() * 0.2)
+            .collect();
+        let k_w: Vec<f32> = (0..(kv * d * hidden))
+            .map(|i| ((i as f32) * 0.5711 + 1.0).sin() * 0.2)
+            .collect();
+        let v_w: Vec<f32> = (0..(kv * d * hidden))
+            .map(|i| ((i as f32) * 0.9173 + 2.0).sin() * 0.2)
+            .collect();
+        let o_w: Vec<f32> = (0..(hidden * h * d))
+            .map(|i| ((i as f32) * 0.6133 + 3.0).sin() * 0.2)
+            .collect();
+        attn.set_q_proj_weight(&MxArray::from_float32(&q_w, &[2 * h * d, hidden])?)?;
+        attn.set_k_proj_weight(&MxArray::from_float32(&k_w, &[kv * d, hidden])?)?;
+        attn.set_v_proj_weight(&MxArray::from_float32(&v_w, &[kv * d, hidden])?)?;
+        attn.set_o_proj_weight(&MxArray::from_float32(&o_w, &[hidden, h * d])?)?;
+
+        let x_vals: Vec<f32> = (0..(4 * hidden))
+            .map(|i| ((i as f32) * 0.8317).sin())
+            .collect();
+        let probe_vals: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32) * 0.3719 + 5.0).sin())
+            .collect();
+        let probe = MxArray::from_float32(&probe_vals, &[1, 1, hidden])?;
+
+        // Chunk prefill: one 4-token forward.
+        let mut cache_chunk = KVCache::new();
+        let x_full = MxArray::from_float32(&x_vals, &[1, 4, hidden])?;
+        let _ = attn.forward(&x_full, None, Some(&mut cache_chunk), None)?;
+        assert_eq!(cache_chunk.get_offset(), 4);
+
+        // Stepwise prefill: four 1-token forwards.
+        let mut cache_step = KVCache::new();
+        for t in 0..4usize {
+            let x_t = MxArray::from_float32(
+                &x_vals[t * hidden as usize..(t + 1) * hidden as usize],
+                &[1, 1, hidden],
+            )?;
+            let _ = attn.forward(&x_t, None, Some(&mut cache_step), None)?;
+        }
+        assert_eq!(cache_step.get_offset(), 4);
+
+        // Same probe token through both caches.
+        let out_chunk = attn.forward(&probe, None, Some(&mut cache_chunk), None)?;
+        let out_step = attn.forward(&probe, None, Some(&mut cache_step), None)?;
+
+        let a = out_chunk.to_float32()?;
+        let b = out_step.to_float32()?;
+        assert_eq!(a.len(), b.len());
+        let mut max_diff = 0.0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            max_diff = max_diff.max((x - y).abs());
+        }
+        // Observed ~1.4e-4 with the fix (chunk vs stepwise runs different
+        // f32 GEMM/GEMV kernels and softmax reduction orders); the broken
+        // head-axis rotation produced ~0.9. 1e-3 sits three orders of
+        // magnitude below the failure signal.
+        assert!(
+            max_diff < 1e-3,
+            "chunk-prefilled and stepwise-prefilled caches disagree \
+             (max_abs_diff={max_diff}); scalar RoPE is not rotating along \
+             the token axis"
+        );
+        Ok(())
     }
 
     /// Builds two `Qwen3_5Attention`s from byte-identical q/k/v/o weights:
