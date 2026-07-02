@@ -3,16 +3,11 @@
 //!
 //! Mirrors `lfm2_paged_vs_flat_parity.rs`. Qwen3.5's hybrid layer mix
 //! (GDN linear-attention + full-attention) means only the
-//! full-attention layers route through the paged adapter. The compiled
-//! C++ forward is bypassed entirely on the paged path; this gate
-//! verifies that the pure-Rust paged forward is byte-equal to the
-//! pure-Rust flat forward (for greedy decoding) on real weights.
-//!
-//! ⚠️ The compiled C++ forward path is the production fast path on
-//! flat (≈6.4 tok/s on M3 Max). When the paged adapter is enabled the
-//! Rust fallback runs instead — so the parity comparison is between
-//! two Rust forward paths, NOT between Rust paged and compiled C++
-//! flat. This is the same trade-off LFM2 makes with the conv operator.
+//! full-attention layers route through the paged adapter. Both sides of
+//! the comparison are pure-Rust eager forwards (the compiled C++
+//! qwen3.5 forward no longer exists): this gate verifies that the paged
+//! forward is byte-equal to the flat forward (for greedy decoding) on
+//! real weights.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH` so a plain `cargo test --ignored`
 //! without the env var still passes (the early-return short-circuits

@@ -819,9 +819,9 @@ fn project_last_token_logits(
 /// head, returning `(last_token_logits[vocab], full_chunk_hidden[1, T, hidden])`.
 ///
 /// The paged prefill variant needs every chunk's post-`final_norm` hidden so
-/// the MTP committed-history prefill seed (`prefill_mtp_commit`) gets a
-/// contiguous `[1, prompt_len, hidden]` tensor — mirrors
-/// `chunked_prefill_with_hidden` on the dense path.
+/// the MTP committed-history prompt seed (`prompt_hidden`, consumed by
+/// `begin_mtp_decode`) gets a contiguous `[1, prompt_len, hidden]` tensor —
+/// mirrors `chunked_prefill_with_hidden` on the dense path.
 fn project_last_token_logits_with_full_hidden(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
@@ -852,9 +852,10 @@ fn project_last_token_logits_with_full_hidden(
         full_hidden
     };
 
-    // The caller runs `synchronize_and_clear_cache()` before
-    // `prefill_mtp_commit`, which would otherwise free the lazy graph nodes
-    // backing the kept hidden. Materialise before return.
+    // The caller runs `synchronize_and_clear_cache()` after prefill, before
+    // `begin_mtp_decode` consumes the kept hidden as its prompt-prefix seed
+    // — that sweep would otherwise free the lazy graph nodes backing the
+    // kept hidden. Materialise before return.
     kept_hidden.eval();
     debug_assert_eq!(kept_hidden.shape_at(0)?, 1);
     debug_assert!(kept_hidden.shape_at(1)? >= 1);

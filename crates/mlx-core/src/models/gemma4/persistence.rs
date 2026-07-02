@@ -994,10 +994,12 @@ fn apply_weights(
     // int8 bytes as a dense weight, see `try_build_sym8_quantized_linear`).
     //
     // Paged KV stays the gemma4 default under sym8 (`use_block_paged_cache`
-    // defaults true in `model.rs`): gemma4 has NO compiled C++ forward path,
-    // and the eager paged loop drives the same `LinearProj::forward` sym8
-    // route as flat — qwen3_5's force-flat sym8 guard exists only because
-    // its compiled registry can't represent sym8, which does not transfer.
+    // defaults true in `model.rs`): gemma4's eager paged loop drives the
+    // same `LinearProj::forward` sym8 route as flat, and gemma4 ships sym8
+    // under paged decode. qwen3_5's force-flat sym8 pin is a conservative
+    // validation-scope choice on its own path (sym8 there is validated on
+    // the flat path only; paged is simply unvalidated) — a rationale that
+    // does not transfer here.
     let try_build_ql = |prefix: &str| -> Result<Option<super::quantized_linear::QuantizedLinear>> {
         let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud

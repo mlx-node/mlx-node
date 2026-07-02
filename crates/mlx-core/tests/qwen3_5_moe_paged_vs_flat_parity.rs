@@ -2,9 +2,8 @@
 //! MoE.
 //!
 //! Mirrors `qwen3_5_paged_vs_flat_parity.rs` but loads the MoE
-//! checkpoint. Same caveats apply — the compiled C++ MoE forward path
-//! is bypassed when the paged adapter is enabled, so this gate is a
-//! Rust-paged-vs-Rust-flat comparison.
+//! checkpoint. Same caveats apply — both sides are pure-Rust eager
+//! forwards, so this gate is a Rust-paged-vs-Rust-flat comparison.
 //!
 //! Gated on `MLX_TEST_MODEL_PATH`. Run with:
 //!

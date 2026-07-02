@@ -86,8 +86,9 @@ pub struct ChatConfig {
     #[napi(ts_type = "boolean | undefined")]
     pub reuse_cache: Option<bool>,
     /// MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-    /// loop on the dense compiled path. Requires the model checkpoint to carry
-    /// an MTP head (otherwise silently ignored). Default: `false`.
+    /// loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+    /// checkpoint to carry an MTP head (otherwise silently ignored). Default:
+    /// `false`.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
     /// MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`

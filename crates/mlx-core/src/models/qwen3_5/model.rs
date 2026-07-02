@@ -4293,8 +4293,8 @@ impl Qwen35Inner {
         // prior NON-streaming paged turn (`send()` → `chat_tokens_delta_sync`
         // → `paged_turn_sync_core`) therefore leaves `self.caches`'
         // full-attention slots EMPTY/STALE for the prior turn's tokens.
-        // Delta-prefilling only `delta_tokens` on top of that and exporting
-        // `self.caches` into the compiled/MTP graph would decode from an
+        // Delta-prefilling only `delta_tokens` on top of that and running
+        // the eager MTP decode against `self.caches` would decode from an
         // incomplete flat prefix (missing the prior turn's attention KV).
         //
         // Fix: when taking this dense fallback AND the flat caches are dirty
@@ -4306,7 +4306,7 @@ impl Qwen35Inner {
         // cache-prefix miss (full reset + full re-prefill). The GDN recurrent
         // state cannot be rewound mid-sequence, so a full reset + full
         // prefill is the only coherent way to seed both the GDN linear and
-        // full-attention flat caches for the compiled/MTP decode.
+        // full-attention flat caches for the eager MTP decode.
         //
         // The dirty gate keeps this a ONE-TIME cost on the paged→dense
         // transition: the flag is cleared once at end-of-turn success (atomic
@@ -8523,9 +8523,10 @@ fn chunked_prefill_with_size(
 /// state for the prompt tail needed by MTP, concatenated along the time axis
 /// -> `[1, kept_len, hidden]`.
 ///
-/// Used only when MTP is active for the turn: the prompt hiddens are
-/// needed to commit the prompt prefix into the MTP committed-history
-/// cache (`prefill_mtp_commit`). Logits-only callers keep the cheaper
+/// Used only when MTP is active for the turn: the prompt hiddens flow
+/// through `ChatDecodeInputs::prompt_hidden` into `begin_mtp_decode`'s
+/// prompt-prefix seed, which commits the prompt prefix into the MTP
+/// committed-history caches. Logits-only callers keep the cheaper
 /// `chunked_prefill`. The per-chunk forward op sequence is identical for
 /// chunks whose hidden is kept; chunks before the requested tail use the
 /// logits-only path and discard hidden to avoid materializing prompt history

@@ -27,9 +27,9 @@
 //! drop-acceptance threshold (`0.75`) and probe-interval pattern are lifted
 //! directly.
 //!
-//! The compiled MTP verify graphs are pre-warmed at model load for every
-//! depth in `{1..=5}`, so switching depth between cycles is zero-cost from
-//! the compile side — the policy can swing freely.
+//! The MTP verify pass is pure-Rust eager — there are no per-depth
+//! compiled graphs to pre-warm, so switching depth between cycles carries
+//! no setup cost and the policy can swing freely.
 
 use std::time::Duration;
 

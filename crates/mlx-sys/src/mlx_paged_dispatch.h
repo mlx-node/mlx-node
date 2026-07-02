@@ -12,7 +12,8 @@
 // primitives dispatched here are the graph-native default: every paged
 // family's pure-Rust forward (qwen3, qwen3.5 dense/MoE, lfm2, gemma4)
 // emits them via `PagedKVCacheAdapter::update_keys_values_native` /
-// `gather_kv_for_decode_graph` / `gather_kv_for_prefill_chunk`, so the
+// `gather_kv_for_decode_graph` (`gather_kv_for_prefill_chunk` is
+// family-dependent: opt-in default-OFF on lfm2, absent on qwen3), so the
 // K/V write and attention read ride MLX's lazy graph with no per-layer
 // host sync. They also stay compile-traceable (usable inside
 // `mlx::core::compile`), covered by the compile-trace smoke tests in

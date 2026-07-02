@@ -920,19 +920,23 @@ pub(crate) trait ChatBackend {
     where
         Self: 'a;
 
-    /// Set up the turn's decode path and return the stepper. == the
-    /// compiled-vs-eager dispatch blocks ahead of every `decode_loop!`
-    /// invocation (compiled lock acquisition + C++ seed-from-prefill on
-    /// the compiled path — `models/lfm2/model.rs` ~873-1100,
-    /// `models/qwen3_5/model.rs` compiled-init branches — or the
-    /// `DecodeOps` closure construction on the eager path). Turn-constant
-    /// captures (embedding weight, stream handles, the
-    /// `turn.params.reuse_cache` gate for [`DecodeStep::end_decode`])
-    /// move into the returned impl.
+    /// Set up the turn's decode stepper. Every family returns a pure-Rust
+    /// eager stepper; `turn` is consulted only for turn-constant setup:
     ///
-    /// lfm2 trap: the lfm2 impl must branch on `turn.is_delta` and return
-    /// the EAGER stepper for delta turns — its delta decode loop is always
-    /// eager, unlike the fresh flat path's compiled dispatch.
+    ///   * qwen3_5 dense reads `turn.params` / `turn.total_seq_len` /
+    ///     `turn.is_delta` / `turn.has_images` for its sync-path
+    ///     decode-entry trace (KV-capacity estimate via
+    ///     `engine::kv_capacity_round_up_saturating`) and, together with
+    ///     the recorded streaming-ness, picks the `chat*_rust` relabel.
+    ///   * qwen3 / MoE read only `turn.is_delta` for their profiler
+    ///     relabels (qwen3 additionally seeds `rope_offsets` from its
+    ///     post-prefill cursor — model state, not `turn`).
+    ///   * lfm2 / gemma4 ignore `turn` entirely and just wrap `self`.
+    ///
+    /// Turn-constant captures (the embedding weight and, for the qwen3.5
+    /// families, its transpose) move into the returned impl.
+    /// [`DecodeStep::end_decode`] is a default no-op that no family
+    /// overrides.
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>>;
 
     /// Decode the generated tokens and assemble the turn's
@@ -1105,7 +1109,7 @@ pub(crate) trait ChatBackend {
 
     /// Turn-level profiler label. Feeds
     /// `DecodeProfiler::new(label, family_name())`; the decode-path
-    /// relabel (compiled/eager) is [`DecodeStep::profiler_relabel`].
+    /// relabel is [`DecodeStep::profiler_relabel`].
     ///
     /// Default == the qwen3_5 dense labels (the de-facto engine
     /// reference): `"chat"` / `"chat_delta"` / `"chat_stream"` /
@@ -1298,10 +1302,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// `[vocab]`.
     ///
     /// == the forked cores' `run_paged_prefill_chunk(suffix, prefix_len,
-    /// ..)` + last-token projection. MAY eval its input (compiled-paged
-    /// needs the concrete suffix); eager qwen3 does not. The engine fires
-    /// the post-prefill `synchronize_and_clear_cache` AFTER this returns
-    /// (it is NOT this method's job).
+    /// ..)` + last-token projection. MAY eval intermediates mid-prefill
+    /// (the chunked workers materialize each non-final chunk to bound the
+    /// lazy graph). The engine fires the post-prefill
+    /// `synchronize_and_clear_cache` AFTER this returns (it is NOT this
+    /// method's job).
     fn paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
@@ -1310,9 +1315,10 @@ pub(crate) trait PagedBackend: ChatBackend {
     ) -> Result<MxArray>;
 
     /// Build the per-step paged decode stepper (the analog of
-    /// [`ChatBackend::begin_decode`]). Captures the turn constants
-    /// (`num_layers`, the dummy positions array, the compiled-paged
-    /// guards) into the returned stepper, which then drives
+    /// [`ChatBackend::begin_decode`]). Captures the turn constants into
+    /// the returned stepper (qwen3: `num_layers` + its dummy positions
+    /// array; gemma4 adds a diagnostic step counter; the rest just wrap
+    /// `self`), which then drives
     /// [`crate::engine::decode::run_decode_loop`].
     fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>>;
 
@@ -1460,7 +1466,7 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// Default — the dedicated `generation_stream`: a fresh Metal command
     /// queue that isolates decode work for the standard-KV families.
     ///
-    /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its compiled-paged
+    /// lfm2 OVERRIDES this to the canonical DEFAULT stream. Its paged
     /// forward holds persistent per-layer K/V pools across steps; running that
     /// forward on a queue SEPARATE from the shared loop's top-of-iteration
     /// `y.eval()` (which always runs on the default stream) forces a
@@ -1479,9 +1485,7 @@ pub(crate) trait PagedBackend: ChatBackend {
 /// MTP propose/verify loop needs to construct its per-turn stepper. The
 /// per-cycle scratch (snapshot / GDN tape / stashed replay error) does
 /// NOT live here: it becomes STRUCT FIELDS of the concrete
-/// [`MtpStepper`] (the analog of the compiled-paged guards on
-/// [`PagedBackend::PagedDecode`]), so the GDN tape never crosses the
-/// trait boundary.
+/// [`MtpStepper`], so the GDN tape never crosses the trait boundary.
 ///
 /// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
 /// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
@@ -1551,8 +1555,7 @@ pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
     /// stashed replay error live as STRUCT FIELDS of the concrete stepper
-    /// (declaration order == teardown order, like the compiled-paged
-    /// guards on [`PagedBackend::PagedDecode`]).
+    /// (declaration order == teardown order).
     type MtpDecode<'a>: MtpStepper
     where
         Self: 'a;

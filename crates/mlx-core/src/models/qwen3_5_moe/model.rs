@@ -279,7 +279,7 @@ pub(crate) struct Qwen35MoeInner {
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
-    /// consumed by [`ChatBackend::begin_decode`]'s compiled/eager
+    /// consumed by [`ChatBackend::begin_decode`]'s
     /// profiler relabel, which must pick the `moe_chat_*` vs
     /// `moe_chat_stream_*` label family (`TurnSetup` does not carry
     /// streaming-ness). Whole-turn override paths (vision/paged/MTP)
@@ -2396,11 +2396,12 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
-        // Pure-Rust paged prefill: writes K/V into the adapter pool via
-        // `update_keys_values` per layer (Metal kernel dispatch — direct
-        // buffer mutation, NOT MLX graph) and populates the GDN linear
-        // caches in `Qwen3_5LayerCache::Linear(ArraysCache)`. Both are
-        // exactly what the pure-Rust paged decode steps
+        // Pure-Rust paged prefill: writes K/V into the adapter pool per
+        // layer via `update_keys_values_native` (graph-native `PagedKVWrite`
+        // primitive — the default; the synchronous raw-Metal
+        // `update_keys_values` is the error/opt-out fallback) and populates
+        // the GDN linear caches in `Qwen3_5LayerCache::Linear(ArraysCache)`.
+        // Both are exactly what the pure-Rust paged decode steps
         // (`paged_forward::run_paged_decode_step`) read as inputs.
         let last_logits = {
             let embed = self.embedding.clone();
@@ -6004,8 +6005,8 @@ impl Qwen35MoeInner {
     /// [`Self::vision_mtp_whole_turn_stream_core`], delta streaming →
     /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every MoE-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
-    /// AR), the paged-always-wins dispatch (including the
+    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back
+    /// to AR when ineligible), the paged-always-wins dispatch (including the
     /// paged-text-only rejection for image turns — unlike dense, MoE
     /// has NO `mtp_takes_dense_path` exception: its paged early-return
     /// runs before any MTP consideration on every path).
