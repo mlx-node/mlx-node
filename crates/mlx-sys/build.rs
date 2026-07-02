@@ -10,6 +10,19 @@ fn metal_toolchain_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Explicit deployment-target floor for the macOS build products. When unset,
+/// every toolchain stamps its own default and the artifact floor silently
+/// tracks the build machine: the metal compiler uses the SDK's default min-OS
+/// and MLX's CMake defaults `CMAKE_OSX_DEPLOYMENT_TARGET` to the build host's
+/// macOS version. Setting `MACOSX_DEPLOYMENT_TARGET` (already honored by
+/// rustc and cc for the Rust side) makes the floor deliberate for the CMake
+/// and metallib products too.
+fn macos_deployment_target() -> Option<String> {
+    env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// Compile the paged-attention `.metal` sources into
 /// `<out_dir>/paged_attn.metallib`. The kernels live in
 /// `crates/mlx-paged-attn/metal/`. mlx-sys's own
@@ -51,22 +64,28 @@ fn compile_paged_attn_metallib(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         let air_name = file.replace('/', "_").replace(".metal", ".air");
         let air_path = out_dir.join(&air_name);
 
-        let status = Command::new("xcrun")
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                "-c",
-                src_path.to_str().unwrap(),
-                "-o",
-                air_path.to_str().unwrap(),
-                "-I",
-                metal_src_dir.to_str().unwrap(),
-                "-O3",
-                "-ffast-math",
-            ])
-            .status()
-            .expect("Failed to execute xcrun metal");
+        let mut compile_cmd = Command::new("xcrun");
+        compile_cmd.args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-c",
+            src_path.to_str().unwrap(),
+            "-o",
+            air_path.to_str().unwrap(),
+            "-I",
+            metal_src_dir.to_str().unwrap(),
+            "-O3",
+            "-ffast-math",
+        ]);
+        // Pin the metallib's min-OS stamp when a floor is requested, matching
+        // what MLX's kernel CMake does for mlx.metallib. The metal driver
+        // reads MACOSX_DEPLOYMENT_TARGET from the environment too, but the
+        // explicit flag keeps the floor visible in the command line.
+        if let Some(target) = macos_deployment_target() {
+            compile_cmd.arg(format!("-mmacosx-version-min={target}"));
+        }
+        let status = compile_cmd.status().expect("Failed to execute xcrun metal");
         if !status.success() {
             panic!(
                 "Metal compilation failed for {}: exit code {:?}",
@@ -177,6 +196,10 @@ fn xcrun_find(tool: &str) -> Option<String> {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=mlx");
+    // The deployment-target floor participates in both the CMake configure
+    // and the paged-attn metallib compile; changing it must re-run this
+    // script or the caches keep the old floor.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     // Watch all C++ source files, headers, and Metal kernel includes
     let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
     if let Ok(entries) = std::fs::read_dir(&src_dir) {
@@ -259,6 +282,16 @@ fn main() {
                 "x86_64"
             },
         );
+        // Forward an explicit deployment-target floor as a -D define: a
+        // define overrides a stale CMAKE_OSX_DEPLOYMENT_TARGET already
+        // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache),
+        // which the environment variable alone cannot. When unset, MLX's
+        // CMakeLists defaults the floor to the build host's macOS version.
+        // Note MLX only builds the NAX (M5 tensor-core) kernels when this
+        // floor is >= 26.2 — pinning lower silently drops them.
+        if let Some(deployment_target) = macos_deployment_target() {
+            cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
+        }
     }
 
     if target_os == "macos" {
