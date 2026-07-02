@@ -667,8 +667,8 @@ mod tests {
     /// bf16 parity live inside the vendored-MLX NAX broken classes on
     /// gen>=17 GPUs. The reference's `Q@K^T` and `attn@V` are bf16 GEMMs
     /// with K = head_dim = 64 / K = T (unaligned-K garbage class), and the
-    /// fast path's fused bf16 full-SDPA (q_len > 8) is the kernel class the
-    /// item-G review measured 0.1-1.9 off per row. Probed on the t=64 case
+    /// fast path's fused bf16 full-SDPA (q_len > 8) is a kernel class
+    /// measured 0.1-1.9 off per row vs host truth. Probed on the t=64 case
     /// against a host-f64 banded-attention truth built from the same
     /// bf16-rounded inputs: fast err 2.22, reference err 2.05 (output
     /// max_abs 0.96) — the observed parity failure (max_abs_diff 0.988 vs
