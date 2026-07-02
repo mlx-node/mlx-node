@@ -24,11 +24,12 @@ mod common;
 
 #[test]
 fn synthetic_moe_mtp_gate_v2_committed_history() {
-    // Set the flag before building the runtime so no other thread exists yet
-    // when the environment is mutated, and before any model code can hit the
-    // stepper's once-per-process flag read.
-    // SAFETY: single-threaded at this point — the tokio workers and model
-    // threads that later read the environment are spawned below.
+    // Set the flag before building the runtime, and before any model code can
+    // hit the stepper's once-per-process flag read.
+    // SAFETY: `set_var` requires no concurrent access to the process
+    // environment. This is the binary's only `#[test]`, so libtest runs just
+    // this one test thread; the tokio workers and model threads — the only
+    // in-process readers of this flag — are spawned below, after the set.
     unsafe { std::env::set_var("MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY", "1") };
 
     tokio::runtime::Builder::new_multi_thread()
