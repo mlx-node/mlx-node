@@ -7,5 +7,5 @@
     "types": ["node"]
   },
   "include": ["."],
-  "exclude": ["build.ts"]
+  "exclude": ["build.ts", "dist"]
 }

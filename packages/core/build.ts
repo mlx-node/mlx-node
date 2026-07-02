@@ -1,4 +1,5 @@
-import { readFile, writeFile, copyFile, readdir, stat, mkdir } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { readFile, writeFile, copyFile, stat, mkdir } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -6,6 +7,13 @@ import { NapiCli, createBuildCommand } from '@napi-rs/cli';
 import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
+import {
+  assertMetallibIntegrity,
+  collectMetallibCandidates,
+  hostAppleTriple,
+  profileDirName,
+  shouldExpectNaxKernels,
+} from './metallib-select';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const buildCommand = createBuildCommand(process.argv.slice(2));
@@ -109,66 +117,85 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   console.log(`Copied ${expectedName} -> ${dst}`);
 }
 
+// Probe the same inputs MLX's kernel CMake uses to decide whether the NAX
+// (M5 tensor-core) kernels are compiled on this host; the metallib gate then
+// requires them to be present. Any probe failure downgrades to the base gate
+// only — a broken Metal toolchain already fails the native build itself.
+function detectExpectNax(): boolean {
+  try {
+    const sdkVersion = execFileSync('xcrun', ['-sdk', 'macosx', '--show-sdk-version'], { encoding: 'utf-8' }).trim();
+    const hostVersion = execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
+    return shouldExpectNaxKernels(sdkVersion, hostVersion, process.env.MACOSX_DEPLOYMENT_TARGET);
+  } catch {
+    return false;
+  }
+}
+
 async function copyMetallibs() {
   const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
   const destDirs = [__dirname, npmDarwinDir];
 
-  const targetDir = join(__dirname, '../../target');
-  // Find mlx.metallib in the build directory.
-  // Pattern: target/*/release/build/mlx-sys-*/out/lib/mlx.metallib
-  const archDirs = await readdir(targetDir);
-  for (const arch of archDirs) {
-    const releaseDir = join(targetDir, arch, 'release', 'build');
-    let buildDirs: string[];
-    try {
-      buildDirs = await readdir(releaseDir);
-    } catch {
-      // release/build dir doesn't exist for this arch
-      continue;
-    }
-    for (const dir of buildDirs) {
-      if (!dir.startsWith('mlx-sys-')) continue;
-      const libDir = join(releaseDir, dir, 'out', 'lib');
-      const mlxPath = join(libDir, 'mlx.metallib');
-      try {
-        await stat(mlxPath);
-      } catch {
-        // metallib not at this path, continue searching
-        continue;
-      }
-      // mlx.metallib is required: copy to all destinations or fail.
-      for (const dest of destDirs) {
-        const dst = join(dest, 'mlx.metallib');
-        await copyFile(mlxPath, dst);
-        console.log(`Copied mlx.metallib -> ${dst}`);
-      }
-      // paged_attn.metallib is also required for darwin.
-      // It lives next to mlx.metallib in the same lib dir.
-      const pagedPath = join(libDir, 'paged_attn.metallib');
-      try {
-        await stat(pagedPath);
-      } catch {
-        throw new Error(
-          `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
-            `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
-            `at runtime; without it, the addon throws on first paged-attention use. ` +
-            `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
-        );
-      }
-      for (const dest of destDirs) {
-        const dst = join(dest, 'paged_attn.metallib');
-        await copyFile(pagedPath, dst);
-        console.log(`Copied paged_attn.metallib -> ${dst}`);
-      }
-      // Final sanity-check: every destination must have BOTH files.
-      // This catches a copy that silently overwrote or partially
-      // failed; cheaper to fail the build than to publish a broken
-      // optional package.
-      await assertMetallibPresence(destDirs);
-      return;
-    }
+  // Bind the search to the build napi just ran: same target dir, same
+  // triple (napi always passes `--target`, defaulting to the host triple),
+  // same profile. See metallib-select.ts for why a loose "first directory
+  // that has a metallib" scan is unsafe.
+  const targetRoot = buildOptions.targetDir ?? process.env.CARGO_BUILD_TARGET_DIR ?? join(__dirname, '../../target');
+  const triple = buildOptions.target ?? process.env.CARGO_BUILD_TARGET ?? hostAppleTriple();
+  const profile = profileDirName(buildOptions);
+  const candidates = collectMetallibCandidates(targetRoot, triple, profile);
+  if (candidates.length === 0) {
+    throw new Error(
+      `mlx.metallib not found under ${join(targetRoot, triple, profile, 'build')}/mlx-sys-*/out/lib/ ` +
+        `(nor the plain ${join(targetRoot, profile, 'build')} layout).`,
+    );
   }
-  throw new Error('mlx.metallib not found under any target/<arch>/release/build/mlx-sys-*/out/lib/');
+  const picked = candidates[0]!;
+  if (candidates.length > 1) {
+    console.warn(
+      `Multiple mlx-sys metallib dirs found; using the most recently built one:\n` +
+        candidates
+          .map(
+            (c, i) =>
+              `  ${i === 0 ? '->' : '  '} ${c.metallibPath} (${c.size} bytes, ${new Date(c.rankMtimeMs).toISOString()})`,
+          )
+          .join('\n'),
+    );
+  }
+
+  // Hard gate: never ship a truncated or stale-pin metallib. A mismatch here
+  // pairs wrong kernels with the freshly built addon and produces garbage
+  // inference output with no error at load time.
+  const metallib = await readFile(picked.metallibPath);
+  assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
+
+  for (const dest of destDirs) {
+    const dst = join(dest, 'mlx.metallib');
+    await copyFile(picked.metallibPath, dst);
+    console.log(`Copied mlx.metallib -> ${dst}`);
+  }
+  // paged_attn.metallib is also required for darwin.
+  // It lives next to mlx.metallib in the same lib dir.
+  const pagedPath = join(picked.libDir, 'paged_attn.metallib');
+  try {
+    await stat(pagedPath);
+  } catch {
+    throw new Error(
+      `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
+        `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
+        `at runtime; without it, the addon throws on first paged-attention use. ` +
+        `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
+    );
+  }
+  for (const dest of destDirs) {
+    const dst = join(dest, 'paged_attn.metallib');
+    await copyFile(pagedPath, dst);
+    console.log(`Copied paged_attn.metallib -> ${dst}`);
+  }
+  // Final sanity-check: every destination must have BOTH files.
+  // This catches a copy that silently overwrote or partially
+  // failed; cheaper to fail the build than to publish a broken
+  // optional package.
+  await assertMetallibPresence(destDirs);
 }
 
 async function assertMetallibPresence(destDirs: string[]) {
