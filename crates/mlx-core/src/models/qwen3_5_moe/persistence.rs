@@ -535,12 +535,24 @@ fn apply_weights_moe_inner(
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
             // Per-expert 3-D stacked projections route through gather_qmm,
-            // which has no sym8 pack. Convert's `sym8_eligible` forces every
-            // switch_mlp.* tensor to an explicit affine-8 per-layer override,
-            // so a sym8 PLQ reaching this arm means corrupt/hand-edited quant
-            // metadata — fail loud, never fall back to a silent affine/dense
-            // read of int8 bytes.
+            // which has no sym8 pack. Two cases, keyed on the `.scales`
+            // sidecar — the shared "is this prefix quantized?" signal
+            // (`try_build_sym8_quantized_linear`'s documented contract):
+            //   * `.scales` ABSENT — the trio was emitted dense (convert's
+            //     group-coherence pass forces the whole trio dense when any
+            //     member is unquantizable), so a sym8 top-level DEFAULT
+            //     legitimately resolves here with no override. `Ok(None)`
+            //     hands the prefix to the dtype-guarded dense fallback below.
+            //   * `.scales` PRESENT — quantized bytes under a sym8 PLQ means
+            //     corrupt/hand-edited quant metadata (convert's
+            //     `sym8_eligible` forces every quantized switch_mlp.* tensor
+            //     to an explicit affine-8 per-layer override) — fail loud,
+            //     never fall back to a silent affine/dense read of int8
+            //     bytes.
             PerLayerMode::Sym8 => {
+                if !params.contains_key(&format!("{prefix}.scales")) {
+                    return Ok(None);
+                }
                 return Err(Error::from_reason(format!(
                     "sym8 layer '{prefix}': per-expert switch_mlp projections (3-D stacked \
                      experts) have no sym8 kernel; convert forces these to an affine-8 \
@@ -1832,8 +1844,8 @@ mod tests {
     }
 
     use super::{
-        AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MxArray, PerLayerMode,
-        PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
+        AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
+        PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
         default_per_layer_quant, load_vision_encoder_moe,
     };
     use std::collections::HashMap;
@@ -2159,6 +2171,90 @@ mod tests {
             msg.contains("switch_mlp.gate_proj") && msg.contains("sym8"),
             "error must name the expert projection and mention sym8, got: {msg}"
         );
+    }
+
+    /// A checkpoint whose top-level mode is sym8 can legitimately carry a
+    /// DENSE switch_mlp trio: convert's group-coherence pass forces the whole
+    /// trio dense when any member is unquantizable (e.g. K not divisible by
+    /// the affine group size), emitting f32 weights with NO `.scales` sidecar
+    /// and NO per-layer override. The prefix then resolves to the sym8
+    /// DEFAULT PLQ, and `try_build_qsl` must treat the absent `.scales` as
+    /// "this layer is not quantized" (`Ok(None)`, the contract shared with
+    /// `try_build_sym8_quantized_linear` and the 2-D `try_build_ql`) so the
+    /// dtype-guarded dense fallback installs the weights — NOT fail the whole
+    /// load with the re-convert error.
+    #[test]
+    fn sym8_default_loads_forced_dense_switch_mlp_trio() {
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!(
+                "[skip] sym8 MoE forced-dense trio test: int8 kernels need an M5+ GPU (gen >= 17)"
+            );
+            return;
+        }
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // One OTHER tensor genuinely sym8-quantized: makes
+        // `is_quantized_checkpoint` true so the loader takes the quantized
+        // MoE arm (the path that calls `try_build_qsl`).
+        synth_sym8_group(&mut params, "layers.0.self_attn.q_proj", 64, 64);
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+        // The forced-dense trio: 3-D f32 [experts, N, K] with K = 60 (fails
+        // the affine group gate, so convert's coherence pass emitted the
+        // whole trio dense), no .scales, no per-layer override.
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            params.insert(
+                format!("layers.0.mlp.switch_mlp.{suffix}.weight"),
+                MxArray::from_float32(&vec![0.5f32; 4 * 8 * 60], &[4, 8, 60]).expect("trio"),
+            );
+        }
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Sym8),
+            &HashMap::new(),
+            /* has_vision */ false,
+        )
+        .expect("forced-dense switch_mlp trio under a sym8 default must load dense");
+
+        match &inner.layers[0].mlp {
+            MLPType::MoE(moe) => {
+                let switch = moe.get_switch_mlp();
+                assert!(
+                    !switch.is_quantized(),
+                    "trio must land on the dense SwitchGLU path"
+                );
+                let w = switch.get_gate_proj_weight();
+                assert_eq!(
+                    w.dtype().unwrap(),
+                    DType::Float32,
+                    "dense fallback must keep the f32 checkpoint dtype"
+                );
+                assert_eq!(
+                    &w.shape().unwrap()[..],
+                    &[4i64, 8, 60],
+                    "dense fallback must install the checkpoint tensor, not the ctor placeholder"
+                );
+            }
+            _ => panic!("layer 0 must be MoE (decoder_sparse_step = 1)"),
+        }
     }
 
     /// A sym8 checkpoint on an MTP-capable config must LOAD (the non-expert
