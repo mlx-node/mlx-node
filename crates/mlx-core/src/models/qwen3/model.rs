@@ -4967,13 +4967,32 @@ mod tests {
     /// 97-token prompt. Tolerance budget mirrors the multi-chunk parity
     /// test (atol=rtol=5e-3 for bf16 + chunk-boundary fma reorderings).
     ///
-    /// Skips on no-Metal hosts.
+    /// Skips on no-Metal hosts, and on hosts whose half-precision GEMM
+    /// fails the `test_support::half_gemm_untrustworthy` canary: this
+    /// config's matmuls (K=64 projections, K=32 fallback-SDPA scores) sit
+    /// inside the vendored-MLX NAX unaligned-K broken regime on gen>=17
+    /// GPUs, and the 1-token tail chunk dispatches M=1 GEMV (correct)
+    /// where the single-shot rows go through the broken GEMM — so the two
+    /// paths deterministically diverge O(1) with no chunking bug present
+    /// (chunk-offset/mask/pool bookkeeping was verified independently:
+    /// the same comparison is byte-equal for 96/16 and 98/16 geometries,
+    /// and a patterned adapter write/read round-trip is exact for every
+    /// chunk geometry).
     #[test]
     fn test_chunked_prefill_uneven_tail_matches_single_shot() {
         // Block-paged needs the Metal backend; on a non-Metal build the
         // adapter is gated off (None) and there is nothing to exercise.
         if !crate::engine::persistence::compiled_forward_backend_available() {
             eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_uneven_tail_matches_single_shot: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
             return;
         }
         let cfg = paged_tiny_config(Some(true));

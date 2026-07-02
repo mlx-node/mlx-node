@@ -1002,14 +1002,36 @@ mod tests {
     ///
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
-    /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69.
+    /// observed `max_abs_diff = 0.0693`, argmax stable at idx=69 (M3,
+    /// pre scalar-RoPE-axis fix — the magnitude will differ after that
+    /// fix since both paths' rotation angles changed; the 0.25 budget
+    /// rationale below is unchanged).
     /// Requires Metal GPU; run with `--ignored`.
+    ///
+    /// Skips on hosts whose half-precision GEMM fails the
+    /// `test_support::half_gemm_untrustworthy` canary: this config's
+    /// q_proj (K=128, N=256) and fallback-SDPA matmuls (K=32 scores)
+    /// sit inside the vendored-MLX NAX unaligned-K broken regime on
+    /// gen>=17 GPUs, where chunk length changes which kernel class each
+    /// token's math takes and parity deterministically breaks O(1)
+    /// (observed 0.86-0.91 with argmax flips on M5 Max) with no chunking
+    /// bug present.
+    ///
     /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
     /// machines without Metal, which aborts the test process before
     /// Rust can catch the failure.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits() {
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
+            return;
+        }
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
         }
@@ -1079,14 +1101,32 @@ mod tests {
     ///
     /// `mlx_sys::mlx_seed(0xC0DEC0DE)` pins MLX's random init so the
     /// chunked-vs-single-shot drift is reproducible across runs;
-    /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80.
+    /// observed `max_abs_diff = 0.1199`, argmax stable at idx=80 (M3,
+    /// pre scalar-RoPE-axis fix — the magnitude will differ after that
+    /// fix since both paths' rotation angles changed; the 0.25 budget
+    /// rationale is unchanged).
     /// Requires Metal GPU; run with `--ignored`.
+    ///
+    /// Skips on hosts whose half-precision GEMM fails the
+    /// `test_support::half_gemm_untrustworthy` canary — same rationale
+    /// as `test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits`
+    /// above (observed 0.73-0.91 on M5 Max with no chunking bug).
+    ///
     /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
     /// machines without Metal, which aborts the test process before
     /// Rust can catch the failure.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_chunked_prefill_qwen3_5_moe_uneven_tail() {
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping test_chunked_prefill_qwen3_5_moe_uneven_tail: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX unaligned-K bug); tiny-config chunked-vs-\
+                 single-shot parity is not meaningful here"
+            );
+            return;
+        }
         unsafe {
             mlx_sys::mlx_seed(0xC0DEC0DE);
         }
