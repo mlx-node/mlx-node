@@ -2458,6 +2458,79 @@ mod tests {
         }
     }
 
+    /// A saved dense-MTP checkpoint must round-trip its MTP layer count.
+    /// `parse_config` reads the count ONLY from the HF-convention keys
+    /// (`mtp_num_hidden_layers` / `num_nextn_predict_layers`) and ignores the
+    /// serde field name `n_mtp_layers`, so `save_model_sync` must inject the
+    /// HF key into config.json (mirroring the MoE saver) — without it a
+    /// reloaded checkpoint comes back with `n_mtp_layers = 0` and its MTP
+    /// head is silently dropped.
+    #[test]
+    fn save_model_sync_round_trips_mtp_layer_count() {
+        let label = "save_model_sync_round_trips_mtp_layer_count";
+        let cfg = Qwen3_5Config {
+            n_mtp_layers: 1,
+            ..no_mtp_layer_cfg()
+        };
+
+        let mut inner = match Qwen35Inner::new(cfg) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                // Random-init construction needs MLX ops; skip cleanly when
+                // the GPU/device is unavailable (CI without Metal).
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+        // A random-init MTP head's weights ARE its loaded weights (same
+        // rationale as `create_random_qwen35_moe_checkpoint_sync`); the saver
+        // only serializes the `mtp.*` tensors when this flag is set.
+        inner.mtp_weights_loaded = true;
+
+        let ckpt_dir = std::env::temp_dir().join(format!(
+            "mlx-qwen35-dense-mtp-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = DirCleanup(ckpt_dir.clone());
+        let ckpt_path = ckpt_dir
+            .to_str()
+            .expect("temp checkpoint path is not valid UTF-8")
+            .to_string();
+
+        inner
+            .save_model_sync(&ckpt_path)
+            .unwrap_or_else(|err| panic!("save_model_sync failed in {label}: {}", err.reason));
+
+        let config_json = std::fs::read_to_string(ckpt_dir.join("config.json"))
+            .expect("saved config.json must be readable");
+        let raw: Value = serde_json::from_str(&config_json).expect("saved config.json is JSON");
+        assert_eq!(
+            raw.get("mtp_num_hidden_layers").and_then(|v| v.as_i64()),
+            Some(1),
+            "saved config.json must carry the HF-convention MTP key"
+        );
+
+        let reparsed = parse_config(&raw).expect("saved config.json must re-parse");
+        assert_eq!(
+            reparsed.n_mtp_layers, 1,
+            "reloaded config must reconstruct the MTP module (n_mtp_layers)"
+        );
+    }
+
     /// Persistence-level regression for the tied+quantized lm_head packed
     /// fast-path (paged, non-MTP, non-VLM): a quantized `embedding.*` sidecar
     /// on a paged config must load via `Embedding::load_quantized_packed`

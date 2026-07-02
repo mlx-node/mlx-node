@@ -1246,6 +1246,17 @@ impl Qwen35Inner {
         })?;
         if let serde_json::Value::Object(ref mut map) = config_value {
             map.insert("model_type".to_string(), serde_json::json!("qwen3_5"));
+            // `parse_config` reads the MTP layer count ONLY from the
+            // HF-convention keys `mtp_num_hidden_layers` /
+            // `num_nextn_predict_layers`; the serde field name
+            // `n_mtp_layers` is ignored on load. Without this, a saved MTP
+            // checkpoint reloads with `n_mtp_layers = 0` and its head is
+            // silently dropped. Mirrors the MoE saver
+            // (`qwen3_5_moe::model::Qwen35MoeInner::save_model_sync`).
+            map.insert(
+                "mtp_num_hidden_layers".to_string(),
+                serde_json::json!(self.config.n_mtp_layers),
+            );
         }
 
         let weights_json = serde_json::json!({
