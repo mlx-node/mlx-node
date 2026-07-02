@@ -923,8 +923,27 @@ mod tests {
     /// Test gradient correctness for float32 without masking
     /// Note: This is a spot-check test that verifies gradients are in the right ballpark.
     /// Due to numerical precision issues with finite differences, we use a lenient tolerance.
+    ///
+    /// Skips on hosts where f32 GEMM/SDPA silently run in TF32 precision
+    /// (`test_support::f32_gemm_tf32_degraded`): the central-difference signal
+    /// here is `2 * epsilon * grad` ~ 1e-6 on a loss of ~0.5 (inputs are
+    /// N(0, 0.02), so dQ/dK are ~1e-5..1e-4), which true-f32 forward noise
+    /// (~1e-7) resolves but TF32-truncated forwards (~1e-4 loss error) drown
+    /// completely — observed numerical estimates then include exact 0.0
+    /// (f(x+e) and f(x-e) round to the same value) and noise-dominated
+    /// garbage, failing 6/9 samples. The same binary passes 9/9 with
+    /// `MLX_ENABLE_TF32=0` exported.
     #[test]
     fn test_attention_vjp_finite_diff_f32_no_mask() {
+        if crate::test_support::f32_gemm_tf32_degraded() {
+            eprintln!(
+                "skipping test_attention_vjp_finite_diff_f32_no_mask: this host \
+                 runs f32 GEMM/SDPA in TF32 precision (MLX_ENABLE_TF32 defaults \
+                 to 1 on NAX-capable GPUs), which drowns the finite-difference \
+                 signal; export MLX_ENABLE_TF32=0 to run it"
+            );
+            return;
+        }
         let batch = 1;
         let heads = 2;
         let seq_len = 16;
@@ -1000,9 +1019,26 @@ mod tests {
 
     /// Test gradient correctness for float32 with causal masking
     /// Note: This is a spot-check test that verifies gradients are in the right ballpark.
+    ///
+    /// Skips on TF32-degraded hosts for the same reason as
+    /// `test_attention_vjp_finite_diff_f32_no_mask` (see its docstring):
+    /// the finite-difference signal (~1e-6 loss delta) needs true-f32
+    /// forwards; with the vendored pin's `MLX_ENABLE_TF32=1` default on
+    /// NAX GPUs this test fails 6/9 samples, and passes 9/9 with
+    /// `MLX_ENABLE_TF32=0` exported.
     #[test]
     fn test_attention_vjp_finite_diff_f32_causal() {
         use crate::array::scaled_dot_product_attention_causal;
+
+        if crate::test_support::f32_gemm_tf32_degraded() {
+            eprintln!(
+                "skipping test_attention_vjp_finite_diff_f32_causal: this host \
+                 runs f32 GEMM/SDPA in TF32 precision (MLX_ENABLE_TF32 defaults \
+                 to 1 on NAX-capable GPUs), which drowns the finite-difference \
+                 signal; export MLX_ENABLE_TF32=0 to run it"
+            );
+            return;
+        }
 
         let batch = 1;
         let heads = 2;

@@ -724,8 +724,27 @@ mod tests {
     /// Same parity sweep as the bf16 test but in f32, where both paths use
     /// identical precision throughout. This catches algorithmic bugs that
     /// would be hidden under the bf16 magnitude-scaled tolerance.
+    ///
+    /// Skips on hosts where f32 GEMM/SDPA silently run in TF32 precision
+    /// (`test_support::f32_gemm_tf32_degraded`): the vendored MLX pin
+    /// defaults `MLX_ENABLE_TF32=1`, which on gen>=17 GPUs routes both this
+    /// test's fused f32 SDPA (q_len > 8) and the reference's f32 matmuls to
+    /// NAX kernels that truncate inputs to 11-bit mantissas. The two paths
+    /// then disagree at TF32 scale (measured max_abs_diff 9.35e-4 on the
+    /// t=64 case) instead of true-f32 scale, and the 5e-5 oracle bound is
+    /// unmeetable with no algorithmic bug present — the same binary passes
+    /// with `MLX_ENABLE_TF32=0` exported.
     #[test]
     fn banded_attention_matches_reference_f32() {
+        if crate::test_support::f32_gemm_tf32_degraded() {
+            eprintln!(
+                "skipping banded_attention_matches_reference_f32: this host runs \
+                 f32 GEMM/SDPA in TF32 precision (MLX_ENABLE_TF32 defaults to 1 \
+                 on NAX-capable GPUs), so the true-f32 5e-5 parity bound is not \
+                 meaningful; export MLX_ENABLE_TF32=0 to run it"
+            );
+            return;
+        }
         unsafe { sys::mlx_seed(0x6632_6e64) };
 
         let cases: &[(i64, i64, i64, i64, i64, i32)] = &[
