@@ -249,6 +249,43 @@ fn is_skipped(stripped: &str) -> bool {
         || stripped.contains("rotary_emb")
 }
 
+/// Convert-time self-consistency tripwire for the gemma-prequant import:
+/// every `.scales`-bearing output tensor must carry a per-layer override,
+/// keyed by its pre-namespace (stripped) module prefix. The emitters uphold
+/// this by construction — `emit_affine_per_row` and the PLE arm insert the
+/// affine triplet and its override together, and the bf16-dequantized I8
+/// modules emit a dense `.weight` only (no `.scales`, so they need no
+/// exclusion here) — so a failure means a future emitter change decoupled
+/// tensor and override, which would silently make external loaders resolve
+/// the tensor through the top-level default and mis-dequantize it.
+///
+/// Deliberately scoped to the gemma-prequant import. The generic quantize
+/// paths cannot carry this guard: their override maps are intentionally
+/// sparse (only decisions that differ from the global defaults are recorded),
+/// so a `.scales` tensor without an override is the normal case there, and
+/// verifying it "matches the top-level default" would require re-deriving
+/// bits/group_size from mode-specific packed tensor layouts.
+fn verify_override_coverage(
+    weights: &HashMap<String, MxArray>,
+    overrides: &HashMap<String, serde_json::Value>,
+) -> Result<()> {
+    let covered: std::collections::HashSet<String> =
+        overrides.keys().map(|k| namespaced_key(k)).collect();
+    for key in weights.keys() {
+        let Some(prefix) = key.strip_suffix(".scales") else {
+            continue;
+        };
+        if !covered.contains(prefix) {
+            return Err(Error::from_reason(format!(
+                "gemma-QAT import: quantized tensor `{key}` has no per-layer quantization \
+                 override; the config.json `quantization` block would misrepresent it and \
+                 external loaders would dequantize it with the top-level defaults"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Bit-width for a 2/4-bit text linear, derived from the E2B layer schedule:
 /// `self_attn.*` is always 4-bit; `mlp.*` is 4-bit for layers 0–14 and 2-bit for
 /// layers ≥ 15. Returns `None` for keys this routing does not cover.
@@ -627,6 +664,8 @@ pub(crate) fn import_gemma_prequantized(
             LINEAR_GROUP_SIZE,
         )?;
     }
+
+    verify_override_coverage(&out, &overrides)?;
 
     Ok((out, overrides))
 }
@@ -1317,6 +1356,47 @@ mod tests {
         let err =
             top_level_quant_metadata(&ov).expect_err("mixed modes have no honest top-level value");
         assert!(err.to_string().contains("mix modes"));
+    }
+
+    #[test]
+    fn override_coverage_rejects_scales_without_override() {
+        // A `.scales`-bearing output tensor with no per-layer override would
+        // make external loaders fall back to the top-level default — the
+        // guard must fail the conversion instead.
+        let mut weights = HashMap::new();
+        weights.insert(
+            "language_model.model.layers.0.self_attn.q_proj.scales".to_string(),
+            f32_array(&[0.5], &[1, 1]),
+        );
+        let err = verify_override_coverage(&weights, &HashMap::new())
+            .expect_err("a .scales tensor without an override must fail the import");
+        assert!(
+            err.to_string()
+                .contains("language_model.model.layers.0.self_attn.q_proj.scales"),
+            "error must name the uncovered tensor: {err}"
+        );
+    }
+
+    #[test]
+    fn override_coverage_accepts_matching_override_and_dense_weights() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "language_model.model.layers.0.self_attn.q_proj.scales".to_string(),
+            f32_array(&[0.5], &[1, 1]),
+        );
+        // Dense (I8-dequant style) weights without `.scales` need no override.
+        weights.insert(
+            "language_model.model.layers.0.per_layer_input_gate.weight".to_string(),
+            f32_array(&[1.0], &[1, 1]),
+        );
+        // Overrides are keyed by the pre-namespace (stripped) module prefix.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        verify_override_coverage(&weights, &overrides)
+            .expect("covered .scales + dense weights must pass");
     }
 
     #[test]
