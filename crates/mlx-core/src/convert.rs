@@ -4444,8 +4444,9 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 ///   AND shared_expert trio `{root}.mlp.shared_expert.{gate,up,down}_proj` —
 ///   `qwen3_5_moe/persistence.rs` builds each trio all-or-none (`if let
 ///   (Some(..), Some(..), Some(..))`); a partial trio drops ALL THREE members
-///   to the dense setters, sending the quantized members' packed payloads
-///   down the dense route. Reachable since qwen3_5_moe gained sym8 dispatch
+///   to the dense setters, where `ensure_dense_weight_floating` rejects the
+///   quantized members' packed non-float weights (matching the dense qwen3_5
+///   fallbacks). Reachable since qwen3_5_moe gained sym8 dispatch
 ///   for its non-expert sublayers (the old blanket fail-loud-on-any-sym8-
 ///   config guard is gone): under a sym8 default, 3-D switch_mlp experts and
 ///   2-D members with `K % 16 != 0` are both forced to affine-8

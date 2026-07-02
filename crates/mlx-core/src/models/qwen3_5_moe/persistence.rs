@@ -15,8 +15,8 @@ use crate::engine::persistence::{
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, ensure_int8_storage_resolves_sym8, has_sym8_mode,
-    parse_quant_block, resolve_default_mode,
+    default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, parse_quant_block, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -601,6 +601,9 @@ fn apply_weights_moe_inner(
             info!("Loaded quantized embedding ({}-bit)", plq.bits);
         }
     } else if let Some(w) = params.get("embedding.weight") {
+        // Dense fallback (no `.scales`): a stripped quant group must never
+        // reach the dense lookup / tied-lm_head matmul.
+        ensure_dense_weight_floating("embedding.weight", w)?;
         inner.embedding.set_weight(w)?;
     }
 
@@ -616,11 +619,15 @@ fn apply_weights_moe_inner(
         } else if let Some(ref mut head) = inner.lm_head
             && let Some(w) = params.get("lm_head.weight")
         {
+            // Dense fallback (no `.scales`) — same stripped-quant-group
+            // dtype guard as the embedding above.
+            ensure_dense_weight_floating("lm_head.weight", w)?;
             head.set_weight(w, "lm_head")?;
         }
     } else if let Some(ref mut head) = inner.lm_head
         && let Some(w) = params.get("lm_head.weight")
     {
+        ensure_dense_weight_floating("lm_head.weight", w)?;
         head.set_weight(w, "lm_head")?;
     }
 
@@ -632,6 +639,11 @@ fn apply_weights_moe_inner(
         match &mut layer.attn {
             AttentionType::Linear(gdn) => {
                 if is_quantized {
+                    // Dense fallbacks below are dtype-guarded, mirroring the
+                    // dense qwen3_5 loader: a truncated quant group (packed
+                    // `.weight` whose `.scales` was stripped) makes
+                    // `try_build_ql` return `Ok(None)`, and the packed bytes
+                    // must NEVER reach the dense bf16 route.
                     if let Some(ql) =
                         try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))?
                     {
@@ -639,6 +651,10 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
 
@@ -649,6 +665,10 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_ba_weight(w)?;
                     }
 
@@ -659,12 +679,25 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.out_proj.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_out_proj_weight(w)?;
                     }
                 } else {
+                    // Unquantized-checkpoint arm. Still dtype-guarded: a
+                    // FULLY-stripped quant checkpoint (every `.scales`
+                    // removed) flips `is_quantized` false and lands here, so
+                    // packed/int8 storage must fail loud before any dense
+                    // setter.
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_qkvz.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
                     if let Some(w) =
@@ -673,6 +706,14 @@ fn apply_weights_moe_inner(
                         if let Some(z) =
                             params.get(&format!("{}.linear_attn.in_proj_z.weight", prefix))
                         {
+                            ensure_dense_weight_floating(
+                                &format!("{}.linear_attn.in_proj_qkv.weight", prefix),
+                                w,
+                            )?;
+                            ensure_dense_weight_floating(
+                                &format!("{}.linear_attn.in_proj_z.weight", prefix),
+                                z,
+                            )?;
                             let combined = MxArray::concatenate(w, z, 0)?;
                             gdn.set_in_proj_qkvz_weight(&combined)?;
                         } else {
@@ -685,17 +726,33 @@ fn apply_weights_moe_inner(
                     if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_ba.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_in_proj_ba_weight(w)?;
                     }
                     if let Some(b) = params.get(&format!("{}.linear_attn.in_proj_b.weight", prefix))
                         && let Some(a) =
                             params.get(&format!("{}.linear_attn.in_proj_a.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_b.weight", prefix),
+                            b,
+                        )?;
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.in_proj_a.weight", prefix),
+                            a,
+                        )?;
                         let combined = MxArray::concatenate(b, a, 0)?;
                         gdn.set_in_proj_ba_weight(&combined)?;
                     }
                     if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.linear_attn.out_proj.weight", prefix),
+                            w,
+                        )?;
                         gdn.set_out_proj_weight(w)?;
                     }
                 }
@@ -714,12 +771,18 @@ fn apply_weights_moe_inner(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
+                    // Dense fallbacks below are dtype-guarded (see the GDN
+                    // branch above): truncated quant groups must fail loud.
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))?
                     {
                         attn.set_quantized_q_proj(ql);
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.q_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.q_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_q_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))?
@@ -728,6 +791,10 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.k_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.k_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_k_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))?
@@ -736,6 +803,10 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.v_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.v_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_v_proj_weight(w)?;
                     }
                     if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))?
@@ -744,19 +815,41 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.self_attn.o_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_o_proj_weight(w)?;
                     }
                 } else {
+                    // Unquantized-checkpoint arm — dtype-guarded like the GDN
+                    // branch above.
                     if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.q_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_q_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.k_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_k_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.v_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_v_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.self_attn.o_proj.weight", prefix),
+                            w,
+                        )?;
                         attn.set_o_proj_weight(w)?;
                     }
                 }
@@ -800,24 +893,39 @@ fn apply_weights_moe_inner(
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
                     } else {
+                        // Partial trio: ALL THREE fall back to the dense
+                        // setters, so any quantized member's packed payload
+                        // must fail loud here instead of entering dense math.
                         if let Some(w) = params.get(&format!("{}.weight", gate_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", gate_key), w)?;
                             mlp.set_gate_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", up_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", up_key), w)?;
                             mlp.set_up_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", down_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", down_key), w)?;
                             mlp.set_down_proj_weight(w)?;
                         }
                     }
                 } else {
                     if let Some(w) = params.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.gate_proj.weight", prefix),
+                            w,
+                        )?;
                         mlp.set_gate_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.up_proj.weight", prefix), w)?;
                         mlp.set_up_proj_weight(w)?;
                     }
                     if let Some(w) = params.get(&format!("{}.mlp.down_proj.weight", prefix)) {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.down_proj.weight", prefix),
+                            w,
+                        )?;
                         mlp.set_down_proj_weight(w)?;
                     }
                 }
@@ -825,9 +933,15 @@ fn apply_weights_moe_inner(
             MLPType::Dense(MLPVariant::Quantized { .. }) => {}
             MLPType::MoE(moe) => {
                 if is_quantized {
+                    // Dense fallbacks below are dtype-guarded, mirroring the
+                    // dense qwen3_5 loader. This matters most for the
+                    // switch_mlp trio, whose dense setters are infallible: a
+                    // packed member of a partial trio would otherwise enter
+                    // dense expert math silently (garbage logits, no error).
                     if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
                         moe.set_quantized_gate(ql);
                     } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
                         moe.set_gate_weight(w)?;
                     }
 
@@ -844,12 +958,15 @@ fn apply_weights_moe_inner(
                         moe.set_switch_mlp(quantized_switch);
                     } else {
                         if let Some(w) = params.get(&format!("{}.weight", gate_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", gate_proj_key), w)?;
                             moe.set_switch_mlp_gate_proj_weight(w);
                         }
                         if let Some(w) = params.get(&format!("{}.weight", up_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", up_proj_key), w)?;
                             moe.set_switch_mlp_up_proj_weight(w);
                         }
                         if let Some(w) = params.get(&format!("{}.weight", down_proj_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", down_proj_key), w)?;
                             moe.set_switch_mlp_down_proj_weight(w);
                         }
                     }
@@ -866,12 +983,15 @@ fn apply_weights_moe_inner(
                         moe.set_quantized_shared_expert(qg, qu, qd);
                     } else {
                         if let Some(w) = params.get(&format!("{}.weight", se_gate_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_gate_key), w)?;
                             moe.set_shared_expert_gate_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", se_up_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_up_key), w)?;
                             moe.set_shared_expert_up_proj_weight(w)?;
                         }
                         if let Some(w) = params.get(&format!("{}.weight", se_down_key)) {
+                            ensure_dense_weight_floating(&format!("{}.weight", se_down_key), w)?;
                             moe.set_shared_expert_down_proj_weight(w)?;
                         }
                     }
@@ -883,45 +1003,80 @@ fn apply_weights_moe_inner(
                     } else if let Some(w) =
                         params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
                         moe.set_shared_expert_gate_weight(w)?;
                     }
                 } else {
+                    // Unquantized-checkpoint arm — dtype-guarded like the GDN
+                    // branch above.
                     if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
+                        ensure_dense_weight_floating(&format!("{}.mlp.gate.weight", prefix), w)?;
                         moe.set_gate_weight(w)?;
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.switch_mlp.gate_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.gate_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_switch_mlp_gate_proj_weight(w);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.switch_mlp.up_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.up_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_switch_mlp_up_proj_weight(w);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.switch_mlp.down_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_switch_mlp_down_proj_weight(w);
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.shared_expert.gate_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_shared_expert_gate_proj_weight(w)?;
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.shared_expert.up_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.up_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_shared_expert_up_proj_weight(w)?;
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.shared_expert.down_proj.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert.down_proj.weight", prefix),
+                            w,
+                        )?;
                         moe.set_shared_expert_down_proj_weight(w)?;
                     }
                     if let Some(w) =
                         params.get(&format!("{}.mlp.shared_expert_gate.weight", prefix))
                     {
+                        ensure_dense_weight_floating(
+                            &format!("{}.mlp.shared_expert_gate.weight", prefix),
+                            w,
+                        )?;
                         moe.set_shared_expert_gate_weight(w)?;
                     }
                 }
@@ -2157,6 +2312,84 @@ mod tests {
         assert!(
             inner.image_processor.is_none(),
             "sym8 checkpoint must NOT install the image processor"
+        );
+    }
+
+    /// A packed (non-float) member of a PARTIAL quant group must fail loud
+    /// on the dense fallback, never silently install. When a `.scales`
+    /// sidecar is missing, `try_build_ql`/`try_build_qsl` return `Ok(None)`
+    /// and the whole trio drops to the dense setters — the switch_mlp
+    /// setters are infallible, so without the dtype guard a packed Uint32
+    /// payload would enter dense expert math (garbage logits, no error).
+    /// Mirrors dense qwen3_5's `ensure_dense_weight_floating` fallback
+    /// contract.
+    #[test]
+    fn packed_weight_without_sidecars_fails_loud_on_dense_fallback() {
+        let config = tiny_sym8_moe_cfg();
+        let scales_placeholder = || {
+            // Lone `.scales` on an unrelated projection flips
+            // `is_quantized_checkpoint` true without forming any buildable
+            // quant group (same trick as the sym8 fail-loud test above).
+            MxArray::from_float32(&[0.0f32], &[1]).expect("scales placeholder")
+        };
+
+        // (a) switch_mlp trio member: packed Uint32 `.weight`, no sidecars.
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            scales_placeholder(),
+        );
+        params.insert(
+            "layers.0.mlp.switch_mlp.gate_proj.weight".to_string(),
+            MxArray::from_uint32(&vec![0u32; 2 * 16 * 8], &[2, 16, 8]).expect("packed uint32"),
+        );
+        let per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        let err = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect_err("packed switch_mlp member without sidecars must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layers.0.mlp.switch_mlp.gate_proj.weight") && msg.contains("non-float"),
+            "error must name the key and the dtype problem, got: {msg}"
+        );
+
+        // (b) shared_expert trio member: same stripped-sidecar shape.
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            scales_placeholder(),
+        );
+        params.insert(
+            "layers.0.mlp.shared_expert.up_proj.weight".to_string(),
+            MxArray::from_uint32(&vec![0u32; 8 * 8], &[8, 8]).expect("packed uint32"),
+        );
+        let err = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect_err("packed shared_expert member without sidecars must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layers.0.mlp.shared_expert.up_proj.weight") && msg.contains("non-float"),
+            "error must name the key and the dtype problem, got: {msg}"
         );
     }
 }
