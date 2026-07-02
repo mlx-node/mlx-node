@@ -1621,10 +1621,12 @@ pub(crate) trait MtpStepper {
     /// [`Self::restore_and_replay_main`] / [`Self::commit_mtp`]).
     fn embedding_weight(&self) -> &MxArray;
 
-    /// `true` on the dense path where [`Self::commit_mtp`] runs the real
-    /// committed-history commit (and `run_mtp_cycle` uses the
-    /// `chain_start = 0` draft mask). == `MtpOps::committed_history_active`.
-    /// MoE / cycle-history steppers return `false`.
+    /// `true` when [`Self::commit_mtp`] runs the real committed-history
+    /// commit (and `run_mtp_cycle` uses the `chain_start = 0` draft mask) —
+    /// both the dense and MoE eager steppers report this whenever their
+    /// flag-gated `use_committed` gate holds; steppers with no
+    /// committed-history support return `false`.
+    /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
 
     /// Optional profiler relabel for the MTP path (e.g.
@@ -1709,8 +1711,9 @@ pub(crate) trait MtpStepper {
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
     /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
-    /// consumes it. A no-op impl keeps the cycle-history policy (MoE /
-    /// tests). == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
+    /// consumes it. A no-op impl keeps the cycle-history policy (tests, or
+    /// dense/MoE steppers whose flag-gated `use_committed` gate is off).
+    /// == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
     /// prev_hidden [1,1,hidden], verify_hiddens [1,D+1,hidden],
     /// committed_ids [K+2], k_accepted, embedding_weight)`.
     fn commit_mtp(

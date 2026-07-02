@@ -1518,13 +1518,35 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
     })
 }
 
+/// Create a random-init Qwen3.5 MoE model and save it to `save_path`,
+/// synchronously on the calling thread.
+///
+/// Shared core of the NAPI `create_random_qwen35_moe_checkpoint` wrapper
+/// (which runs it on a dedicated model thread) and the pure-Rust synthetic
+/// MTP integration tests (which call it directly; MLX ops are fine on a test
+/// thread). A random-init MTP head's weights ARE its loaded weights, so
+/// `mtp_weights_loaded` is set whenever the config declares MTP layers —
+/// without it `save_model_sync` would drop the `mtp.*` tensors and the
+/// reloaded checkpoint could never engage speculative decode. The in-memory
+/// model is released when this returns.
+pub fn create_random_qwen35_moe_checkpoint_sync(
+    config: Qwen3_5MoeConfig,
+    save_path: &str,
+) -> Result<()> {
+    let mut inner = Qwen35MoeInner::new(config)?;
+    if inner.config.n_mtp_layers > 0 {
+        inner.mtp_weights_loaded = true;
+    }
+    inner.save_model_sync(save_path)
+}
+
 /// Create a random-init Qwen3.5 MoE model and save it to disk.
 ///
-/// Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
-/// random-weight `Qwen35MoeInner` directly, then dispatches
-/// `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
-/// of the promise, so the in-memory model is released once the checkpoint has
-/// been written. Used by TypeScript test fixtures that need an on-disk
+/// Spawns a dedicated model thread whose init runs
+/// [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
+/// the thread holds no state and is dropped once the promise resolves, so
+/// the in-memory model is released as soon as the checkpoint has been
+/// written. Used by TypeScript test fixtures that need an on-disk
 /// checkpoint without keeping a NAPI model instance alive.
 #[napi]
 pub fn create_random_qwen35_moe_checkpoint<'env>(
@@ -1532,28 +1554,18 @@ pub fn create_random_qwen35_moe_checkpoint<'env>(
     config: Qwen3_5MoeConfig,
     save_path: String,
 ) -> Result<PromiseRaw<'env, ()>> {
-    use super::model::Qwen35MoeCmd;
-
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::<()>::spawn_with_init(
         move || {
-            let inner = Qwen35MoeInner::new(config)?;
-            Ok((inner, ()))
+            create_random_qwen35_moe_checkpoint_sync(config, &save_path)?;
+            Ok(((), ()))
         },
-        handle_qwen35_moe_cmd,
+        |_state, _cmd| {},
     );
 
     env.spawn_future(async move {
         init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        thread.send(Qwen35MoeCmd::SaveModel {
-            save_path,
-            reply: tx,
-        })?;
-        rx.await
-            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))??;
 
         // Drop the thread explicitly so the dedicated OS thread shuts down
         // now that the checkpoint has been written.

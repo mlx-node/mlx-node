@@ -8850,7 +8850,11 @@ fn project_last_logits_from_pre_norm_hidden(
 ///
 /// Precondition: `total >= 1`. For `total in {1..7}` the single chunk is
 /// `total` itself.
-fn partition_prefill_chunks(total: usize) -> Vec<usize> {
+///
+/// `pub(crate)`: also used by `MoeMtpStepper::begin_mtp_decode`'s
+/// committed-history v2 prompt-prefix seed
+/// (`crate::models::qwen3_5_moe::model`), which mirrors this dense chunking.
+pub(crate) fn partition_prefill_chunks(total: usize) -> Vec<usize> {
     debug_assert!(total >= 1, "partition_prefill_chunks: total must be >= 1");
     const CHUNK: usize = 6;
     if total == 1 {
