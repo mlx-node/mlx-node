@@ -661,8 +661,31 @@ mod tests {
     /// Fast SDPA-based `banded_attention` should agree with the reference impl
     /// across the shapes used by the privacy-filter design (T=257, band=128)
     /// plus a couple of neighbours that stress GQA + multi-batch behaviour.
+    ///
+    /// Skips on hosts whose half-precision GEMM fails the
+    /// `test_support::half_gemm_untrustworthy` canary: BOTH sides of this
+    /// bf16 parity live inside the vendored-MLX NAX broken classes on
+    /// gen>=17 GPUs. The reference's `Q@K^T` and `attn@V` are bf16 GEMMs
+    /// with K = head_dim = 64 / K = T (unaligned-K garbage class), and the
+    /// fast path's fused bf16 full-SDPA (q_len > 8) is the kernel class the
+    /// item-G review measured 0.1-1.9 off per row. Probed on the t=64 case
+    /// against a host-f64 banded-attention truth built from the same
+    /// bf16-rounded inputs: fast err 2.22, reference err 2.05 (output
+    /// max_abs 0.96) — the observed parity failure (max_abs_diff 0.988 vs
+    /// tol 0.023) is garbage-vs-garbage, so the assertion is meaningless
+    /// here, not merely out of tolerance.
     #[test]
     fn banded_attention_matches_reference_on_random_inputs() {
+        if crate::test_support::half_gemm_untrustworthy() {
+            eprintln!(
+                "skipping banded_attention_matches_reference_on_random_inputs: \
+                 half-precision GEMM fails the K=64/N=64 canary on this host \
+                 (vendored-MLX NAX bug); both the bf16 reference matmuls and \
+                 the fused bf16 SDPA are untrustworthy, so bf16 parity is not \
+                 meaningful here"
+            );
+            return;
+        }
         // Seed for reproducibility — bf16 parity is intrinsically tight to
         // the magnitude-scaled tolerance, so we don't want a flaky test on
         // unlucky random draws.
