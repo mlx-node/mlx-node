@@ -4422,8 +4422,9 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// Identify the CO-QUANTIZED group a weight base key (key minus `.weight`)
 /// belongs to, returning the full canonical member base list. Returns `None`
 /// for keys whose loaders resolve quantization per tensor (attention
-/// projections, GDN, embeddings, gemma4 MoE `experts.*`, qwen3_5_moe — the
-/// latter has no sym8 dispatch and fails loud up front on any sym8 config).
+/// projections, GDN, embeddings, gemma4 MoE `experts.*`, and qwen3_5_moe's
+/// router `.mlp.gate` / `.mlp.shared_expert_gate` — each of the latter builds
+/// through its own `try_build_ql` call with an independent dense fallback).
 ///
 /// These are the groups whose loaders are strict all-or-none:
 /// - dense MLP `{root}.mlp.{gate,up,down}_proj` — gemma4 (`gemma4/
@@ -4439,11 +4440,27 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 /// - lfm2 MoE quartet: router `{root}.feed_forward.gate` + 3D stacked
 ///   `{root}.feed_forward.switch_mlp.{gate,up,down}_proj` —
 ///   `moe_layer_is_quantized` couples all four (`moe_proj_bases`).
+/// - qwen3_5_moe switch_mlp trio `{root}.mlp.switch_mlp.{gate,up,down}_proj`
+///   AND shared_expert trio `{root}.mlp.shared_expert.{gate,up,down}_proj` —
+///   `qwen3_5_moe/persistence.rs` builds each trio all-or-none (`if let
+///   (Some(..), Some(..), Some(..))`); a partial trio drops ALL THREE members
+///   to the dense setters, sending the quantized members' packed payloads
+///   down the dense route. Reachable since qwen3_5_moe gained sym8 dispatch
+///   for its non-expert sublayers (the old blanket fail-loud-on-any-sym8-
+///   config guard is gone): under a sym8 default, 3-D switch_mlp experts and
+///   2-D members with `K % 16 != 0` are both forced to affine-8
+///   (`sym8_eligible`; a sym8 override reaching `try_build_qsl` fails loud at
+///   load), and a forced-affine member that ALSO fails the affine
+///   `K % group_size` alignment would silently stay dense next to quantized
+///   siblings without this table.
 ///
 /// `strip_suffix` is an exact tail match, so the tables cannot cross-match:
 /// `…switch_mlp.gate_proj` never strips as `.mlp.gate_proj` (the char before
-/// `mlp` is `_`, not `.`) and `…feed_forward.gate_proj` never strips as
-/// `.feed_forward.gate`.
+/// `mlp` is `_`, not `.`), `…feed_forward.gate_proj` never strips as
+/// `.feed_forward.gate`, qwen's `.mlp.switch_mlp.*` suffixes never match
+/// lfm2's `.feed_forward.switch_mlp.*` (different parent segment, both ways),
+/// and `….mlp.shared_expert.gate_proj` ends in `expert.gate_proj`, which no
+/// other table's suffix matches.
 fn coquant_group_members(base: &str) -> Option<Vec<String>> {
     const LFM2_MOE: [&str; 4] = [
         ".feed_forward.gate",
@@ -4456,8 +4473,24 @@ fn coquant_group_members(base: &str) -> Option<Vec<String>> {
         ".feed_forward.up_proj",
         ".feed_forward.down_proj",
     ];
+    const QWEN35_MOE_SWITCH: [&str; 3] = [
+        ".mlp.switch_mlp.gate_proj",
+        ".mlp.switch_mlp.up_proj",
+        ".mlp.switch_mlp.down_proj",
+    ];
+    const QWEN35_MOE_SHARED_EXPERT: [&str; 3] = [
+        ".mlp.shared_expert.gate_proj",
+        ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
+    ];
     const DENSE_MLP: [&str; 3] = [".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"];
-    for table in [&LFM2_MOE[..], &LFM2_FFN[..], &DENSE_MLP[..]] {
+    for table in [
+        &LFM2_MOE[..],
+        &LFM2_FFN[..],
+        &QWEN35_MOE_SWITCH[..],
+        &QWEN35_MOE_SHARED_EXPERT[..],
+        &DENSE_MLP[..],
+    ] {
         for suffix in table {
             if let Some(root) = base.strip_suffix(suffix) {
                 return Some(table.iter().map(|s| format!("{root}{s}")).collect());
@@ -8348,6 +8381,189 @@ mod tests {
                 .expect("forced-affine member must carry a per-layer override");
             assert_eq!(ov["mode"], "affine");
             assert_eq!(ov["bits"], 8);
+        }
+    }
+
+    #[test]
+    fn sym8_group_coherence_covers_qwen35_moe_switch_and_shared_expert_groups() {
+        // qwen3_5_moe's loader builds the switch_mlp trio and the
+        // shared_expert trio all-or-none (`if let (Some, Some, Some)` in
+        // `qwen3_5_moe/persistence.rs`); a partial trio drops every member to
+        // the dense setters. One alignment-ineligible member must therefore
+        // force its whole trio dense. The router `.mlp.gate` and
+        // `.mlp.shared_expert_gate` resolve per tensor and must NOT be pulled
+        // dense by a sibling trio. Real MoE dims are 64-aligned, so only
+        // synthetic odd geometry exercises this.
+        let hidden = 64i64;
+        let odd = 24i64; // % 16 != 0 and % 64 != 0 → can never emit quantized
+
+        let w = |shape: &[i64]| {
+            let a = MxArray::random_normal(shape, 0.0, 0.02, Some(DType::Float32)).unwrap();
+            a.eval();
+            a
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 (incoherent switch trio): gate/up experts are 3-D with
+        // K=64 (forced affine-8, would emit); down has K=24 → forced affine
+        // then alignment-skipped → the whole trio must stay dense. The
+        // router gate in the same layer is per-tensor and must still emit.
+        weights.insert("model.layers.0.mlp.gate.weight".into(), w(&[4, hidden]));
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.0.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, odd]),
+        );
+        // Layer 1 (incoherent shared_expert trio): gate/up are sym8-eligible
+        // (K=64), down has K=24 (sym8-ineligible → forced affine-8 →
+        // alignment-skipped) → the whole trio must stay dense. The
+        // shared-expert output gate is per-tensor and must still emit.
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, odd]),
+        );
+        weights.insert(
+            "model.layers.1.mlp.shared_expert_gate.weight".into(),
+            w(&[1, hidden]),
+        );
+        // Layer 2 (control): both trios fully 64-aligned → switch experts
+        // emit forced affine-8, shared_expert members emit sym8.
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.gate_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.up_proj.weight".into(),
+            w(&[2, 16, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.switch_mlp.down_proj.weight".into(),
+            w(&[2, hidden, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.gate_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.up_proj.weight".into(),
+            w(&[32, hidden]),
+        );
+        weights.insert(
+            "model.layers.2.mlp.shared_expert.down_proj.weight".into(),
+            w(&[hidden, 32]),
+        );
+
+        let overrides = quantize_weights(&mut weights, 8, 64, "sym8", false)
+            .expect("sym8 quantize with coherence pass must succeed");
+
+        // Incoherent trios: every member dense float, no sidecars, no
+        // overrides.
+        for base in [
+            "model.layers.0.mlp.switch_mlp.gate_proj",
+            "model.layers.0.mlp.switch_mlp.up_proj",
+            "model.layers.0.mlp.switch_mlp.down_proj",
+            "model.layers.1.mlp.shared_expert.gate_proj",
+            "model.layers.1.mlp.shared_expert.up_proj",
+            "model.layers.1.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("incoherent-trio member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Float32,
+                "{base} must stay dense float (whole-trio coherence)"
+            );
+            assert!(
+                !weights.contains_key(&format!("{base}.scales")),
+                "{base} must not gain a scales sidecar"
+            );
+            assert!(
+                !overrides.contains_key(base),
+                "{base} must not carry a per-layer override"
+            );
+        }
+
+        // Per-tensor gates next to the incoherent trios must still emit
+        // (forced affine-8 via `is_router_gate`) — proves the drop is
+        // trio-scoped and the gates are not table members.
+        for base in [
+            "model.layers.0.mlp.gate",
+            "model.layers.1.mlp.shared_expert_gate",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("gate weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} resolves per tensor and must still quantize affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("affine gate under a sym8 default must carry an override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control switch trio: forced affine-8 (packed Uint32 + override).
+        for base in [
+            "model.layers.2.mlp.switch_mlp.gate_proj",
+            "model.layers.2.mlp.switch_mlp.up_proj",
+            "model.layers.2.mlp.switch_mlp.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control switch member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Uint32,
+                "{base} (aligned 3-D experts) must emit forced affine-8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            let ov = overrides
+                .get(base)
+                .expect("forced-affine expert must carry a per-layer override");
+            assert_eq!(ov["mode"], "affine");
+            assert_eq!(ov["bits"], 8);
+        }
+
+        // Control shared_expert trio: genuine sym8 (int8 weight + f32
+        // scales, no override — sym8 IS the default here).
+        for base in [
+            "model.layers.2.mlp.shared_expert.gate_proj",
+            "model.layers.2.mlp.shared_expert.up_proj",
+            "model.layers.2.mlp.shared_expert.down_proj",
+        ] {
+            let wt = weights
+                .get(&format!("{base}.weight"))
+                .expect("control shared member weight present");
+            assert_eq!(
+                wt.dtype().unwrap(),
+                DType::Int8,
+                "{base} (aligned 2-D shared expert) must quantize sym8"
+            );
+            assert!(weights.contains_key(&format!("{base}.scales")));
+            assert!(
+                !overrides.contains_key(base),
+                "sym8-at-default member must not carry an override"
+            );
         }
     }
 
