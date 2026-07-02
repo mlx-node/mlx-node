@@ -535,22 +535,27 @@ fn apply_weights_moe_inner(
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
             // Per-expert 3-D stacked projections route through gather_qmm,
-            // which has no sym8 pack. Two cases, keyed on the `.scales`
-            // sidecar — the shared "is this prefix quantized?" signal
-            // (`try_build_sym8_quantized_linear`'s documented contract):
-            //   * `.scales` ABSENT — the trio was emitted dense (convert's
-            //     group-coherence pass forces the whole trio dense when any
-            //     member is unquantizable), so a sym8 top-level DEFAULT
-            //     legitimately resolves here with no override. `Ok(None)`
+            // which has no sym8 pack. Sym8 reaches a switch prefix two ways
+            // (`effective_plq_for`: direct per-layer entry, else the
+            // top-level default — the gate/GDN-merge fallbacks never key on
+            // switch prefixes), and only the DEFAULT falling through has a
+            // legitimate dense reading:
+            //   * `.scales` ABSENT with NO explicit entry for this prefix —
+            //     the trio was emitted dense (convert's group-coherence pass
+            //     forces the whole trio dense when any member is
+            //     unquantizable, recording no override), so the sym8
+            //     top-level DEFAULT legitimately resolves here. `Ok(None)`
             //     hands the prefix to the dtype-guarded dense fallback below.
-            //   * `.scales` PRESENT — quantized bytes under a sym8 PLQ means
+            //   * `.scales` PRESENT, or an EXPLICIT sym8 per-layer entry —
             //     corrupt/hand-edited quant metadata (convert's
             //     `sym8_eligible` forces every quantized switch_mlp.* tensor
-            //     to an explicit affine-8 per-layer override) — fail loud,
-            //     never fall back to a silent affine/dense read of int8
-            //     bytes.
+            //     to an explicit affine-8 per-layer override and never emits
+            //     sym8 ones) — fail loud, never install the prefix through a
+            //     silent affine/dense fallback.
             PerLayerMode::Sym8 => {
-                if !params.contains_key(&format!("{prefix}.scales")) {
+                if !params.contains_key(&format!("{prefix}.scales"))
+                    && !per_layer_quant.contains_key(prefix)
+                {
                     return Ok(None);
                 }
                 return Err(Error::from_reason(format!(
@@ -2166,6 +2171,85 @@ mod tests {
             /* has_vision */ false,
         )
         .expect_err("3-D stacked experts have no sym8 kernel; must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("switch_mlp.gate_proj") && msg.contains("sym8"),
+            "error must name the expert projection and mention sym8, got: {msg}"
+        );
+    }
+
+    /// An EXPLICIT per-layer sym8 override on a switch_mlp expert projection
+    /// is lying metadata: convert never emits one (`sym8_eligible` forces
+    /// every quantized switch_mlp.* tensor to an affine-8 override, and the
+    /// group-coherence pass emits forced-dense trios with NO override — a
+    /// sym8 entry can only come from hand-edited/stale config.json). Even
+    /// when the trio carries float weights with no `.scales` sidecar, the
+    /// load must fail loud on the explicit override rather than silently
+    /// installing the weights dense — only the top-level sym8 DEFAULT
+    /// falling through (no explicit entry) may take the forced-dense
+    /// `Ok(None)` hand-off.
+    #[test]
+    fn sym8_explicit_switch_mlp_override_without_scales_fails_loud() {
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // One OTHER genuinely-quantized tensor (affine pack; never forwarded,
+        // so the pack contents are irrelevant): makes `is_quantized_checkpoint`
+        // true so the loader takes the quantized MoE arm — the path that calls
+        // `try_build_qsl`.
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 64 * 8], &[64, 8])
+                .expect("q_proj pack")
+                .astype(DType::Uint32)
+                .expect("astype uint32"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64 * 2], &[64, 2]).expect("q_proj scales"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.biases".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 64 * 2], &[64, 2]).expect("q_proj biases"),
+        );
+        // The lying trio: float 3-D expert weights, NO `.scales`, but an
+        // explicit sym8 per-layer override for gate_proj.
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            params.insert(
+                format!("layers.0.mlp.switch_mlp.{suffix}.weight"),
+                MxArray::from_float32(&vec![0.5f32; 4 * 8 * 64], &[4, 8, 64]).expect("trio"),
+            );
+        }
+
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.mlp.switch_mlp.gate_proj".to_string(),
+            default_per_layer_quant(8, -1, PerLayerMode::Sym8),
+        );
+
+        let err = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect_err(
+            "an explicit sym8 override on a switch_mlp projection must fail loud even without .scales",
+        );
         let msg = format!("{err}");
         assert!(
             msg.contains("switch_mlp.gate_proj") && msg.contains("sym8"),
