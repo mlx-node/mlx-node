@@ -119,6 +119,91 @@ pub(crate) fn validate_e2b_qat_schedule(config: &serde_json::Value) -> Result<()
     Ok(())
 }
 
+/// Derive the honest top-level `quantization` block values from the per-layer
+/// overrides `import_gemma_prequantized` emitted — the import path's single
+/// source of truth for what was actually written to disk. Returns
+/// `(bits, group_size, mode)`.
+///
+/// `mode` and `group_size` are uniform across every override by construction
+/// (every 2/4-bit module is repacked to MLX affine at `LINEAR_GROUP_SIZE` /
+/// `PLE_GROUP_SIZE` = 128), so they are asserted uniform and returned
+/// directly; a divergence means the emitters changed and whoever changed them
+/// must decide what the top level should say. `bits` genuinely varies per
+/// module (the E2B schedule mixes 2- and 4-bit), so no single top-level value
+/// can describe every tensor: the modal (most common) bit-width is recorded,
+/// with ties broken toward the wider width. That is safe because every
+/// `.scales`-bearing output tensor carries its own complete
+/// `{bits, group_size, mode}` override — the top level only serves as the
+/// default for quantized tensors WITHOUT an override, and the importer emits
+/// none.
+pub(crate) fn top_level_quant_metadata(
+    overrides: &HashMap<String, serde_json::Value>,
+) -> Result<(i32, i32, String)> {
+    let mut mode: Option<String> = None;
+    let mut group_size: Option<i64> = None;
+    let mut bits_counts: HashMap<i64, usize> = HashMap::new();
+    for (key, ov) in overrides {
+        let read = |field: &str| {
+            ov.get(field).cloned().ok_or_else(|| {
+                Error::from_reason(format!(
+                    "gemma-QAT import: per-layer override `{key}` is missing `{field}`"
+                ))
+            })
+        };
+        let b = read("bits")?.as_i64().ok_or_else(|| {
+            Error::from_reason(format!(
+                "gemma-QAT import: per-layer override `{key}` has a non-integer `bits`"
+            ))
+        })?;
+        let gs = read("group_size")?.as_i64().ok_or_else(|| {
+            Error::from_reason(format!(
+                "gemma-QAT import: per-layer override `{key}` has a non-integer `group_size`"
+            ))
+        })?;
+        let m = read("mode")?.as_str().map(str::to_string).ok_or_else(|| {
+            Error::from_reason(format!(
+                "gemma-QAT import: per-layer override `{key}` has a non-string `mode`"
+            ))
+        })?;
+        match &mode {
+            None => mode = Some(m),
+            Some(prev) if *prev != m => {
+                return Err(Error::from_reason(format!(
+                    "gemma-QAT import: per-layer overrides mix modes ({prev} vs {m}); \
+                     no honest top-level `quantization.mode` exists — update \
+                     top_level_quant_metadata alongside the emitter change"
+                )));
+            }
+            _ => {}
+        }
+        match group_size {
+            None => group_size = Some(gs),
+            Some(prev) if prev != gs => {
+                return Err(Error::from_reason(format!(
+                    "gemma-QAT import: per-layer overrides mix group sizes ({prev} vs {gs}); \
+                     no honest top-level `quantization.group_size` exists — update \
+                     top_level_quant_metadata alongside the emitter change"
+                )));
+            }
+            _ => {}
+        }
+        *bits_counts.entry(b).or_default() += 1;
+    }
+    let (Some(mode), Some(group_size)) = (mode, group_size) else {
+        return Err(Error::from_reason(
+            "gemma-QAT import emitted no quantized modules; cannot derive an honest \
+             top-level `quantization` block"
+                .to_string(),
+        ));
+    };
+    let bits = bits_counts
+        .into_iter()
+        .max_by_key(|&(bits, count)| (count, bits))
+        .map(|(bits, _)| bits)
+        .expect("non-empty overrides imply at least one bits entry");
+    Ok((bits as i32, group_size as i32, mode))
+}
+
 /// Strip the HF wrapper prefix the same way `Gemma4Recipe::sanitize` does,
 /// returning the bare module key.
 fn strip_hf_prefix(key: &str) -> &str {
@@ -1155,5 +1240,111 @@ mod tests {
         );
         let (out, _ov) = import_gemma_prequantized(raw, &json!({}), DType::BFloat16).unwrap();
         assert!(out.contains_key("language_model.model.layers.0.self_attn.q_proj.weight"));
+    }
+
+    #[test]
+    fn top_level_metadata_uniform_gs_mode_modal_bits() {
+        // Mixed 2/4-bit overrides at uniform group 128 / affine → the top
+        // level records the modal bit-width (4: two modules vs one).
+        let mut ov = HashMap::new();
+        ov.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        ov.insert(
+            "layers.0.self_attn.k_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        ov.insert(
+            "layers.20.mlp.down_proj".to_string(),
+            json!({ "bits": 2, "group_size": 128, "mode": "affine" }),
+        );
+        let (bits, group_size, mode) = top_level_quant_metadata(&ov).unwrap();
+        assert_eq!(bits, 4);
+        assert_eq!(group_size, 128);
+        assert_eq!(mode, "affine");
+    }
+
+    #[test]
+    fn top_level_metadata_bits_tie_breaks_wider() {
+        let mut ov = HashMap::new();
+        ov.insert(
+            "lm_head".to_string(),
+            json!({ "bits": 2, "group_size": 128, "mode": "affine" }),
+        );
+        ov.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        let (bits, _, _) = top_level_quant_metadata(&ov).unwrap();
+        assert_eq!(bits, 4, "a 2/4 tie must break toward the wider width");
+    }
+
+    #[test]
+    fn top_level_metadata_rejects_empty_overrides() {
+        let err = top_level_quant_metadata(&HashMap::new())
+            .expect_err("no quantized modules → no honest top-level block");
+        assert!(err.to_string().contains("no quantized modules"));
+    }
+
+    #[test]
+    fn top_level_metadata_rejects_mixed_group_size() {
+        let mut ov = HashMap::new();
+        ov.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        ov.insert(
+            "embed_tokens_per_layer".to_string(),
+            json!({ "bits": 4, "group_size": 64, "mode": "affine" }),
+        );
+        let err = top_level_quant_metadata(&ov)
+            .expect_err("mixed group sizes have no honest top-level value");
+        assert!(err.to_string().contains("mix group sizes"));
+    }
+
+    #[test]
+    fn top_level_metadata_rejects_mixed_mode() {
+        let mut ov = HashMap::new();
+        ov.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            json!({ "bits": 4, "group_size": 128, "mode": "affine" }),
+        );
+        ov.insert(
+            "lm_head".to_string(),
+            json!({ "bits": 8, "group_size": 128, "mode": "mxfp8" }),
+        );
+        let err =
+            top_level_quant_metadata(&ov).expect_err("mixed modes have no honest top-level value");
+        assert!(err.to_string().contains("mix modes"));
+    }
+
+    #[test]
+    fn top_level_metadata_from_real_import() {
+        // End-to-end over an actual import: a 4-bit q_proj + a 2-bit
+        // down_proj derive (bits=4 via tie-break, 128, affine).
+        let (out_f, in_f) = (4usize, 128usize);
+        let mut raw = HashMap::new();
+        raw.insert(
+            "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
+            packed_u8_array(&make_q(out_f, in_f, 4), out_f, in_f, 4),
+        );
+        raw.insert(
+            "model.language_model.layers.0.self_attn.q_proj.weight_scale".to_string(),
+            f32_array(&per_row_scales(out_f, 0.001), &[out_f as i64, 1]),
+        );
+        raw.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight".to_string(),
+            packed_u8_array(&make_q(out_f, in_f, 2), out_f, in_f, 2),
+        );
+        raw.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight_scale".to_string(),
+            f32_array(&per_row_scales(out_f, 0.01), &[out_f as i64, 1]),
+        );
+        let (_out, ov) = import_gemma_prequantized(raw, &json!({}), DType::BFloat16).unwrap();
+        let (bits, group_size, mode) = top_level_quant_metadata(&ov).unwrap();
+        assert_eq!(bits, 4);
+        assert_eq!(group_size, 128);
+        assert_eq!(mode, "affine");
     }
 }

@@ -2317,11 +2317,26 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Apply quantization if requested
     let mut per_layer_overrides: HashMap<String, serde_json::Value> =
         gemma_pre_overrides.unwrap_or_default();
-    // Effective mode/group_size recorded in config.json. The no-recipe path
-    // updates these when --q-mxfp upgrades the global mode to mxfp4/mxfp8 so
-    // downstream loaders dispatch to the correct builder.
+    // Effective mode/group_size/bits recorded in config.json. The no-recipe
+    // path updates mode/group_size when --q-mxfp upgrades the global mode to
+    // mxfp4/mxfp8 so downstream loaders dispatch to the correct builder.
     let mut quant_mode_effective = quant_mode.clone();
     let mut quant_group_size_effective = quant_group_size;
+    let mut quant_bits_effective = quant_bits;
+    // The gemma-prequant path never runs the quantize block below (--quantize
+    // is rejected up front), so the effective values would otherwise stay at
+    // the generic CLI defaults (affine / 4-bit / group 64) — dishonest: every
+    // sidecar the importer emits is a 128-group affine repack. External
+    // loaders that trust the top-level default for tensors without a
+    // per-layer override would mis-dequantize, so derive the top-level block
+    // from the importer's own override map instead.
+    if is_gemma_prequantized {
+        let (bits, group_size, mode) =
+            crate::convert_gemma_import::top_level_quant_metadata(&per_layer_overrides)?;
+        quant_bits_effective = bits;
+        quant_group_size_effective = group_size;
+        quant_mode_effective = mode;
+    }
     // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
     // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
     // lookup + quantized tied-head matmul), so the embedding table can be
@@ -2670,7 +2685,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         };
         let mut quant_obj = serde_json::json!({
             "group_size": group_size_value,
-            "bits": quant_bits,
+            "bits": quant_bits_effective,
             "mode": quant_mode_effective,
         });
         if let Some(obj) = quant_obj.as_object_mut() {
@@ -10518,5 +10533,175 @@ mod tests {
         eprintln!("vision_tower tensors are dense (no .scales) ✓");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Gemma-prequant conversions must write an HONEST top-level
+    /// `quantization` / `quantization_config` block. The importer repacks
+    /// every 2/4-bit module to MLX affine at group_size=128 (mode "affine",
+    /// bits per the E2B schedule) and records a complete per-layer override
+    /// for each — but the top-level values come from the `--quantize` CLI
+    /// defaults (group_size=64), which this path never uses. An external
+    /// mlx-lm-style loader that trusts the top-level default for any tensor
+    /// lacking an override would mis-dequantize at group 64.
+    ///
+    /// Fully synthetic (tiny tensors, no checkpoint needed): drives the real
+    /// `convert_model` pipeline end-to-end and asserts on the WRITTEN
+    /// config.json.
+    #[tokio::test]
+    async fn convert_model_gemma_prequant_top_level_block_is_honest() {
+        let base = std::env::temp_dir().join(format!(
+            "gemma_prequant_toplevel_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+
+        // config.json: gemma quant_method + the exact E2B module_quant_configs
+        // schedule `validate_e2b_qat_schedule` pins.
+        let config = serde_json::json!({
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "quant_method": "gemma",
+                "module_quant_configs": {
+                    "^lm_head$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens$": { "num_bits": 2 },
+                    "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                    "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                    "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                    "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                }
+            }
+        });
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .expect("write config.json");
+
+        // Synthetic source tensors in the wNa8o8 layout:
+        //  - 4-bit packed U8 `[out, in/2]` + per-row f32 scale `[out, 1]`
+        //  - 2-bit packed U8 `[out, in/4]` + per-row f32 scale
+        //  - I8 gate `[out, in]` + per-row f32 scale (dequants to dense bf16)
+        //  - float norm passthrough
+        // Two 4-bit modules vs one 2-bit module makes the modal bit-width an
+        // unambiguous 4, mirroring the real E2B checkpoint where 4-bit
+        // modules dominate.
+        let mut src: HashMap<String, MxArray> = HashMap::new();
+        let row_scales = [0.5f32, 0.25, 0.125, 0.0625];
+        for name in ["q_proj", "k_proj"] {
+            // 4-bit, in_features=128 → 64 packed bytes per row.
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight"),
+                MxArray::from_uint8(&[0x88u8; 4 * 64], &[4, 64]).unwrap(),
+            );
+            src.insert(
+                format!("model.language_model.layers.0.self_attn.{name}.weight_scale"),
+                MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+            );
+        }
+        // 2-bit MLP linear (layer 20 ≥ 15), in_features=128 → 32 bytes per row.
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight".to_string(),
+            MxArray::from_uint8(&[0x66u8; 4 * 32], &[4, 32]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.20.mlp.down_proj.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // I8 per-layer gate → dense bf16 `.weight`, no `.scales`, no override.
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight".to_string(),
+            MxArray::from_int8(&[7i8; 4 * 16], &[4, 16]).unwrap(),
+        );
+        src.insert(
+            "model.language_model.layers.0.per_layer_input_gate.weight_scale".to_string(),
+            MxArray::from_float32(&row_scales, &[4, 1]).unwrap(),
+        );
+        // Float passthrough.
+        src.insert(
+            "model.language_model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[16]).unwrap(),
+        );
+        crate::utils::safetensors::save_safetensors(
+            input.join("model.safetensors"),
+            &mut src,
+            None,
+        )
+        .expect("write synthetic model.safetensors");
+
+        let result = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4".to_string()),
+            quantize: None,
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("synthetic gemma-prequant conversion must succeed");
+        assert!(result.num_tensors > 0);
+
+        let config_str = std::fs::read_to_string(output.join("config.json"))
+            .expect("output config.json must exist");
+        let out_config: serde_json::Value =
+            serde_json::from_str(&config_str).expect("output config.json must be valid JSON");
+        for block_key in ["quantization", "quantization_config"] {
+            let block = out_config.get(block_key).unwrap_or_else(|| {
+                panic!("output config.json must carry a top-level `{block_key}` block")
+            });
+            assert_eq!(
+                block["group_size"].as_i64(),
+                Some(128),
+                "top-level {block_key}.group_size must match the 128-group affine \
+                 sidecars the importer writes, got {:?}",
+                block["group_size"]
+            );
+            assert_eq!(
+                block["bits"].as_i64(),
+                Some(4),
+                "top-level {block_key}.bits must be the modal sidecar bit-width (4), got {:?}",
+                block["bits"]
+            );
+            assert_eq!(
+                block["mode"].as_str(),
+                Some("affine"),
+                "top-level {block_key}.mode must be 'affine', got {:?}",
+                block["mode"]
+            );
+            // Per-layer overrides keep their true (schedule) values.
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["group_size"].as_i64(),
+                Some(128)
+            );
+            assert_eq!(
+                block["language_model.model.layers.0.self_attn.q_proj"]["bits"].as_i64(),
+                Some(4)
+            );
+            assert_eq!(
+                block["language_model.model.layers.20.mlp.down_proj"]["bits"].as_i64(),
+                Some(2)
+            );
+            // The I8-dequant gate is dense: it must NOT get an override entry.
+            assert!(
+                block
+                    .get("language_model.model.layers.0.per_layer_input_gate")
+                    .is_none(),
+                "I8-dequant modules are dense bf16 and must not carry an override"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
