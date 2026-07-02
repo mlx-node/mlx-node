@@ -3,6 +3,8 @@
 
 use std::sync::OnceLock;
 
+use mlx_sys as sys;
+
 use crate::array::{DType, MxArray};
 
 /// Returns `true` when this host's half-precision GEMM produces results
@@ -37,6 +39,71 @@ use crate::array::{DType, MxArray};
 /// gated assertions to run anyway (for measuring the divergence on a
 /// broken host, or for re-validating after an MLX pin bump before the
 /// canary is removed).
+pub(crate) fn half_gemm_untrustworthy() -> bool {
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        if std::env::var_os("MLX_TEST_FORCE_HALF_PARITY").is_some_and(|v| v == "1") {
+            eprintln!(
+                "half_gemm_untrustworthy: MLX_TEST_FORCE_HALF_PARITY=1 — bypassing \
+                 the canary; gated parity assertions will run even if this host's \
+                 half-precision GEMM is broken"
+            );
+            return false;
+        }
+        let run = || -> Result<bool, napi::Error> {
+            let m = 8usize;
+            let k_dim = 64usize;
+            let n_dim = 64usize;
+            let x_vals: Vec<f32> = (0..(m * k_dim))
+                .map(|i| ((i as f32 * 0.9173 + 0.37).sin()) * 1.5)
+                .collect();
+            let w_vals: Vec<f32> = (0..(k_dim * n_dim))
+                .map(|i| ((i as f32 * 0.5711 + 0.71).sin()) * 0.5)
+                .collect();
+            let x = MxArray::from_float32(&x_vals, &[m as i64, k_dim as i64])?
+                .astype(DType::BFloat16)?;
+            let w = MxArray::from_float32(&w_vals, &[k_dim as i64, n_dim as i64])?
+                .astype(DType::BFloat16)?;
+
+            let flat = |a: &MxArray| -> Result<Vec<f32>, napi::Error> {
+                let n: i64 = a.shape()?.iter().product();
+                let f = a.reshape(&[n])?.astype(DType::Float32)?;
+                f.eval();
+                (0..n as usize).map(|i| f.item_at_float32(i)).collect()
+            };
+
+            let y = flat(&x.matmul(&w)?)?;
+            let xb = flat(&x)?;
+            let wb = flat(&w)?;
+            let mut max_err = 0.0f32;
+            for r in 0..m {
+                for n in 0..n_dim {
+                    let mut acc = 0.0f32;
+                    for k in 0..k_dim {
+                        acc += xb[r * k_dim + k] * wb[k * n_dim + n];
+                    }
+                    max_err = max_err.max((y[r * n_dim + n] - acc).abs());
+                }
+            }
+            Ok(max_err > 0.1)
+        };
+        match run() {
+            Ok(untrustworthy) => {
+                if untrustworthy {
+                    eprintln!(
+                        "half_gemm_untrustworthy: this host's bf16 GEMM fails the \
+                         K=64/N=64 canary (vendored-MLX NAX unaligned-K bug on \
+                         gen>=17 GPUs); half-precision parity assertions on tiny \
+                         configs are gated off"
+                    );
+                }
+                untrustworthy
+            }
+            Err(_) => false,
+        }
+    })
+}
+
 /// Returns `true` when this host silently computes f32 GEMM in reduced
 /// (TF32-class) precision instead of true f32.
 ///
@@ -119,50 +186,95 @@ pub(crate) fn f32_gemm_tf32_degraded() -> bool {
     })
 }
 
-pub(crate) fn half_gemm_untrustworthy() -> bool {
+/// Returns `true` when this host's half-precision **sorted** `gather_mm`
+/// (the `right_sorted` M=1-rows fast path MoE expert dispatch uses once a
+/// forward carries >= 64 token-expert indices) produces garbage.
+///
+/// This is a distinct broken kernel from the plain-GEMM canary above: on
+/// gen>=17 GPUs + macOS 26.2+ the vendored pin routes bf16/f16 sorted
+/// gather_mm to `gather_mm_rhs_nax` (`matmul.cpp:2408`), which against a
+/// host-f64 reference errs O(1) at EVERY K probed — K=4: 2.7, K=64: 5.0,
+/// K=128: 3.7, K=256: 3.9, K=2048: 2.9 — including block-aligned and
+/// production-scale K, unlike the plain NAX GEMM whose damage is confined
+/// to unaligned K. The same call with f32 operands and `MLX_ENABLE_TF32=0`
+/// (dispatching the non-NAX `gather_mm_rhs`) matches the host reference to
+/// ~1e-8, and the UNSORTED m=1 path (`gather_mv`) is correct in bf16 — so
+/// an MLX pin bump can fix the plain GEMM and this kernel independently,
+/// which is why they get separate probes.
+///
+/// (Also documented here because it is test-adjacent: with the pin's
+/// `MLX_ENABLE_TF32=1` default, f32 sorted gather_mm ABORTS the process —
+/// dispatch enters `gather_mm_rhs_nax`, whose JIT template instantiation
+/// for float32 throws an uncatchable foreign exception through the FFI
+/// boundary.)
+///
+/// Same contract as `half_gemm_untrustworthy`: `false` when the probe
+/// cannot run, and `MLX_TEST_FORCE_HALF_PARITY=1` bypasses it.
+pub(crate) fn sorted_gather_mm_untrustworthy() -> bool {
     static RESULT: OnceLock<bool> = OnceLock::new();
     *RESULT.get_or_init(|| {
         if std::env::var_os("MLX_TEST_FORCE_HALF_PARITY").is_some_and(|v| v == "1") {
             eprintln!(
-                "half_gemm_untrustworthy: MLX_TEST_FORCE_HALF_PARITY=1 — bypassing \
-                 the canary; gated parity assertions will run even if this host's \
-                 half-precision GEMM is broken"
+                "sorted_gather_mm_untrustworthy: MLX_TEST_FORCE_HALF_PARITY=1 — \
+                 bypassing the canary; gated parity assertions will run even if \
+                 this host's sorted half-precision gather_mm is broken"
             );
             return false;
         }
         let run = || -> Result<bool, napi::Error> {
-            let m = 8usize;
+            let rows = 64usize;
+            let n_exp = 4usize;
             let k_dim = 64usize;
             let n_dim = 64usize;
-            let x_vals: Vec<f32> = (0..(m * k_dim))
+            // x: [rows, 1, 1, K] bf16 — each row is one M=1 matmul, matching
+            // the SwitchGLU gather-sort layout.
+            let x_vals: Vec<f32> = (0..(rows * k_dim))
                 .map(|i| ((i as f32 * 0.9173 + 0.37).sin()) * 1.5)
                 .collect();
-            let w_vals: Vec<f32> = (0..(k_dim * n_dim))
+            let x = MxArray::from_float32(&x_vals, &[rows as i64, 1, 1, k_dim as i64])?
+                .astype(DType::BFloat16)?;
+            // b: [E, K, N] bf16 expert stack.
+            let w_vals: Vec<f32> = (0..(n_exp * k_dim * n_dim))
                 .map(|i| ((i as f32 * 0.5711 + 0.71).sin()) * 0.5)
                 .collect();
-            let x = MxArray::from_float32(&x_vals, &[m as i64, k_dim as i64])?
+            let w = MxArray::from_float32(&w_vals, &[n_exp as i64, k_dim as i64, n_dim as i64])?
                 .astype(DType::BFloat16)?;
-            let w = MxArray::from_float32(&w_vals, &[k_dim as i64, n_dim as i64])?
-                .astype(DType::BFloat16)?;
+            // Sorted expert ids, rows/n_exp rows per expert.
+            let per = rows / n_exp;
+            let ids: Vec<i32> = (0..rows).map(|r| (r / per) as i32).collect();
+            let idx = MxArray::from_int32(&ids, &[rows as i64, 1])?;
 
+            let out = MxArray::from_handle(
+                unsafe {
+                    sys::mlx_gather_mm(
+                        x.handle.0,
+                        w.handle.0,
+                        std::ptr::null_mut(),
+                        idx.handle.0,
+                        true,
+                    )
+                },
+                "sorted_gather_mm_canary",
+            )?;
             let flat = |a: &MxArray| -> Result<Vec<f32>, napi::Error> {
                 let n: i64 = a.shape()?.iter().product();
                 let f = a.reshape(&[n])?.astype(DType::Float32)?;
                 f.eval();
-                (0..n as usize).map(|i| f.item_at_float32(i)).collect()
+                Ok(f.to_float32()?.to_vec())
             };
-
-            let y = flat(&x.matmul(&w)?)?;
+            let got = flat(&out)?;
             let xb = flat(&x)?;
             let wb = flat(&w)?;
             let mut max_err = 0.0f32;
-            for r in 0..m {
+            for r in 0..rows {
+                let e = ids[r] as usize;
                 for n in 0..n_dim {
-                    let mut acc = 0.0f32;
+                    let mut acc = 0.0f64;
                     for k in 0..k_dim {
-                        acc += xb[r * k_dim + k] * wb[k * n_dim + n];
+                        acc +=
+                            xb[r * k_dim + k] as f64 * wb[e * k_dim * n_dim + k * n_dim + n] as f64;
                     }
-                    max_err = max_err.max((y[r * n_dim + n] - acc).abs());
+                    max_err = max_err.max((got[r * n_dim + n] - acc as f32).abs());
                 }
             }
             Ok(max_err > 0.1)
@@ -171,10 +283,11 @@ pub(crate) fn half_gemm_untrustworthy() -> bool {
             Ok(untrustworthy) => {
                 if untrustworthy {
                     eprintln!(
-                        "half_gemm_untrustworthy: this host's bf16 GEMM fails the \
-                         K=64/N=64 canary (vendored-MLX NAX unaligned-K bug on \
-                         gen>=17 GPUs); half-precision parity assertions on tiny \
-                         configs are gated off"
+                        "sorted_gather_mm_untrustworthy: this host's bf16 sorted \
+                         gather_mm fails the K=64/N=64 canary (vendored-MLX \
+                         gather_mm_rhs_nax bug on gen>=17 GPUs, broken at every \
+                         probed K incl. 2048); half-precision MoE gather-sort \
+                         parity assertions are gated off"
                     );
                 }
                 untrustworthy

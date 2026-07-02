@@ -476,8 +476,39 @@ mod tests {
         );
     }
 
+    /// Skips on hosts where either NAX half-precision kernel class this test
+    /// depends on is broken (gen>=17 GPUs on the current vendored-MLX pin):
+    ///
+    /// 1. `test_support::half_gemm_untrustworthy` — with 32 tokens the router
+    ///    gate projection is a bf16 `[32,4] @ [4,4]` GEMM (M>1, K=4), which
+    ///    the NAX unaligned-K bug turns into garbage (probed vs host truth:
+    ///    max_err 3.2; e.g. token-0 logit for expert 2 computes 0 where the
+    ///    true value is 1.0), corrupting every token's routing scores before
+    ///    the experts even run. The single-token sibling tests stay green
+    ///    because M=1 dispatches the correct GEMV.
+    /// 2. `test_support::sorted_gather_mm_untrustworthy` — the >= 64-index
+    ///    branch also switches expert dispatch to sorted `gather_mm`
+    ///    (`gather_mm_rhs_nax`), which is garbage at every K on such hosts.
+    ///
+    /// The gather-sort logic itself is NOT under suspicion: the identical
+    /// 32-token forward with f32 weights/input (same gather_sort /
+    /// scatter_unsort code, non-NAX kernels via MLX_ENABLE_TF32=0) matches
+    /// the per-token reference to 1.5e-8. Both canaries must be healthy
+    /// before the bf16 assertion means anything again, hence the OR.
     #[test]
     fn forward_64_index_gather_sort_branch() {
+        if crate::test_support::half_gemm_untrustworthy()
+            || crate::test_support::sorted_gather_mm_untrustworthy()
+        {
+            eprintln!(
+                "skipping forward_64_index_gather_sort_branch: this host's NAX \
+                 half-precision kernels are broken (plain unaligned-K GEMM \
+                 corrupts the [32,4]@[4,4] router gate, and/or sorted \
+                 gather_mm_rhs corrupts the expert matmuls), so the bf16 \
+                 gather-sort parity assertion is not meaningful here"
+            );
+            return;
+        }
         // 32 tokens x top_k=2 = 64 indices >= 64 → exercises the gather-sort
         // path in SwitchGLU::forward. Must equal the per-token reference.
         let bias = [0.0f32; N_EXP];
