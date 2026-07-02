@@ -337,8 +337,10 @@ impl Qwen3_5MoeMTPModule {
                 PerLayerMode::Affine => {
                     try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
                 }
-                // Unreachable: `apply_weights_moe_inner` rejects sym8
-                // checkpoints before the MTP load runs.
+                // Unreachable: `apply_weights_moe_inner` disables the MTP
+                // head load for sym8 checkpoints (`mtp_weights_loaded =
+                // false`, warn) before this `apply_weights` can run, so no
+                // sym8 PLQ ever reaches these builders.
                 PerLayerMode::Sym8 => None,
             }
         };

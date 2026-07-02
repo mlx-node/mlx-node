@@ -36,8 +36,14 @@ pub enum PerLayerMode {
     /// `[N]` scales, no biases, group_size is null/meaningless). Consumed by
     /// the int8 kernels (`int8_w8a16_qmv` decode / `int8_w8a8_matmul`
     /// prefill), NEVER by `mlx_quantized_matmul` (there is no affine pack).
-    /// Dispatched by dense qwen3_5, lfm2/lfm2_moe, and gemma4 (all via the
-    /// shared `try_build_sym8_quantized_linear`); qwen3_5_moe still rejects.
+    /// Dispatched by dense qwen3_5, qwen3_5_moe (non-expert sublayers only —
+    /// attention q/k/v/o, GDN linear-attention, shared-expert MLP body; the
+    /// router gate and shared_expert_gate are accuracy-forced affine-8 by
+    /// `compute_moe_defaults` + convert's `is_router_gate`, so they never
+    /// dispatch sym8), lfm2/lfm2_moe, and gemma4 (all via the shared
+    /// `try_build_sym8_quantized_linear`). The per-expert `switch_mlp.*`
+    /// gather path (qwen3_5_moe, lfm2_moe) has no sym8 kernel and always
+    /// resolves to a forced-affine per-layer override instead.
     Sym8,
 }
 
@@ -72,14 +78,17 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
 /// True when the resolved quantization settings reference sym8 anywhere
 /// (top-level default mode OR any per-layer override).
 ///
-/// Used by the loaders with sym8 dispatch (dense qwen3_5, lfm2/lfm2_moe,
-/// gemma4) to scope-gate the checkpoint: qwen3_5 pins flat KV + disables
-/// MTP/vision; lfm2 is eager-FLAT only v1, so it skips the C++
-/// compiled-forward registration (it stores 2-D `.weight` tensors in the
-/// [N,K] checkpoint orientation, which the shared `sym8_linear_proj`
-/// fail-loud rejects) and forces the flat decode shape; gemma4 has no
-/// compiled registry and keeps its eager paged default. qwen3_5_moe has no
-/// sym8 dispatch and uses this to fail loud up front.
+/// Used by the loaders with sym8 dispatch (dense qwen3_5, qwen3_5_moe,
+/// lfm2/lfm2_moe, gemma4) to scope-gate the checkpoint: qwen3_5 pins flat KV
+/// and disables MTP/vision; qwen3_5_moe disables its speculative MTP head and
+/// vision encoder the same way (the MTP module's own `try_build_ql`/
+/// `try_build_qsl` closures have unwired `Sym8 => None` arms, so a sym8 MTP
+/// head cannot load — the loader fail-softs to plain AR decode) while its
+/// AR-decode non-expert sublayers keep dispatching sym8; lfm2 is eager-FLAT
+/// only v1, so it skips the C++ compiled-forward registration (it stores 2-D
+/// `.weight` tensors in the [N,K] checkpoint orientation, which the shared
+/// `sym8_linear_proj` fail-loud rejects) and forces the flat decode shape;
+/// gemma4 has no compiled registry and keeps its eager paged default.
 pub fn has_sym8_mode(
     top_level_mode: Option<PerLayerMode>,
     per_layer: &HashMap<String, PerLayerQuant>,

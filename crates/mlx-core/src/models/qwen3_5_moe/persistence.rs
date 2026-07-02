@@ -15,8 +15,8 @@ use crate::engine::persistence::{
 };
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
-    default_per_layer_quant, effective_plq_for, has_sym8_mode, parse_quant_block,
-    resolve_default_mode,
+    default_per_layer_quant, effective_plq_for, ensure_int8_storage_resolves_sym8, has_sym8_mode,
+    parse_quant_block, resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -31,11 +31,12 @@ use super::decoder_layer::{AttentionType, MLPType};
 use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    MLPVariant, PerLayerMode, PerLayerQuant, QuantizedSwitchLinear, is_mxfp8_checkpoint,
-    is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
+    MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
+    is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_mxfp4_quantized_linear,
     try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
     try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear,
     try_build_nvfp4_quantized_switch_linear, try_build_quantized_linear,
+    try_build_sym8_quantized_linear,
 };
 use super::switch_glu::SwitchGLU;
 
@@ -477,21 +478,21 @@ fn apply_weights_moe_inner(
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     has_vision: bool,
 ) -> Result<()> {
-    // sym8 is consumed by the DENSE Qwen3.5 loader only (eager int8 W8A8
-    // path). The MoE loader has no sym8 dispatch — fail loud instead of
-    // letting the Sym8 match arms below silently fall back to dense weights
-    // (an int8 [N,K] tensor through `set_weight` would be garbage).
-    if has_sym8_mode(top_level_mode, per_layer_quant) {
-        return Err(Error::from_reason(
-            "sym8 checkpoints are not supported by the qwen3_5_moe loader yet \
-             (sym8 v1 is dense Qwen3.5 only). Re-convert with an affine quant mode.",
-        ));
-    }
+    // sym8 dispatch covers the NON-EXPERT sublayers (attention q/k/v/o, GDN
+    // in_proj_qkvz/in_proj_ba/out_proj, shared-expert MLP body) through the
+    // same shared `QuantizedLinear` machinery as the dense qwen3_5 loader.
+    // The per-expert `switch_mlp.*` gather path has no sym8 kernel — convert
+    // forces those 3-D tensors to an explicit affine-8 per-layer override
+    // (`sym8_eligible` rejects ndim != 2), and `try_build_qsl` below fails
+    // loud if a sym8 override ever reaches it. The speculative MTP head is
+    // disabled under sym8 (see the MTP branch below), mirroring dense.
+    let checkpoint_has_sym8 = has_sym8_mode(top_level_mode, per_layer_quant);
     let is_quantized = is_quantized_checkpoint(params);
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
 
-    // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine).
+    // Helper: dispatch by per-layer mode (mxfp4 / mxfp8 / nvfp4 / affine /
+    // sym8).
     //
     // Per-projection PLQ resolution (override lookup, merged GDN fallback,
     // and gate-prefix routing) is delegated to `effective_plq_for`. That
@@ -499,34 +500,54 @@ fn apply_weights_moe_inner(
     // `*.mlp.shared_expert_gate`) by routing them to `default_gate_plq`
     // when no per-layer override is recorded — the historical
     // `try_build_ql_gate` closure is therefore subsumed and removed.
-    let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
+    //
+    // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back to
+    // the dense-weight branch"; `Err` = fail-loud (a malformed sym8 group
+    // must never silently fall back, see `try_build_sym8_quantized_linear`).
+    let try_build_ql = |params: &HashMap<String, MxArray>,
+                        prefix: &str|
+     -> Result<Option<QuantizedLinear>> {
         let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
-        match plq.mode {
+        // int8 STORAGE with non-sym8 metadata = config drift — fail loud
+        // before the int8 tensor can flow into the affine/mxfp builders.
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
+        Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
             PerLayerMode::Affine => {
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
-            // Unreachable: the sym8 guard at the top of this function
-            // rejects sym8 checkpoints before any builder runs.
-            PerLayerMode::Sym8 => None,
-        }
+            PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
+        })
     };
 
-    let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
+    let try_build_qsl = |params: &HashMap<String, MxArray>,
+                         prefix: &str|
+     -> Result<Option<QuantizedSwitchLinear>> {
         let plq = effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq));
-        match plq.mode {
+        ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
+        Ok(match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_switch_linear(params, prefix),
             PerLayerMode::Affine => {
                 try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
             }
-            // Unreachable: the sym8 guard at the top of this function
-            // rejects sym8 checkpoints before any builder runs.
-            PerLayerMode::Sym8 => None,
-        }
+            // Per-expert 3-D stacked projections route through gather_qmm,
+            // which has no sym8 pack. Convert's `sym8_eligible` forces every
+            // switch_mlp.* tensor to an explicit affine-8 per-layer override,
+            // so a sym8 PLQ reaching this arm means corrupt/hand-edited quant
+            // metadata — fail loud, never fall back to a silent affine/dense
+            // read of int8 bytes.
+            PerLayerMode::Sym8 => {
+                return Err(Error::from_reason(format!(
+                    "sym8 layer '{prefix}': per-expert switch_mlp projections (3-D stacked \
+                     experts) have no sym8 kernel; convert forces these to an affine-8 \
+                     per-layer override — re-convert the checkpoint"
+                )));
+            }
+        })
     };
 
     // Embedding — supports both dense and quantized weights
@@ -590,7 +611,7 @@ fn apply_weights_moe_inner(
 
     // lm_head — direct access, no lock
     if is_quantized {
-        if let Some(ql) = try_build_ql(params, "lm_head") {
+        if let Some(ql) = try_build_ql(params, "lm_head")? {
             inner.lm_head = Some(super::quantized_linear::LinearProj::Quantized(ql));
         } else if let Some(ref mut head) = inner.lm_head
             && let Some(w) = params.get("lm_head.weight")
@@ -612,7 +633,7 @@ fn apply_weights_moe_inner(
             AttentionType::Linear(gdn) => {
                 if is_quantized {
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))?
                     {
                         gdn.set_quantized_in_proj_qkvz(ql);
                     } else if let Some(w) =
@@ -622,7 +643,7 @@ fn apply_weights_moe_inner(
                     }
 
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))?
                     {
                         gdn.set_quantized_in_proj_ba(ql);
                     } else if let Some(w) =
@@ -632,7 +653,7 @@ fn apply_weights_moe_inner(
                     }
 
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))
+                        try_build_ql(params, &format!("{}.linear_attn.out_proj", prefix))?
                     {
                         gdn.set_quantized_out_proj(ql);
                     } else if let Some(w) =
@@ -693,7 +714,7 @@ fn apply_weights_moe_inner(
             }
             AttentionType::Full(attn) => {
                 if is_quantized {
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))?
                     {
                         attn.set_quantized_q_proj(ql);
                     } else if let Some(w) =
@@ -701,7 +722,7 @@ fn apply_weights_moe_inner(
                     {
                         attn.set_q_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))?
                     {
                         attn.set_quantized_k_proj(ql);
                     } else if let Some(w) =
@@ -709,7 +730,7 @@ fn apply_weights_moe_inner(
                     {
                         attn.set_k_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))?
                     {
                         attn.set_quantized_v_proj(ql);
                     } else if let Some(w) =
@@ -717,7 +738,7 @@ fn apply_weights_moe_inner(
                     {
                         attn.set_v_proj_weight(w)?;
                     }
-                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))
+                    if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))?
                     {
                         attn.set_quantized_o_proj(ql);
                     } else if let Some(w) =
@@ -772,9 +793,9 @@ fn apply_weights_moe_inner(
                     let up_key = format!("{}.mlp.up_proj", prefix);
                     let down_key = format!("{}.mlp.down_proj", prefix);
 
-                    let q_gate = try_build_ql(params, &gate_key);
-                    let q_up = try_build_ql(params, &up_key);
-                    let q_down = try_build_ql(params, &down_key);
+                    let q_gate = try_build_ql(params, &gate_key)?;
+                    let q_up = try_build_ql(params, &up_key)?;
+                    let q_down = try_build_ql(params, &down_key)?;
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         layer.set_quantized_dense_mlp(qg, qu, qd);
@@ -804,7 +825,7 @@ fn apply_weights_moe_inner(
             MLPType::Dense(MLPVariant::Quantized { .. }) => {}
             MLPType::MoE(moe) => {
                 if is_quantized {
-                    if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix)) {
+                    if let Some(ql) = try_build_ql(params, &format!("{}.mlp.gate", prefix))? {
                         moe.set_quantized_gate(ql);
                     } else if let Some(w) = params.get(&format!("{}.mlp.gate.weight", prefix)) {
                         moe.set_gate_weight(w)?;
@@ -814,9 +835,9 @@ fn apply_weights_moe_inner(
                     let up_proj_key = format!("{}.mlp.switch_mlp.up_proj", prefix);
                     let down_proj_key = format!("{}.mlp.switch_mlp.down_proj", prefix);
 
-                    let q_gate = try_build_qsl(params, &gate_proj_key);
-                    let q_up = try_build_qsl(params, &up_proj_key);
-                    let q_down = try_build_qsl(params, &down_proj_key);
+                    let q_gate = try_build_qsl(params, &gate_proj_key)?;
+                    let q_up = try_build_qsl(params, &up_proj_key)?;
+                    let q_down = try_build_qsl(params, &down_proj_key)?;
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                         let quantized_switch = SwitchGLU::new_quantized(qg, qu, qd);
@@ -837,9 +858,9 @@ fn apply_weights_moe_inner(
                     let se_up_key = format!("{}.mlp.shared_expert.up_proj", prefix);
                     let se_down_key = format!("{}.mlp.shared_expert.down_proj", prefix);
 
-                    let q_se_gate = try_build_ql(params, &se_gate_key);
-                    let q_se_up = try_build_ql(params, &se_up_key);
-                    let q_se_down = try_build_ql(params, &se_down_key);
+                    let q_se_gate = try_build_ql(params, &se_gate_key)?;
+                    let q_se_up = try_build_ql(params, &se_up_key)?;
+                    let q_se_down = try_build_ql(params, &se_down_key)?;
 
                     if let (Some(qg), Some(qu), Some(qd)) = (q_se_gate, q_se_up, q_se_down) {
                         moe.set_quantized_shared_expert(qg, qu, qd);
@@ -856,7 +877,7 @@ fn apply_weights_moe_inner(
                     }
 
                     if let Some(ql) =
-                        try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))
+                        try_build_ql(params, &format!("{}.mlp.shared_expert_gate", prefix))?
                     {
                         moe.set_quantized_shared_expert_gate(ql);
                     } else if let Some(w) =
@@ -932,36 +953,50 @@ fn apply_weights_moe_inner(
     // decode. On an incomplete set, warn + disable MTP (leave
     // `mtp_weights_loaded = false`) rather than feeding garbage to the head.
     if inner.mtp.is_some() {
-        // Derive the expected MLP-key schema from the SAME flavor decision
-        // `Qwen3_5MoeMTPModule::new` uses (`is_moe_layer(fa_idx)`), NOT a
-        // hardcoded `Moe`. The MTP layer mirrors the main decoder at
-        // `fa_idx = full_attention_interval - 1`, so a dense-flavored MoE-MTP
-        // layer (sparse step not dividing the interval, or `fa_idx ∈
-        // mlp_only_layers`) emits dense `mlp.{gate,up,down}_proj` keys via
-        // `get_parameters`/`apply_weights`. Hardcoding `Moe` would demand
-        // `switch_mlp.* + mlp.gate`, flag the complete dense-flavored
-        // checkpoint as incomplete, and silently disable speculative MTP even
-        // though the flavor-aware `apply_weights` would have loaded it fine.
-        let body = super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(config);
-        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
-            params,
-            body,
-            config.n_mtp_layers,
-        );
-        if missing.is_empty() {
-            if let Some(mtp) = inner.mtp.as_mut() {
-                mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
-            }
-            inner.mtp_weights_loaded = true;
-        } else {
+        if checkpoint_has_sym8 {
+            // sym8 scope: MTP is OUT, mirroring the dense loader. mtp.rs's
+            // own `try_build_ql`/`try_build_qsl` closures have unwired
+            // `Sym8 => None` arms, so a sym8 MTP head cannot build — loading
+            // it would silently install nothing. Fail soft into plain AR
+            // decode, mirroring the missing-weights branch below.
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5-MoE config declares {} MTP layer(s), but MTP weights are incomplete; \
-                 disabling speculative MTP. Missing first entries: {:?} ({} total)",
-                config.n_mtp_layers,
-                &missing[..missing.len().min(12)],
-                missing.len()
+                "Qwen3.5-MoE: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on the sym8 (eager int8) path; disabling speculative MTP.",
+                config.n_mtp_layers
             );
+        } else {
+            // Derive the expected MLP-key schema from the SAME flavor decision
+            // `Qwen3_5MoeMTPModule::new` uses (`is_moe_layer(fa_idx)`), NOT a
+            // hardcoded `Moe`. The MTP layer mirrors the main decoder at
+            // `fa_idx = full_attention_interval - 1`, so a dense-flavored MoE-MTP
+            // layer (sparse step not dividing the interval, or `fa_idx ∈
+            // mlp_only_layers`) emits dense `mlp.{gate,up,down}_proj` keys via
+            // `get_parameters`/`apply_weights`. Hardcoding `Moe` would demand
+            // `switch_mlp.* + mlp.gate`, flag the complete dense-flavored
+            // checkpoint as incomplete, and silently disable speculative MTP even
+            // though the flavor-aware `apply_weights` would have loaded it fine.
+            let body = super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(config);
+            let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+                params,
+                body,
+                config.n_mtp_layers,
+            );
+            if missing.is_empty() {
+                if let Some(mtp) = inner.mtp.as_mut() {
+                    mtp.apply_weights(params, default_plq, default_gate_plq, per_layer_quant)?;
+                }
+                inner.mtp_weights_loaded = true;
+            } else {
+                inner.mtp_weights_loaded = false;
+                warn!(
+                    "Qwen3.5-MoE config declares {} MTP layer(s), but MTP weights are incomplete; \
+                     disabling speculative MTP. Missing first entries: {:?} ({} total)",
+                    config.n_mtp_layers,
+                    &missing[..missing.len().min(12)],
+                    missing.len()
+                );
+            }
         }
     }
 
@@ -1043,6 +1078,72 @@ fn apply_weights_moe_inner(
         total_weights
     );
     Ok(())
+}
+
+/// Load the vision encoder onto `inner` when the checkpoint ships one —
+/// unless the checkpoint is sym8.
+///
+/// sym8 v1 scope is TEXT-ONLY, mirroring the dense loader
+/// (`qwen3_5/persistence.rs`): the eager VLM prefill path is not wired for
+/// sym8 int8 operands, so an image turn would run bf16-shaped matmuls
+/// against the [N,K] int8 kernel weights and emit garbage. Under sym8
+/// (top-level default OR any per-layer override — the same trigger as the
+/// MTP-disable gate in `apply_weights_moe_inner`) the vision tower is
+/// stripped with a loud warn so image turns fail loud ("vision
+/// encoder/processor not loaded") instead.
+///
+/// Returns the retained `vision_params` (`None` under sym8) so the caller's
+/// weight-byte accounting only counts tensors that were actually installed.
+fn load_vision_encoder_moe(
+    inner: &mut Qwen35MoeInner,
+    vision_params: Option<HashMap<String, MxArray>>,
+    raw: &Value,
+    config: &Qwen3_5MoeConfig,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<Option<HashMap<String, MxArray>>> {
+    let vision_params = if has_sym8_mode(top_level_mode, per_layer_quant) {
+        if vision_params.is_some() {
+            warn!(
+                "Qwen3.5-MoE: sym8 checkpoint ships a vision tower, but sym8 \
+                 v1 is text-only — skipping vision encoder load (image turns \
+                 will be rejected)."
+            );
+        }
+        None
+    } else {
+        vision_params
+    };
+
+    if let Some(ref vparams) = vision_params {
+        let vision_config = parse_vision_config(raw);
+        info!(
+            "Vision config: {} layers, hidden={}, heads={}, patch={}",
+            vision_config.num_layers,
+            vision_config.hidden_size,
+            vision_config.num_heads,
+            vision_config.patch_size,
+        );
+
+        let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
+        load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
+
+        inner.init_mrope_layers(
+            vec![11, 11, 10],
+            config.rope_theta,
+            config.max_position_embeddings,
+        )?;
+
+        inner.set_vision_encoder(vision_encoder)?;
+        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+        inner.set_spatial_merge_size(vision_config.spatial_merge_size);
+
+        info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
+    } else {
+        info!("Qwen3.5 MoE model loaded successfully");
+    }
+
+    Ok(vision_params)
 }
 
 /// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
@@ -1287,34 +1388,17 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         inner.set_tokenizer(Arc::new(tok));
                     }
 
-                    // Load vision encoder if present
-                    if let Some(ref vparams) = vision_params {
-                        let vision_config = parse_vision_config(&raw);
-                        info!(
-                            "Vision config: {} layers, hidden={}, heads={}, patch={}",
-                            vision_config.num_layers,
-                            vision_config.hidden_size,
-                            vision_config.num_heads,
-                            vision_config.patch_size,
-                        );
-
-                        let mut vision_encoder = Qwen3_5VisionEncoder::new(vision_config.clone())?;
-                        load_vision_weights(&mut vision_encoder, vparams, &vision_config)?;
-
-                        inner.init_mrope_layers(
-                            vec![11, 11, 10],
-                            config.rope_theta,
-                            config.max_position_embeddings,
-                        )?;
-
-                        inner.set_vision_encoder(vision_encoder)?;
-                        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
-                        inner.set_spatial_merge_size(vision_config.spatial_merge_size);
-
-                        info!("Qwen3.5 MoE-VL model loaded successfully (with vision encoder)");
-                    } else {
-                        info!("Qwen3.5 MoE model loaded successfully");
-                    }
+                    // Load vision encoder if present. Under sym8 the vision
+                    // tower is stripped (loud warn) — sym8 v1 is text-only,
+                    // mirroring the dense loader.
+                    let vision_params = load_vision_encoder_moe(
+                        &mut inner,
+                        vision_params,
+                        &raw,
+                        &config,
+                        top_level_mode,
+                        &per_layer_quant,
+                    )?;
 
                     // Deterministic weight-byte total for the cache-limit
                     // coordinator. Includes text + vision weights when a
@@ -1593,8 +1677,9 @@ mod tests {
     }
 
     use super::{
-        DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MxArray, PerLayerMode, PerLayerQuant,
-        Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
+        AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MxArray, PerLayerMode,
+        PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
+        default_per_layer_quant, load_vision_encoder_moe,
     };
     use std::collections::HashMap;
 
@@ -1748,6 +1833,330 @@ mod tests {
         assert!(
             inner.embedding.is_packed_quantized(),
             "tied+quantized MoE embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
+        );
+    }
+
+    // ===== sym8 (per-output-channel symmetric int8) loader dispatch =====
+    //
+    // qwen3_5_moe's non-expert sublayers (attention q/k/v/o, GDN
+    // in_proj_qkvz/in_proj_ba/out_proj, shared-expert MLP body) reuse dense
+    // qwen3_5's LinearProj/QuantizedLinear machinery, so the sym8 int8 W8A8
+    // backend is family-agnostic. These tests pin the LOADER seam: a
+    // sym8-default checkpoint must install the raw int8 backend on non-expert
+    // linears, the per-expert switch_mlp gather path (no sym8 kernel) must
+    // fail loud on a sym8 override, and an MTP-capable sym8 checkpoint must
+    // load with the speculative MTP head disabled.
+
+    /// Flat (non-paged), tied, non-MTP tiny MoE config for the sym8 loader
+    /// tests. `full_attention_interval = 1` makes layer 0 Full attention and
+    /// `decoder_sparse_step = 1` makes it MoE; `hidden_size = num_heads *
+    /// head_dim = 64`, so q_proj's K = 64 satisfies the sym8 kernel's
+    /// K % 16 == 0 contract.
+    fn tiny_sym8_moe_cfg() -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 8,
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 256,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 1,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: None,
+            moe_intermediate_size: None,
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// Synthesize a well-formed sym8 group under `{base}.*`: int8 `[n,k]`
+    /// weight (values in [-127,127]) + positive f32 `[n]` scales. Mirrors the
+    /// dense/lfm2 sym8 test helper of the same name.
+    fn synth_sym8_group(p: &mut HashMap<String, MxArray>, base: &str, n: i64, k: i64) {
+        let q: Vec<f32> = (0..n * k).map(|i| ((i % 255) - 127) as f32).collect();
+        let w = MxArray::from_float32(&q, &[n, k])
+            .expect("from_float32")
+            .astype(DType::Int8)
+            .expect("astype int8");
+        let s: Vec<f32> = (0..n).map(|i| 0.001 + (i as f32) * 1e-4).collect();
+        p.insert(format!("{base}.weight"), w);
+        p.insert(
+            format!("{base}.scales"),
+            MxArray::from_float32(&s, &[n]).expect("scales"),
+        );
+    }
+
+    #[test]
+    fn sym8_default_installs_int8_backend_on_attention_q_proj() {
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[skip] sym8 MoE loader test: int8 kernels need an M5+ GPU (gen >= 17)");
+            return;
+        }
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // hidden_size=64, num_heads=4, head_dim=16 -> q_proj is [64, 64]; K=64
+        // satisfies the sym8 kernel's K % 16 == 0 contract.
+        synth_sym8_group(&mut params, "layers.0.self_attn.q_proj", 64, 64);
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+
+        // Mirrors what convert.rs actually emits for a real sym8 checkpoint:
+        // 3-D switch_mlp.* experts always get a forced affine-8 override.
+        let mut per_layer_quant = HashMap::new();
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            per_layer_quant.insert(
+                format!("layers.0.mlp.switch_mlp.{suffix}"),
+                default_per_layer_quant(8, 64, PerLayerMode::Affine),
+            );
+        }
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Sym8),
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("sym8-default checkpoint must load: attention is a non-expert sublayer");
+
+        match &inner.layers[0].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.get_q_proj_weight().dtype().unwrap(),
+                    DType::Int8,
+                    "q_proj must install the raw int8 sym8 backend, not affine-packed Uint32"
+                );
+            }
+            AttentionType::Linear(_) => {
+                panic!("tiny_sym8_moe_cfg (full_attention_interval=1) must assign Full attention")
+            }
+        }
+    }
+
+    #[test]
+    fn sym8_switch_mlp_expert_projection_fails_loud_never_silently_affine() {
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.mlp.switch_mlp.gate_proj.scales".to_string(),
+            MxArray::from_float32(&[0.0f32], &[1]).expect("scales placeholder"),
+        );
+
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.mlp.switch_mlp.gate_proj".to_string(),
+            default_per_layer_quant(8, -1, PerLayerMode::Sym8),
+        );
+
+        let err = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect_err("3-D stacked experts have no sym8 kernel; must fail loud");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("switch_mlp.gate_proj") && msg.contains("sym8"),
+            "error must name the expert projection and mention sym8, got: {msg}"
+        );
+    }
+
+    /// A sym8 checkpoint on an MTP-capable config must LOAD (the non-expert
+    /// sublayers dispatch sym8) but leave the speculative MTP head DISABLED:
+    /// mtp.rs's own builder closures have no sym8 wiring (`Sym8 => None`), so
+    /// without the call-site gate the head would silently install nothing.
+    /// Mirrors dense qwen3_5's MTP-disable-under-sym8 branch.
+    #[test]
+    fn sym8_checkpoint_disables_mtp_head_load() {
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[skip] sym8 MoE MTP-disable test: int8 kernels need an M5+ GPU (gen >= 17)");
+            return;
+        }
+        let config = Qwen3_5MoeConfig {
+            n_mtp_layers: 1,
+            ..tiny_sym8_moe_cfg()
+        };
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+        assert!(
+            inner.mtp.is_some(),
+            "config with n_mtp_layers=1 must construct the MTP module"
+        );
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        synth_sym8_group(&mut params, "layers.0.self_attn.q_proj", 64, 64);
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+
+        let mut per_layer_quant = HashMap::new();
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            per_layer_quant.insert(
+                format!("layers.0.mlp.switch_mlp.{suffix}"),
+                default_per_layer_quant(8, 64, PerLayerMode::Affine),
+            );
+        }
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Sym8),
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("sym8 MTP-capable checkpoint must still load (plain AR decode)");
+
+        assert!(
+            !inner.mtp_weights_loaded,
+            "sym8 checkpoint must disable the speculative MTP head load"
+        );
+        assert!(
+            !inner.has_mtp_weights(),
+            "has_mtp_weights() must report inactive under sym8"
+        );
+    }
+
+    /// A sym8 checkpoint that ships a vision tower must LOAD (text-only)
+    /// with the vision encoder NOT installed: the eager VLM prefill path is
+    /// not wired for sym8 int8 operands, so `load_vision_encoder_moe` strips
+    /// the vision params under sym8 (loud warn, image turns then fail loud
+    /// with "vision encoder/processor not loaded"). Mirrors dense qwen3_5's
+    /// vision-gate-under-sym8 branch.
+    #[test]
+    fn sym8_checkpoint_skips_vision_encoder_load() {
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17 {
+            eprintln!("[skip] sym8 MoE vision-gate test: int8 kernels need an M5+ GPU (gen >= 17)");
+            return;
+        }
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        synth_sym8_group(&mut params, "layers.0.self_attn.q_proj", 64, 64);
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+
+        let mut per_layer_quant = HashMap::new();
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            per_layer_quant.insert(
+                format!("layers.0.mlp.switch_mlp.{suffix}"),
+                default_per_layer_quant(8, 64, PerLayerMode::Affine),
+            );
+        }
+
+        // Text load succeeds under sym8 (has_vision mirrors the real loader,
+        // which passes true when the checkpoint ships vision tensors).
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Sym8),
+            &per_layer_quant,
+            /* has_vision */ true,
+        )
+        .expect("sym8 checkpoint with a vision tower must still load (text-only)");
+
+        // The checkpoint ships vision tensors; under sym8 the vision step
+        // must strip them WITHOUT erroring and WITHOUT installing the
+        // encoder (a real tower would need real weights — the gate must
+        // reject BEFORE any vision weight is read).
+        let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+        vision_params.insert(
+            "patch_embed.proj.weight".to_string(),
+            MxArray::from_float32(&[0.0f32], &[1]).expect("vision placeholder"),
+        );
+        let raw = serde_json::json!({});
+        let retained = load_vision_encoder_moe(
+            &mut inner,
+            Some(vision_params),
+            &raw,
+            &config,
+            Some(PerLayerMode::Sym8),
+            &per_layer_quant,
+        )
+        .expect("sym8 vision gate must fail soft (strip + warn), not error");
+
+        assert!(
+            retained.is_none(),
+            "sym8 must strip the vision params (weight-byte accounting must not count them)"
+        );
+        assert!(
+            inner.vision_encoder.is_none(),
+            "sym8 checkpoint must NOT install the vision encoder"
+        );
+        assert!(
+            inner.image_processor.is_none(),
+            "sym8 checkpoint must NOT install the image processor"
         );
     }
 }

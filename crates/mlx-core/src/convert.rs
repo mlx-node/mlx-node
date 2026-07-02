@@ -922,8 +922,12 @@ pub(crate) mod recipe {
         }
 
         fn sym8_supported(&self) -> bool {
-            // Dense qwen3_5 has a sym8 dispatch; qwen3_5_moe does not.
-            !self.is_moe
+            // Both dense qwen3_5 and qwen3_5_moe dispatch sym8. The MoE loader
+            // covers its non-expert sublayers (attention, GDN, shared-expert
+            // MLP body); 3-D stacked switch_mlp experts are forced to an
+            // affine-8 per-layer override by `sym8_eligible`, so the emitted
+            // checkpoint always loads back.
+            true
         }
 
         fn has_mtp(&self) -> MtpPolicy {
@@ -1548,7 +1552,7 @@ pub struct ConversionOptions {
     pub quant_group_size: Option<i32>,
 
     /// Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-    /// "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+    /// "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
     /// implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
     pub quant_mode: Option<String>,
 
@@ -1778,20 +1782,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // sym8 v1 dispatch exists in the dense qwen3_5, lfm2/lfm2_moe, and
-        // gemma4 loaders (2D linears only — 3D stacked experts are auto-forced
-        // to affine-8 below). qwen3_5_moe still rejects sym8 up front (its
-        // per-expert SwitchMLP/gather path has no sym8 dispatch), so allowing
-        // it here would emit checkpoints this package cannot load back.
+        // sym8 dispatch exists in the qwen3_5 (dense + MoE non-expert
+        // sublayers), lfm2/lfm2_moe, and gemma4 loaders (2D linears only —
+        // 3D stacked experts are auto-forced to affine-8 below, so
+        // qwen3_5_moe's per-expert SwitchMLP/gather path never sees sym8).
         let sym8_supported = model_type
             .as_deref()
             .and_then(recipe::recipe_for)
             .is_some_and(|r| r.sym8_supported());
         if !sym8_supported {
             return Err(Error::from_reason(format!(
-                "sym8 is currently supported for model types qwen3_5 (dense), \
-                 lfm2, lfm2_moe, and gemma4 only (got {:?}); other families' \
-                 loaders have no sym8 dispatch",
+                "sym8 is currently supported for model types qwen3_5, \
+                 qwen3_5_moe, lfm2, lfm2_moe, and gemma4 only (got {:?}); \
+                 other families' loaders have no sym8 dispatch",
                 model_type.as_deref()
             )));
         }
@@ -5625,13 +5628,15 @@ mod tests {
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
-            // sym8_supported == old sym8 allowlist (NOTE qwen3_5_moe excluded).
-            // gemma4_unified routes to Gemma4Recipe and supports sym8 like gemma4.
+            // sym8_supported allowlist: qwen3_5 (dense + MoE), lfm2/lfm2_moe,
+            // gemma4. gemma4_unified routes to Gemma4Recipe and supports sym8
+            // like gemma4. qwen3_5_moe dispatches sym8 on its non-expert
+            // sublayers (3-D stacked experts stay convert-forced affine-8).
             assert_eq!(
                 r.sym8_supported(),
                 matches!(
                     mt,
-                    "qwen3_5" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
+                    "qwen3_5" | "qwen3_5_moe" | "lfm2" | "lfm2_moe" | "gemma4" | "gemma4_unified"
                 ),
                 "{mt}: sym8_supported mismatch vs inline sym8 allowlist"
             );
@@ -5668,10 +5673,11 @@ mod tests {
         // unrecognized model_type's flags as false then errors at dispatch).
         assert!(recipe::recipe_for("not-a-real-model").is_none());
 
-        // qwen3_5 vs qwen3_5_moe sym8 asymmetry is the subtle case: same recipe
-        // family, opposite sym8 support.
+        // qwen3_5 and qwen3_5_moe share the recipe family and BOTH support
+        // sym8: the MoE loader dispatches sym8 on its non-expert sublayers,
+        // while per-expert switch_mlp tensors stay convert-forced affine-8.
         assert!(recipe::recipe_for("qwen3_5").unwrap().sym8_supported());
-        assert!(!recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
+        assert!(recipe::recipe_for("qwen3_5_moe").unwrap().sym8_supported());
     }
 
     /// Byte-faithfulness gate for `Gemma4Recipe::sanitize`. Builds a tiny
