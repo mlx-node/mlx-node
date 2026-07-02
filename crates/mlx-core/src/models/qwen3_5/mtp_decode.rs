@@ -154,7 +154,7 @@ const CHAINED_CYCLES_MIN_GPU_GEN: i32 = 17;
 // Once MTP caches use committed-history and the verifier exports
 // `verify_hidden[K]`, chaining avoids paying the Step-A target forward at the
 // start of every speculative cycle. That hidden slice is fused into the same
-// `async_eval` batch as `(token, g_compiled_caches)` at end-of-iteration (see
+// `async_eval` batch as `(token, main layer caches)` at end-of-iteration (see
 // the `eval_step_with_chained_hidden` stepper hook) so the slice becomes a sibling
 // of the next-cycle draft's first inputs rather than a late dependency
 // materialized inside the draft graph build.
@@ -426,11 +426,13 @@ pub(crate) fn mtp_batch_target_arrays_enabled() -> bool {
 
 // Native stochastic verifier sparse-target output.
 //
-// This is an opt-out gate for the dense Qwen compiled path. When the sampler is
-// in MTPLX parity mode, the verifier can return compact
-// `[depth+1, top_k]` target ids/probabilities directly from the native graph
-// instead of surfacing full `[1, depth+1, vocab]` logits and rebuilding the same
-// sparse rows on the Rust side.
+// This is an opt-out gate for the native sparse-verify fast path
+// (`MtpStepper::verify_step_sparse`). When the sampler is in MTPLX parity
+// mode, such a verifier can return compact `[depth+1, top_k]` target
+// ids/probabilities directly from the native graph instead of surfacing full
+// `[1, depth+1, vocab]` logits and rebuilding the same sparse rows on the
+// Rust side. No eager stepper implements `verify_step_sparse` today, so the
+// gate is currently inert; kept for a future native sparse verifier.
 pub(crate) fn mtp_native_sparse_verify_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| match std::env::var("MLX_MTP_NATIVE_SPARSE_VERIFY") {
@@ -727,8 +729,8 @@ pub(crate) fn trace_acceptance_dense(
 // The qwen3_5 dense/MoE whole-turn cores behind the engine's `mtp_turn` /
 // `vision_turn` probes (`vision_mtp_whole_turn_core` and the delta/streaming
 // twins in `models/qwen3_5/model.rs` and `models/qwen3_5_moe/model.rs`) invoke
-// `decode_loop!` for their AR arms (MTP compiled-init failure → AR decode;
-// vision turns; the MTP-ineligible delta shapes). The MTP propose/verify loop
+// `decode_loop!` for their AR arms (plain AR turns; vision turns;
+// the MTP-ineligible delta shapes). The MTP propose/verify loop
 // those cores interleave with now lives in `crate::engine::mtp_turn`, so the
 // AR macro lives HERE next to the MTP draft/verify helpers it shares.
 // =============================================================================

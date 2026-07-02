@@ -1380,11 +1380,9 @@ fn apply_weights_inner(
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        // sym8 v1 scope: MTP is OUT. The sym8 compiled coverage is the FLAT
-        // decode only (`qwen35_decode_fn`, atomic eager C++); the MTP
-        // draft/verify graphs are `mlx::core::compile`d and the sym8 custom
-        // Metal kernels are unproven inside a compile trace. Loading the MTP
-        // head through the affine builders would also mis-pack int8 tensors —
+        // sym8 v1 scope: MTP is OUT. The MTP quant builders carry no sym8 arm
+        // (`mtp.rs` maps `PerLayerMode::Sym8 => None`), and loading the MTP
+        // head through the affine builders would mis-pack int8 tensors —
         // skip the load and fail soft into plain AR decode, mirroring the
         // missing-weights branch.
         if has_sym8_mode(top_level_mode, per_layer_quant) {
@@ -1646,20 +1644,21 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     parse_quant_block(quant_cfg, quant_group_size);
                 augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant);
 
-                // sym8 v1 scope: the compiled C++ path covers the FLAT decode
-                // only (`qwen35_decode_fn` — atomic eager C++, no
-                // `mlx::core::compile`). The block-paged decode graph IS
-                // `mlx::core::compile`d, and the sym8 custom Metal kernels are
-                // unproven inside a compile trace — force the flat path so a
+                // sym8 v1 scope: sym8 is only validated on the dense FLAT
+                // (eager int8) decode path. Dense paged decode is pure-Rust
+                // eager too, but sym8 under it is simply UNVALIDATED — the pin
+                // is retained conservatively, forcing the flat path so a
                 // paged-opt-in config (or MLX_QWEN35_PAGED_OVERRIDE=1) cannot
-                // route sym8 through it.
+                // route sym8 through it. (MoE and gemma4 already ship sym8
+                // under paged decode, so lifting this pin is a plausible
+                // follow-up — a behavior decision, not made here.)
                 if has_sym8_mode(top_level_mode, &per_layer_quant)
                     && config.use_block_paged_cache == Some(true)
                 {
                     warn!(
                         "Qwen3.5: sym8 checkpoint requested block-paged KV cache; \
-                         the sym8 compiled path is flat-only — forcing \
-                         use_block_paged_cache=false."
+                         sym8 is validated on the flat (eager int8) path only — \
+                         forcing use_block_paged_cache=false."
                     );
                     config.use_block_paged_cache = Some(false);
                 }
@@ -1974,8 +1973,8 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
             .map(|v| v as u32),
         // Stage 1 (MTP-paged enablement): we do NOT auto-flip
         // `use_block_paged_cache` based on `n_mtp_layers > 0`. The
-        // Stage 1 hot path still runs the dense compiled MTP cycle
-        // (verify reads from `g_compiled_caches`, not the paged pool),
+        // default MTP hot path still runs the FLAT eager MTP cycle
+        // (verify reads the flat Rust layer caches, not the paged pool),
         // so eagerly constructing the paged adapter on every MTP-
         // capable checkpoint adds ~256 MB of unused GPU memory pressure
         // AND (more importantly) silently routes pure-AR turns on the

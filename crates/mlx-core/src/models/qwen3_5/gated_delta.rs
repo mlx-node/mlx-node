@@ -25,8 +25,8 @@ const CHUNK_THRESHOLD: i64 = 64;
 /// chunked Metal kernel (`gated_delta_chunked.metal.inc`) is pure scalar-FMA + `simd_sum`
 /// reductions with ZERO `simdgroup_matrix` / NAX matmul, so it never had a tensor-core
 /// advantage. The gen gate was a stale inversion of an old M3 result that was never A/B'd on
-/// M5; it is removed. Per-step is already the canonical path on M1–M4, for all `seq < 64`, all
-/// masked GDN calls, and every compiled-C++ prefill path — so per-step is the de-facto
+/// M5; it is removed. Per-step is already the canonical path on M1–M4, for all `seq < 64`, and
+/// all masked GDN calls — so per-step is the de-facto
 /// reference everywhere.
 ///
 /// Chunked is retained behind `MLX_GDN_KERNEL=chunked` for A/B and bring-up only. NOTE: the two

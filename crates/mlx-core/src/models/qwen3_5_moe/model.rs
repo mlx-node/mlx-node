@@ -2400,7 +2400,8 @@ impl Qwen35MoeInner {
         // `update_keys_values` per layer (Metal kernel dispatch — direct
         // buffer mutation, NOT MLX graph) and populates the GDN linear
         // caches in `Qwen3_5LayerCache::Linear(ArraysCache)`. Both are
-        // exactly what the C++ compiled paged decode reads as inputs.
+        // exactly what the pure-Rust paged decode steps
+        // (`paged_forward::run_paged_decode_step`) read as inputs.
         let last_logits = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
@@ -2517,8 +2518,9 @@ impl Qwen35MoeInner {
 
     /// Block-paged streaming variant for MoE — mirrors dense
     /// `paged_turn_stream_core`. See [`Self::paged_turn_sync_core`]
-    /// for the C++ compiled paged dispatch rationale; the streaming path
-    /// uses the same lock acquisition + fall-back semantics.
+    /// for the paged dispatch rationale (pure-Rust paged prefill + decode
+    /// against the adapter pool); the streaming path uses the same
+    /// adapter lifecycle + prefix-reuse semantics.
     #[allow(clippy::too_many_arguments)]
     fn paged_turn_stream_core(
         &mut self,

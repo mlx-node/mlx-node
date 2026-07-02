@@ -89,11 +89,10 @@ struct PagedAttentionInputs {
 // NA int8 W8A8 lazy graph builders (defined in mlx_na_int8.cpp).
 //
 // External-linkage C++ entry points for the sym8 (per-output-channel symmetric
-// int8) linear path, so the compiled C++ forwards (mlx_qwen35_common.h
-// `linear_proj`) can emit the SAME graph nodes the eager Rust
-// `QuantizedLinear::forward_sym8` emits via the `mlx_w8a8_linear` /
-// `mlx_int8_qmv` FFI wrappers (the wrappers now delegate to these). Keeping a
-// single definition is what makes compiled-vs-eager sym8 decode byte-identical.
+// int8) linear path. The eager Rust `QuantizedLinear::forward_sym8` emits
+// these graphs via the `mlx_w8a8_linear` / `mlx_int8_qmv` FFI wrappers, which
+// delegate to these builders. Keeping the math in ONE definition means every
+// consumer emits byte-identical graph nodes for the same inputs.
 //
 // Contract (both):
 //   x    : [M,K] activations (bf16; non-bf16 defensively cast)
@@ -111,7 +110,7 @@ struct PagedAttentionInputs {
 // qmv_w8a16_lazy takes BOTH weight orientations: w_kn [K,N] (the GEMM operand,
 // consumed by the 2D-block fallback under INT8_QMV16_SG=0 and the W8A8
 // reroute) and w_nk [N,K] (the CHECKPOINT orientation, consumed by the default
-// simd_sum-style kernel — buffer-shared with the registry/params tensor).
+// simd_sum-style kernel — buffer-shared with the params tensor).
 // =============================================================================
 namespace na_int8 {
 mlx::core::array w8a8_linear_lazy(const mlx::core::array& x,

@@ -732,7 +732,7 @@ fn chat_turn_core<B: ChatBackend>(
             total_seq_len: tokens.len(),
         };
         let mut step = backend.begin_decode(&turn_setup)?;
-        // Decode-path relabel (compiled/eager) — see
+        // Decode-path relabel — see
         // `DecodeStep::profiler_relabel`.
         if let Some(label) = step.profiler_relabel() {
             profiler.set_label(label);
@@ -787,10 +787,11 @@ fn chat_turn_core<B: ChatBackend>(
         {
             step.materialize_final(last_token)?;
         }
-        // Fallible post-loop hook (compiled-path export). Runs while the
-        // stepper (and its lock/reset guards) is still alive, BEFORE
+        // Fallible post-loop hook (currently a no-op for every family —
+        // see `DecodeStep::end_decode`). Runs while the
+        // stepper (and any guards it holds) is still alive, BEFORE
         // `save_cache_state` below. On Err the turn aborts here: the
-        // stepper drops (reset guards fire) and NO session state is
+        // stepper drops (its guards fire) and NO session state is
         // saved.
         step.end_decode()?;
     }

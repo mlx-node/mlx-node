@@ -185,8 +185,8 @@ pub fn int8_w8a8_qmv(x: &MxArray, w_i8: &MxArray, s_w: &MxArray) -> Result<MxArr
 /// streams `[N,K]` row-major like MLX's affine qmv; the eager layer passes
 /// its stored checkpoint weight, so this is buffer-shared, not a copy);
 /// `s_w` f32 `[N]`. The result is **lazy** and narrowed to bf16 inside the
-/// kernel. `INT8_QMV_W8A16=0` (read inside the shared C++ builder, so eager
-/// and compiled stay byte-identical) reroutes back to the W8A8 qmv for
+/// kernel. `INT8_QMV_W8A16=0` (read inside the shared C++ builder, so every
+/// caller sees one dispatch rule) reroutes back to the W8A8 qmv for
 /// same-binary A/B. Returns `Err` when unsupported (gen < 17 or
 /// `K % 16 != 0`) or on a kernel/FFI failure.
 pub fn int8_w8a16_qmv(

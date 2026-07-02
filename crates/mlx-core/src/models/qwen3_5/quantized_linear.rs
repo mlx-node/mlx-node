@@ -486,7 +486,7 @@ impl QuantizedLinear {
     /// `M >= 3` → [`int8_gemm::int8_w8a8_matmul`] (the W8A8 prefill GEMM —
     /// act quant amortizes at prefill M). The only env gate is the
     /// same-binary A/B escape hatch `INT8_QMV_W8A16=0` (read inside the
-    /// shared C++ builder, so eager and compiled stay byte-identical) which
+    /// shared C++ builder, so every caller sees one dispatch rule) which
     /// reroutes decode back to the W8A8 qmv. Fail-loud on kernel error
     /// (there is no affine pack to fall back to).
     fn forward_sym8(&self, x: &MxArray) -> Result<MxArray> {

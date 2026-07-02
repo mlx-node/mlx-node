@@ -2101,7 +2101,8 @@ impl Gemma4Inner {
         // Gemma4's forward runs entirely through primitive-op FFI that takes
         // weight arrays by POINTER (from this Rust `inner`/`params`), so there
         // is no process-global weight table to populate and nothing to register
-        // here. `inner.model_id` (drawn from `QWEN35_MODEL_ID_COUNTER`) is a
+        // here. `inner.model_id` (drawn from gemma4's private `MODEL_ID_COUNTER`
+        // in `model.rs`) is a
         // purely local per-instance handle surfaced to NAPI; it is not a
         // routing key and never leaves this process state.
 

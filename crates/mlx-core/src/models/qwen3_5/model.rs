@@ -55,14 +55,12 @@ pub(crate) struct VisionCacheInner {
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 
-// The shared model-id counter lives in `crate::engine::compiled_lock` (the
-// family-neutral home for the C++ compiled-registry contract). Re-exported here
-// for unqualified internal use across the dense + MoE forward code.
+// The shared model-id counter lives in `crate::engine::compiled_lock` so the
+// dense + MoE families draw from one id space (per-instance ids never
+// overlap). Re-exported here for unqualified use by this module's
+// `Qwen35Inner::new`; MoE imports it from `crate::engine::compiled_lock`
+// directly.
 pub(crate) use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
-
-// The process-wide compiled-path locks live in `crate::engine::compiled_lock`;
-// imported here for unqualified internal use (no re-export — external consumers
-// import them from `crate::engine::compiled_lock`).
 
 fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
     (0..config.num_layers as usize)
@@ -268,8 +266,8 @@ pub(crate) struct Qwen35Inner {
     /// `Some(...)`, full-attention layers route through this adapter
     /// while linear-attention (GDN) layers stay on
     /// `Qwen3_5LayerCache::Linear` with no cross-request prefix reuse.
-    /// The compiled C++ forward path is bypassed entirely on the paged
-    /// path.
+    /// Paged turns run the pure-Rust eager paged forward
+    /// (`paged_forward::run_paged_prefill_chunk` / `run_paged_decode_step`).
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention
@@ -304,7 +302,7 @@ pub(crate) struct Qwen35Inner {
     /// Whether the CURRENT generic-flow turn is streaming. Set by the
     /// [`ChatBackend::profiler_label`] hook (the session core calls it
     /// exactly once per generic-flow turn, before `begin_decode`);
-    /// consumed by [`ChatBackend::begin_decode`]'s compiled/eager
+    /// consumed by [`ChatBackend::begin_decode`]'s
     /// profiler relabel, which must pick the `chat_*` vs `chat_stream_*`
     /// label family (`TurnSetup` does not carry streaming-ness).
     /// Whole-turn override paths (vision/paged/MTP) never consult it.
@@ -532,8 +530,8 @@ pub(crate) struct ChatDecodeInputs {
     /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
     /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran
     /// the hidden-emitting `chunked_prefill_with_hidden`. Consumed once,
-    /// after `init_mtp_compiled_from_main`, to commit the prompt prefix
-    /// into the MTP committed-history cache via `prefill_mtp_commit`.
+    /// by `begin_mtp_decode`'s prompt-prefix seed, to commit the prompt
+    /// prefix into the MTP committed-history cache.
     /// `None` for non-MTP turns and for the streaming/delta paths.
     pub prompt_hidden: Option<MxArray>,
     /// The exact prompt token ids whose hiddens `prompt_hidden` holds —
@@ -1873,8 +1871,8 @@ impl Qwen35Inner {
         })
     }
 
-    /// Shared post-prefill pipeline: penalty → sample → compiled init (if needed)
-    /// → decode loop → cache export → save cache state → finalize result.
+    /// Shared post-prefill pipeline: penalty → sample → decode loop (eager
+    /// MTP or AR) → save cache state → finalize result.
     ///
     /// Extracted from `vision_mtp_whole_turn_core` so it can also be driven by the text-only
     /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
@@ -2290,8 +2288,8 @@ impl Qwen35Inner {
     ///   fall back to GDN replay from token 0.
     /// * Pure-cache prompt (every prompt token already in the paged
     ///   pool) is rejected — same caveat as LFM2 / Qwen3 paged paths.
-    /// * The compiled C++ forward path is bypassed — paged turns run
-    ///   the pure-Rust `DecoderLayer::forward_paged_or_flat`.
+    /// * Paged turns run the pure-Rust
+    ///   `DecoderLayer::forward_paged_or_flat`.
     fn paged_turn_sync_core(
         &mut self,
         tokens: Vec<u32>,
@@ -2585,8 +2583,9 @@ impl Qwen35Inner {
 
         // Paged prompt-prefix MTP prefill. Mirrors the dense gate's
         // `want_prompt_hidden` predicate. Capturing the post-`final_norm`
-        // hidden for every prompt token lets the paged-MTP gate seed
-        // `g_mtp_committed_len = N` via `prefill_mtp_commit` before cycle 1, so
+        // hidden for every prompt token lets `begin_mtp_decode`'s
+        // prompt-prefix seed commit the full prompt (advancing the stepper's
+        // `committed_len` to N) before cycle 1, so
         // MTP drafts attend over the prompt (matches the dense MTP path). The
         // `cached_prefix_len == 0` clause matches dense: on a cache-reuse turn
         // the suffix-only prefill cannot produce the full prompt's hidden
@@ -2754,7 +2753,7 @@ impl Qwen35Inner {
             let _ = outcome.last_in_cache;
 
             // `self.caches` already holds the live GDN state (the eager paged
-            // forwards wrote it directly) — no compiled cache export needed.
+            // forwards wrote it directly) — nothing to export.
             return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
 
@@ -3887,10 +3886,11 @@ impl Qwen35Inner {
     /// [`Self::paged_turn_stream_core`]. Mirrors LFM2's
     /// `paged_turn_stream_core_inner`.
     ///
-    /// Uses a C++ compiled paged decode dispatcher when
-    /// `use_cpp_paged` is true. See the sync sibling
-    /// `paged_turn_sync_core_inner` for the cpp_session_ready gate
-    /// rationale.
+    /// Runs the pure-Rust paged path — same dispatch as the sync sibling
+    /// `paged_turn_sync_core_inner`: prefill populates the GDN linear
+    /// caches and writes K/V into the adapter pool, then decode steps run
+    /// through `paged_forward::run_paged_decode_step` (or the eager paged
+    /// MTP arm when the MTP gate holds).
     #[allow(clippy::too_many_arguments)]
     fn paged_turn_stream_core_inner<'a>(
         &mut self,
@@ -4241,9 +4241,8 @@ impl Qwen35Inner {
         };
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // Paged streaming path does not carry an MTP gate;
-        // MTP-on-paged streams continue to fall through to the dense
-        // compiled streaming path. Non-MTP paged streams take the paged
+        // MTP-on-paged delta streams fall through to the dense (flat)
+        // streaming path; non-MTP paged streams take the paged
         // streaming core.
         let mtp_takes_dense_path =
             p.enable_mtp && self.has_mtp_weights() && self.paged_adapter.is_some();
@@ -6522,15 +6521,13 @@ impl StreamSender<'_> {
     }
 }
 
-/// Paged decode stepper for qwen3_5 dense (compiled-paged hybrid — the paged
-/// analog of the FLAT [`Qwen35Decode`]). Drives
+/// Paged decode stepper for qwen3_5 dense (the paged analog of the FLAT
+/// [`Qwen35Decode`]). Drives
 /// [`crate::engine::decode::run_decode_loop`] through the generic
 /// [`crate::engine::paged_turn::run_paged_turn`]: each `forward` runs the
-/// compiled C++ paged step when seeded, else the pure-Rust eager paged step.
-/// Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode` (which armed
-/// the guards + seeded the C++ paged session), consumed across the whole decode
-/// loop, dropped at loop exit (the `CompiledResetGuard` resets the C++ paged
-/// globals on EVERY exit path).
+/// pure-Rust eager paged step against the live post-prefill adapter pools +
+/// GDN caches. Created by `<Qwen35Inner as PagedBackend>::begin_paged_decode`,
+/// consumed across the whole decode loop.
 pub(crate) struct Qwen35PagedDecode<'a> {
     inner: &'a mut Qwen35Inner,
 }
@@ -6590,7 +6587,7 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
     }
 
     fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token`: the compiled-paged forward
+        // Single SYNCHRONOUS eval of `next_token`: the paged forward
         // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
         // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
         // is the cheapest correct cadence.
@@ -6858,8 +6855,8 @@ impl PagedBackend for Qwen35Inner {
     }
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
-        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT the
-        // per-turn `generation_stream`. dense's compiled forward + every
+        // Run the paged DECODE on the canonical DEFAULT stream, NOT the
+        // per-turn `generation_stream`. dense's paged forward + every
         // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
         // queue separate from the shared loop's top-of-iteration `y.eval()`
         // (always on the default stream) would force a cross-queue
@@ -6975,9 +6972,10 @@ impl Qwen35Inner {
     /// [`Self::chat_stream_sync_inner`], delta streaming →
     /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every dense-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (compiled-init fallback to
-    /// AR), the MTP-on-paged `mtp_takes_dense_path` release/rebuild
-    /// dance, and the paged-text-only rejection for image turns.
+    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back to
+    /// AR when ineligible), the MTP-on-paged `mtp_takes_dense_path`
+    /// release/rebuild dance, and the paged-text-only rejection for
+    /// image turns.
     ///
     /// Delta turns recover the raw delta from the engine-composed
     /// `args.tokens` (`cached_history + delta` by construction — the
@@ -7043,8 +7041,8 @@ impl Qwen35Inner {
     ///   * MTP turns (`enable_mtp && has_mtp_weights`) take the native
     ///     paged-MTP path. The streaming-MTP probe declined earlier
     ///     (routed to `mtp_turn` → `dense_whole_turn`), so only SYNC reaches
-    ///     here with MTP on; `paged_turn_sync_core` self-handles the
-    ///     compiled-availability check + MTP gate + silent AR fallback. The
+    ///     here with MTP on; `paged_turn_sync_core` self-handles the MTP
+    ///     gate (the eager paged MTP arm, with AR fallback). The
     ///     `(sink, cancelled)` match is preserved so any future MTP-stream
     ///     entry still finds its dispatch target.
     ///   * NON-MTP turns (sync or stream) → the new generic AR+paged path via
@@ -7109,10 +7107,7 @@ impl Qwen35Inner {
 /// non-paged, non-MTP) flow on Qwen3.5 dense
 /// ([`ChatBackend::begin_decode`]).
 ///
-/// Carries the compiled-vs-eager dispatch: the compiled arm drives
-/// `forward_compiled` against the C++ graph seeded by `begin_decode`,
-/// the eager arm drives the pure-Rust `forward_inner` over the flat
-/// caches.
+/// Drives the pure-Rust eager `forward_inner` over the flat caches.
 pub(crate) struct Qwen35Decode<'a> {
     inner: &'a mut Qwen35Inner,
     embedding_weight: MxArray,
@@ -7260,8 +7255,8 @@ impl MtpStepper for DenseMtpStepper<'_> {
 
     // Step A main forward: eager pre-norm + final-norm + project. Returns
     // `hidden` shaped `[1, hidden]` (squeeze the time axis) to match the
-    // compiled contract; `logits` stays `[1, 1, vocab]` with
-    // `needs_squeeze = true`.
+    // [`MtpStepper::forward_with_hidden`] contract; `logits` stays
+    // `[1, 1, vocab]` with `needs_squeeze = true`.
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
@@ -7761,8 +7756,8 @@ impl MtpBackend for Qwen35Inner {
             layer_kinds,
         };
 
-        // Prompt-prefix seed (v2 committed-history only). Mirror the compiled
-        // `prefill_mtp_commit`: commit the contiguous run
+        // Prompt-prefix seed (v2 committed-history only): commit the
+        // contiguous run
         // `[prompt_hidden_ids[1..], y]` (length P, token 0 skipped, the first
         // sampled token `y` appended) into the persistent MTP cache so the
         // drafter attends the prompt from cycle 1. Each committed token `x` is
@@ -8114,8 +8109,9 @@ impl ChatBackend for Qwen35Inner {
 
     fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         // `p.enable_mtp && has_mtp_weights` turns run the dense cores whose
-        // internal MTP gate does the compiled-availability check,
-        // `init_mtp_compiled…`, and the silent AR fallback on init failure.
+        // internal MTP gate drives the eager MTP turn
+        // (`engine::mtp_turn::run_mtp_turn`) and falls back to plain AR
+        // decode when MTP is ineligible for the turn shape.
         // Everything beyond this entry condition stays inside those cores.
         if !(args.params.enable_mtp && self.has_mtp_weights()) {
             return None;
@@ -8795,7 +8791,7 @@ fn project_logits_from_hidden(
 
 /// Eager (pure-Rust) MTP verify step.
 ///
-/// Translation of the compiled `forward_mtp_verify_compiled_with_hidden`
+/// Translation of the deleted compiled `forward_mtp_verify_compiled_with_hidden`
 /// FFI: runs the `verify_ids` (`[1, K+1]` int32) through the SAME main-model
 /// stack the AR path uses (`forward_pre_norm_inner` + `final_norm` +
 /// `project_logits_from_hidden`), advancing `inner.caches` by `K+1` positions.

@@ -456,14 +456,15 @@ pub(crate) fn run_paged_vlm_prefill(
 ///
 /// Mirror of `chunked_prefill_with_hidden` (dense / flat path). The
 /// paged-MTP gate inside `paged_turn_sync_core_inner` consumes this so
-/// `prefill_mtp_commit` can seed `g_mtp_committed_len = N` before the
+/// `begin_mtp_decode`'s prompt-prefix seed can commit the full prompt
+/// (advancing the stepper's `committed_len` to N) before the
 /// first MTP cycle — without it the MTP draft attends over a
 /// prompt-less context and parity vs the AR run breaks.
 ///
 /// Caller MUST gate on `cached_prefix_len == 0` (the dense gate uses
 /// the same `want_prompt_hidden` predicate). On a cache-reuse turn the
 /// prefill only processes the suffix, so the captured hidden would not
-/// cover the full prompt and `prefill_mtp_commit` cannot use it.
+/// cover the full prompt and the prompt-prefix seed cannot use it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_chunk_with_hidden(
     full_tokens: &[u32],
@@ -939,9 +940,9 @@ pub(crate) fn run_paged_decode_step(
 /// Routes full-attention layers through the paged adapter (writing one new K/V
 /// slot into the pool, attending over `read_kv_range(0, total_ctx)`) and GDN
 /// layers through the flat `Qwen3_5LayerCache::Linear` slots in `caches`, the
-/// same split `run_paged_decode_step` uses. The eager analogue of the compiled
-/// `forward_with_hidden` closure that calls `forward_dense_cpp_paged` +
-/// `export_last_hidden_paged`.
+/// same split `run_paged_decode_step` uses. The eager analogue of the deleted
+/// compiled `forward_with_hidden` closure that called `forward_dense_cpp_paged`
+/// + `export_last_hidden_paged`.
 ///
 /// Returns `(logits [1, 1, vocab], hidden [1, hidden])`. The hidden is squeezed
 /// on the time axis to match the eager-flat MTP `forward_with_hidden` contract
@@ -1025,7 +1026,7 @@ pub(crate) fn run_paged_step_with_hidden(
 /// at every verify position, recording the per-layer GDN tape for the rollback
 /// replay.
 ///
-/// The eager analogue of the compiled `forward_mtp_verify_paged` FFI. The
+/// The eager analogue of the deleted compiled `forward_mtp_verify_paged` FFI. The
 /// `verify_ids` (`[1, K+1]` int32) are recorded into the adapter in ONE
 /// `record_tokens` call (so the new K/V land at logical positions
 /// `[ctx, ctx+K]`), then run through every layer: full-attention via the paged

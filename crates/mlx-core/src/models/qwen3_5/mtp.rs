@@ -237,8 +237,8 @@ impl Qwen3_5MTPModule {
                     try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
                 }
                 // Unreachable in practice: `apply_weights_inner` skips the MTP
-                // load entirely for sym8 checkpoints (MTP needs the compiled
-                // verify path, which sym8 disables). `None` here keeps the
+                // load entirely for sym8 checkpoints (the dense loader
+                // disables speculative MTP under sym8). `None` here keeps the
                 // exhaustive match honest without silently mis-packing.
                 PerLayerMode::Sym8 => None,
             }

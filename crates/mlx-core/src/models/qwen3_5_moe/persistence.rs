@@ -178,19 +178,19 @@ fn sanitize_weights(
 
         // MTP *non-expert* weights bypass the +1.0 norm shift and stay in final
         // MTPLX form (norms, fc, attn, shared-expert, router gate are consumed
-        // as-is by both the MTP module and the compiled MTP graph). MTP
+        // as-is by the MTP module). MTP
         // *expert* weights (`mtp.*.mlp.experts.*`), however, must be normalized
         // identically to the main namespace — fused gate_up split, experts ->
-        // switch_mlp rename, per-expert stacking — so the compiled MoE-MTP path's
-        // `switch_mlp.*` 3D-transpose lookups resolve (they otherwise throw
-        // "MTP 3D transpose not found"). Those weights fall through to the shared
+        // switch_mlp rename, per-expert stacking — so the MoE-MTP head's
+        // `switch_mlp.*` stacked-expert lookups resolve like the main
+        // namespace's. Those weights fall through to the shared
         // expert-normalization paths below, which are prefix-safe. Only the
         // conv1d transpose still applies to the bypassed weights — defensive,
         // MTP layers reuse the main DecoderLayer architecture which includes
         // conv1d.
         //
         // MoE-MTP IS functional once the MTP norms are in final (+1.0-shifted)
-        // form: on a `mlx convert`-ed checkpoint the compiled draft head drafts
+        // form: on a `mlx convert`-ed checkpoint the MTP draft head drafts
         // ~2-2.25 tokens/cycle and is a ~1.25x win at the default depth 1 (proven
         // 2026-06-01, byte-identical to AR). The earlier "0-accept draft-head bug"
         // was REFUTED — it was a raw-checkpoint artifact: the loader shifts MAIN
@@ -1340,9 +1340,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             // deterministic weight-byte footprint for the cache-limit
             // coordinator. No process-wide active-memory sampling —
             // the sum of `params.values().nbytes()` is race-free and
-            // deterministic. Caveat: the MoE transpose cache
-            // `g_weight_transposes_3d` is built lazily on the FIRST
-            // compiled prefill, not at load time — the coordinator's
+            // deterministic. Caveat: post-load lazy growth (the warmup
+            // forward pass and any lazy scratch) lands after this
+            // measurement — the coordinator's
             // 1.75x multiplier adds ~75% slack to cover that post-load
             // growth without needing runtime measurements. See
             // `cache_limit.rs` module docs.

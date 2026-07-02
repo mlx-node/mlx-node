@@ -6,12 +6,17 @@
 // Kernel names + threadgroup-memory math + V1/V2 selection mirror the
 // Rust dispatcher in `crates/mlx-paged-attn/src/metal/{state,
 // reshape_and_cache, paged_attention}.rs`. The Rust dispatcher remains
-// in place: it is the active production paged path for Qwen3, LFM2, and
-// Gemma4 (whose paged forward goes through `PagedKVCacheAdapter` →
-// `LayerKVPool` → Rust `dispatch_*`, NOT these C++ Custom primitives).
-// The C++ port here is exclusively for the compile-traceable primitives
-// used inside the Qwen3.5 dense / MoE C++ compile graphs
-// (`mlx_qwen35_init_paged` / `mlx_qwen35_moe_init_paged`).
+// in place as the synchronous fallback path: the adapter's raw-Metal
+// `PagedKVCacheAdapter::update_keys_values` goes through `LayerKVPool` →
+// Rust `dispatch_*`, outside MLX's graph scheduler. The `Custom`
+// primitives dispatched here are the graph-native default: every paged
+// family's pure-Rust forward (qwen3, qwen3.5 dense/MoE, lfm2, gemma4)
+// emits them via `PagedKVCacheAdapter::update_keys_values_native` /
+// `gather_kv_for_decode_graph` / `gather_kv_for_prefill_chunk`, so the
+// K/V write and attention read ride MLX's lazy graph with no per-layer
+// host sync. They also stay compile-traceable (usable inside
+// `mlx::core::compile`), covered by the compile-trace smoke tests in
+// `mlx_paged_ops.cpp`.
 //
 // Notes:
 //   - The .metallib for these kernels is compiled by `mlx-sys/build.rs`

@@ -40,9 +40,10 @@ pub(crate) trait DecodeStep {
     /// Single-token forward pass. `input_ids` is the `[1, 1]` token the
     /// loop reshaped from the previous sample. Returns `(logits,
     /// needs_squeeze)` — `needs_squeeze == true` when the logits still
-    /// carry the sequence axis (`[1, 1, vocab]`, eager Rust forwards)
-    /// and the loop must `squeeze(&[1])` them; compiled C++ forwards
-    /// return `[1, vocab]` directly and pass `false`.
+    /// carry the sequence axis (`[1, 1, vocab]`)
+    /// and the loop must `squeeze(&[1])` them; steppers that already
+    /// collapse to `[1, vocab]` (e.g. the lfm2 and qwen3_5 paged
+    /// steppers) pass `false`.
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)>;
 
     /// Like [`DecodeStep::forward`], but the engine ALSO hands the
@@ -54,8 +55,8 @@ pub(crate) trait DecodeStep {
     /// `y.reshape([1, 1])` lazy node — calling `item_at_int32` on it
     /// forces a second per-step eval/sync that the loop already paid at
     /// the top. That extra synchronize is invisible on a slow eager
-    /// forward (qwen3 dense) but measurably regresses a FAST compiled-paged
-    /// decode (lfm2 / future qwen3_5* compiled paged) by several percent.
+    /// forward (qwen3 dense) but measurably regresses a FAST paged
+    /// decode (lfm2, qwen3_5 dense/MoE, gemma4) by several percent.
     /// Such steppers override this to consume the handed `token_id`
     /// directly. The default forwards to [`DecodeStep::forward`] (flat
     /// steppers embed `input_ids` and never need the scalar; qwen3 paged
@@ -456,45 +457,28 @@ pub(crate) enum ResetScope {
 
 /// Turn-constant inputs for [`ChatBackend::begin_decode`].
 ///
-/// Field set derived from what the compiled/eager decode-setup blocks
-/// read (`models/lfm2/model.rs` compiled seed block, `models/qwen3_5/
-/// model.rs` compiled-init branches):
+/// Field set derived from what the family `begin_decode` impls read:
 pub(crate) struct TurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`]. Two consumers:
-    ///   * `params.reuse_cache` gates the compiled-cache export in
-    ///     [`DecodeStep::end_decode`] — the stepper captures it here at
-    ///     `begin_decode` time (qwen3_5 dense/MoE `if p.reuse_cache`
-    ///     export blocks, lfm2 `if use_compiled && reuse_cache`);
-    ///   * `params.enable_mtp` / `params.mtp_depth` /
-    ///     `params.max_new_tokens` feed the qwen3_5 decode-entry
-    ///     `info!` trace (`chat_with_caches_inner` "chat_decode entry"
-    ///     block).
-    ///
-    /// `params.max_new_tokens` is also the KV budget input: lfm2's
-    /// compiled seed sizes its fixed padded cache via
-    /// `kv_capacity_round_up(prefill_len, max_new_tokens)`; the qwen3.5
-    /// compiled init does the same. (There is deliberately no separate
-    /// `max_new_tokens` field so the two copies cannot drift.)
+    /// The turn's resolved [`ChatParams`]. `params.enable_mtp` /
+    /// `params.mtp_depth` / `params.max_new_tokens` feed the qwen3_5
+    /// dense decode-entry `info!` trace, whose `max_kv_len` estimate is
+    /// derived via `kv_capacity_round_up_saturating(total_seq_len,
+    /// max_new_tokens)`; the other families do not read `params` at
+    /// `begin_decode` time.
     pub params: &'a ChatParams,
     /// Delta-continuation flag (this turn appended a text delta on top of
     /// the live KV caches rather than running a fresh prefill). Read by
-    /// the qwen3.5 dense/MoE, qwen3, and lfm2 decode-setup blocks for
-    /// their session-continuation bookkeeping and entry traces.
+    /// the qwen3.5 dense/MoE and qwen3 `begin_decode` impls for their
+    /// profiler relabels and entry traces.
     pub is_delta: bool,
     /// Whether this turn carried image input. Read by the qwen3.5 dense
     /// decode-entry `info!` trace.
     pub has_images: bool,
     /// Total post-prefill sequence length: cached prefix + freshly
     /// prefilled tokens (i.e. the full prompt; the session-delta paths
-    /// pass `cached_history + delta`).
-    ///
-    /// The qwen3.5 compiled init sizes its fixed KV budget from `seq_len`
-    /// (`kv_capacity_round_up(seq_len, max_new_tokens)` in
-    /// `chat_with_caches_inner`), and `seq_len` there is the TOTAL prompt
-    /// length — not the prefilled tail. lfm2 deliberately ignores this
-    /// field and seeds from the live attention-KV offset instead (see the
-    /// "CRITICAL: seed the compiled decode position from the LIVE
-    /// attention KV offset" comment in `models/lfm2/model.rs`).
+    /// pass `cached_history + delta`). Read by the qwen3.5 dense
+    /// decode-entry trace (`prefill_seq_len` plus the `max_kv_len`
+    /// estimate above).
     pub total_seq_len: usize,
 }
 
@@ -1622,10 +1606,13 @@ pub(crate) trait MtpStepper {
     fn embedding_weight(&self) -> &MxArray;
 
     /// `true` when [`Self::commit_mtp`] runs the real committed-history
-    /// commit (and `run_mtp_cycle` uses the `chain_start = 0` draft mask) —
-    /// both the dense and MoE eager steppers report this whenever their
-    /// flag-gated `use_committed` gate holds; steppers with no
-    /// committed-history support return `false`.
+    /// commit. The engine ANDs it with `cycle_seed_was_chained` to pick
+    /// the chained-cycle commit anchor
+    /// (`MtpCommitAnchor::SkipAlreadyCommittedAnchor` instead of
+    /// `IncludeAnchor`) and the `chained_anchor` argument of
+    /// [`Self::begin_cycle`]. Both the dense and MoE eager steppers
+    /// report this whenever their flag-gated `use_committed` gate holds;
+    /// steppers with no committed-history support return `false`.
     /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
 

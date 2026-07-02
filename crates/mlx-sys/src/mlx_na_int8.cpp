@@ -765,10 +765,9 @@ mlx::core::array int8_weight_to_kn(const mlx::core::array& w_i8) {
 // External-linkage lazy graph builders (declared in mlx_common.h).
 //
 // SINGLE SOURCE OF TRUTH for the sym8 W8A8 linear math: the extern "C" FFI
-// wrappers below (`mlx_w8a8_linear`, `mlx_int8_qmv` — the eager Rust path) and
-// the compiled C++ forward (`linear_proj` sym8 dispatch in
-// mlx_qwen35_common.h) both call these, so the two paths emit byte-identical
-// graphs for the same inputs. Contract checks THROW here; the FFI wrappers
+// wrappers below (`mlx_w8a8_linear`, `mlx_int8_qmv` — the eager Rust path)
+// delegate to these builders, so every consumer emits byte-identical graphs
+// for the same inputs. Contract checks THROW here; the FFI wrappers
 // translate to cerr + false.
 // =============================================================================
 namespace na_int8 {

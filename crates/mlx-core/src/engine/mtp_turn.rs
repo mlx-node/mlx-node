@@ -239,7 +239,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // Keep the draft step's hidden/embedding handles alive even if the
         // EV gate stops here. The fixed-depth path always retains these
         // handles through the cycle tail; matching that lifetime matters
-        // for MLX's lazy compiled cache writes.
+        // for MLX's lazy cache writes.
         prev_hidden = h_next;
         let id_arr = A::from_int32(&[tok_id], &[1])?;
         let emb_2d = embedding_weight.take(&id_arr, 0)?; // [1, hidden]
@@ -299,8 +299,8 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         "MTP verify input built"
     );
     // Snapshot the main path's GDN linear caches + offset BEFORE verify
-    // runs its D+1 sequential forwards. Verify mutates `g_compiled_caches`
-    // in place; on rejection we restore from this snapshot and replay only
+    // runs its D+1 sequential forwards. Verify mutates the main-path
+    // caches in place; on rejection we restore from this snapshot and replay only
     // the K accepted drafts so the linear recurrent state matches the
     // committed token stream. On full accept the snapshot is discarded —
     // verify already left the linear state correctly advanced.
@@ -457,7 +457,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     } else {
         // We materialize logits now so per-position slicing reads
         // from a CPU-resident buffer for penalty application. The
-        // hiddens ride on the same compiled graph; we only eval the
+        // hiddens ride on the same lazy graph; we only eval the
         // K-th slice below.
         //
         // Note: the sparse-accept path also benefits from this eager
@@ -928,7 +928,8 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // Chained cycles skip Step A. Their `last_committed_id` is the prior
     // cycle's boundary token, already committed by that prior cycle. The
     // commit must therefore skip the anchor and append only
-    // `accepted_tokens`, advancing `g_mtp_committed_len` by the number of
+    // `accepted_tokens`, advancing the stepper's committed length by the
+    // number of
     // newly emitted tokens. Re-committing the anchor would drift the MTP
     // RoPE base by one slot per chained cycle.
     let committed_ids: Vec<u32> = match commit_anchor {
@@ -1685,7 +1686,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         } else {
             depth
         };
-        // Near-tail budget cap. The compiled verify writes `depth+1`
+        // Near-tail budget cap. The verify writes `depth+1`
         // target-cache slots BEFORE the post-verify truncation to
         // `max_new_tokens`; when fewer than `depth+1` main-cache
         // slots remain near the tail the write can overrun the
@@ -1909,7 +1910,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // When chaining IS enabled, flush the main path's KV-cache
         // lazy graph BEFORE the next cycle starts AND fuse the
         // chained `verify_hidden[K]` slice into the SAME `async_eval`
-        // batch as `(token, g_compiled_caches)`.
+        // batch as `(token, main layer caches)`.
         //
         // A plain `eval_step(y, h, false)` here would leave the
         // chained hidden LAZY across the iteration boundary (that
@@ -1918,8 +1919,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // `prev_hidden = chained_hidden`, materializing the slice
         // forced a mid-cycle Metal command-buffer roundtrip that the
         // Step-A bypass doesn't pay (Step A's `forward_with_hidden`
-        // returns `(logits, hidden)` as siblings of the same compiled
-        // forward and `eval_step` co-schedules them via
+        // returns `(logits, hidden)` as siblings of the same forward
+        // graph and `eval_step` co-schedules them via
         // `next_token → logits → hidden`).
         //
         // `eval_step_with_chained_hidden` extends the same dispatch

@@ -15,14 +15,18 @@ use crate::array::{DType, MxArray};
 use crate::engine::params::ModelGenerationDefaults;
 use crate::utils::safetensors::load_safetensors_lazy;
 
-/// Whether the compiled C++ forward path can run on this host.
+/// Whether the Metal-only native paths can run on this host.
 ///
-/// The compiled Qwen3.5 dense/MoE forward uses `fast::metal_kernel` (the GDN
-/// gating/recurrence kernels) and the block-paged custom primitives. Both
-/// require MLX's Metal backend and throw at runtime without it. On the
-/// CUDA/Linux build (`mlx_metal_is_available()` is false) the loaders must
-/// skip compiled-forward weight registration so `model_id` stays unset and
-/// every forward falls back to the device-agnostic eager Rust path.
+/// The block-paged custom primitives (`paged_kv_write` / `paged_attention`)
+/// and the GDN `fast::metal_kernel` kernels require MLX's Metal backend and
+/// throw at runtime without it. On the CUDA/Linux build
+/// (`mlx_metal_is_available()` is false) the model constructors leave the
+/// paged adapter unset and the GDN dispatch takes the ops path, so every
+/// forward falls back to the device-agnostic eager Rust path.
+///
+/// (The name is historical: this probe originally gated the deleted
+/// compiled-C++-forward weight registration; today it is a plain
+/// Metal-availability check.)
 ///
 /// The probe is cached: `mlx_metal_is_available()` is a constant per process.
 pub(crate) fn compiled_forward_backend_available() -> bool {
