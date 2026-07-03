@@ -1318,6 +1318,34 @@ fn load_vision_encoder_moe(
     Ok(vision_params)
 }
 
+/// Pin a sym8 checkpoint to the flat (eager int8) KV path, mirroring the
+/// dense loader's sym8 pin (`qwen3_5/persistence.rs`).
+///
+/// A sym8 MoE checkpoint on the block-paged path fails its FIRST paged KV
+/// write: sym8 convert stores norm weights as f32 (the affine twin stores
+/// bf16), and `fast::rms_norm` promotes its output to
+/// `result_type(x, weight)`, so K leaves `k_norm` as f32 while V — which has
+/// no norm and comes straight out of the bf16-emitting int8 kernels — stays
+/// bf16. The paged pool's `update_keys_values` hard-rejects mixed K/V dtypes
+/// (its kernel templates on a single 2-byte KV element type), aborting the
+/// generation with "keys/values dtype mismatch (Float32 vs BFloat16)". The
+/// flat `KVCache` has no such gate, so the flat path is the validated one.
+fn pin_sym8_to_flat_kv_cache(
+    config: &mut Qwen3_5MoeConfig,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) {
+    if has_sym8_mode(top_level_mode, per_layer_quant) && config.use_block_paged_cache == Some(true)
+    {
+        warn!(
+            "Qwen3.5-MoE: sym8 checkpoint requested block-paged KV cache; \
+             sym8 is validated on the flat (eager int8) path only — \
+             forcing use_block_paged_cache=false."
+        );
+        config.use_block_paged_cache = Some(false);
+    }
+}
+
 /// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
 ///
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
@@ -1356,7 +1384,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         Error::from_reason(format!("Failed to parse config: {}", e))
                     })?;
 
-                    let config = parse_config(&raw)?;
+                    let mut config = parse_config(&raw)?;
 
                     info!(
                         "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
@@ -1507,6 +1535,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         mtp_linear_suffixes,
                         &mut per_layer_quant,
                     );
+
+                    // sym8 emits mixed-dtype K/V (f32 K after the f32-weight
+                    // k_norm, bf16 V) which the block-paged pool hard-rejects;
+                    // force the flat path before `Qwen35MoeInner::new` builds
+                    // the paged adapter. See `pin_sym8_to_flat_kv_cache`.
+                    pin_sym8_to_flat_kv_cache(&mut config, top_level_mode, &per_layer_quant);
 
                     if quant_cfg.is_some() {
                         info!(
@@ -1851,7 +1885,7 @@ mod tests {
     use super::{
         AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
         PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
-        default_per_layer_quant, load_vision_encoder_moe,
+        default_per_layer_quant, load_vision_encoder_moe, pin_sym8_to_flat_kv_cache,
     };
     use std::collections::HashMap;
 
@@ -2493,6 +2527,63 @@ mod tests {
             inner.image_processor.is_none(),
             "sym8 checkpoint must NOT install the image processor"
         );
+    }
+
+    /// A sym8 checkpoint that requests the block-paged KV cache must be
+    /// pinned to the flat path (see `pin_sym8_to_flat_kv_cache`): sym8's f32
+    /// norm weights promote K to f32 after `k_norm` while V stays bf16, and
+    /// the paged pool's `update_keys_values` hard-rejects mixed K/V dtypes —
+    /// the first paged generation would abort. Asserts the EFFECTIVE cache
+    /// mode (`paged_adapter` presence), not just the config bit, for both the
+    /// pinned sym8 config and an affine control.
+    #[test]
+    fn sym8_checkpoint_pins_flat_kv_cache() {
+        // Top-level sym8 mode: the pin fires and the built model is flat.
+        let mut cfg = moe_paged_tiny_cfg();
+        assert_eq!(cfg.use_block_paged_cache, Some(true));
+        pin_sym8_to_flat_kv_cache(&mut cfg, Some(PerLayerMode::Sym8), &HashMap::new());
+        assert_eq!(
+            cfg.use_block_paged_cache,
+            Some(false),
+            "sym8 top-level mode must force use_block_paged_cache=false"
+        );
+        let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+        assert!(
+            inner.paged_adapter.is_none(),
+            "pinned sym8 model must run the flat KV path (no paged adapter)"
+        );
+
+        // Per-layer-only sym8 (no top-level mode) must pin too — has_sym8_mode
+        // covers both shapes.
+        let mut cfg = moe_paged_tiny_cfg();
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            default_per_layer_quant(8, -1, PerLayerMode::Sym8),
+        );
+        pin_sym8_to_flat_kv_cache(&mut cfg, None, &per_layer_quant);
+        assert_eq!(
+            cfg.use_block_paged_cache,
+            Some(false),
+            "a per-layer sym8 override must force use_block_paged_cache=false"
+        );
+
+        // Affine control: the paged request survives and the adapter builds
+        // (on hosts with the paged backend available).
+        let mut cfg = moe_paged_tiny_cfg();
+        pin_sym8_to_flat_kv_cache(&mut cfg, Some(PerLayerMode::Affine), &HashMap::new());
+        assert_eq!(
+            cfg.use_block_paged_cache,
+            Some(true),
+            "affine checkpoints must keep their block-paged request"
+        );
+        if crate::engine::persistence::compiled_forward_backend_available() {
+            let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            assert!(
+                inner.paged_adapter.is_some(),
+                "affine paged config must build the paged adapter"
+            );
+        }
     }
 
     /// A packed (non-float) member of a PARTIAL quant group must fail loud
