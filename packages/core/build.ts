@@ -135,6 +135,18 @@ function detectExpectNax(): boolean {
   }
 }
 
+// Publish/release fail-closed switch (set as `MLX_METALLIB_STRICT=1` in the
+// CI workflow env — see .github/workflows/ci.yml). In strict mode the metallib
+// gates FAIL CLOSED: a Metal-enabled addon that bakes no METAL_PATH aborts the
+// build instead of scanning possibly-stale mlx-sys-* dirs, and a min-OS stamp
+// that cannot be parsed aborts instead of skipping the deployment-floor check.
+// Local `yarn build:native` leaves it unset and keeps the lenient
+// warn-and-continue behavior so a CPU-only / exotic dev build still works.
+function metallibStrictMode(): boolean {
+  const v = process.env.MLX_METALLIB_STRICT;
+  return v === '1' || v === 'true';
+}
+
 // The intended min-OS load floor for the artifacts we ship: an explicit
 // MACOSX_DEPLOYMENT_TARGET (what build.rs forwards to the MLX cmake build and
 // the paged-attn metal link), else the build host's macOS version (MLX's
@@ -169,12 +181,14 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   });
   const triple = buildOptions.target ?? process.env.CARGO_BUILD_TARGET ?? hostAppleTriple();
   const profile = profileDirName(buildOptions);
+  const strict = metallibStrictMode();
   const picked = selectMetallib({
     addonBinary: await readFile(nodeOutput.path),
     addonPath: nodeOutput.path,
     targetRoot,
     triple,
     profile,
+    strict,
     warn: (msg) => console.warn(msg),
   });
   console.log(
@@ -191,7 +205,12 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   const metallib = await readFile(picked.metallibPath);
   assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
   if (deploymentFloor !== undefined) {
-    assertMetallibFloor(metallib, { path: picked.metallibPath, deploymentFloor, warn: (msg) => console.warn(msg) });
+    assertMetallibFloor(metallib, {
+      path: picked.metallibPath,
+      deploymentFloor,
+      strict,
+      warn: (msg) => console.warn(msg),
+    });
   }
 
   for (const dest of destDirs) {
@@ -211,7 +230,12 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   });
   assertPagedMetallibIntegrity(paged.contents, { path: paged.path });
   if (deploymentFloor !== undefined) {
-    assertMetallibFloor(paged.contents, { path: paged.path, deploymentFloor, warn: (msg) => console.warn(msg) });
+    assertMetallibFloor(paged.contents, {
+      path: paged.path,
+      deploymentFloor,
+      strict,
+      warn: (msg) => console.warn(msg),
+    });
   }
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');

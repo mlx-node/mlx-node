@@ -409,6 +409,42 @@ describe('selectMetallib', () => {
       }),
     ).toThrow(/mlx\.metallib not found under/);
   });
+
+  it('STRICT (publish): throws instead of scanning when the addon bakes no METAL_PATH', () => {
+    // A fresh, newest metallib is on disk — lenient mode would ship it — but a
+    // publish build must not pair an unbound scan result with the addon.
+    addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'fresh', 0);
+    const warnings: string[] = [];
+    expect(() =>
+      selectMetallib({
+        addonBinary: fakeAddon(['no baked path here']),
+        addonPath: 'fake.node',
+        targetRoot: root,
+        triple: TRIPLE,
+        profile: 'release',
+        strict: true,
+        warn: (m) => warnings.push(m),
+      }),
+    ).toThrow(/MLX_METALLIB_STRICT/);
+    expect(warnings).toHaveLength(0); // fail closed — no scan warning, no scan
+  });
+
+  it('non-strict (local dev): still scans and warns when the addon bakes no METAL_PATH', () => {
+    const newest = addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'fresh', 0);
+    const warnings: string[] = [];
+    const picked = selectMetallib({
+      addonBinary: fakeAddon(['no baked path here']),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+      strict: false,
+      warn: (m) => warnings.push(m),
+    });
+    expect(picked.source).toBe('scan');
+    expect(picked.metallibPath).toBe(newest);
+    expect(warnings.some((w) => w.includes('No baked METAL_PATH'))).toBe(true);
+  });
 });
 
 describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
@@ -579,6 +615,37 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     expect(() =>
       assertMetallibFloor(mtlbHeader(26, 2, { magic: 'NOPE' }), { path: 'x', deploymentFloor: '26.0' }),
     ).not.toThrow();
+  });
+
+  it('STRICT (publish): throws instead of warn-skip when the MTLB header layout is unrecognized', () => {
+    // A publish build must not ship a metallib whose floor cannot be verified.
+    const future = mtlbHeader(26, 2, { containerVersion: 3 }); // parses to undefined
+    expect(parseMetallibMinOs(future)).toBeUndefined();
+    const warnings: string[] = [];
+    expect(() =>
+      assertMetallibFloor(future, { path: 'x', deploymentFloor: '26.0', strict: true, warn: (m) => warnings.push(m) }),
+    ).toThrow(/MLX_METALLIB_STRICT/);
+    expect(warnings).toHaveLength(0); // fail closed — no warn-and-skip
+  });
+
+  it('non-strict (local dev): still warns and skips on an unrecognized MTLB header layout', () => {
+    const future = mtlbHeader(26, 2, { platform: 0x8002 });
+    const warnings: string[] = [];
+    expect(() =>
+      assertMetallibFloor(future, { path: 'x', deploymentFloor: '26.0', strict: false, warn: (m) => warnings.push(m) }),
+    ).not.toThrow();
+    expect(warnings.some((w) => w.includes('unrecognized MTLB header layout'))).toBe(true);
+  });
+
+  it('STRICT still accepts a recognized stamp at/below the floor and enforces above it', () => {
+    // Strict mode only changes the unparseable branch; a recognized stamp
+    // behaves exactly as before.
+    expect(() =>
+      assertMetallibFloor(mtlbHeader(26, 0), { path: 'x', deploymentFloor: '26.0', strict: true }),
+    ).not.toThrow();
+    expect(() => assertMetallibFloor(mtlbHeader(26, 2), { path: 'x', deploymentFloor: '26.0', strict: true })).toThrow(
+      /above the intended deployment floor/,
+    );
   });
 });
 

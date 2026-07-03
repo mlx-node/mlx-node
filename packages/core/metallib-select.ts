@@ -218,6 +218,15 @@ export function selectMetallib(opts: {
   targetRoot: string;
   triple: string;
   profile: string;
+  /**
+   * Publish/release mode (set from `MLX_METALLIB_STRICT` in CI). A
+   * Metal-enabled darwin addon always bakes its METAL_PATH, so a missing
+   * binding on a publish build means Metal was disabled or the addon is
+   * broken — fail closed instead of scanning possibly-stale mlx-sys-* dirs
+   * for a metallib that may not be this addon's kernels. Local dev leaves it
+   * off and keeps the lenient scan.
+   */
+  strict?: boolean;
   warn?: (msg: string) => void;
 }): SelectedMetallib {
   const warn = opts.warn ?? (() => {});
@@ -264,6 +273,17 @@ export function selectMetallib(opts: {
         `${binding.installCopyPath} from the same bound build dir.`,
     );
     return selected(binding.installCopyPath);
+  }
+  if (opts.strict) {
+    throw new Error(
+      `[build.ts metallib gate] no baked METAL_PATH in ${opts.addonPath} while MLX_METALLIB_STRICT ` +
+        `is set (publish/release build). A Metal-enabled darwin addon always bakes the METAL_PATH ` +
+        `of the mlx-sys build it linked against; its absence means Metal was disabled for this ` +
+        `build (MLX_DISABLE_METAL) or the addon is broken. Refusing to scan stale mlx-sys-* dirs — ` +
+        `a same-pin metallib from an unrelated build passes the size/marker gates yet may not be ` +
+        `the kernels this addon links. Build with Metal enabled (never set MLX_DISABLE_METAL for a ` +
+        `published artifact), or skip metallib packaging for a CPU-only build.`,
+    );
   }
   warn(
     `No baked METAL_PATH found in ${opts.addonPath}; falling back to scanning ` +
@@ -540,15 +560,27 @@ export function parseMetallibMinOs(metallib: Buffer): string | undefined {
  * Deployment-floor gate: a metallib whose container min-OS stamp is ABOVE
  * the intended floor refuses to load on floor machines, and the kernel-name
  * inventory cannot tell floors apart. A stamp below the floor is harmless
- * (it loads on the floor and older). Warns and skips when the header layout
- * is not recognized — this gate is best-effort by design.
+ * (it loads on the floor and older). When the header layout is not
+ * recognized the gate is best-effort: local dev warns and skips, but a
+ * publish/release build (`strict`, from `MLX_METALLIB_STRICT`) fails closed —
+ * shipping a metallib whose floor cannot be verified could publish a package
+ * that fails to load on the floor OS.
  */
 export function assertMetallibFloor(
   metallib: Buffer,
-  opts: { path: string; deploymentFloor: string; warn?: (msg: string) => void },
+  opts: { path: string; deploymentFloor: string; strict?: boolean; warn?: (msg: string) => void },
 ): void {
   const stamped = parseMetallibMinOs(metallib);
   if (stamped === undefined) {
+    if (opts.strict) {
+      throw new Error(
+        `[build.ts metallib gate] ${opts.path}: unrecognized MTLB header layout while ` +
+          `MLX_METALLIB_STRICT is set (publish/release build) — the min-OS floor cannot be ` +
+          `verified against ${opts.deploymentFloor}, and shipping an unverifiable metallib risks ` +
+          `an artifact that fails to load on macOS ${opts.deploymentFloor}. The container header ` +
+          `format changed (new toolchain?); update parseMetallibMinOs to recognize the new layout.`,
+      );
+    }
     opts.warn?.(
       `[build.ts metallib gate] ${opts.path}: unrecognized MTLB header layout; ` +
         `skipping the deployment-floor check (min-OS stamp not verifiable).`,

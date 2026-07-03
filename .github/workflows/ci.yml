@@ -24,6 +24,15 @@ env:
   # off them. Set on the whole workflow so test jobs exercise the same
   # floor the publish artifacts ship with.
   MACOSX_DEPLOYMENT_TARGET: '26.0'
+  # Publish/release fail-closed switch for the metallib packaging gates in
+  # packages/core/build.ts. The `build` job's `yarn build` produces the .node +
+  # metallib artifacts the publish job ships, and every CI build can feed a
+  # release, so strictness is on for the whole workflow. With it set, a
+  # Metal-enabled darwin addon that bakes no METAL_PATH aborts the build instead
+  # of scanning possibly-stale mlx-sys-* dirs, and an unparseable metallib
+  # min-OS stamp aborts instead of silently skipping the deployment-floor check.
+  # Local `yarn build:native` leaves it unset and keeps the lenient dev behavior.
+  MLX_METALLIB_STRICT: '1'
 
 jobs:
   build:
