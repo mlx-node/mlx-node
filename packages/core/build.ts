@@ -10,10 +10,12 @@ import viteConfig from '../../vite.config';
 import {
   assertMetallibFloor,
   assertMetallibIntegrity,
+  assertPagedMetallibIntegrity,
   hostAppleTriple,
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
+  selectPagedMetallib,
   shouldExpectNaxKernels,
 } from './metallib-select';
 
@@ -197,36 +199,23 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     await copyFile(picked.metallibPath, dst);
     console.log(`Copied mlx.metallib -> ${dst}`);
   }
-  // paged_attn.metallib is also required for darwin. build.rs writes it to
-  // the OUT_DIR root and copies it into out/lib; prefer the origin file and
-  // accept the copy when the origin is gone — both live in the selected
-  // build's out dir, so the binding still holds.
-  const pagedCandidates = [join(picked.outDir, 'paged_attn.metallib'), join(picked.libDir, 'paged_attn.metallib')];
-  let pagedPath: string | undefined;
-  let pagedMetallib: Buffer | undefined;
-  for (const candidate of pagedCandidates) {
-    try {
-      pagedMetallib = await readFile(candidate);
-      pagedPath = candidate;
-      break;
-    } catch {
-      // absent here — try the next location
-    }
-  }
-  if (pagedPath === undefined || pagedMetallib === undefined) {
-    throw new Error(
-      `paged_attn.metallib not found at ${pagedCandidates.join(' nor at ')}. The paged-attention ` +
-        `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
-        `at runtime; without it, the addon throws on first paged-attention use. ` +
-        `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
-    );
-  }
+  // paged_attn.metallib is also required for darwin, under the same
+  // contract as mlx.metallib: build.rs writes the origin to the OUT_DIR
+  // root and copies it into out/lib; both-present pairs must be
+  // byte-identical, and the shipped file passes size/magic + floor gates
+  // before any copy.
+  const paged = selectPagedMetallib({
+    outDir: picked.outDir,
+    libDir: picked.libDir,
+    warn: (msg) => console.warn(msg),
+  });
+  assertPagedMetallibIntegrity(paged.contents, { path: paged.path });
   if (deploymentFloor !== undefined) {
-    assertMetallibFloor(pagedMetallib, { path: pagedPath, deploymentFloor, warn: (msg) => console.warn(msg) });
+    assertMetallibFloor(paged.contents, { path: paged.path, deploymentFloor, warn: (msg) => console.warn(msg) });
   }
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');
-    await copyFile(pagedPath, dst);
+    await copyFile(paged.path, dst);
     console.log(`Copied paged_attn.metallib -> ${dst}`);
   }
   // Final sanity-check: every destination must have BOTH files.

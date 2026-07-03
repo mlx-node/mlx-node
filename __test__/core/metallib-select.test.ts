@@ -6,9 +6,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'vite-plus/test';
 
 import {
   BASE_KERNEL_MARKERS,
+  MIN_PAGED_METALLIB_BYTES,
   NAX_KERNEL_MARKERS,
   assertMetallibFloor,
   assertMetallibIntegrity,
+  assertPagedMetallibIntegrity,
   collectMetallibCandidates,
   compareVersions,
   extractBakedMetallibBinding,
@@ -17,6 +19,7 @@ import {
   profileDirName,
   resolveTargetRoot,
   selectMetallib,
+  selectPagedMetallib,
   shouldExpectNaxKernels,
 } from '../../packages/core/metallib-select';
 
@@ -350,6 +353,86 @@ describe('selectMetallib', () => {
         profile: 'release',
       }),
     ).toThrow(/mlx\.metallib not found under/);
+  });
+});
+
+describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
+  let root: string;
+  let outDir: string;
+  let libDir: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'metallib-select-paged-'));
+    outDir = join(root, 'out');
+    libDir = join(outDir, 'lib');
+    mkdirSync(libDir, { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeOrigin(content: string): string {
+    const p = join(outDir, 'paged_attn.metallib');
+    writeFileSync(p, content);
+    return p;
+  }
+  function writeInstallCopy(content: string): string {
+    const p = join(libDir, 'paged_attn.metallib');
+    writeFileSync(p, content);
+    return p;
+  }
+
+  it('ships the build.rs origin when both copies are byte-identical', () => {
+    const origin = writeOrigin('MTLB same-bytes');
+    writeInstallCopy('MTLB same-bytes');
+    const picked = selectPagedMetallib({ outDir, libDir });
+    expect(picked.path).toBe(origin);
+    expect(picked.contents.toString()).toBe('MTLB same-bytes');
+  });
+
+  it('REJECTS a both-present mismatch instead of silently preferring either copy', () => {
+    writeOrigin('MTLB origin-bytes');
+    writeInstallCopy('MTLB different-install-copy');
+    expect(() => selectPagedMetallib({ outDir, libDir })).toThrow(/not byte-identical/);
+  });
+
+  it('REJECTS loudly when the origin is truncated next to a good install copy (no silent fallback)', () => {
+    const good = 'MTLB ' + 'k'.repeat(64);
+    writeOrigin(good.slice(0, 7)); // interrupted write of the same build
+    writeInstallCopy(good);
+    expect(() => selectPagedMetallib({ outDir, libDir })).toThrow(/not byte-identical/);
+  });
+
+  it('ships the surviving copy (with a warning) when only one of the two exists', () => {
+    const origin = writeOrigin('MTLB origin-only');
+    let warnings: string[] = [];
+    const fromOrigin = selectPagedMetallib({ outDir, libDir, warn: (m) => warnings.push(m) });
+    expect(fromOrigin.path).toBe(origin);
+    expect(warnings.some((w) => w.includes('is missing'))).toBe(true);
+
+    rmSync(origin);
+    const installCopy = writeInstallCopy('MTLB install-copy-only');
+    warnings = [];
+    const fromCopy = selectPagedMetallib({ outDir, libDir, warn: (m) => warnings.push(m) });
+    expect(fromCopy.path).toBe(installCopy);
+    expect(fromCopy.contents.toString()).toBe('MTLB install-copy-only');
+    expect(warnings.some((w) => w.includes('is missing'))).toBe(true);
+  });
+
+  it('throws the loud not-found error when neither copy exists', () => {
+    expect(() => selectPagedMetallib({ outDir, libDir })).toThrow(/paged_attn\.metallib not found at/);
+  });
+
+  it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
+    // An identically-truncated PAIR passes selection (byte-equal) — the
+    // integrity gate is what catches it.
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB tiny'), { path: 'x' })).toThrow(
+      new RegExp(`below the ${MIN_PAGED_METALLIB_BYTES}-byte floor`),
+    );
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('NOPE junk'), { path: 'x', minBytes: 1 })).toThrow(
+      /MTLB container magic/,
+    );
+    expect(() => assertPagedMetallibIntegrity(Buffer.from('MTLB healthy'), { path: 'x', minBytes: 1 })).not.toThrow();
   });
 });
 

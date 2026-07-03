@@ -49,6 +49,15 @@ export interface MetallibCandidate {
 /** Smallest healthy mlx.metallib observed is ~154 MB; anything far below is truncated. */
 export const MIN_METALLIB_BYTES = 100 * 1024 * 1024;
 
+/**
+ * Every healthy paged_attn.metallib observed to date (8 samples across
+ * debug/release profiles and old/new MLX pins) is exactly 19,490,342 bytes
+ * (~19.5 MB) — the kernel set is ours (crates/mlx-paged-attn) and stable.
+ * A 4 MiB floor keeps generous headroom for future kernel trimming while
+ * still catching a truncated or interrupted write.
+ */
+export const MIN_PAGED_METALLIB_BYTES = 4 * 1024 * 1024;
+
 /** Kernel names present in every healthy mlx.metallib from the vendored MLX. */
 export const BASE_KERNEL_MARKERS = ['steel_attention', 'sdpa_vector'] as const;
 
@@ -262,6 +271,89 @@ export function selectMetallib(opts: {
     );
   }
   return { outDir: dirname(picked.libDir), libDir: picked.libDir, metallibPath: picked.metallibPath, source: 'scan' };
+}
+
+export interface SelectedPagedMetallib {
+  path: string;
+  contents: Buffer;
+}
+
+function readIfExists(path: string): Buffer | undefined {
+  try {
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve paged_attn.metallib inside the selected mlx-sys build dir, under
+ * the same contract as the mlx.metallib binding: build.rs writes the origin
+ * to the OUT_DIR root and copies it into `out/lib`, so when BOTH exist they
+ * must be byte-identical (a mismatch means one of them is stale or
+ * truncated — fail loudly, never silently prefer either); a single
+ * surviving copy ships with a warning; neither existing throws.
+ */
+export function selectPagedMetallib(opts: {
+  outDir: string;
+  libDir: string;
+  warn?: (msg: string) => void;
+}): SelectedPagedMetallib {
+  const warn = opts.warn ?? (() => {});
+  const originPath = join(opts.outDir, 'paged_attn.metallib');
+  const installCopyPath = join(opts.libDir, 'paged_attn.metallib');
+  const origin = readIfExists(originPath);
+  const installCopy = readIfExists(installCopyPath);
+  if (origin === undefined && installCopy === undefined) {
+    throw new Error(
+      `paged_attn.metallib not found at ${originPath} nor at ${installCopyPath}. The paged-attention ` +
+        `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
+        `at runtime; without it, the addon throws on first paged-attention use. ` +
+        `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
+    );
+  }
+  if (origin !== undefined && installCopy !== undefined) {
+    if (!origin.equals(installCopy)) {
+      throw new Error(
+        `[build.ts metallib gate] ${originPath} (the file build.rs produced) and its install copy ` +
+          `${installCopyPath} are not byte-identical — one of them is stale or truncated. Re-run ` +
+          `the native build; if it persists, remove ${opts.outDir} to force a clean build.`,
+      );
+    }
+    return { path: originPath, contents: origin };
+  }
+  if (origin !== undefined) {
+    warn(`${installCopyPath} is missing; shipping the build.rs origin ${originPath} directly.`);
+    return { path: originPath, contents: origin };
+  }
+  warn(`${originPath} is missing; shipping its install copy ${installCopyPath} from the same build dir.`);
+  return { path: installCopyPath, contents: installCopy! };
+}
+
+/**
+ * Hard gate before paged_attn.metallib is copied anywhere, mirroring
+ * `assertMetallibIntegrity`: a truncated file or a non-metallib container
+ * must fail the build loudly. There is no kernel-name inventory here — the
+ * paged-attn kernel set is small and ours — so the gate is the size floor
+ * plus the MTLB container magic.
+ */
+export function assertPagedMetallibIntegrity(metallib: Buffer, opts: { path: string; minBytes?: number }): void {
+  const minBytes = opts.minBytes ?? MIN_PAGED_METALLIB_BYTES;
+  if (metallib.byteLength < minBytes) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} is ${metallib.byteLength} bytes, below the ` +
+        `${minBytes}-byte floor of a healthy paged_attn.metallib (every observed healthy ` +
+        `build is ~19.5 MB) — the file is truncated or the build was interrupted. Re-run ` +
+        `the native build; if it persists, remove the containing mlx-sys-*/out dir.`,
+    );
+  }
+  if (metallib.toString('latin1', 0, 4) !== 'MTLB') {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} does not start with the MTLB container magic — ` +
+        `this is not a Metal library. Re-run the native build; if it persists, remove the ` +
+        `containing mlx-sys-*/out dir.`,
+    );
+  }
 }
 
 export function profileDirName(opts: { profile?: string | undefined; release?: boolean | undefined }): string {
