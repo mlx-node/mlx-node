@@ -186,7 +186,9 @@ describe('extractBakedMetallibBinding', () => {
     expect(binding).toBeDefined();
     expect(binding!.outDir).toBe(BAKED_DIR_A);
     expect(binding!.libDir).toBe(`${BAKED_DIR_A}/lib`);
-    expect(binding!.metallibPath).toBe(`${BAKED_DIR_A}/lib/mlx.metallib`);
+    expect(binding!.installCopyPath).toBe(`${BAKED_DIR_A}/lib/mlx.metallib`);
+    // the double slash in the baked string is normalized away
+    expect(binding!.bakedPath).toBe(`${BAKED_DIR_A}/build/mlx/backend/metal/kernels/mlx.metallib`);
   });
 
   it('accepts the single-slash kernels path form too', () => {
@@ -230,6 +232,15 @@ describe('selectMetallib', () => {
     return metallib;
   }
 
+  /** The cmake kernels build-tree file a baked METAL_PATH points at. */
+  function addBakedFile(rel: string, content: string): string {
+    const kernelsDir = join(root, rel, 'out', 'build', 'mlx', 'backend', 'metal', 'kernels');
+    mkdirSync(kernelsDir, { recursive: true });
+    const baked = join(kernelsDir, 'mlx.metallib');
+    writeFileSync(baked, content);
+    return baked;
+  }
+
   it('rejects a same-pin NEWER but unbound candidate: the baked METAL_PATH wins over mtime rank', () => {
     const boundRel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
     const bound = addOutDir(boundRel, 'bound-build', 7);
@@ -251,7 +262,54 @@ describe('selectMetallib', () => {
     expect(picked.metallibPath).toBe(bound);
   });
 
-  it('throws (never falls back to another dir) when the bound metallib is missing on disk', () => {
+  it('ships the exact baked build-tree file when it matches its out/lib install copy', () => {
+    const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+    addOutDir(rel, 'same-bytes', 0);
+    const baked = addBakedFile(rel, 'same-bytes');
+    const picked = selectMetallib({
+      addonBinary: fakeAddon([bakedPathFor(join(root, rel, 'out'))]),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+    });
+    expect(picked.source).toBe('baked');
+    expect(picked.metallibPath).toBe(baked);
+  });
+
+  it('REJECTS a diverged out/lib install copy: baked file and install copy must be byte-identical', () => {
+    const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+    addOutDir(rel, 'stale-install-copy', 0);
+    addBakedFile(rel, 'fresh-origin-bytes');
+    expect(() =>
+      selectMetallib({
+        addonBinary: fakeAddon([bakedPathFor(join(root, rel, 'out'))]),
+        addonPath: 'fake.node',
+        targetRoot: root,
+        triple: TRIPLE,
+        profile: 'release',
+      }),
+    ).toThrow(/not byte-identical/);
+  });
+
+  it('SUCCEEDS with the baked file when the out/lib install copy is missing entirely', () => {
+    const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+    const baked = addBakedFile(rel, 'origin-only');
+    const warnings: string[] = [];
+    const picked = selectMetallib({
+      addonBinary: fakeAddon([bakedPathFor(join(root, rel, 'out'))]),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+      warn: (m) => warnings.push(m),
+    });
+    expect(picked.source).toBe('baked');
+    expect(picked.metallibPath).toBe(baked);
+    expect(warnings.some((w) => w.includes('is missing'))).toBe(true);
+  });
+
+  it('throws (never falls back to another dir) when the bound build has no metallib left on disk', () => {
     addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'newer-unbound', 0);
     const addon = fakeAddon([bakedPathFor(join(root, `${TRIPLE}/release/build/mlx-sys-aaaa1111`, 'out'))]);
     expect(() =>
@@ -262,7 +320,7 @@ describe('selectMetallib', () => {
         triple: TRIPLE,
         profile: 'release',
       }),
-    ).toThrow(/does not exist/);
+    ).toThrow(/neither that file nor its install copy .* exists/);
   });
 
   it('falls back to the mtime scan only when the addon bakes no METAL_PATH', () => {
@@ -295,17 +353,31 @@ describe('selectMetallib', () => {
   });
 });
 
-/** MTLB container header with the given min-OS stamp (u16 LE major @12, minor @14). */
-function mtlbHeader(major: number, minor: number, magic = 'MTLB'): Buffer {
+/**
+ * MTLB container header with the given min-OS stamp (u16 LE major @12,
+ * minor @14) in the recognized layout: platform tag 0x8001 @4, container
+ * version 2 @6, library type 0x00 @10, macOS tag 0x81 @11. `opts` corrupts
+ * individual fields to model future/unknown container revisions.
+ */
+function mtlbHeader(
+  major: number,
+  minor: number,
+  opts?: { magic?: string; platform?: number; containerVersion?: number; libraryType?: number; osTag?: number },
+): Buffer {
   const header = Buffer.alloc(24);
-  header.write(magic, 0, 'latin1');
+  header.write(opts?.magic ?? 'MTLB', 0, 'latin1');
+  header.writeUInt16LE(opts?.platform ?? 0x8001, 4);
+  header.writeUInt16LE(opts?.containerVersion ?? 2, 6);
+  header.writeUInt16LE(9, 8); // container minor version — varies by toolchain, not validated
+  header[10] = opts?.libraryType ?? 0x00;
+  header[11] = opts?.osTag ?? 0x81;
   header.writeUInt16LE(major, 12);
   header.writeUInt16LE(minor, 14);
   return header;
 }
 
 describe('parseMetallibMinOs / assertMetallibFloor', () => {
-  it('parses the min-OS stamp out of the MTLB header', () => {
+  it('parses the min-OS stamp out of the recognized MTLB header layout', () => {
     expect(parseMetallibMinOs(mtlbHeader(26, 0))).toBe('26.0');
     expect(parseMetallibMinOs(mtlbHeader(26, 2))).toBe('26.2');
     expect(parseMetallibMinOs(mtlbHeader(15, 0))).toBe('15.0');
@@ -315,10 +387,29 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
   });
 
   it('returns undefined on unknown layouts instead of guessing', () => {
-    expect(parseMetallibMinOs(mtlbHeader(26, 0, 'NOPE'))).toBeUndefined();
+    expect(parseMetallibMinOs(mtlbHeader(26, 0, { magic: 'NOPE' }))).toBeUndefined();
     expect(parseMetallibMinOs(Buffer.from('MTLB'))).toBeUndefined();
     expect(parseMetallibMinOs(mtlbHeader(0, 0))).toBeUndefined();
     expect(parseMetallibMinOs(mtlbHeader(4242, 0))).toBeUndefined();
+  });
+
+  it('a future container revision (version-like bytes at 12/14 but unrecognized layout) SKIPS with a warning, never hard-fails', () => {
+    // Each fixture stamps a would-fail min-OS 26.2 under floor 26.0, but a
+    // single unrecognized layout field must downgrade enforcement to a skip.
+    const futureLayouts = [
+      mtlbHeader(26, 2, { containerVersion: 3 }),
+      mtlbHeader(26, 2, { platform: 0x8002 }),
+      mtlbHeader(26, 2, { libraryType: 0x01 }),
+      mtlbHeader(26, 2, { osTag: 0x82 }),
+    ];
+    for (const fixture of futureLayouts) {
+      expect(parseMetallibMinOs(fixture)).toBeUndefined();
+      const warnings: string[] = [];
+      expect(() =>
+        assertMetallibFloor(fixture, { path: 'x', deploymentFloor: '26.0', warn: (m) => warnings.push(m) }),
+      ).not.toThrow();
+      expect(warnings.some((w) => w.includes('unrecognized MTLB header layout'))).toBe(true);
+    }
   });
 
   it('rejects a metallib stamped above the intended deployment floor', () => {
@@ -331,7 +422,9 @@ describe('parseMetallibMinOs / assertMetallibFloor', () => {
     expect(() => assertMetallibFloor(mtlbHeader(26, 0), { path: 'x', deploymentFloor: '26.0' })).not.toThrow();
     expect(() => assertMetallibFloor(mtlbHeader(15, 0), { path: 'x', deploymentFloor: '26.0' })).not.toThrow();
     expect(() => assertMetallibFloor(mtlbHeader(26, 0), { path: 'x', deploymentFloor: '26.5.2' })).not.toThrow();
-    expect(() => assertMetallibFloor(mtlbHeader(26, 2, 'NOPE'), { path: 'x', deploymentFloor: '26.0' })).not.toThrow();
+    expect(() =>
+      assertMetallibFloor(mtlbHeader(26, 2, { magic: 'NOPE' }), { path: 'x', deploymentFloor: '26.0' }),
+    ).not.toThrow();
   });
 });
 

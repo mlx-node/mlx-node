@@ -189,7 +189,7 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
   const metallib = await readFile(picked.metallibPath);
   assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
   if (deploymentFloor !== undefined) {
-    assertMetallibFloor(metallib, { path: picked.metallibPath, deploymentFloor });
+    assertMetallibFloor(metallib, { path: picked.metallibPath, deploymentFloor, warn: (msg) => console.warn(msg) });
   }
 
   for (const dest of destDirs) {
@@ -197,22 +197,32 @@ async function copyMetallibs(outputs: Awaited<typeof task>) {
     await copyFile(picked.metallibPath, dst);
     console.log(`Copied mlx.metallib -> ${dst}`);
   }
-  // paged_attn.metallib is also required for darwin.
-  // It lives next to mlx.metallib in the same lib dir.
-  const pagedPath = join(picked.libDir, 'paged_attn.metallib');
-  let pagedMetallib: Buffer;
-  try {
-    pagedMetallib = await readFile(pagedPath);
-  } catch {
+  // paged_attn.metallib is also required for darwin. build.rs writes it to
+  // the OUT_DIR root and copies it into out/lib; prefer the origin file and
+  // accept the copy when the origin is gone — both live in the selected
+  // build's out dir, so the binding still holds.
+  const pagedCandidates = [join(picked.outDir, 'paged_attn.metallib'), join(picked.libDir, 'paged_attn.metallib')];
+  let pagedPath: string | undefined;
+  let pagedMetallib: Buffer | undefined;
+  for (const candidate of pagedCandidates) {
+    try {
+      pagedMetallib = await readFile(candidate);
+      pagedPath = candidate;
+      break;
+    } catch {
+      // absent here — try the next location
+    }
+  }
+  if (pagedPath === undefined || pagedMetallib === undefined) {
     throw new Error(
-      `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
+      `paged_attn.metallib not found at ${pagedCandidates.join(' nor at ')}. The paged-attention ` +
         `compile path (mlx_paged_dispatch.cpp) loads this metallib via dladdr ` +
         `at runtime; without it, the addon throws on first paged-attention use. ` +
         `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
     );
   }
   if (deploymentFloor !== undefined) {
-    assertMetallibFloor(pagedMetallib, { path: pagedPath, deploymentFloor });
+    assertMetallibFloor(pagedMetallib, { path: pagedPath, deploymentFloor, warn: (msg) => console.warn(msg) });
   }
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');
