@@ -175,11 +175,23 @@ export interface SelectedMetallib {
   source: 'baked' | 'scan';
 }
 
+/**
+ * Only ENOENT/ENOTDIR mean "the artifact is not there". Anything else
+ * (EACCES, EPERM, EISDIR, EIO, ...) means the artifact may well exist but
+ * cannot be inspected — treating that as absence would silently skip the
+ * byte-identity comparison and ship the other copy unverified.
+ */
+function isAbsenceError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 function statSize(path: string): number | undefined {
   try {
     return statSync(path).size;
-  } catch {
-    return undefined;
+  } catch (err) {
+    if (isAbsenceError(err)) return undefined;
+    throw new Error(`[build.ts metallib gate] cannot stat ${path}: ${(err as Error).message}`);
   }
 }
 
@@ -281,8 +293,9 @@ export interface SelectedPagedMetallib {
 function readIfExists(path: string): Buffer | undefined {
   try {
     return readFileSync(path);
-  } catch {
-    return undefined;
+  } catch (err) {
+    if (isAbsenceError(err)) return undefined;
+    throw new Error(`[build.ts metallib gate] cannot read ${path}: ${(err as Error).message}`);
   }
 }
 

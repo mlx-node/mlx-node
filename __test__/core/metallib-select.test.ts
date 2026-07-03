@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -24,6 +24,11 @@ import {
 } from '../../packages/core/metallib-select';
 
 const TRIPLE = 'aarch64-apple-darwin';
+
+// chmod-based unreadability tests are meaningless as root (root bypasses
+// permission bits); CI and dev both run unprivileged, so this only guards
+// exotic environments.
+const runningAsRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
 describe('compareVersions', () => {
   it('orders dotted versions numerically, not lexically', () => {
@@ -326,6 +331,30 @@ describe('selectMetallib', () => {
     ).toThrow(/neither that file nor its install copy .* exists/);
   });
 
+  it.skipIf(runningAsRoot)(
+    'THROWS when the baked file is uninspectable (EACCES), instead of treating it as absent and shipping the install copy',
+    () => {
+      const rel = `${TRIPLE}/release/build/mlx-sys-aaaa1111`;
+      addOutDir(rel, 'good-install-copy', 0);
+      addBakedFile(rel, 'origin-bytes');
+      const kernelsDir = join(root, rel, 'out', 'build', 'mlx', 'backend', 'metal', 'kernels');
+      chmodSync(kernelsDir, 0o000); // stat on the baked file now fails with EACCES, not ENOENT
+      try {
+        expect(() =>
+          selectMetallib({
+            addonBinary: fakeAddon([bakedPathFor(join(root, rel, 'out'))]),
+            addonPath: 'fake.node',
+            targetRoot: root,
+            triple: TRIPLE,
+            profile: 'release',
+          }),
+        ).toThrow(/cannot stat/);
+      } finally {
+        chmodSync(kernelsDir, 0o755);
+      }
+    },
+  );
+
   it('falls back to the mtime scan only when the addon bakes no METAL_PATH', () => {
     const newest = addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'fresh', 0);
     addOutDir(`${TRIPLE}/release/build/mlx-sys-aaaa1111`, 'stale', 7);
@@ -422,6 +451,22 @@ describe('selectPagedMetallib / assertPagedMetallibIntegrity', () => {
   it('throws the loud not-found error when neither copy exists', () => {
     expect(() => selectPagedMetallib({ outDir, libDir })).toThrow(/paged_attn\.metallib not found at/);
   });
+
+  it.skipIf(runningAsRoot)(
+    'THROWS when the origin is present but unreadable (EACCES), instead of shipping the install copy uncompared',
+    () => {
+      const origin = writeOrigin('MTLB origin-bytes');
+      writeInstallCopy('MTLB good-install-copy');
+      chmodSync(origin, 0o000);
+      try {
+        const warnings: string[] = [];
+        expect(() => selectPagedMetallib({ outDir, libDir, warn: (m) => warnings.push(m) })).toThrow(/cannot read/);
+        expect(warnings).toHaveLength(0); // no warn-and-degrade
+      } finally {
+        chmodSync(origin, 0o644);
+      }
+    },
+  );
 
   it('integrity gate: rejects truncation via the size floor and non-MTLB content via the magic', () => {
     // An identically-truncated PAIR passes selection (byte-equal) — the
