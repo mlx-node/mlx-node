@@ -8,10 +8,12 @@ import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
 import {
+  assertMetallibFloor,
   assertMetallibIntegrity,
-  collectMetallibCandidates,
   hostAppleTriple,
   profileDirName,
+  resolveTargetRoot,
+  selectMetallib,
   shouldExpectNaxKernels,
 } from './metallib-select';
 
@@ -74,7 +76,7 @@ await copyNativeAddon(outputs);
 // build there is no Metal toolchain and no metallib to copy, so skip the
 // whole step (and its presence assert) on non-darwin platforms.
 if (process.platform === 'darwin') {
-  await copyMetallibs();
+  await copyMetallibs(outputs);
 }
 
 // Derive the napi addon file name + the matching `npm/<triple>/` directory
@@ -131,42 +133,64 @@ function detectExpectNax(): boolean {
   }
 }
 
-async function copyMetallibs() {
+// The intended min-OS load floor for the artifacts we ship: an explicit
+// MACOSX_DEPLOYMENT_TARGET (what build.rs forwards to the MLX cmake build and
+// the paged-attn metal link), else the build host's macOS version (MLX's
+// cmake default). Undefined skips the floor gate — a broken sw_vers probe
+// must not fail an otherwise healthy build.
+function detectDeploymentFloor(): string | undefined {
+  const env = process.env.MACOSX_DEPLOYMENT_TARGET;
+  if (env !== undefined && env !== '') return env;
+  try {
+    return execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf-8' }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+async function copyMetallibs(outputs: Awaited<typeof task>) {
   const npmDarwinDir = join(__dirname, 'npm', 'darwin-arm64');
   const destDirs = [__dirname, npmDarwinDir];
 
-  // Bind the search to the build napi just ran: same target dir, same
-  // triple (napi always passes `--target`, defaulting to the host triple),
-  // same profile. See metallib-select.ts for why a loose "first directory
-  // that has a metallib" scan is unsafe.
-  const targetRoot = buildOptions.targetDir ?? process.env.CARGO_BUILD_TARGET_DIR ?? join(__dirname, '../../target');
+  // Authoritative binding: the freshly built addon bakes the METAL_PATH of
+  // the exact mlx-sys build it linked against; ship that build's metallibs.
+  // The target-dir/triple/profile derivation only feeds the heuristic scan
+  // used when no path is baked (see metallib-select.ts).
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (!nodeOutput) {
+    throw new Error('[build.ts smoke check] native addon output missing from napi build');
+  }
+  const targetRoot = resolveTargetRoot({
+    targetDir: buildOptions.targetDir,
+    env: process.env,
+    defaultRoot: join(__dirname, '../../target'),
+  });
   const triple = buildOptions.target ?? process.env.CARGO_BUILD_TARGET ?? hostAppleTriple();
   const profile = profileDirName(buildOptions);
-  const candidates = collectMetallibCandidates(targetRoot, triple, profile);
-  if (candidates.length === 0) {
-    throw new Error(
-      `mlx.metallib not found under ${join(targetRoot, triple, profile, 'build')}/mlx-sys-*/out/lib/ ` +
-        `(nor the plain ${join(targetRoot, profile, 'build')} layout).`,
-    );
-  }
-  const picked = candidates[0]!;
-  if (candidates.length > 1) {
-    console.warn(
-      `Multiple mlx-sys metallib dirs found; using the most recently built one:\n` +
-        candidates
-          .map(
-            (c, i) =>
-              `  ${i === 0 ? '->' : '  '} ${c.metallibPath} (${c.size} bytes, ${new Date(c.rankMtimeMs).toISOString()})`,
-          )
-          .join('\n'),
-    );
-  }
+  const picked = selectMetallib({
+    addonBinary: await readFile(nodeOutput.path),
+    addonPath: nodeOutput.path,
+    targetRoot,
+    triple,
+    profile,
+    warn: (msg) => console.warn(msg),
+  });
+  console.log(
+    picked.source === 'baked'
+      ? `Metallib bound via the addon's baked METAL_PATH: ${picked.metallibPath}`
+      : `Metallib selected by directory scan (no baked METAL_PATH): ${picked.metallibPath}`,
+  );
 
-  // Hard gate: never ship a truncated or stale-pin metallib. A mismatch here
-  // pairs wrong kernels with the freshly built addon and produces garbage
-  // inference output with no error at load time.
+  // Hard gates: never ship a truncated or stale-pin metallib (wrong kernels
+  // paired with the fresh addon produce garbage inference with no error at
+  // load time), nor one stamped above the intended deployment floor (it
+  // would refuse to load on floor machines).
+  const deploymentFloor = detectDeploymentFloor();
   const metallib = await readFile(picked.metallibPath);
   assertMetallibIntegrity(metallib, { path: picked.metallibPath, expectNax: detectExpectNax() });
+  if (deploymentFloor !== undefined) {
+    assertMetallibFloor(metallib, { path: picked.metallibPath, deploymentFloor });
+  }
 
   for (const dest of destDirs) {
     const dst = join(dest, 'mlx.metallib');
@@ -176,8 +200,9 @@ async function copyMetallibs() {
   // paged_attn.metallib is also required for darwin.
   // It lives next to mlx.metallib in the same lib dir.
   const pagedPath = join(picked.libDir, 'paged_attn.metallib');
+  let pagedMetallib: Buffer;
   try {
-    await stat(pagedPath);
+    pagedMetallib = await readFile(pagedPath);
   } catch {
     throw new Error(
       `paged_attn.metallib not found at ${pagedPath}. The paged-attention ` +
@@ -185,6 +210,9 @@ async function copyMetallibs() {
         `at runtime; without it, the addon throws on first paged-attention use. ` +
         `Check that mlx-sys/build.rs ran compile_paged_attn_metallib successfully.`,
     );
+  }
+  if (deploymentFloor !== undefined) {
+    assertMetallibFloor(pagedMetallib, { path: pagedPath, deploymentFloor });
   }
   for (const dest of destDirs) {
     const dst = join(dest, 'paged_attn.metallib');

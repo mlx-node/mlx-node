@@ -7,17 +7,29 @@
 // in CI-restored cargo caches). A naive "first directory that contains
 // mlx.metallib" scan can therefore pair a stale metallib with a fresh .node —
 // the kernels then mismatch the compiled C++ and inference produces garbage
-// without any error. Selection here is bound to the build that just ran:
+// without any error. Selection is bound to the build that just ran:
 //
-//   1. Only the tree the napi build used is scanned:
+//   1. AUTHORITATIVE binding: MLX bakes the absolute path of its cmake
+//      kernels output into the addon as the `METAL_PATH` compile definition
+//      (`mlx/backend/metal/device.cpp` `default_mtllib_path`). That string
+//      names the exact `mlx-sys-<hash>/out` dir the addon linked against, so
+//      `extractBakedMetallibBinding` reads it out of the freshly built .node
+//      and the copy step ships `<that out dir>/lib/mlx.metallib` — no
+//      heuristics, immune to newer same-pin dirs left by other cargo
+//      invocations (different feature unification, clippy/test builds,
+//      rust-cache restores) that a recency ranking could wrongly prefer.
+//   2. Heuristic fallback (only when no METAL_PATH is baked, e.g. a
+//      Metal-less addon): scan the tree the napi build used —
 //      `<targetRoot>/<triple>/<profile>/build` (napi always passes
-//      `--target`); the plain `<targetRoot>/<profile>/build` layout is a
-//      fallback for napi-less flows, never mixed with the primary tree.
-//   2. Among candidate `mlx-sys-*` dirs, the one cargo touched most recently
-//      wins (`invoked.timestamp` / build-script `output` / metallib mtime).
-//   3. The chosen metallib must pass a content gate (minimum size + expected
-//      kernel names, including the current pin's NAX kernels on hosts where
-//      MLX builds them) or the build fails loudly instead of shipping it.
+//      `--target`), with the plain `<targetRoot>/<profile>/build` layout as
+//      a napi-less fallback — and pick the `mlx-sys-*` dir cargo touched
+//      most recently (`invoked.timestamp` / build-script `output` /
+//      metallib mtime).
+//   3. Content gates run on the chosen metallib either way: minimum size +
+//      expected kernel names (including the current pin's NAX kernels on
+//      hosts where MLX builds them), plus a min-OS stamp check against the
+//      intended deployment floor. Failures abort the build loudly instead
+//      of shipping a broken pairing.
 //
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
 // other toolchains/branches, and deleting them forces a full MLX rebuild.
@@ -48,6 +60,154 @@ export const NAX_KERNEL_MARKERS = ['affine_qmv_wide', 'steel_gemm_segmented_nax'
 
 export function hostAppleTriple(arch: string = process.arch): string {
   return arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+}
+
+/**
+ * Cargo target-dir resolution for the fallback scan, mirroring cargo's own
+ * precedence: `--target-dir` flag > `CARGO_TARGET_DIR` env >
+ * `CARGO_BUILD_TARGET_DIR` env (the `build.target-dir` config form) > the
+ * repo default. Empty env values behave like unset, matching cargo.
+ */
+export function resolveTargetRoot(opts: {
+  /** `--target-dir` as parsed by the napi CLI (its flag is forwarded to cargo). */
+  targetDir: string | undefined;
+  env: Record<string, string | undefined>;
+  defaultRoot: string;
+}): string {
+  const nonEmpty = (v: string | undefined): string | undefined => (v !== undefined && v !== '' ? v : undefined);
+  return (
+    nonEmpty(opts.targetDir) ??
+    nonEmpty(opts.env['CARGO_TARGET_DIR']) ??
+    nonEmpty(opts.env['CARGO_BUILD_TARGET_DIR']) ??
+    opts.defaultRoot
+  );
+}
+
+/** The exact mlx-sys build a native addon linked against, read from the addon itself. */
+export interface MetallibBinding {
+  /** The METAL_PATH string baked into the binary (cmake kernels build-tree path). */
+  bakedPath: string;
+  /** `.../mlx-sys-<hash>/out` — OUT_DIR of the bound mlx-sys build. */
+  outDir: string;
+  /** `.../out/lib` — install dir holding mlx.metallib + paged_attn.metallib. */
+  libDir: string;
+  /** `.../out/lib/mlx.metallib`. */
+  metallibPath: string;
+}
+
+/**
+ * MLX compiles `device.cpp` with `-DMETAL_PATH="<kernels build dir>/mlx.metallib"`
+ * (see `mlx/backend/metal/CMakeLists.txt`), so every Metal-enabled addon carries
+ * the absolute path of the kernels dir it linked against. The trailing
+ * `kernels//` double slash comes from CMake joining a dir that already ends in
+ * `/`; accept both forms.
+ */
+const BAKED_METAL_PATH_RE = /^(\/.+\/mlx-sys-[0-9a-f]+\/out)\/build\/mlx\/backend\/metal\/kernels\/{1,2}mlx\.metallib$/;
+
+/** Longest plausible baked path; bounds the NUL-terminated-string expansion. */
+const MAX_BAKED_PATH_BYTES = 4096;
+
+/**
+ * Extract the baked METAL_PATH from an addon binary. Returns undefined when
+ * the binary carries no baked path (Metal not built in); throws when it
+ * carries more than one distinct path — that would mean two different MLX
+ * builds were linked and no single metallib can be authoritative.
+ */
+export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBinding | undefined {
+  const needle = Buffer.from('mlx.metallib');
+  const bindings = new Map<string, MetallibBinding>();
+  let at = addonBinary.indexOf(needle);
+  while (at !== -1) {
+    // Expand the hit to its enclosing NUL-terminated C string (bounded: a
+    // hit inside non-string data must not walk megabytes backwards).
+    let start = at;
+    const startFloor = Math.max(0, at - MAX_BAKED_PATH_BYTES);
+    while (start > startFloor && addonBinary[start - 1] !== 0) start--;
+    let end = at + needle.length;
+    const endCap = Math.min(addonBinary.length, end + MAX_BAKED_PATH_BYTES);
+    while (end < endCap && addonBinary[end] !== 0) end++;
+    const candidate = addonBinary.subarray(start, end).toString('utf-8');
+    const match = BAKED_METAL_PATH_RE.exec(candidate);
+    if (match) {
+      const outDir = match[1]!;
+      const libDir = join(outDir, 'lib');
+      bindings.set(candidate, { bakedPath: candidate, outDir, libDir, metallibPath: join(libDir, 'mlx.metallib') });
+    }
+    at = addonBinary.indexOf(needle, at + needle.length);
+  }
+  if (bindings.size === 0) return undefined;
+  if (bindings.size > 1) {
+    throw new Error(
+      `[build.ts metallib gate] the addon bakes ${bindings.size} distinct METAL_PATH strings — ` +
+        `cannot bind a single metallib to it:\n` +
+        [...bindings.keys()].map((p) => `  ${p}`).join('\n'),
+    );
+  }
+  return bindings.values().next().value;
+}
+
+export interface SelectedMetallib {
+  libDir: string;
+  metallibPath: string;
+  /** 'baked' = authoritative binding from the addon binary; 'scan' = heuristic fallback. */
+  source: 'baked' | 'scan';
+}
+
+/**
+ * Pick the metallib to ship with a freshly built addon. The baked METAL_PATH
+ * inside the addon is authoritative; the mtime-ranked directory scan runs
+ * only when the addon carries no baked path at all. When the baked dir has
+ * lost its metallib this throws instead of falling back — shipping a
+ * different build's metallib is exactly the pairing hazard this exists to
+ * prevent.
+ */
+export function selectMetallib(opts: {
+  addonBinary: Buffer;
+  addonPath: string;
+  targetRoot: string;
+  triple: string;
+  profile: string;
+  warn?: (msg: string) => void;
+}): SelectedMetallib {
+  const warn = opts.warn ?? (() => {});
+  const binding = extractBakedMetallibBinding(opts.addonBinary);
+  if (binding) {
+    try {
+      statSync(binding.metallibPath);
+    } catch {
+      throw new Error(
+        `[build.ts metallib gate] ${opts.addonPath} was linked against the mlx-sys build at ` +
+          `${binding.outDir} (baked METAL_PATH: ${binding.bakedPath}), but ${binding.metallibPath} ` +
+          `does not exist. That build dir was deleted or moved after linking; re-run the native ` +
+          `build so the addon and metallib come out of the same mlx-sys build.`,
+      );
+    }
+    return { libDir: binding.libDir, metallibPath: binding.metallibPath, source: 'baked' };
+  }
+  warn(
+    `No baked METAL_PATH found in ${opts.addonPath}; falling back to scanning ` +
+      `${opts.targetRoot} for the most recent mlx-sys build.`,
+  );
+  const candidates = collectMetallibCandidates(opts.targetRoot, opts.triple, opts.profile);
+  if (candidates.length === 0) {
+    throw new Error(
+      `mlx.metallib not found under ${join(opts.targetRoot, opts.triple, opts.profile, 'build')}/mlx-sys-*/out/lib/ ` +
+        `(nor the plain ${join(opts.targetRoot, opts.profile, 'build')} layout).`,
+    );
+  }
+  const picked = candidates[0]!;
+  if (candidates.length > 1) {
+    warn(
+      `Multiple mlx-sys metallib dirs found; using the most recently built one:\n` +
+        candidates
+          .map(
+            (c, i) =>
+              `  ${i === 0 ? '->' : '  '} ${c.metallibPath} (${c.size} bytes, ${new Date(c.rankMtimeMs).toISOString()})`,
+          )
+          .join('\n'),
+    );
+  }
+  return { libDir: picked.libDir, metallibPath: picked.metallibPath, source: 'scan' };
 }
 
 export function profileDirName(opts: { profile?: string | undefined; release?: boolean | undefined }): string {
@@ -173,5 +333,46 @@ export function assertMetallibIntegrity(
           `target/*/release/build/.`,
       );
     }
+  }
+}
+
+/**
+ * Read the min-OS stamp from a metallib's MTLB container header: magic
+ * `MTLB` at offset 0, min-OS major as u16 LE at offset 12, minor at 14.
+ * Verified against `xcrun metal -mmacosx-version-min=15.0/26.0/26.2` output
+ * (`0f00 0000` / `1a00 0000` / `1a00 0200`) and cross-checked with
+ * `xcrun air-vtool -show` on the shipped artifacts. Returns undefined when
+ * the header does not look like this layout — the floor gate is
+ * best-effort and must not fail on a future container revision.
+ */
+export function parseMetallibMinOs(metallib: Buffer): string | undefined {
+  if (metallib.byteLength < 16) return undefined;
+  if (metallib.toString('latin1', 0, 4) !== 'MTLB') return undefined;
+  const major = metallib.readUInt16LE(12);
+  const minor = metallib.readUInt16LE(14);
+  // macOS majors run 10 (Yosemite era) through the year-based 26+; anything
+  // outside a generous bound means the offset no longer holds a version.
+  if (major < 10 || major > 99) return undefined;
+  return `${major}.${minor}`;
+}
+
+/**
+ * Deployment-floor gate: a metallib whose container min-OS stamp is ABOVE
+ * the intended floor refuses to load on floor machines, and the kernel-name
+ * inventory cannot tell floors apart. A stamp below the floor is harmless
+ * (it loads on the floor and older). Skips silently when the header cannot
+ * be parsed.
+ */
+export function assertMetallibFloor(metallib: Buffer, opts: { path: string; deploymentFloor: string }): void {
+  const stamped = parseMetallibMinOs(metallib);
+  if (stamped === undefined) return;
+  if (compareVersions(stamped, opts.deploymentFloor) > 0) {
+    throw new Error(
+      `[build.ts metallib gate] ${opts.path} stamps min-OS ${stamped}, above the intended ` +
+        `deployment floor ${opts.deploymentFloor} — it would fail to load on macOS ` +
+        `${opts.deploymentFloor} hosts. It was linked under a different ` +
+        `MACOSX_DEPLOYMENT_TARGET; re-run the native build with the intended floor ` +
+        `(if it persists, purge the containing mlx-sys-*/out dir).`,
+    );
   }
 }
