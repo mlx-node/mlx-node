@@ -287,11 +287,25 @@ fn main() {
         // recorded in CMakeCache.txt (e.g. a CI-restored cargo cache),
         // which the environment variable alone cannot. When unset, MLX's
         // CMakeLists defaults the floor to the build host's macOS version.
-        // Note MLX only builds the NAX (M5 tensor-core) kernels when this
-        // floor is >= 26.2 — pinning lower silently drops them.
         if let Some(deployment_target) = macos_deployment_target() {
             cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", &deployment_target);
         }
+        // Upstream MLX only builds the NAX (gen-17 tensor-core) kernels when
+        // the deployment floor is >= 26.2 and otherwise compiles the dispatch
+        // out via MLX_METAL_NO_NAX. The vendored fork branch
+        // (mlx-node/mlx#nax-macos-26-0-floor) adds MLX_METAL_FORCE_NAX to
+        // decouple kernel presence from the floor, so one published artifact
+        // can keep a macOS 26.0 floor AND carry the NAX kernels. The NAX
+        // kernels themselves still compile at -mmacosx-version-min=26.2 —
+        // they need the 26.2 tensor-ops ABI (lower targets select MPP's
+        // pre-26.2 compatibility intrinsics, which miscompute) — while the
+        // metallib links at the floor, so it loads on all of macOS 26.
+        // Runtime dispatch (`is_nax_available`: gpu gen >= 17 && macOS >=
+        // 26.2) keeps pre-26.2 machines from ever instantiating the
+        // 26.2-targeted functions. The option is inert when the floor is
+        // already >= 26.2 and when the SDK cannot build NAX (SDK < 26.2 or
+        // MSL < 4.0).
+        cfg.define("MLX_METAL_FORCE_NAX", "ON");
     }
 
     if target_os == "macos" {

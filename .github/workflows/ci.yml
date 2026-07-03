@@ -15,6 +15,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 1
+  # Deployment floor of every macOS build product (metallib min-OS stamp,
+  # libmlx, .node). Without it the floor silently tracks the runner image's
+  # macOS version and ratchets with runner updates. 26.0 keeps published
+  # binaries loading on all macOS 26 releases; the vendored MLX fork still
+  # builds the NAX kernels at this floor (MLX_METAL_FORCE_NAX, see
+  # crates/mlx-sys/build.rs) and runtime dispatch keeps pre-26.2 machines
+  # off them. Set on the whole workflow so test jobs exercise the same
+  # floor the publish artifacts ship with.
+  MACOSX_DEPLOYMENT_TARGET: '26.0'
 
 jobs:
   build:

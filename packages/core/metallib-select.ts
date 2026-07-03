@@ -67,11 +67,20 @@ export function compareVersions(a: string, b: string): number {
 }
 
 /**
- * Mirror of the NAX condition in MLX's
- * `mlx/backend/metal/kernels/CMakeLists.txt`: NAX kernels are compiled iff
- * the macOS SDK is >= 26.2 AND the effective `CMAKE_OSX_DEPLOYMENT_TARGET`
- * is >= 26.2, where the deployment target defaults to the build host's
- * macOS version when `MACOSX_DEPLOYMENT_TARGET` is not set.
+ * Mirror of the NAX condition in the vendored MLX's
+ * `mlx/backend/metal/kernels/CMakeLists.txt` as configured by
+ * `crates/mlx-sys/build.rs`. mlx-sys always passes `-DMLX_METAL_FORCE_NAX=ON`
+ * (fork branch `nax-macos-26-0-floor`), which drops upstream's
+ * deployment-target >= 26.2 clause, so NAX kernels are compiled iff the macOS
+ * SDK is >= 26.2 AND the effective `CMAKE_OSX_DEPLOYMENT_TARGET` is >= 26.0
+ * (below 26.0 the Metal language version falls under MSL 4.0 and the gate's
+ * `MLX_METAL_VERSION GREATER_EQUAL 400` clause fails). The deployment target
+ * defaults to the build host's macOS version when `MACOSX_DEPLOYMENT_TARGET`
+ * is not set. The force-built NAX kernels internally compile against the
+ * macOS 26.2 tensor-ops ABI while the metallib links (and load-gates) at the
+ * floor; runtime dispatch still requires macOS 26.2 — kernel presence and
+ * dispatch are deliberately decoupled so one 26.0-floor artifact serves
+ * every macOS 26 host.
  */
 export function shouldExpectNaxKernels(
   sdkVersion: string,
@@ -79,7 +88,7 @@ export function shouldExpectNaxKernels(
   deploymentTargetEnv: string | undefined,
 ): boolean {
   const effectiveTarget = deploymentTargetEnv && deploymentTargetEnv !== '' ? deploymentTargetEnv : hostVersion;
-  return compareVersions(sdkVersion, '26.2') >= 0 && compareVersions(effectiveTarget, '26.2') >= 0;
+  return compareVersions(sdkVersion, '26.2') >= 0 && compareVersions(effectiveTarget, '26.0') >= 0;
 }
 
 /**

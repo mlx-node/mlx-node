@@ -121,12 +121,13 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 | Linux · aarch64 / glibc · NVIDIA | CUDA    | 🧪 Experimental — inference preview             |
 
 > **macOS version floor:** the prebuilt `darwin-arm64` binaries published to npm are
-> compiled on `macos-26` CI runners against the macOS 26 SDK, so their Metal library
-> targets MSL 4 and does not load on macOS 15 or older — **macOS 26+ is required for
-> the prebuilt binaries**. Building from source works on macOS ≥ 14 (MLX's floor); the
+> built with an explicit macOS 26.0 deployment floor (MSL 4) — they load on every
+> macOS 26 release and do not load on macOS 15 or older, so **macOS 26+ is required
+> for the prebuilt binaries**. They also carry MLX's NAX kernels (M5-class GPUs),
+> which activate only at runtime on macOS 26.2+ — on 26.0/26.1 the same binary runs
+> the standard kernels. Building from source works on macOS ≥ 14 (MLX's floor); the
 > deployment floor then defaults to the build host's macOS version, and can be pinned
-> explicitly with `MACOSX_DEPLOYMENT_TARGET`. MLX's NAX kernels (M5-class GPUs) are
-> only compiled in when the floor is ≥ 26.2 and only dispatch on macOS 26.2+.
+> explicitly with `MACOSX_DEPLOYMENT_TARGET`.
 
 ### NVIDIA CUDA (experimental preview)
 

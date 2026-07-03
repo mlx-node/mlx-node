@@ -28,16 +28,19 @@ describe('compareVersions', () => {
 });
 
 describe('shouldExpectNaxKernels', () => {
-  it('mirrors the MLX cmake gate: SDK >= 26.2 AND effective deployment target >= 26.2', () => {
+  it('mirrors the forced-NAX cmake gate: SDK >= 26.2 AND effective deployment target >= 26.0', () => {
     // deployment target defaults to the host version when the env is unset
     expect(shouldExpectNaxKernels('26.5', '26.5.2', undefined)).toBe(true);
     expect(shouldExpectNaxKernels('26.2', '26.2', undefined)).toBe(true);
-    // host below 26.2 -> defaulted deployment target too low
-    expect(shouldExpectNaxKernels('26.5', '26.1', undefined)).toBe(false);
+    // MLX_METAL_FORCE_NAX drops upstream's >= 26.2 floor clause: any
+    // macOS 26 target (MSL 4.0) builds the NAX kernels
+    expect(shouldExpectNaxKernels('26.5', '26.1', undefined)).toBe(true);
     // SDK too old builds no NAX regardless of target
     expect(shouldExpectNaxKernels('15.5', '26.5', undefined)).toBe(false);
-    // explicit env pin overrides the host default in both directions
-    expect(shouldExpectNaxKernels('26.5', '26.5', '26.0')).toBe(false);
+    // the published-artifact configuration: 26.0 floor still carries NAX
+    expect(shouldExpectNaxKernels('26.5', '26.5', '26.0')).toBe(true);
+    // a pre-26 floor drops MSL below 4.0, which fails the gate's
+    // MLX_METAL_VERSION >= 400 clause
     expect(shouldExpectNaxKernels('26.5', '26.5', '15.0')).toBe(false);
     expect(shouldExpectNaxKernels('26.5', '26.1', '26.2')).toBe(true);
     // empty env behaves like unset
