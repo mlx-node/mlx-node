@@ -143,6 +143,32 @@ describe('collectMetallibCandidates', () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0]!.metallibPath).toBe(debug);
   });
+
+  it.skipIf(runningAsRoot)(
+    'THROWS when the newest candidate is untraversable (EACCES), instead of skipping it and picking an older one',
+    () => {
+      addOutDir(`${TRIPLE}/release/build/mlx-sys-aaaa1111`, 'older-readable', 7);
+      addOutDir(`${TRIPLE}/release/build/mlx-sys-ffff2222`, 'newest-unreadable', 0);
+      const newestLibDir = join(root, `${TRIPLE}/release/build/mlx-sys-ffff2222`, 'out', 'lib');
+      chmodSync(newestLibDir, 0o000); // stat on its metallib now fails EACCES, not ENOENT
+      try {
+        expect(() => collectMetallibCandidates(root, TRIPLE, 'release')).toThrow(/cannot stat/);
+      } finally {
+        chmodSync(newestLibDir, 0o755);
+      }
+    },
+  );
+
+  it.skipIf(runningAsRoot)('THROWS when a candidate build root exists but cannot be listed (EACCES)', () => {
+    addOutDir(`${TRIPLE}/release/build/mlx-sys-aaaa1111`, 'unreachable', 0);
+    const buildRoot = join(root, TRIPLE, 'release', 'build');
+    chmodSync(buildRoot, 0o000);
+    try {
+      expect(() => collectMetallibCandidates(root, TRIPLE, 'release')).toThrow(/cannot list/);
+    } finally {
+      chmodSync(buildRoot, 0o755);
+    }
+  });
 });
 
 describe('resolveTargetRoot', () => {

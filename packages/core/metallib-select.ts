@@ -34,7 +34,7 @@
 //
 // Stale dirs are deliberately NOT deleted: they are live cargo cache for
 // other toolchains/branches, and deleting them forces a full MLX rebuild.
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, type Stats } from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
 
 export interface MetallibCandidate {
@@ -179,20 +179,26 @@ export interface SelectedMetallib {
  * Only ENOENT/ENOTDIR mean "the artifact is not there". Anything else
  * (EACCES, EPERM, EISDIR, EIO, ...) means the artifact may well exist but
  * cannot be inspected — treating that as absence would silently skip the
- * byte-identity comparison and ship the other copy unverified.
+ * byte-identity comparison (or, in the fallback scan, skip the current
+ * candidate and select an older one). Every fs probe in this module routes
+ * through this policy: absence continues, everything else fails loudly.
  */
 function isAbsenceError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
-function statSize(path: string): number | undefined {
+function statIfExists(path: string): Stats | undefined {
   try {
-    return statSync(path).size;
+    return statSync(path);
   } catch (err) {
     if (isAbsenceError(err)) return undefined;
     throw new Error(`[build.ts metallib gate] cannot stat ${path}: ${(err as Error).message}`);
   }
+}
+
+function statSize(path: string): number | undefined {
+  return statIfExists(path)?.size;
 }
 
 /**
@@ -422,8 +428,12 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
     let entries: string[];
     try {
       entries = readdirSync(buildRoot);
-    } catch {
-      continue;
+    } catch (err) {
+      // A missing tree just means the build used the other layout; anything
+      // else (EACCES, ...) would silently hide the current candidates and
+      // let an older readable one win — fail loudly instead.
+      if (isAbsenceError(err)) continue;
+      throw new Error(`[build.ts metallib gate] cannot list ${buildRoot}: ${(err as Error).message}`);
     }
     const candidates: MetallibCandidate[] = [];
     for (const dir of entries) {
@@ -431,20 +441,19 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
       const scriptDir = join(buildRoot, dir);
       const libDir = join(scriptDir, 'out', 'lib');
       const metallibPath = join(libDir, 'mlx.metallib');
-      let metallibStat;
-      try {
-        metallibStat = statSync(metallibPath);
-      } catch {
-        continue;
-      }
+      // Dirs without a metallib are skipped; an uninspectable one throws
+      // (via statIfExists) rather than being mistaken for absent.
+      const metallibStat = statIfExists(metallibPath);
+      if (metallibStat === undefined) continue;
       // `invoked.timestamp` is rewritten when cargo (re)runs the build
       // script; the metallib/`output` mtimes cover reused cached outputs.
       let rankMtimeMs = metallibStat.mtimeMs;
       for (const probe of ['invoked.timestamp', 'output']) {
-        try {
-          rankMtimeMs = Math.max(rankMtimeMs, statSync(join(scriptDir, probe)).mtimeMs);
-        } catch {
-          // probe file absent — fall back to the mtimes we have
+        // Probe files are optional; when absent the mtimes we have rank the
+        // dir. Unreadable probes throw — they would corrupt the ranking.
+        const probeStat = statIfExists(join(scriptDir, probe));
+        if (probeStat !== undefined) {
+          rankMtimeMs = Math.max(rankMtimeMs, probeStat.mtimeMs);
         }
       }
       candidates.push({ libDir, metallibPath, size: metallibStat.size, rankMtimeMs });
