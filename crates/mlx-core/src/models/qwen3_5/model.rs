@@ -285,6 +285,13 @@ pub(crate) struct Qwen35Inner {
     /// history. Pure-flat sessions only; the paged path rolls back its adapter
     /// directly.
     pub(crate) flat_mtp_caches_desynced: bool,
+    /// Count of full-history flat re-prefills taken by the streaming delta path
+    /// because the caches were desynced (the discard+re-prefill heal at
+    /// `chat_stream_tokens_delta_sync_inner`). Monotonic; lets a test confirm a
+    /// continue turn actually took the heal path (the streaming chunk's
+    /// `prompt_tokens`/`cached_tokens` are reported identically for heal and warm,
+    /// so they can't distinguish the two).
+    pub(crate) flat_full_reprefill_count: u64,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -331,6 +338,26 @@ pub(crate) enum Qwen35Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
+    /// Test-only: snapshot the flat-MTP cache state between turns —
+    /// `(cached_token_history.len(), flat_mtp_caches_desynced,
+    /// flat_full_reprefill_count)`. The length is the committed prompt+generation
+    /// history (how many tokens a turn actually committed, independent of the
+    /// warm/heal path a later turn takes); the flag is whether a mid-cycle stop
+    /// stranded tokens and armed the heal; the count is the monotonic number of
+    /// full-history re-prefill heals taken so far (so a test can confirm a
+    /// continue turn actually took the heal path).
+    #[doc(hidden)]
+    MtpFlatStateForTest {
+        reply: ResponseTx<(usize, bool, u64)>,
+    },
+    /// Test-only: arm the flat-MTP desync heal (`flat_mtp_caches_desynced =
+    /// true`) so the NEXT delta turn takes the discard+re-prefill path
+    /// deterministically. The heal re-prefills from `cached_token_history` and
+    /// ignores the (discarded) cache contents, so arming the flag on a clean
+    /// session faithfully exercises the heal without a host-timing-dependent
+    /// mid-cycle cancel.
+    #[doc(hidden)]
+    ForceFlatMtpDesyncForTest { reply: ResponseTx<()> },
     /// Training-session commands shared with the model-neutral engine. The
     /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
@@ -436,6 +463,17 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
+        }
+        Qwen35Cmd::MtpFlatStateForTest { reply } => {
+            let _ = reply.send(Ok((
+                inner.cached_token_history.len(),
+                inner.flat_mtp_caches_desynced,
+                inner.flat_full_reprefill_count,
+            )));
+        }
+        Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
+            inner.flat_mtp_caches_desynced = true;
+            let _ = reply.send(Ok(()));
         }
         // --- Training commands ---
         Qwen35Cmd::Train(train_cmd) => {
@@ -688,6 +726,7 @@ impl Qwen35Inner {
             paged_adapter,
             paged_full_attn_caches_dirty: false,
             flat_mtp_caches_desynced: false,
+            flat_full_reprefill_count: 0,
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
@@ -4329,6 +4368,7 @@ impl Qwen35Inner {
             // Discard the paged-session flat caches (full-attn slots are
             // stale, GDN state belongs to the released paged request) and
             // re-prefill the entire conversation into fresh flat caches.
+            self.flat_full_reprefill_count += 1;
             self.caches = Some(fresh_dense_layer_caches(&self.config));
             let prompt =
                 MxArray::from_uint32(&full_token_history, &[1, full_token_history.len() as i64])?;
@@ -8323,6 +8363,42 @@ impl Qwen3_5Model {
                 cancelled: cancelled_inner,
             }))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
+    }
+
+    /// Test-only snapshot of the flat-MTP cache state, read *between* turns:
+    /// `(committed_history_len, flat_mtp_caches_desynced, full_reprefill_count)`.
+    ///
+    /// `committed_history_len` is `cached_token_history.len()` — the prompt plus
+    /// the committed generation of every completed turn — i.e. exactly how many
+    /// tokens a turn committed. Unlike `ChatStreamChunk.prompt_tokens` (hardcoded
+    /// to the delta length on the streaming delta path, heal or warm), it is
+    /// path-independent and comparable across MTP and AR turns.
+    /// `flat_mtp_caches_desynced` reports whether the preceding turn stranded
+    /// tokens mid-cycle and armed the heal. `full_reprefill_count` is the
+    /// monotonic number of discard+re-prefill heals the streaming delta path has
+    /// taken — the only externally-observable proof a continue turn actually took
+    /// the heal (the reported `prompt_tokens`/`cached_tokens` cannot distinguish
+    /// heal from warm). Serialized behind the model thread, so it observes the
+    /// fully-finalized preceding turn.
+    #[doc(hidden)]
+    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64) {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
+            reply,
+        })
+        .await
+        .expect("mtp_flat_state_for_test: model thread reply failed")
+    }
+
+    /// Test-only: arm the flat-MTP desync heal so the NEXT delta turn takes the
+    /// discard+re-prefill path. Lets a test exercise the heal deterministically
+    /// (the mid-cycle cancel that naturally arms it is host-timing-dependent).
+    #[doc(hidden)]
+    pub async fn force_flat_mtp_desync_for_test(&self) {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
+        })
+        .await
+        .expect("force_flat_mtp_desync_for_test: model thread reply failed")
     }
 
     /// Get the number of parameters in the model.
