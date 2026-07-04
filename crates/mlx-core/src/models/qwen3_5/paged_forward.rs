@@ -42,11 +42,12 @@ use crate::engine::vision::VisionMerge;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::nn::{Embedding, Linear, RMSNorm};
+use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
+use super::quantized_linear::LinearProj;
 
 fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
@@ -166,7 +167,7 @@ pub(crate) fn run_paged_prefill_chunk(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -208,7 +209,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -362,7 +363,7 @@ fn run_paged_prefill_single_shot(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -416,7 +417,7 @@ pub(crate) fn run_paged_vlm_prefill(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -475,7 +476,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -512,7 +513,7 @@ fn run_paged_prefill_chunk_with_hidden_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -668,7 +669,7 @@ fn run_paged_prefill_single_shot_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -791,7 +792,7 @@ fn run_paged_prefill_one_chunk(
 fn project_last_token_logits(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embed: &Embedding,
     embedding_weight: &MxArray,
 ) -> Result<MxArray> {
@@ -825,7 +826,7 @@ fn project_last_token_logits(
 fn project_last_token_logits_with_full_hidden(
     hidden_states: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embed: &Embedding,
     embedding_weight: &MxArray,
     keep_last_hidden: Option<usize>,
@@ -874,7 +875,7 @@ pub(crate) fn run_paged_decode_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
@@ -955,7 +956,7 @@ pub(crate) fn run_paged_step_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],
@@ -1046,7 +1047,7 @@ pub(crate) fn run_paged_verify_step(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
     layer_kinds: &[Qwen3_5LayerKind],

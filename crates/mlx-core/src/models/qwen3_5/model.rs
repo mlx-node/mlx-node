@@ -8,6 +8,7 @@ use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 use napi_derive::napi;
 use tracing::{debug, info, warn};
 
+use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
@@ -245,7 +246,7 @@ pub(crate) struct Qwen35Inner {
     pub(crate) embedding: Embedding,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
-    pub(crate) lm_head: Option<Linear>,
+    pub(crate) lm_head: Option<LinearProj>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
@@ -600,11 +601,11 @@ impl Qwen35Inner {
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(Linear::new(
+            Some(LinearProj::Standard(Linear::new(
                 config.hidden_size as u32,
                 config.vocab_size as u32,
                 Some(false),
-            )?)
+            )?))
         };
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -6361,7 +6362,7 @@ impl Qwen35Inner {
         for (name, updated_param) in updated_params.iter() {
             if name == "lm_head.weight" {
                 if let Some(ref mut lm) = self.lm_head {
-                    lm.set_weight(updated_param)?;
+                    lm.set_weight(updated_param, "lm_head")?;
                 }
             } else if name == "final_norm.weight" {
                 self.final_norm.set_weight(updated_param)?;
@@ -8523,7 +8524,7 @@ fn chunked_prefill(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
 ) -> Result<MxArray> {
@@ -8546,7 +8547,7 @@ fn chunked_prefill_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     chunk_size: i64,
@@ -8613,7 +8614,7 @@ fn chunked_prefill_with_hidden(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
@@ -8638,7 +8639,7 @@ fn chunked_prefill_with_hidden_with_size(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
@@ -8755,7 +8756,7 @@ fn forward_inner(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
     let hidden = forward_pre_norm_inner(input_ids, embedding_weight, layers, caches)?;
@@ -8850,7 +8851,7 @@ fn forward_pre_norm_inner_with_tape(
 
 fn project_logits_from_hidden(
     hidden: &MxArray,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
@@ -8887,7 +8888,7 @@ fn eager_verify_step(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     verify_ids: &MxArray,
     emb: &MxArray,
     emb_t: Option<&MxArray>,
@@ -8911,7 +8912,7 @@ fn eager_verify_step(
 fn project_last_logits_from_pre_norm_hidden(
     hidden: &MxArray,
     final_norm: &RMSNorm,
-    lm_head: &Option<Linear>,
+    lm_head: &Option<LinearProj>,
     embedding_weight: &MxArray,
     embedding_weight_t: Option<&MxArray>,
 ) -> Result<MxArray> {
@@ -10036,7 +10037,7 @@ mod paged_construction_tests {
 
         if let Some(head) = inner.lm_head.as_mut() {
             let w = head.get_weight();
-            head.set_weight(&cast(&w)).expect("set lm_head");
+            head.set_weight(&cast(&w), "lm_head").expect("set lm_head");
         }
 
         for layer in inner.layers.iter_mut() {

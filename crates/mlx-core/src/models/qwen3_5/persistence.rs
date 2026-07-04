@@ -1032,27 +1032,21 @@ fn apply_weights_inner(
         inner.final_norm.set_weight(w)?;
     }
 
-    // LM head
+    // LM head. The outer `Some(head)` guard preserves the tied-embeddings
+    // path: when `tie_word_embeddings`, `inner.lm_head` is `None` and the head
+    // is never installed even if `lm_head.*` tensors are present. The head
+    // installs through the mode-aware `try_build_ql` dispatch (affine / mxfp8 /
+    // mxfp4 / nvfp4 / sym8) so non-affine quantized heads load, not just affine
+    // — the legacy `Linear::load_quantized` hardcoded affine dequant.
     if let Some(ref mut head) = inner.lm_head {
-        if let Some(scales) = params.get("lm_head.scales") {
-            let weight = params.get("lm_head.weight").ok_or_else(|| {
-                Error::from_reason("Missing lm_head.weight for quantized lm_head")
-            })?;
-            let biases = params.get("lm_head.biases");
-            let plq = per_layer_quant
-                .get("lm_head")
-                .copied()
-                .unwrap_or(default_plq);
-            head.load_quantized(weight, scales, biases, plq.group_size, plq.bits)?;
-            info!(
-                "Loaded quantized lm_head ({}-bit, quantized_matmul on forward)",
-                plq.bits
-            );
+        if let Some(ql) = try_build_ql(params, "lm_head")? {
+            head.set_quantized(ql);
+            info!("Loaded quantized lm_head (mode-aware, quantized_matmul on forward)");
         } else if let Some(w) = params.get("lm_head.weight") {
             // Dense fallback (no `.scales`) — same stripped-quant-group
             // dtype guard as the embedding above.
             ensure_dense_weight_floating("lm_head.weight", w)?;
-            head.set_weight(w)?;
+            head.set_weight(w, "lm_head")?;
         }
     }
 
@@ -2661,6 +2655,223 @@ mod tests {
             inner.embedding.is_packed_quantized(),
             "tied+quantized embedding.* on the paged path must load via load_quantized_packed, not the legacy dense load_quantized"
         );
+    }
+
+    /// The dense `lm_head` must install through the mode-aware `LinearProj`
+    /// dispatch (`try_build_ql`): a non-affine (mxfp8) quantized head and an
+    /// affine quantized head both install as `LinearProj::Quantized`, a bf16
+    /// head installs as `LinearProj::Standard`, and a tied config leaves the
+    /// head `None`.
+    ///
+    /// Regression guard for `Linear::load_quantized` hardcoding affine dequant:
+    /// an mxfp8/nvfp4 head previously crashed ("Biases must be provided for
+    /// affine quantization") because the legacy install called
+    /// `head.load_quantized(...)` unconditionally. The install-only checks
+    /// tolerate the end-of-load completeness gate (this fixture provides only
+    /// `lm_head.*`), which fires strictly AFTER the head backend is installed
+    /// on `inner`.
+    #[test]
+    fn dense_lm_head_installs_mode_aware_linearproj() {
+        use super::super::quantized_linear::{
+            DEFAULT_QUANT_MODE, LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+        };
+        let label = "dense_lm_head_installs_mode_aware_linearproj";
+
+        // Construct an untied inner first — this is the op that needs MLX/Metal,
+        // so a clean skip here means the fixture builds below never hit a device
+        // error.
+        let untied_cfg = Qwen3_5Config {
+            vocab_size: 8,
+            tie_word_embeddings: false,
+            ..no_mtp_layer_cfg()
+        };
+        let vocab = untied_cfg.vocab_size as i64;
+        let hidden = untied_cfg.hidden_size as i64;
+
+        let new_inner = || match Qwen35Inner::new(untied_cfg.clone()) {
+            Ok(inner) => Some(inner),
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    None
+                } else {
+                    panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+                }
+            }
+        };
+
+        // Array builders. Reachable only after `Qwen35Inner::new` succeeded, so
+        // the device is up and `.expect` is safe.
+        let u32_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![0.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+        let bf16_arr = |shape: &[i64], v: f32| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![v; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+
+        // Run `apply_weights_inner` for an install-only fixture: the partial
+        // checkpoint (only `lm_head.*`) is rejected by the completeness gate,
+        // which runs AFTER the head install — tolerate only that specific error.
+        let apply_install_only =
+            |inner: &mut Qwen35Inner,
+             params: &HashMap<String, MxArray>,
+             plq: &HashMap<String, PerLayerQuant>| {
+                match apply_weights_inner(
+                    inner,
+                    params,
+                    &untied_cfg,
+                    DEFAULT_QUANT_BITS,
+                    DEFAULT_QUANT_GROUP_SIZE,
+                    None,
+                    plq,
+                    /* has_vision */ false,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let msg = err.reason.to_string();
+                        assert!(
+                            msg.contains("missing mandatory weights"),
+                            "unexpected apply_weights_inner error in {label}: {msg}"
+                        );
+                    }
+                }
+            };
+
+        // (a) Non-affine (mxfp8) head → Quantized. This is the case the legacy
+        //     `head.load_quantized` (affine-only) crashed on.
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+            params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+            let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+            plq.insert(
+                "lm_head".into(),
+                PerLayerQuant {
+                    bits: MXFP8_BITS,
+                    group_size: MXFP8_GROUP_SIZE,
+                    mode: PerLayerMode::Mxfp8,
+                },
+            );
+            apply_install_only(&mut inner, &params, &plq);
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+                "mxfp8 lm_head must install as LinearProj::Quantized"
+            );
+            if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+                assert_eq!(ql.mode(), MXFP8_MODE, "mxfp8 head must keep mxfp8 mode");
+            }
+        }
+
+        // (b) Affine head → Quantized (mode "affine").
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u32_arr(&[vocab, hidden / 8]));
+            params.insert(
+                "lm_head.scales".into(),
+                bf16_arr(&[vocab, hidden / 32], 1.0),
+            );
+            params.insert(
+                "lm_head.biases".into(),
+                bf16_arr(&[vocab, hidden / 32], 0.0),
+            );
+            let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+            plq.insert(
+                "lm_head".into(),
+                PerLayerQuant {
+                    bits: 4,
+                    group_size: 32,
+                    mode: PerLayerMode::Affine,
+                },
+            );
+            apply_install_only(&mut inner, &params, &plq);
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+                "affine lm_head must install as LinearProj::Quantized"
+            );
+            if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+                assert_eq!(
+                    ql.mode(),
+                    DEFAULT_QUANT_MODE,
+                    "affine head must keep affine mode"
+                );
+            }
+        }
+
+        // (c) bf16 dense head (no `.scales`) → Standard.
+        {
+            let Some(mut inner) = new_inner() else { return };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), bf16_arr(&[vocab, hidden], 0.01));
+            apply_install_only(&mut inner, &params, &HashMap::new());
+            assert!(
+                matches!(inner.lm_head, Some(LinearProj::Standard(_))),
+                "bf16 lm_head must install as LinearProj::Standard"
+            );
+        }
+
+        // (d) Tied config → head stays `None` regardless of params.
+        {
+            let tied_cfg = Qwen3_5Config {
+                vocab_size: 8,
+                tie_word_embeddings: true,
+                ..no_mtp_layer_cfg()
+            };
+            let mut inner = match Qwen35Inner::new(tied_cfg.clone()) {
+                Ok(inner) => inner,
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("Metal") || msg.contains("device") {
+                        eprintln!("skipping {label} tied case (MLX/Metal unavailable): {msg}");
+                        return;
+                    }
+                    panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+                }
+            };
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+            params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+            match apply_weights_inner(
+                &mut inner,
+                &params,
+                &tied_cfg,
+                DEFAULT_QUANT_BITS,
+                DEFAULT_QUANT_GROUP_SIZE,
+                None,
+                &HashMap::new(),
+                false,
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    assert!(
+                        msg.contains("missing mandatory weights"),
+                        "unexpected apply_weights_inner error in {label} tied case: {msg}"
+                    );
+                }
+            }
+            assert!(
+                inner.lm_head.is_none(),
+                "tied lm_head must remain None when tie_word_embeddings=true"
+            );
+        }
     }
 
     /// Build the three (never-quantized) MTP norms as bf16. Returns `None`
