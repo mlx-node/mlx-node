@@ -2673,7 +2673,7 @@ mod tests {
     #[test]
     fn dense_lm_head_installs_mode_aware_linearproj() {
         use super::super::quantized_linear::{
-            DEFAULT_QUANT_MODE, LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
+            LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE,
         };
         let label = "dense_lm_head_installs_mode_aware_linearproj";
 
@@ -2807,11 +2807,7 @@ mod tests {
                 "affine lm_head must install as LinearProj::Quantized"
             );
             if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
-                assert_eq!(
-                    ql.mode(),
-                    DEFAULT_QUANT_MODE,
-                    "affine head must keep affine mode"
-                );
+                assert_eq!(ql.mode(), "affine", "affine head must keep affine mode");
             }
         }
 

@@ -404,7 +404,7 @@ impl Qwen3_5MTPModule {
         }
 
         let fc_quant = if params.contains_key("mtp.fc.scales") {
-            "affine-quantized"
+            "quantized"
         } else if params.contains_key("mtp.fc.weight") {
             "dense"
         } else {
