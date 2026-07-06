@@ -5220,7 +5220,18 @@ pub(crate) fn apply_awq_prescaling(
         // ── Group A: norm → gate_proj + up_proj ──
         let gate_key = format!("{prefix}.mlp.gate_proj.weight");
         let up_key = format!("{prefix}.mlp.up_proj.weight");
-        let norm_key = format!("{prefix}.post_attention_layernorm.weight");
+        // The inverse scale must land on the norm whose output the MLP reads.
+        // gemma4 sandwich layers feed the MLP from pre_feedforward_layernorm;
+        // their post_attention_layernorm normalizes the attention output into
+        // the residual, so folding 1/s there rescales the attention branch and
+        // leaves gate/up columns uncompensated. Two-norm families (qwen3_5,
+        // lfm2) have no pre_feedforward_layernorm and keep the classic target.
+        let sandwich_norm_key = format!("{prefix}.pre_feedforward_layernorm.weight");
+        let norm_key = if weights.contains_key(&sandwich_norm_key) {
+            sandwich_norm_key
+        } else {
+            format!("{prefix}.post_attention_layernorm.weight")
+        };
 
         if let Some(scales) = compute_group_a_scales(imatrix, &gate_key, &up_key, ratio)? {
             // gate_proj.weight *= scales (broadcast over columns: [out, in] * [1, in])
@@ -5638,6 +5649,133 @@ mod tests {
             modified, 9,
             "AWQ must fire on VLM-prefixed weights and compensate in_proj_a/in_proj_b"
         );
+    }
+
+    /// Group A must fold the inverse MLP scale into the norm whose output the
+    /// MLP actually consumes. In gemma4's 4-norm sandwich layer that is
+    /// `pre_feedforward_layernorm`; `post_attention_layernorm` there normalizes
+    /// the attention output into the residual stream, so dividing it by the MLP
+    /// scales corrupts the attention branch while leaving gate/up columns
+    /// uncompensated. Two-norm families (qwen3_5, lfm2) have no
+    /// pre_feedforward_layernorm and must keep folding into
+    /// post_attention_layernorm.
+    #[test]
+    fn awq_group_a_targets_sandwich_ffn_norm() {
+        use crate::utils::imatrix::ImatrixData;
+
+        const K: i64 = 4;
+        const N: i64 = 2;
+
+        let ones = |shape: &[i64]| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            MxArray::from_float32(&vec![1.0f32; numel], shape).expect("from_float32")
+        };
+        let read = |w: &MxArray| w.to_float32().expect("to_float32");
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // Layer 0 — gemma4-style sandwich layer (has pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.0.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.0.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        weights.insert(
+            "language_model.model.layers.0.pre_feedforward_layernorm.weight".into(),
+            ones(&[K]),
+        );
+        // Layer 1 — qwen-style two-norm layer (no pre_feedforward_layernorm).
+        for key in [
+            "language_model.model.layers.1.mlp.gate_proj.weight",
+            "language_model.model.layers.1.mlp.up_proj.weight",
+        ] {
+            weights.insert(key.into(), ones(&[N, K]));
+        }
+        weights.insert(
+            "language_model.model.layers.1.post_attention_layernorm.weight".into(),
+            ones(&[K]),
+        );
+
+        // importance [1, 4, 9, 16] → scales = sqrt(imp)/sqrt(max*min) = [0.5, 1, 1.5, 2]
+        let importance: HashMap<String, Vec<f32>> = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+            (
+                "model.layers.1.mlp.up_proj.weight",
+                vec![1.0, 4.0, 9.0, 16.0],
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let imatrix = ImatrixData {
+            importance,
+            chunk_count: 1,
+            chunk_size: 1,
+        };
+
+        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
+        assert_eq!(modified, 6, "gate + up + one norm per layer");
+
+        let expected_scales = [0.5f32, 1.0, 1.5, 2.0];
+        let expected_inv: Vec<f32> = expected_scales.iter().map(|s| 1.0 / s).collect();
+
+        // Sandwich layer: inverse lands on pre_feedforward_layernorm; the
+        // attention-output norm stays byte-identical.
+        let pre_ffn =
+            read(&weights["language_model.model.layers.0.pre_feedforward_layernorm.weight"]);
+        let post_attn =
+            read(&weights["language_model.model.layers.0.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (pre_ffn[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 0 pre_feedforward_layernorm[{j}] = {} expected {}",
+                pre_ffn[j],
+                expected_inv[j]
+            );
+            assert!(
+                (post_attn[j] - 1.0).abs() < 1e-6,
+                "layer 0 post_attention_layernorm[{j}] must be untouched, got {}",
+                post_attn[j]
+            );
+        }
+
+        // Two-norm layer: unchanged behavior — inverse folds into
+        // post_attention_layernorm.
+        let qwen_norm =
+            read(&weights["language_model.model.layers.1.post_attention_layernorm.weight"]);
+        for j in 0..K as usize {
+            assert!(
+                (qwen_norm[j] - expected_inv[j]).abs() < 1e-5,
+                "layer 1 post_attention_layernorm[{j}] = {} expected {}",
+                qwen_norm[j],
+                expected_inv[j]
+            );
+        }
+
+        // Reparametrization invariant: gate columns × ffn-norm channels == 1.
+        let gate = read(&weights["language_model.model.layers.0.mlp.gate_proj.weight"]);
+        for j in 0..K as usize {
+            let prod = gate[j] * pre_ffn[j];
+            assert!(
+                (prod - 1.0).abs() < 1e-5,
+                "layer 0 gate[{j}] × pre_ffn_norm[{j}] = {prod}, fold must be balanced"
+            );
+        }
     }
 
     /// Registry-consistency gate: for the exhaustive set of supported
