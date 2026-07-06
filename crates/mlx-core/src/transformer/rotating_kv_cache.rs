@@ -472,6 +472,15 @@ impl RotatingKVCache {
             ));
         }
 
+        // Full-range slices, not clones: `temporal_order` returns a CLONE of
+        // the live storage when it is already in temporal order, and a cloned
+        // `MxArray` shares the same underlying handle. The single-token
+        // update path overwrites that handle's descriptor in place, which
+        // would silently rewrite the snapshot. Slicing creates a new array
+        // object that captures the current descriptor by value.
+        let ordered_keys = ordered_keys.slice_axis(2, 0, cached_tokens as i64)?;
+        let ordered_values = ordered_values.slice_axis(2, 0, cached_tokens as i64)?;
+
         Ok(Some(RotatingKVCacheSnapshot {
             keys: ordered_keys,
             values: ordered_values,
@@ -542,8 +551,12 @@ impl RotatingKVCache {
             ));
         }
 
-        self.keys = Some(snapshot.keys.clone());
-        self.values = Some(snapshot.values.clone());
+        // Full-range slices, not clones, so the restored cache does not share
+        // the snapshot's array handles: a later single-token in-place update
+        // on this cache must not rewrite the snapshot (which callers may
+        // restore again, e.g. checkpoint heal paths).
+        self.keys = Some(snapshot.keys.slice_axis(2, 0, cached_tokens as i64)?);
+        self.values = Some(snapshot.values.slice_axis(2, 0, cached_tokens as i64)?);
         self.offset = snapshot.offset;
         self.idx = cached_tokens;
         Ok(())
@@ -859,6 +872,45 @@ mod tests {
         assert_float_data(&stored_after_chunk2, &[10.0, 11.0, 12.0, 13.0]);
         assert_eq!(cache.get_offset(), 13);
         assert_eq!(cache.get_cached_token_count().unwrap(), 4);
+    }
+
+    /// A snapshot must stay intact when the source cache (or a cache
+    /// restored from it) later takes the single-token IN-PLACE update path,
+    /// which overwrites the live array's descriptor instead of rebinding it.
+    #[test]
+    fn test_snapshot_is_immune_to_in_place_updates() {
+        // Single over-window concat leaves storage in temporal order with
+        // idx == max_size, so the next single-token update writes in place.
+        let mut source = RotatingKVCache::new(4, None);
+        let keys = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 6, 1]).unwrap();
+        let values =
+            MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[1, 1, 6, 1]).unwrap();
+        source.update_and_fetch(&keys, &values).unwrap();
+
+        let snapshot = source.snapshot().unwrap().unwrap();
+        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
+
+        // In-place single-token update on the SOURCE must not leak into the
+        // snapshot.
+        let k7 = MxArray::from_float32(&[7.0], &[1, 1, 1, 1]).unwrap();
+        let v7 = MxArray::from_float32(&[70.0], &[1, 1, 1, 1]).unwrap();
+        source.update_and_fetch(&k7, &v7).unwrap();
+        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
+        assert_float_data(&snapshot.values, &[30.0, 40.0, 50.0, 60.0]);
+
+        // In-place single-token update on a RESTORED cache must not leak
+        // into the snapshot either; a second restore still sees the
+        // original tail.
+        let mut restored = RotatingKVCache::new(4, None);
+        restored.restore_snapshot(&snapshot).unwrap();
+        restored.update_and_fetch(&k7, &v7).unwrap();
+        assert_float_data(&snapshot.keys, &[3.0, 4.0, 5.0, 6.0]);
+
+        let mut restored_again = RotatingKVCache::new(4, None);
+        restored_again.restore_snapshot(&snapshot).unwrap();
+        let (again_keys, again_values) = restored_again.fetch_current_kv().unwrap();
+        assert_float_data(&again_keys, &[3.0, 4.0, 5.0, 6.0]);
+        assert_float_data(&again_values, &[30.0, 40.0, 50.0, 60.0]);
     }
 
     #[test]
