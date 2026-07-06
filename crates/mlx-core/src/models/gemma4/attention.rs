@@ -63,7 +63,7 @@ fn trim_mask(mask: Option<&MxArray>, kv_len: i64) -> Result<Option<MxArray>> {
 ///
 /// Key insight: exponent denominator = full `dims` (head_size), not `rotated_dims`.
 /// Only `partial_rotary_factor` fraction of dims are actually rotated.
-struct Gemma4ProportionalRoPE {
+pub(crate) struct Gemma4ProportionalRoPE {
     /// Pre-computed frequencies for `mx.fast.rope`, shape [dims/2].
     /// First rotated_dims/2 entries: factor * base^(2i / dims)
     /// Remaining entries: inf (causes no rotation in mx.fast.rope)
@@ -81,7 +81,7 @@ impl Gemma4ProportionalRoPE {
     /// * `dims` - Full head dimension (e.g. 512)
     /// * `partial_rotary_factor` - Fraction of dims to rotate (e.g. 0.25)
     /// * `base` - RoPE theta (e.g. 1_000_000.0)
-    fn new(dims: i32, partial_rotary_factor: f64, base: f64) -> Result<Self> {
+    pub(crate) fn new(dims: i32, partial_rotary_factor: f64, base: f64) -> Result<Self> {
         // rotated_dims = int(dims * partial_rotary_factor)
         let rotated_dims = (dims as f64 * partial_rotary_factor) as i32;
         let half_rotated = (rotated_dims / 2) as usize;
@@ -106,7 +106,7 @@ impl Gemma4ProportionalRoPE {
     ///
     /// Single fused `mx.fast.rope` call with inf-padded frequencies.
     /// No split/scatter needed — the kernel handles everything.
-    fn forward(&self, x: &MxArray, offset: i32) -> Result<MxArray> {
+    pub(crate) fn forward(&self, x: &MxArray, offset: i32) -> Result<MxArray> {
         let offset_arr = MxArray::from_int32(&[offset], &[1])?;
         let handle = unsafe {
             sys::mlx_fast_rope_with_freqs(

@@ -4,6 +4,10 @@ pub mod clippable_linear;
 pub mod config;
 pub mod decoder_layer;
 pub(crate) mod diagnostic;
+// Consumed by the DSpark speculative-decode engine loop, which is wired in
+// separately; until then only the inline tests exercise this module.
+#[allow(dead_code)]
+pub(crate) mod dspark;
 pub mod image_processor;
 pub mod layer_cache;
 pub mod mlp;
