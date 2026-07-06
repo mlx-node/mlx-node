@@ -87,7 +87,13 @@ export {
 } from './models/qwen3-configs.js';
 
 // Model loading
-export { loadModel, loadSession, detectModelType, type ModelType } from './models/model-loader.js';
+export {
+  loadModel,
+  loadSession,
+  detectModelType,
+  type ModelType,
+  type LoadModelOptions,
+} from './models/model-loader.js';
 
 // Interfaces
 export type { TrainableModel, LoadableModel } from './interfaces.js';

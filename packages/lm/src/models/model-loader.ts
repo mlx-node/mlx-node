@@ -34,7 +34,11 @@ const MODEL_REGISTRY = {
   qwen3: { load: (p: string) => Qwen3Model.load(p), kind: 'trainable' },
   qwen3_5: { load: (p: string) => Qwen35Model.load(p), kind: 'trainable' },
   qwen3_5_moe: { load: (p: string) => Qwen35MoeModel.load(p), kind: 'trainable' },
-  gemma4: { load: (p: string) => Gemma4Model.load(p), kind: 'loadable' },
+  gemma4: {
+    load: (p: string, o?: LoadModelOptions) =>
+      Gemma4Model.load(p, o?.draftModelPath === undefined ? null : { draftModelPath: o.draftModelPath }),
+    kind: 'loadable',
+  },
   lfm2: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },
   lfm2_moe: { load: (p: string) => Lfm2Model.load(p), kind: 'loadable' },
   harrier: { load: (p: string) => HarrierModel.load(p), kind: 'embedding' },
@@ -46,15 +50,53 @@ export type ModelType = keyof typeof MODEL_REGISTRY;
 
 const SUPPORTED_MODEL_TYPES = new Set<ModelType>(Object.keys(MODEL_REGISTRY) as ModelType[]);
 
+/** Optional settings for {@link loadModel} / {@link loadSession}. */
+export interface LoadModelOptions {
+  /**
+   * Gemma4 only: directory of a DSpark draft checkpoint (config.json +
+   * model.safetensors) loaded alongside the target model for speculative
+   * decoding (forwarded as `Gemma4LoadOptions.draftModelPath`). DSpark runs
+   * on the flat KV-cache path, so the target checkpoint must not explicitly
+   * enable `use_block_paged_cache`. Setting this for any other model family
+   * is a hard error — no other loader accepts a draft model.
+   */
+  draftModelPath?: string;
+}
+
+/**
+ * Dispatch a load through the registry, validating gemma4-only options.
+ * `draftModelPath` reaches ONLY the gemma4 row; every other family rejects
+ * it loudly instead of silently ignoring a caller's speculative-decode
+ * intent.
+ */
+function dispatchLoad(
+  modelType: ModelType,
+  modelPath: string,
+  options: LoadModelOptions | undefined,
+): Promise<unknown> {
+  if (options?.draftModelPath !== undefined && modelType !== 'gemma4') {
+    throw new Error(
+      `draftModelPath (DSpark speculative decoding) is only supported by gemma4 models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  return modelType === 'gemma4'
+    ? MODEL_REGISTRY.gemma4.load(modelPath, options)
+    : MODEL_REGISTRY[modelType].load(modelPath);
+}
+
 /**
  * Load a model from disk, auto-detecting architecture from config.json.
  *
  * Supports both language models (Qwen3, Qwen3.5) and vision-language models
  * (Qianfan-OCR / InternVL). Use `instanceof` to narrow the returned type.
+ *
+ * `options.draftModelPath` attaches a DSpark draft checkpoint for
+ * speculative decoding — gemma4 only; any other detected family rejects it.
  */
-export async function loadModel(modelPath: string): Promise<LoadableModel> {
+export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);
-  return MODEL_REGISTRY[modelType].load(modelPath) as unknown as Promise<LoadableModel>;
+  return dispatchLoad(modelType, modelPath, options) as Promise<LoadableModel>;
 }
 
 /**
@@ -72,8 +114,16 @@ export async function loadModel(modelPath: string): Promise<LoadableModel> {
  *     package dependency), so callers who want a Qianfan-OCR session
  *     must import `QianfanOCRModel` from `@mlx-node/vlm` and construct
  *     `new ChatSession(model)` directly.
+ *
+ * `options.draftModelPath` attaches a DSpark draft checkpoint for
+ * speculative decoding — gemma4 only; any other detected family rejects it.
+ * The resulting session auto-enables the speculative path (the model
+ * reports `hasMtpWeights()`); pass `enableMtp: false` per call to opt out.
  */
-export async function loadSession(modelPath: string): Promise<ChatSession<SessionCapableModel>> {
+export async function loadSession(
+  modelPath: string,
+  options?: LoadModelOptions,
+): Promise<ChatSession<SessionCapableModel>> {
   const modelType = await detectModelType(modelPath);
   const kind = MODEL_REGISTRY[modelType].kind;
   if (kind === 'embedding') {
@@ -84,7 +134,7 @@ export async function loadSession(modelPath: string): Promise<ChatSession<Sessio
       'loadSession: Qianfan-OCR / InternVL session support lives in @mlx-node/vlm. Import QianfanOCRModel from @mlx-node/vlm and construct ChatSession(model) directly.',
     );
   }
-  const m = await MODEL_REGISTRY[modelType].load(modelPath);
+  const m = await dispatchLoad(modelType, modelPath, options);
   return new ChatSession(m as unknown as SessionCapableModel);
 }
 

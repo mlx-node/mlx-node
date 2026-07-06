@@ -300,10 +300,12 @@ export interface SessionCapableModel {
    */
   hasBlockPagedCache?(): boolean;
   /**
-   * MTP: whether the underlying native model checkpoint shipped
-   * an MTP (Multi-Token-Prediction) head loaded by persistence.
-   * Currently surfaced by `Qwen3_5Model` and
-   * `Qwen3_5MoeModel`; all other native wrappers omit the method, in
+   * MTP: whether the underlying native model can run speculative
+   * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
+   * head shipped in the checkpoint and loaded by persistence) and by
+   * `Gemma4Model` (an external DSpark draft model attached via
+   * `loadModel` / `loadSession` `draftModelPath` — NOT in-checkpoint
+   * MTP heads); all other native wrappers omit the method, in
    * which case callers treat a missing getter as `false` (no MTP).
    *
    * When `true`, {@link ChatSession#mergeConfig} auto-defaults the
@@ -353,6 +355,13 @@ export interface SessionCapableModel {
    * flag inventory), so omitting them from `defaultConfig` /
    * `SendOptions.config` is the recommended path for callers that
    * just want speculative decoding "on with sensible defaults".
+   *
+   * Gemma4 + DSpark reinterprets the knobs: an unset `mtpDepth` runs
+   * full draft blocks (the draft checkpoint's block size — 7 tokens on
+   * `dspark_gemma4_12b_block7`), and an explicit `mtpDepth` acts as a
+   * CAP on that block (clamped to `[1, blockSize]`, not `[1, 5]`).
+   * `mtpAdaptiveDepth` is ignored — the DSpark loop has no adaptive
+   * depth policy.
    */
   hasMtpWeights?(): boolean;
 }
@@ -1290,7 +1299,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * `hasMtpWeights()` returning `true`, set `enableMtp = true` so the
    * speculative-decode path runs out of the box on MTP-capable
    * checkpoints. An explicit `false` from either source wins (the
-   * undefined-check below preserves it).
+   * undefined-check below preserves it). This duck-typed check also
+   * covers Gemma4 with a DSpark draft attached (`hasMtpWeights()`
+   * reports the external draft there, not in-checkpoint MTP heads).
    */
   private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
     const merged: ChatConfig = {

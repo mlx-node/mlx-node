@@ -174,7 +174,9 @@ export declare class Gemma4Model {
    * Note: this only reports draft availability. Whether speculative
    * decoding actually runs on a given call also requires the per-request
    * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-   * surface. Stubs from `new(config)` always return `false`.
+   * surface, but it reports an external DSpark draft model, not
+   * in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * `false`.
    */
   hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
@@ -742,9 +744,20 @@ export declare class MxArray {
   divScalar(value: number): MxArray;
   matmul(other: MxArray): MxArray;
   /**
-   * Fused matrix multiply-add: D = beta * C + alpha * (self @ B)
-   * where self is A. More efficient than separate matmul and add operations.
-   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B)
+   * Matrix multiply-add: D = beta * C + alpha * (self @ B), where self is A.
+   * Default: alpha=1.0, beta=1.0, giving D = C + (self @ B).
+   *
+   * Computed explicitly (matmul, optional alpha scale, then add beta*C)
+   * rather than via the fused `mlx::core::addmm` primitive. The fused
+   * primitive is correct on a well-formed metallib, but this project's local
+   * release build is known to non-deterministically miscompile fused GEMM
+   * kernels (see the metallib-corruption notes), which manifested as the
+   * fused addmm dropping `beta*C` and corrupting every biased linear — most
+   * visibly the vision tower (`qkv`, `proj`, `fc1`, `fc2`, merger all carry a
+   * bias; bias-free LM/MoE linears pass a zero `C` and were unaffected). The
+   * explicit form keeps the `C` term robust to that build hazard; the
+   * `nn::linear` unit tests assert it applies a non-zero `C`, so they double
+   * as a canary if a future build corrupts the matmul kernel too.
    */
   addmm(c: MxArray, b: MxArray, alpha?: number | undefined | null, beta?: number | undefined | null): MxArray;
   abs(): MxArray;
@@ -2338,8 +2351,9 @@ export interface ChatConfig {
   reuseCache?: boolean | undefined;
   /**
    * MTP: opt-in flag enabling the Multi-Token Prediction speculative decode
-   * loop on the dense compiled path. Requires the model checkpoint to carry
-   * an MTP head (otherwise silently ignored). Default: `false`.
+   * loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
+   * checkpoint to carry an MTP head (otherwise silently ignored). Default:
+   * `false`.
    */
   enableMtp?: boolean | undefined;
   /**
@@ -2535,7 +2549,7 @@ export interface ConversionOptions {
   quantGroupSize?: number;
   /**
    * Quantization mode: "affine" (default), "mxfp4", "mxfp8", "nvfp4", or
-   * "sym8" (per-output-channel symmetric int8; dense qwen3_5 + lfm2/lfm2_moe + gemma4 in v1,
+   * "sym8" (per-output-channel symmetric int8; qwen3_5 + qwen3_5_moe + lfm2/lfm2_moe + gemma4,
    * implies bits=8, no group_size — consciously NOT mlx-lm-loadable)
    */
   quantMode?: string;
@@ -2645,11 +2659,11 @@ export declare function createRandomQwen35Checkpoint(config: Qwen35Config, saveP
 /**
  * Create a random-init Qwen3.5 MoE model and save it to disk.
  *
- * Spawns a dedicated `ModelThread<Qwen35MoeCmd>` whose init builds a fresh
- * random-weight `Qwen35MoeInner` directly, then dispatches
- * `Qwen35MoeCmd::SaveModel` on that thread. The thread is dropped at the end
- * of the promise, so the in-memory model is released once the checkpoint has
- * been written. Used by TypeScript test fixtures that need an on-disk
+ * Spawns a dedicated model thread whose init runs
+ * [`create_random_qwen35_moe_checkpoint_sync`] (random-init inner + save);
+ * the thread holds no state and is dropped once the promise resolves, so
+ * the in-memory model is released as soon as the checkpoint has been
+ * written. Used by TypeScript test fixtures that need an on-disk
  * checkpoint without keeping a NAPI model instance alive.
  */
 export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig, savePath: string): Promise<undefined>;
@@ -2929,7 +2943,7 @@ export interface Gemma4Config {
   useBlockPagedCache?: boolean | undefined;
 }
 
-/** Optional load-time settings for `Gemma4Model.load`. */
+/** Optional load-time settings for [`Gemma4Model::load`]. */
 export interface Gemma4LoadOptions {
   /**
    * Directory of a DSpark draft checkpoint (config.json +
@@ -2939,7 +2953,7 @@ export interface Gemma4LoadOptions {
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */
-  draftModelPath?: string | undefined;
+  draftModelPath?: string;
 }
 
 /**

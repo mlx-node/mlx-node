@@ -418,9 +418,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
   //
   // `ConstructorParameters<C>` (not `never[]`) keeps each native config
   // constructor — e.g. `new Gemma4Model(config)` / `new QianfanOCRModel(config)`
-  // — visible on the generated wrapper for TypeScript consumers.
+  // — visible on the generated wrapper for TypeScript consumers. Likewise,
+  // `Parameters<C['load']>` keeps each family's native load signature —
+  // `[modelPath]` for most, `[modelPath, options?]` for Gemma4
+  // (`Gemma4LoadOptions.draftModelPath` / DSpark).
   new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
-  load(modelPath: string): Promise<StreamingInstance<C, O>>;
+  load(...args: Parameters<C['load']>): Promise<StreamingInstance<C, O>>;
 } {
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
@@ -437,8 +440,13 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
   const Base = NativeClass as unknown as new (...args: never[]) => SessionCapableModel;
 
   class StreamingModelImpl extends Base {
-    static async load(modelPath: string): Promise<StreamingModel> {
-      const instance = await NativeClass.load(modelPath);
+    static async load(modelPath: string, ...rest: unknown[]): Promise<StreamingModel> {
+      // Forward any trailing family-specific load options verbatim (e.g.
+      // Gemma4's `Gemma4LoadOptions` with `draftModelPath`); families whose
+      // native `load` takes only the path receive no extras. The public
+      // signature is re-narrowed per family via `Parameters<C['load']>` in
+      // the factory return type below.
+      const instance = await (NativeClass.load as (...args: unknown[]) => Promise<object>)(modelPath, ...rest);
       // Use `this.prototype` (not `StreamingModelImpl.prototype`) so the
       // concrete subclass declared per family supplies the prototype and
       // `instanceof ConcreteSubclass` holds.
@@ -524,7 +532,7 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
 
   return StreamingModelImpl as unknown as {
     new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
-    load(modelPath: string): Promise<StreamingInstance<C, O>>;
+    load(...args: Parameters<C['load']>): Promise<StreamingInstance<C, O>>;
   };
 }
 

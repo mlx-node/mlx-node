@@ -5624,7 +5624,9 @@ impl Gemma4Model {
     /// Note: this only reports draft availability. Whether speculative
     /// decoding actually runs on a given call also requires the per-request
     /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-    /// surface. Stubs from `new(config)` always return `false`.
+    /// surface, but it reports an external DSpark draft model, not
+    /// in-checkpoint MTP heads. Stubs from `new(config)` always return
+    /// `false`.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.dspark_active
