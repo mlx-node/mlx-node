@@ -85,8 +85,10 @@ enum CycleStop {
 /// Engine-owned DSpark propose/verify whole-turn loop.
 ///
 /// Per cycle: pre-checks (mtp_turn's exact order) → propose (skipped on the
-/// degenerate `L_cap == 0` cycle) → ONE batched verify over
-/// `[anchor, drafts..]` → acceptance (greedy batched-argmax fast path, or
+/// degenerate `L_cap == 0` cycle; hard error on an over-long return) → ONE
+/// batched verify over `[anchor, drafts..]` → acceptance (greedy temperature:
+/// argmax-based — batched fast path when penalties are no-op, per-row
+/// penalized argmax otherwise, never dists/RNG; sampled temperature:
 /// per-position `accept_with_residual`) → STOP-CLAMP over the accepted list
 /// BEFORE commit → `commit(keep = 1 + min(emit_count, k), 1 + L)` → emit →
 /// cache-clear cadence → stop or `anchor = boundary; eval_boundary`.
@@ -176,11 +178,20 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     }
 
     // Turn-constant accept-policy gates (params are fixed for the turn).
+    // At GREEDY temperature acceptance is ALWAYS argmax-based and never
+    // reads proposal dists or consumes RNG (the DsparkProposal contract
+    // ships empty `draft_dists` there); `penalties_no_op` only selects
+    // between the batched-argmax fast path and the per-row penalized-argmax
+    // path. This matches `run_mtp_cycle`'s T=0-with-penalties behavior: its
+    // legacy dense branch feeds the PENALIZED row into
+    // `accept_with_residual`, whose T=0 shortcut reduces to exactly
+    // "penalized argmax == draft id" with an argmax boundary.
     let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
     let sampling_cfg = p.sampling_config.unwrap_or_default();
     let penalties_no_op =
         p.repetition_penalty == 1.0 && p.presence_penalty == 0.0 && p.frequency_penalty == 0.0;
-    let greedy = sampling::is_greedy_temperature(temperature) && penalties_no_op;
+    let greedy_temp = sampling::is_greedy_temperature(temperature);
+    let greedy_fast = greedy_temp && penalties_no_op;
 
     // DELIBERATE DIVERGENCE from `run_mtp_turn`: cancellation is checked at
     // the cycle top and inside the pre-commit stop-clamp, NOT per emitted
@@ -252,10 +263,20 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 draft_dists: Vec::new(),
             }
         };
-        // The stepper may return fewer than `l_cap` (confidence truncation);
-        // a longer return is tolerated — the stop-clamp below caps emission
-        // at the budget regardless.
+        // Contract enforcement at the proposal boundary: `propose` may
+        // return FEWER than `l_cap` (confidence truncation), NEVER more. An
+        // over-long block would inflate the verify write past the
+        // `remaining - 1` budget cap's target-cache slot expectations, and
+        // the stop-clamp runs AFTER verify so it cannot un-write those
+        // slots — a hard error surfaces the stepper bug instead of masking
+        // it.
         let draft_len = proposal.draft_ids.len();
+        if draft_len > l_cap {
+            return Err(Error::from_reason(format!(
+                "DSpark propose over-returned: {draft_len} draft tokens for a cap of {l_cap} \
+                 (the DsparkStepper::propose contract allows fewer, never more)"
+            )));
+        }
 
         let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
         verify_ids.push(anchor);
@@ -270,10 +291,10 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
-        let accept_res: Result<(usize, u32)> = if greedy {
-            // Greedy fast path: ONE batched argmax over all 1+L rows, a
-            // single eval, then CPU reads. No RNG consumed (mirrors
-            // `accept_with_residual`'s T=0 shortcut).
+        let accept_res: Result<(usize, u32)> = if greedy_fast {
+            // Greedy fast path (penalties no-op): ONE batched argmax over
+            // all 1+L rows, a single eval, then CPU reads. No RNG consumed
+            // (mirrors `accept_with_residual`'s T=0 shortcut).
             (|| {
                 let argmax_arr = logits.argmax(-1, None)?;
                 argmax_arr.eval();
@@ -286,6 +307,51 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     k += 1;
                 }
                 Ok((k, target_argmax[k] as u32))
+            })()
+        } else if greedy_temp {
+            // Penalized-greedy path (T=0 with active penalties): per-row
+            // `apply_all_penalties` over the sequentially extended history,
+            // then a plain argmax decides accept/boundary. No proposal
+            // dists, no RNG — behaviorally identical to `run_mtp_cycle`'s
+            // legacy dense branch at T=0, where `accept_with_residual`'s
+            // argmax shortcut reads the penalized row and the bonus
+            // `sample(penalized)` degenerates to its argmax.
+            (|| {
+                let vocab = logits.shape_at(2)?;
+                let mut hist_extended: Vec<u32> = hist.clone();
+                let mut k = 0usize;
+                let mut boundary: Option<u32> = None;
+                for i in 0..draft_len {
+                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                    let argmax_arr = penalized.argmax(0, None)?;
+                    argmax_arr.eval();
+                    let target_id = argmax_arr.item_at_int32(0)?;
+                    if target_id == proposal.draft_ids[i] {
+                        k += 1;
+                        hist_extended.push(target_id as u32);
+                    } else {
+                        boundary = Some(target_id as u32);
+                        break;
+                    }
+                }
+                let boundary_id = match boundary {
+                    Some(b) => b,
+                    None => {
+                        // All L drafts accepted: boundary = penalized
+                        // argmax of row L.
+                        let i = draft_len;
+                        let v_slice =
+                            logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                        let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                        let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                        let argmax_arr = penalized.argmax(0, None)?;
+                        argmax_arr.eval();
+                        argmax_arr.item_at_int32(0)? as u32
+                    }
+                };
+                Ok((k, boundary_id))
             })()
         } else {
             // Sampled path: per-position Leviathan accept + residual
@@ -368,6 +434,11 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             let mut sim: Vec<u32> = Vec::with_capacity(generated.len() + accepted.len());
             sim.extend_from_slice(generated);
             for (idx, &tok) in accepted.iter().enumerate() {
+                // Defensive: with the over-return check above, a cycle
+                // emits at most `l_cap + 1 <= remaining` tokens, so this
+                // budget arm is unreachable for compliant flows. Kept for
+                // byte-parity with mtp's emit-loop guard and as
+                // defense-in-depth against future L_cap-math regressions.
                 if sim.len() >= max_as_usize {
                     stop = Some(CycleStop::Length);
                     break;
@@ -535,17 +606,19 @@ mod tests {
 
     /// Canned per-cycle script.
     ///
-    /// `draft_ids` is what `propose` returns (deliberately allowed to exceed
-    /// the requested `max_len` so the budget stop-clamp can be exercised).
+    /// `draft_ids` is what `propose` returns (a script MAY exceed the
+    /// requested `max_len` to exercise the engine's over-return error).
     /// `draft_dists[i]` is the full `[vocab]` f32 proposal row `q_i`
-    /// (empty on greedy scripts). `verify_argmax[j]` is the argmax of
-    /// verify-logits row `j` (`j` in `0..=L`); missing entries fall back
-    /// to 0 so over-long verifies stay defined.
+    /// (empty on greedy scripts). Verify logits come from `verify_rows`
+    /// when set (explicit full rows, for penalty-sensitive tests);
+    /// otherwise each row is a one-hot spike at `verify_argmax[j]`
+    /// (`j` in `0..=L`; missing entries fall back to 0).
     #[derive(Clone)]
     struct CycleScript {
         draft_ids: Vec<i32>,
         draft_dists: Vec<Vec<f32>>,
         verify_argmax: Vec<i32>,
+        verify_rows: Option<Vec<Vec<f32>>>,
     }
 
     impl CycleScript {
@@ -554,6 +627,16 @@ mod tests {
                 draft_ids,
                 draft_dists: Vec::new(),
                 verify_argmax,
+                verify_rows: None,
+            }
+        }
+
+        fn with_rows(draft_ids: Vec<i32>, verify_rows: Vec<Vec<f32>>) -> Self {
+            Self {
+                draft_ids,
+                draft_dists: Vec::new(),
+                verify_argmax: Vec::new(),
+                verify_rows: Some(verify_rows),
             }
         }
     }
@@ -635,8 +718,13 @@ mod tests {
             let rows = verify_ids.len();
             let mut flat: Vec<f32> = Vec::with_capacity(rows * self.vocab as usize);
             for j in 0..rows {
-                let argmax_id = script.verify_argmax.get(j).copied().unwrap_or(0);
-                flat.extend(logits_row(self.vocab, argmax_id, self.neg_fill));
+                match script.verify_rows.as_ref().and_then(|r| r.get(j)) {
+                    Some(row) => flat.extend_from_slice(row),
+                    None => {
+                        let argmax_id = script.verify_argmax.get(j).copied().unwrap_or(0);
+                        flat.extend(logits_row(self.vocab, argmax_id, self.neg_fill));
+                    }
+                }
             }
             let logits = MxArray::from_float32(&flat, &[1, rows as i64, self.vocab])?;
             let n = self.verify_count.get();
@@ -848,29 +936,39 @@ mod tests {
         acceptance: Option<(f64, Vec<f64>, u32)>,
     }
 
-    /// Drive the SYNC (non-streaming) turn over the scripted backend.
-    fn drive_turn(
+    /// Raw outcome of a SYNC turn drive — keeps the `Result` so contract-
+    /// error tests can assert the failure alongside the ledger state.
+    struct RawTurnOut {
+        result: Result<super::DsparkTurnOutcome>,
+        generated: Vec<u32>,
+        finish_reason: String,
+        acceptance: Option<(f64, Vec<f64>, u32)>,
+    }
+
+    /// Drive the SYNC (non-streaming) turn over the scripted backend with a
+    /// caller-supplied RNG, without unwrapping the loop result.
+    fn drive_turn_raw<R: rand::Rng>(
         backend: &mut MockDsparkBackend,
         params: ChatParams,
         first_token: u32,
         eos_id: u32,
         block_size: usize,
-    ) -> TurnOut {
+        rng: &mut R,
+    ) -> RawTurnOut {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = DecodeProfiler::new("dspark_turn_test", "test");
         let mut generated: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<Instant> = None;
-        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
         let y = MxArray::from_int32(&[first_token as i32], &[1])
             .unwrap_or_else(|e| panic!("y construction: {}", e.reason));
         let generation_stream = Stream::new(DeviceType::Gpu);
         let max_new_tokens = params.max_new_tokens;
 
-        let outcome = run_dspark_turn(
+        let result = run_dspark_turn(
             backend,
-            &mut rng,
+            rng,
             DsparkTurnArgs {
                 y,
                 block_size,
@@ -887,17 +985,67 @@ mod tests {
                 generation_stream,
             },
             None,
-        )
-        .unwrap_or_else(|e| panic!("run_dspark_turn failed: {}", e.reason));
+        );
 
+        // The commit-exactly-once design keeps the histories in lockstep on
+        // BOTH the success and the error path (emission always pushes both).
         assert_eq!(token_history, generated, "history must mirror generated");
 
-        TurnOut {
+        RawTurnOut {
+            result,
             generated,
             finish_reason,
+            acceptance: profiler.mtp_acceptance_summary(),
+        }
+    }
+
+    /// Drive the SYNC (non-streaming) turn over the scripted backend.
+    fn drive_turn(
+        backend: &mut MockDsparkBackend,
+        params: ChatParams,
+        first_token: u32,
+        eos_id: u32,
+        block_size: usize,
+    ) -> TurnOut {
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
+        let raw = drive_turn_raw(backend, params, first_token, eos_id, block_size, &mut rng);
+        let outcome = raw
+            .result
+            .unwrap_or_else(|e| panic!("run_dspark_turn failed: {}", e.reason));
+
+        TurnOut {
+            generated: raw.generated,
+            finish_reason: raw.finish_reason,
             last_in_cache: outcome.last_in_cache,
             ledger: backend.ledger_snapshot(),
-            acceptance: profiler.mtp_acceptance_summary(),
+            acceptance: raw.acceptance,
+        }
+    }
+
+    /// Counting RNG wrapper — proves the greedy accept paths consume ZERO
+    /// random draws. rand 0.10: implementing `TryRng<Error = Infallible>`
+    /// yields the infallible `Rng` via the blanket impl.
+    struct CountingRng {
+        inner: rand::rngs::StdRng,
+        draws: Rc<Cell<usize>>,
+    }
+
+    impl rand::TryRng for CountingRng {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+            self.draws.set(self.draws.get() + 1);
+            rand::TryRng::try_next_u32(&mut self.inner)
+        }
+
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+            self.draws.set(self.draws.get() + 1);
+            rand::TryRng::try_next_u64(&mut self.inner)
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+            self.draws.set(self.draws.get() + 1);
+            rand::TryRng::try_fill_bytes(&mut self.inner, dst)
         }
     }
 
@@ -1058,36 +1206,138 @@ mod tests {
     }
 
     #[test]
-    fn dspark_turn_budget_clamp_mid_block() {
-        // The stepper over-returns (3 drafts for max_len 2) and everything
-        // verifies — accepted = [4,5,6,7]. Budget 4 (seed + 3): the clamp
-        // cuts BEFORE the boundary (idx 3) → emit 3, reason "length". All 3
-        // emitted tokens are accepted drafts with kept K/V → keep =
-        // 1 + min(3, 3) = 4, total = 1+L = 4, last_in_cache TRUE.
-        let mut backend = MockDsparkBackend::greedy(
-            16,
-            vec![CycleScript::greedy(vec![4, 5, 6], vec![4, 5, 6, 7])],
-        );
+    fn dspark_turn_budget_exact_fit_no_mid_block_cut() {
+        // With the over-return contract enforced, a compliant cycle emits at
+        // most `l_cap + 1 <= remaining` tokens, so a mid-block BUDGET cut is
+        // arithmetically unreachable (the clamp's budget arm is defensive).
+        // The tightest compliant case lands EXACTLY on the budget: the cycle
+        // completes uncut (full keep, eval_boundary fired) and the run exits
+        // "length" at the next loop top.
+        let mut backend =
+            MockDsparkBackend::greedy(16, vec![CycleScript::greedy(vec![4, 5], vec![4, 5, 6])]);
         let mut p = greedy_params();
-        p.max_new_tokens = 4;
+        p.max_new_tokens = 4; // seed + l_cap(2) drafts + boundary = exactly 4
         let out = drive_turn(&mut backend, p, 3, 15, 2);
 
         assert_eq!(
             out.generated,
             vec![3, 4, 5, 6],
-            "budget cut before the boundary"
+            "exact fit: every cycle token emitted, no clamp cut"
         );
         assert_eq!(out.finish_reason, "length");
         assert!(
-            out.last_in_cache,
-            "budget clamp cut at the boundary: last emitted is an accepted \
-             draft with kept K/V"
+            !out.last_in_cache,
+            "clean length exit lands on the unverified boundary token"
         );
-        assert_eq!(commits(&out.ledger), vec![(4, 4)]);
+        assert_eq!(
+            commits(&out.ledger),
+            vec![(3, 3)],
+            "full keep — no clamp cut"
+        );
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::EvalBoundary { .. })),
+            1,
+            "the cycle completed (no mid-block stop) before the loop-top length exit"
+        );
+    }
+
+    #[test]
+    fn dspark_turn_overlong_proposal_is_rejected() {
+        // propose returns 3 drafts for a cap of 2 — the engine must hard-
+        // error at the proposal boundary, BEFORE verify writes any
+        // target-cache slot (the stop-clamp runs after verify and could not
+        // protect the near-tail slot budget).
+        let mut backend = MockDsparkBackend::greedy(
+            16,
+            vec![CycleScript::greedy(vec![4, 5, 6], vec![4, 5, 6, 7])],
+        );
+        let mut p = greedy_params();
+        p.max_new_tokens = 8;
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
+        let raw = drive_turn_raw(&mut backend, p, 3, 15, 2, &mut rng);
+
+        let err = match raw.result {
+            Ok(_) => panic!("over-long proposal must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("over-returned"),
+            "error names the contract violation, got: {}",
+            err.reason
+        );
+        assert_eq!(
+            backend.ledger_snapshot(),
+            vec![Call::Propose {
+                anchor: 3,
+                max_len: 2
+            }],
+            "hard error fires before verify — no target-cache slots written"
+        );
+        assert_eq!(raw.generated, vec![3], "only the seed was committed");
+    }
+
+    #[test]
+    fn dspark_turn_greedy_with_penalties_penalized_argmax_no_dists_no_rng() {
+        // T=0 + repetition_penalty 2.0: valid params must run the
+        // penalized-greedy arm — EMPTY draft_dists are accepted (the trait
+        // ships no dists at greedy temperature), the accept decision follows
+        // the PENALIZED argmax, and zero RNG draws are consumed.
+        //
+        // Row 0 (anchor 3, history [3]): raw argmax is 3 (10.0), but 3 is in
+        // history → 10/2 = 5 < 9.0 at token 4 → penalized argmax 4 == draft
+        // 4 → ACCEPT (a raw-argmax accept would reject here — this pins the
+        // penalty actually driving the decision).
+        // Row 1 (boundary, extended history [3, 4]): raw argmax 4 (10.0)
+        // penalized to 5 < 8.0 at token 6 → boundary 6.
+        let mut row0 = vec![0.0f32; 16];
+        row0[3] = 10.0;
+        row0[4] = 9.0;
+        let mut row1 = vec![0.0f32; 16];
+        row1[4] = 10.0;
+        row1[6] = 8.0;
+        let mut backend =
+            MockDsparkBackend::greedy(16, vec![CycleScript::with_rows(vec![4], vec![row0, row1])]);
+        let mut p = greedy_params();
+        p.max_new_tokens = 3; // seed + 1 draft + boundary; l_cap = 1
+        p.repetition_penalty = 2.0;
+        p.repetition_context_size = 20;
+
+        let draws = Rc::new(Cell::new(0usize));
+        let mut rng = CountingRng {
+            inner: <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE),
+            draws: Rc::clone(&draws),
+        };
+        let raw = drive_turn_raw(&mut backend, p, 3, 15, 2, &mut rng);
+        let outcome = raw
+            .result
+            .unwrap_or_else(|e| panic!("penalized-greedy turn failed: {}", e.reason));
+
+        assert_eq!(
+            raw.generated,
+            vec![3, 4, 6],
+            "acceptance and boundary follow the PENALIZED argmax"
+        );
+        assert_eq!(raw.finish_reason, "length");
+        assert!(!outcome.last_in_cache, "run ends on the boundary token");
+        let ledger = backend.ledger_snapshot();
+        assert_eq!(
+            ledger.first(),
+            Some(&Call::Propose {
+                anchor: 3,
+                max_len: 1
+            }),
+            "near-tail cap still applies on the penalized-greedy arm"
+        );
+        assert_eq!(commits(&ledger), vec![(2, 2)], "keep = 1 + k = 2");
+        assert_eq!(
+            raw.acceptance.map(|(mean, _, cycles)| (mean, cycles)),
+            Some((1.0, 1)),
+            "record_mtp_cycle(1, 1) for the penalized-greedy cycle"
+        );
+        assert_eq!(
+            draws.get(),
             0,
-            "budget stop breaks before scheduling a next anchor"
+            "greedy temperature must not consume RNG, even with active penalties"
         );
     }
 
@@ -1445,6 +1695,7 @@ mod tests {
                 draft_ids: vec![4, 5],
                 draft_dists: vec![one_hot(16, 4), one_hot(16, 5)],
                 verify_argmax: vec![4, 5, 6],
+                verify_rows: None,
             }],
         );
         let mut p = dense_params();
@@ -1476,6 +1727,7 @@ mod tests {
                 draft_ids: vec![4, 5],
                 draft_dists: vec![one_hot(16, 4), one_hot(16, 5)],
                 verify_argmax: vec![9, 0, 0],
+                verify_rows: None,
             }],
         );
         let p = dense_params();

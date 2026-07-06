@@ -1815,13 +1815,17 @@ pub(crate) trait DsparkBackend: ChatBackend {
 /// `#[allow(dead_code)]`: see [`DsparkBackend`].
 #[allow(dead_code)]
 pub(crate) struct DsparkProposal {
-    /// `L <= max_len` proposed token ids (the stepper may return fewer than
-    /// asked — confidence truncation).
+    /// `L <= max_len` proposed token ids. The stepper may return FEWER than
+    /// asked (confidence truncation) but never more — the engine hard-errors
+    /// on an over-long block (it would overrun the near-tail budget cap's
+    /// target-cache slot expectations).
     pub draft_ids: Vec<i32>,
     /// Per-position f32 `[vocab]` proposal-density rows `q_i` — the
     /// distribution `draft_ids[i]` was actually drawn from, consumed by
     /// `sampling::accept_with_residual` on the sampled accept path. EMPTY
-    /// when the turn is greedy (T=0 argmax accept never reads `q`).
+    /// whenever the turn's temperature is greedy
+    /// (`sampling::is_greedy_temperature`) — greedy acceptance, with or
+    /// without active penalties, is argmax-based and never reads `q`.
     pub draft_dists: Vec<MxArray>,
 }
 
@@ -1860,13 +1864,16 @@ pub(crate) trait DsparkStepper {
     /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
     /// emitted token, whose K/V is NOT yet in the target cache — the
     /// engine's subsequent [`Self::verify`] writes it at position 0).
-    /// Returns `L <= max_len` drafted ids plus, on sampled turns, the
-    /// per-position proposal densities. `rng` is consumed only on sampled
-    /// turns (greedy drafting must not advance it — mirrors the
-    /// `accept_with_residual` T=0 shortcut's zero-RNG contract). `&mut dyn
-    /// rand::Rng` (rand 0.10's dyn-compatible core trait — the pre-0.10
-    /// `RngCore`) keeps this trait object-safe while the engine loop stays
-    /// generic over `R: rand::Rng`, matching `run_mtp_turn`'s house style.
+    /// Returns `L <= max_len` drafted ids (never more — the engine
+    /// hard-errors on over-return) plus, on sampled-temperature turns, the
+    /// per-position proposal densities. `rng` is consumed only at
+    /// non-greedy temperature: at greedy temperature — regardless of active
+    /// penalties — drafting and acceptance are argmax-based and must not
+    /// advance it (mirrors the `accept_with_residual` T=0 shortcut's
+    /// zero-RNG contract). `&mut dyn rand::Rng` (rand 0.10's dyn-compatible
+    /// core trait — the pre-0.10 `RngCore`) keeps this trait object-safe
+    /// while the engine loop stays generic over `R: rand::Rng`, matching
+    /// `run_mtp_turn`'s house style.
     ///
     /// Never called with `max_len == 0`: the engine skips propose entirely
     /// on the degenerate single-AR-step cycle.
