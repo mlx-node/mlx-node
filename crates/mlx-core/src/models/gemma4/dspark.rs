@@ -36,6 +36,19 @@ const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
 /// `temperature < 1e-5`).
 const GREEDY_TEMPERATURE: f64 = 1e-5;
 
+// Fixed DSpark v1 checkpoint geometry. The loader's 74-tensor completeness
+// gate derives its expected keys and shapes from the config, so these values
+// are PINNED at validation rather than trusted from config.json — a
+// config-consistent checkpoint with different geometry (fewer layers, no
+// confidence head, other head widths, other rope constants) must be rejected,
+// not silently loaded under a weaker contract.
+const DSPARK_NUM_LAYERS: usize = 5;
+const DSPARK_NUM_ATTENTION_HEADS: i64 = 16;
+const DSPARK_NUM_KV_HEADS: i64 = 1;
+const DSPARK_GLOBAL_HEAD_DIM: i64 = 512;
+const DSPARK_PARTIAL_ROTARY_FACTOR: f64 = 0.25;
+const DSPARK_ROPE_THETA: f64 = 1_000_000.0;
+
 // ============================================
 // Config
 // ============================================
@@ -148,11 +161,52 @@ impl DsparkConfig {
                 "DSpark draft requires attention_k_eq_v=true (the checkpoint has no v_proj weights)",
             ));
         }
+        if self.num_hidden_layers != DSPARK_NUM_LAYERS {
+            return Err(Error::from_reason(format!(
+                "DSpark draft num_hidden_layers={} is unsupported: the v1 checkpoint contract pins {} decoder layers",
+                self.num_hidden_layers, DSPARK_NUM_LAYERS
+            )));
+        }
+        if self.num_attention_heads != DSPARK_NUM_ATTENTION_HEADS {
+            return Err(Error::from_reason(format!(
+                "DSpark draft num_attention_heads={} is unsupported: the v1 checkpoint contract pins {}",
+                self.num_attention_heads, DSPARK_NUM_ATTENTION_HEADS
+            )));
+        }
+        if self.num_global_key_value_heads != DSPARK_NUM_KV_HEADS {
+            return Err(Error::from_reason(format!(
+                "DSpark draft num_global_key_value_heads={} is unsupported: the v1 checkpoint contract pins {}",
+                self.num_global_key_value_heads, DSPARK_NUM_KV_HEADS
+            )));
+        }
+        if self.global_head_dim != DSPARK_GLOBAL_HEAD_DIM {
+            return Err(Error::from_reason(format!(
+                "DSpark draft global_head_dim={} is unsupported: the v1 checkpoint contract pins {}",
+                self.global_head_dim, DSPARK_GLOBAL_HEAD_DIM
+            )));
+        }
+        if !self.enable_confidence_head {
+            return Err(Error::from_reason(
+                "DSpark draft requires enable_confidence_head=true: the v1 checkpoint contract includes the confidence head tensors",
+            ));
+        }
         let rope = &self.rope_parameters.full_attention;
         if rope.rope_type != "proportional" {
             return Err(Error::from_reason(format!(
                 "DSpark draft rope_parameters.full_attention.rope_type must be \"proportional\", got {:?}",
                 rope.rope_type
+            )));
+        }
+        if rope.partial_rotary_factor != DSPARK_PARTIAL_ROTARY_FACTOR {
+            return Err(Error::from_reason(format!(
+                "DSpark draft rope partial_rotary_factor={} is unsupported: the v1 checkpoint contract pins {}",
+                rope.partial_rotary_factor, DSPARK_PARTIAL_ROTARY_FACTOR
+            )));
+        }
+        if rope.rope_theta != DSPARK_ROPE_THETA {
+            return Err(Error::from_reason(format!(
+                "DSpark draft rope_theta={} is unsupported: the v1 checkpoint contract pins {}",
+                rope.rope_theta, DSPARK_ROPE_THETA
             )));
         }
         if self.markov_rank <= 0 {
@@ -172,20 +226,6 @@ impl DsparkConfig {
             return Err(Error::from_reason(
                 "DSpark draft block_size must be at least 1",
             ));
-        }
-        if self.num_hidden_layers == 0 {
-            return Err(Error::from_reason(
-                "DSpark draft num_hidden_layers must be at least 1",
-            ));
-        }
-        if self.num_attention_heads <= 0
-            || self.num_global_key_value_heads <= 0
-            || self.num_attention_heads % self.num_global_key_value_heads != 0
-        {
-            return Err(Error::from_reason(format!(
-                "DSpark draft num_attention_heads={} must be a positive multiple of num_global_key_value_heads={}",
-                self.num_attention_heads, self.num_global_key_value_heads
-            )));
         }
         if let Some(cap) = self.final_logit_softcapping
             && cap <= 0.0
@@ -796,35 +836,35 @@ impl DsparkDraftModel {
         let head_dim = self.config.global_head_dim;
         let mut missing: Vec<String> = Vec::new();
 
-        if let Some(w) = take_tensor(tensors, "embed_tokens.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "embed_tokens.weight", &mut missing)? {
             self.embed_tokens.load_weight(&w)?;
         }
-        if let Some(w) = take_tensor(tensors, "lm_head.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "lm_head.weight", &mut missing)? {
             self.lm_head.set_weight(&w, "lm_head")?;
         }
-        if let Some(w) = take_tensor(tensors, "norm.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "norm.weight", &mut missing)? {
             apply_norm_weight(&mut self.norm, &w, hidden, "norm")?;
         }
-        if let Some(w) = take_tensor(tensors, "fc.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "fc.weight", &mut missing)? {
             self.fc.set_weight(&w, "fc")?;
         }
-        if let Some(w) = take_tensor(tensors, "hidden_norm.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "hidden_norm.weight", &mut missing)? {
             apply_norm_weight(&mut self.hidden_norm, &w, hidden, "hidden_norm")?;
         }
-        if let Some(w) = take_tensor(tensors, "markov_head.markov_w1.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "markov_head.markov_w1.weight", &mut missing)? {
             check_2d_shape(&w, vocab, rank, "markov_head.markov_w1.weight")?;
             self.markov_w1 = w;
         }
-        if let Some(w) = take_tensor(tensors, "markov_head.markov_w2.weight", &mut missing) {
+        if let Some(w) = take_tensor(tensors, "markov_head.markov_w2.weight", &mut missing)? {
             check_2d_shape(&w, vocab, rank, "markov_head.markov_w2.weight")?;
             self.markov_w2 = w;
         }
         if let Some(proj) = self.confidence_proj.as_mut() {
-            if let Some(w) = take_tensor(tensors, "confidence_head.proj.weight", &mut missing) {
+            if let Some(w) = take_tensor(tensors, "confidence_head.proj.weight", &mut missing)? {
                 check_2d_shape(&w, 1, hidden + rank, "confidence_head.proj.weight")?;
                 proj.set_weight(&w)?;
             }
-            if let Some(b) = take_tensor(tensors, "confidence_head.proj.bias", &mut missing) {
+            if let Some(b) = take_tensor(tensors, "confidence_head.proj.bias", &mut missing)? {
                 if b.ndim()? != 1 || b.shape_at(0)? != 1 {
                     return Err(Error::from_reason(format!(
                         "DSpark confidence_head.proj.bias must be [1], got {:?}",
@@ -858,12 +898,12 @@ impl DsparkDraftModel {
                 ("self_attn.k_norm", &mut layer.self_attn.k_norm, head_dim),
             ] {
                 let key = format!("{prefix}.{suffix}.weight");
-                if let Some(w) = take_tensor(tensors, &key, &mut missing) {
+                if let Some(w) = take_tensor(tensors, &key, &mut missing)? {
                     apply_norm_weight(norm, &w, dims, &key)?;
                 }
             }
             let scalar_key = format!("{prefix}.layer_scalar");
-            if let Some(w) = take_tensor(tensors, &scalar_key, &mut missing) {
+            if let Some(w) = take_tensor(tensors, &scalar_key, &mut missing)? {
                 if w.ndim()? != 1 || w.shape_at(0)? != 1 {
                     return Err(Error::from_reason(format!(
                         "DSpark {scalar_key} must be [1], got {:?}",
@@ -876,42 +916,42 @@ impl DsparkDraftModel {
                 tensors,
                 &format!("{prefix}.self_attn.q_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.self_attn.q_proj.set_weight(&w, "q_proj")?;
             }
             if let Some(w) = take_tensor(
                 tensors,
                 &format!("{prefix}.self_attn.k_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.self_attn.k_proj.set_weight(&w, "k_proj")?;
             }
             if let Some(w) = take_tensor(
                 tensors,
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.self_attn.o_proj.set_weight(&w, "o_proj")?;
             }
             if let Some(w) = take_tensor(
                 tensors,
                 &format!("{prefix}.mlp.gate_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.mlp.set_gate_proj_weight(&w)?;
             }
             if let Some(w) = take_tensor(
                 tensors,
                 &format!("{prefix}.mlp.up_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.mlp.set_up_proj_weight(&w)?;
             }
             if let Some(w) = take_tensor(
                 tensors,
                 &format!("{prefix}.mlp.down_proj.weight"),
                 &mut missing,
-            ) {
+            )? {
                 layer.mlp.set_down_proj_weight(&w)?;
             }
         }
@@ -933,18 +973,27 @@ impl DsparkDraftModel {
 }
 
 /// Remove `key` from `tensors`, recording it in `missing` when absent.
+///
+/// A present tensor must be bf16 — the v1 checkpoint contract is bf16-only,
+/// and an exact-key f32/f16 file would otherwise push the whole forward into
+/// an unsupported dtype regime (f32 stays confined to runtime readbacks:
+/// sampling distributions and confidence probabilities).
 fn take_tensor(
     tensors: &mut HashMap<String, MxArray>,
     key: &str,
     missing: &mut Vec<String>,
-) -> Option<MxArray> {
-    match tensors.remove(key) {
-        Some(tensor) => Some(tensor),
-        None => {
-            missing.push(key.to_string());
-            None
-        }
+) -> Result<Option<MxArray>> {
+    let Some(tensor) = tensors.remove(key) else {
+        missing.push(key.to_string());
+        return Ok(None);
+    };
+    let dtype = tensor.dtype()?;
+    if dtype != DType::BFloat16 {
+        return Err(Error::from_reason(format!(
+            "DSpark draft tensor {key} must be bf16, got {dtype:?} (only bf16 checkpoints are supported)"
+        )));
     }
+    Ok(Some(tensor))
 }
 
 fn apply_norm_weight(norm: &mut RMSNorm, w: &MxArray, dims: i64, name: &str) -> Result<()> {
@@ -1221,6 +1270,65 @@ mod tests {
         expect_err(&parse(&json), "markov_rank");
     }
 
+    // Pinned-geometry guards: the loader's expected-key/shape contract is
+    // derived from the config, so any geometry other than the fixed v1
+    // 74-tensor layout must be rejected at validation.
+
+    #[test]
+    fn wrong_num_hidden_layers_rejected() {
+        let json =
+            base_config_json().replace("\"num_hidden_layers\": 5", "\"num_hidden_layers\": 4");
+        expect_err(&parse(&json), "num_hidden_layers");
+    }
+
+    #[test]
+    fn wrong_num_attention_heads_rejected() {
+        let json =
+            base_config_json().replace("\"num_attention_heads\": 16", "\"num_attention_heads\": 8");
+        expect_err(&parse(&json), "num_attention_heads");
+    }
+
+    #[test]
+    fn wrong_num_global_key_value_heads_rejected() {
+        let json = base_config_json().replace(
+            "\"num_global_key_value_heads\": 1",
+            "\"num_global_key_value_heads\": 2",
+        );
+        expect_err(&parse(&json), "num_global_key_value_heads");
+    }
+
+    #[test]
+    fn wrong_global_head_dim_rejected() {
+        let json =
+            base_config_json().replace("\"global_head_dim\": 512", "\"global_head_dim\": 256");
+        expect_err(&parse(&json), "global_head_dim");
+    }
+
+    #[test]
+    fn confidence_head_disabled_rejected() {
+        let json = base_config_json().replace(
+            "\"enable_confidence_head\": true",
+            "\"enable_confidence_head\": false",
+        );
+        expect_err(&parse(&json), "enable_confidence_head");
+    }
+
+    #[test]
+    fn wrong_partial_rotary_factor_rejected() {
+        let json = base_config_json().replace(
+            "\"partial_rotary_factor\": 0.25",
+            "\"partial_rotary_factor\": 0.5",
+        );
+        expect_err(&parse(&json), "partial_rotary_factor");
+    }
+
+    #[test]
+    fn wrong_rope_theta_rejected() {
+        let json =
+            base_config_json().replace("\"rope_theta\": 1000000.0", "\"rope_theta\": 10000.0");
+        expect_err(&parse(&json), "rope_theta");
+    }
+
     // ── Markov correction math ─────────────────────────────────────────
 
     /// Tiny fixture: V=8, rank=2, hand-computed expected correction row.
@@ -1399,6 +1507,99 @@ mod tests {
     fn to_vec_f32(a: &MxArray) -> Vec<f32> {
         a.eval();
         a.to_float32().unwrap().to_vec()
+    }
+
+    // ── Weight-install gate (apply_weights seam) ───────────────────────
+
+    /// Complete bf16 tensor map matching `tiny_config()`'s expected keys and
+    /// shapes. Tests mutate it to simulate broken checkpoints.
+    fn synthetic_tiny_tensors() -> std::collections::HashMap<String, MxArray> {
+        let mut specs: Vec<(String, Vec<i64>)> = vec![
+            ("embed_tokens.weight".into(), vec![16, 8]),
+            ("lm_head.weight".into(), vec![16, 8]),
+            ("norm.weight".into(), vec![8]),
+            ("fc.weight".into(), vec![8, 16]),
+            ("hidden_norm.weight".into(), vec![8]),
+            ("markov_head.markov_w1.weight".into(), vec![16, 2]),
+            ("markov_head.markov_w2.weight".into(), vec![16, 2]),
+            ("confidence_head.proj.weight".into(), vec![1, 10]),
+            ("confidence_head.proj.bias".into(), vec![1]),
+        ];
+        for i in 0..2 {
+            for (suffix, shape) in [
+                ("input_layernorm.weight", vec![8]),
+                ("post_attention_layernorm.weight", vec![8]),
+                ("pre_feedforward_layernorm.weight", vec![8]),
+                ("post_feedforward_layernorm.weight", vec![8]),
+                ("self_attn.q_norm.weight", vec![4]),
+                ("self_attn.k_norm.weight", vec![4]),
+                ("layer_scalar", vec![1]),
+                ("self_attn.q_proj.weight", vec![8, 8]),
+                ("self_attn.k_proj.weight", vec![4, 8]),
+                ("self_attn.o_proj.weight", vec![8, 8]),
+                ("mlp.gate_proj.weight", vec![16, 8]),
+                ("mlp.up_proj.weight", vec![16, 8]),
+                ("mlp.down_proj.weight", vec![8, 16]),
+            ] {
+                specs.push((format!("layers.{i}.{suffix}"), shape));
+            }
+        }
+        specs
+            .into_iter()
+            .map(|(key, shape)| {
+                let arr = MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap();
+                (key, arr)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_weights_accepts_complete_bf16_set() {
+        let mut model = DsparkDraftModel::new(tiny_config()).unwrap();
+        let mut tensors = synthetic_tiny_tensors();
+        model.apply_weights(&mut tensors).unwrap();
+        assert!(tensors.is_empty(), "all tensors must be consumed");
+    }
+
+    #[test]
+    fn apply_weights_rejects_non_bf16_tensor() {
+        let mut model = DsparkDraftModel::new(tiny_config()).unwrap();
+        let mut tensors = synthetic_tiny_tensors();
+        tensors.insert(
+            "fc.weight".to_string(),
+            MxArray::zeros(&[8, 16], Some(DType::Float32)).unwrap(),
+        );
+        let err = model
+            .apply_weights(&mut tensors)
+            .expect_err("an f32 weight must be rejected");
+        assert!(err.reason.contains("fc.weight"), "got: {}", err.reason);
+        assert!(err.reason.contains("bf16"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn apply_weights_reports_missing_and_leftover_keys() {
+        let mut model = DsparkDraftModel::new(tiny_config()).unwrap();
+        let mut tensors = synthetic_tiny_tensors();
+        tensors.remove("layers.1.mlp.up_proj.weight");
+        tensors.insert(
+            "layers.0.self_attn.v_proj.weight".to_string(),
+            MxArray::zeros(&[4, 8], Some(DType::BFloat16)).unwrap(),
+        );
+        let err = model
+            .apply_weights(&mut tensors)
+            .expect_err("missing + stray keys must be rejected");
+        assert!(err.reason.contains("missing"), "got: {}", err.reason);
+        assert!(
+            err.reason.contains("layers.1.mlp.up_proj.weight"),
+            "got: {}",
+            err.reason
+        );
+        assert!(err.reason.contains("unexpected"), "got: {}", err.reason);
+        assert!(
+            err.reason.contains("layers.0.self_attn.v_proj.weight"),
+            "got: {}",
+            err.reason
+        );
     }
 
     // ── Context cache invariants ───────────────────────────────────────
