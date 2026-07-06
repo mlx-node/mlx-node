@@ -2205,6 +2205,13 @@ impl Gemma4Inner {
                 weight_bytes = weight_bytes.saturating_add(shard.nbytes() as u64);
             }
         }
+        // The DSpark draft's checkpoint tensors are model-owned resident
+        // weights too (~GBs of bf16 for the 12B draft); fold them in so
+        // the cache-limit coordinator sees the true footprint instead of
+        // silently over-granting cache on draft-loaded sessions.
+        if let Some(draft) = inner.dspark.as_ref() {
+            weight_bytes = weight_bytes.saturating_add(draft.weight_bytes());
+        }
 
         Ok((inner, weight_bytes))
     }
@@ -2467,6 +2474,68 @@ mod tests {
             err.reason
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Loading WITH the draft must report a strictly larger weight-byte
+    /// total to the cache-limit coordinator than loading without — larger
+    /// by EXACTLY the draft checkpoint's tensor bytes (the draft's ~GBs of
+    /// bf16 are model-owned resident weights; omitting them over-grants
+    /// cache on exactly the constrained devices the limit protects).
+    ///
+    /// Run (single-threaded; two sequential full 12B loads):
+    ///
+    /// ```shell
+    /// PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
+    /// MLX_TEST_GEMMA4_MODEL_PATH=... MLX_TEST_GEMMA4_DSPARK_PATH=... \
+    ///     cargo test -p mlx-core --lib --release -- --ignored \
+    ///     --test-threads=1 load_with_draft_registers_strictly_larger_weight_bytes
+    /// ```
+    #[test]
+    #[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH (two full 12B loads)"]
+    fn load_with_draft_registers_strictly_larger_weight_bytes() {
+        let (Ok(model), Ok(draft)) = (
+            std::env::var("MLX_TEST_GEMMA4_MODEL_PATH"),
+            std::env::var("MLX_TEST_GEMMA4_DSPARK_PATH"),
+        ) else {
+            eprintln!("skipping: set MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH");
+            return;
+        };
+        // Two full loads back-to-back: skip the warmup forwards.
+        // SAFETY: env-gated model test, run single-threaded by contract.
+        unsafe { std::env::set_var("GEMMA4_NO_WARMUP", "1") };
+        let plain_bytes = {
+            let (_inner, bytes) =
+                Gemma4Inner::load_from_dir(&model, None).expect("plain 12B load failed");
+            bytes
+        };
+        crate::array::clear_cache();
+        let (inner, with_draft_bytes) =
+            Gemma4Inner::load_from_dir(&model, Some(&draft)).expect("12B + draft load failed");
+        unsafe { std::env::remove_var("GEMMA4_NO_WARMUP") };
+
+        let draft_bytes = inner
+            .dspark
+            .as_ref()
+            .expect("draft must be attached")
+            .weight_bytes();
+        assert!(
+            draft_bytes > (1u64 << 30),
+            "the real 12B draft checkpoint is multi-GB, got {draft_bytes} bytes"
+        );
+        assert!(
+            with_draft_bytes > plain_bytes,
+            "draft load must register strictly more weight bytes \
+             (with={with_draft_bytes} without={plain_bytes})"
+        );
+        assert_eq!(
+            with_draft_bytes,
+            plain_bytes.saturating_add(draft_bytes),
+            "the weight-byte delta must be exactly the draft checkpoint's tensor bytes"
+        );
+        println!(
+            "[draft_weight_bytes] without={plain_bytes} with={with_draft_bytes} \
+             draft={draft_bytes}"
+        );
     }
 
     #[test]

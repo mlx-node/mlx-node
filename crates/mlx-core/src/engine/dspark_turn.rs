@@ -59,11 +59,14 @@ pub(crate) struct DsparkTurnArgs<'a> {
 /// caches can never desync), so only `last_in_cache` is surfaced.
 pub(crate) struct DsparkTurnOutcome {
     /// Whether the LAST emitted token's K/V is already in the target cache.
-    /// `true` iff the last emitted token is the anchor or an accepted draft
-    /// (verify wrote its slot and commit kept it); `false` when it is a
-    /// cycle's boundary token (bonus/residual — never written this cycle;
-    /// it only gains K/V as the NEXT cycle's verify anchor). The save uses
-    /// `drop_last_always = !last_in_cache`.
+    /// `true` iff the last emitted token is a KEPT accepted draft (verify
+    /// wrote its slot and commit kept it); `false` when it is a cycle's
+    /// boundary token (bonus/residual — never written this cycle; it only
+    /// gains K/V as the NEXT cycle's verify anchor) AND on every in-cycle
+    /// stop cut — the stop-clamp's AR-parity exclusion never keeps the
+    /// tripping token's slot, so every stop exit reports `false`, exactly
+    /// like the AR reference (which never forwards its final token on a
+    /// non-length stop). The save uses `drop_last_always = !last_in_cache`.
     pub last_in_cache: bool,
 }
 
@@ -84,8 +87,12 @@ enum CycleStop {
 /// argmax-based — batched fast path when penalties are no-op, per-row
 /// penalized argmax otherwise, never dists/RNG; sampled temperature:
 /// per-position `accept_with_residual`) → STOP-CLAMP over the accepted list
-/// BEFORE commit → `commit(keep = 1 + min(emit_count, k), 1 + L)` → emit →
-/// cache-clear cadence → stop or `anchor = boundary; eval_boundary`.
+/// BEFORE commit → `commit(keep = 1 + kept_drafts, 1 + L)` where
+/// `kept_drafts = min(emit_count, k)` EXCEPT that an in-cycle stop token's
+/// slot is never kept (AR-parity: the tripping token is excluded when the
+/// clamp cut at an accepted draft, so a stop exit leaves the cache exactly
+/// where the AR reference would) → emit → cache-clear cadence → stop or
+/// `anchor = boundary; eval_boundary`.
 ///
 /// Driven in production by gemma4's `mtp_turn` override
 /// (`dspark_chat_turn`); the module's mock tests pin the loop contract.
@@ -464,7 +471,27 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // NO K/V (it becomes the next cycle's anchor), so it never counts
         // toward `keep` — hence `min(emit_count, k)` counts only kept
         // accepted-draft slots.
-        let keep = 1 + emit_count.min(accepted_drafts_k);
+        //
+        // AR-PARITY on in-cycle stops: an in-cycle stop token (EOS /
+        // cancel-observed / repetition-tripping — always the LAST emitted
+        // token) is NEVER committed to the target cache. The AR reference
+        // never forwards its final token on a non-length stop and the
+        // family saves drop it from the persisted history, so keeping its
+        // slot here would leave the speculative session one K/V (and one
+        // history token, via `last_in_cache`) AHEAD of the AR session for
+        // the same transcript. When the clamp cut at an ACCEPTED DRAFT
+        // (`emit_count <= k` — Stop/Cancelled/Repetition always follow a
+        // push, so `emit_count >= 1` there), exclude the tripping token's
+        // slot; a boundary-stop cut changes nothing (no slot to exclude).
+        let kept_drafts = match stop {
+            Some(CycleStop::Stop) | Some(CycleStop::Cancelled) | Some(CycleStop::Repetition(_))
+                if emit_count <= accepted_drafts_k =>
+            {
+                emit_count.saturating_sub(1)
+            }
+            _ => emit_count.min(accepted_drafts_k),
+        };
+        let keep = 1 + kept_drafts;
         profiler.begin("dspark_commit");
         let commit_res = step.commit(keep, 1 + draft_len);
         profiler.end();
@@ -520,10 +547,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
 
         // `last_in_cache` invariant: true iff the LAST emitted token's K/V
-        // is in the target cache. Accepted drafts (indices < k) and the
-        // anchor have kept K/V slots; the boundary does not. `emit_count ==
-        // k + 1` (full emit incl. boundary) on every non-stop cycle.
-        last_in_cache = emit_count <= accepted_drafts_k;
+        // is in the target cache — i.e. it is one of the `kept_drafts`
+        // slots. `emit_count == k + 1` (full emit incl. boundary) on every
+        // non-stop cycle → false; in-cycle stop tokens are never kept (the
+        // AR-parity exclusion above) → false on every stop cut, whether the
+        // stop token was an accepted draft or the boundary.
+        last_in_cache = emit_count <= kept_drafts;
 
         if let Some(kind) = stop {
             match kind {
@@ -1143,9 +1172,11 @@ mod tests {
     fn dspark_turn_eos_at_accepted_draft_keep_math() {
         // depth 3: drafts [4,15,6] all accepted (verify [4,15,6,7]) + bonus
         // 7 → accepted = [4,15,6,7]. EOS (15) is accepted draft j=1: the
-        // clamp cuts INCLUSIVE at it → emit j+1 = 2 tokens, keep = j+2 = 3
-        // (anchor + drafts 4,15), total = 4, reason "stop". The EOS is an
-        // accepted draft whose verify K/V slot is kept → last_in_cache TRUE.
+        // clamp cuts INCLUSIVE at it → emit j+1 = 2 tokens. AR-PARITY: the
+        // EOS itself is NEVER committed (AR never forwards its final token
+        // on a stop and the save drops it from history) → keep = 1 + j = 2
+        // (anchor + draft 4 only), total = 4, reason "stop", and
+        // last_in_cache FALSE so the save drops the EOS from history too.
         let mut backend = MockDsparkBackend::greedy(
             16,
             vec![CycleScript::greedy(vec![4, 15, 6], vec![4, 15, 6, 7])],
@@ -1157,13 +1188,14 @@ mod tests {
         assert_eq!(out.generated, vec![3, 4, 15], "emit stops at the EOS draft");
         assert_eq!(out.finish_reason, "stop");
         assert!(
-            out.last_in_cache,
-            "EOS at accepted draft j: its K/V is kept → last_in_cache = true"
+            !out.last_in_cache,
+            "EOS at accepted draft j: its slot is excluded from keep → \
+             last_in_cache = false (save drops it, matching AR)"
         );
         assert_eq!(
             commits(&out.ledger),
-            vec![(3, 4)],
-            "keep = j+2 = 3, total = 1+L = 4"
+            vec![(2, 4)],
+            "keep = 1 + j = 2 (EOS slot excluded), total = 1+L = 4"
         );
         // The clamp resolves the stop BEFORE commit — no second cycle runs.
         assert_eq!(count(&out.ledger, |c| matches!(c, Call::Verify { .. })), 1);
@@ -1177,6 +1209,35 @@ mod tests {
         let (mean, _, cycles) = out.acceptance.expect("one cycle recorded");
         assert!((mean - 3.0).abs() < 1e-9);
         assert_eq!(cycles, 1);
+    }
+
+    #[test]
+    fn dspark_turn_eos_at_first_accepted_draft_keeps_anchor_only() {
+        // AR-parity edge: EOS is the FIRST accepted draft (j=0). emit = 1,
+        // its slot is excluded → keep = 1 (anchor only, kept_drafts = 0),
+        // total = 1+L = 4, last_in_cache FALSE. Post-turn state is
+        // identical to an AR turn that generated [anchor, EOS] and dropped
+        // the EOS: only the anchor's K/V (and history entry) survive.
+        let mut backend = MockDsparkBackend::greedy(
+            16,
+            vec![CycleScript::greedy(vec![15, 5, 6], vec![15, 5, 6, 7])],
+        );
+        let mut p = greedy_params();
+        p.mtp_depth = 3;
+        let out = drive_turn(&mut backend, p, 3, 15, 3);
+
+        assert_eq!(out.generated, vec![3, 15], "emit stops at the EOS draft");
+        assert_eq!(out.finish_reason, "stop");
+        assert!(!out.last_in_cache);
+        assert_eq!(
+            commits(&out.ledger),
+            vec![(1, 4)],
+            "keep = 1 (anchor only): the EOS slot and all later verify rows roll back"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::EvalBoundary { .. })),
+            0
+        );
     }
 
     #[test]
@@ -1339,7 +1400,9 @@ mod tests {
         // max_consecutive_tokens = 3: the third consecutive 9 trips the
         // cutoff mid-block. accepted = [9,9,9,9] (drafts [9,9,9] all
         // "accepted", bonus 9); the clamp cuts INCLUSIVE at the third 9 →
-        // emit 3, reason "repetition", keep = 1 + min(3,3) = 4, total 4.
+        // emit 3, reason "repetition". AR-parity: the tripping token is an
+        // in-cycle stop token — its slot is excluded → keep = 1 + 2 = 3,
+        // total 4, last_in_cache FALSE.
         let mut backend = MockDsparkBackend::greedy(
             16,
             vec![CycleScript::greedy(vec![9, 9, 9], vec![9, 9, 9, 9])],
@@ -1352,10 +1415,11 @@ mod tests {
         assert_eq!(out.generated, vec![3, 9, 9, 9]);
         assert_eq!(out.finish_reason, "repetition");
         assert!(
-            out.last_in_cache,
-            "repetition tripped on an accepted draft — its K/V is kept"
+            !out.last_in_cache,
+            "repetition tripped on an accepted draft — the tripping token's \
+             slot is excluded (AR-parity) so the save drops it"
         );
-        assert_eq!(commits(&out.ledger), vec![(4, 4)]);
+        assert_eq!(commits(&out.ledger), vec![(3, 4)]);
     }
 
     // ---- 3. L_cap math -----------------------------------------------------
@@ -1638,9 +1702,11 @@ mod tests {
     fn dspark_turn_streaming_cancel_in_clamp_commits_exactly_once() {
         // Cancel flips DURING the first verify (after the loop-top check).
         // The clamp observes it after the first accepted token: emit 1,
-        // reason "cancelled", commit(keep = 1 + min(1, k=2) = 2, total 3)
-        // — commit still happens EXACTLY once and the cancel token is
-        // committed but NOT streamed (mtp emit-arm parity).
+        // reason "cancelled". AR-parity: the cancel-observed token is an
+        // in-cycle stop token — its slot is excluded → commit(keep = 1,
+        // total 3) — commit still happens EXACTLY once and the cancel token
+        // is emitted (in `generated`) but NOT streamed and NOT persisted
+        // (mtp emit-arm parity + AR drop-last).
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut backend =
             MockDsparkBackend::greedy(7, vec![CycleScript::greedy(vec![1, 3], vec![1, 3, 4])]);
@@ -1654,8 +1720,8 @@ mod tests {
         );
         assert_eq!(out.finish_reason, "cancelled");
         assert!(
-            out.last_in_cache,
-            "the cancel token is an accepted draft with kept K/V"
+            !out.last_in_cache,
+            "the cancel token's slot is excluded from keep (AR-parity)"
         );
         assert_eq!(
             out.chunks,
@@ -1664,8 +1730,8 @@ mod tests {
         );
         assert_eq!(
             commits(&out.ledger),
-            vec![(2, 3)],
-            "commit-exactly-once with the clamped keep"
+            vec![(1, 3)],
+            "commit-exactly-once with the clamped, stop-excluded keep"
         );
         assert_eq!(
             count(&out.ledger, |c| matches!(c, Call::EvalBoundary { .. })),

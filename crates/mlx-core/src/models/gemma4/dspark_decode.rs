@@ -317,9 +317,12 @@ impl Gemma4Inner {
     /// existing cache-prefix machinery → chunked prefill WITH the DSpark
     /// tap (per-chunk capture → fuse → context-append → drop; full-prompt
     /// tapped hiddens are never held) → anchor sample (byte-identical to
-    /// the generic flow) → `run_dspark_turn` → save (drop-last driven by
-    /// the loop's `last_in_cache`) → finalize (+ default
-    /// `augment_performance`, which fills the `mtp_*` acceptance fields).
+    /// the generic flow) → `run_dspark_turn` → save (AR-parity: stop exits
+    /// drop the final token, length exits materialize its K/V and keep
+    /// all — post-turn history AND cache offsets equal the AR flow's for
+    /// every stop shape) → finalize (+ default `augment_performance`,
+    /// which fills the `mtp_*` acceptance fields). Every error between
+    /// prefill start and the save fails CLOSED (`dspark_fail_closed`).
     pub(crate) fn dspark_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         let eos_id = args.eos_id;
@@ -399,36 +402,54 @@ impl Gemma4Inner {
             args.sink.map(|_| ChatBackend::stream_emitter(self));
 
         // --- tapped prefill: target K/V + the draft's fused context ---
+        // From here until the save runs, every error FAILS CLOSED
+        // (`dspark_fail_closed`): the target caches advance during
+        // prefill/verify with nothing recorded in `cached_token_history`
+        // yet, so an error abandoned mid-flight would leave a
+        // history-vs-cache offset mismatch that a later prefix-reuse hit
+        // could warm-start corrupt K/V from.
         profiler.begin_prefill();
-        let (last_logits, turn_state) = self.dspark_prefill_with_tap(
+        let (last_logits, turn_state) = match self.dspark_prefill_with_tap(
             &prefill_tokens,
             cached_prefix_len as i32,
             generation_stream,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => return Err(self.dspark_fail_closed(e)),
+        };
         profiler.end_prefill();
 
         // --- anchor sample: byte-identical to the generic flow ---
-        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
-        let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
+        let y = match apply_all_penalties(last_logits, &token_history, &p)
+            .and_then(|logits| crate::sampling::sample(&logits, p.sampling_config))
+        {
+            Ok(y) => y,
+            Err(e) => return Err(self.dspark_fail_closed(e)),
+        };
         y.eval();
 
-        ChatBackend::eval_caches(self)?;
+        if let Err(e) = ChatBackend::eval_caches(self) {
+            return Err(self.dspark_fail_closed(e));
+        }
         if report_perf {
             first_token_instant = Some(Instant::now());
         }
 
-        let block_size = self
-            .dspark
-            .as_ref()
-            .map(|d| d.config.block_size)
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark turn: no draft model loaded"))?;
+        let block_size = match self.dspark.as_ref().map(|d| d.config.block_size) {
+            Some(b) => b,
+            None => {
+                return Err(self.dspark_fail_closed(Error::from_reason(
+                    "gemma4 DSpark turn: no draft model loaded",
+                )));
+            }
+        };
 
         // Hand the prefill-built draft context to the stepper (taken by
         // `begin_dspark_decode` inside the loop).
         self.dspark_turn_state = Some(turn_state);
 
         let mut rng = rand::rng();
-        let last_in_cache;
+        let mut last_in_cache;
         {
             let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
                 (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
@@ -462,27 +483,39 @@ impl Gemma4Inner {
                 },
                 streaming_ctx,
             );
-            // A loop failure before `begin_dspark_decode` consumed the
-            // stash would leave stale per-turn state behind; clear it so
-            // the next turn can never observe it.
-            if outcome.is_err() {
-                self.dspark_turn_state = None;
+            // Fail CLOSED on any loop error: verify advances the target
+            // caches BEFORE commit resolves, so an error mid-cycle (or a
+            // failed rollback/commit) can leave K/V rows the history knows
+            // nothing about. The reset also clears the per-turn draft
+            // stash, whether or not `begin_dspark_decode` consumed it.
+            match outcome {
+                Ok(o) => last_in_cache = o.last_in_cache,
+                Err(e) => return Err(self.dspark_fail_closed(e)),
             }
-            last_in_cache = outcome?.last_in_cache;
         }
 
-        // --- save: drop-last driven by the loop's `last_in_cache` ---
-        // `!last_in_cache` = the final emitted token has no K/V slot (a
-        // cycle boundary, an unverified stop seed, or a clean length exit)
-        // — drop it so `cached_token_history.len()` equals the physical
-        // cache length. A kept final token (EOS accepted as a draft, its
-        // verify slot committed) stays in the history for the same
-        // alignment reason — the qwen3.5 MTP cores' `drop_last_always =
-        // !last_in_cache` convention. The `finish_reason == "length"` arm
-        // is unreachable belt-and-braces (clean length exits always land on
-        // an uncached boundary), kept for parity with
-        // `save_cache_state_direct`'s documented semantics.
-        let drop_last = !last_in_cache || finish_reason == "length";
+        // --- save: AR-parity drop-last + length-exit materialization ---
+        // The loop reports `last_in_cache == false` on EVERY stop-shaped
+        // exit (in-cycle stop tokens are never committed — the loop's
+        // AR-parity exclusion — and boundary stops never had a slot) and on
+        // clean length exits (the final token is an unverified boundary).
+        //   Stop exits (`finish_reason != "length"`): drop the final token
+        //   from the persisted history — exactly the AR save, which never
+        //   forwards its final token and drops it on every non-length stop.
+        //   Length exits: the AR flow keeps ALL tokens and materializes the
+        //   final token's K/V with one extra forward
+        //   (`Gemma4Decode::materialize_final`); mirror it so the physical
+        //   cache offsets equal the keep-all history.
+        if finish_reason == "length"
+            && !last_in_cache
+            && let Some(&final_token) = generated_tokens.last()
+        {
+            if let Err(e) = self.dspark_materialize_final(final_token, generation_stream) {
+                return Err(self.dspark_fail_closed(e));
+            }
+            last_in_cache = true;
+        }
+        let drop_last = !last_in_cache;
         let history_tokens: &[u32] = if drop_last && !generated_tokens.is_empty() {
             &generated_tokens[..generated_tokens.len() - 1]
         } else {
@@ -716,10 +749,61 @@ impl Gemma4Inner {
             },
         ))
     }
+
+    /// Fail CLOSED after a DSpark turn error that may have left the target
+    /// caches advanced beyond `cached_token_history` (prefill and verify
+    /// write K/V before the save records anything): drop the whole warm
+    /// session via `reset_caches_sync` (caches → `None`, history/media
+    /// keys/sliding checkpoints cleared) plus the per-turn draft stash, so
+    /// no later turn can prefix-match into corrupt or misaligned K/V. The
+    /// next fresh turn takes the cold path (full re-prefill); a delta turn
+    /// on the dropped session is rejected by the live-session guard.
+    /// Returns the error for `return Err(self.dspark_fail_closed(e))`
+    /// ergonomics.
+    fn dspark_fail_closed(&mut self, err: Error) -> Error {
+        // Infallible today (`caches = None` + field clears); even if it
+        // ever grows a fallible arm, nothing warm-reusable can survive it.
+        let _ = self.reset_caches_sync();
+        self.dspark_turn_state = None;
+        err
+    }
+
+    /// LENGTH-exit only: run ONE more forward for the final emitted token
+    /// so its K/V lands in the live session caches, then DISCARD the
+    /// logits — the DSpark analog of `Gemma4Decode::materialize_final`
+    /// (the AR flow keeps every token on length exits and materializes the
+    /// final one; the save's keep-all history then equals the physical
+    /// cache offsets). No sample / push / emit; like the AR steppers, this
+    /// deliberately does NOT fire a sliding decode-boundary checkpoint.
+    fn dspark_materialize_final(&mut self, token_id: u32, stream: Stream) -> Result<()> {
+        let caches = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark materialize_final: caches missing"))?;
+        let input_ids = MxArray::from_int32(&[token_id as i32], &[1, 1])?;
+        let _stream_ctx = StreamContext::new(stream);
+        crate::models::gemma4::diagnostic::set_step(-1);
+        let _logits = forward_inner(
+            &input_ids,
+            &self.embed_tokens,
+            &self.layers,
+            caches,
+            &self.final_norm,
+            &self.lm_head,
+            self.embed_weight_t.as_ref(),
+            self.ple.as_ref(),
+            &self.config,
+            None,
+        )?;
+        eval_gemma4_caches(caches)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::engine::types::ChatConfig;
     use crate::models::gemma4::config::Gemma4Config;
@@ -728,7 +812,22 @@ mod tests {
     /// Tiny flat-path Gemma4 config (paged OFF so `Gemma4Inner::new` builds
     /// no adapter): 4 hybrid layers, one KV-shared.
     fn tiny_target_config() -> Gemma4Config {
-        serde_json::from_value(serde_json::json!({
+        serde_json::from_value(tiny_target_config_value())
+            .expect("tiny Gemma4 config must deserialize")
+    }
+
+    /// [`tiny_target_config`] with an overridden sliding window — window 2
+    /// makes any verify block over 2 rows violate the
+    /// `snapshot_before_verify` rollback invariant (the fail-closed
+    /// regression's REAL, unmocked mid-turn error).
+    fn tiny_target_config_with_window(window: i64) -> Gemma4Config {
+        let mut v = tiny_target_config_value();
+        v["sliding_window"] = serde_json::json!(window);
+        serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+    }
+
+    fn tiny_target_config_value() -> serde_json::Value {
+        serde_json::json!({
             "vocab_size": 16,
             "hidden_size": 8,
             "num_hidden_layers": 4,
@@ -748,8 +847,7 @@ mod tests {
             ],
             "num_kv_shared_layers": 1,
             "use_block_paged_cache": false
-        }))
-        .expect("tiny Gemma4 config must deserialize")
+        })
     }
 
     /// Tiny draft config geometry-matched to [`tiny_target_config`]
@@ -914,5 +1012,347 @@ mod tests {
         unsafe { std::env::set_var("MLX_DSPARK_CONFIDENCE_THRESHOLD", "not-a-number") };
         assert_eq!(dspark_confidence_threshold_from_env(), 0.0);
         unsafe { std::env::remove_var("MLX_DSPARK_CONFIDENCE_THRESHOLD") };
+    }
+
+    // ── fail-closed error path (whole-turn core) ───────────────────────
+
+    /// WordLevel tokenizer covering the full tiny vocab (ids 0..16 as
+    /// `t0`..`t15`) so every decode over tiny-model output succeeds,
+    /// written to a temp `tokenizer.json` for `Qwen3Tokenizer::from_file`.
+    fn tiny_qwen_tokenizer() -> Arc<crate::tokenizer::Qwen3Tokenizer> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_dspark_tiny_tokenizer_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp tokenizer dir");
+        let vocab = (0..16)
+            .map(|i| format!("\"t{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {{
+                    "type": "WordLevel",
+                    "vocab": {{ {vocab} }},
+                    "unk_token": "t0"
+                }}
+            }}"#
+        );
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, json).expect("write tiny tokenizer.json");
+        Arc::new(
+            crate::tokenizer::Qwen3Tokenizer::from_file(&path).expect("tiny tokenizer must load"),
+        )
+    }
+
+    fn tiny_turn_config(mtp_depth: Option<i32>, max_new_tokens: i32) -> ChatConfig {
+        ChatConfig {
+            mtp_depth,
+            max_new_tokens: Some(max_new_tokens),
+            temperature: Some(0.0),
+            reuse_cache: Some(true),
+            report_performance: Some(true),
+            include_reasoning: Some(false),
+            ..ChatConfig::default()
+        }
+    }
+
+    /// Drive `dspark_chat_turn` directly (sync — no model thread), with an
+    /// out-of-vocab `eos_id` so the tiny model can only exit "length".
+    fn run_tiny_dspark_turn(
+        inner: &mut Gemma4Inner,
+        tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
+        tokens: &[u32],
+        config: &ChatConfig,
+    ) -> Result<crate::engine::types::ChatResult> {
+        let p = ChatBackend::resolve_params(inner, config);
+        let thinking = ChatBackend::thinking_setup(inner, config);
+        let mut args = WholeTurnArgs {
+            tokens,
+            tokenizer,
+            eos_id: 999,
+            config,
+            params: &p,
+            thinking,
+            is_delta: false,
+            sink: None,
+            cancelled: None,
+            images: &[],
+            audio: &[],
+        };
+        match inner.dspark_chat_turn(&mut args)? {
+            TurnOutput::Complete(r) => Ok(*r),
+            TurnOutput::Streamed => panic!("sync dspark turn returned TurnOutput::Streamed"),
+        }
+    }
+
+    /// FAIL-CLOSED regression: a REAL (unmocked) stepper error AFTER
+    /// prefill has advanced the target caches must drop the entire warm
+    /// session — caches, `cached_token_history`, per-turn stash — so no
+    /// later turn can prefix-match into K/V the history knows nothing
+    /// about; and the very next turn must succeed via the cold path.
+    ///
+    /// Error injection: sliding_window 2 with the default depth (draft
+    /// block_size 3) makes the first cycle's 4-row verify block violate
+    /// `snapshot_before_verify`'s window >= block invariant — the error
+    /// fires at the verify seam of cycle 1, after `dspark_prefill_with_tap`
+    /// appended the whole prompt to every active cache.
+    #[test]
+    fn dspark_turn_error_fails_closed_then_cold_turn_recovers() {
+        let mut inner = Gemma4Inner::new(tiny_target_config_with_window(2))
+            .expect("tiny window-2 Gemma4Inner must construct");
+        inner.dspark = Some(DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model"));
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+
+        // Turn 1: unset depth resolves to block_size 3 → 1+3 verify rows
+        // over a 2-token window → hard error mid-turn.
+        let err = run_tiny_dspark_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+            .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
+        assert!(
+            err.reason.contains("sliding window") && err.reason.contains("verify block"),
+            "expected the snapshot_before_verify window guard, got: {}",
+            err.reason
+        );
+        // Fail CLOSED: nothing warm-reusable may survive the error.
+        assert!(inner.caches.is_none(), "caches must be dropped");
+        assert!(
+            inner.cached_token_history.is_empty(),
+            "cached_token_history must be cleared (it never covered the prefilled K/V)"
+        );
+        assert!(
+            inner.dspark_turn_state.is_none(),
+            "the per-turn draft stash must be cleared"
+        );
+        assert!(
+            !ChatBackend::has_live_session(&inner),
+            "the session must not be warm-reusable after a failed turn"
+        );
+        assert_eq!(
+            ChatBackend::verify_cache_prefix(&inner, &tokens, true),
+            0,
+            "no prefix hit may match against the dropped session"
+        );
+
+        // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
+        // turn must run cold end-to-end and land fully consistent.
+        let res = run_tiny_dspark_turn(
+            &mut inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(Some(1), 3),
+        )
+        .expect("the next turn after fail-closed must succeed via the cold path");
+        assert_eq!(res.finish_reason, "length");
+        assert_eq!(
+            res.cached_tokens, 0,
+            "nothing may be warm-reused after fail-closed"
+        );
+        assert_eq!(res.num_tokens, 3, "budget-3 length exit");
+
+        // Length-exit AR parity (keep-all + materialize): the saved history
+        // holds prompt + ALL generated tokens and every ACTIVE cache offset
+        // equals the history length — the final token's K/V was
+        // materialized by `dspark_materialize_final`.
+        let history = inner.cached_token_history.clone();
+        assert_eq!(history.len(), tokens.len() + res.num_tokens as usize);
+        assert_eq!(&history[..tokens.len()], &tokens[..]);
+        let mask = dspark_shared_slot_mask(&inner.config);
+        let caches = inner
+            .caches
+            .as_ref()
+            .expect("live caches after a successful turn");
+        for (i, cache) in caches.iter().enumerate() {
+            let expected = if mask[i] { 0 } else { history.len() as i32 };
+            assert_eq!(
+                cache.get_offset(),
+                expected,
+                "cache {i} offset must equal the saved history length \
+                 (length-exit materialize; shared slots stay unwritten)"
+            );
+        }
+    }
+
+    // ── EOS-accepted-as-draft AR state parity (real model, env-gated) ──
+
+    /// EOS-ACCEPTED-AS-DRAFT regression: full post-turn STATE parity vs the
+    /// AR flow — `cached_token_history` byte-equal AND physical cache
+    /// offsets equal to the history length — across a 2-turn warm-continue,
+    /// with the stop SHAPE (EOS cut INSIDE the accepted drafts, not at a
+    /// cycle boundary) pinned via the mtp acceptance stats: on a boundary
+    /// stop or clean cycles, generated == seed + Σk + cycles; a cut inside
+    /// accepted drafts loses the cut cycle's boundary token (and any drafts
+    /// past the EOS), so generated < seed + Σk + cycles.
+    ///
+    /// Run (single-threaded; both env vars required):
+    ///
+    /// ```shell
+    /// PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) \
+    /// MLX_TEST_GEMMA4_MODEL_PATH=... MLX_TEST_GEMMA4_DSPARK_PATH=... \
+    ///     cargo test -p mlx-core --lib --release -- --ignored \
+    ///     --test-threads=1 dspark_eos_accepted_draft_state_matches_ar_e2e
+    /// ```
+    #[test]
+    #[ignore = "needs MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH (real 12B + draft)"]
+    fn dspark_eos_accepted_draft_state_matches_ar_e2e() {
+        let (Ok(model_path), Ok(draft_path)) = (
+            std::env::var("MLX_TEST_GEMMA4_MODEL_PATH"),
+            std::env::var("MLX_TEST_GEMMA4_DSPARK_PATH"),
+        ) else {
+            eprintln!("skipping: set MLX_TEST_GEMMA4_MODEL_PATH + MLX_TEST_GEMMA4_DSPARK_PATH");
+            return;
+        };
+
+        // Tie-screened fixture (see tests/gemma4_dspark.rs module doc);
+        // measured shape on this checkpoint: the EOS is cut inside accepted
+        // drafts on turn 1 (deficit >= 1 below).
+        const PROMPT: &str = "What is the capital of France? Answer with just the city name.";
+        const FOLLOW_UP: &str = "And of Italy? Same format.";
+
+        fn cfg(enable_mtp: bool) -> ChatConfig {
+            ChatConfig {
+                max_new_tokens: Some(64),
+                temperature: Some(0.0),
+                include_reasoning: Some(false),
+                report_performance: Some(true),
+                reuse_cache: Some(true),
+                enable_mtp: Some(enable_mtp),
+                mtp_adaptive_depth: Some(false),
+                ..ChatConfig::default()
+            }
+        }
+        fn user(content: &str) -> crate::tokenizer::ChatMessage {
+            crate::tokenizer::ChatMessage {
+                role: "user".to_string(),
+                content: content.to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                images: None,
+                audio: None,
+            }
+        }
+        fn assert_offsets_match_history(inner: &Gemma4Inner, label: &str) {
+            let h = inner.cached_token_history.len() as i32;
+            let mask = dspark_shared_slot_mask(&inner.config);
+            let caches = inner.caches.as_ref().expect("live caches");
+            assert!(h > 0, "[{label}] saved history must be non-empty");
+            for (i, cache) in caches.iter().enumerate() {
+                let expected = if mask[i] { 0 } else { h };
+                assert_eq!(
+                    cache.get_offset(),
+                    expected,
+                    "[{label}] cache {i} physical offset diverged from the {h}-token history"
+                );
+            }
+        }
+
+        // ONE instance for both passes (the draft never touches the flat AR
+        // path, and a fresh session start resets the prior session).
+        let (mut inner, _weight_bytes) = Gemma4Inner::load_from_dir(&model_path, Some(&draft_path))
+            .expect("12B + draft load failed");
+
+        // --- AR baseline: 2 turns, capturing history + offsets ---
+        let ar1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(false))
+            .expect("AR turn 1 failed");
+        assert_eq!(ar1.finish_reason, "stop", "fixture must stop early on EOS");
+        let ar_h1 = inner.cached_token_history.clone();
+        assert_offsets_match_history(&inner, "ar_turn1");
+        let ar2 = crate::engine::session::session_continue(
+            &mut inner,
+            FOLLOW_UP.to_string(),
+            None,
+            None,
+            cfg(false),
+        )
+        .expect("AR turn 2 failed");
+        let ar_h2 = inner.cached_token_history.clone();
+        assert_offsets_match_history(&inner, "ar_turn2");
+
+        // --- DSpark pass: same 2 turns ---
+        let sp1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(true))
+            .expect("DSpark turn 1 failed");
+        assert_eq!(sp1.finish_reason, "stop");
+        // SHAPE fingerprint: the EOS must have been accepted as a DRAFT.
+        let perf = sp1.performance.as_ref().expect("DSpark perf missing");
+        let cycles = perf.mtp_cycles.expect("mtp_cycles missing") as i64;
+        let mean_k = perf
+            .mtp_mean_accepted_tokens
+            .expect("mtp_mean_accepted_tokens missing");
+        let total_k = (mean_k * cycles as f64).round() as i64;
+        let full_emission = 1 + total_k + cycles;
+        assert!(cycles > 0, "DSpark cycles must have run");
+        assert!(
+            (sp1.num_tokens as i64) < full_emission,
+            "fixture no longer stops INSIDE accepted drafts (generated {} == seed + \u{03a3}k + \
+             cycles = {full_emission}; the EOS landed on a cycle boundary) — re-screen the \
+             prompt so the accepted-draft-EOS shape is actually exercised",
+            sp1.num_tokens,
+        );
+        let sp_h1 = inner.cached_token_history.clone();
+        assert_offsets_match_history(&inner, "dspark_turn1");
+
+        let sp2 = crate::engine::session::session_continue(
+            &mut inner,
+            FOLLOW_UP.to_string(),
+            None,
+            None,
+            cfg(true),
+        )
+        .expect("DSpark turn 2 failed");
+        assert!(
+            sp2.cached_tokens > 0,
+            "turn 2 must warm-continue on the saved session, got cached_tokens=0"
+        );
+        assert!(
+            sp2.performance
+                .as_ref()
+                .and_then(|p| p.mtp_cycles)
+                .unwrap_or(0)
+                > 0,
+            "the warm-continue turn must also run DSpark cycles"
+        );
+        let sp_h2 = inner.cached_token_history.clone();
+        assert_offsets_match_history(&inner, "dspark_turn2");
+
+        // --- Parity: transcript AND full logical/physical session state ---
+        assert_eq!(sp1.text, ar1.text, "turn 1 text diverged from AR");
+        assert_eq!(sp1.raw_text, ar1.raw_text, "turn 1 raw_text diverged");
+        assert_eq!(sp1.num_tokens, ar1.num_tokens);
+        assert_eq!(sp2.text, ar2.text, "turn 2 text diverged from AR");
+        assert_eq!(sp2.raw_text, ar2.raw_text, "turn 2 raw_text diverged");
+        assert_eq!(sp2.finish_reason, ar2.finish_reason);
+        assert_eq!(sp2.num_tokens, ar2.num_tokens);
+        assert_eq!(
+            sp_h1, ar_h1,
+            "post-turn-1 cached_token_history diverged from AR \
+             (the accepted-draft EOS must be dropped from the persisted state)"
+        );
+        assert_eq!(
+            sp_h2, ar_h2,
+            "post-turn-2 cached_token_history diverged from AR"
+        );
+        println!(
+            "[eos_accepted_draft_state] turn1: tokens={} cycles={cycles} \u{03a3}k={total_k} \
+             deficit={} | turn2: tokens={} cached={} | history lens: {} / {}",
+            sp1.num_tokens,
+            full_emission - sp1.num_tokens as i64,
+            sp2.num_tokens,
+            sp2.cached_tokens,
+            sp_h1.len(),
+            sp_h2.len(),
+        );
     }
 }

@@ -629,6 +629,12 @@ pub(crate) struct DsparkDraftModel {
     /// `Linear(hidden + markov_rank -> 1)` with bias; `None` when
     /// `enable_confidence_head` is false.
     confidence_proj: Option<Linear>,
+    /// Total checkpoint tensor bytes, summed by `load_draft_model` BEFORE
+    /// `apply_weights` drains the tensor map. Model-owned resident weights
+    /// — the gemma4 loader folds this into the deterministic weight-byte
+    /// total it registers with the cache-limit coordinator. `0` for a
+    /// placeholder-weight model built via `new` alone (tests).
+    weight_bytes: u64,
 }
 
 impl DsparkDraftModel {
@@ -671,11 +677,18 @@ impl DsparkDraftModel {
             markov_w1,
             markov_w2,
             confidence_proj,
+            weight_bytes: 0,
         })
     }
 
     pub(crate) fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Checkpoint tensor bytes (see the field doc) for cache-limit
+    /// accounting.
+    pub(crate) fn weight_bytes(&self) -> u64 {
+        self.weight_bytes
     }
 
     /// Fuse the tapped target-layer hidden states into the draft's context
@@ -1129,8 +1142,16 @@ pub(crate) fn load_draft_model(
         )));
     }
     let mut tensors = load_safetensors_lazy(&weights_path)?;
+    // Sum the checkpoint bytes BEFORE `apply_weights` drains the map.
+    // `nbytes` is shape×itemsize metadata — no eval. `apply_weights`
+    // rejects leftover keys, so this total is exactly the applied set.
+    let weight_bytes: u64 = tensors
+        .values()
+        .map(|t| t.nbytes() as u64)
+        .fold(0u64, |acc, v| acc.saturating_add(v));
     let mut model = DsparkDraftModel::new(config)?;
     model.apply_weights(&mut tensors)?;
+    model.weight_bytes = weight_bytes;
     Ok(model)
 }
 
@@ -1513,9 +1534,9 @@ mod tests {
     /// Sized-down config exercising the same code paths as the real draft:
     /// 2 layers, 2 heads x head_dim 4 with 1 shared KV head, live partial
     /// rotation (factor 0.5 -> pair 0 rotated, pair 1 identity).
-    fn tiny_config() -> DsparkConfig {
-        parse(
-            r#"{
+    /// A raw `&str` so the checkpoint-dir tests can write it verbatim as a
+    /// `config.json`.
+    const TINY_CONFIG_JSON: &str = r#"{
                 "architectures": ["Gemma4DSparkModel"],
                 "model_type": "gemma4_text",
                 "block_size": 3,
@@ -1542,8 +1563,10 @@ mod tests {
                         "rope_type": "proportional"
                     }
                 }
-            }"#,
-        )
+            }"#;
+
+    fn tiny_config() -> DsparkConfig {
+        parse(TINY_CONFIG_JSON)
     }
 
     fn rand_array(shape: &[i64]) -> MxArray {
@@ -1646,6 +1669,124 @@ mod tests {
             "got: {}",
             err.reason
         );
+    }
+
+    // ── Cache-limit weight accounting ──────────────────────────────────
+
+    /// Smallest config that passes `DsparkConfig::validate`'s v1 pins
+    /// (5 layers, 16 heads x head_dim 512, 1 KV head, rope 0.25/1e6) while
+    /// keeping the FREE dimensions tiny (hidden 8, vocab 16) — for tests
+    /// that must go through the full `load_draft_model` checkpoint path.
+    const V1_MINI_CONFIG_JSON: &str = r#"{
+                "architectures": ["Gemma4DSparkModel"],
+                "model_type": "gemma4_text",
+                "block_size": 3,
+                "mask_token_id": 4,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 16,
+                "global_head_dim": 512,
+                "num_global_key_value_heads": 1,
+                "rms_norm_eps": 1e-6,
+                "final_logit_softcapping": 30.0,
+                "vocab_size": 16,
+                "target_layer_ids": [0, 1],
+                "num_target_layers": 4,
+                "markov_rank": 2,
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": true,
+                "attention_k_eq_v": true,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 1000000.0,
+                        "rope_type": "proportional"
+                    }
+                }
+            }"#;
+
+    /// Complete bf16 tensor map for [`V1_MINI_CONFIG_JSON`] (the
+    /// `synthetic_tiny_tensors` key template at the v1-pinned attention
+    /// geometry: 5 layers, q/o over 16*512 dims, q/k norms over 512).
+    fn synthetic_v1_mini_tensors() -> std::collections::HashMap<String, MxArray> {
+        let mut specs: Vec<(String, Vec<i64>)> = vec![
+            ("embed_tokens.weight".into(), vec![16, 8]),
+            ("lm_head.weight".into(), vec![16, 8]),
+            ("norm.weight".into(), vec![8]),
+            ("fc.weight".into(), vec![8, 16]),
+            ("hidden_norm.weight".into(), vec![8]),
+            ("markov_head.markov_w1.weight".into(), vec![16, 2]),
+            ("markov_head.markov_w2.weight".into(), vec![16, 2]),
+            ("confidence_head.proj.weight".into(), vec![1, 10]),
+            ("confidence_head.proj.bias".into(), vec![1]),
+        ];
+        for i in 0..5 {
+            for (suffix, shape) in [
+                ("input_layernorm.weight", vec![8]),
+                ("post_attention_layernorm.weight", vec![8]),
+                ("pre_feedforward_layernorm.weight", vec![8]),
+                ("post_feedforward_layernorm.weight", vec![8]),
+                ("self_attn.q_norm.weight", vec![512]),
+                ("self_attn.k_norm.weight", vec![512]),
+                ("layer_scalar", vec![1]),
+                ("self_attn.q_proj.weight", vec![16 * 512, 8]),
+                ("self_attn.k_proj.weight", vec![512, 8]),
+                ("self_attn.o_proj.weight", vec![8, 16 * 512]),
+                ("mlp.gate_proj.weight", vec![16, 8]),
+                ("mlp.up_proj.weight", vec![16, 8]),
+                ("mlp.down_proj.weight", vec![8, 16]),
+            ] {
+                specs.push((format!("layers.{i}.{suffix}"), shape));
+            }
+        }
+        specs
+            .into_iter()
+            .map(|(key, shape)| {
+                let arr = MxArray::zeros(&shape, Some(DType::BFloat16)).unwrap();
+                (key, arr)
+            })
+            .collect()
+    }
+
+    /// `load_draft_model` must report the checkpoint's exact total tensor
+    /// bytes (summed BEFORE `apply_weights` drains the map): the gemma4
+    /// loader folds this into the weight-byte total it registers with the
+    /// cache-limit coordinator, so a silent 0 would over-grant cache by
+    /// the draft's full resident size (~GBs of bf16 on the real draft).
+    #[test]
+    fn load_draft_model_reports_checkpoint_weight_bytes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_dspark_weight_bytes_test_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("create temp checkpoint dir");
+        fs::write(dir.join("config.json"), V1_MINI_CONFIG_JSON).expect("write config.json");
+        let mut tensors = synthetic_v1_mini_tensors();
+        let expected: u64 = tensors.values().map(|t| t.nbytes() as u64).sum();
+        assert!(expected > 0, "the mini checkpoint must have nonzero bytes");
+        crate::utils::safetensors::save_safetensors(
+            dir.join("model.safetensors"),
+            &mut tensors,
+            None,
+        )
+        .expect("write model.safetensors");
+
+        let model = load_draft_model(&dir, 8, 16, 4).expect("mini v1 checkpoint must load");
+        assert_eq!(
+            model.weight_bytes(),
+            expected,
+            "weight_bytes must equal the exact checkpoint tensor byte total"
+        );
+        // A placeholder-weight model (no checkpoint) reports 0.
+        assert_eq!(
+            DsparkDraftModel::new(tiny_config()).unwrap().weight_bytes(),
+            0
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ── Context cache invariants ───────────────────────────────────────
