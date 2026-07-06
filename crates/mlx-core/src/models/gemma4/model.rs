@@ -6054,6 +6054,19 @@ pub(crate) fn dspark_verify_forward(
     )
 }
 
+/// Shared-slot mask for `snapshot_before_verify`, index-aligned with the
+/// per-layer caches vec: entry i is true iff decoder layer i is KV-shared.
+/// Shared layers read their anchor layer's cache; their own vec entry is
+/// never written by a forward pass.
+// Consumed by the DSpark speculative-decode engine loop, which is wired in
+// separately; until then only the inline tests exercise this helper.
+#[allow(dead_code)]
+pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
+    (0..config.num_hidden_layers as usize)
+        .map(|i| config.is_kv_shared_layer(i))
+        .collect()
+}
+
 /// Compute PLE (per-layer embeddings) from input_ids.
 /// Returns shape [B, T, num_layers, ple_dim].
 fn compute_ple(
@@ -9590,8 +9603,15 @@ mod dspark_tap_tests {
         )
         .unwrap();
 
-        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1).
+        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
+        // with the real snapshot → verify → commit flow around the verify.
         let layer_ids = [0usize, 2, 3];
+        let shared_slots = dspark_shared_slot_mask(&config);
+        assert_eq!(
+            shared_slots,
+            vec![false, false, false, true],
+            "config-derived shared-slot mask"
+        );
         let mut caches_b = init_caches_for_config(&config);
         let mut prefill_tap = DsparkTap::new(&layer_ids);
         let hidden_b = forward_body(
@@ -9605,6 +9625,12 @@ mod dspark_tap_tests {
             None,
             &config,
             Some(&mut prefill_tap),
+        )
+        .unwrap();
+        let rollback = super::super::layer_cache::snapshot_before_verify(
+            &caches_b,
+            block_ids.shape_at(1).unwrap() as usize,
+            &shared_slots,
         )
         .unwrap();
         let mut verify_tap = DsparkTap::new(&layer_ids);
@@ -9653,6 +9679,18 @@ mod dspark_tap_tests {
             caches_b[3].get_offset(),
             0,
             "KV-shared layer's cache entry must stay untouched"
+        );
+
+        // Partial-keep commit on the real model: active caches land at
+        // prefill + keep, the shared slot stays untouched.
+        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched after commit"
         );
     }
 

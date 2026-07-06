@@ -291,16 +291,24 @@ pub(crate) struct Gemma4VerifyRollback {
     /// Per-cache sliding snapshots, index-aligned with the caches slice.
     /// `None` for global layers and for sliding caches that were empty.
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
-    /// Per-cache offsets before the verify forward. KV-shared layers keep an
-    /// allocated-but-never-written vec entry that stays at offset 0; storing
-    /// the offset per cache lets commit recognize those entries.
+    /// Per-cache offsets before the verify forward.
     start_offsets: Vec<i32>,
-    /// Tokens the verify forward appends to every cache it writes.
+    /// Caller-declared KV-shared slots, index-aligned with the caches slice.
+    /// A shared layer reads its anchor's cache; its own vec entry is never
+    /// written by a forward pass and must not move across a verify.
+    shared_slots: Vec<bool>,
+    /// Tokens the verify forward appends to every ACTIVE (non-shared) cache.
     total_written: usize,
 }
 
 /// Snapshot every cache before a verify forward that will append
 /// `total_to_write` tokens.
+///
+/// `shared_slots` must mark exactly the cache vec entries that belong to
+/// KV-shared layers (`Gemma4Config::is_kv_shared_layer` per index — see
+/// `dspark_shared_slot_mask`). Declaring them explicitly lets commit enforce
+/// the exact-advance invariant on every active cache instead of inferring
+/// activity from offsets.
 ///
 /// Global caches need no snapshot (rollback is a `trim`); sliding caches
 /// snapshot their ordered window tail. Errors when a sliding window is
@@ -310,11 +318,22 @@ pub(crate) struct Gemma4VerifyRollback {
 pub(crate) fn snapshot_before_verify(
     caches: &[Gemma4LayerCache],
     total_to_write: usize,
+    shared_slots: &[bool],
 ) -> Result<Gemma4VerifyRollback> {
     if total_to_write == 0 {
         return Err(Error::new(
             Status::InvalidArg,
             "snapshot_before_verify: total_to_write must be at least 1",
+        ));
+    }
+    if shared_slots.len() != caches.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "snapshot_before_verify: {} caches but shared_slots covers {}",
+                caches.len(),
+                shared_slots.len()
+            ),
         ));
     }
     let mut snapshots = Vec::with_capacity(caches.len());
@@ -337,6 +356,7 @@ pub(crate) fn snapshot_before_verify(
     Ok(Gemma4VerifyRollback {
         snapshots,
         start_offsets,
+        shared_slots: shared_slots.to_vec(),
         total_written: total_to_write,
     })
 }
@@ -344,16 +364,21 @@ pub(crate) fn snapshot_before_verify(
 /// Commit the first `keep` tokens of a verify block and roll back the rest.
 ///
 /// Preconditions: `rb` was taken right before the verify forward, and the
-/// verify forward appended `rb.total_written` tokens to every cache it
-/// writes. Caches whose offset did not move (KV-shared layers' unused vec
-/// entries) are skipped, so each physical cache is touched exactly once.
+/// verify forward appended `rb.total_written` tokens to every ACTIVE cache.
+/// EVERY commit (including full keep) validates the whole vec against the
+/// declared `shared_slots`: an active cache must sit at exactly
+/// `start + total_written` and a shared slot must not have moved, else a
+/// hard error — a routing bug that leaves an owner cache unwritten can
+/// never be silently committed. Validation runs over the full vec before
+/// any cache is mutated, so a failed commit leaves all caches untouched.
 ///
-/// * `keep == total_written`: no-op — the appended block is kept as-is.
+/// * `keep == total_written`: validated no-op — the appended block is kept.
 /// * `keep < total_written`: global caches trim to `start + keep`; sliding
 ///   caches slice the block tail, restore the pre-verify snapshot, then
 ///   re-append the first `keep` tail rows through the normal update path,
 ///   leaving state identical to a cache that only ever saw the kept prefix.
-///   `keep == 0` discards the block entirely.
+///   `keep == 0` discards the block entirely. Shared slots are untouched,
+///   so each physical cache is touched exactly once.
 #[allow(dead_code)]
 pub(crate) fn commit_after_verify(
     caches: &mut [Gemma4LayerCache],
@@ -379,6 +404,33 @@ pub(crate) fn commit_after_verify(
             ),
         ));
     }
+
+    for (idx, cache) in caches.iter().enumerate() {
+        let start = rb.start_offsets[idx];
+        let current = cache.get_offset();
+        if rb.shared_slots[idx] {
+            if current != start {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "commit_after_verify: cache {idx} is a KV-shared slot but moved from offset {start} to {current}; shared slots are never written by a verify forward"
+                    ),
+                ));
+            }
+        } else {
+            let expected = start + rb.total_written as i32;
+            if current != expected {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "commit_after_verify: active cache {idx} is at offset {current}, expected {expected} (start {start} + {}-token verify block)",
+                        rb.total_written
+                    ),
+                ));
+            }
+        }
+    }
+
     if keep == rb.total_written {
         return Ok(());
     }
@@ -388,22 +440,8 @@ pub(crate) fn commit_after_verify(
         .zip(rb.snapshots.iter().zip(rb.start_offsets.iter()))
         .enumerate()
     {
-        let current = cache.get_offset();
-        if current == start {
-            // This cache was not written by the verify forward (KV-shared
-            // layers read their anchor's cache; their own vec entry never
-            // advances). Nothing to roll back.
+        if rb.shared_slots[idx] {
             continue;
-        }
-        let expected = start + rb.total_written as i32;
-        if current != expected {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "commit_after_verify: cache {idx} moved from offset {start} to {current}, expected {expected} after a {}-token verify block",
-                    rb.total_written
-                ),
-            ));
         }
 
         if cache.is_sliding() {
@@ -577,7 +615,7 @@ mod tests {
 
                 let mut live = [Gemma4LayerCache::new_sliding(window)];
                 apply_appends(&mut live[0], prefill);
-                let rollback = snapshot_before_verify(&live, block.len()).unwrap();
+                let rollback = snapshot_before_verify(&live, block.len(), &[false]).unwrap();
                 let (bk, bv) = kv_pair(&block);
                 live[0].update_and_fetch(&bk, &bv).unwrap();
                 commit_after_verify(&mut live, &rollback, keep).unwrap();
@@ -647,107 +685,177 @@ mod tests {
         assert!(empty.sliding_tail(1).is_err());
     }
 
-    /// Mixed vec of global + sliding caches, including untouched entries that
-    /// model KV-shared layers (their vec slot is never written by a forward).
+    /// Mixed vec of global + sliding caches, including entries declared as
+    /// KV-shared slots (their vec entry is never written by a forward).
+    const MIXED_ACTIVE: [usize; 4] = [0, 1, 2, 3];
+    const MIXED_SHARED: [usize; 2] = [4, 5];
+    const MIXED_MASK: [bool; 6] = [false, false, false, false, true, true];
+
+    fn build_mixed_caches() -> Vec<Gemma4LayerCache> {
+        let mut caches = vec![
+            Gemma4LayerCache::new_global(),
+            Gemma4LayerCache::new_sliding(8),
+            Gemma4LayerCache::new_global(),
+            Gemma4LayerCache::new_sliding(8),
+            // KV-shared entries: allocated but never written.
+            Gemma4LayerCache::new_sliding(8),
+            Gemma4LayerCache::new_global(),
+        ];
+        for &i in &MIXED_ACTIVE {
+            let (k, v) = kv_pair(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+            caches[i].update_and_fetch(&k, &v).unwrap();
+        }
+        caches
+    }
+
+    fn append_block_to(caches: &mut [Gemma4LayerCache], indices: &[usize], block: &[f32]) {
+        for &i in indices {
+            let (k, v) = kv_pair(block);
+            caches[i].update_and_fetch(&k, &v).unwrap();
+        }
+    }
+
     #[test]
     fn commit_after_verify_mixed_caches() {
-        const ACTIVE: [usize; 4] = [0, 1, 2, 3];
-        const DEAD: [usize; 2] = [4, 5];
-
-        fn build() -> Vec<Gemma4LayerCache> {
-            let mut caches = vec![
-                Gemma4LayerCache::new_global(),
-                Gemma4LayerCache::new_sliding(8),
-                Gemma4LayerCache::new_global(),
-                Gemma4LayerCache::new_sliding(8),
-                // KV-shared style entries: allocated but never written.
-                Gemma4LayerCache::new_sliding(8),
-                Gemma4LayerCache::new_global(),
-            ];
-            for &i in &ACTIVE {
-                let (k, v) = kv_pair(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-                caches[i].update_and_fetch(&k, &v).unwrap();
-            }
-            caches
-        }
-
-        fn append_block(caches: &mut [Gemma4LayerCache], block: &[f32]) {
-            for &i in &ACTIVE {
-                let (k, v) = kv_pair(block);
-                caches[i].update_and_fetch(&k, &v).unwrap();
-            }
-        }
-
         let block = [101.0f32, 102.0, 103.0];
 
-        // Full keep: no-op, all active offsets stay at n + T.
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block);
+        // Full keep: validated no-op, all active offsets stay at n + T.
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block);
         commit_after_verify(&mut caches, &rollback, block.len()).unwrap();
-        for &i in &ACTIVE {
+        for &i in &MIXED_ACTIVE {
             assert_eq!(caches[i].get_offset(), 8, "cache {i} full-keep offset");
         }
-        for &i in &DEAD {
-            assert_eq!(caches[i].get_offset(), 0, "dead cache {i} must stay empty");
+        for &i in &MIXED_SHARED {
+            assert_eq!(caches[i].get_offset(), 0, "shared slot {i} must stay empty");
         }
 
         // Partial keep: every active cache lands at n + keep with exactly the
-        // kept prefix appended; dead caches untouched.
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block);
+        // kept prefix appended; shared slots untouched.
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block);
         commit_after_verify(&mut caches, &rollback, 1).unwrap();
-        for &i in &ACTIVE {
+        for &i in &MIXED_ACTIVE {
             assert_eq!(caches[i].get_offset(), 6, "cache {i} partial-keep offset");
             let (k, v) = caches[i].get_cached_kv().unwrap();
             assert_float_data(&k, &[1.0, 2.0, 3.0, 4.0, 5.0, 101.0]);
             assert_float_data(&v, &[10.0, 20.0, 30.0, 40.0, 50.0, 1010.0]);
         }
-        for &i in &DEAD {
-            assert_eq!(caches[i].get_offset(), 0, "dead cache {i} must stay empty");
+        for &i in &MIXED_SHARED {
+            assert_eq!(caches[i].get_offset(), 0, "shared slot {i} must stay empty");
         }
 
         // keep == 0: the verify block is fully discarded.
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block);
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block);
         commit_after_verify(&mut caches, &rollback, 0).unwrap();
-        for &i in &ACTIVE {
+        for &i in &MIXED_ACTIVE {
             assert_eq!(caches[i].get_offset(), 5, "cache {i} keep-0 offset");
             let (k, _) = caches[i].get_cached_kv().unwrap();
             assert_float_data(&k, &[1.0, 2.0, 3.0, 4.0, 5.0]);
         }
 
         // keep > total_written is rejected.
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block);
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block);
         assert!(commit_after_verify(&mut caches, &rollback, 4).is_err());
 
         // A cache that advanced by anything other than total_written is a
         // contract violation, not something to silently "fix".
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block[..2]);
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block[..2]);
         assert!(commit_after_verify(&mut caches, &rollback, 1).is_err());
 
         // Cache-count mismatch between snapshot and commit is rejected.
-        let mut caches = build();
-        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
-        append_block(&mut caches, &block);
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        append_block_to(&mut caches, &MIXED_ACTIVE, &block);
         assert!(commit_after_verify(&mut caches[..5], &rollback, 1).is_err());
     }
 
+    /// An ACTIVE cache the verify forward failed to write is a hard error on
+    /// partial keep — and commit must not have mutated ANY cache (validation
+    /// runs over the whole vec before rollback starts).
     #[test]
-    fn snapshot_before_verify_validates_window_and_block() {
+    fn commit_rejects_unmoved_active_cache_on_partial_keep() {
+        let block = [101.0f32, 102.0, 103.0];
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        // Cache 2 (active, global) is skipped by the "verify forward".
+        append_block_to(&mut caches, &[0, 1, 3], &block);
+
+        let err = commit_after_verify(&mut caches, &rollback, 1)
+            .expect_err("unmoved active cache must fail partial-keep commit");
+        assert!(
+            err.reason.contains("active cache 2"),
+            "error must name the unmoved active cache, got: {}",
+            err.reason
+        );
+        // No cache was rolled back by the failed commit.
+        for &i in &[0usize, 1, 3] {
+            assert_eq!(caches[i].get_offset(), 8, "cache {i} must be untouched");
+        }
+        assert_eq!(caches[2].get_offset(), 5, "cache 2 must be untouched");
+    }
+
+    /// Full keep is no longer a blind no-op: an active cache at the wrong
+    /// offset fails commit even when keep == total_written.
+    #[test]
+    fn commit_validates_active_offsets_on_full_keep() {
+        let block = [101.0f32, 102.0, 103.0];
+        let mut caches = build_mixed_caches();
+        let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+        // Cache 1 (active, sliding) is skipped by the "verify forward".
+        append_block_to(&mut caches, &[0, 2, 3], &block);
+
+        let err = commit_after_verify(&mut caches, &rollback, block.len())
+            .expect_err("unmoved active cache must fail full-keep commit");
+        assert!(
+            err.reason.contains("active cache 1"),
+            "error must name the unmoved active cache, got: {}",
+            err.reason
+        );
+    }
+
+    /// A slot declared KV-shared that MOVED during verify is a routing bug,
+    /// rejected on both full and partial keep.
+    #[test]
+    fn commit_rejects_moved_shared_slot() {
+        let block = [101.0f32, 102.0, 103.0];
+        for keep in [block.len(), 1] {
+            let mut caches = build_mixed_caches();
+            let rollback = snapshot_before_verify(&caches, block.len(), &MIXED_MASK).unwrap();
+            // Shared slot 4 is unexpectedly written too.
+            append_block_to(&mut caches, &[0, 1, 2, 3, 4], &block);
+
+            let err = commit_after_verify(&mut caches, &rollback, keep)
+                .expect_err("moved shared slot must fail commit");
+            assert!(
+                err.reason.contains("cache 4") && err.reason.contains("KV-shared"),
+                "error must name the moved shared slot, got: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_before_verify_validates_window_block_and_mask() {
         let caches = vec![Gemma4LayerCache::new_sliding(2)];
         assert!(
-            snapshot_before_verify(&caches, 3).is_err(),
+            snapshot_before_verify(&caches, 3, &[false]).is_err(),
             "window smaller than the verify block cannot be rolled back"
         );
-        assert!(snapshot_before_verify(&caches, 0).is_err());
-        assert!(snapshot_before_verify(&caches, 2).is_ok());
+        assert!(snapshot_before_verify(&caches, 0, &[false]).is_err());
+        assert!(
+            snapshot_before_verify(&caches, 2, &[false, true]).is_err(),
+            "shared_slots length must match the caches vec"
+        );
+        assert!(snapshot_before_verify(&caches, 2, &[false]).is_ok());
     }
 
     /// A one-token verify block (T = 1 + 0 drafts) takes the rotating
@@ -765,7 +873,7 @@ mod tests {
 
         let mut live = [Gemma4LayerCache::new_sliding(8)];
         apply_appends(&mut live[0], std::slice::from_ref(&prefill));
-        let rollback = snapshot_before_verify(&live, 1).unwrap();
+        let rollback = snapshot_before_verify(&live, 1, &[false]).unwrap();
         let (bk, bv) = kv_pair(&[999.0]);
         live[0].update_and_fetch(&bk, &bv).unwrap();
         commit_after_verify(&mut live, &rollback, 0).unwrap();
