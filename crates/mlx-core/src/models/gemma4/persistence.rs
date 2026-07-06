@@ -2183,6 +2183,17 @@ impl Gemma4Inner {
                 draft.config.block_size,
                 draft.config.target_layer_ids,
             );
+            // Materialize the draft's mmap-backed tensors NOW, with the same
+            // chunked mechanism as the target's pass below: left lazy, the
+            // FIRST speculative forward would page-fault the whole multi-GB
+            // checkpoint from cold mmap mid-GPU-work (the qwen3.5 cold-mmap
+            // load-watchdog failure class the target pass exists to prevent).
+            // `collect_weight_arrays` enumerates every checkpoint tensor (74
+            // on the v1 contract) — byte-coverage pinned by
+            // `collect_weight_arrays_covers_every_checkpoint_tensor`.
+            let draft_weights = draft.collect_weight_arrays();
+            let draft_refs: Vec<&MxArray> = draft_weights.iter().collect();
+            crate::array::memory::materialize_weights(&draft_refs)?;
             inner.dspark = Some(draft);
         }
 

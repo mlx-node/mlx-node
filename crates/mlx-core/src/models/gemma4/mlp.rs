@@ -53,16 +53,15 @@ impl GemmaMLP {
         self.down_proj.set_weight(weight)
     }
 
-    // Test-only weight getters.
-    #[cfg(test)]
+    // Weight getters (cheap handle clones). Production use: the DSpark
+    // draft's post-load weight-materialization pass
+    // (`DsparkDraftModel::collect_weight_arrays`); also used by tests.
     pub(crate) fn gate_proj_weight(&self) -> MxArray {
         self.gate_proj.get_weight()
     }
-    #[cfg(test)]
     pub(crate) fn up_proj_weight(&self) -> MxArray {
         self.up_proj.get_weight()
     }
-    #[cfg(test)]
     pub(crate) fn down_proj_weight(&self) -> MxArray {
         self.down_proj.get_weight()
     }

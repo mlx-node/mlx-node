@@ -555,6 +555,21 @@ impl Gemma4Inner {
             // Residual flush through the emitter (same skip-special flag as
             // the in-loop DecodeStream so `streamed_text_len` accounting
             // stays consistent).
+            //
+            // CANCEL SEMANTICS (deliberate, verified AR/MTP parity): on a
+            // cancelled turn the loop's clamp commits the cancel-observed
+            // token to `generated_tokens` without step-streaming it; this
+            // flush then delivers its text, so the TOTAL streamed text
+            // equals `decode(generated_tokens)` — exactly the AR loop's
+            // documented origin/main contract (`engine/decode.rs`
+            // cancel-snapshot comment: the token is pushed at the loop top,
+            // the break skips the detok, and the post-loop residual flush
+            // re-streams the tail) and the MTP core's behavior (initial-arm
+            // skip + unconditioned family flush). Suppressing the suffix
+            // here would make a cancelled DSpark stream the ONLY path whose
+            // streamed text cannot reconstruct the terminal chunk's
+            // raw_text. The suffix is pinned to exactly ONE token by
+            // `dspark_turn_streaming_cancel_in_clamp_commits_exactly_once`.
             let full_text = tokenizer
                 .decode_sync(&generated_tokens, stream_skip_special)
                 .unwrap_or_else(|e| {
@@ -846,7 +861,13 @@ mod tests {
                 "full_attention"
             ],
             "num_kv_shared_layers": 1,
-            "use_block_paged_cache": false
+            "use_block_paged_cache": false,
+            // Explicitly EMPTY: the config default is [1], which is inside
+            // the tiny 16-token vocab — random placeholder-weight turns
+            // would then stop nondeterministically on token 1 instead of
+            // running to their length budget (the whole-turn tests pass an
+            // out-of-vocab session eos_id=999 as the only stop).
+            "eos_token_ids": []
         })
     }
 
@@ -1182,6 +1203,140 @@ mod tests {
                  (length-exit materialize; shared slots stay unwritten)"
             );
         }
+    }
+
+    // ── streaming cancellation (whole-turn) ────────────────────────────
+
+    /// Records every chunk and flips the shared cancel flag once
+    /// `flip_after` NON-TERMINAL chunks have arrived (the sink runs inline
+    /// on the decode thread, so the flip lands mid-turn deterministically).
+    struct CancelAfterSink {
+        chunks: std::sync::Mutex<Vec<crate::engine::types::ChatStreamChunk>>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        flip_after: usize,
+    }
+
+    impl crate::engine::backend::ChunkSink for CancelAfterSink {
+        fn send(&self, chunk: Result<crate::engine::types::ChatStreamChunk>) {
+            if let (Ok(c), Ok(mut v)) = (chunk, self.chunks.lock()) {
+                v.push(c);
+                if v.iter().filter(|c| !c.done).count() >= self.flip_after {
+                    self.cancelled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// WHOLE-TURN streaming cancellation through `dspark_chat_turn`: a
+    /// cancel raised from the chunk sink must terminate the stream promptly
+    /// ("cancelled", bounded block-granular overrun — never running on to
+    /// the budget) and leave the cached session state consistent (AR-parity
+    /// drop-last: the final emitted token is persisted in NEITHER the
+    /// history NOR the caches; offsets equal the history), with the next
+    /// turn running normally. Chunk-vs-residual byte accounting for the
+    /// cancel suffix is pinned at the engine seam
+    /// (`dspark_turn_streaming_cancel_in_clamp_commits_exactly_once`),
+    /// where the mid-clamp cancel point is injectable; a sink-driven flip
+    /// lands at the next loop-top by construction.
+    #[test]
+    fn dspark_streaming_cancel_whole_turn_state_consistent() {
+        // Placeholder weights come from MLX's global PRNG (`Linear::new` is
+        // Xavier-uniform); pin it so the token stream — and with it the
+        // chunk/flip timing the `n` bound below asserts on — is identical
+        // on every run (the repo's established `mlx_seed` test pattern).
+        unsafe { mlx_sys::mlx_seed(0xD5_9A4B_0001) };
+        let mut inner =
+            Gemma4Inner::new(tiny_target_config()).expect("tiny Gemma4Inner must construct");
+        inner.dspark = Some(DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model"));
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        // Budget 12 with a flip after 2 chunks: a broken cancel would run to
+        // the length exit and emit ~12 chunks.
+        let mut config = tiny_turn_config(Some(1), 12);
+        config.include_reasoning = Some(true);
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = CancelAfterSink {
+            chunks: std::sync::Mutex::new(Vec::new()),
+            cancelled: Arc::clone(&cancelled),
+            flip_after: 2,
+        };
+        let p = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: 999,
+            config: &config,
+            params: &p,
+            thinking,
+            is_delta: false,
+            sink: Some(&sink),
+            cancelled: Some(&cancelled),
+            images: &[],
+            audio: &[],
+        };
+        let out = inner
+            .dspark_chat_turn(&mut args)
+            .expect("streaming cancelled turn must complete cleanly");
+        assert!(
+            matches!(out, TurnOutput::Streamed),
+            "streaming turn must return TurnOutput::Streamed"
+        );
+
+        let chunks = sink.chunks.into_inner().expect("sink poisoned");
+        let terminal = chunks
+            .iter()
+            .find(|c| c.done)
+            .expect("stream must end with a terminal done-chunk");
+        assert_eq!(
+            terminal.finish_reason.as_deref(),
+            Some("cancelled"),
+            "sink-raised cancel must finish the turn as cancelled"
+        );
+        let n = terminal.num_tokens.expect("terminal must carry num_tokens") as usize;
+        assert!(
+            (1..=5).contains(&n),
+            "cancel must stop within one depth-1 cycle of the flip \
+             (seed + <= 2 cycles of <= 2 tokens), got {n} generated tokens"
+        );
+
+        // AR-parity cancelled save: the final emitted token is dropped from
+        // the history AND was never committed to the caches.
+        let history = inner.cached_token_history.clone();
+        assert_eq!(
+            history.len(),
+            tokens.len() + n - 1,
+            "cancelled turn must persist prompt + generated minus the final token"
+        );
+        assert_eq!(&history[..tokens.len()], &tokens[..]);
+        let mask = dspark_shared_slot_mask(&inner.config);
+        let caches = inner.caches.as_ref().expect("live caches after the turn");
+        for (i, cache) in caches.iter().enumerate() {
+            let expected = if mask[i] { 0 } else { history.len() as i32 };
+            assert_eq!(
+                cache.get_offset(),
+                expected,
+                "cache {i} offset must equal the saved history length after a cancel"
+            );
+        }
+        assert!(
+            ChatBackend::has_live_session(&inner),
+            "a cleanly cancelled turn leaves a warm-reusable session (AR parity)"
+        );
+
+        // The next turn runs normally (fresh prompt: the longer saved
+        // history is a prefix-miss, so it takes the cold path).
+        let res = run_tiny_dspark_turn(
+            &mut inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(Some(1), 3),
+        )
+        .expect("the turn after a cancelled stream must succeed");
+        assert_eq!(res.finish_reason, "length");
+        assert_eq!(res.num_tokens, 3);
     }
 
     // ── EOS-accepted-as-draft AR state parity (real model, env-gated) ──

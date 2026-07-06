@@ -53,6 +53,11 @@ const DSPARK_NUM_KV_HEADS: i64 = 1;
 const DSPARK_GLOBAL_HEAD_DIM: i64 = 512;
 const DSPARK_PARTIAL_ROTARY_FACTOR: f64 = 0.25;
 const DSPARK_ROPE_THETA: f64 = 1_000_000.0;
+/// Pinned like the geometry above: `block_size` flows straight into the
+/// default `mtp_depth` (resolve_params) and sizes every `[1, 1+L, vocab]`
+/// verify forward, so a corrupted config with real weights and a huge
+/// block_size would otherwise turn the first request into an OOM/abort.
+const DSPARK_BLOCK_SIZE: usize = 7;
 
 // ============================================
 // Config
@@ -230,10 +235,18 @@ impl DsparkConfig {
                 "DSpark draft markov_head_type {head_type:?} is unsupported (only \"vanilla\")"
             )));
         }
-        if self.block_size == 0 {
-            return Err(Error::from_reason(
-                "DSpark draft block_size must be at least 1",
-            ));
+        if self.block_size != DSPARK_BLOCK_SIZE {
+            return Err(Error::from_reason(format!(
+                "DSpark draft block_size={} is unsupported: the v1 checkpoint contract pins {} \
+                 (block_size becomes the default mtp_depth and sizes every verify forward)",
+                self.block_size, DSPARK_BLOCK_SIZE
+            )));
+        }
+        if self.mask_token_id < 0 || (self.mask_token_id as i64) >= self.vocab_size {
+            return Err(Error::from_reason(format!(
+                "DSpark draft mask_token_id={} is out of range for vocab_size={}",
+                self.mask_token_id, self.vocab_size
+            )));
         }
         if let Some(cap) = self.final_logit_softcapping
             && cap <= 0.0
@@ -689,6 +702,64 @@ impl DsparkDraftModel {
     /// accounting.
     pub(crate) fn weight_bytes(&self) -> u64 {
         self.weight_bytes
+    }
+
+    /// Every checkpoint-backed tensor the draft owns, as cheap array-handle
+    /// clones — 74 on the v1 contract (9 top-level + 13 per layer). The
+    /// gemma4 loader feeds these to `materialize_weights` right after the
+    /// draft loads, mirroring the target's own materialization pass: left
+    /// lazy, the whole checkpoint would page-fault from cold mmap during
+    /// the FIRST speculative forward (the qwen3.5 cold-mmap load-watchdog
+    /// failure class). The handles are exactly the applied checkpoint
+    /// arrays (`apply_weights` installs them verbatim — bf16-only, no
+    /// casts), so their byte total equals [`Self::weight_bytes`]; the
+    /// coverage test pins both the count and that byte equality.
+    pub(crate) fn collect_weight_arrays(&self) -> Vec<MxArray> {
+        fn push_proj(out: &mut Vec<MxArray>, proj: &LinearProj) {
+            match proj {
+                LinearProj::Standard(l) => {
+                    out.push(l.get_weight());
+                    if let Some(b) = l.get_bias() {
+                        out.push(b);
+                    }
+                }
+                // Unreachable today (apply_weights is bf16-only, so every
+                // draft projection is Standard); collecting nothing here
+                // means a future quantized draft FAILS the byte-coverage
+                // test loudly instead of silently under-materializing.
+                LinearProj::Quantized(_) => {}
+            }
+        }
+        let mut out = Vec::with_capacity(9 + 13 * self.layers.len());
+        out.push(self.embed_tokens.weight());
+        push_proj(&mut out, &self.fc);
+        out.push(self.hidden_norm.get_weight());
+        for layer in &self.layers {
+            out.push(layer.input_layernorm.get_weight());
+            out.push(layer.post_attention_layernorm.get_weight());
+            out.push(layer.pre_feedforward_layernorm.get_weight());
+            out.push(layer.post_feedforward_layernorm.get_weight());
+            out.push(layer.layer_scalar.clone());
+            out.push(layer.self_attn.q_norm.get_weight());
+            out.push(layer.self_attn.k_norm.get_weight());
+            push_proj(&mut out, &layer.self_attn.q_proj);
+            push_proj(&mut out, &layer.self_attn.k_proj);
+            push_proj(&mut out, &layer.self_attn.o_proj);
+            out.push(layer.mlp.gate_proj_weight());
+            out.push(layer.mlp.up_proj_weight());
+            out.push(layer.mlp.down_proj_weight());
+        }
+        out.push(self.norm.get_weight());
+        push_proj(&mut out, &self.lm_head);
+        out.push(self.markov_w1.clone());
+        out.push(self.markov_w2.clone());
+        if let Some(conf) = &self.confidence_proj {
+            out.push(conf.get_weight());
+            if let Some(b) = conf.get_bias() {
+                out.push(b);
+            }
+        }
+        out
     }
 
     /// Fuse the tapped target-layer hidden states into the draft's context
@@ -1332,6 +1403,31 @@ mod tests {
     }
 
     #[test]
+    fn unpinned_block_size_rejected() {
+        // block_size is a PINNED v1 constant, not a free knob: it becomes the
+        // default mtp_depth and sizes every [1, 1+L, vocab] verify forward,
+        // so a corrupted config with real weights and block_size=1000 would
+        // otherwise drive the first request into OOM/abort territory.
+        let json = base_config_json().replace("\"block_size\": 7", "\"block_size\": 1000");
+        let reason = expect_err(&parse(&json), "block_size");
+        assert!(reason.contains("pins 7"), "got: {reason}");
+        // 0 is rejected by the same pin (the old >= 1 floor is subsumed).
+        let json = base_config_json().replace("\"block_size\": 7", "\"block_size\": 0");
+        expect_err(&parse(&json), "block_size");
+    }
+
+    #[test]
+    fn out_of_vocab_mask_token_rejected() {
+        // mask_token_id indexes the draft's embedding table on every propose;
+        // out-of-range values must fail the load, not the first forward.
+        let json = base_config_json().replace("\"mask_token_id\": 4", "\"mask_token_id\": 262144");
+        let reason = expect_err(&parse(&json), "mask_token_id");
+        assert!(reason.contains("262144"), "got: {reason}");
+        let json = base_config_json().replace("\"mask_token_id\": 4", "\"mask_token_id\": -1");
+        expect_err(&parse(&json), "mask_token_id");
+    }
+
+    #[test]
     fn zero_markov_rank_rejected() {
         let json = base_config_json().replace("\"markov_rank\": 256", "\"markov_rank\": 0");
         expect_err(&parse(&json), "markov_rank");
@@ -1674,13 +1770,14 @@ mod tests {
     // ── Cache-limit weight accounting ──────────────────────────────────
 
     /// Smallest config that passes `DsparkConfig::validate`'s v1 pins
-    /// (5 layers, 16 heads x head_dim 512, 1 KV head, rope 0.25/1e6) while
-    /// keeping the FREE dimensions tiny (hidden 8, vocab 16) — for tests
-    /// that must go through the full `load_draft_model` checkpoint path.
+    /// (5 layers, 16 heads x head_dim 512, 1 KV head, block 7, rope
+    /// 0.25/1e6) while keeping the FREE dimensions tiny (hidden 8, vocab
+    /// 16) — for tests that must go through the full `load_draft_model`
+    /// checkpoint path.
     const V1_MINI_CONFIG_JSON: &str = r#"{
                 "architectures": ["Gemma4DSparkModel"],
                 "model_type": "gemma4_text",
-                "block_size": 3,
+                "block_size": 7,
                 "mask_token_id": 4,
                 "hidden_size": 8,
                 "intermediate_size": 16,
@@ -1749,6 +1846,30 @@ mod tests {
             .collect()
     }
 
+    /// Write the v1-mini checkpoint (config + zero-filled bf16 tensors) to a
+    /// fresh temp dir; returns `(dir, checkpoint_byte_total)`.
+    fn write_v1_mini_checkpoint() -> (std::path::PathBuf, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_dspark_v1_mini_checkpoint_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("create temp checkpoint dir");
+        fs::write(dir.join("config.json"), V1_MINI_CONFIG_JSON).expect("write config.json");
+        let mut tensors = synthetic_v1_mini_tensors();
+        let total: u64 = tensors.values().map(|t| t.nbytes() as u64).sum();
+        assert!(total > 0, "the mini checkpoint must have nonzero bytes");
+        crate::utils::safetensors::save_safetensors(
+            dir.join("model.safetensors"),
+            &mut tensors,
+            None,
+        )
+        .expect("write model.safetensors");
+        (dir, total)
+    }
+
     /// `load_draft_model` must report the checkpoint's exact total tensor
     /// bytes (summed BEFORE `apply_weights` drains the map): the gemma4
     /// loader folds this into the weight-byte total it registers with the
@@ -1756,25 +1877,7 @@ mod tests {
     /// the draft's full resident size (~GBs of bf16 on the real draft).
     #[test]
     fn load_draft_model_reports_checkpoint_weight_bytes() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "gemma4_dspark_weight_bytes_test_{}_{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).expect("create temp checkpoint dir");
-        fs::write(dir.join("config.json"), V1_MINI_CONFIG_JSON).expect("write config.json");
-        let mut tensors = synthetic_v1_mini_tensors();
-        let expected: u64 = tensors.values().map(|t| t.nbytes() as u64).sum();
-        assert!(expected > 0, "the mini checkpoint must have nonzero bytes");
-        crate::utils::safetensors::save_safetensors(
-            dir.join("model.safetensors"),
-            &mut tensors,
-            None,
-        )
-        .expect("write model.safetensors");
-
+        let (dir, expected) = write_v1_mini_checkpoint();
         let model = load_draft_model(&dir, 8, 16, 4).expect("mini v1 checkpoint must load");
         assert_eq!(
             model.weight_bytes(),
@@ -1786,6 +1889,39 @@ mod tests {
             DsparkDraftModel::new(tiny_config()).unwrap().weight_bytes(),
             0
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The loader's post-load materialization pass must cover EVERY
+    /// checkpoint tensor: `collect_weight_arrays` yields exactly the v1
+    /// contract's 74 tensors and their byte total equals `weight_bytes`
+    /// (i.e. nothing the checkpoint shipped stays behind as a lazy mmap
+    /// reference the first speculative forward would page-fault in). Also
+    /// exercises the `materialize_weights` pass itself over the collected
+    /// handles — the exact call the gemma4 loader makes after
+    /// `load_draft_model`.
+    #[test]
+    fn collect_weight_arrays_covers_every_checkpoint_tensor() {
+        let (dir, checkpoint_bytes) = write_v1_mini_checkpoint();
+        let model = load_draft_model(&dir, 8, 16, 4).expect("mini v1 checkpoint must load");
+
+        let arrays = model.collect_weight_arrays();
+        assert_eq!(
+            arrays.len(),
+            74,
+            "v1 contract: 9 top-level + 13 x {} layers",
+            DSPARK_NUM_LAYERS
+        );
+        let total: u64 = arrays.iter().map(|a| a.nbytes() as u64).sum();
+        assert_eq!(
+            total, checkpoint_bytes,
+            "collected arrays must cover every checkpoint byte (a gap here \
+             means the loader's materialization pass leaves lazy mmap refs)"
+        );
+
+        let refs: Vec<&MxArray> = arrays.iter().collect();
+        crate::array::memory::materialize_weights(&refs)
+            .expect("the loader's materialization pass must succeed on the collected handles");
         let _ = fs::remove_dir_all(&dir);
     }
 

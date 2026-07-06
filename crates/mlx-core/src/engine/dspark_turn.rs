@@ -1546,6 +1546,10 @@ mod tests {
         last_in_cache: bool,
         chunks: Vec<String>,
         ledger: Vec<Call>,
+        /// Bytes of `decode(generated)` covered by the step-streamed chunks —
+        /// the whole-turn residual flush emits exactly
+        /// `decode(generated)[streamed_text_len..]` after the loop returns.
+        streamed_text_len: usize,
     }
 
     /// Drive the STREAMING turn over the scripted backend. `pre_cancelled`
@@ -1624,7 +1628,26 @@ mod tests {
             last_in_cache: outcome.last_in_cache,
             chunks,
             ledger: backend.ledger_snapshot(),
+            streamed_text_len,
         }
+    }
+
+    /// The residual the whole-turn core's post-loop flush would emit:
+    /// `decode(generated)[streamed_text_len..]` — the platform-wide
+    /// streaming contract (engine/decode.rs cancel-snapshot comment) is
+    /// that step chunks + this residual reconstruct EXACTLY
+    /// `decode(generated_tokens)`, on cancelled turns included.
+    fn residual_of(out: &StreamOut) -> String {
+        let full = tiny_tokenizer()
+            .decode(&out.generated, true)
+            .unwrap_or_else(|e| panic!("decode failed: {e}"));
+        assert!(
+            out.streamed_text_len <= full.len(),
+            "streamed_text_len {} ran past decode(generated) ({} bytes)",
+            out.streamed_text_len,
+            full.len()
+        );
+        full[out.streamed_text_len..].to_string()
     }
 
     #[test]
@@ -1663,6 +1686,11 @@ mod tests {
             concat, full_text,
             "streamed chunk concatenation must equal the sync emission's text"
         );
+        assert_eq!(
+            residual_of(&streamed),
+            "",
+            "an uncancelled turn leaves nothing for the residual flush"
+        );
     }
 
     #[test]
@@ -1691,6 +1719,12 @@ mod tests {
         assert!(
             out.chunks.is_empty(),
             "cancelled before any chunk was streamed"
+        );
+        assert_eq!(
+            residual_of(&out),
+            "t0",
+            "the whole-turn residual flush delivers the committed-but-unstreamed \
+             seed's text (mtp initial-arm parity: total streamed == decode(generated))"
         );
         assert!(
             out.ledger.is_empty(),
@@ -1727,6 +1761,18 @@ mod tests {
             out.chunks,
             vec![String::from("t0")],
             "the cancel-observed token is committed but not streamed"
+        );
+        // Residual contract (AR/MTP parity): the whole-turn flush emits
+        // decode(generated)[streamed_text_len..]; on a cancel cut that
+        // suffix is EXACTLY the single cancel-observed token's text —
+        // never more (no other suppressed tokens can hide behind it), so
+        // step chunks + residual reconstruct decode(generated), the same
+        // total the AR loop's documented origin/main cancel semantics
+        // produce (engine/decode.rs cancel-snapshot comment).
+        assert_eq!(
+            residual_of(&out),
+            " t1",
+            "the unstreamed suffix must be exactly the cancel-observed token's text"
         );
         assert_eq!(
             commits(&out.ledger),
