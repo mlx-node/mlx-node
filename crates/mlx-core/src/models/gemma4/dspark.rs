@@ -239,6 +239,35 @@ impl DsparkConfig {
 }
 
 // ============================================
+// Target-side hidden tap
+// ============================================
+
+/// Capture request threaded through the TARGET model's forward passes.
+///
+/// `layer_ids` lists the decoder layers whose residual-stream hidden state
+/// the target must capture, and must be strictly ascending (the order the
+/// layer loop pushes captures — matches the `target_layer_ids` contract in
+/// [`DsparkConfig::validate`]). For each forward call the target pushes the
+/// FULL `[B, T, hidden]` hidden of layer `i` taken immediately after the
+/// layer's residual add, PRE final-norm (the HF `hidden_states[i + 1]`
+/// convention) — one entry per `layer_ids` entry, in order. Chunked prefill
+/// therefore appends `layer_ids.len()` entries per chunk; callers slice what
+/// they need.
+pub(crate) struct DsparkTap<'a> {
+    pub layer_ids: &'a [usize],
+    pub captured: Vec<MxArray>,
+}
+
+impl<'a> DsparkTap<'a> {
+    pub(crate) fn new(layer_ids: &'a [usize]) -> Self {
+        Self {
+            layer_ids,
+            captured: Vec::new(),
+        }
+    }
+}
+
+// ============================================
 // Markov head math
 // ============================================
 

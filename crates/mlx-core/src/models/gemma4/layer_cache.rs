@@ -189,6 +189,74 @@ impl Gemma4LayerCache {
         self.stashed_kv.take()
     }
 
+    /// Rewind a global cache to `new_len` tokens (passthrough to
+    /// `KVCache::trim`; the next append overwrites the trimmed region in
+    /// place). Errors on sliding caches — a rotating window cannot be
+    /// rewound by moving the offset; use the snapshot/restore rollback path.
+    pub(crate) fn trim_global(&mut self, new_len: i32) -> Result<()> {
+        match &mut self.inner {
+            CacheType::Global(c) => {
+                c.trim(new_len);
+                self.stashed_kv = None;
+                Ok(())
+            }
+            CacheType::Sliding(_) => Err(Error::new(
+                Status::InvalidArg,
+                "trim_global cannot rewind a Gemma4 sliding cache; use snapshot/restore rollback",
+            )),
+        }
+    }
+
+    /// The LAST `n` cached entries of a sliding cache in temporal order,
+    /// as `(keys, values)` slices of the current window contents.
+    ///
+    /// After a T-token verify append on a window >= T, the last T entries
+    /// are exactly the verify block's K/V. Errors on global caches and when
+    /// `n` is zero or exceeds the cached token count.
+    pub(crate) fn sliding_tail(&self, n: usize) -> Result<(MxArray, MxArray)> {
+        match &self.inner {
+            CacheType::Global(_) => Err(Error::new(
+                Status::InvalidArg,
+                "sliding_tail is only valid on a Gemma4 sliding cache",
+            )),
+            CacheType::Sliding(c) => {
+                let (keys, values) = c.fetch_current_kv().ok_or_else(|| {
+                    Error::new(
+                        Status::InvalidArg,
+                        "sliding_tail requested on an empty Gemma4 sliding cache",
+                    )
+                })?;
+                let cached = keys.shape_at(2)?;
+                let n = n as i64;
+                if n < 1 || n > cached {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("sliding_tail: n={n} out of range for {cached} cached tokens"),
+                    ));
+                }
+                Ok((
+                    keys.slice_axis(2, cached - n, cached)?,
+                    values.slice_axis(2, cached - n, cached)?,
+                ))
+            }
+        }
+    }
+
+    /// Clear a sliding cache back to empty. Errors on global caches.
+    fn reset_sliding(&mut self) -> Result<()> {
+        match &mut self.inner {
+            CacheType::Global(_) => Err(Error::new(
+                Status::InvalidArg,
+                "reset_sliding is only valid on a Gemma4 sliding cache",
+            )),
+            CacheType::Sliding(c) => {
+                c.reset();
+                self.stashed_kv = None;
+                Ok(())
+            }
+        }
+    }
+
     /// Collect references to the raw internal K/V arrays for eval between
     /// chunked prefill steps. Matches Qwen3.5's `collect_arrays` pattern.
     pub fn collect_cache_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
@@ -213,6 +281,151 @@ impl Gemma4LayerCache {
     }
 }
 
+/// Cache state captured before a DSpark verify forward, used by
+/// [`commit_after_verify`] to roll every cache back to the kept prefix when
+/// the target accepts only part of the verified block.
+// Consumed by the DSpark speculative-decode engine loop, which is wired in
+// separately; until then only the inline tests exercise these primitives.
+#[allow(dead_code)]
+pub(crate) struct Gemma4VerifyRollback {
+    /// Per-cache sliding snapshots, index-aligned with the caches slice.
+    /// `None` for global layers and for sliding caches that were empty.
+    snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
+    /// Per-cache offsets before the verify forward. KV-shared layers keep an
+    /// allocated-but-never-written vec entry that stays at offset 0; storing
+    /// the offset per cache lets commit recognize those entries.
+    start_offsets: Vec<i32>,
+    /// Tokens the verify forward appends to every cache it writes.
+    total_written: usize,
+}
+
+/// Snapshot every cache before a verify forward that will append
+/// `total_to_write` tokens.
+///
+/// Global caches need no snapshot (rollback is a `trim`); sliding caches
+/// snapshot their ordered window tail. Errors when a sliding window is
+/// smaller than the verify block, because the block tail could then not be
+/// recovered for a partial-keep rollback.
+#[allow(dead_code)]
+pub(crate) fn snapshot_before_verify(
+    caches: &[Gemma4LayerCache],
+    total_to_write: usize,
+) -> Result<Gemma4VerifyRollback> {
+    if total_to_write == 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "snapshot_before_verify: total_to_write must be at least 1",
+        ));
+    }
+    let mut snapshots = Vec::with_capacity(caches.len());
+    let mut start_offsets = Vec::with_capacity(caches.len());
+    for (idx, cache) in caches.iter().enumerate() {
+        if let Some(state) = cache.sliding_state()?
+            && (state.window_size as i64) < total_to_write as i64
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "snapshot_before_verify: cache {idx} sliding window {} is smaller than the {total_to_write}-token verify block; its tail could not be recovered for rollback",
+                    state.window_size
+                ),
+            ));
+        }
+        start_offsets.push(cache.get_offset());
+        snapshots.push(cache.snapshot_sliding()?);
+    }
+    Ok(Gemma4VerifyRollback {
+        snapshots,
+        start_offsets,
+        total_written: total_to_write,
+    })
+}
+
+/// Commit the first `keep` tokens of a verify block and roll back the rest.
+///
+/// Preconditions: `rb` was taken right before the verify forward, and the
+/// verify forward appended `rb.total_written` tokens to every cache it
+/// writes. Caches whose offset did not move (KV-shared layers' unused vec
+/// entries) are skipped, so each physical cache is touched exactly once.
+///
+/// * `keep == total_written`: no-op — the appended block is kept as-is.
+/// * `keep < total_written`: global caches trim to `start + keep`; sliding
+///   caches slice the block tail, restore the pre-verify snapshot, then
+///   re-append the first `keep` tail rows through the normal update path,
+///   leaving state identical to a cache that only ever saw the kept prefix.
+///   `keep == 0` discards the block entirely.
+#[allow(dead_code)]
+pub(crate) fn commit_after_verify(
+    caches: &mut [Gemma4LayerCache],
+    rb: &Gemma4VerifyRollback,
+    keep: usize,
+) -> Result<()> {
+    if caches.len() != rb.snapshots.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "commit_after_verify: {} caches but rollback snapshot covers {}",
+                caches.len(),
+                rb.snapshots.len()
+            ),
+        ));
+    }
+    if keep > rb.total_written {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "commit_after_verify: keep={keep} exceeds the {}-token verify block",
+                rb.total_written
+            ),
+        ));
+    }
+    if keep == rb.total_written {
+        return Ok(());
+    }
+
+    for (idx, (cache, (snapshot, &start))) in caches
+        .iter_mut()
+        .zip(rb.snapshots.iter().zip(rb.start_offsets.iter()))
+        .enumerate()
+    {
+        let current = cache.get_offset();
+        if current == start {
+            // This cache was not written by the verify forward (KV-shared
+            // layers read their anchor's cache; their own vec entry never
+            // advances). Nothing to roll back.
+            continue;
+        }
+        let expected = start + rb.total_written as i32;
+        if current != expected {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "commit_after_verify: cache {idx} moved from offset {start} to {current}, expected {expected} after a {}-token verify block",
+                    rb.total_written
+                ),
+            ));
+        }
+
+        if cache.is_sliding() {
+            let (tail_keys, tail_values) = cache.sliding_tail(rb.total_written)?;
+            match snapshot {
+                Some(snapshot) => cache.restore_sliding_snapshot(snapshot)?,
+                // The sliding cache was empty before the verify forward;
+                // rolling back means clearing it entirely.
+                None => cache.reset_sliding()?,
+            }
+            if keep > 0 {
+                let kept_keys = tail_keys.slice_axis(2, 0, keep as i64)?;
+                let kept_values = tail_values.slice_axis(2, 0, keep as i64)?;
+                cache.update_and_fetch(&kept_keys, &kept_values)?;
+            }
+        } else {
+            cache.trim_global(start + keep as i32)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +434,351 @@ mod tests {
         arr.eval();
         let data = arr.to_float32().unwrap().to_vec();
         assert_eq!(data, expected);
+    }
+
+    /// Build a K/V pair shaped [1, 1, n, 1]: keys carry `values` verbatim,
+    /// values carry `values * 10` so K and V mixups are visible.
+    fn kv_pair(values: &[f32]) -> (MxArray, MxArray) {
+        let n = values.len() as i64;
+        let keys = MxArray::from_float32(values, &[1, 1, n, 1]).unwrap();
+        let scaled: Vec<f32> = values.iter().map(|v| v * 10.0).collect();
+        let vals = MxArray::from_float32(&scaled, &[1, 1, n, 1]).unwrap();
+        (keys, vals)
+    }
+
+    /// Apply a sequence of appends (each inner vec is one `update_and_fetch`
+    /// call; single-element vecs take the single-token path).
+    fn apply_appends(cache: &mut Gemma4LayerCache, appends: &[Vec<f32>]) {
+        for chunk in appends {
+            let (k, v) = kv_pair(chunk);
+            cache.update_and_fetch(&k, &v).unwrap();
+        }
+    }
+
+    fn assert_same_f32(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.shape().unwrap().to_vec(),
+            b.shape().unwrap().to_vec(),
+            "{ctx}: shape"
+        );
+        let a_bits: Vec<u32> = a
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let b_bits: Vec<u32> = b
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a_bits, b_bits, "{ctx}: contents");
+    }
+
+    /// Compare a rolled-back cache against a reference cache that only ever
+    /// saw prefill + kept prefix: logical state, temporal contents, and the
+    /// behavior of one subsequent single-token append.
+    ///
+    /// `compare_idx` gates comparing the raw write index and raw attention
+    /// views: a rollback restores storage in temporal order, so when the
+    /// reference's backing buffer is ROTATED (idx mid-window) the physical
+    /// layout legitimately differs while offset, temporal contents, and all
+    /// subsequent appends remain identical.
+    fn assert_rollback_matches_reference(
+        live: &mut Gemma4LayerCache,
+        reference: &mut Gemma4LayerCache,
+        compare_idx: bool,
+        ctx: &str,
+    ) {
+        let ls = live.sliding_state().unwrap().unwrap();
+        let rs = reference.sliding_state().unwrap().unwrap();
+        if compare_idx {
+            assert_eq!(ls, rs, "{ctx}: state");
+        } else {
+            assert_eq!(ls.offset, rs.offset, "{ctx}: offset");
+            assert_eq!(ls.window_size, rs.window_size, "{ctx}: window");
+            assert_eq!(ls.keep, rs.keep, "{ctx}: keep param");
+            assert_eq!(ls.cached_tokens, rs.cached_tokens, "{ctx}: cached_tokens");
+            assert_eq!(ls.initialized, rs.initialized, "{ctx}: initialized");
+        }
+
+        match (live.get_cached_kv(), reference.get_cached_kv()) {
+            (Some((lk, lv)), Some((rk, rv))) => {
+                assert_same_f32(&lk, &rk, &format!("{ctx}: temporal keys"));
+                assert_same_f32(&lv, &rv, &format!("{ctx}: temporal values"));
+            }
+            (None, None) => {}
+            (l, r) => panic!(
+                "{ctx}: cache emptiness mismatch: live={} reference={}",
+                l.is_some(),
+                r.is_some()
+            ),
+        }
+
+        let (ak, av) = kv_pair(&[201.0]);
+        let (live_k, live_v) = live.update_and_fetch(&ak, &av).unwrap();
+        let (ref_k, ref_v) = reference.update_and_fetch(&ak, &av).unwrap();
+        if compare_idx {
+            assert_same_f32(
+                &live_k,
+                &ref_k,
+                &format!("{ctx}: post-append attention keys"),
+            );
+            assert_same_f32(
+                &live_v,
+                &ref_v,
+                &format!("{ctx}: post-append attention values"),
+            );
+        }
+        assert_eq!(
+            live.get_offset(),
+            reference.get_offset(),
+            "{ctx}: post-append offset"
+        );
+        let (lk2, lv2) = live.get_cached_kv().unwrap();
+        let (rk2, rv2) = reference.get_cached_kv().unwrap();
+        assert_same_f32(&lk2, &rk2, &format!("{ctx}: post-append temporal keys"));
+        assert_same_f32(&lv2, &rv2, &format!("{ctx}: post-append temporal values"));
+    }
+
+    /// The critical rollback invariant: snapshot → multi-token verify append
+    /// → rollback-to-keep leaves the sliding cache byte-identical to a cache
+    /// that only ever saw prefill + kept prefix, for every keep in 0..=T,
+    /// pre-wrap, post-wrap, rotated-storage, and empty-prefill.
+    #[test]
+    fn sliding_reappend_matches_reference() {
+        let window = 8;
+        let block: Vec<f32> = (101..=108).map(|v| v as f32).collect();
+
+        let rotated_prefill: Vec<Vec<f32>> = {
+            let mut appends = vec![(1..=5).map(|v| v as f32).collect::<Vec<f32>>()];
+            for v in 6..=12 {
+                appends.push(vec![v as f32]);
+            }
+            appends
+        };
+        let scenarios: Vec<(&str, Vec<Vec<f32>>, bool)> = vec![
+            ("pre_wrap", vec![(1..=5).map(|v| v as f32).collect()], true),
+            (
+                "post_wrap",
+                vec![(1..=40).map(|v| v as f32).collect()],
+                true,
+            ),
+            ("rotated_idx", rotated_prefill, false),
+            ("empty_prefill", vec![], true),
+        ];
+
+        for (name, prefill, compare_idx) in &scenarios {
+            for keep in 0..=block.len() {
+                let ctx = format!("{name} keep={keep}");
+
+                let mut live = [Gemma4LayerCache::new_sliding(window)];
+                apply_appends(&mut live[0], prefill);
+                let rollback = snapshot_before_verify(&live, block.len()).unwrap();
+                let (bk, bv) = kv_pair(&block);
+                live[0].update_and_fetch(&bk, &bv).unwrap();
+                commit_after_verify(&mut live, &rollback, keep).unwrap();
+
+                let mut reference = Gemma4LayerCache::new_sliding(window);
+                apply_appends(&mut reference, prefill);
+                if keep > 0 {
+                    let (kk, kv) = kv_pair(&block[..keep]);
+                    reference.update_and_fetch(&kk, &kv).unwrap();
+                }
+
+                assert_rollback_matches_reference(&mut live[0], &mut reference, *compare_idx, &ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn trim_global_trims_global_and_errors_on_sliding() {
+        let mut global = Gemma4LayerCache::new_global();
+        let (k, v) = kv_pair(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        global.update_and_fetch(&k, &v).unwrap();
+        assert_eq!(global.get_offset(), 8);
+
+        global.trim_global(5).unwrap();
+        assert_eq!(global.get_offset(), 5);
+        let (cached_k, cached_v) = global.get_cached_kv().unwrap();
+        assert_float_data(&cached_k, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_float_data(&cached_v, &[10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        // The next append overwrites the trimmed region in place.
+        let (nk, nv) = kv_pair(&[99.0]);
+        global.update_and_fetch(&nk, &nv).unwrap();
+        assert_eq!(global.get_offset(), 6);
+        let (cached_k, cached_v) = global.get_cached_kv().unwrap();
+        assert_float_data(&cached_k, &[1.0, 2.0, 3.0, 4.0, 5.0, 99.0]);
+        assert_float_data(&cached_v, &[10.0, 20.0, 30.0, 40.0, 50.0, 990.0]);
+
+        let mut sliding = Gemma4LayerCache::new_sliding(4);
+        let (sk, sv) = kv_pair(&[1.0, 2.0]);
+        sliding.update_and_fetch(&sk, &sv).unwrap();
+        assert!(sliding.trim_global(1).is_err());
+        assert_eq!(sliding.get_offset(), 2, "failed trim must not mutate");
+    }
+
+    #[test]
+    fn sliding_tail_returns_block_rows_and_errors_on_global() {
+        let mut sliding = Gemma4LayerCache::new_sliding(8);
+        let (pk, pv) = kv_pair(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        sliding.update_and_fetch(&pk, &pv).unwrap();
+        let (bk, bv) = kv_pair(&[101.0, 102.0, 103.0, 104.0]);
+        sliding.update_and_fetch(&bk, &bv).unwrap();
+
+        let (tail_k, tail_v) = sliding.sliding_tail(4).unwrap();
+        assert_float_data(&tail_k, &[101.0, 102.0, 103.0, 104.0]);
+        assert_float_data(&tail_v, &[1010.0, 1020.0, 1030.0, 1040.0]);
+
+        // n beyond the cached token count and n == 0 are rejected.
+        assert!(sliding.sliding_tail(9).is_err());
+        assert!(sliding.sliding_tail(0).is_err());
+
+        let mut global = Gemma4LayerCache::new_global();
+        let (gk, gv) = kv_pair(&[1.0, 2.0]);
+        global.update_and_fetch(&gk, &gv).unwrap();
+        assert!(global.sliding_tail(1).is_err());
+
+        let empty = Gemma4LayerCache::new_sliding(8);
+        assert!(empty.sliding_tail(1).is_err());
+    }
+
+    /// Mixed vec of global + sliding caches, including untouched entries that
+    /// model KV-shared layers (their vec slot is never written by a forward).
+    #[test]
+    fn commit_after_verify_mixed_caches() {
+        const ACTIVE: [usize; 4] = [0, 1, 2, 3];
+        const DEAD: [usize; 2] = [4, 5];
+
+        fn build() -> Vec<Gemma4LayerCache> {
+            let mut caches = vec![
+                Gemma4LayerCache::new_global(),
+                Gemma4LayerCache::new_sliding(8),
+                Gemma4LayerCache::new_global(),
+                Gemma4LayerCache::new_sliding(8),
+                // KV-shared style entries: allocated but never written.
+                Gemma4LayerCache::new_sliding(8),
+                Gemma4LayerCache::new_global(),
+            ];
+            for &i in &ACTIVE {
+                let (k, v) = kv_pair(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+                caches[i].update_and_fetch(&k, &v).unwrap();
+            }
+            caches
+        }
+
+        fn append_block(caches: &mut [Gemma4LayerCache], block: &[f32]) {
+            for &i in &ACTIVE {
+                let (k, v) = kv_pair(block);
+                caches[i].update_and_fetch(&k, &v).unwrap();
+            }
+        }
+
+        let block = [101.0f32, 102.0, 103.0];
+
+        // Full keep: no-op, all active offsets stay at n + T.
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block);
+        commit_after_verify(&mut caches, &rollback, block.len()).unwrap();
+        for &i in &ACTIVE {
+            assert_eq!(caches[i].get_offset(), 8, "cache {i} full-keep offset");
+        }
+        for &i in &DEAD {
+            assert_eq!(caches[i].get_offset(), 0, "dead cache {i} must stay empty");
+        }
+
+        // Partial keep: every active cache lands at n + keep with exactly the
+        // kept prefix appended; dead caches untouched.
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block);
+        commit_after_verify(&mut caches, &rollback, 1).unwrap();
+        for &i in &ACTIVE {
+            assert_eq!(caches[i].get_offset(), 6, "cache {i} partial-keep offset");
+            let (k, v) = caches[i].get_cached_kv().unwrap();
+            assert_float_data(&k, &[1.0, 2.0, 3.0, 4.0, 5.0, 101.0]);
+            assert_float_data(&v, &[10.0, 20.0, 30.0, 40.0, 50.0, 1010.0]);
+        }
+        for &i in &DEAD {
+            assert_eq!(caches[i].get_offset(), 0, "dead cache {i} must stay empty");
+        }
+
+        // keep == 0: the verify block is fully discarded.
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block);
+        commit_after_verify(&mut caches, &rollback, 0).unwrap();
+        for &i in &ACTIVE {
+            assert_eq!(caches[i].get_offset(), 5, "cache {i} keep-0 offset");
+            let (k, _) = caches[i].get_cached_kv().unwrap();
+            assert_float_data(&k, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        }
+
+        // keep > total_written is rejected.
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block);
+        assert!(commit_after_verify(&mut caches, &rollback, 4).is_err());
+
+        // A cache that advanced by anything other than total_written is a
+        // contract violation, not something to silently "fix".
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block[..2]);
+        assert!(commit_after_verify(&mut caches, &rollback, 1).is_err());
+
+        // Cache-count mismatch between snapshot and commit is rejected.
+        let mut caches = build();
+        let rollback = snapshot_before_verify(&caches, block.len()).unwrap();
+        append_block(&mut caches, &block);
+        assert!(commit_after_verify(&mut caches[..5], &rollback, 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_before_verify_validates_window_and_block() {
+        let caches = vec![Gemma4LayerCache::new_sliding(2)];
+        assert!(
+            snapshot_before_verify(&caches, 3).is_err(),
+            "window smaller than the verify block cannot be rolled back"
+        );
+        assert!(snapshot_before_verify(&caches, 0).is_err());
+        assert!(snapshot_before_verify(&caches, 2).is_ok());
+    }
+
+    /// A one-token verify block (T = 1 + 0 drafts) takes the rotating
+    /// cache's IN-PLACE single-token update path, which overwrites the
+    /// backing array's descriptor rather than rebinding it. The pre-verify
+    /// snapshot must not alias that array, or the rollback would restore
+    /// post-verify data. Regression test for the `temporal_order` clone
+    /// branch (`idx == cache_len`) sharing the live handle.
+    #[test]
+    fn sliding_rollback_survives_single_token_verify_append() {
+        // Post-wrap single-concat prefill leaves idx == cached length ==
+        // window, exactly the state where the snapshot would alias the
+        // live storage and the next single-token append writes in place.
+        let prefill: Vec<f32> = (1..=40).map(|v| v as f32).collect();
+
+        let mut live = [Gemma4LayerCache::new_sliding(8)];
+        apply_appends(&mut live[0], std::slice::from_ref(&prefill));
+        let rollback = snapshot_before_verify(&live, 1).unwrap();
+        let (bk, bv) = kv_pair(&[999.0]);
+        live[0].update_and_fetch(&bk, &bv).unwrap();
+        commit_after_verify(&mut live, &rollback, 0).unwrap();
+
+        let mut reference = Gemma4LayerCache::new_sliding(8);
+        apply_appends(&mut reference, &[prefill]);
+
+        assert_rollback_matches_reference(
+            &mut live[0],
+            &mut reference,
+            false,
+            "single-token verify keep=0",
+        );
     }
 
     #[test]

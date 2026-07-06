@@ -108,6 +108,7 @@ fn escape_gemma4_content(s: &str) -> String {
 
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
+use super::dspark::DsparkTap;
 use super::layer_cache::Gemma4LayerCache;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -4568,6 +4569,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -4603,6 +4605,7 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
+            None,
         )?;
         Ok(())
     }
@@ -5203,6 +5206,7 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?;
         }
         eval_gemma4_caches(
@@ -5231,6 +5235,7 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
+                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -5753,6 +5758,10 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 ///
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
+///
+/// When `tap` is provided, the residual-stream hidden of each tapped layer
+/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
+/// `layer_ids` order; the compute graph is otherwise unchanged.
 fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
@@ -5763,7 +5772,22 @@ fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
+    if let Some(t) = tap.as_deref() {
+        let mut previous: Option<usize> = None;
+        for &id in t.layer_ids {
+            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
+                return Err(Error::from_reason(format!(
+                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
+                    t.layer_ids,
+                    layers.len()
+                )));
+            }
+            previous = Some(id);
+        }
+    }
+
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -5914,6 +5938,15 @@ fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
+
+        // Residual-stream hidden of layer i (post residual add, pre
+        // final-norm — HF `hidden_states[i + 1]`), captured for both the
+        // regular and the KV-shared branch.
+        if let Some(t) = tap.as_deref_mut()
+            && t.layer_ids.contains(&i)
+        {
+            t.captured.push(h.clone());
+        }
     }
 
     // Final norm
@@ -5933,6 +5966,7 @@ fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -5944,6 +5978,7 @@ fn forward_inner(
         ple,
         None,
         config,
+        tap,
     )?;
 
     crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &h, None);
@@ -5975,6 +6010,48 @@ fn forward_inner(
         crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
         Ok(logits)
     }
+}
+
+/// Run the target over a `[1, T]` verify block at the current cache offset,
+/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
+///
+/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
+/// the same masks/rope the chunked prefill uses). It does not sample and
+/// touches no history bookkeeping; caches advance by T. Callers pair it with
+/// `snapshot_before_verify` / `commit_after_verify` for rollback.
+// Consumed by the DSpark speculative-decode engine loop, which is wired in
+// separately; until then only the inline tests exercise this wrapper.
+#[allow(dead_code)]
+pub(crate) fn dspark_verify_forward(
+    block_ids: &MxArray,
+    embedding: &Embedding,
+    layers: &[Gemma4DecoderLayer],
+    caches: &mut [Gemma4LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    ple: Option<&PleComponents>,
+    config: &Gemma4Config,
+    tap: &mut DsparkTap<'_>,
+) -> Result<MxArray> {
+    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
+        return Err(Error::from_reason(format!(
+            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
+            block_ids.shape()?.as_ref()
+        )));
+    }
+    forward_inner(
+        block_ids,
+        embedding,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embed_weight_t,
+        ple,
+        config,
+        Some(tap),
+    )
 }
 
 /// Compute PLE (per-layer embeddings) from input_ids.
@@ -6702,6 +6779,7 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
+    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -6747,6 +6825,7 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
+            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -6771,6 +6850,7 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
+            tap,
         )?;
     }
 
@@ -9396,6 +9476,255 @@ mod tool_delta_marker_tests {
         assert_eq!(
             occurrences, 1,
             "marker count should be 1 (the original literal); got {occurrences} in:\n{rendered}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod dspark_tap_tests {
+    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
+    //! paths must leave the compute graph byte-identical to a tap-less
+    //! run, while capturing the residual-stream hiddens of the tapped
+    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer) through the REAL
+    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+
+    use super::*;
+    use crate::models::gemma4::dspark::DsparkTap;
+
+    fn tiny_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+        }))
+        .expect("tiny Gemma4 config must deserialize")
+    }
+
+    fn tiny_model(config: &Gemma4Config) -> (Embedding, Vec<Gemma4DecoderLayer>, RMSNorm) {
+        let embedding =
+            Embedding::new(config.vocab_size as u32, config.hidden_size as u32).unwrap();
+        let layers: Vec<Gemma4DecoderLayer> = (0..config.num_hidden_layers as usize)
+            .map(|i| Gemma4DecoderLayer::new(config, i).unwrap())
+            .collect();
+        let final_norm =
+            RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps)).unwrap();
+        (embedding, layers, final_norm)
+    }
+
+    fn assert_bitwise_eq(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        assert_eq!(
+            a.shape().unwrap().to_vec(),
+            b.shape().unwrap().to_vec(),
+            "{ctx}: shape"
+        );
+        let a_bits: Vec<u32> = a
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let b_bits: Vec<u32> = b
+            .to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(a_bits, b_bits, "{ctx}: bits");
+    }
+
+    #[test]
+    fn dspark_tap_purity_and_verify_forward() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+
+        // 6-token prefill then a 3-token verify block: the block runs
+        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
+        // so the windowed-mask path is exercised.
+        let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
+        let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
+
+        // Pass A: no tap.
+        let mut caches_a = init_caches_for_config(&config);
+        let hidden_a = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+        let logits_a = forward_inner(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_a,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            None,
+        )
+        .unwrap();
+
+        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1).
+        let layer_ids = [0usize, 2, 3];
+        let mut caches_b = init_caches_for_config(&config);
+        let mut prefill_tap = DsparkTap::new(&layer_ids);
+        let hidden_b = forward_body(
+            Some(&prefill_ids),
+            None,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            None,
+            None,
+            &config,
+            Some(&mut prefill_tap),
+        )
+        .unwrap();
+        let mut verify_tap = DsparkTap::new(&layer_ids);
+        let logits_b = dspark_verify_forward(
+            &block_ids,
+            &embedding,
+            &layers,
+            &mut caches_b,
+            &final_norm,
+            &None,
+            None,
+            None,
+            &config,
+            &mut verify_tap,
+        )
+        .unwrap();
+
+        // Tap must not perturb the compute graph.
+        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
+        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
+        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
+
+        // One [B, T, hidden] capture per tapped layer, per forward call.
+        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
+        for arr in &prefill_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
+        }
+        assert_eq!(verify_tap.captured.len(), layer_ids.len());
+        for arr in &verify_tap.captured {
+            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
+        }
+
+        // Different layers must yield different hiddens (real per-layer
+        // captures, not one array pushed repeatedly).
+        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
+        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Caches advance by T on both passes; the KV-shared layer's own
+        // vec entry is never written (it reads its anchor's cache).
+        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+            assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
+            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
+        }
+        assert_eq!(
+            caches_b[3].get_offset(),
+            0,
+            "KV-shared layer's cache entry must stay untouched"
+        );
+    }
+
+    #[test]
+    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
+
+        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
+            let mut caches = init_caches_for_config(&config);
+            let mut tap = DsparkTap::new(&bad);
+            let result = forward_body(
+                Some(&ids),
+                None,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                None,
+                None,
+                &config,
+                Some(&mut tap),
+            );
+            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dspark_verify_forward_rejects_bad_block_shape() {
+        let config = tiny_config();
+        let (embedding, layers, final_norm) = tiny_model(&config);
+        let layer_ids = [0usize];
+
+        // Batch > 1 is rejected.
+        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &batch2,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
+        );
+
+        // 1-D input is rejected.
+        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
+        let mut caches = init_caches_for_config(&config);
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            dspark_verify_forward(
+                &flat,
+                &embedding,
+                &layers,
+                &mut caches,
+                &final_norm,
+                &None,
+                None,
+                None,
+                &config,
+                &mut tap,
+            )
+            .is_err()
         );
     }
 }
