@@ -1850,11 +1850,34 @@ impl Gemma4Inner {
     /// cache-limit coordinator. See `cache_limit.rs` module docs for
     /// why this deterministic measurement is preferred over a
     /// process-wide `get_active_memory()` delta.
-    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
+    ///
+    /// `draft_model_path` optionally points at a DSpark draft checkpoint
+    /// directory loaded alongside the target for speculative decoding.
+    /// DSpark runs only on the flat KV-cache path, so an explicit
+    /// `use_block_paged_cache: true` in the target config is a hard error
+    /// (silently ignoring the explicit draft request would be worse), and
+    /// the unset default (paged ON) is forced to flat.
+    pub fn load_from_dir(model_path: &str, draft_model_path: Option<&str>) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
         let mut config = parse_config(path)?;
+
+        // DSpark/paged conflict guard — BEFORE any weight I/O so a
+        // misconfigured request fails fast. `use_block_paged_cache`
+        // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
+        // request flips that default to flat, but an EXPLICIT `true` is a
+        // config-level conflict the caller must resolve.
+        if draft_model_path.is_some() {
+            if config.use_block_paged_cache == Some(true) {
+                return Err(Error::from_reason(
+                    "Gemma4 draft_model_path conflicts with use_block_paged_cache=true: DSpark \
+                     speculative decoding runs only on the flat KV-cache path. Remove \
+                     draft_model_path or set use_block_paged_cache to false in config.json.",
+                ));
+            }
+            config.use_block_paged_cache = Some(false);
+        }
 
         // Merge stop tokens and sampling defaults from generation_config.json
         let gen_config_path = path.join("generation_config.json");
@@ -2139,6 +2162,30 @@ impl Gemma4Inner {
             );
         }
 
+        // DSpark draft model — loaded AFTER the target body so its geometry
+        // validation runs against the fully-parsed target config. Loader
+        // errors propagate verbatim (they carry the guard-rail messages:
+        // geometry pins, bf16-only gate, 74-tensor completeness).
+        if let Some(draft_dir) = draft_model_path {
+            let draft_path = Path::new(draft_dir);
+            // Same cold-mmap pre-warm as the target shards: the draft's
+            // first forward must not page-fault a cold region on the GPU.
+            prewarm_checkpoint_pages(draft_path);
+            let draft = super::dspark::load_draft_model(
+                draft_path,
+                config.hidden_size as i64,
+                config.vocab_size as i64,
+                config.num_hidden_layers as usize,
+            )?;
+            info!(
+                "[gemma4] DSpark draft model loaded: {} layers, block_size={}, target_layer_ids={:?}",
+                draft.num_layers(),
+                draft.config.block_size,
+                draft.config.target_layer_ids,
+            );
+            inner.dspark = Some(draft);
+        }
+
         // Deterministic weight-byte total for the cache-limit
         // coordinator. Computed from the still-live `params` map
         // before it is dropped at end-of-function.
@@ -2168,8 +2215,12 @@ impl Gemma4Model {
     ///
     /// Spawns a dedicated model thread. The init_fn runs all weight loading on
     /// that thread, then the thread enters its command loop.
-    pub async fn load_from_dir(model_path: &str) -> Result<Self> {
+    pub async fn load_from_dir(
+        model_path: &str,
+        options: Option<super::model::Gemma4LoadOptions>,
+    ) -> Result<Self> {
         let model_path = model_path.to_string();
+        let draft_model_path = options.and_then(|o| o.draft_model_path);
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
             move || {
@@ -2180,12 +2231,14 @@ impl Gemma4Model {
                 // sampling — the deterministic path is race-free
                 // against concurrent inference. See `cache_limit.rs`
                 // module docs.
-                let (inner, weight_bytes) = Gemma4Inner::load_from_dir(&model_path)?;
+                let (inner, weight_bytes) =
+                    Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
                 let has_vision = inner.image_processor.is_some();
                 let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.paged_adapter.is_some();
+                let dspark_active = inner.dspark.is_some();
                 Ok((
                     inner,
                     (
@@ -2194,13 +2247,14 @@ impl Gemma4Model {
                         has_audio,
                         cache_limit_guard,
                         paged_active,
+                        dspark_active,
                     ),
                 ))
             },
             crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
         );
 
-        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active) =
+        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active, dspark_active) =
             init_rx
                 .await
                 .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
@@ -2213,6 +2267,7 @@ impl Gemma4Model {
             initialized: true,
             paged_active,
             _cache_limit_guard: Some(cache_limit_guard),
+            dspark_active,
         })
     }
 }
@@ -2336,6 +2391,80 @@ mod tests {
         assert!(
             cfg.unified_vision_config.is_none(),
             "plain gemma4 must leave unified_vision_config None"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write a config.json into a fresh temp dir (no weights) for
+    /// `load_from_dir` guard tests that must fail BEFORE any weight I/O.
+    fn write_config_dir(json: serde_json::Value) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gemma4_dspark_load_guard_test_{}_{}",
+            std::process::id(),
+            id
+        ));
+        fs::create_dir_all(&dir).expect("create temp config dir");
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&json).expect("serialize config json"),
+        )
+        .expect("write config.json");
+        dir
+    }
+
+    /// draft_model_path + an EXPLICIT `use_block_paged_cache: true` is a
+    /// hard load error, surfaced from the config guard BEFORE any weight
+    /// I/O (the temp dir deliberately carries no safetensors).
+    #[test]
+    fn dspark_draft_conflicts_with_explicit_paged_cache() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 },
+            "use_block_paged_cache": true
+        }));
+        let err = match Gemma4Inner::load_from_dir(
+            dir.to_str().expect("utf8 temp dir"),
+            Some("/nonexistent/dspark-draft"),
+        ) {
+            Ok(_) => panic!("explicit paged + draft must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("use_block_paged_cache=true"),
+            "error must name the conflicting flag, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("draft_model_path"),
+            "error must name the draft option, got: {}",
+            err.reason
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With `use_block_paged_cache` UNSET, a draft request passes the guard
+    /// (the default is forced to flat) — the load then fails later on the
+    /// missing weights, NOT on the conflict guard.
+    #[test]
+    fn dspark_draft_with_unset_paged_flag_passes_the_guard() {
+        let dir = write_config_dir(serde_json::json!({
+            "model_type": "gemma4_text",
+            "text_config": { "hidden_size": 64 }
+        }));
+        let err = match Gemma4Inner::load_from_dir(
+            dir.to_str().expect("utf8 temp dir"),
+            Some("/nonexistent/dspark-draft"),
+        ) {
+            Ok(_) => panic!("temp dir has no weights; the load must still fail downstream"),
+            Err(e) => e,
+        };
+        assert!(
+            !err.reason.contains("use_block_paged_cache=true"),
+            "unset paged flag must not trip the conflict guard, got: {}",
+            err.reason
         );
         let _ = fs::remove_dir_all(&dir);
     }

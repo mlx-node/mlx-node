@@ -1763,11 +1763,9 @@ pub(crate) trait MtpStepper {
 /// ([`crate::engine::dspark_turn::run_dspark_turn`]) needs to construct its
 /// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
 /// draft-model KV window) lives as STRUCT FIELDS of the concrete
-/// [`DsparkStepper`], never here.
-///
-/// `#[allow(dead_code)]`: constructed by `run_dspark_turn` (exercised via its
-/// mock tests); the gemma4 stepper that consumes it in production lands in a
-/// follow-up.
+/// [`DsparkStepper`], never here. Prefill-derived state (the gemma4 draft
+/// context) travels through the family's own stash
+/// (`Gemma4Inner::dspark_turn_state`), consumed by `begin_dspark_decode`.
 #[allow(dead_code)]
 pub(crate) struct DsparkTurnSetup<'a> {
     /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives
@@ -1788,11 +1786,8 @@ pub(crate) struct DsparkTurnSetup<'a> {
 /// GAT (`type DsparkDecode<'a>`) has no stable trait-level default. A family
 /// opts in by implementing this trait (+ [`DsparkStepper`] for its stepper)
 /// and overriding `ChatBackend::mtp_turn` to call `run_dspark_turn`;
-/// DSpark-less families do not implement it.
-///
-/// `#[allow(dead_code)]`: exercised by the `engine::dspark_turn` mock tests;
-/// the production gemma4 stepper lands in a follow-up.
-#[allow(dead_code)]
+/// DSpark-less families do not implement it. Production implementation:
+/// gemma4 (`models::gemma4::dspark_decode`).
 pub(crate) trait DsparkBackend: ChatBackend {
     /// Per-turn DSpark propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop (the analog of [`MtpBackend::MtpDecode`]).
@@ -1811,9 +1806,6 @@ pub(crate) trait DsparkBackend: ChatBackend {
 }
 
 /// One cycle's drafted block from [`DsparkStepper::propose`].
-///
-/// `#[allow(dead_code)]`: see [`DsparkBackend`].
-#[allow(dead_code)]
 pub(crate) struct DsparkProposal {
     /// `L <= max_len` proposed token ids. The stepper may return FEWER than
     /// asked (confidence truncation) but never more — the engine hard-errors
@@ -1831,9 +1823,6 @@ pub(crate) struct DsparkProposal {
 
 /// Output of [`DsparkStepper::verify`] — ONE batched target forward over
 /// `[anchor, d_0..d_{L-1}]`.
-///
-/// `#[allow(dead_code)]`: see [`DsparkBackend`].
-#[allow(dead_code)]
 pub(crate) struct DsparkVerifyOutput {
     /// Target logits `[1, 1+L, vocab]`: row `i` is the target's next-token
     /// distribution AFTER `verify_ids[i]`.
@@ -1856,10 +1845,7 @@ pub(crate) struct DsparkVerifyOutput {
 /// prefix). The engine loop sees only token ids, logits, and the
 /// `keep`/`total_written` bookkeeping — so the draft model's conditioning
 /// stays a stepper-private concern and the trait stays model-agnostic.
-///
-/// `#[allow(dead_code)]`: exercised by the `engine::dspark_turn` mock tests;
-/// the production gemma4 stepper lands in a follow-up.
-#[allow(dead_code)]
+/// Production implementation: `Gemma4DsparkStepper`.
 pub(crate) trait DsparkStepper {
     /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
     /// emitted token, whose K/V is NOT yet in the target cache — the

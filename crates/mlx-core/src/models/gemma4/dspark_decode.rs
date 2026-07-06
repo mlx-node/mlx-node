@@ -1,0 +1,918 @@
+//! Gemma4 DSpark speculative-decode wiring: the family-side
+//! [`DsparkStepper`]/[`DsparkBackend`] implementation the engine-owned
+//! [`crate::engine::dspark_turn::run_dspark_turn`] loop drives, plus the
+//! whole-turn core (`dspark_chat_turn`) behind gemma4's
+//! `ChatBackend::mtp_turn` override.
+//!
+//! Split of responsibilities:
+//!   * the DRAFT model (5-layer cross-attending transformer, markov head,
+//!     confidence head, context K/V cache) lives in [`super::dspark`];
+//!   * the TARGET-side primitives (hidden tap, verify forward,
+//!     snapshot/commit rollback, shared-slot mask) live in
+//!     [`super::model`] / [`super::layer_cache`];
+//!   * the model-agnostic propose → verify → accept → stop-clamp → commit
+//!     loop lives in [`crate::engine::dspark_turn`];
+//!   * THIS module glues them together for gemma4.
+
+use std::time::Instant;
+
+use napi::bindgen_prelude::*;
+
+use crate::array::MxArray;
+use crate::decode_profiler::DecodeProfiler;
+use crate::engine::backend::{
+    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkTurnSetup, DsparkVerifyOutput,
+    FinalizeArgs, ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+};
+use crate::engine::decode::StreamingCtx;
+use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
+use crate::engine::finalize::compute_performance_metrics;
+use crate::engine::params::{ChatParams, generated_capacity_hint};
+use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::stream::{DeviceType, Stream, StreamContext};
+
+use super::dspark::{DsparkContextCache, DsparkTap, truncate_by_confidence};
+use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
+use super::model::{
+    GEMMA4_PREFILL_STEP_SIZE, Gemma4Inner, compute_ple, dspark_shared_slot_mask,
+    dspark_verify_forward, eval_gemma4_caches, forward_body, forward_inner,
+};
+
+/// Per-turn draft-context handoff from `dspark_chat_turn`'s tapped prefill
+/// to [`DsparkBackend::begin_dspark_decode`].
+///
+/// The engine's [`DsparkTurnSetup`] carries only turn constants, so the
+/// prefill-derived draft context travels through
+/// `Gemma4Inner::dspark_turn_state`: the whole-turn core stashes it right
+/// before calling `run_dspark_turn`, and `begin_dspark_decode` TAKES it
+/// into the stepper (so it can never leak across turns — a fresh context is
+/// built every turn).
+pub(crate) struct DsparkTurnState {
+    /// The draft's fused-context K/V cache, holding one row per freshly
+    /// prefilled prompt token (absolute positions
+    /// `position_base .. position_base + rows`).
+    pub(crate) ctx: DsparkContextCache,
+    /// Absolute sequence position of the NEXT context row / target-cache
+    /// slot — `cached_prefix_len + prefill_len` right after prefill, then
+    /// advanced by `keep` on every commit.
+    pub(crate) next_pos: i32,
+}
+
+/// Confidence-truncation threshold for drafted blocks, read ONCE at stepper
+/// construction. Default `0.0` = keep-all (truncation disabled); invalid
+/// values fall back to the default.
+fn dspark_confidence_threshold_from_env() -> f32 {
+    std::env::var("MLX_DSPARK_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.0)
+}
+
+/// Per-turn gemma4 DSpark stepper ([`DsparkBackend::DsparkDecode`]).
+///
+/// Owns the turn's draft context cache and position cursor; borrows the
+/// model for the whole decode loop. The tapped target hiddens and the
+/// verify rollback are stashed between `verify` and `commit` — they never
+/// cross the engine trait (see the invariant on [`DsparkStepper`]).
+pub(crate) struct Gemma4DsparkStepper<'a> {
+    inner: &'a mut Gemma4Inner,
+    ctx: DsparkContextCache,
+    /// Absolute position of the next verify block's anchor (== the current
+    /// committed sequence length: prompt + anchor-exclusive generation).
+    next_pos: i32,
+    /// Draft `target_layer_ids` as decoder indices (strictly ascending).
+    layer_ids: Vec<usize>,
+    /// Config-derived KV-shared slot mask ([`dspark_shared_slot_mask`]),
+    /// passed to every `snapshot_before_verify`.
+    shared_slots: Vec<bool>,
+    confidence_threshold: f32,
+    /// Pending rollback from the last `verify`, consumed by `commit`.
+    rollback: Option<Gemma4VerifyRollback>,
+    /// Tapped `[1, 1+L, hidden]` hiddens from the last `verify` (one per
+    /// `layer_ids` entry), consumed by `commit`.
+    tapped: Option<Vec<MxArray>>,
+}
+
+impl DsparkStepper for Gemma4DsparkStepper<'_> {
+    fn propose(
+        &mut self,
+        anchor_id: u32,
+        max_len: usize,
+        params: &ChatParams,
+        rng: &mut dyn rand::Rng,
+    ) -> Result<DsparkProposal> {
+        let draft =
+            self.inner.dspark.as_ref().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark propose: no draft model loaded")
+            })?;
+        if max_len == 0 {
+            return Err(Error::from_reason(
+                "gemma4 DSpark propose: engine contract violation (max_len == 0 cycles skip propose)",
+            ));
+        }
+
+        // Draft block: `[anchor, MASK x (max_len - 1)]` at the block's
+        // absolute positions (anchor sits at `next_pos`). ONE forward over
+        // the persisted fused context; row k's logits draft the token at
+        // absolute position `next_pos + k + 1`.
+        let mask_id = draft.config.mask_token_id;
+        let mut block_ids: Vec<i32> = Vec::with_capacity(max_len);
+        block_ids.push(anchor_id as i32);
+        block_ids.resize(max_len, mask_id);
+        let block = MxArray::from_int32(&block_ids, &[1, max_len as i64])?;
+        let (block_hidden, block_logits) = draft.forward_block(&block, self.next_pos, &self.ctx)?;
+
+        // Sequential markov-chained sampling. Greedy detection INSIDE
+        // `sample_block_sequential` uses the engine's
+        // `sampling::is_greedy_temperature` predicate — the same predicate
+        // `run_dspark_turn` keys its accept policy on — so the returned
+        // `dists` are empty exactly when the engine expects them empty, and
+        // at sampled temperature each row is the EXACT distribution the
+        // draw came from.
+        let cfg = params.sampling_config.unwrap_or_default();
+        let (mut draft_ids, mut draft_dists) =
+            draft.sample_block_sequential(&block_logits, anchor_id as i32, max_len, &cfg, rng)?;
+
+        // Confidence truncation (opt-in via MLX_DSPARK_CONFIDENCE_THRESHOLD,
+        // read once at stepper construction): keep the longest prefix whose
+        // keep-probability clears the threshold. Returning FEWER tokens than
+        // `max_len` is allowed by the engine contract (never more).
+        if self.confidence_threshold > 0.0 {
+            let mut prev_tokens: Vec<i32> = Vec::with_capacity(max_len);
+            prev_tokens.push(anchor_id as i32);
+            prev_tokens.extend_from_slice(&draft_ids[..max_len - 1]);
+            let keep_probs = draft.confidence_keep_probs(&block_hidden, &prev_tokens)?;
+            let keep = truncate_by_confidence(&keep_probs, self.confidence_threshold);
+            draft_ids.truncate(keep);
+            draft_dists.truncate(keep);
+        }
+
+        Ok(DsparkProposal {
+            draft_ids,
+            draft_dists,
+        })
+    }
+
+    fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+        if verify_ids.is_empty() {
+            return Err(Error::from_reason(
+                "gemma4 DSpark verify: empty verify block",
+            ));
+        }
+        // Commit-exactly-once defense: a second verify before the previous
+        // cycle's commit would orphan its rollback (the caches would then
+        // hold TWO uncommitted verify blocks).
+        if self.rollback.is_some() || self.tapped.is_some() {
+            return Err(Error::from_reason(
+                "gemma4 DSpark verify: previous verify was never committed",
+            ));
+        }
+
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark verify: caches missing"))?;
+        let rb = snapshot_before_verify(caches, verify_ids.len(), &self.shared_slots)?;
+
+        let ids_i32: Vec<i32> = verify_ids.iter().map(|&t| t as i32).collect();
+        let block = MxArray::from_int32(&ids_i32, &[1, verify_ids.len() as i64])?;
+        let mut tap = DsparkTap::new(&self.layer_ids);
+        let logits = dspark_verify_forward(
+            &block,
+            &inner.embed_tokens,
+            &inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            inner.embed_weight_t.as_ref(),
+            inner.ple.as_ref(),
+            &inner.config,
+            &mut tap,
+        )?;
+        if tap.captured.len() != self.layer_ids.len() {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark verify: tapped {} hiddens for {} configured target layers",
+                tap.captured.len(),
+                self.layer_ids.len()
+            )));
+        }
+
+        self.rollback = Some(rb);
+        self.tapped = Some(tap.captured);
+        Ok(DsparkVerifyOutput { logits })
+    }
+
+    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        let rb = self.rollback.take().ok_or_else(|| {
+            Error::from_reason("gemma4 DSpark commit: no pending verify rollback")
+        })?;
+        let tapped = self
+            .tapped
+            .take()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens"))?;
+        if keep == 0 {
+            return Err(Error::from_reason(
+                "gemma4 DSpark commit: engine contract violation (keep must be >= 1 — the anchor's slot is unconditionally kept)",
+            ));
+        }
+        if let Some(first) = tapped.first()
+            && first.shape_at(1)? != total_written as i64
+        {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark commit: stashed tapped hiddens cover {} positions but the engine reports a {}-token verify block",
+                first.shape_at(1)?,
+                total_written
+            )));
+        }
+
+        // Target side: keep the first `keep` of the verify block's K/V
+        // slots, roll back the rest (validated against the shared-slot mask
+        // on every commit, full keep included).
+        {
+            let caches = self
+                .inner
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: caches missing"))?;
+            commit_after_verify(caches, &rb, keep)?;
+        }
+
+        // Draft side: fuse the kept prefix of the tapped hiddens and append
+        // it to the persisted context at the block's base position, then
+        // advance the cursor. The boundary token has no slot on either side
+        // — it re-enters as the next cycle's verify anchor.
+        let draft = self
+            .inner
+            .dspark
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no draft model loaded"))?;
+        let mut kept: Vec<MxArray> = Vec::with_capacity(tapped.len());
+        for hidden in &tapped {
+            kept.push(hidden.slice_axis(1, 0, keep as i64)?);
+        }
+        let fused = draft.fuse_context(&kept)?;
+        self.ctx.append(draft, &fused, self.next_pos)?;
+        self.next_pos += keep as i32;
+        Ok(())
+    }
+
+    fn eval_boundary(&self, token: &MxArray) {
+        // Schedule-only async eval of the next cycle's anchor (gemma4's
+        // decode eval pattern: token only, never the logits).
+        MxArray::async_eval_arrays(&[token]);
+    }
+}
+
+impl DsparkBackend for Gemma4Inner {
+    type DsparkDecode<'a>
+        = Gemma4DsparkStepper<'a>
+    where
+        Self: 'a;
+
+    fn begin_dspark_decode(
+        &mut self,
+        _setup: &DsparkTurnSetup<'_>,
+    ) -> Result<Self::DsparkDecode<'_>> {
+        let state = self.dspark_turn_state.take().ok_or_else(|| {
+            Error::from_reason(
+                "gemma4 DSpark: begin_dspark_decode requires a prepared draft context \
+                 (dspark_chat_turn's tapped prefill must run first)",
+            )
+        })?;
+        let layer_ids: Vec<usize> = {
+            let draft = self.dspark.as_ref().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark: begin_dspark_decode without a draft model")
+            })?;
+            draft
+                .config
+                .target_layer_ids
+                .iter()
+                .map(|&id| id as usize)
+                .collect()
+        };
+        let shared_slots = dspark_shared_slot_mask(&self.config);
+        let confidence_threshold = dspark_confidence_threshold_from_env();
+        Ok(Gemma4DsparkStepper {
+            inner: self,
+            ctx: state.ctx,
+            next_pos: state.next_pos,
+            layer_ids,
+            shared_slots,
+            confidence_threshold,
+            rollback: None,
+            tapped: None,
+        })
+    }
+}
+
+impl Gemma4Inner {
+    /// DSpark whole-turn core behind gemma4's `ChatBackend::mtp_turn`
+    /// override — the DSpark analog of the engine's generic
+    /// `chat_turn_core` tail, sync AND streaming through the same body
+    /// (`args.sink` presence selects the mode, mirroring
+    /// `vision_chat_turn` / the MTP whole-turn cores).
+    ///
+    /// Flow: resolve params (+ `extra_eos_ids`) → prefix decision via the
+    /// existing cache-prefix machinery → chunked prefill WITH the DSpark
+    /// tap (per-chunk capture → fuse → context-append → drop; full-prompt
+    /// tapped hiddens are never held) → anchor sample (byte-identical to
+    /// the generic flow) → `run_dspark_turn` → save (drop-last driven by
+    /// the loop's `last_in_cache`) → finalize (+ default
+    /// `augment_performance`, which fills the `mtp_*` acceptance fields).
+    pub(crate) fn dspark_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        let tokenizer = args.tokenizer.clone();
+        let eos_id = args.eos_id;
+        let thinking = args.thinking;
+        let is_delta = args.is_delta;
+        let tokens: Vec<u32> = args.tokens.to_vec();
+        let is_streaming = args.sink.is_some();
+
+        let think_end_id = tokenizer.think_end_id();
+        let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
+
+        // Owned params: re-resolve from the request config (deterministic —
+        // identical to what the session core handed us in `args.params`),
+        // then populate the stop-set the loop reads from
+        // `ChatParams::extra_eos_ids` (the generic flow threads it as a
+        // separate decode-loop argument instead).
+        let mut p = ChatBackend::resolve_params(self, args.config);
+        p.extra_eos_ids = ChatBackend::extra_eos_ids(self);
+        let reuse_cache = p.reuse_cache;
+        let report_perf = p.report_performance;
+        let max_new_tokens = p.max_new_tokens;
+
+        let generation_start = report_perf.then(Instant::now);
+        let mut first_token_instant: Option<Instant> = None;
+
+        // Prefix decision — the generic core's reset-or-delta split:
+        //   Fresh: all-or-nothing `verify_cache_prefix`; strict-extend hits
+        //   prefill only the tail, miss AND exact-match reset + re-prefill.
+        //   Delta: strict extension by construction (`tokens` == cached
+        //   history ++ delta); prefill exactly the tail.
+        let prior_cached_len = if is_delta {
+            self.cached_token_history.len()
+        } else {
+            0
+        };
+        let (prefill_tokens, cached_prefix_len): (Vec<u32>, usize) = if is_delta {
+            (tokens[prior_cached_len..].to_vec(), prior_cached_len)
+        } else {
+            let hit = ChatBackend::verify_cache_prefix(self, &tokens, reuse_cache);
+            if hit > 0 && hit < tokens.len() {
+                tracing::info!(
+                    "DSpark cache reuse: {} cached tokens, {} new tokens to prefill",
+                    hit,
+                    tokens.len() - hit,
+                );
+                (tokens[hit..].to_vec(), hit)
+            } else {
+                ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
+                (tokens.clone(), 0)
+            }
+        };
+
+        let prompt_token_count = tokens.len();
+        let mut token_history: Vec<u32> = tokens.clone();
+        let mut generated_tokens: Vec<u32> =
+            Vec::with_capacity(generated_capacity_hint(max_new_tokens));
+        let mut finish_reason = String::from("length");
+
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let mut profiler = DecodeProfiler::new(
+            ChatBackend::profiler_label(self, is_delta, is_streaming),
+            ChatBackend::family_name(self),
+        );
+        profiler.set_prompt_tokens(prefill_tokens.len() as u32);
+        profiler.snapshot_memory_before();
+
+        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+
+        // Streaming decode state (mirrors the generic core; only the
+        // streaming branch reads it).
+        let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
+        let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = thinking.enabled;
+        let mut emitter: Option<Box<dyn StreamEmitter>> =
+            args.sink.map(|_| ChatBackend::stream_emitter(self));
+
+        // --- tapped prefill: target K/V + the draft's fused context ---
+        profiler.begin_prefill();
+        let (last_logits, turn_state) = self.dspark_prefill_with_tap(
+            &prefill_tokens,
+            cached_prefix_len as i32,
+            generation_stream,
+        )?;
+        profiler.end_prefill();
+
+        // --- anchor sample: byte-identical to the generic flow ---
+        let last_logits = apply_all_penalties(last_logits, &token_history, &p)?;
+        let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
+        y.eval();
+
+        ChatBackend::eval_caches(self)?;
+        if report_perf {
+            first_token_instant = Some(Instant::now());
+        }
+
+        let block_size = self
+            .dspark
+            .as_ref()
+            .map(|d| d.config.block_size)
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark turn: no draft model loaded"))?;
+
+        // Hand the prefill-built draft context to the stepper (taken by
+        // `begin_dspark_decode` inside the loop).
+        self.dspark_turn_state = Some(turn_state);
+
+        let mut rng = rand::rng();
+        let last_in_cache;
+        {
+            let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
+                (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
+                    callback: sink,
+                    cancelled,
+                    decode_stream: &mut decode_stream,
+                    tokenizer: tokenizer.inner(),
+                    streamed_text_len: &mut streamed_text_len,
+                    last_is_reasoning: &mut last_is_reasoning,
+                    emitter: em.as_mut(),
+                }),
+                _ => None,
+            };
+            let outcome = run_dspark_turn(
+                self,
+                &mut rng,
+                DsparkTurnArgs {
+                    y,
+                    block_size,
+                    params: &p,
+                    reasoning_tracker: &mut reasoning_tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens,
+                    eos_id,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf,
+                    generation_stream,
+                },
+                streaming_ctx,
+            );
+            // A loop failure before `begin_dspark_decode` consumed the
+            // stash would leave stale per-turn state behind; clear it so
+            // the next turn can never observe it.
+            if outcome.is_err() {
+                self.dspark_turn_state = None;
+            }
+            last_in_cache = outcome?.last_in_cache;
+        }
+
+        // --- save: drop-last driven by the loop's `last_in_cache` ---
+        // `!last_in_cache` = the final emitted token has no K/V slot (a
+        // cycle boundary, an unverified stop seed, or a clean length exit)
+        // — drop it so `cached_token_history.len()` equals the physical
+        // cache length. A kept final token (EOS accepted as a draft, its
+        // verify slot committed) stays in the history for the same
+        // alignment reason — the qwen3.5 MTP cores' `drop_last_always =
+        // !last_in_cache` convention. The `finish_reason == "length"` arm
+        // is unreachable belt-and-braces (clean length exits always land on
+        // an uncached boundary), kept for parity with
+        // `save_cache_state_direct`'s documented semantics.
+        let drop_last = !last_in_cache || finish_reason == "length";
+        let history_tokens: &[u32] = if drop_last && !generated_tokens.is_empty() {
+            &generated_tokens[..generated_tokens.len() - 1]
+        } else {
+            &generated_tokens
+        };
+        let mut new_history = Vec::with_capacity(tokens.len() + history_tokens.len());
+        new_history.extend_from_slice(&tokens);
+        new_history.extend_from_slice(history_tokens);
+        self.cached_token_history = new_history;
+        if !is_delta {
+            // Fresh text-only turn: clear any stale media keys (the DSpark
+            // path is text-only by its `mtp_turn` gate).
+            self.cached_image_key = None;
+            self.cached_audio_key = None;
+        }
+
+        // --- finalize ---
+        let performance = if report_perf {
+            compute_performance_metrics(
+                generation_start,
+                first_token_instant,
+                prefill_tokens.len(),
+                generated_tokens.len(),
+            )
+            .map(|mut m| {
+                // Default augmentation fills the mtp_* acceptance fields
+                // from the profiler's recorded DSpark cycles.
+                ChatBackend::augment_performance(self, &profiler, &mut m);
+                m
+            })
+        } else {
+            None
+        };
+        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+
+        if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
+            // Residual flush through the emitter (same skip-special flag as
+            // the in-loop DecodeStream so `streamed_text_len` accounting
+            // stays consistent).
+            let full_text = tokenizer
+                .decode_sync(&generated_tokens, stream_skip_special)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to decode generated tokens: {}", e);
+                    String::new()
+                });
+            if full_text.len() > streamed_text_len {
+                let residual = &full_text[streamed_text_len..];
+                em.on_residual(residual, last_is_reasoning, p.include_reasoning, sink);
+            }
+        }
+
+        let reported_prompt_tokens: u32 = if is_delta && is_streaming {
+            let delta_len = prompt_token_count - prior_cached_len;
+            ChatBackend::stream_delta_prompt_tokens(self, prompt_token_count, delta_len)
+        } else {
+            prompt_token_count as u32
+        };
+
+        let mut result = ChatBackend::finalize_turn(
+            self,
+            FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &generated_tokens,
+                finish_reason,
+                think_end_id,
+                think_end_str: think_end_str.as_deref(),
+                performance,
+                include_reasoning: p.include_reasoning,
+                thinking_enabled: thinking.enabled,
+                prompt_tokens: reported_prompt_tokens,
+                reasoning_tokens,
+            },
+        )?;
+        // cached_tokens mirrors the session core's overwrite: fresh turns
+        // report the matched prefix, delta turns the prior history length.
+        result.cached_tokens = if is_delta {
+            prior_cached_len as u32
+        } else {
+            cached_prefix_len as u32
+        };
+
+        if let (Some(sink), Some(em)) = (args.sink, emitter.as_mut()) {
+            em.finish(&result, sink);
+            return Ok(TurnOutput::Streamed);
+        }
+        Ok(TurnOutput::Complete(Box::new(result)))
+    }
+
+    /// Chunked prefill WITH the DSpark hidden tap.
+    ///
+    /// Target-side compute is byte-identical to the AR path
+    /// (`prefill_body_gemma4` + the last-token `forward_inner`): same
+    /// upfront embedding/PLE, same 512-token chunking, same eval cadence
+    /// and `clear_cache`, same last-token split — the tap only CLONES the
+    /// residual-stream hiddens (tap purity is pinned by
+    /// `dspark_tap_purity_and_verify_forward`).
+    ///
+    /// Per chunk: forward w/ a FRESH tap → `fuse_context` → context-append
+    /// at the chunk's absolute base → drop the tap. Full-prompt tapped
+    /// hiddens are never held. `position_base` is the cached-prefix length
+    /// (the absolute position of `prefill_tokens[0]`); cached-prefix tokens
+    /// have NO context rows — the draft cross-attends over whatever rows
+    /// exist, and verification always re-derives ground truth from the
+    /// target, so a shorter context can only depress acceptance, never
+    /// correctness.
+    ///
+    /// Returns the sampling-ready last-token logits `[1, vocab]` plus the
+    /// turn's [`DsparkTurnState`].
+    fn dspark_prefill_with_tap(
+        &mut self,
+        prefill_tokens: &[u32],
+        position_base: i32,
+        stream: Stream,
+    ) -> Result<(MxArray, DsparkTurnState)> {
+        if prefill_tokens.is_empty() {
+            return Err(Error::from_reason(
+                "gemma4 DSpark prefill: empty prefill token set",
+            ));
+        }
+        if self.caches.is_none() {
+            self.init_caches_sync()?;
+        }
+
+        let inner = &mut *self;
+        let draft = inner
+            .dspark
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark prefill: no draft model loaded"))?;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark prefill: caches missing"))?;
+        let layer_ids: Vec<usize> = draft
+            .config
+            .target_layer_ids
+            .iter()
+            .map(|&id| id as usize)
+            .collect();
+        let mut ctx = DsparkContextCache::new(draft.num_layers());
+
+        let n = prefill_tokens.len() as i64;
+        let ids_i32: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
+        let prompt = MxArray::from_int32(&ids_i32, &[1, n])?;
+
+        {
+            let _stream_ctx = StreamContext::new(stream);
+            if n > 1 {
+                // Body over tokens [0 .. n-1] — the last token is handled by
+                // the full forward below (`prefill_body_gemma4`'s split).
+                let prefill_len = n - 1;
+                let prefill_ids = prompt.slice_axis(1, 0, prefill_len)?;
+                let all_embeds = {
+                    let emb = inner.embed_tokens.forward(&prefill_ids)?;
+                    emb.mul_scalar((inner.config.hidden_size as f64).sqrt())?
+                };
+                let all_ple: Option<MxArray> = match inner.ple.as_ref() {
+                    Some(ple) => Some(compute_ple(&prefill_ids, &all_embeds, ple, prefill_len)?),
+                    None => None,
+                };
+                let mut offset: i64 = 0;
+                while offset < prefill_len {
+                    let end = if prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
+                        offset + GEMMA4_PREFILL_STEP_SIZE
+                    } else {
+                        prefill_len
+                    };
+                    let chunk_embeds = all_embeds.slice_axis(1, offset, end)?;
+                    let chunk_ple = all_ple
+                        .as_ref()
+                        .map(|p| p.slice_axis(1, offset, end))
+                        .transpose()?;
+                    let mut tap = DsparkTap::new(&layer_ids);
+                    let _hidden = forward_body(
+                        None,
+                        Some(chunk_embeds),
+                        &inner.embed_tokens,
+                        &inner.layers,
+                        caches,
+                        &inner.final_norm,
+                        inner.ple.as_ref(),
+                        chunk_ple.as_ref(),
+                        &inner.config,
+                        Some(&mut tap),
+                    )?;
+                    // capture → fuse → append → drop, per chunk.
+                    let fused = draft.fuse_context(&tap.captured)?;
+                    ctx.append(draft, &fused, position_base + offset as i32)?;
+                    // Eval cadence mirrors `prefill_body_gemma4`: full
+                    // chunks eval+clear between iterations; the remainder
+                    // chunk is covered by the post-body eval below.
+                    if end < prefill_len {
+                        eval_gemma4_caches(caches)?;
+                        crate::array::clear_cache();
+                    }
+                    offset = end;
+                }
+            }
+        }
+        eval_gemma4_caches(caches)?;
+
+        // Last token: full forward (lm_head + softcap) with one more tapped
+        // context row, exactly the AR prefill's last-token split.
+        let last = prompt.slice_axis(1, n - 1, n)?;
+        let last_logits = {
+            let _stream_ctx = StreamContext::new(stream);
+            crate::models::gemma4::diagnostic::set_step(-1);
+            let mut tap = DsparkTap::new(&layer_ids);
+            let logits = forward_inner(
+                &last,
+                &inner.embed_tokens,
+                &inner.layers,
+                caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                inner.embed_weight_t.as_ref(),
+                inner.ple.as_ref(),
+                &inner.config,
+                Some(&mut tap),
+            )?;
+            let fused = draft.fuse_context(&tap.captured)?;
+            ctx.append(draft, &fused, position_base + (n - 1) as i32)?;
+            logits
+        };
+        let last_logits = last_logits.squeeze(Some(&[1]))?;
+
+        Ok((
+            last_logits,
+            DsparkTurnState {
+                ctx,
+                next_pos: position_base + n as i32,
+            },
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::types::ChatConfig;
+    use crate::models::gemma4::config::Gemma4Config;
+    use crate::models::gemma4::dspark::{DsparkConfig, DsparkDraftModel};
+
+    /// Tiny flat-path Gemma4 config (paged OFF so `Gemma4Inner::new` builds
+    /// no adapter): 4 hybrid layers, one KV-shared.
+    fn tiny_target_config() -> Gemma4Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 16,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 128,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "num_kv_shared_layers": 1,
+            "use_block_paged_cache": false
+        }))
+        .expect("tiny Gemma4 config must deserialize")
+    }
+
+    /// Tiny draft config geometry-matched to [`tiny_target_config`]
+    /// (hidden 8, vocab 16, 4 target layers, block_size 3).
+    fn tiny_draft_config() -> DsparkConfig {
+        serde_json::from_str(
+            r#"{
+                "architectures": ["Gemma4DSparkModel"],
+                "model_type": "gemma4_text",
+                "block_size": 3,
+                "mask_token_id": 4,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "global_head_dim": 4,
+                "num_global_key_value_heads": 1,
+                "rms_norm_eps": 1e-6,
+                "final_logit_softcapping": 30.0,
+                "vocab_size": 16,
+                "target_layer_ids": [0, 2],
+                "num_target_layers": 4,
+                "markov_rank": 2,
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": true,
+                "attention_k_eq_v": true,
+                "rope_parameters": {
+                    "full_attention": {
+                        "partial_rotary_factor": 0.5,
+                        "rope_theta": 10000.0,
+                        "rope_type": "proportional"
+                    }
+                }
+            }"#,
+        )
+        .expect("tiny draft config must deserialize")
+    }
+
+    fn tiny_inner_with_draft() -> Gemma4Inner {
+        let mut inner =
+            Gemma4Inner::new(tiny_target_config()).expect("tiny Gemma4Inner must construct");
+        let draft =
+            DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model must construct");
+        inner.dspark = Some(draft);
+        inner
+    }
+
+    fn chat_config(mtp_depth: Option<i32>) -> ChatConfig {
+        ChatConfig {
+            mtp_depth,
+            ..ChatConfig::default()
+        }
+    }
+
+    // ── resolve_params depth override ──────────────────────────────────
+
+    /// With a draft loaded, an UNSET `mtpDepth` resolves to the draft's
+    /// block_size (full blocks), bypassing the engine's default of 1.
+    #[test]
+    fn resolve_params_unset_depth_defaults_to_block_size() {
+        let inner = tiny_inner_with_draft();
+        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
+        assert_eq!(p.mtp_depth, 3, "unset depth must resolve to block_size");
+    }
+
+    /// An explicit depth is clamped to `[1, block_size]` from the RAW
+    /// config value — the engine's central [1, 5] clamp must not cap a
+    /// block_size wider than 5 (the real checkpoint's block_size is 7),
+    /// and nonpositive values clamp up to 1 without wrapping.
+    #[test]
+    fn resolve_params_explicit_depth_clamps_to_block_size() {
+        let inner = tiny_inner_with_draft();
+        for (requested, expected) in [(1, 1), (2, 2), (3, 3), (99, 3), (0, 1), (-7, 1)] {
+            let p = ChatBackend::resolve_params(&inner, &chat_config(Some(requested)));
+            assert_eq!(
+                p.mtp_depth, expected,
+                "mtpDepth={requested} must resolve to {expected}"
+            );
+        }
+    }
+
+    /// Without a draft model the family override is inert: the engine's
+    /// central [1, 5] clamp is untouched.
+    #[test]
+    fn resolve_params_without_draft_keeps_engine_clamp() {
+        let inner = Gemma4Inner::new(tiny_target_config()).expect("tiny inner");
+        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
+        assert_eq!(p.mtp_depth, 1);
+        let p = ChatBackend::resolve_params(&inner, &chat_config(Some(99)));
+        assert_eq!(p.mtp_depth, 5, "engine clamp caps at 5 without a draft");
+    }
+
+    // ── begin_dspark_decode plumbing ───────────────────────────────────
+
+    /// The stepper derives the shared-slot mask from the target config
+    /// (`dspark_shared_slot_mask`) and the layer ids from the draft's
+    /// `target_layer_ids`; the per-turn context stash is TAKEN (single
+    /// use), and calling begin without a stash is a hard error.
+    #[test]
+    fn begin_dspark_decode_takes_stash_and_derives_mask() {
+        let mut inner = tiny_inner_with_draft();
+        let num_draft_layers = inner
+            .dspark
+            .as_ref()
+            .map(|d| d.num_layers())
+            .expect("draft loaded");
+
+        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
+        let setup = DsparkTurnSetup {
+            params: &p,
+            block_size: 3,
+        };
+
+        // No stash → hard error naming the missing prefill.
+        let err = inner
+            .begin_dspark_decode(&setup)
+            .err()
+            .expect("begin without a stash must fail");
+        assert!(
+            err.reason.contains("prepared draft context"),
+            "got: {}",
+            err.reason
+        );
+
+        // Stash → stepper carries the config-derived mask + draft layer ids
+        // and the stash is consumed.
+        inner.dspark_turn_state = Some(DsparkTurnState {
+            ctx: DsparkContextCache::new(num_draft_layers),
+            next_pos: 7,
+        });
+        {
+            let stepper = inner
+                .begin_dspark_decode(&setup)
+                .expect("begin with a stash must succeed");
+            assert_eq!(
+                stepper.shared_slots,
+                vec![false, false, false, true],
+                "mask must come from dspark_shared_slot_mask(config)"
+            );
+            assert_eq!(stepper.layer_ids, vec![0, 2]);
+            assert_eq!(stepper.next_pos, 7);
+            assert!(stepper.rollback.is_none() && stepper.tapped.is_none());
+        }
+        assert!(
+            inner.dspark_turn_state.is_none(),
+            "the per-turn stash must be consumed by begin_dspark_decode"
+        );
+    }
+
+    // ── confidence threshold env ───────────────────────────────────────
+
+    /// Threshold parsing: unset/invalid → 0.0 (keep-all). NOTE: reads the
+    /// process env — no parallel test mutates this variable.
+    #[test]
+    fn confidence_threshold_env_parsing() {
+        // SAFETY: test-local env mutation; no other test in this binary
+        // touches MLX_DSPARK_CONFIDENCE_THRESHOLD.
+        unsafe { std::env::remove_var("MLX_DSPARK_CONFIDENCE_THRESHOLD") };
+        assert_eq!(dspark_confidence_threshold_from_env(), 0.0);
+        unsafe { std::env::set_var("MLX_DSPARK_CONFIDENCE_THRESHOLD", "0.25") };
+        assert_eq!(dspark_confidence_threshold_from_env(), 0.25);
+        unsafe { std::env::set_var("MLX_DSPARK_CONFIDENCE_THRESHOLD", "not-a-number") };
+        assert_eq!(dspark_confidence_threshold_from_env(), 0.0);
+        unsafe { std::env::remove_var("MLX_DSPARK_CONFIDENCE_THRESHOLD") };
+    }
+}

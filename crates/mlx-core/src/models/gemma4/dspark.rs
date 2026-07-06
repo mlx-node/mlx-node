@@ -31,10 +31,15 @@ use super::quantized_linear::LinearProj;
 /// Draft architecture name required in the checkpoint's `architectures` list.
 const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
 
-/// Temperature below which draft sampling is greedy argmax. Matches the
-/// DeepSpec reference (`deepspec/utils/sampling.py::sample_tokens`,
-/// `temperature < 1e-5`).
-const GREEDY_TEMPERATURE: f64 = 1e-5;
+// Greedy-vs-sampled detection for draft sampling uses the ENGINE's
+// `sampling::is_greedy_temperature` predicate — the same predicate the
+// speculative-decode loop (`engine::dspark_turn::run_dspark_turn`) uses for
+// its accept policy. The two MUST agree: at a "greedy" temperature the loop
+// requires `draft_dists` to be EMPTY (argmax accept, no RNG), while at a
+// "sampled" temperature it requires one proposal distribution per drafted
+// token. A private threshold here (the DeepSpec reference used
+// `temperature < 1e-5`) would disagree with the engine on temperatures in
+// (1e-6, 1e-5) and hard-error the sampled accept path.
 
 // Fixed DSpark v1 checkpoint geometry. The loader's 74-tensor completeness
 // gate derives its expected keys and shapes from the config, so these values
@@ -73,6 +78,9 @@ pub(crate) struct DsparkRopeParameters {
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DsparkConfig {
     pub(crate) architectures: Vec<String>,
+    /// Checkpoint schema surface (deserialized for completeness; the
+    /// architecture gate keys on `architectures`).
+    #[allow(dead_code)]
     pub(crate) model_type: String,
     pub(crate) block_size: usize,
     pub(crate) mask_token_id: i32,
@@ -546,15 +554,21 @@ impl DsparkContextCache {
         Ok(())
     }
 
-    /// Number of cached context positions.
+    /// Number of cached context positions. Production appends only KEPT
+    /// rows (the stepper never needs len/reset/trim — a fresh cache is
+    /// built every turn); these accessors serve the inline tests and any
+    /// future retention policy.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> i32 {
         self.caches.first().map_or(0, |c| c.get_offset())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         for cache in &mut self.caches {
             cache.reset();
@@ -563,6 +577,7 @@ impl DsparkContextCache {
 
     /// Keep only the first `new_len` context positions (passthrough to each
     /// layer's `KVCache::trim`).
+    #[allow(dead_code)]
     pub(crate) fn trim(&mut self, new_len: i32) {
         for cache in &mut self.caches {
             cache.trim(new_len);
@@ -740,11 +755,13 @@ impl DsparkDraftModel {
     /// Position k's logits are `base_logits[:, k] + markov_correction(prev)`
     /// where `prev` starts at `anchor` and chains through the sampled tokens
     /// (the markov bias is added AFTER the softcap; there is no second
-    /// softcap). Greedy below [`GREEDY_TEMPERATURE`]: argmax, empty
-    /// distribution list. Otherwise each token is drawn (via `rng`) from the
-    /// EXACT filtered distribution `sampling::sampling_distribution` builds
-    /// for `cfg`, and the per-position f32 `[vocab]` distribution rows are
-    /// returned for later rejection sampling.
+    /// softcap). Greedy iff [`sampling::is_greedy_temperature`] — the SAME
+    /// predicate the engine's accept loop uses, so draft sampling mode and
+    /// accept mode can never disagree: argmax, empty distribution list.
+    /// Otherwise each token is drawn (via `rng`) from the EXACT filtered
+    /// distribution `sampling::sampling_distribution` builds for `cfg`, and
+    /// the per-position f32 `[vocab]` distribution rows are returned for
+    /// later rejection sampling.
     pub(crate) fn sample_block_sequential<R: Rng + ?Sized>(
         &self,
         base_logits: &MxArray,
@@ -771,7 +788,7 @@ impl DsparkDraftModel {
             )));
         }
         let temperature = cfg.temperature.unwrap_or(1.0);
-        let greedy = temperature < GREEDY_TEMPERATURE;
+        let greedy = sampling::is_greedy_temperature(temperature);
 
         let mut tokens = Vec::with_capacity(len);
         let mut dists = Vec::new();
@@ -1825,6 +1842,38 @@ mod tests {
                 "position {k}: sampled token {token} must have positive probability"
             );
         }
+    }
+
+    /// The greedy/sampled switch must follow the ENGINE predicate
+    /// (`sampling::is_greedy_temperature`, f32 `<= 1e-6`), not the DeepSpec
+    /// reference threshold (`< 1e-5`): a temperature in (1e-6, 1e-5) is
+    /// SAMPLED to the engine's accept loop, which then requires one proposal
+    /// distribution per drafted token — an empty `dists` there would
+    /// hard-error the sampled accept path.
+    #[test]
+    fn sample_block_sequential_greedy_predicate_matches_engine() {
+        let (model, base_logits) = chained_markov_model();
+        let temp = 5e-6f64;
+        assert!(
+            !sampling::is_greedy_temperature(temp),
+            "fixture temperature must be sampled per the engine predicate"
+        );
+        let cfg = SamplingConfig {
+            temperature: Some(temp),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+        };
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(7);
+        let (tokens, dists) = model
+            .sample_block_sequential(&base_logits, 3, 3, &cfg, &mut rng)
+            .unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(
+            dists.len(),
+            3,
+            "engine-sampled temperature must ship one proposal distribution per token"
+        );
     }
 
     #[test]

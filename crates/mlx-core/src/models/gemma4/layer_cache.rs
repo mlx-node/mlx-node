@@ -284,9 +284,6 @@ impl Gemma4LayerCache {
 /// Cache state captured before a DSpark verify forward, used by
 /// [`commit_after_verify`] to roll every cache back to the kept prefix when
 /// the target accepts only part of the verified block.
-// Consumed by the DSpark speculative-decode engine loop, which is wired in
-// separately; until then only the inline tests exercise these primitives.
-#[allow(dead_code)]
 pub(crate) struct Gemma4VerifyRollback {
     /// Per-cache sliding snapshots, index-aligned with the caches slice.
     /// `None` for global layers and for sliding caches that were empty.
@@ -314,7 +311,6 @@ pub(crate) struct Gemma4VerifyRollback {
 /// snapshot their ordered window tail. Errors when a sliding window is
 /// smaller than the verify block, because the block tail could then not be
 /// recovered for a partial-keep rollback.
-#[allow(dead_code)]
 pub(crate) fn snapshot_before_verify(
     caches: &[Gemma4LayerCache],
     total_to_write: usize,
@@ -379,7 +375,6 @@ pub(crate) fn snapshot_before_verify(
 ///   leaving state identical to a cache that only ever saw the kept prefix.
 ///   `keep == 0` discards the block entirely. Shared slots are untouched,
 ///   so each physical cache is touched exactly once.
-#[allow(dead_code)]
 pub(crate) fn commit_after_verify(
     caches: &mut [Gemma4LayerCache],
     rb: &Gemma4VerifyRollback,

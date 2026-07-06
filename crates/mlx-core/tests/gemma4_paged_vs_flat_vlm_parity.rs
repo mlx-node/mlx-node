@@ -193,7 +193,7 @@ async fn gemma4_paged_vlm_correctness() {
     let paged_dir =
         clone_model_dir(&src, "gemma4-vlm-paged", true).expect("clone paged model dir failed");
 
-    let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Gemma-4-VL model");
 
@@ -285,7 +285,7 @@ async fn gemma4_paged_vlm_continue_is_rejected() {
 
     let paged_dir = clone_model_dir(&src, "gemma4-vlm-paged-continue", true)
         .expect("clone paged model dir failed");
-    let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Gemma-4-VL model");
 
@@ -353,7 +353,7 @@ async fn gemma4_image_turn_without_paged_adapter_errors() {
     // paged adapter (the only configuration where the vision path is absent).
     let flat_dir = clone_model_dir(&src, "gemma4-vlm-no-paged", false)
         .expect("clone no-paged model dir failed");
-    let flat_model = Gemma4Model::load(flat_dir.to_string_lossy().to_string())
+    let flat_model = Gemma4Model::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load no-paged Gemma-4-VL model");
 

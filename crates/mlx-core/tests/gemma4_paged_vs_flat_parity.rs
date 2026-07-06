@@ -198,10 +198,10 @@ async fn gemma4_paged_vs_flat_greedy_token_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
-    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy())
+    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy(), None)
         .await
         .expect("failed to load flat-path Gemma4 model");
-    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy())
+    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy(), None)
         .await
         .expect("failed to load paged-path Gemma4 model");
 
@@ -277,10 +277,10 @@ async fn gemma4_paged_vs_flat_prefix_reuse_parity() {
         Err(e) => panic!("failed to clone model dir for paged path: {e}"),
     };
 
-    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy())
+    let flat_model = Gemma4Model::load_from_dir(&flat_dir.to_string_lossy(), None)
         .await
         .expect("failed to load flat-path Gemma4 model");
-    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy())
+    let paged_model = Gemma4Model::load_from_dir(&paged_dir.to_string_lossy(), None)
         .await
         .expect("failed to load paged-path Gemma4 model");
 

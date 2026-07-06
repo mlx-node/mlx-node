@@ -29,11 +29,8 @@ use crate::stream::Stream;
 /// Required arguments of [`run_dspark_turn`] — the DSpark analog of
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
 /// prompt-hidden seed fields (the DSpark stepper owns its draft-context
-/// seeding) and plus the draft `block_size`.
-///
-/// `#[allow(dead_code)]`: exercised by the module's mock tests; the gemma4
-/// caller that constructs it in production lands in a follow-up.
-#[allow(dead_code)]
+/// seeding) and plus the draft `block_size`. Constructed in production by
+/// gemma4's `dspark_chat_turn`.
 pub(crate) struct DsparkTurnArgs<'a> {
     /// First generated token (sampled from the prefill logits BEFORE the
     /// turn). The loop takes ownership and emits it first (guarded by the
@@ -60,9 +57,6 @@ pub(crate) struct DsparkTurnArgs<'a> {
 /// [`crate::engine::mtp_turn::MtpTurnOutcome`]: DSpark has no flat-desync
 /// side channel (the stop-clamp runs BEFORE commit, so the target and draft
 /// caches can never desync), so only `last_in_cache` is surfaced.
-///
-/// `#[allow(dead_code)]`: see [`DsparkTurnArgs`].
-#[allow(dead_code)]
 pub(crate) struct DsparkTurnOutcome {
     /// Whether the LAST emitted token's K/V is already in the target cache.
     /// `true` iff the last emitted token is the anchor or an accepted draft
@@ -93,9 +87,8 @@ enum CycleStop {
 /// BEFORE commit → `commit(keep = 1 + min(emit_count, k), 1 + L)` → emit →
 /// cache-clear cadence → stop or `anchor = boundary; eval_boundary`.
 ///
-/// `#[allow(dead_code)]`: exercised by the module's mock tests; the gemma4
-/// `mtp_turn` override that drives it in production lands in a follow-up.
-#[allow(dead_code)]
+/// Driven in production by gemma4's `mtp_turn` override
+/// (`dspark_chat_turn`); the module's mock tests pin the loop contract.
 pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     backend: &mut B,
     rng: &mut R,

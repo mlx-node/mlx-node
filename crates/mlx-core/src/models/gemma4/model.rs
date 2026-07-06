@@ -8,7 +8,6 @@ use napi_derive::napi;
 
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
-use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup,
     ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
@@ -20,7 +19,6 @@ use crate::inference_trace::{
 };
 use crate::models::gemma4::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
-use crate::profiling::PerformanceMetrics;
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
@@ -405,6 +403,19 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// DSpark draft model for speculative decoding (`Gemma4LoadOptions::
+    /// draft_model_path`). Mutually exclusive with `paged_adapter`: the
+    /// load path hard-errors on an explicit `use_block_paged_cache: true`
+    /// conflict and forces the unset default to flat, so `dspark.is_some()`
+    /// implies `paged_adapter.is_none()`.
+    pub(crate) dspark: Option<super::dspark::DsparkDraftModel>,
+    /// Per-turn DSpark draft-context handoff: `dspark_chat_turn` builds the
+    /// draft's fused-context cache during its tapped prefill and stashes it
+    /// here; `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
+    /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
+    /// so prefill-derived state travels through this seam). Always `None`
+    /// outside a live `dspark_chat_turn`.
+    pub(crate) dspark_turn_state: Option<super::dspark_decode::DsparkTurnState>,
     /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
     /// computed once here in `Gemma4Inner::new` instead of re-derived
     /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
@@ -480,6 +491,27 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// Snapshot of `Gemma4Inner::dspark.is_some()` captured at load time
+    /// (same mirroring pattern as `paged_active`): whether a DSpark draft
+    /// model was loaded via `Gemma4LoadOptions::draft_model_path`. Surfaced
+    /// through the `hasMtpWeights()` NAPI method (named for parity with the
+    /// Qwen3.5 surface) so server endpoints can branch without a
+    /// model-thread roundtrip. Stubs from `new(config)` always report
+    /// `false`.
+    pub(crate) dspark_active: bool,
+}
+
+/// Optional load-time settings for [`Gemma4Model::load`].
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct Gemma4LoadOptions {
+    /// Directory of a DSpark draft checkpoint (config.json +
+    /// model.safetensors) to load alongside the target model for
+    /// speculative decoding. DSpark runs only on the flat KV-cache path:
+    /// setting this while the model config explicitly enables
+    /// `use_block_paged_cache` is a hard load error, and an unset
+    /// `use_block_paged_cache` is forced to `false`.
+    pub draft_model_path: Option<String>,
 }
 
 static MODEL_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1020,6 +1052,8 @@ impl Gemma4Inner {
             cached_image_key: None,
             cached_audio_key: None,
             paged_adapter,
+            dspark: None,
+            dspark_turn_state: None,
             layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
@@ -4945,6 +4979,20 @@ impl ChatBackend for Gemma4Inner {
         // channel segments itself). Defensive: pin `true` so the engine's
         // emitter gate can never suppress.
         p.include_reasoning = true;
+        // DSpark draft depth: with a draft model loaded, an unset
+        // `mtpDepth` runs full draft blocks (`block_size`, 7 on the v1
+        // checkpoint); an explicit value is clamped to `[1, block_size]`
+        // from the RAW config value — the engine's central clamp is
+        // `[1, 5]` (an MTP-head contract that does not apply to DSpark),
+        // so this family-local post-edit widens it without touching the
+        // shared clamp.
+        if let Some(draft) = self.dspark.as_ref() {
+            let block_size = draft.config.block_size;
+            p.mtp_depth = match config.mtp_depth {
+                Some(d) => (d.max(1) as usize).min(block_size),
+                None => block_size,
+            };
+        }
         p
     }
 
@@ -5399,11 +5447,11 @@ impl ChatBackend for Gemma4Inner {
         }
     }
 
-    fn augment_performance(&self, _profiler: &DecodeProfiler, _metrics: &mut PerformanceMetrics) {
-        // No-op: gemma4 has no MTP heads (acceptance fields stay None) and
-        // its metrics carry no `profile_phases`. The default would only add
-        // profiling-gated extras; keep the payload byte-stable instead.
-    }
+    // `augment_performance` deliberately NOT overridden: the default
+    // (`profiler.fill_mtp_acceptance`) fills the `mtp_*` acceptance fields
+    // after a DSpark turn (and copies `profile_phases` when profiling is
+    // enabled). AR turns record no MTP cycle, so their acceptance fields
+    // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
         // Requires an initialized session: a non-empty
@@ -5421,6 +5469,24 @@ impl ChatBackend for Gemma4Inner {
         // paged engine, which drives the adapter lifecycle via
         // [`PagedBackend`] and reuses the shared `run_decode_loop`.
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    }
+
+    /// DSpark speculative-decode whole-turn path. Dispatches only when the
+    /// request opted in (`enableMtp`), a draft model is loaded, the flat KV
+    /// path is active (no paged adapter — enforced at load, re-checked here
+    /// defensively), and the turn is text-only (image/audio turns were
+    /// already routed to `vision_turn` by the session core; re-checked
+    /// defensively). Everything else falls through to the generic AR flow.
+    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+        if !(args.params.enable_mtp
+            && self.dspark.is_some()
+            && self.paged_adapter.is_none()
+            && args.images.is_empty()
+            && args.audio.is_empty())
+        {
+            return None;
+        }
+        Some(self.dspark_chat_turn(args))
     }
 
     fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
@@ -5520,6 +5586,7 @@ impl Gemma4Model {
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
+            dspark_active: false,
         }
     }
 
@@ -5550,10 +5617,59 @@ impl Gemma4Model {
         self.model_id as u32
     }
 
+    /// Whether a DSpark draft model is loaded on this instance (via
+    /// `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
+    /// decode whole-turn path.
+    ///
+    /// Note: this only reports draft availability. Whether speculative
+    /// decoding actually runs on a given call also requires the per-request
+    /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+    /// surface. Stubs from `new(config)` always return `false`.
+    #[napi]
+    pub fn has_mtp_weights(&self) -> bool {
+        self.dspark_active
+    }
+
     /// Load a Gemma4 model from a directory.
     #[napi]
-    pub async fn load(model_path: String) -> Result<Gemma4Model> {
-        Self::load_from_dir(&model_path).await
+    pub async fn load(
+        model_path: String,
+        options: Option<Gemma4LoadOptions>,
+    ) -> Result<Gemma4Model> {
+        Self::load_from_dir(&model_path, options).await
+    }
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into, so a
+    /// pure-Rust integration test can exercise the streaming path without a
+    /// NAPI host (same pattern as `Qwen3_5Model::chat_stream_session_start_for_test`).
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+    )> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        thread.send(ChatCmd::StreamSessionStart {
+            messages,
+            config,
+            stream_tx,
+            cancelled: cancelled_inner,
+        })?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 }
 
@@ -5762,7 +5878,7 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 /// When `tap` is provided, the residual-stream hidden of each tapped layer
 /// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
 /// `layer_ids` order; the compute graph is otherwise unchanged.
-fn forward_body(
+pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
     embedding: &Embedding,
@@ -5956,7 +6072,7 @@ fn forward_body(
 /// Full forward pass: transformer body + lm_head + logit softcapping.
 ///
 /// Used for the final prefill chunk and for each decode step.
-fn forward_inner(
+pub(crate) fn forward_inner(
     input_ids: &MxArray,
     embedding: &Embedding,
     layers: &[Gemma4DecoderLayer],
@@ -6019,9 +6135,6 @@ fn forward_inner(
 /// the same masks/rope the chunked prefill uses). It does not sample and
 /// touches no history bookkeeping; caches advance by T. Callers pair it with
 /// `snapshot_before_verify` / `commit_after_verify` for rollback.
-// Consumed by the DSpark speculative-decode engine loop, which is wired in
-// separately; until then only the inline tests exercise this wrapper.
-#[allow(dead_code)]
 pub(crate) fn dspark_verify_forward(
     block_ids: &MxArray,
     embedding: &Embedding,
@@ -6058,9 +6171,6 @@ pub(crate) fn dspark_verify_forward(
 /// per-layer caches vec: entry i is true iff decoder layer i is KV-shared.
 /// Shared layers read their anchor layer's cache; their own vec entry is
 /// never written by a forward pass.
-// Consumed by the DSpark speculative-decode engine loop, which is wired in
-// separately; until then only the inline tests exercise this helper.
-#[allow(dead_code)]
 pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
     (0..config.num_hidden_layers as usize)
         .map(|i| config.is_kv_shared_layer(i))
@@ -6069,7 +6179,7 @@ pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
 
 /// Compute PLE (per-layer embeddings) from input_ids.
 /// Returns shape [B, T, num_layers, ple_dim].
-fn compute_ple(
+pub(crate) fn compute_ple(
     input_ids: &MxArray,
     h: &MxArray,
     ple: &PleComponents,
@@ -6334,7 +6444,7 @@ fn gemma4_default_paged_cache_memory_mb(
 /// Note: mlx-lm uses 2048 but the first eval triggers Metal shader compilation
 /// which can GPU-timeout with very large graphs. Using 512 keeps individual
 /// command buffers under Metal's timeout limit.
-const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
+pub(crate) const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const GEMMA4_PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
@@ -6749,7 +6859,7 @@ fn gemma4_paged_prefill_body_chunk_plan_inner(
 
 /// Evaluate all Gemma4 cache arrays to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
-fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
+pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
     let mut arrays: Vec<&MxArray> = Vec::new();
     for cache in caches {
         cache.collect_cache_arrays(&mut arrays);

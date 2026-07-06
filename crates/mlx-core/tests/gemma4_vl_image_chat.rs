@@ -151,7 +151,7 @@ async fn gemma4_vl_image_chat_t0_capture() {
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
 
-    let model = Gemma4Model::load(model_path.clone())
+    let model = Gemma4Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Gemma-4-VL model");
 

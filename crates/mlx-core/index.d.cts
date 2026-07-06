@@ -166,8 +166,19 @@ export declare class Gemma4Model {
    */
   hasBlockPagedCache(): boolean;
   modelId(): number;
+  /**
+   * Whether a DSpark draft model is loaded on this instance (via
+   * `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
+   * decode whole-turn path.
+   *
+   * Note: this only reports draft availability. Whether speculative
+   * decoding actually runs on a given call also requires the per-request
+   * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
+   * surface. Stubs from `new(config)` always return `false`.
+   */
+  hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
-  static load(modelPath: string): Promise<Gemma4Model>;
+  static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
    * Reset all caches and clear cached token history. Exposed
    * so tests and session-management code can start from a
@@ -2916,6 +2927,19 @@ export interface Gemma4Config {
    * real Gemma-4-E2B weights.
    */
   useBlockPagedCache?: boolean | undefined;
+}
+
+/** Optional load-time settings for `Gemma4Model.load`. */
+export interface Gemma4LoadOptions {
+  /**
+   * Directory of a DSpark draft checkpoint (config.json +
+   * model.safetensors) to load alongside the target model for
+   * speculative decoding. DSpark runs only on the flat KV-cache path:
+   * setting this while the model config explicitly enables
+   * `use_block_paged_cache` is a hard load error, and an unset
+   * `use_block_paged_cache` is forced to `false`.
+   */
+  draftModelPath?: string | undefined;
 }
 
 /**
