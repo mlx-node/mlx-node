@@ -11,6 +11,7 @@ pub(crate) mod cache;
 pub(crate) mod cmd;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
+pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;

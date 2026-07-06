@@ -1756,6 +1756,150 @@ pub(crate) trait MtpStepper {
     fn into_desynced(self) -> bool;
 }
 
+/// Per-turn setup the engine hands to [`DsparkBackend::begin_dspark_decode`].
+///
+/// DSpark analog of [`MtpTurnSetup`] — carries the turn constants the
+/// engine-owned draft/verify loop
+/// ([`crate::engine::dspark_turn::run_dspark_turn`]) needs to construct its
+/// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
+/// draft-model KV window) lives as STRUCT FIELDS of the concrete
+/// [`DsparkStepper`], never here.
+///
+/// `#[allow(dead_code)]`: constructed by `run_dspark_turn` (exercised via its
+/// mock tests); the gemma4 stepper that consumes it in production lands in a
+/// follow-up.
+#[allow(dead_code)]
+pub(crate) struct DsparkTurnSetup<'a> {
+    /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives
+    /// the per-cycle accept policy and `params.max_new_tokens` is the decode
+    /// budget.
+    pub params: &'a ChatParams,
+    /// Draft block size: the hard upper bound on tokens drafted per
+    /// propose/verify cycle. The engine additionally caps each cycle by
+    /// `params.mtp_depth` and by the remaining token budget minus one.
+    pub block_size: usize,
+}
+
+/// Sub-trait of [`ChatBackend`] for families whose DSpark (draft-model)
+/// speculative-decode whole-turn flows through the engine-owned
+/// propose/verify loop [`crate::engine::dspark_turn::run_dspark_turn`].
+///
+/// Split out of [`ChatBackend`] for the SAME reason as [`MtpBackend`]: the
+/// GAT (`type DsparkDecode<'a>`) has no stable trait-level default. A family
+/// opts in by implementing this trait (+ [`DsparkStepper`] for its stepper)
+/// and overriding `ChatBackend::mtp_turn` to call `run_dspark_turn`;
+/// DSpark-less families do not implement it.
+///
+/// `#[allow(dead_code)]`: exercised by the `engine::dspark_turn` mock tests;
+/// the production gemma4 stepper lands in a follow-up.
+#[allow(dead_code)]
+pub(crate) trait DsparkBackend: ChatBackend {
+    /// Per-turn DSpark propose/verify stepper. Borrows `&mut self` for the
+    /// whole decode loop (the analog of [`MtpBackend::MtpDecode`]).
+    type DsparkDecode<'a>: DsparkStepper
+    where
+        Self: 'a;
+
+    /// Build the per-turn DSpark stepper (the analog of
+    /// [`MtpBackend::begin_mtp_decode`]). Captures the turn constants (draft
+    /// model handle, target tap, block size) into the returned stepper,
+    /// which then drives the engine-owned `run_dspark_turn` loop.
+    fn begin_dspark_decode(
+        &mut self,
+        setup: &DsparkTurnSetup<'_>,
+    ) -> Result<Self::DsparkDecode<'_>>;
+}
+
+/// One cycle's drafted block from [`DsparkStepper::propose`].
+///
+/// `#[allow(dead_code)]`: see [`DsparkBackend`].
+#[allow(dead_code)]
+pub(crate) struct DsparkProposal {
+    /// `L <= max_len` proposed token ids (the stepper may return fewer than
+    /// asked — confidence truncation).
+    pub draft_ids: Vec<i32>,
+    /// Per-position f32 `[vocab]` proposal-density rows `q_i` — the
+    /// distribution `draft_ids[i]` was actually drawn from, consumed by
+    /// `sampling::accept_with_residual` on the sampled accept path. EMPTY
+    /// when the turn is greedy (T=0 argmax accept never reads `q`).
+    pub draft_dists: Vec<MxArray>,
+}
+
+/// Output of [`DsparkStepper::verify`] — ONE batched target forward over
+/// `[anchor, d_0..d_{L-1}]`.
+///
+/// `#[allow(dead_code)]`: see [`DsparkBackend`].
+#[allow(dead_code)]
+pub(crate) struct DsparkVerifyOutput {
+    /// Target logits `[1, 1+L, vocab]`: row `i` is the target's next-token
+    /// distribution AFTER `verify_ids[i]`.
+    pub logits: MxArray,
+}
+
+/// Per-turn DSpark stepper the engine-owned loop
+/// ([`crate::engine::dspark_turn::run_dspark_turn`]) drives.
+///
+/// The `&mut self` borrow model is strictly sequential: the engine calls
+/// exactly one method at a time, in the fixed per-cycle order
+/// `propose → verify → commit → eval_boundary`. `eval_boundary` is `&self`
+/// (schedule-only, no state mutation), the rest are `&mut self`.
+///
+/// # Invariant — tapped hidden states NEVER cross this trait
+///
+/// The real stepper taps the target model's hidden states inside
+/// [`Self::verify`], stashes them as its own fields, and consumes them in
+/// [`Self::commit`] (seeding the next cycle's draft context from the kept
+/// prefix). The engine loop sees only token ids, logits, and the
+/// `keep`/`total_written` bookkeeping — so the draft model's conditioning
+/// stays a stepper-private concern and the trait stays model-agnostic.
+///
+/// `#[allow(dead_code)]`: exercised by the `engine::dspark_turn` mock tests;
+/// the production gemma4 stepper lands in a follow-up.
+#[allow(dead_code)]
+pub(crate) trait DsparkStepper {
+    /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
+    /// emitted token, whose K/V is NOT yet in the target cache — the
+    /// engine's subsequent [`Self::verify`] writes it at position 0).
+    /// Returns `L <= max_len` drafted ids plus, on sampled turns, the
+    /// per-position proposal densities. `rng` is consumed only on sampled
+    /// turns (greedy drafting must not advance it — mirrors the
+    /// `accept_with_residual` T=0 shortcut's zero-RNG contract). `&mut dyn
+    /// rand::Rng` (rand 0.10's dyn-compatible core trait — the pre-0.10
+    /// `RngCore`) keeps this trait object-safe while the engine loop stays
+    /// generic over `R: rand::Rng`, matching `run_mtp_turn`'s house style.
+    ///
+    /// Never called with `max_len == 0`: the engine skips propose entirely
+    /// on the degenerate single-AR-step cycle.
+    fn propose(
+        &mut self,
+        anchor_id: u32,
+        max_len: usize,
+        params: &ChatParams,
+        rng: &mut dyn rand::Rng,
+    ) -> Result<DsparkProposal>;
+
+    /// ONE batched target forward over `verify_ids = [anchor, d_0..d_{L-1}]`
+    /// (length `1+L`; `L == 0` degenerates to a plain single-token AR step
+    /// THROUGH verify). Writes `1+L` K/V slots into the target cache and
+    /// stashes the tapped per-position hidden states as stepper fields for
+    /// [`Self::commit`].
+    fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput>;
+
+    /// Commit the cycle: keep the first `keep` of the `total_written`
+    /// (`== 1+L`) target-cache slots [`Self::verify`] wrote and roll back
+    /// the rest; consume the stashed tapped hiddens to re-seed the draft
+    /// model on the kept prefix. `keep >= 1` always (the anchor's slot is
+    /// unconditionally kept); the cycle's boundary token has NO K/V slot —
+    /// it becomes the next cycle's anchor.
+    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()>;
+
+    /// Schedule async eval for the boundary token that becomes the next
+    /// cycle's anchor. `&self` — schedules only, no mutation. Called at the
+    /// iteration boundary on the continue path (the analog of
+    /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
+    fn eval_boundary(&self, token: &MxArray);
+}
+
 /// Per-family training backend the model-neutral training-command handler
 /// ([`crate::engine::cmd::handle_train_cmd`]) drives.
 ///
