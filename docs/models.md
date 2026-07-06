@@ -9,7 +9,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3**         |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                            |
 | **Qwen3.5 Dense** |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant |
 | **Qwen3.5 MoE**   |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant            |
-| **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE                        |
+| **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark spec. decoding |
 | **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                          |
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4 and LFM2.5 are inference-only.
@@ -73,6 +73,28 @@ for await (const event of session.sendStream('Hello!')) {
 ```
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
+
+## Speculative decoding: Gemma4 + DSpark
+
+Gemma4 supports DSpark speculative decoding: an external draft model proposes a block of tokens per cycle and the target model verifies the whole block in one forward, committing the accepted prefix. Pass `draftModelPath` (a DSpark draft checkpoint directory, e.g. `deepseek-ai/dspark_gemma4_12b_block7`) when loading:
+
+```typescript
+import { loadSession } from '@mlx-node/lm';
+
+const session = await loadSession('./models/gemma-4-12b-it', {
+  draftModelPath: './models/dspark_gemma4_12b_block7',
+});
+// The attached draft flips hasMtpWeights(), so ChatSession auto-enables the
+// speculative path; pass `enableMtp: false` per call to opt out.
+const result = await session.send('Give a simple recipe for pancakes.', { config: { temperature: 0 } });
+console.log(result.performance?.mtpCycles, result.performance?.mtpMeanAcceptedTokensTotal);
+```
+
+- **Lossless at T=0** — every committed token is verified by the target model, so greedy output matches the plain autoregressive run (up to inherent bf16 near-ties; see the oracle suite in `crates/mlx-core/tests/gemma4_dspark.rs`).
+- **Stats** — `ChatResult.performance` reports `mtpCycles` (draft+verify cycles executed) and `mtpMeanAcceptedTokensTotal` (mean committed tokens per cycle, including the always-verified token).
+- **Knobs** — an unset `mtpDepth` runs full draft blocks (7 tokens on the v1 draft); an explicit `mtpDepth` caps the block. `mtpAdaptiveDepth` is ignored.
+- **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 12B draft). DSpark runs on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
+- `draftModelPath` is gemma4-only: `loadModel` / `loadSession` reject it for every other family.
 
 ## Server-side sessions
 

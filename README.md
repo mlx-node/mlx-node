@@ -55,6 +55,7 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 - Multi-turn `ChatSession` with live KV cache reuse
 - Streaming generation via `sendStream()`
 - Tool calling and chat templates
+- Speculative decoding: Qwen3.5 MTP heads, Gemma4 DSpark draft models ([docs](docs/models.md#speculative-decoding-gemma4--dspark))
 
 </td>
 <td width="33%" valign="top">
