@@ -1112,7 +1112,6 @@ impl Gemma4Inner {
     }
 
     /// The loaded assistant draft, when the draft variant is assistant.
-    #[allow(dead_code)] // consumed by the assistant decode stepper
     pub(crate) fn assistant_draft(&self) -> Option<&super::assistant::AssistantDraftModel> {
         match self.draft.as_ref() {
             Some(Gemma4Draft::Assistant(draft)) => Some(draft),
@@ -6269,7 +6268,6 @@ pub(crate) fn dspark_verify_forward(
 /// it does not sample and touches no history bookkeeping; caches advance by
 /// T. Callers pair it with `snapshot_before_verify` / `commit_after_verify`
 /// for rollback.
-#[allow(dead_code)] // exercised by the inline tests until the assistant decode stepper lands
 pub(crate) fn assistant_verify_forward(
     block_ids: &MxArray,
     embedding: &Embedding,
@@ -6315,7 +6313,6 @@ pub(crate) fn dspark_shared_slot_mask(config: &Gemma4Config) -> Vec<bool> {
 
 /// Target-layer indices whose KV caches the assistant draft reads: one
 /// source per attention type, index-aligned with the per-layer caches vec.
-#[allow(dead_code)] // exercised by the inline tests until the assistant decode stepper lands
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AssistantKvSources {
     pub sliding: usize,
@@ -6331,7 +6328,6 @@ pub(crate) struct AssistantKvSources {
 /// layers `should_store_shared_kv` marks; without sharing they are simply
 /// the last layer of each type. Errors when the non-shared prefix lacks
 /// either attention type — the draft needs one K/V source per type.
-#[allow(dead_code)] // exercised by the inline tests until the assistant decode stepper lands
 pub(crate) fn assistant_kv_source_indices(config: &Gemma4Config) -> Result<AssistantKvSources> {
     let first_shared = config.first_kv_shared_layer();
     let last_below_boundary = |layer_type: &str| {

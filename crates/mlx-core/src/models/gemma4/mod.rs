@@ -1,4 +1,5 @@
 pub(crate) mod assistant;
+pub(crate) mod assistant_decode;
 pub mod attention;
 pub mod audio_processor;
 pub mod clippable_linear;

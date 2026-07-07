@@ -553,14 +553,12 @@ impl AssistantDecoderLayer {
 /// Dh]`, committed positions only): the last non-KV-shared target layer of
 /// each attention type. Every draft layer attends to the pair matching its
 /// own type.
-#[allow(dead_code)] // consumed by the assistant decode stepper; exercised by the inline tests until it lands
 pub(crate) struct AssistantSharedKv {
     pub sliding: (MxArray, MxArray),
     pub full: (MxArray, MxArray),
 }
 
 /// One chained draft step's outputs.
-#[allow(dead_code)] // consumed by the assistant decode stepper; exercised by the inline tests until it lands
 pub(crate) struct AssistantStepOutput {
     /// Softcapped draft logits `[1, 1, vocab]`.
     pub logits: MxArray,
@@ -571,7 +569,6 @@ pub(crate) struct AssistantStepOutput {
 /// The assistant draft model: backbone-pair input projection, hybrid Q-only
 /// decoder layers over the target's shared K/V, final norm, tied lm_head,
 /// and backbone output projection.
-#[allow(dead_code)] // consumed by the assistant decode stepper; exercised by the inline tests until it lands
 pub(crate) struct AssistantDraftModel {
     pub(crate) config: AssistantConfig,
     /// `Linear(2B -> H)` over `concat([token_embed, h_prev])` — token FIRST.
@@ -590,7 +587,6 @@ pub(crate) struct AssistantDraftModel {
     weight_bytes: u64,
 }
 
-#[allow(dead_code)] // consumed by the assistant decode stepper; exercised by the inline tests until it lands
 impl AssistantDraftModel {
     /// Build the module tree for `config` with placeholder weights.
     /// Callers must apply checkpoint weights before running a forward pass.
@@ -867,7 +863,6 @@ impl AssistantDraftModel {
 
 /// Load an assistant draft checkpoint (config.json + safetensors, single
 /// file or sharded) and validate it against the target model's geometry.
-#[allow(dead_code)] // consumed by the assistant decode stepper; exercised by the inline tests until it lands
 pub(crate) fn load_draft_model(dir: &Path, target: &Gemma4Config) -> Result<AssistantDraftModel> {
     let config_path = dir.join("config.json");
     let raw = fs::read_to_string(&config_path).map_err(|e| {

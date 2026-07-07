@@ -31,11 +31,13 @@ use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{DeviceType, Stream, StreamContext};
 
+use super::assistant_decode::{AssistantTurnState, Gemma4AssistantStepper};
 use super::dspark::{DsparkContextCache, DsparkTap, truncate_by_confidence};
 use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
 use super::model::{
-    GEMMA4_PREFILL_STEP_SIZE, Gemma4Draft, Gemma4Inner, compute_ple, dspark_shared_slot_mask,
-    dspark_verify_forward, eval_gemma4_caches, forward_body, forward_inner,
+    GEMMA4_PREFILL_STEP_SIZE, Gemma4Draft, Gemma4Inner, assistant_kv_source_indices, compute_ple,
+    dspark_shared_slot_mask, dspark_verify_forward, eval_gemma4_caches, forward_body,
+    forward_inner,
 };
 
 /// Per-turn draft handoff from the whole-turn core's prefill to
@@ -51,6 +53,10 @@ use super::model::{
 /// with the loaded draft variant.
 pub(crate) enum Gemma4DraftTurnState {
     Dspark(DsparkTurnState),
+    // Stashed by the whole-turn core's assistant prefill arm; exercised by
+    // the assistant decode tests until that arm lands.
+    #[allow(dead_code)]
+    Assistant(AssistantTurnState),
 }
 
 /// DSpark's [`Gemma4DraftTurnState`] payload: the draft's fused-context
@@ -271,9 +277,56 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
     }
 }
 
+/// Per-turn stepper dispatch: [`DsparkBackend::DsparkDecode`] is ONE
+/// associated type, so the two variant steppers ship behind this enum with
+/// straight 4-method delegation. Constructed only by
+/// [`DsparkBackend::begin_dspark_decode`], which hard-errors when the
+/// stashed [`Gemma4DraftTurnState`] variant disagrees with the loaded
+/// [`Gemma4Draft`] variant.
+pub(crate) enum Gemma4DraftStepper<'a> {
+    Dspark(Gemma4DsparkStepper<'a>),
+    Assistant(Gemma4AssistantStepper<'a>),
+}
+
+impl DsparkStepper for Gemma4DraftStepper<'_> {
+    fn propose(
+        &mut self,
+        anchor_id: u32,
+        max_len: usize,
+        params: &ChatParams,
+        rng: &mut dyn rand::Rng,
+    ) -> Result<DsparkProposal> {
+        match self {
+            Self::Dspark(stepper) => stepper.propose(anchor_id, max_len, params, rng),
+            Self::Assistant(stepper) => stepper.propose(anchor_id, max_len, params, rng),
+        }
+    }
+
+    fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+        match self {
+            Self::Dspark(stepper) => stepper.verify(verify_ids),
+            Self::Assistant(stepper) => stepper.verify(verify_ids),
+        }
+    }
+
+    fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+        match self {
+            Self::Dspark(stepper) => stepper.commit(keep, total_written),
+            Self::Assistant(stepper) => stepper.commit(keep, total_written),
+        }
+    }
+
+    fn eval_boundary(&self, token: &MxArray) {
+        match self {
+            Self::Dspark(stepper) => stepper.eval_boundary(token),
+            Self::Assistant(stepper) => stepper.eval_boundary(token),
+        }
+    }
+}
+
 impl DsparkBackend for Gemma4Inner {
     type DsparkDecode<'a>
-        = Gemma4DsparkStepper<'a>
+        = Gemma4DraftStepper<'a>
     where
         Self: 'a;
 
@@ -305,7 +358,7 @@ impl DsparkBackend for Gemma4Inner {
                 };
                 let shared_slots = dspark_shared_slot_mask(&self.config);
                 let confidence_threshold = dspark_confidence_threshold_from_env();
-                Ok(Gemma4DsparkStepper {
+                Ok(Gemma4DraftStepper::Dspark(Gemma4DsparkStepper {
                     inner: self,
                     ctx: state.ctx,
                     next_pos: state.next_pos,
@@ -314,7 +367,20 @@ impl DsparkBackend for Gemma4Inner {
                     confidence_threshold,
                     rollback: None,
                     tapped: None,
-                })
+                }))
+            }
+            Gemma4DraftTurnState::Assistant(state) => {
+                if self.assistant_draft().is_none() {
+                    return Err(Error::from_reason(
+                        "gemma4 draft decode: an assistant turn state is stashed but the loaded \
+                         draft is not the assistant variant",
+                    ));
+                }
+                let kv_sources = assistant_kv_source_indices(&self.config)?;
+                let shared_slots = dspark_shared_slot_mask(&self.config);
+                Ok(Gemma4DraftStepper::Assistant(
+                    Gemma4AssistantStepper::from_turn_state(self, state, kv_sources, shared_slots),
+                ))
             }
         }
     }
@@ -929,7 +995,7 @@ pub(crate) mod tests {
         .expect("tiny draft config must deserialize")
     }
 
-    fn tiny_inner_with_draft() -> Gemma4Inner {
+    pub(crate) fn tiny_inner_with_draft() -> Gemma4Inner {
         let mut inner =
             Gemma4Inner::new(tiny_target_config()).expect("tiny Gemma4Inner must construct");
         let draft =
@@ -1114,9 +1180,15 @@ pub(crate) mod tests {
             next_pos: 7,
         }));
         {
-            let stepper = inner
+            let stepper = match inner
                 .begin_dspark_decode(&setup)
-                .expect("begin with a stash must succeed");
+                .expect("begin with a stash must succeed")
+            {
+                Gemma4DraftStepper::Dspark(stepper) => stepper,
+                Gemma4DraftStepper::Assistant(_) => {
+                    panic!("a DSpark draft must yield the DSpark stepper")
+                }
+            };
             assert_eq!(
                 stepper.shared_slots,
                 vec![false, false, false, true],
