@@ -1108,7 +1108,7 @@ impl DsparkDraftModel {
 /// and an exact-key f32/f16 file would otherwise push the whole forward into
 /// an unsupported dtype regime (f32 stays confined to runtime readbacks:
 /// sampling distributions and confidence probabilities).
-fn take_tensor(
+pub(crate) fn take_tensor(
     tensors: &mut HashMap<String, MxArray>,
     key: &str,
     missing: &mut Vec<String>,
@@ -1126,7 +1126,12 @@ fn take_tensor(
     Ok(Some(tensor))
 }
 
-fn apply_norm_weight(norm: &mut RMSNorm, w: &MxArray, dims: i64, name: &str) -> Result<()> {
+pub(crate) fn apply_norm_weight(
+    norm: &mut RMSNorm,
+    w: &MxArray,
+    dims: i64,
+    name: &str,
+) -> Result<()> {
     if w.ndim()? != 1 || w.shape_at(0)? != dims {
         return Err(Error::from_reason(format!(
             "DSpark {name} weight must be [{dims}], got {:?}",
@@ -1136,7 +1141,7 @@ fn apply_norm_weight(norm: &mut RMSNorm, w: &MxArray, dims: i64, name: &str) -> 
     norm.set_weight(w)
 }
 
-fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
+pub(crate) fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
     if w.ndim()? != 2 || w.shape_at(0)? != rows || w.shape_at(1)? != cols {
         return Err(Error::from_reason(format!(
             "DSpark {name} must be [{rows}, {cols}], got {:?}",
@@ -1149,7 +1154,7 @@ fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> Result<()> {
 /// Inverse-CDF draw from a dense probability row (mirrors the sparse-slice
 /// sampler in `sampling.rs`, but over the full vocab row that
 /// `sampling_distribution` returns).
-fn sample_index_from_probs<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
+pub(crate) fn sample_index_from_probs<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
     let total: f64 = probs
         .iter()
         .filter(|p| p.is_finite() && **p > 0.0)
