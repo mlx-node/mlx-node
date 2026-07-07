@@ -6249,22 +6249,25 @@ pub(crate) struct AssistantKvSources {
 
 /// Resolve the assistant draft's K/V source layers: for each attention type,
 /// the LAST non-KV-shared target layer of that type — the max index
-/// `i < config.first_kv_shared_layer()` whose layer type matches. With KV
-/// sharing enabled these are exactly the anchor layers
-/// `should_store_shared_kv` marks; without sharing they are simply the last
-/// layer of each type. Errors when the non-shared prefix lacks either
-/// attention type — the draft needs one K/V source per type.
+/// `i < config.first_kv_shared_layer()` whose `layer_types` entry equals the
+/// type string exactly, the same matching `should_store_shared_kv` uses to
+/// mark anchors. Layers with a missing or unrecognized `layer_types` entry
+/// match neither type. With KV sharing enabled these are exactly the anchor
+/// layers `should_store_shared_kv` marks; without sharing they are simply
+/// the last layer of each type. Errors when the non-shared prefix lacks
+/// either attention type — the draft needs one K/V source per type.
 #[allow(dead_code)] // exercised by the inline tests until the assistant decode stepper lands
 pub(crate) fn assistant_kv_source_indices(config: &Gemma4Config) -> Result<AssistantKvSources> {
     let first_shared = config.first_kv_shared_layer();
-    let last_below_boundary =
-        |is_global: bool| (0..first_shared).rfind(|&i| config.is_global_layer(i) == is_global);
-    let sliding = last_below_boundary(false).ok_or_else(|| {
+    let last_below_boundary = |layer_type: &str| {
+        (0..first_shared).rfind(|&i| config.layer_types.get(i).is_some_and(|t| t == layer_type))
+    };
+    let sliding = last_below_boundary("sliding_attention").ok_or_else(|| {
         Error::from_reason(format!(
             "assistant KV source mapping: no non-KV-shared sliding_attention layer in layers 0..{first_shared}"
         ))
     })?;
-    let full = last_below_boundary(true).ok_or_else(|| {
+    let full = last_below_boundary("full_attention").ok_or_else(|| {
         Error::from_reason(format!(
             "assistant KV source mapping: no non-KV-shared full_attention layer in layers 0..{first_shared}"
         ))
@@ -10119,6 +10122,43 @@ mod assistant_seam_tests {
             "got: {}",
             err.reason
         );
+    }
+
+    /// A truncated `layer_types` vec leaves trailing layers without an
+    /// entry. Such layers match neither attention type: the mapping resolves
+    /// only exact `layer_types` entries (like `should_store_shared_kv`) and
+    /// errors when a type has no exact entry below the boundary, instead of
+    /// treating the missing entries as full attention.
+    #[test]
+    fn kv_source_indices_ignore_layers_with_missing_layer_types_entry() {
+        // 4 layers, `layer_types` truncated to 2 entries, no KV sharing.
+        let truncated = |layer_types: &[&str]| -> Gemma4Config {
+            let mut v = tiny_target_config_value();
+            v["layer_types"] = serde_json::json!(layer_types);
+            v.as_object_mut()
+                .expect("tiny config value is an object")
+                .remove("num_kv_shared_layers");
+            serde_json::from_value(v).expect("tiny Gemma4 config must deserialize")
+        };
+
+        // Both types have exact entries: layers 2/3 (no entry) must not be
+        // selected even though the full-attention fallback would claim them.
+        let sources =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "full_attention"]))
+                .expect("mapping must resolve from the exact entries");
+        assert_eq!(
+            sources,
+            AssistantKvSources {
+                sliding: 0,
+                full: 1
+            }
+        );
+
+        // No exact full_attention entry anywhere: hard error, not index 3.
+        let err =
+            assistant_kv_source_indices(&truncated(&["sliding_attention", "sliding_attention"]))
+                .expect_err("missing full_attention entry must error");
+        assert!(err.reason.contains("full_attention"), "got: {}", err.reason);
     }
 
     // ── lm_head tail extraction ────────────────────────────────────────
