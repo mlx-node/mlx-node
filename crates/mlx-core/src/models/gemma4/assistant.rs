@@ -138,13 +138,56 @@ impl AssistantConfig {
                 "ordered/centroid masked-embedding assistant heads (E2B/E4B) are not yet supported",
             ));
         }
+        // Draft-local sanity BEFORE the target-compat arms: every signed
+        // dimension below is later cast with `as u32`/`as usize` (or used in
+        // modulo math) during module construction, so zero/negative values
+        // must be rejected here rather than wrap into absurd allocations.
+        let text = &self.text_config;
+        for (field, value) in [
+            ("backbone_hidden_size", self.backbone_hidden_size),
+            ("hidden_size", text.hidden_size),
+            ("intermediate_size", text.intermediate_size),
+            ("num_attention_heads", text.num_attention_heads),
+            ("num_key_value_heads", text.num_key_value_heads),
+            (
+                "num_global_key_value_heads",
+                text.num_global_key_value_heads,
+            ),
+            ("head_dim", text.head_dim),
+            ("vocab_size", text.vocab_size),
+            ("sliding_window", text.sliding_window),
+        ] {
+            if value <= 0 {
+                return Err(Error::from_reason(format!(
+                    "assistant draft {field}={value} must be positive"
+                )));
+            }
+        }
+        if let Some(global_head_dim) = text.global_head_dim
+            && global_head_dim <= 0
+        {
+            return Err(Error::from_reason(format!(
+                "assistant draft global_head_dim={global_head_dim} must be positive"
+            )));
+        }
+        if text.num_hidden_layers < 1 {
+            return Err(Error::from_reason(format!(
+                "assistant draft num_hidden_layers={} must be at least 1",
+                text.num_hidden_layers
+            )));
+        }
+        if text.rms_norm_eps <= 0.0 {
+            return Err(Error::from_reason(format!(
+                "assistant draft rms_norm_eps={} must be positive",
+                text.rms_norm_eps
+            )));
+        }
         if self.backbone_hidden_size != target.hidden_size as i64 {
             return Err(Error::from_reason(format!(
                 "assistant draft backbone_hidden_size={} does not match target hidden_size={}",
                 self.backbone_hidden_size, target.hidden_size
             )));
         }
-        let text = &self.text_config;
         if text.vocab_size != target.vocab_size as i64 {
             return Err(Error::from_reason(format!(
                 "assistant draft vocab_size={} does not match target vocab_size={}",
@@ -1109,6 +1152,76 @@ mod tests {
             "\"final_logit_softcapping\": 0.0",
         );
         expect_err(&parse(&json), &target_12b(), "final_logit_softcapping");
+    }
+
+    /// Draft-local dimension sanity must fire BEFORE any target-compat arm:
+    /// zero/negative geometry would otherwise reach the `as u32`/`as usize`
+    /// casts in module construction and wrap into absurd allocations.
+    #[test]
+    fn negative_hidden_size_rejected() {
+        let json = base_config_json().replace("\"hidden_size\": 1024", "\"hidden_size\": -1024");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "hidden_size=-1024 must be positive",
+        );
+    }
+
+    #[test]
+    fn zero_intermediate_size_rejected() {
+        let json =
+            base_config_json().replace("\"intermediate_size\": 8192", "\"intermediate_size\": 0");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "intermediate_size=0 must be positive",
+        );
+    }
+
+    #[test]
+    fn zero_num_hidden_layers_rejected() {
+        let json =
+            base_config_json().replace("\"num_hidden_layers\": 4", "\"num_hidden_layers\": 0");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "num_hidden_layers=0 must be at least 1",
+        );
+    }
+
+    #[test]
+    fn negative_head_dim_rejected() {
+        let json = base_config_json().replace("\"head_dim\": 256", "\"head_dim\": -256");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "head_dim=-256 must be positive",
+        );
+    }
+
+    #[test]
+    fn negative_num_attention_heads_rejected() {
+        // -16 % 8 == 0, so the existing divisibility arm alone would let a
+        // negative head count through to the (num_heads * head_dim) cast.
+        let json = base_config_json().replace(
+            "\"num_attention_heads\": 16",
+            "\"num_attention_heads\": -16",
+        );
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "num_attention_heads=-16 must be positive",
+        );
+    }
+
+    #[test]
+    fn nonpositive_rms_norm_eps_rejected() {
+        let json = base_config_json().replace("\"rms_norm_eps\": 1e-06", "\"rms_norm_eps\": 0.0");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "rms_norm_eps=0 must be positive",
+        );
     }
 
     // ── Tiny-model fixtures ────────────────────────────────────────────
