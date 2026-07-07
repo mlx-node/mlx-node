@@ -1103,11 +1103,12 @@ impl DsparkDraftModel {
 }
 
 /// Remove `key` from `tensors`, recording it in `missing` when absent.
+/// Shared by the DSpark and assistant draft loaders.
 ///
-/// A present tensor must be bf16 — the v1 checkpoint contract is bf16-only,
-/// and an exact-key f32/f16 file would otherwise push the whole forward into
-/// an unsupported dtype regime (f32 stays confined to runtime readbacks:
-/// sampling distributions and confidence probabilities).
+/// A present tensor must be bf16 — the draft checkpoint contract is
+/// bf16-only, and an exact-key f32/f16 file would otherwise push the whole
+/// forward into an unsupported dtype regime (f32 stays confined to runtime
+/// readbacks: sampling distributions and confidence probabilities).
 pub(crate) fn take_tensor(
     tensors: &mut HashMap<String, MxArray>,
     key: &str,
@@ -1120,12 +1121,14 @@ pub(crate) fn take_tensor(
     let dtype = tensor.dtype()?;
     if dtype != DType::BFloat16 {
         return Err(Error::from_reason(format!(
-            "DSpark draft tensor {key} must be bf16, got {dtype:?} (only bf16 checkpoints are supported)"
+            "Gemma4 draft tensor {key} must be bf16, got {dtype:?} (only bf16 checkpoints are supported)"
         )));
     }
     Ok(Some(tensor))
 }
 
+/// Shape-checked RMSNorm weight install, shared by the DSpark and assistant
+/// draft loaders.
 pub(crate) fn apply_norm_weight(
     norm: &mut RMSNorm,
     w: &MxArray,
@@ -1134,7 +1137,7 @@ pub(crate) fn apply_norm_weight(
 ) -> Result<()> {
     if w.ndim()? != 1 || w.shape_at(0)? != dims {
         return Err(Error::from_reason(format!(
-            "DSpark {name} weight must be [{dims}], got {:?}",
+            "Gemma4 draft {name} weight must be [{dims}], got {:?}",
             w.shape()?.as_ref()
         )));
     }
