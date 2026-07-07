@@ -303,8 +303,9 @@ export interface SessionCapableModel {
    * MTP: whether the underlying native model can run speculative
    * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
    * head shipped in the checkpoint and loaded by persistence) and by
-   * `Gemma4Model` (an external DSpark draft model attached via
-   * `loadModel` / `loadSession` `draftModelPath` — NOT in-checkpoint
+   * `Gemma4Model` (an external draft model — DSpark or Google gemma-4
+   * assistant, auto-detected from the draft's config.json — attached
+   * via `loadModel` / `loadSession` `draftModelPath`; NOT in-checkpoint
    * MTP heads); all other native wrappers omit the method, in
    * which case callers treat a missing getter as `false` (no MTP).
    *
@@ -330,11 +331,13 @@ export interface SessionCapableModel {
    * the same field.
    *
    * - **`mtpDepth`** — pins the MTP draft depth per speculative cycle.
-   *   Clamped to `[1, 5]` by the verify FFI contract. When unset,
-   *   native code currently pins depth 1. Setting `mtpDepth` explicitly
-   *   pins that value unless the caller also passes
-   *   `mtpAdaptiveDepth: true` to opt into adaptive depth with the
-   *   supplied maximum/seed.
+   *   On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the
+   *   verify FFI contract, and when unset native code currently pins
+   *   depth 1. Setting `mtpDepth` explicitly pins that value unless
+   *   the caller also passes `mtpAdaptiveDepth: true` to opt into
+   *   adaptive depth with the supplied maximum/seed. Gemma4 external
+   *   drafts resolve the field per draft variant instead — see the
+   *   Gemma4 section below.
    * - **`mtpAdaptiveDepth`** — toggles the adaptive depth policy.
    *   Defaults to OFF. When ON, the default mode runs a 5-state machine
    *   (`Explore` → `Full` → {`NeighborProbe` | `Reduced` → `Probe`})
@@ -356,12 +359,26 @@ export interface SessionCapableModel {
    * `SendOptions.config` is the recommended path for callers that
    * just want speculative decoding "on with sensible defaults".
    *
-   * Gemma4 + DSpark reinterprets the knobs: an unset `mtpDepth` runs
-   * full draft blocks (the draft checkpoint's block size — 7 tokens on
-   * `dspark_gemma4_12b_block7`), and an explicit `mtpDepth` acts as a
-   * CAP on that block (clamped to `[1, blockSize]`, not `[1, 5]`).
-   * `mtpAdaptiveDepth` is ignored — the DSpark loop has no adaptive
-   * depth policy.
+   * ## Gemma4 external drafts (`draftModelPath`)
+   *
+   * Gemma4 reinterprets the knobs per draft variant (resolved in
+   * `gemma4/model.rs` `resolve_params`, always from the RAW config
+   * value — the engine's central `[1, 5]` clamp is an MTP-head
+   * contract that does not apply to external drafts):
+   *
+   * - **DSpark**: an unset `mtpDepth` runs full draft blocks (the
+   *   draft checkpoint's block size — 7 tokens on
+   *   `dspark_gemma4_12b_block7`), and an explicit `mtpDepth` acts as
+   *   a CAP on that block (clamped to `[1, blockSize]`).
+   * - **Assistant** (Google `gemma-4-*-it-assistant`): chained AR
+   *   drafting has no checkpoint-pinned block size — an unset
+   *   `mtpDepth` drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`,
+   *   a quality/latency tradeoff, not a checkpoint contract), and an
+   *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+   *
+   * `mtpAdaptiveDepth` is ignored for BOTH variants — neither external
+   * draft loop has an adaptive depth policy. Qwen3.5 native-MTP
+   * semantics above are unchanged.
    */
   hasMtpWeights?(): boolean;
 }
@@ -1300,8 +1317,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * speculative-decode path runs out of the box on MTP-capable
    * checkpoints. An explicit `false` from either source wins (the
    * undefined-check below preserves it). This duck-typed check also
-   * covers Gemma4 with a DSpark draft attached (`hasMtpWeights()`
-   * reports the external draft there, not in-checkpoint MTP heads).
+   * covers Gemma4 with an external draft attached — DSpark or Google
+   * assistant (`hasMtpWeights()` reports the external draft there,
+   * not in-checkpoint MTP heads).
    */
   private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
     const merged: ChatConfig = {

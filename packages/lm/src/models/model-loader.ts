@@ -53,12 +53,17 @@ const SUPPORTED_MODEL_TYPES = new Set<ModelType>(Object.keys(MODEL_REGISTRY) as 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
   /**
-   * Gemma4 only: directory of a DSpark draft checkpoint (config.json +
+   * Gemma4 only: directory of an external draft checkpoint (config.json +
    * model.safetensors) loaded alongside the target model for speculative
-   * decoding (forwarded as `Gemma4LoadOptions.draftModelPath`). DSpark runs
-   * on the flat KV-cache path, so the target checkpoint must not explicitly
-   * enable `use_block_paged_cache`. Setting this for any other model family
-   * is a hard error — no other loader accepts a draft model.
+   * decoding (forwarded as `Gemma4LoadOptions.draftModelPath`). Accepts
+   * either a DSpark draft or a Google gemma-4 assistant draft
+   * (`google/gemma-4-*-it-assistant`); the variant is auto-detected from
+   * the draft's config.json (`model_type` `gemma4_assistant` /
+   * `gemma4_unified_assistant` → assistant, `architectures` containing
+   * `Gemma4DSparkModel` → DSpark). Draft decoding runs on the flat
+   * KV-cache path, so the target checkpoint must not explicitly enable
+   * `use_block_paged_cache`. Setting this for any other model family is a
+   * hard error — no other loader accepts a draft model.
    */
   draftModelPath?: string;
 }
@@ -91,7 +96,8 @@ function dispatchLoad(
  * Supports both language models (Qwen3, Qwen3.5) and vision-language models
  * (Qianfan-OCR / InternVL). Use `instanceof` to narrow the returned type.
  *
- * `options.draftModelPath` attaches a DSpark draft checkpoint for
+ * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
+ * Google gemma-4 assistant, auto-detected from the draft's config.json) for
  * speculative decoding — gemma4 only; any other detected family rejects it.
  */
 export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
@@ -115,7 +121,8 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  *     must import `QianfanOCRModel` from `@mlx-node/vlm` and construct
  *     `new ChatSession(model)` directly.
  *
- * `options.draftModelPath` attaches a DSpark draft checkpoint for
+ * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
+ * Google gemma-4 assistant, auto-detected from the draft's config.json) for
  * speculative decoding — gemma4 only; any other detected family rejects it.
  * The resulting session auto-enables the speculative path (the model
  * reports `hasMtpWeights()`); pass `enableMtp: false` per call to opt out.

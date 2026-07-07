@@ -421,7 +421,8 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
   // — visible on the generated wrapper for TypeScript consumers. Likewise,
   // `Parameters<C['load']>` keeps each family's native load signature —
   // `[modelPath]` for most, `[modelPath, options?]` for Gemma4
-  // (`Gemma4LoadOptions.draftModelPath` / DSpark).
+  // (`Gemma4LoadOptions.draftModelPath` — external DSpark or Google
+  // assistant draft).
   new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
   load(...args: Parameters<C['load']>): Promise<StreamingInstance<C, O>>;
 } {

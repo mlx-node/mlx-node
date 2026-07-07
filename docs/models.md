@@ -4,13 +4,13 @@
 
 All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendStream` / `sendToolResult` / `reset`) driven by the native `chatSessionStart` / `chatSessionContinue` / `chatSessionContinueTool` NAPI entry points. The legacy `model.chat()` / `model.chatStream()` methods are removed from every generative model.
 
-| Model             | `generate()` | Session API |  Training  | Notes                                                            |
-| ----------------- | :----------: | :---------: | :--------: | ---------------------------------------------------------------- |
-| **Qwen3**         |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                            |
-| **Qwen3.5 Dense** |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant |
-| **Qwen3.5 MoE**   |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant            |
+| Model             | `generate()` | Session API |  Training  | Notes                                                                            |
+| ----------------- | :----------: | :---------: | :--------: | -------------------------------------------------------------------------------- |
+| **Qwen3**         |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
+| **Qwen3.5 Dense** |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant                 |
+| **Qwen3.5 MoE**   |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
 | **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
-| **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                          |
+| **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4 and LFM2.5 are inference-only.
 
