@@ -91,13 +91,28 @@ pub struct ChatConfig {
     /// `false`.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
-    /// MTP: number of draft tokens per speculative cycle. Clamped to `[1, 5]`
-    /// by the verify FFI contract. Default: 1.
+    /// MTP: number of draft tokens per speculative cycle.
     ///
+    /// On Qwen3.5 native MTP heads it is clamped to `[1, 5]` by the verify
+    /// FFI contract, and when unset native code currently pins depth 1.
     /// When `mtpAdaptiveDepth` is `true`, this value is used as the
     /// throughput-policy seed and the expected-value policy's max depth.
     /// Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
     /// enable it.
+    ///
+    /// Gemma4 external drafts (`draftModelPath`) resolve the field per draft
+    /// variant instead (`gemma4/model.rs` `resolve_params`, always from the
+    /// RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
+    /// contract that does not apply to external drafts):
+    /// - DSpark: an unset `mtpDepth` runs full draft blocks (the draft
+    ///   checkpoint's block size — 7 tokens on `dspark_gemma4_12b_block7`),
+    ///   and an explicit `mtpDepth` acts as a CAP on that block (clamped to
+    ///   `[1, blockSize]`).
+    /// - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
+    ///   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
+    ///   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+    ///
+    /// `mtpAdaptiveDepth` is ignored for both Gemma4 external-draft variants.
     #[napi(ts_type = "number | undefined")]
     pub mtp_depth: Option<i32>,
     /// MTP: when true, the decode loop runs the adaptive
