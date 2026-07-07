@@ -129,8 +129,11 @@ export interface AnthropicMessagesRequest {
    *     `enableMtp` untouched so the downstream `ChatSession` auto-
    *     default (true when the model ships an MTP head) applies.
    *   * `mtp_depth`: positive integer override for the per-call draft
-   *     depth. Forwarded to `ChatConfig.mtpDepth` as-is; the native
-   *     side validates it.
+   *     depth. The server forwards any positive integer ≤ 64 (a sanity
+   *     ceiling that only blocks garbage) and the native per-family
+   *     `resolve_params` owns the real clamps: qwen3.5 native MTP
+   *     [1, 5], gemma4 DSpark capped at the draft block size, gemma4
+   *     assistant drafts [1, 8].
    */
   extra_body?: {
     // Typed as `string | null` (not the literal union `'mtp' | 'ar'`)

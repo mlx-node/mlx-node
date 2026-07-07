@@ -1370,6 +1370,28 @@ describe('mapAnthropicRequest', () => {
       });
       expect(config.mtpDepth).toBe(2);
     });
+
+    it('forwards mtp_depth 8 (gemma4 assistant max; native owns per-family clamps)', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Hello' }],
+        extra_body: { mtp_depth: 8 },
+      });
+      expect(config.mtpDepth).toBe(8);
+    });
+
+    it('rejects non-integer, non-positive, and > 64 mtp_depth values', () => {
+      for (const depth of [0, -1, 65, 2.5, Number.NaN, null]) {
+        const { config } = mapAnthropicRequest({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 1024,
+          messages: [{ role: 'user', content: 'Hello' }],
+          extra_body: { mtp_depth: depth as never },
+        });
+        expect(config.mtpDepth).toBeUndefined();
+      }
+    });
   });
 
   // -------------------------------------------------------------------

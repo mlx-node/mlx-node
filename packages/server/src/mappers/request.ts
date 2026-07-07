@@ -125,12 +125,15 @@ export interface MappedRequest {
  *     downstream `ChatSession.mergeConfig` auto-default (true when
  *     the model ships an MTP head) applies.
  *
- *   * `mtp_depth: <positive int ≤ 5>` → `mtpDepth = value`
- *   * non-integer, out-of-range, or absent → `mtpDepth` untouched;
- *     downstream Rust validation (W5 FFI) catches any pathological
- *     value the server didn't reject. Cheap server-side rejection
- *     for the obvious cases (zero, negative, NaN, > 5) saves a
- *     round-trip into the model thread.
+ *   * `mtp_depth: <positive int ≤ 64>` → `mtpDepth = value`
+ *   * non-integer, out-of-range, or absent → `mtpDepth` untouched.
+ *     The real clamps are per-family and owned by native
+ *     `resolve_params`: qwen3.5 native MTP clamps to [1, 5], gemma4
+ *     DSpark caps at the draft block size (7 on v1), and the gemma4
+ *     assistant draft clamps to [1, 8]. The server therefore only
+ *     rejects garbage — non-integers, non-positives, and values
+ *     > 64 (a generous sanity ceiling far above any family's real
+ *     clamp) — which saves a round-trip into the model thread.
  *
  * Kept as a pure helper rather than inlined into each mapper so the
  * two endpoints can't drift in semantics.
@@ -149,7 +152,7 @@ export function applyExtraBodyMtpOverrides(
   // Any other value (null, undefined, unknown string) → leave alone.
 
   const depth = extraBody.mtp_depth;
-  if (depth != null && Number.isInteger(depth) && depth > 0 && depth <= 5) {
+  if (depth != null && Number.isInteger(depth) && depth > 0 && depth <= 64) {
     config.mtpDepth = depth;
   }
 }

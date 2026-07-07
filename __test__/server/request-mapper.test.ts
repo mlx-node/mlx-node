@@ -426,8 +426,22 @@ describe('mapRequest', () => {
       expect(config.mtpDepth).toBe(4);
     });
 
-    it('rejects mtp_depth values outside the [1, 5] integer range', () => {
-      for (const depth of [0, -1, 6, 2.5, Number.NaN, null]) {
+    it('forwards depths above the old qwen cap (6-8, e.g. gemma4 assistant max 8)', () => {
+      // Per-family native `resolve_params` owns the real clamps (qwen3.5
+      // native MTP [1,5]; gemma4 DSpark ≤ block size; gemma4 assistant
+      // [1,8]) — the server must not re-encode any single family's cap.
+      for (const depth of [6, 7, 8]) {
+        const { config } = mapRequest({
+          model: 'test-model',
+          input: 'Hello',
+          extra_body: { mtp_depth: depth },
+        });
+        expect(config.mtpDepth).toBe(depth);
+      }
+    });
+
+    it('rejects non-integer, non-positive, and > 64 mtp_depth values', () => {
+      for (const depth of [0, -1, 65, 2.5, Number.NaN, null]) {
         const { config } = mapRequest({
           model: 'test-model',
           input: 'Hello',
