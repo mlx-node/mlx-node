@@ -81,7 +81,7 @@ function dispatchLoad(
 ): Promise<unknown> {
   if (options?.draftModelPath !== undefined && modelType !== 'gemma4') {
     throw new Error(
-      `draftModelPath (DSpark speculative decoding) is only supported by gemma4 models; ` +
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
