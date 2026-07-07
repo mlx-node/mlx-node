@@ -403,19 +403,21 @@ pub(crate) struct Gemma4Inner {
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
-    /// DSpark draft model for speculative decoding (`Gemma4LoadOptions::
-    /// draft_model_path`). Mutually exclusive with `paged_adapter`: the
-    /// load path hard-errors on an explicit `use_block_paged_cache: true`
-    /// conflict and forces the unset default to flat, so `dspark.is_some()`
-    /// implies `paged_adapter.is_none()`.
-    pub(crate) dspark: Option<super::dspark::DsparkDraftModel>,
-    /// Per-turn DSpark draft-context handoff: `dspark_chat_turn` builds the
-    /// draft's fused-context cache during its tapped prefill and stashes it
-    /// here; `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
+    /// Draft model for speculative decoding (`Gemma4LoadOptions::
+    /// draft_model_path`), either [`Gemma4Draft`] variant. Mutually
+    /// exclusive with `paged_adapter`: the load path hard-errors on an
+    /// explicit `use_block_paged_cache: true` conflict and forces the unset
+    /// default to flat, so `draft.is_some()` implies
+    /// `paged_adapter.is_none()`.
+    pub(crate) draft: Option<Gemma4Draft>,
+    /// Per-turn draft handoff: the whole-turn core builds the variant's
+    /// prefill-derived state (DSpark fused-context cache / assistant
+    /// last-prompt hidden) during prefill and stashes it here;
+    /// `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
     /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
     /// so prefill-derived state travels through this seam). Always `None`
-    /// outside a live `dspark_chat_turn`.
-    pub(crate) dspark_turn_state: Option<super::dspark_decode::DsparkTurnState>,
+    /// outside a live draft whole-turn.
+    pub(crate) draft_turn_state: Option<super::dspark_decode::Gemma4DraftTurnState>,
     /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
     /// computed once here in `Gemma4Inner::new` instead of re-derived
     /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
@@ -437,6 +439,43 @@ pub(crate) struct Gemma4Inner {
     /// `text_delta_image_guard` rejects a media-session delta as today.
     media_session_continuable: bool,
     pub(crate) model_id: u64,
+}
+
+/// Draft-model variant loaded alongside the target for speculative decoding
+/// (`Gemma4LoadOptions::draft_model_path`). The kind probe in
+/// `persistence.rs` picks the variant from the draft checkpoint's
+/// config.json identity fields, then hands the directory to that variant's
+/// strict loader.
+pub(crate) enum Gemma4Draft {
+    /// DeepSpec DSpark external draft: 5-layer cross-attending transformer
+    /// drafting whole masked blocks over a fused target-hidden context
+    /// ([`super::dspark`]).
+    Dspark(super::dspark::DsparkDraftModel),
+    /// Google assistant checkpoint draft: Q-only transformer drafting by
+    /// chained single-token AR steps over the target's committed KV caches
+    /// ([`super::assistant`]).
+    Assistant(super::assistant::AssistantDraftModel),
+}
+
+impl Gemma4Draft {
+    /// Checkpoint tensor bytes for cache-limit accounting (see the variant
+    /// loaders' `weight_bytes` docs for the measurement contract).
+    pub(crate) fn weight_bytes(&self) -> u64 {
+        match self {
+            Self::Dspark(draft) => draft.weight_bytes(),
+            Self::Assistant(draft) => draft.weight_bytes(),
+        }
+    }
+
+    /// Every checkpoint-backed tensor the draft owns, for the post-load
+    /// materialization pass (cheap array-handle clones covering exactly the
+    /// applied checkpoint set — byte-coverage pinned per variant).
+    pub(crate) fn collect_weight_arrays(&self) -> Vec<MxArray> {
+        match self {
+            Self::Dspark(draft) => draft.collect_weight_arrays(),
+            Self::Assistant(draft) => draft.collect_weight_arrays(),
+        }
+    }
 }
 
 /// Gemma 4 dense language model.
@@ -491,24 +530,25 @@ pub struct Gemma4Model {
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
-    /// Snapshot of `Gemma4Inner::dspark.is_some()` captured at load time
-    /// (same mirroring pattern as `paged_active`): whether a DSpark draft
-    /// model was loaded via `Gemma4LoadOptions::draft_model_path`. Surfaced
-    /// through the `hasMtpWeights()` NAPI method (named for parity with the
-    /// Qwen3.5 surface) so server endpoints can branch without a
-    /// model-thread roundtrip. Stubs from `new(config)` always report
-    /// `false`.
-    pub(crate) dspark_active: bool,
+    /// Snapshot of `Gemma4Inner::draft.is_some()` captured at load time
+    /// (same mirroring pattern as `paged_active`): whether a draft model —
+    /// either [`Gemma4Draft`] variant — was loaded via
+    /// `Gemma4LoadOptions::draft_model_path`. Surfaced through the
+    /// `hasMtpWeights()` NAPI method (named for parity with the Qwen3.5
+    /// surface) so server endpoints can branch without a model-thread
+    /// roundtrip. Stubs from `new(config)` always report `false`.
+    pub(crate) draft_active: bool,
 }
 
 /// Optional load-time settings for [`Gemma4Model::load`].
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Gemma4LoadOptions {
-    /// Directory of a DSpark draft checkpoint (config.json +
-    /// model.safetensors) to load alongside the target model for
-    /// speculative decoding. DSpark runs only on the flat KV-cache path:
-    /// setting this while the model config explicitly enables
+    /// Directory of a draft checkpoint (config.json + safetensors) to load
+    /// alongside the target model for speculative decoding — either a
+    /// DSpark draft or a Google assistant draft; the kind is probed from
+    /// the draft config.json. Draft decoding runs only on the flat KV-cache
+    /// path: setting this while the model config explicitly enables
     /// `use_block_paged_cache` is a hard load error, and an unset
     /// `use_block_paged_cache` is forced to `false`.
     pub draft_model_path: Option<String>,
@@ -1052,8 +1092,8 @@ impl Gemma4Inner {
             cached_image_key: None,
             cached_audio_key: None,
             paged_adapter,
-            dspark: None,
-            dspark_turn_state: None,
+            draft: None,
+            draft_turn_state: None,
             layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
@@ -1061,6 +1101,29 @@ impl Gemma4Inner {
             media_session_continuable: false,
             model_id,
         })
+    }
+
+    /// The loaded DSpark draft, when the draft variant is DSpark.
+    pub(crate) fn dspark_draft(&self) -> Option<&super::dspark::DsparkDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// The loaded assistant draft, when the draft variant is assistant.
+    #[allow(dead_code)] // consumed by the assistant decode stepper
+    pub(crate) fn assistant_draft(&self) -> Option<&super::assistant::AssistantDraftModel> {
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Assistant(draft)) => Some(draft),
+            _ => None,
+        }
+    }
+
+    /// Whether ANY draft variant is loaded (the speculative whole-turn
+    /// gate; see `mtp_turn`).
+    pub(crate) fn has_draft(&self) -> bool {
+        self.draft.is_some()
     }
 
     /// Initialize the per-turn KV caches in-place.
@@ -4979,19 +5042,30 @@ impl ChatBackend for Gemma4Inner {
         // channel segments itself). Defensive: pin `true` so the engine's
         // emitter gate can never suppress.
         p.include_reasoning = true;
-        // DSpark draft depth: with a draft model loaded, an unset
-        // `mtpDepth` runs full draft blocks (`block_size`, 7 on the v1
-        // checkpoint); an explicit value is clamped to `[1, block_size]`
-        // from the RAW config value — the engine's central clamp is
-        // `[1, 5]` (an MTP-head contract that does not apply to DSpark),
-        // so this family-local post-edit widens it without touching the
-        // shared clamp.
-        if let Some(draft) = self.dspark.as_ref() {
-            let block_size = draft.config.block_size;
-            p.mtp_depth = match config.mtp_depth {
-                Some(d) => (d.max(1) as usize).min(block_size),
-                None => block_size,
-            };
+        // Draft depth: with a draft model loaded, `mtpDepth` resolves per
+        // variant — a family-local post-edit of the engine's central
+        // `[1, 5]` clamp (an MTP-head contract that does not apply to
+        // external drafts), always clamping from the RAW config value.
+        //   * DSpark: unset runs full draft blocks (`block_size`, 7 on the
+        //     v1 checkpoint); explicit values clamp to `[1, block_size]`.
+        //   * Assistant: chained AR drafting has no checkpoint-pinned block
+        //     size — unset resolves to `ASSISTANT_DEFAULT_DEPTH`; explicit
+        //     values clamp to `[1, ASSISTANT_MAX_DEPTH]`.
+        match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => {
+                let block_size = draft.config.block_size;
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(block_size),
+                    None => block_size,
+                };
+            }
+            Some(Gemma4Draft::Assistant(_)) => {
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(super::assistant::ASSISTANT_MAX_DEPTH),
+                    None => super::assistant::ASSISTANT_DEFAULT_DEPTH,
+                };
+            }
+            None => {}
         }
         p
     }
@@ -5471,15 +5545,16 @@ impl ChatBackend for Gemma4Inner {
         Some(crate::engine::paged_turn::run_paged_turn(self, args))
     }
 
-    /// DSpark speculative-decode whole-turn path. Dispatches only when the
-    /// request opted in (`enableMtp`), a draft model is loaded, the flat KV
-    /// path is active (no paged adapter — enforced at load, re-checked here
-    /// defensively), and the turn is text-only (image/audio turns were
-    /// already routed to `vision_turn` by the session core; re-checked
-    /// defensively). Everything else falls through to the generic AR flow.
+    /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
+    /// variant). Dispatches only when the request opted in (`enableMtp`), a
+    /// draft model is loaded, the flat KV path is active (no paged adapter
+    /// — enforced at load, re-checked here defensively), and the turn is
+    /// text-only (image/audio turns were already routed to `vision_turn`
+    /// by the session core; re-checked defensively). Everything else falls
+    /// through to the generic AR flow.
     fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
         if !(args.params.enable_mtp
-            && self.dspark.is_some()
+            && self.has_draft()
             && self.paged_adapter.is_none()
             && args.images.is_empty()
             && args.audio.is_empty())
@@ -5586,7 +5661,7 @@ impl Gemma4Model {
             initialized: false,
             paged_active: false,
             _cache_limit_guard: None,
-            dspark_active: false,
+            draft_active: false,
         }
     }
 
@@ -5617,19 +5692,19 @@ impl Gemma4Model {
         self.model_id as u32
     }
 
-    /// Whether a DSpark draft model is loaded on this instance (via
-    /// `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
-    /// decode whole-turn path.
+    /// Whether a draft model — DSpark or Google assistant — is loaded on
+    /// this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+    /// the speculative-decode whole-turn path.
     ///
     /// Note: this only reports draft availability. Whether speculative
     /// decoding actually runs on a given call also requires the per-request
     /// `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-    /// surface, but it reports an external DSpark draft model, not
-    /// in-checkpoint MTP heads. Stubs from `new(config)` always return
+    /// surface, but it reports an external draft model (either variant),
+    /// not in-checkpoint MTP heads. Stubs from `new(config)` always return
     /// `false`.
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
-        self.dspark_active
+        self.draft_active
     }
 
     /// Load a Gemma4 model from a directory.

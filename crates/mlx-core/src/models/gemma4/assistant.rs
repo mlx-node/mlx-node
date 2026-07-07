@@ -34,6 +34,17 @@ use super::quantized_linear::LinearProj;
 pub(crate) const ASSISTANT_MODEL_TYPES: [&str; 2] =
     ["gemma4_assistant", "gemma4_unified_assistant"];
 
+/// Tokens drafted per propose/verify cycle when the request leaves
+/// `mtpDepth` unset. Unlike DSpark there is no checkpoint-pinned block
+/// size — the assistant drafts by chained single-token AR steps — so the
+/// default is a quality/latency tradeoff, not a checkpoint contract.
+pub(crate) const ASSISTANT_DEFAULT_DEPTH: usize = 3;
+
+/// Hard cap on an explicit `mtpDepth` for the assistant draft: each drafted
+/// token is one full chained draft forward AND one extra verify row, so an
+/// unbounded depth would let a single request inflate every verify block.
+pub(crate) const ASSISTANT_MAX_DEPTH: usize = 8;
+
 const SLIDING_ATTENTION: &str = "sliding_attention";
 const FULL_ATTENTION: &str = "full_attention";
 

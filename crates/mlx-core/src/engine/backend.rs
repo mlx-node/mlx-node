@@ -1764,8 +1764,8 @@ pub(crate) trait MtpStepper {
 /// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
 /// draft-model KV window) lives as STRUCT FIELDS of the concrete
 /// [`DsparkStepper`], never here. Prefill-derived state (the gemma4 draft
-/// context) travels through the family's own stash
-/// (`Gemma4Inner::dspark_turn_state`), consumed by `begin_dspark_decode`.
+/// context / assistant seed hidden) travels through the family's own stash
+/// (`Gemma4Inner::draft_turn_state`), consumed by `begin_dspark_decode`.
 #[allow(dead_code)]
 pub(crate) struct DsparkTurnSetup<'a> {
     /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives

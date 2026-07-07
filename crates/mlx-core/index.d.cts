@@ -167,15 +167,15 @@ export declare class Gemma4Model {
   hasBlockPagedCache(): boolean;
   modelId(): number;
   /**
-   * Whether a DSpark draft model is loaded on this instance (via
-   * `Gemma4LoadOptions::draft_model_path`), enabling the speculative-
-   * decode whole-turn path.
+   * Whether a draft model — DSpark or Google assistant — is loaded on
+   * this instance (via `Gemma4LoadOptions::draft_model_path`), enabling
+   * the speculative-decode whole-turn path.
    *
    * Note: this only reports draft availability. Whether speculative
    * decoding actually runs on a given call also requires the per-request
    * `enableMtp` flag. Named `hasMtpWeights` for parity with the Qwen3.5
-   * surface, but it reports an external DSpark draft model, not
-   * in-checkpoint MTP heads. Stubs from `new(config)` always return
+   * surface, but it reports an external draft model (either variant),
+   * not in-checkpoint MTP heads. Stubs from `new(config)` always return
    * `false`.
    */
   hasMtpWeights(): boolean;
@@ -2946,10 +2946,11 @@ export interface Gemma4Config {
 /** Optional load-time settings for [`Gemma4Model::load`]. */
 export interface Gemma4LoadOptions {
   /**
-   * Directory of a DSpark draft checkpoint (config.json +
-   * model.safetensors) to load alongside the target model for
-   * speculative decoding. DSpark runs only on the flat KV-cache path:
-   * setting this while the model config explicitly enables
+   * Directory of a draft checkpoint (config.json + safetensors) to load
+   * alongside the target model for speculative decoding — either a
+   * DSpark draft or a Google assistant draft; the kind is probed from
+   * the draft config.json. Draft decoding runs only on the flat KV-cache
+   * path: setting this while the model config explicitly enables
    * `use_block_paged_cache` is a hard load error, and an unset
    * `use_block_paged_cache` is forced to `false`.
    */

@@ -29,7 +29,7 @@ use super::mlp::GemmaMLP;
 use super::quantized_linear::LinearProj;
 
 /// Draft architecture name required in the checkpoint's `architectures` list.
-const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
+pub(crate) const DSPARK_ARCHITECTURE: &str = "Gemma4DSparkModel";
 
 // Greedy-vs-sampled detection for draft sampling uses the ENGINE's
 // `sampling::is_greedy_temperature` predicate — the same predicate the
