@@ -5560,7 +5560,7 @@ impl ChatBackend for Gemma4Inner {
         {
             return None;
         }
-        Some(self.dspark_chat_turn(args))
+        Some(self.draft_chat_turn(args))
     }
 
     fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {

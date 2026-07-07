@@ -1,18 +1,22 @@
-//! Gemma4 DSpark speculative-decode wiring: the family-side
+//! Gemma4 draft speculative-decode wiring: the family-side
 //! [`DsparkStepper`]/[`DsparkBackend`] implementation the engine-owned
 //! [`crate::engine::dspark_turn::run_dspark_turn`] loop drives, plus the
-//! whole-turn core (`dspark_chat_turn`) behind gemma4's
+//! variant-generic whole-turn core (`draft_chat_turn`) behind gemma4's
 //! `ChatBackend::mtp_turn` override.
 //!
 //! Split of responsibilities:
-//!   * the DRAFT model (5-layer cross-attending transformer, markov head,
-//!     confidence head, context K/V cache) lives in [`super::dspark`];
+//!   * the DSpark DRAFT model (5-layer cross-attending transformer, markov
+//!     head, confidence head, context K/V cache) lives in [`super::dspark`];
+//!     the assistant draft + its stepper live in [`super::assistant`] /
+//!     [`super::assistant_decode`];
 //!   * the TARGET-side primitives (hidden tap, verify forward,
 //!     snapshot/commit rollback, shared-slot mask) live in
 //!     [`super::model`] / [`super::layer_cache`];
 //!   * the model-agnostic propose → verify → accept → stop-clamp → commit
 //!     loop lives in [`crate::engine::dspark_turn`];
-//!   * THIS module glues them together for gemma4.
+//!   * THIS module glues them together for gemma4: the DSpark stepper, the
+//!     variant dispatch ([`Gemma4DraftTurnState`] / [`Gemma4DraftStepper`] /
+//!     `begin_dspark_decode`), and the whole-turn core.
 
 use std::time::Instant;
 
@@ -53,14 +57,12 @@ use super::model::{
 /// with the loaded draft variant.
 pub(crate) enum Gemma4DraftTurnState {
     Dspark(DsparkTurnState),
-    // Stashed by the whole-turn core's assistant prefill arm; exercised by
-    // the assistant decode tests until that arm lands.
-    #[allow(dead_code)]
     Assistant(AssistantTurnState),
 }
 
 /// DSpark's [`Gemma4DraftTurnState`] payload: the draft's fused-context
-/// cache built by `dspark_chat_turn`'s tapped prefill.
+/// cache built by the whole-turn core's tapped prefill
+/// (`dspark_prefill_with_tap`).
 pub(crate) struct DsparkTurnState {
     /// The draft's fused-context K/V cache, holding one row per freshly
     /// prefilled prompt token (absolute positions
@@ -387,23 +389,25 @@ impl DsparkBackend for Gemma4Inner {
 }
 
 impl Gemma4Inner {
-    /// DSpark whole-turn core behind gemma4's `ChatBackend::mtp_turn`
-    /// override — the DSpark analog of the engine's generic
-    /// `chat_turn_core` tail, sync AND streaming through the same body
-    /// (`args.sink` presence selects the mode, mirroring
+    /// Draft whole-turn core (both [`Gemma4Draft`] variants) behind
+    /// gemma4's `ChatBackend::mtp_turn` override — the draft analog of the
+    /// engine's generic `chat_turn_core` tail, sync AND streaming through
+    /// the same body (`args.sink` presence selects the mode, mirroring
     /// `vision_chat_turn` / the MTP whole-turn cores).
     ///
     /// Flow: resolve params (+ `extra_eos_ids`) → prefix decision via the
-    /// existing cache-prefix machinery → chunked prefill WITH the DSpark
-    /// tap (per-chunk capture → fuse → context-append → drop; full-prompt
-    /// tapped hiddens are never held) → anchor sample (byte-identical to
-    /// the generic flow) → `run_dspark_turn` → save (AR-parity: stop exits
-    /// drop the final token, length exits materialize its K/V and keep
-    /// all — post-turn history AND cache offsets equal the AR flow's for
-    /// every stop shape) → finalize (+ default `augment_performance`,
-    /// which fills the `mtp_*` acceptance fields). Every error between
-    /// prefill start and the save fails CLOSED (`dspark_fail_closed`).
-    pub(crate) fn dspark_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    /// existing cache-prefix machinery → the VARIANT's prefill (DSpark:
+    /// chunked prefill WITH the hidden tap, per-chunk capture → fuse →
+    /// context-append → drop; assistant: the same chunked prefill keeping
+    /// only the last token's post-final-norm hidden) → anchor sample
+    /// (byte-identical to the generic flow) → `run_dspark_turn` → save
+    /// (AR-parity: stop exits drop the final token, length exits
+    /// materialize its K/V and keep all — post-turn history AND cache
+    /// offsets equal the AR flow's for every stop shape) → finalize
+    /// (+ default `augment_performance`, which fills the `mtp_*`
+    /// acceptance fields). Every error between prefill start and the save
+    /// fails CLOSED (`draft_fail_closed`).
+    pub(crate) fn draft_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         let eos_id = args.eos_id;
         let thinking = args.thinking;
@@ -481,21 +485,36 @@ impl Gemma4Inner {
         let mut emitter: Option<Box<dyn StreamEmitter>> =
             args.sink.map(|_| ChatBackend::stream_emitter(self));
 
-        // --- tapped prefill: target K/V + the draft's fused context ---
+        // --- variant prefill: target K/V + the draft's per-turn state ---
         // From here until the save runs, every error FAILS CLOSED
-        // (`dspark_fail_closed`): the target caches advance during
+        // (`draft_fail_closed`): the target caches advance during
         // prefill/verify with nothing recorded in `cached_token_history`
         // yet, so an error abandoned mid-flight would leave a
         // history-vs-cache offset mismatch that a later prefix-reuse hit
         // could warm-start corrupt K/V from.
         profiler.begin_prefill();
-        let (last_logits, turn_state) = match self.dspark_prefill_with_tap(
-            &prefill_tokens,
-            cached_prefix_len as i32,
-            generation_stream,
-        ) {
-            Ok(v) => v,
-            Err(e) => return Err(self.dspark_fail_closed(e)),
+        let (last_logits, turn_state) = match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(_)) => match self.dspark_prefill_with_tap(
+                &prefill_tokens,
+                cached_prefix_len as i32,
+                generation_stream,
+            ) {
+                Ok((logits, state)) => (logits, Gemma4DraftTurnState::Dspark(state)),
+                Err(e) => return Err(self.draft_fail_closed(e)),
+            },
+            Some(Gemma4Draft::Assistant(_)) => match self.assistant_prefill_with_hidden(
+                &prefill_tokens,
+                cached_prefix_len as i32,
+                generation_stream,
+            ) {
+                Ok((logits, state)) => (logits, Gemma4DraftTurnState::Assistant(state)),
+                Err(e) => return Err(self.draft_fail_closed(e)),
+            },
+            None => {
+                return Err(self.draft_fail_closed(Error::from_reason(
+                    "gemma4 draft turn: no draft model loaded",
+                )));
+            }
         };
         profiler.end_prefill();
 
@@ -504,29 +523,33 @@ impl Gemma4Inner {
             .and_then(|logits| crate::sampling::sample(&logits, p.sampling_config))
         {
             Ok(y) => y,
-            Err(e) => return Err(self.dspark_fail_closed(e)),
+            Err(e) => return Err(self.draft_fail_closed(e)),
         };
         y.eval();
 
         if let Err(e) = ChatBackend::eval_caches(self) {
-            return Err(self.dspark_fail_closed(e));
+            return Err(self.draft_fail_closed(e));
         }
         if report_perf {
             first_token_instant = Some(Instant::now());
         }
 
-        let block_size = match self.dspark_draft().map(|d| d.config.block_size) {
-            Some(b) => b,
+        // Per-cycle draft cap: DSpark blocks are checkpoint-pinned; the
+        // assistant drafts by chained AR steps, so the resolved depth IS
+        // the cap.
+        let block_size = match self.draft.as_ref() {
+            Some(Gemma4Draft::Dspark(draft)) => draft.config.block_size,
+            Some(Gemma4Draft::Assistant(_)) => p.mtp_depth,
             None => {
-                return Err(self.dspark_fail_closed(Error::from_reason(
-                    "gemma4 DSpark turn: no draft model loaded",
+                return Err(self.draft_fail_closed(Error::from_reason(
+                    "gemma4 draft turn: no draft model loaded",
                 )));
             }
         };
 
-        // Hand the prefill-built draft context to the stepper (taken by
+        // Hand the prefill-built draft state to the stepper (taken by
         // `begin_dspark_decode` inside the loop).
-        self.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(turn_state));
+        self.draft_turn_state = Some(turn_state);
 
         let mut rng = rand::rng();
         let mut last_in_cache;
@@ -570,7 +593,7 @@ impl Gemma4Inner {
             // stash, whether or not `begin_dspark_decode` consumed it.
             match outcome {
                 Ok(o) => last_in_cache = o.last_in_cache,
-                Err(e) => return Err(self.dspark_fail_closed(e)),
+                Err(e) => return Err(self.draft_fail_closed(e)),
             }
         }
 
@@ -591,7 +614,7 @@ impl Gemma4Inner {
             && let Some(&final_token) = generated_tokens.last()
         {
             if let Err(e) = self.dspark_materialize_final(final_token, generation_stream) {
-                return Err(self.dspark_fail_closed(e));
+                return Err(self.draft_fail_closed(e));
             }
             last_in_cache = true;
         }
@@ -851,7 +874,7 @@ impl Gemma4Inner {
         ))
     }
 
-    /// Fail CLOSED after a DSpark turn error that may have left the target
+    /// Fail CLOSED after a draft turn error that may have left the target
     /// caches advanced beyond `cached_token_history` (prefill and verify
     /// write K/V before the save records anything): drop the whole warm
     /// session via `reset_caches_sync` (caches → `None`, history/media
@@ -859,9 +882,9 @@ impl Gemma4Inner {
     /// no later turn can prefix-match into corrupt or misaligned K/V. The
     /// next fresh turn takes the cold path (full re-prefill); a delta turn
     /// on the dropped session is rejected by the live-session guard.
-    /// Returns the error for `return Err(self.dspark_fail_closed(e))`
+    /// Returns the error for `return Err(self.draft_fail_closed(e))`
     /// ergonomics.
-    fn dspark_fail_closed(&mut self, err: Error) -> Error {
+    fn draft_fail_closed(&mut self, err: Error) -> Error {
         // Infallible today (`caches = None` + field clears); even if it
         // ever grows a fallible arm, nothing warm-reusable can survive it.
         let _ = self.reset_caches_sync();
@@ -1226,7 +1249,7 @@ pub(crate) mod tests {
     /// WordLevel tokenizer covering the full tiny vocab (ids 0..16 as
     /// `t0`..`t15`) so every decode over tiny-model output succeeds,
     /// written to a temp `tokenizer.json` for `Qwen3Tokenizer::from_file`.
-    fn tiny_qwen_tokenizer() -> Arc<crate::tokenizer::Qwen3Tokenizer> {
+    pub(crate) fn tiny_qwen_tokenizer() -> Arc<crate::tokenizer::Qwen3Tokenizer> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -1263,7 +1286,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn tiny_turn_config(mtp_depth: Option<i32>, max_new_tokens: i32) -> ChatConfig {
+    pub(crate) fn tiny_turn_config(mtp_depth: Option<i32>, max_new_tokens: i32) -> ChatConfig {
         ChatConfig {
             mtp_depth,
             max_new_tokens: Some(max_new_tokens),
@@ -1275,9 +1298,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Drive `dspark_chat_turn` directly (sync — no model thread), with an
+    /// Drive `draft_chat_turn` directly (sync — no model thread), with an
     /// out-of-vocab `eos_id` so the tiny model can only exit "length".
-    fn run_tiny_dspark_turn(
+    pub(crate) fn run_tiny_draft_turn(
         inner: &mut Gemma4Inner,
         tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
         tokens: &[u32],
@@ -1298,9 +1321,9 @@ pub(crate) mod tests {
             images: &[],
             audio: &[],
         };
-        match inner.dspark_chat_turn(&mut args)? {
+        match inner.draft_chat_turn(&mut args)? {
             TurnOutput::Complete(r) => Ok(*r),
-            TurnOutput::Streamed => panic!("sync dspark turn returned TurnOutput::Streamed"),
+            TurnOutput::Streamed => panic!("sync draft turn returned TurnOutput::Streamed"),
         }
     }
 
@@ -1327,7 +1350,7 @@ pub(crate) mod tests {
 
         // Turn 1: unset depth resolves to block_size 3 → 1+3 verify rows
         // over a 2-token window → hard error mid-turn.
-        let err = run_tiny_dspark_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+        let err = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
             .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
         assert!(
             err.reason.contains("sliding window") && err.reason.contains("verify block"),
@@ -1356,7 +1379,7 @@ pub(crate) mod tests {
 
         // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
         // turn must run cold end-to-end and land fully consistent.
-        let res = run_tiny_dspark_turn(
+        let res = run_tiny_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,
@@ -1398,10 +1421,10 @@ pub(crate) mod tests {
     /// Records every chunk and flips the shared cancel flag once
     /// `flip_after` NON-TERMINAL chunks have arrived (the sink runs inline
     /// on the decode thread, so the flip lands mid-turn deterministically).
-    struct CancelAfterSink {
-        chunks: std::sync::Mutex<Vec<crate::engine::types::ChatStreamChunk>>,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
-        flip_after: usize,
+    pub(crate) struct CancelAfterSink {
+        pub(crate) chunks: std::sync::Mutex<Vec<crate::engine::types::ChatStreamChunk>>,
+        pub(crate) cancelled: Arc<std::sync::atomic::AtomicBool>,
+        pub(crate) flip_after: usize,
     }
 
     impl crate::engine::backend::ChunkSink for CancelAfterSink {
@@ -1416,7 +1439,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// WHOLE-TURN streaming cancellation through `dspark_chat_turn`: a
+    /// WHOLE-TURN streaming cancellation through `draft_chat_turn`: a
     /// cancel raised from the chunk sink must terminate the stream promptly
     /// ("cancelled", bounded block-granular overrun — never running on to
     /// the budget) and leave the cached session state consistent (AR-parity
@@ -1468,7 +1491,7 @@ pub(crate) mod tests {
             audio: &[],
         };
         let out = inner
-            .dspark_chat_turn(&mut args)
+            .draft_chat_turn(&mut args)
             .expect("streaming cancelled turn must complete cleanly");
         assert!(
             matches!(out, TurnOutput::Streamed),
@@ -1518,7 +1541,7 @@ pub(crate) mod tests {
 
         // The next turn runs normally (fresh prompt: the longer saved
         // history is a prefix-miss, so it takes the cold path).
-        let res = run_tiny_dspark_turn(
+        let res = run_tiny_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,

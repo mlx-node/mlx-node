@@ -330,7 +330,6 @@ impl Gemma4Inner {
     ///
     /// Returns the sampling-ready last-token logits `[1, vocab]` plus the
     /// turn's [`AssistantTurnState`].
-    #[allow(dead_code)] // wired into the whole-turn core with the draft turn generalization
     pub(crate) fn assistant_prefill_with_hidden(
         &mut self,
         prefill_tokens: &[u32],
@@ -452,17 +451,24 @@ impl Gemma4Inner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::engine::backend::{ChatBackend, DsparkBackend, DsparkTurnSetup};
+    use crate::engine::backend::{
+        ChatBackend, DsparkBackend, DsparkTurnSetup, TurnOutput, WholeTurnArgs,
+    };
     use crate::engine::types::ChatConfig;
+    use crate::models::gemma4::assistant::AssistantDraftModel;
     use crate::models::gemma4::dspark::DsparkContextCache;
     use crate::models::gemma4::dspark_decode::tests::{
-        chat_config, tiny_inner_with_assistant_draft, tiny_inner_with_draft,
+        CancelAfterSink, chat_config, run_tiny_draft_turn, tiny_assistant_config,
+        tiny_inner_with_assistant_draft, tiny_inner_with_draft, tiny_qwen_tokenizer,
+        tiny_target_config, tiny_target_config_with_window, tiny_turn_config,
     };
     use crate::models::gemma4::dspark_decode::{
         DsparkTurnState, Gemma4DraftStepper, Gemma4DraftTurnState,
     };
-    use crate::models::gemma4::model::dspark_shared_slot_mask;
+    use crate::models::gemma4::model::{Gemma4Draft, dspark_shared_slot_mask};
     use crate::stream::DeviceType;
 
     fn to_vec_f32(a: &MxArray) -> Vec<f32> {
@@ -752,5 +758,208 @@ mod tests {
                 "cache {i} offset after commit keep=2"
             );
         }
+    }
+
+    // ── fail-closed error path (whole-turn core) ───────────────────────
+
+    /// FAIL-CLOSED regression on the ASSISTANT variant (the port of the
+    /// DSpark `dspark_turn_error_fails_closed_then_cold_turn_recovers`
+    /// test): a REAL (unmocked) stepper error AFTER prefill has advanced
+    /// the target caches must drop the entire warm session, and the very
+    /// next turn must succeed via the cold path.
+    ///
+    /// Error injection: sliding_window 2 with the default assistant depth
+    /// (3) makes the first cycle's 4-row verify block violate
+    /// `snapshot_before_verify`'s window >= block invariant — the error
+    /// fires at the verify seam of cycle 1, after
+    /// `assistant_prefill_with_hidden` appended the whole prompt to every
+    /// active cache.
+    #[test]
+    fn assistant_turn_error_fails_closed_then_cold_turn_recovers() {
+        let mut inner = Gemma4Inner::new(tiny_target_config_with_window(2))
+            .expect("tiny window-2 Gemma4Inner must construct");
+        inner.draft = Some(Gemma4Draft::Assistant(
+            AssistantDraftModel::new(tiny_assistant_config()).expect("tiny assistant draft"),
+        ));
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+
+        // Turn 1: unset depth resolves to ASSISTANT_DEFAULT_DEPTH (3) →
+        // 1+3 verify rows over a 2-token window → hard error mid-turn.
+        let err = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+            .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
+        assert!(
+            err.reason.contains("sliding window") && err.reason.contains("verify block"),
+            "expected the snapshot_before_verify window guard, got: {}",
+            err.reason
+        );
+        // Fail CLOSED: nothing warm-reusable may survive the error.
+        assert!(inner.caches.is_none(), "caches must be dropped");
+        assert!(
+            inner.cached_token_history.is_empty(),
+            "cached_token_history must be cleared (it never covered the prefilled K/V)"
+        );
+        assert!(
+            inner.draft_turn_state.is_none(),
+            "the per-turn draft stash must be cleared"
+        );
+        assert!(
+            !ChatBackend::has_live_session(&inner),
+            "the session must not be warm-reusable after a failed turn"
+        );
+        assert_eq!(
+            ChatBackend::verify_cache_prefix(&inner, &tokens, true),
+            0,
+            "no prefix hit may match against the dropped session"
+        );
+
+        // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
+        // turn must run cold end-to-end and land fully consistent.
+        let res = run_tiny_draft_turn(
+            &mut inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(Some(1), 3),
+        )
+        .expect("the next turn after fail-closed must succeed via the cold path");
+        assert_eq!(res.finish_reason, "length");
+        assert_eq!(
+            res.cached_tokens, 0,
+            "nothing may be warm-reused after fail-closed"
+        );
+        assert_eq!(res.num_tokens, 3, "budget-3 length exit");
+
+        // Length-exit AR parity (keep-all + materialize): the saved history
+        // holds prompt + ALL generated tokens and every ACTIVE cache offset
+        // equals the history length.
+        let history = inner.cached_token_history.clone();
+        assert_eq!(history.len(), tokens.len() + res.num_tokens as usize);
+        assert_eq!(&history[..tokens.len()], &tokens[..]);
+        let mask = dspark_shared_slot_mask(&inner.config);
+        let caches = inner
+            .caches
+            .as_ref()
+            .expect("live caches after a successful turn");
+        for (i, cache) in caches.iter().enumerate() {
+            let expected = if mask[i] { 0 } else { history.len() as i32 };
+            assert_eq!(
+                cache.get_offset(),
+                expected,
+                "cache {i} offset must equal the saved history length \
+                 (length-exit materialize; shared slots stay unwritten)"
+            );
+        }
+    }
+
+    // ── streaming cancellation (whole-turn) ────────────────────────────
+
+    /// WHOLE-TURN streaming cancellation through `draft_chat_turn` on the
+    /// ASSISTANT variant (mechanical port of the DSpark
+    /// `dspark_streaming_cancel_whole_turn_state_consistent` test): a
+    /// cancel raised from the chunk sink must terminate the stream promptly
+    /// ("cancelled", bounded block-granular overrun — never running on to
+    /// the budget) and leave the cached session state consistent (AR-parity
+    /// drop-last: the final emitted token is persisted in NEITHER the
+    /// history NOR the caches; offsets equal the history), with the next
+    /// turn running normally.
+    #[test]
+    fn assistant_streaming_cancel_whole_turn_state_consistent() {
+        // Placeholder weights come from MLX's global PRNG; pin it so the
+        // token stream — and with it the chunk/flip timing the `n` bound
+        // below asserts on — is identical on every run.
+        unsafe { mlx_sys::mlx_seed(0xA551_0003) };
+        let mut inner =
+            Gemma4Inner::new(tiny_target_config()).expect("tiny Gemma4Inner must construct");
+        inner.draft = Some(Gemma4Draft::Assistant(
+            AssistantDraftModel::new(tiny_assistant_config()).expect("tiny assistant draft"),
+        ));
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        // Budget 12 with a flip after 2 chunks: a broken cancel would run to
+        // the length exit and emit ~12 chunks.
+        let mut config = tiny_turn_config(Some(1), 12);
+        config.include_reasoning = Some(true);
+
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = CancelAfterSink {
+            chunks: std::sync::Mutex::new(Vec::new()),
+            cancelled: Arc::clone(&cancelled),
+            flip_after: 2,
+        };
+        let p = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: 999,
+            config: &config,
+            params: &p,
+            thinking,
+            is_delta: false,
+            sink: Some(&sink),
+            cancelled: Some(&cancelled),
+            images: &[],
+            audio: &[],
+        };
+        let out = inner
+            .draft_chat_turn(&mut args)
+            .expect("streaming cancelled turn must complete cleanly");
+        assert!(
+            matches!(out, TurnOutput::Streamed),
+            "streaming turn must return TurnOutput::Streamed"
+        );
+
+        let chunks = sink.chunks.into_inner().expect("sink poisoned");
+        let terminal = chunks
+            .iter()
+            .find(|c| c.done)
+            .expect("stream must end with a terminal done-chunk");
+        assert_eq!(
+            terminal.finish_reason.as_deref(),
+            Some("cancelled"),
+            "sink-raised cancel must finish the turn as cancelled"
+        );
+        let n = terminal.num_tokens.expect("terminal must carry num_tokens") as usize;
+        assert!(
+            (1..=5).contains(&n),
+            "cancel must stop within one depth-1 cycle of the flip \
+             (seed + <= 2 cycles of <= 2 tokens), got {n} generated tokens"
+        );
+
+        // AR-parity cancelled save: the final emitted token is dropped from
+        // the history AND was never committed to the caches.
+        let history = inner.cached_token_history.clone();
+        assert_eq!(
+            history.len(),
+            tokens.len() + n - 1,
+            "cancelled turn must persist prompt + generated minus the final token"
+        );
+        assert_eq!(&history[..tokens.len()], &tokens[..]);
+        let mask = dspark_shared_slot_mask(&inner.config);
+        let caches = inner.caches.as_ref().expect("live caches after the turn");
+        for (i, cache) in caches.iter().enumerate() {
+            let expected = if mask[i] { 0 } else { history.len() as i32 };
+            assert_eq!(
+                cache.get_offset(),
+                expected,
+                "cache {i} offset must equal the saved history length after a cancel"
+            );
+        }
+        assert!(
+            ChatBackend::has_live_session(&inner),
+            "a cleanly cancelled turn leaves a warm-reusable session (AR parity)"
+        );
+
+        // The next turn runs normally (fresh prompt: the longer saved
+        // history is a prefix-miss, so it takes the cold path).
+        let res = run_tiny_draft_turn(
+            &mut inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(Some(1), 3),
+        )
+        .expect("the turn after a cancelled stream must succeed");
+        assert_eq!(res.finish_reason, "length");
+        assert_eq!(res.num_tokens, 3);
     }
 }

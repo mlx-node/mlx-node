@@ -30,7 +30,7 @@ use crate::stream::Stream;
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
 /// prompt-hidden seed fields (the DSpark stepper owns its draft-context
 /// seeding) and plus the draft `block_size`. Constructed in production by
-/// gemma4's `dspark_chat_turn`.
+/// gemma4's `draft_chat_turn`.
 pub(crate) struct DsparkTurnArgs<'a> {
     /// First generated token (sampled from the prefill logits BEFORE the
     /// turn). The loop takes ownership and emits it first (guarded by the
@@ -95,7 +95,7 @@ enum CycleStop {
 /// `anchor = boundary; eval_boundary`.
 ///
 /// Driven in production by gemma4's `mtp_turn` override
-/// (`dspark_chat_turn`); the module's mock tests pin the loop contract.
+/// (`draft_chat_turn`); the module's mock tests pin the loop contract.
 pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     backend: &mut B,
     rng: &mut R,
