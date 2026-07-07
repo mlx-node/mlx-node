@@ -79,6 +79,7 @@ describe.skipIf(!gated)('Gemma4 DSpark speculative decoding — TS e2e (greedy m
 
     // T=0 losslessness: byte-equal output against the no-draft session.
     expect(dspark.text).toBe(ar.text);
+    expect(dspark.rawText).toBe(ar.rawText);
     expect(dspark.finishReason).toBe(ar.finishReason);
     expect(dspark.numTokens).toBe(ar.numTokens);
 

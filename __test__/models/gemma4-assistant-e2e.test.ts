@@ -88,6 +88,7 @@ describe.skipIf(!gated)('Gemma4 assistant-draft speculative decoding — TS e2e 
 
     // T=0 losslessness: byte-equal output against the no-draft session.
     expect(assistant.text).toBe(ar.text);
+    expect(assistant.rawText).toBe(ar.rawText);
     expect(assistant.finishReason).toBe(ar.finishReason);
     expect(assistant.numTokens).toBe(ar.numTokens);
 
