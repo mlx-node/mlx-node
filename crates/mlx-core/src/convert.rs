@@ -1565,8 +1565,12 @@ pub struct ConversionOptions {
     pub imatrix_path: Option<String>,
 
     /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-    /// When true, applies after the recipe predicate: any 8-bit affine decision
-    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// When true, applies after the recipe predicate: eligible 8-bit affine
+    /// decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+    /// affine-only loaders (lm_head, embed_tokens, router.proj,
+    /// embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+    /// and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+    /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 
@@ -3959,14 +3963,14 @@ pub(crate) fn apply_mxfp_upgrade(
         if is_bitexact_affine_proj(key) {
             return original;
         }
-        // Router gates and shared_expert_gate: ALWAYS force 8-bit affine,
-        // regardless of what the inner predicate returned. MXFP8's coarse
-        // E8M0 scales destroy top-K routing precision. We do not preserve
-        // `Skip` here either: a recipe that wants to keep gates at full
-        // precision would not have a meaningful interaction with `--q-mxfp`
-        // since the loader has no path to load an unquantized gate when
-        // every other weight is quantized. Forcing affine 8-bit matches
-        // Python mlx-lm's `quant_predicate` in `qwen3_5.py`.
+        // Router gates and shared_expert_gate: force 8-bit affine (group_size
+        // 64), but PRESERVE an explicit `Skip` from the inner predicate. MXFP8's
+        // coarse E8M0 scales destroy top-K routing precision, so any non-Skip
+        // gate decision (Default or Custom) is rewritten to affine 8-bit —
+        // matching Python mlx-lm's `quant_predicate` in `qwen3_5.py`
+        // (`{group_size: 64, bits: 8}`). A recipe that returns `Skip` for a gate
+        // (keep it dense/bf16) is honored as-is. Mirrors the Skip-preserving
+        // gate branch in `apply_nvfp4_upgrade`.
         if is_router_gate(key) {
             match original {
                 QuantDecision::Skip => return QuantDecision::Skip,
@@ -5110,8 +5114,8 @@ fn quantize_weights_inner(
 ///
 /// Returns the per-layer override map produced by `quantize_weights_inner`.
 /// The no-recipe path still emits non-default entries for special keys —
-/// e.g. router gates are upgraded to mxfp8 under a global MXFP mode, and
-/// `lm_head` / `router.proj` are forced back to affine — so callers MUST
+/// e.g. router gates are forced to 8-bit affine (regardless of the top-level
+/// MXFP mode), like `lm_head` / `router.proj` — so callers MUST
 /// thread the returned map into `config.json["quantization"]` for the
 /// loader to dispatch correctly.
 fn quantize_weights(

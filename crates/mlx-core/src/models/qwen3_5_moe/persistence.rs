@@ -429,17 +429,28 @@ pub(crate) fn try_build_quantized_switch_linear(
 ///
 /// Returns `(default_plq, default_gate_plq)`.
 ///
-/// Router gate fallback. Historically router gates were always affine 8-bit,
-/// but `--q-mxfp --q-bits 8` (no recipe) upgrades router gates to MXFP8 via
-/// `quantize_weights_inner`'s `is_router_gate` branch. When the global
-/// default also becomes MXFP8 the gate entry matches the global default
-/// exactly, so no per-layer override is emitted to config.json; on load
-/// `per_layer_quant.get(gate_prefix)` then returns None and we fall back
-/// to `default_gate_plq`. It MUST track the top-level mode for those cases.
+/// Router gate fallback for a body gate prefix that has NO per-layer override.
+/// `default_gate_plq` is affine 8/64 for every top-level mode except Mxfp8,
+/// where it is mxfp8 8/32.
 ///
-/// Mode mapping: only MXFP8 is meaningful for router gates (gates are
-/// always 8-bit; MXFP4 gates don't exist), so MXFP4 / Affine top-level
-/// modes both keep the historical affine fallback. MXFP8 → mxfp8/gs=32.
+/// Convert forces body router gates to affine 8/64 (`is_router_gate` in
+/// `apply_mxfp_upgrade` / `quantize_weights_inner`) and emits a per-gate
+/// override only when that decision differs from the top-level default:
+///   - top-level affine 8/64 (recipe path, incl. recipe `--q-mxfp`; or an
+///     affine-8/64 no-recipe convert): the redundant override is ELIDED and the
+///     gate resolves via THIS affine `default_gate_plq` fallback — so the affine
+///     branch is live, not vestigial.
+///   - top-level Mxfp8 (`--q-mode mxfp8`, or no-recipe `--q-mxfp --q-bits 8`):
+///     the affine gate decision differs from the mxfp8 default, so an explicit
+///     affine override IS emitted and `effective_plq_for` resolves the gate from
+///     it. Because that override is always present when the top level is Mxfp8,
+///     the mxfp8 `default_gate_plq` branch never resolves a convert-produced
+///     gate (it could only fire for a foreign/hand-edited config declaring
+///     mode=mxfp8 with no per-gate override). No convert path loads a gate mxfp8.
+///
+/// (MTP-layer gates are governed by the `--q-mtp` policy — the quantizing
+/// policies `cyankiwi`/`all` give them direct affine overrides via
+/// `mtp_quant_decision`.)
 fn compute_moe_defaults(
     params: &HashMap<String, MxArray>,
     top_level_mode: Option<PerLayerMode>,

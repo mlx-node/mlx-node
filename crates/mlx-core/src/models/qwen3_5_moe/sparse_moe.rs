@@ -107,7 +107,7 @@ impl SparseMoeBlock {
 
         // Routing math (softmax-then-topk, optionally renormalized) is shared
         // with the gpt-oss / privacy-filter path via `moe::topk_from_logits`.
-        // The gate matmul stays here because it may be quantized (MXFP8) —
+        // The gate matmul stays here because it may be quantized (8-bit affine) —
         // the shared `TopKRouter` only handles plain `MxArray` gate weights.
         let (top_weights, top_indices) = topk_from_logits(
             &router_logits,

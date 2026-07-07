@@ -54,21 +54,28 @@ Quantization Arguments:
                         with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
                         Applies after the recipe predicate: any 8-bit affine
-                        decision becomes mxfp8, any 4-bit becomes mxfp4. Requires
-                        --quantize and --q-mode affine (default). Forces
-                        group_size=32 for upgraded layers. Skipped keys (kept at
-                        8-bit affine for accuracy or loader compatibility):
+                        decision becomes mxfp8, any 4-bit becomes mxfp4 — except
+                        the recipe-pinned attention/GDN projections (o_proj /
+                        out_proj / in_proj_a / in_proj_b), which stay 8-bit
+                        affine. Requires --quantize and --q-mode affine
+                        (default). Forces
+                        group_size=32 for upgraded layers. Skipped keys fall into
+                        two classes: (1) affine-only loaders keep their
+                        recipe-assigned affine bits (NOT necessarily 8-bit) —
                         lm_head, router projections, embed_tokens (incl. Gemma4
-                        embed_tokens_per_layer), embedding_projection, and MoE
-                        router gates (mlp.gate / shared_expert_gate). MXFP8's
-                        coarse E8M0 scales destroy top-K expert routing on the
-                        gates, matching the Python mlx-lm quant_predicate.
+                        embed_tokens_per_layer), embedding_projection; (2) MoE
+                        router gates (e.g. mlp.gate / shared_expert_gate /
+                        feed_forward.gate) are forced to 8-bit affine, because
+                        MXFP8's coarse E8M0 scales destroy
+                        top-K expert routing, matching the Python mlx-lm
+                        quant_predicate.
 
                         Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp
                         promotes mlp.gate_proj/up_proj to mxfp4 (q/k/v at 6-bit
                         affine, down_proj at 5-bit affine, router gates at 8-bit
-                        affine, lm_head at 8-bit affine, o_proj/out_proj at
-                        8-bit affine). At default --q-bits 3 only down_proj
+                        affine, lm_head at 8-bit affine,
+                        o_proj/out_proj/in_proj_a/in_proj_b at 8-bit affine). At
+                        default --q-bits 3 only down_proj
                         (4b -> mxfp4) gets the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
@@ -263,7 +270,7 @@ export async function run(argv: string[]) {
   }
 
   // Apply recipe-specific defaults for bits when not explicitly set.
-  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, out_proj=bf16
+  // Unsloth recipe: 3-bit base → MLP gate/up=3b, down=4b, embed=5b, lm_head=6b, attn q/k/v=5b+AWQ, o_proj/out_proj/in_proj_a/in_proj_b=8b affine
   // Exception: --q-mode nvfp4 forces bits=4 regardless of recipe, because
   // NVFP4 invariant requires bits=4 (the unsloth 3-bit default would otherwise
   // produce an inconsistent checkpoint: top-level bits=3 but per-layer
@@ -357,7 +364,9 @@ export async function run(argv: string[]) {
       const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
       const qBits = effectiveQuantBits || defaultBits;
       const qGs = quantGroupSize || defaultGs;
-      const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
+      const qMxfpSuffix = args['q-mxfp']
+        ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+        : '';
       console.log(
         `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
       );
@@ -519,7 +528,9 @@ export async function run(argv: string[]) {
     const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
-    const qMxfpSuffix = args['q-mxfp'] ? ', --q-mxfp: 8b->mxfp8, 4b->mxfp4' : '';
+    const qMxfpSuffix = args['q-mxfp']
+      ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+      : '';
     const qGsLabel = qMode === 'sym8' ? 'per-output-channel' : `group_size=${qGs}`;
     console.log(
       `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,

@@ -1249,8 +1249,12 @@ pub struct GgufConversionOptions {
     pub vlm_key_prefix: Option<bool>,
 
     /// Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-    /// When true, applies after the recipe predicate: any 8-bit affine decision
-    /// becomes mxfp8, any 4-bit decision becomes mxfp4. Requires `quant_mode = "affine"`.
+    /// When true, applies after the recipe predicate: eligible 8-bit affine
+    /// decisions become mxfp8 and 4-bit become mxfp4. Kept affine (not upgraded):
+    /// affine-only loaders (lm_head, embed_tokens, router.proj,
+    /// embedding_projection) at their recipe bits, MoE router gates (8-bit affine),
+    /// and the recipe-pinned attention/GDN projections (o_proj / out_proj /
+    /// in_proj_a / in_proj_b, 8-bit affine). Requires `quant_mode = "affine"`.
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 }

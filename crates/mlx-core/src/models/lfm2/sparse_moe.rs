@@ -32,8 +32,9 @@ use super::config::Lfm2Config;
 
 /// LFM2.5 sparse MoE block.
 pub struct Lfm2SparseMoeBlock {
-    /// Router gate: `Standard(Linear)` for bf16/f16, `Quantized` (MXFP8) for
-    /// quantized checkpoints.
+    /// Router gate: `Standard(Linear)` for bf16/f16, `Quantized` for quantized
+    /// checkpoints. Convert forces `feed_forward.gate` to 8-bit affine (never
+    /// mxfp8) via `is_router_gate`, so the quantized form is 8-bit affine.
     gate: LinearProj,
     /// Expert-indexed SwiGLU (gather_mm / gather_qmm). Reused from qwen3_5_moe.
     switch_mlp: SwitchGLU,

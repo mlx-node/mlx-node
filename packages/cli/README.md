@@ -183,9 +183,10 @@ Per-tensor bit assignments (N = `--q-bits`):
 | `linear_attn.in_proj_qkv/z` | N+2  | AWQ-correctable via input_layernorm               |
 | `lm_head`                   | N+3  | Safest tensor (KLD ~0.05)                         |
 | Router gates                | 8    | Standard for MoE routing accuracy                 |
-| `self_attn.o_proj`          | bf16 | No preceding norm — not AWQ-correctable           |
-| `linear_attn.out_proj`      | bf16 | Worst tensor (KLD ~6.0) — not AWQ-correctable     |
-| GDN params (`A_log`, etc.)  | bf16 | Recurrent state params, errors compound over time |
+| `self_attn.o_proj`          | 8 affine | No preceding norm (not AWQ) — kept 8-bit for MTP/AR parity |
+| `linear_attn.out_proj`      | 8 affine | Worst tensor (KLD ~6.0) — kept 8-bit for MTP/AR parity     |
+| `linear_attn.in_proj_a/b`   | 8 affine | Split GDN low-rank projs — kept 8-bit for MTP/AR parity    |
+| GDN params (`A_log`, etc.)  | bf16     | Recurrent state params, errors compound over time         |
 
 ## Examples
 
