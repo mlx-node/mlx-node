@@ -37,6 +37,14 @@ pub(crate) const ASSISTANT_MODEL_TYPES: [&str; 2] =
 const SLIDING_ATTENTION: &str = "sliding_attention";
 const FULL_ATTENTION: &str = "full_attention";
 
+/// Upper bound on every draft config dimension AND on the projection widths
+/// derived from them (`num_attention_heads * head_dim`, `2 *
+/// backbone_hidden_size`): 2^24 = 16,777,216 — far above any real checkpoint
+/// value (max real: vocab_size 262144, intermediate_size 8192) and low
+/// enough that every downstream `as u32`/`as i32` cast and dimension product
+/// in module construction is lossless.
+const ASSISTANT_MAX_DIM: i64 = 1 << 24;
+
 // ============================================
 // Config
 // ============================================
@@ -139,9 +147,12 @@ impl AssistantConfig {
             ));
         }
         // Draft-local sanity BEFORE the target-compat arms: every signed
-        // dimension below is later cast with `as u32`/`as usize` (or used in
-        // modulo math) during module construction, so zero/negative values
-        // must be rejected here rather than wrap into absurd allocations.
+        // dimension below is later cast with `as u32`/`as i32`/`as usize`
+        // (or used in modulo math) during module construction. Bounding each
+        // field to (0, ASSISTANT_MAX_DIM] — and the projection-width
+        // products below to the same bound — guarantees all of those casts
+        // and dimension products are lossless, instead of zero/negative or
+        // oversized values wrapping into absurd placeholder allocations.
         let text = &self.text_config;
         for (field, value) in [
             ("backbone_hidden_size", self.backbone_hidden_size),
@@ -162,13 +173,46 @@ impl AssistantConfig {
                     "assistant draft {field}={value} must be positive"
                 )));
             }
+            if value > ASSISTANT_MAX_DIM {
+                return Err(Error::from_reason(format!(
+                    "assistant draft {field}={value} exceeds sane bound {ASSISTANT_MAX_DIM}"
+                )));
+            }
         }
-        if let Some(global_head_dim) = text.global_head_dim
-            && global_head_dim <= 0
-        {
-            return Err(Error::from_reason(format!(
-                "assistant draft global_head_dim={global_head_dim} must be positive"
-            )));
+        if let Some(global_head_dim) = text.global_head_dim {
+            if global_head_dim <= 0 {
+                return Err(Error::from_reason(format!(
+                    "assistant draft global_head_dim={global_head_dim} must be positive"
+                )));
+            }
+            if global_head_dim > ASSISTANT_MAX_DIM {
+                return Err(Error::from_reason(format!(
+                    "assistant draft global_head_dim={global_head_dim} exceeds sane bound {ASSISTANT_MAX_DIM}"
+                )));
+            }
+        }
+        // The projection widths built from these fields must stay within the
+        // bound too: each factor can pass individually while the product
+        // still overflows the `as u32` casts at the construction sites.
+        for (expr, product) in [
+            (
+                "num_attention_heads*head_dim",
+                text.num_attention_heads.checked_mul(text.head_dim),
+            ),
+            (
+                "num_attention_heads*global_head_dim",
+                text.num_attention_heads.checked_mul(text.full_head_dim()),
+            ),
+            (
+                "2*backbone_hidden_size",
+                self.backbone_hidden_size.checked_mul(2),
+            ),
+        ] {
+            if product.is_none_or(|p| p > ASSISTANT_MAX_DIM) {
+                return Err(Error::from_reason(format!(
+                    "assistant draft {expr} overflows/exceeds sane bound {ASSISTANT_MAX_DIM}"
+                )));
+            }
         }
         if text.num_hidden_layers < 1 {
             return Err(Error::from_reason(format!(
@@ -1155,8 +1199,9 @@ mod tests {
     }
 
     /// Draft-local dimension sanity must fire BEFORE any target-compat arm:
-    /// zero/negative geometry would otherwise reach the `as u32`/`as usize`
-    /// casts in module construction and wrap into absurd allocations.
+    /// zero/negative or out-of-bound geometry would otherwise reach the
+    /// `as u32`/`as i32`/`as usize` casts in module construction and wrap
+    /// into absurd allocations.
     #[test]
     fn negative_hidden_size_rejected() {
         let json = base_config_json().replace("\"hidden_size\": 1024", "\"hidden_size\": -1024");
@@ -1222,6 +1267,47 @@ mod tests {
             &target_12b(),
             "rms_norm_eps=0 must be positive",
         );
+    }
+
+    /// POSITIVE out-of-range dimensions must be rejected too: without the
+    /// upper bound they reach the wrapping `as u32`/`as i32` casts (and the
+    /// placeholder allocations) in module construction.
+    #[test]
+    fn oversized_hidden_size_rejected() {
+        let json = base_config_json().replace("\"hidden_size\": 1024", "\"hidden_size\": 17000000");
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "hidden_size=17000000 exceeds sane bound",
+        );
+    }
+
+    #[test]
+    fn oversized_intermediate_size_rejected() {
+        // 2^40: positive, so the positivity arm alone would wave it through
+        // to the wrapping `as u32` cast in GemmaMLP construction.
+        let json = base_config_json().replace(
+            "\"intermediate_size\": 8192",
+            "\"intermediate_size\": 1099511627776",
+        );
+        expect_err(
+            &parse(&json),
+            &target_12b(),
+            "intermediate_size=1099511627776 exceeds sane bound",
+        );
+    }
+
+    #[test]
+    fn oversized_attention_width_product_rejected() {
+        // Each factor is individually within ASSISTANT_MAX_DIM, but the q/o
+        // projection width num_attention_heads * head_dim = 2^25 exceeds it.
+        let json = base_config_json()
+            .replace(
+                "\"num_attention_heads\": 16",
+                "\"num_attention_heads\": 16384",
+            )
+            .replace("\"head_dim\": 256", "\"head_dim\": 2048");
+        expect_err(&parse(&json), &target_12b(), "num_attention_heads*head_dim");
     }
 
     // ── Tiny-model fixtures ────────────────────────────────────────────
