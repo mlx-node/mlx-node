@@ -9,7 +9,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3**         |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                            |
 | **Qwen3.5 Dense** |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant |
 | **Qwen3.5 MoE**   |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant            |
-| **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark spec. decoding |
+| **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                          |
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4 and LFM2.5 are inference-only.
@@ -74,9 +74,14 @@ for await (const event of session.sendStream('Hello!')) {
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
 
-## Speculative decoding: Gemma4 + DSpark
+## Speculative decoding: Gemma4 drafts (DSpark + assistant MTP)
 
-Gemma4 supports DSpark speculative decoding: an external draft model proposes a block of tokens per cycle and the target model verifies the whole block in one forward, committing the accepted prefix. Pass `draftModelPath` (a DSpark draft checkpoint directory, e.g. `deepseek-ai/dspark_gemma4_12b_block7`) when loading:
+Gemma4 supports two external-draft speculative decoding variants behind one load surface — the loader picks the variant from the draft checkpoint's `config.json`:
+
+- **DSpark** (`deepseek-ai/dspark_gemma4_12b_block7`): a 5-layer draft that proposes a block of up to 7 tokens per cycle from mask tokens, conditioned on tapped target hidden states.
+- **Assistant MTP** (`google/gemma-4-{12B,26B-A4B,31B}-it-assistant`, apache-2.0, ~800 MB): Google's official 4-layer draft. Its attention layers are Q-only and read the **target's own KV caches** (last non-KV-shared sliding/full layers) — the draft keeps no KV cache and never prefills. Tokens are drafted one at a time, chained through a hidden-state feedback loop, `mtpDepth` per cycle (default 3). The E2B/E4B assistants (centroid sparse lm_head) are not yet supported and are rejected at load.
+
+Pass `draftModelPath` when loading:
 
 ```typescript
 import { loadSession } from '@mlx-node/lm';
@@ -90,10 +95,10 @@ const result = await session.send('Give a simple recipe for pancakes.', { config
 console.log(result.performance?.mtpCycles, result.performance?.mtpMeanAcceptedTokensTotal);
 ```
 
-- **Lossless at T=0** — every committed token is verified by the target model, so greedy output matches the plain autoregressive run (up to inherent bf16 near-ties; see the oracle suite in `crates/mlx-core/tests/gemma4_dspark.rs`).
+- **Lossless at T=0** — every committed token is verified by the target model, so greedy output matches the plain autoregressive run (up to inherent bf16 near-ties; see the oracle suites in `crates/mlx-core/tests/gemma4_dspark.rs` and `crates/mlx-core/tests/gemma4_assistant.rs`).
 - **Stats** — `ChatResult.performance` reports `mtpCycles` (draft+verify cycles executed) and `mtpMeanAcceptedTokensTotal` (mean committed tokens per cycle, including the always-verified token).
-- **Knobs** — an unset `mtpDepth` runs full draft blocks (7 tokens on the v1 draft); an explicit `mtpDepth` caps the block. `mtpAdaptiveDepth` is ignored.
-- **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 12B draft). DSpark runs on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
+- **Knobs** — DSpark: an unset `mtpDepth` runs full draft blocks (7 tokens on the v1 draft); an explicit `mtpDepth` caps the block. Assistant: unset `mtpDepth` defaults to 3 drafts per cycle, explicit values clamp to [1, 8]. `mtpAdaptiveDepth` is ignored for both.
+- **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 DSpark 12B draft; ~0.8 GB for an assistant). Both variants run on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
 - `draftModelPath` is gemma4-only: `loadModel` / `loadSession` reject it for every other family.
 
 ## Server-side sessions
