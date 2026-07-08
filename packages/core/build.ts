@@ -23,13 +23,18 @@ const isWasmBuild = buildOptions.target === "wasm32-wasip1-threads";
 
 if (isWasmBuild) {
   // tokio_unstable enables the multi-thread runtime required by wasi-threads.
-  // --allow-undefined lets wasm-ld import the C++ exception-handling tag
-  // (`env.__cpp_exception`, provided at instantiation by the JS host — see
+  //
+  // --allow-undefined-file: the ONLY symbol allowed to stay undefined at link
+  // time is the C++ exception-handling tag `__cpp_exception` (it becomes an
+  // `env` import satisfied at instantiation by the JS host — see
   // wasm_eh_runtime.cpp and the WebAssembly.Tag setup in the browser loaders).
-  // Without it rust-lld errors on the undefined tag from the -fwasm-exceptions
-  // C++ objects. napi-build already passes --import-undefined for functions.
+  // Deliberately NOT the blanket --allow-undefined: that once silently turned
+  // real missing symbols (misnamed FFI decls, native-only callers) into
+  // phantom `env` imports that failed at instantiation with LinkError.
+  // Everything else must resolve at link time.
   process.env.RUSTFLAGS =
-    "--cfg tokio_unstable -C link-arg=--allow-undefined";
+    "--cfg tokio_unstable " +
+    `-C link-arg=--allow-undefined-file=${join(__dirname, "wasm-undefined-symbols.txt")}`;
   // tokenizers/esaxx-rs uses C++ exceptions and has its own cc::Build.
   process.env.TARGET_CXXFLAGS = "-fwasm-exceptions -fexceptions";
   Object.assign(buildOptions, {

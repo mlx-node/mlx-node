@@ -9106,108 +9106,27 @@ fn vlm_prefill(
     )?;
 
     // === STEP 4: Prefill with M-RoPE ===
+    // The compiled C++ VLM prefill (`mlx_qwen35_vlm_*`) is native-only: those
+    // FFI symbols are not compiled into the wasm C++ archives, so wasm always
+    // takes the Rust fallback prefill below. (The browser is text-only; this
+    // is defensive — `use_compiled` is hard-`false` on wasm even though the
+    // weight registry / model-id FFI does exist there.)
+    #[cfg(not(target_family = "wasm"))]
     let use_compiled = unsafe { mlx_sys::mlx_qwen35_get_model_id() } == model_id;
+    #[cfg(target_family = "wasm")]
+    let use_compiled = {
+        let _ = model_id;
+        false
+    };
 
     let (last_logits, _seq_len, compiled_init_done) = if use_compiled {
-        // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
-        use mlx_sys as sys;
-
-        let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
-        let max_kv_len = ((seq_len_i32 + max_new_tokens + 255) / 256) * 256;
-        let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
-
-        let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
-        unsafe {
-            sys::mlx_qwen35_vlm_prefill(
-                inputs_embeds.as_raw_ptr(),
-                position_ids.as_raw_ptr(),
-                model_config.num_layers,
-                model_config.hidden_size,
-                model_config.num_heads,
-                model_config.num_kv_heads,
-                model_config.head_dim,
-                model_config.rope_theta as f32,
-                model_config.rope_dims(),
-                model_config.rms_norm_eps as f32,
-                model_config.full_attention_interval,
-                model_config.linear_num_key_heads,
-                model_config.linear_num_value_heads,
-                model_config.linear_key_head_dim,
-                model_config.linear_value_head_dim,
-                model_config.linear_conv_kernel_dim,
-                if model_config.tie_word_embeddings {
-                    1
-                } else {
-                    0
-                },
-                max_kv_len,
-                1, // batch_size
-                mrope_section.as_ptr(),
-                rope_deltas as i32,
-                &mut output_ptr,
-            );
-        }
-
-        if output_ptr.is_null() {
-            return Err(Error::from_reason(
-                "C++ VLM prefill returned null — check stderr for details",
-            ));
-        }
-
-        // Transfer VLM caches to compiled decode path
-        // vlm_get_cache returns heap-allocated copies — we must delete them after use
-        let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
-        let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
-        for idx in 0..num_caches {
-            cache_ptrs.push(unsafe { sys::mlx_qwen35_vlm_get_cache(idx) });
-        }
-
-        unsafe {
-            sys::mlx_qwen35_compiled_init_from_prefill(
-                model_config.num_layers,
-                model_config.hidden_size,
-                model_config.num_heads,
-                model_config.num_kv_heads,
-                model_config.head_dim,
-                model_config.rope_theta as f32,
-                model_config.rope_dims(),
-                model_config.rms_norm_eps as f32,
-                model_config.full_attention_interval,
-                model_config.linear_num_key_heads,
-                model_config.linear_num_value_heads,
-                model_config.linear_key_head_dim,
-                model_config.linear_value_head_dim,
-                model_config.linear_conv_kernel_dim,
-                if model_config.tie_word_embeddings {
-                    1
-                } else {
-                    0
-                },
-                max_kv_len,
-                1,
-                cache_ptrs.as_mut_ptr(),
-                seq_len_i32,
-            );
-
-            // Adjust offset for rope_deltas (VLM positions differ from sequential)
-            if rope_deltas != 0 {
-                sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
-            }
-
-            // Clean up heap-allocated cache copies from vlm_get_cache
-            for ptr in &cache_ptrs {
-                if !ptr.is_null() {
-                    sys::mlx_array_delete(*ptr);
-                }
-            }
-
-            // Clean up VLM prefill state (caches now owned by compiled decode)
-            sys::mlx_qwen35_vlm_reset();
-        }
-
-        let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
-        // logits is already [1, vocab] from C++ prefill
-        (logits, seq_len_i32 as i64, true) // compiled init done
+        vlm_cpp_prefill_compiled(
+            &inputs_embeds,
+            &position_ids,
+            rope_deltas,
+            model_config,
+            max_new_tokens,
+        )?
     } else {
         // Rust fallback prefill (when C++ weights not loaded, e.g. test models)
         // Init fresh caches
@@ -9270,6 +9189,134 @@ fn vlm_prefill(
     };
 
     Ok((last_logits, rope_deltas, compiled_init_done))
+}
+
+/// Native-only: the compiled C++ VLM prefill — runs all layers in one FFI
+/// call with M-RoPE, then transfers the VLM caches into the compiled decode
+/// path. The `mlx_qwen35_vlm_*` FFI symbols are absent from the wasm C++
+/// archives, so this body must not be compiled for wasm.
+/// Returns `(last_logits, seq_len, /* compiled_init_done */ true)`.
+#[cfg(not(target_family = "wasm"))]
+fn vlm_cpp_prefill_compiled(
+    inputs_embeds: &MxArray,
+    position_ids: &MxArray,
+    rope_deltas: i64,
+    model_config: &Qwen3_5Config,
+    max_new_tokens: i32,
+) -> Result<(MxArray, i64, bool)> {
+    // C++ VLM prefill: runs all layers in one FFI call with M-RoPE
+    use mlx_sys as sys;
+
+    let seq_len_i32 = inputs_embeds.shape_at(1)? as i32;
+    let max_kv_len = ((seq_len_i32 + max_new_tokens + 255) / 256) * 256;
+    let mrope_section: [i32; 3] = [11, 11, 10]; // Qwen3.5-VL
+
+    let mut output_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    unsafe {
+        sys::mlx_qwen35_vlm_prefill(
+            inputs_embeds.as_raw_ptr(),
+            position_ids.as_raw_ptr(),
+            model_config.num_layers,
+            model_config.hidden_size,
+            model_config.num_heads,
+            model_config.num_kv_heads,
+            model_config.head_dim,
+            model_config.rope_theta as f32,
+            model_config.rope_dims(),
+            model_config.rms_norm_eps as f32,
+            model_config.full_attention_interval,
+            model_config.linear_num_key_heads,
+            model_config.linear_num_value_heads,
+            model_config.linear_key_head_dim,
+            model_config.linear_value_head_dim,
+            model_config.linear_conv_kernel_dim,
+            if model_config.tie_word_embeddings {
+                1
+            } else {
+                0
+            },
+            max_kv_len,
+            1, // batch_size
+            mrope_section.as_ptr(),
+            rope_deltas as i32,
+            &mut output_ptr,
+        );
+    }
+
+    if output_ptr.is_null() {
+        return Err(Error::from_reason(
+            "C++ VLM prefill returned null — check stderr for details",
+        ));
+    }
+
+    // Transfer VLM caches to compiled decode path
+    // vlm_get_cache returns heap-allocated copies — we must delete them after use
+    let num_caches = unsafe { sys::mlx_qwen35_vlm_cache_count() };
+    let mut cache_ptrs: Vec<*mut sys::mlx_array> = Vec::with_capacity(num_caches as usize);
+    for idx in 0..num_caches {
+        cache_ptrs.push(unsafe { sys::mlx_qwen35_vlm_get_cache(idx) });
+    }
+
+    unsafe {
+        sys::mlx_qwen35_compiled_init_from_prefill(
+            model_config.num_layers,
+            model_config.hidden_size,
+            model_config.num_heads,
+            model_config.num_kv_heads,
+            model_config.head_dim,
+            model_config.rope_theta as f32,
+            model_config.rope_dims(),
+            model_config.rms_norm_eps as f32,
+            model_config.full_attention_interval,
+            model_config.linear_num_key_heads,
+            model_config.linear_num_value_heads,
+            model_config.linear_key_head_dim,
+            model_config.linear_value_head_dim,
+            model_config.linear_conv_kernel_dim,
+            if model_config.tie_word_embeddings {
+                1
+            } else {
+                0
+            },
+            max_kv_len,
+            1,
+            cache_ptrs.as_mut_ptr(),
+            seq_len_i32,
+        );
+
+        // Adjust offset for rope_deltas (VLM positions differ from sequential)
+        if rope_deltas != 0 {
+            sys::mlx_qwen35_compiled_adjust_offset(rope_deltas as i32);
+        }
+
+        // Clean up heap-allocated cache copies from vlm_get_cache
+        for ptr in &cache_ptrs {
+            if !ptr.is_null() {
+                sys::mlx_array_delete(*ptr);
+            }
+        }
+
+        // Clean up VLM prefill state (caches now owned by compiled decode)
+        sys::mlx_qwen35_vlm_reset();
+    }
+
+    let logits = MxArray::from_handle(output_ptr, "vlm_cpp_prefill")?;
+    // logits is already [1, vocab] from C++ prefill
+    Ok((logits, seq_len_i32 as i64, true)) // compiled init done
+}
+
+/// wasm stub: `use_compiled` is hard-`false` on wasm (see `vlm_prefill`), so
+/// this can never execute; it exists so the call site compiles without
+/// referencing the native-only `mlx_qwen35_vlm_*` FFI symbols.
+#[cfg(target_family = "wasm")]
+fn vlm_cpp_prefill_compiled(
+    _inputs_embeds: &MxArray,
+    _position_ids: &MxArray,
+    _rope_deltas: i64,
+    _model_config: &Qwen3_5Config,
+    _max_new_tokens: i32,
+) -> Result<(MxArray, i64, bool)> {
+    unreachable!("compiled C++ VLM prefill is native-only")
 }
 
 /// Shared VLM prefill steps 1-3: vision cache lookup, vision encoder,

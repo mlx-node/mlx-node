@@ -2602,6 +2602,11 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // contract) BEFORE the `mtp-drafter/` directory, so a leftover sidecar
         // would shadow the freshly-emitted split drafter and load stale weights.
         // Done before writing the body so a reused output dir is clean.
+        //
+        // Native-only: keeps `wasi.path_unlink_file` out of the wasm imports;
+        // the browser never runs the split-MTP convert against a reused
+        // on-disk output dir.
+        #[cfg(not(target_family = "wasm"))]
         remove_stale_legacy_mtp_artifacts(&output_dir)?;
 
         let drafter_tensors = extract_mtp_drafter_tensors(&mut converted_tensors)?;
@@ -3275,6 +3280,12 @@ fn write_mtp_drafter_dir(
 /// the `mtplx_runtime.json` runtime contract. `--q-mtp split` emits a
 /// `mtp-drafter/` directory instead, but the loader probes these legacy
 /// sidecars FIRST, so a leftover from a prior run would shadow the new drafter.
+///
+/// Native-only: the cleanup's `fs::remove_file` is the sole non-test source of
+/// a `wasi.path_unlink_file` import in the wasm binary, and the split-MTP
+/// convert path is not exercised in-browser (see the call site in
+/// `convert_model_inner`).
+#[cfg(not(target_family = "wasm"))]
 const STALE_LEGACY_MTP_ARTIFACTS: [&str; 4] = [
     "mtp.safetensors",
     "mtp/weights.safetensors",
@@ -3288,6 +3299,7 @@ const STALE_LEGACY_MTP_ARTIFACTS: [&str; 4] = [
 /// via `Result`/`?` (no `.unwrap()`). Never touches the `mtp-drafter/` dir or
 /// any unrelated file, and leaves the `mtp/` parent directory in place (only the
 /// `mtp/weights.safetensors` file inside it is removed).
+#[cfg(not(target_family = "wasm"))]
 fn remove_stale_legacy_mtp_artifacts(output_dir: &std::path::Path) -> Result<()> {
     for rel in STALE_LEGACY_MTP_ARTIFACTS {
         let path = output_dir.join(rel);

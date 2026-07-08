@@ -1651,17 +1651,29 @@ unsafe extern "C-unwind" {
     // Qwen3.5 Fused Forward Pass
     // ============================================
 
+    // NOTE on link_name: the C++ weight registry lives in mlx_qwen35.cpp and
+    // exports `mlx_qwen35_`-prefixed symbols only (the historical unprefixed
+    // `mlx_common_weights.cpp` registry was deleted upstream by the
+    // chat-engine refactor before these decls were added). Without the
+    // explicit link_name these resolved to nothing — masked on native by the
+    // .node addon's `-undefined dynamic_lookup` link, and fatal on wasm where
+    // they became phantom `env` imports that fail instantiation.
+
     /// Store a model weight by name (called once per weight during model load)
+    #[link_name = "mlx_qwen35_store_weight"]
     pub fn mlx_store_weight(name: *const std::os::raw::c_char, weight: *mut mlx_array);
 
     /// Clear all stored weights (called on model destruction)
+    #[link_name = "mlx_qwen35_clear_weights"]
     pub fn mlx_clear_weights();
 
     /// Get the number of stored weights (for debugging)
+    #[link_name = "mlx_qwen35_weight_count"]
     pub fn mlx_weight_count() -> usize;
 
     /// Set the active model ID (called after all weights are stored).
     /// Inference checks this against its own model_id to avoid cross-model contamination.
+    #[link_name = "mlx_qwen35_set_model_id"]
     pub fn mlx_set_model_id(id: u64);
 
     /// Get the active model ID. Returns 0 if no model has registered weights.
