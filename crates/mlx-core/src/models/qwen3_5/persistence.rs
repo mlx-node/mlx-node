@@ -968,11 +968,16 @@ fn apply_weights_inner(
         // mxfp8 attention/GDN overrides carry a `Some` amax in config; every
         // other layer stays `None`, so forward behaviour is unchanged here.
         // Also thread the normalized config key so the activation-amax
-        // calibration tap can bucket recorded `max|activation|` by projection.
-        Ok(built.map(|ql| {
-            ql.with_input_amax(plq.input_amax)
-                .with_amax_key(Some(normalize_per_layer_key(prefix)))
-        }))
+        // calibration tap can bucket recorded `max|activation|` by projection —
+        // but ONLY on the recipe's activation-fp8 sites (attn q/k/v/o, merged
+        // GDN in_proj_qkvz, GDN out_proj). A non-site mxfp8 projection (e.g. a
+        // uniform-mxfp8 or hand-edited checkpoint's FFN/lm_head) gets `None` so
+        // the tap skips it and calibration never fake-quants a non-attn/GDN
+        // site.
+        let nk = normalize_per_layer_key(prefix);
+        let amax_key =
+            crate::calibration::activation_amax::is_activation_fp8_site(&nk).then_some(nk);
+        Ok(built.map(move |ql| ql.with_input_amax(plq.input_amax).with_amax_key(amax_key)))
     };
 
     // Embedding

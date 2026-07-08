@@ -85,15 +85,53 @@ impl ActivationAmaxCollector {
     }
 }
 
+/// Whether `normalized_key` (a `normalize_per_layer_key(prefix)` output) names a
+/// projection where the nvidia recipe applies activation FP8 — i.e. an
+/// attention or GDN site whose RUNTIME projection is mxfp8.
+///
+/// The complete set is: `self_attn.{q,k,v,o}_proj`, the MERGED GDN input
+/// projection `linear_attn.in_proj_qkvz` (qkv+z, both mxfp8), and the GDN
+/// `linear_attn.out_proj`. Every other mxfp8 projection a checkpoint might carry
+/// (mxfp4 FFN is not mxfp8, but a hand-edited / uniform-mxfp8 checkpoint could
+/// make FFN or lm_head mxfp8) is NOT an activation-fp8 site, so the loaders must
+/// not attach an `amax_key` there — otherwise the calibration tap would record
+/// it and a later persist would fake-quant it, violating "activation-FP8 applies
+/// only to attn/GDN sites". `in_proj_ba` (a/b, affine 8/64) is not mxfp8 and is
+/// deliberately absent.
+pub fn is_activation_fp8_site(normalized_key: &str) -> bool {
+    const SITES: [&str; 6] = [
+        ".self_attn.q_proj",
+        ".self_attn.k_proj",
+        ".self_attn.v_proj",
+        ".self_attn.o_proj",
+        ".linear_attn.in_proj_qkvz",
+        ".linear_attn.out_proj",
+    ];
+    SITES.iter().any(|s| normalized_key.ends_with(s))
+}
+
 /// Write each collected per-tensor `input_amax` into the model `config.json`
 /// quantization block.
 ///
-/// Reads `config_path`, and for every `(key, val)` in `amax` sets
-/// `"input_amax": val` (a JSON number) onto the *existing* per-layer
-/// quantization entry keyed by `key`. Keys with no matching entry are ignored
-/// (only entries already present as quantization overrides are updated). Every
-/// other field of the config is preserved.
+/// Config-entry-driven: the config `quantization` block is keyed by RAW/WRAPPED
+/// per-layer keys (e.g. `language_model.model.layers.16.self_attn.q_proj`) and
+/// stores the GDN input projection SPLIT (`in_proj_qkv`, `in_proj_z`), while the
+/// collector records under STRIPPED keys with the GDN input projection MERGED
+/// (`in_proj_qkvz`). So we iterate the config entries (not the collected map),
+/// strip each entry key, map it back to its collected source key, and thread the
+/// matching amax in:
+///   * `*.linear_attn.in_proj_qkv` / `*.linear_attn.in_proj_z` → the merged
+///     `*.linear_attn.in_proj_qkvz` collected key (qkv and z share the same
+///     input activation `x`, so the merged amax fans out to BOTH split entries);
+///   * every other entry → its own stripped key.
+///
+/// Only per-layer object entries with a matching collected amax gain
+/// `"input_amax"`; the top-level scalars (`mode`/`bits`/`group_size`) and any
+/// entry with no collected amax (mxfp4 FFN, affine gates, in_proj_a/b, lm_head)
+/// are left untouched. Every other field of the config is preserved.
 pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -> Result<()> {
+    use crate::models::mtp_drafter::strip_wrapper_prefix;
+
     let data = std::fs::read_to_string(config_path)
         .map_err(|e| Error::from_reason(format!("read {}: {e}", config_path.display())))?;
     let mut config: serde_json::Value = serde_json::from_str(&data)
@@ -112,15 +150,29 @@ pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -
     };
 
     if let Some(block) = config.get_mut(block_key).and_then(|v| v.as_object_mut()) {
-        for (key, &val) in amax {
-            // Skip non-finite maxima (NaN/inf would serialize as JSON null).
-            if !val.is_finite() {
+        for (ck, entry_val) in block.iter_mut() {
+            // Only per-layer OBJECT entries carry an `input_amax`. This skips
+            // the top-level `mode`/`bits`/`group_size` scalars (and any other
+            // non-object member) without a hardcoded name list.
+            let Some(entry) = entry_val.as_object_mut() else {
                 continue;
-            }
-            // Only write onto an EXISTING per-layer quantization entry; keys
-            // with no entry are ignored (never fabricated).
-            if let Some(entry) = block.get_mut(key).and_then(|v| v.as_object_mut()) {
-                entry.insert("input_amax".to_string(), serde_json::Value::from(val));
+            };
+            // Config keys are RAW/WRAPPED; collector keys are STRIPPED.
+            let sck = strip_wrapper_prefix(ck);
+            // Fan the MERGED GDN input-projection amax out to BOTH split config
+            // entries (`in_proj_qkv`, `in_proj_z` share the same input `x`).
+            let source = if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_qkv") {
+                format!("{base}.linear_attn.in_proj_qkvz")
+            } else if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_z") {
+                format!("{base}.linear_attn.in_proj_qkvz")
+            } else {
+                sck.to_string()
+            };
+            if let Some(&val) = amax.get(&source) {
+                // Skip non-finite maxima (NaN/inf would serialize as JSON null).
+                if val.is_finite() {
+                    entry.insert("input_amax".to_string(), serde_json::Value::from(val));
+                }
             }
         }
     }
@@ -249,5 +301,119 @@ mod tests {
         assert_eq!(q["mode"], "mxfp8");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `write_amax_into_config` is config-entry-driven: it maps RAW/WRAPPED
+    /// config keys back to the STRIPPED collector keys, and fans the MERGED
+    /// GDN input-projection amax (`in_proj_qkvz`) out to BOTH split config
+    /// entries (`in_proj_qkv`, `in_proj_z`). Non-site / uncollected entries
+    /// (mxfp4 FFN, affine in_proj_a) gain no `input_amax`.
+    #[test]
+    fn write_amax_into_config_maps_wrapped_and_merged_keys() {
+        let path = std::env::temp_dir().join(format!(
+            "mlx_calib_wrapmerge_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Config entries are RAW/WRAPPED (as the nvidia config.json stores them)
+        // and the GDN input projection is SPLIT into in_proj_qkv / in_proj_z.
+        let initial = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8",
+                "group_size": 32,
+                "language_model.model.layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "language_model.model.layers.0.linear_attn.in_proj_z": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "language_model.model.layers.0.linear_attn.out_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "language_model.model.layers.0.mlp.gate_proj": {"bits": 4, "group_size": 32, "mode": "mxfp4"},
+                "language_model.model.layers.0.linear_attn.in_proj_a": {"bits": 8, "group_size": 64, "mode": "affine"}
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        // Collected map uses STRIPPED keys, and the GDN input projection is
+        // recorded under the MERGED key in_proj_qkvz.
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 3.0f32);
+        amax.insert("layers.0.linear_attn.in_proj_qkvz".to_string(), 5.0f32);
+        amax.insert("layers.0.linear_attn.out_proj".to_string(), 2.0f32);
+
+        write_amax_into_config(&path, &amax).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let q = &after["quantization"];
+
+        let amax_of = |k: &str| -> Option<f32> { q[k]["input_amax"].as_f64().map(|v| v as f32) };
+
+        // Wrapped attn q_proj -> stripped source -> 3.0.
+        assert_eq!(
+            amax_of("language_model.model.layers.0.self_attn.q_proj"),
+            Some(3.0)
+        );
+        // Merged in_proj_qkvz amax fans out to BOTH split entries -> 5.0.
+        assert_eq!(
+            amax_of("language_model.model.layers.0.linear_attn.in_proj_qkv"),
+            Some(5.0)
+        );
+        assert_eq!(
+            amax_of("language_model.model.layers.0.linear_attn.in_proj_z"),
+            Some(5.0)
+        );
+        // out_proj direct -> 2.0.
+        assert_eq!(
+            amax_of("language_model.model.layers.0.linear_attn.out_proj"),
+            Some(2.0)
+        );
+        // mxfp4 FFN + affine in_proj_a have no collected amax -> untouched.
+        assert_eq!(amax_of("language_model.model.layers.0.mlp.gate_proj"), None);
+        assert_eq!(
+            amax_of("language_model.model.layers.0.linear_attn.in_proj_a"),
+            None
+        );
+        // Existing fields intact; top-level scalars untouched.
+        assert_eq!(
+            q["language_model.model.layers.0.self_attn.q_proj"]["bits"],
+            8
+        );
+        assert_eq!(q["mode"], "mxfp8");
+        assert_eq!(after["model_type"], "qwen3_5");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `is_activation_fp8_site` matches ONLY the 6 nvidia-recipe attn/GDN
+    /// activation-fp8 sites (incl. the merged `in_proj_qkvz`), and never the
+    /// mxfp4 FFN, tied lm_head, affine GDN a/b, or MoE gate projections.
+    #[test]
+    fn is_activation_fp8_site_matches_only_attn_gdn() {
+        for k in [
+            "layers.0.self_attn.q_proj",
+            "layers.3.self_attn.k_proj",
+            "layers.7.self_attn.v_proj",
+            "layers.12.self_attn.o_proj",
+            "layers.0.linear_attn.in_proj_qkvz",
+            "layers.5.linear_attn.out_proj",
+        ] {
+            assert!(
+                is_activation_fp8_site(k),
+                "{k} must be an activation-fp8 site"
+            );
+        }
+        for k in [
+            "layers.0.mlp.gate_proj",
+            "layers.0.mlp.down_proj",
+            "lm_head",
+            "layers.0.linear_attn.in_proj_ba",
+            "layers.0.linear_attn.in_proj_a",
+            "layers.0.mlp.gate",
+        ] {
+            assert!(!is_activation_fp8_site(k), "{k} must NOT be a site");
+        }
     }
 }
