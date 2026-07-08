@@ -1287,6 +1287,64 @@ pub fn qwen3_5_forward_hidden_states_impl(
     Ok(result)
 }
 
+/// Probe-inserting Qwen3.5 Dense forward for the Jacobian-lens fit (T1.2).
+///
+/// This is the offline-fit twin of [`qwen3_5_forward_hidden_states_impl`] with
+/// two differences that the estimator needs:
+///
+/// 1. **Zero-probe injection.** Before running block `l` it adds `probes[l]`
+///    (a zero-init tensor of the same shape/dtype as the residual) to the
+///    residual at boundary `h_l` — the input to block `l`. `probes` has length
+///    `num_layers` (24), one per non-final boundary `0..=23`. The probes are the
+///    `value_and_grad` differentiation inputs; because `probes[l]` is added to
+///    `h_l`, `∂h_final/∂probes[l] == ∂h_final/∂h_l == J_l`. ONE backward yields
+///    the Jacobian contribution for all 24 boundaries at once. The add happens
+///    in THIS outer loop — OUTSIDE any `checkpoint_apply` wrapper — so the probe
+///    leaves are exact and never recomputed.
+/// 2. **Stops before the final norm.** Returns `h_24` (the last block's output,
+///    pre-final-norm) — the fit target. The lens applies `final_norm` + `W_U`
+///    at readout time (T1.1), so it must NOT be applied here.
+///
+/// GDN (linear) layers run their `use_kernel=false` differentiable ops path via
+/// [`qwen3_5_block_functional`] (never the non-differentiable Metal kernel).
+pub(crate) fn qwen3_5_probe_forward_hidden_states(
+    config: &Qwen3_5Config,
+    params: &HashMap<String, MxArray>,
+    input_ids: &MxArray,
+    probes: &[MxArray],
+    use_checkpointing: bool,
+    ckpt_contexts: &mut autograd::CheckpointContexts,
+) -> Result<MxArray> {
+    let num_layers = config.num_layers as usize;
+    if probes.len() != num_layers {
+        return Err(Error::from_reason(format!(
+            "probe forward: expected {} probes (one per boundary 0..={}), got {}",
+            num_layers,
+            num_layers.saturating_sub(1),
+            probes.len()
+        )));
+    }
+
+    let embed_weight = params
+        .get("embedding.weight")
+        .ok_or_else(|| Error::from_reason("Missing embedding.weight"))?;
+    let mut h = embedding_functional(embed_weight, input_ids)?;
+
+    for layer_idx in 0..num_layers {
+        // Probe at boundary `layer_idx` (residual `h_layer_idx`, the input to
+        // this block). Added OUTSIDE the checkpoint wrapper below.
+        h = h.add(&probes[layer_idx])?;
+        h = if use_checkpointing {
+            qwen3_5_block_checkpointed(params, &h, config, layer_idx, ckpt_contexts)?
+        } else {
+            qwen3_5_block_functional(params, &h, config, layer_idx)?
+        };
+    }
+
+    // STOP before the final norm — return `h_24` (the fit target).
+    Ok(h)
+}
+
 // ============================================
 // Qwen3.5 MoE Model Forward (Functional)
 // ============================================

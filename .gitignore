@@ -193,6 +193,12 @@ test-output
 test-integration-output
 Cargo.lock
 *.node
+
+# J-lens fit artifacts — fp32 master checkpoints + exported J.{layer} packs are
+# build outputs (~50–100 MB), never tracked in git (see qwen3_5/jlens_fit.rs).
+jlens-*.safetensors
+*.jlens.safetensors
+packages/browser/scripts/jlens/*.safetensors
 /docs/superpowers/plans/*.md
 # subagent-driven-development scratch ledger + briefs/reports
 /.superpowers/

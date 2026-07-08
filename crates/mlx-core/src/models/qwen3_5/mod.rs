@@ -8,6 +8,9 @@ pub mod decoder_layer;
 pub mod gated_delta;
 pub mod gated_delta_net;
 pub mod int8_gemm;
+/// Offline Jacobian-lens fit job + finite-difference GDN gate (native-only).
+#[cfg(feature = "full")]
+pub(crate) mod jlens_fit;
 pub mod layer_cache;
 pub mod model;
 pub mod mtp;

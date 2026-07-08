@@ -456,6 +456,26 @@ pub(crate) enum Qwen35Cmd {
         path: String,
         reply: ResponseTx<u32>,
     },
+    /// Offline J-lens fit (T1.2): fit the per-boundary Jacobians `J_l` over the
+    /// given pre-tokenized prompts, accumulate into a resumable fp32 checkpoint,
+    /// and optionally export a `J.{layer}` pack. Native offline eval only —
+    /// runs the functional autograd path OFF every ChatSession/paged-cache path.
+    /// See [`crate::models::qwen3_5::jlens_fit::fit_jacobian_lens`].
+    #[cfg(feature = "full")]
+    FitJacobianLens {
+        opts: crate::models::qwen3_5::jlens_fit::JlensFitOptions,
+        reply: ResponseTx<crate::models::qwen3_5::jlens_fit::JlensFitResult>,
+    },
+    /// Finite-difference gate (T1.2): verify MLX autograd flows correctly
+    /// through the GDN and full-attention boundaries. THE pilot GO/NO-GO signal.
+    /// See [`crate::models::qwen3_5::jlens_fit::verify_finite_diff`].
+    #[cfg(feature = "full")]
+    VerifyJacobianFiniteDiff {
+        prompt_ids: Vec<u32>,
+        boundaries: Vec<u32>,
+        epsilon: f64,
+        reply: ResponseTx<crate::models::qwen3_5::jlens_fit::JlensFiniteDiffResult>,
+    },
     /// Tokenizer-only encode: run the loaded tokenizer over `text` and
     /// return the resulting token ids. No forward pass, no cache touch.
     /// See [`Qwen35Inner::encode_tokens_sync`] for the contract.
@@ -731,6 +751,20 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         #[cfg(feature = "full")]
         Qwen35Cmd::LoadLensPack { path, reply } => {
             let _ = reply.send(inner.load_lens_pack_from_file_sync(path));
+        }
+        #[cfg(feature = "full")]
+        Qwen35Cmd::FitJacobianLens { opts, reply } => {
+            let _ = reply.send(inner.fit_jacobian_lens_sync(opts));
+        }
+        #[cfg(feature = "full")]
+        Qwen35Cmd::VerifyJacobianFiniteDiff {
+            prompt_ids,
+            boundaries,
+            epsilon,
+            reply,
+        } => {
+            let _ =
+                reply.send(inner.verify_jacobian_finite_diff_sync(prompt_ids, boundaries, epsilon));
         }
         Qwen35Cmd::EncodeTokens { text, reply } => {
             let _ = reply.send(inner.encode_tokens_sync(text));
@@ -6573,6 +6607,41 @@ impl Qwen35Inner {
         Ok(loaded)
     }
 
+    /// Offline J-lens fit (T1.2). Loads the frozen bf16 model weights via
+    /// [`Self::get_parameters_sync`] and drives
+    /// [`crate::models::qwen3_5::jlens_fit::fit_jacobian_lens`] over the prompts
+    /// in `opts`. Runs the functional autograd path — never a ChatSession /
+    /// paged-cache path (their vjp throws).
+    #[cfg(feature = "full")]
+    pub(crate) fn fit_jacobian_lens_sync(
+        &self,
+        opts: crate::models::qwen3_5::jlens_fit::JlensFitOptions,
+    ) -> Result<crate::models::qwen3_5::jlens_fit::JlensFitResult> {
+        let params = self.get_parameters_sync()?;
+        crate::models::qwen3_5::jlens_fit::fit_jacobian_lens(&self.config, &params, opts)
+    }
+
+    /// Finite-difference gate (T1.2) — verifies MLX autograd flows through the
+    /// requested GDN and full-attention boundaries. THE pilot GO/NO-GO signal.
+    #[cfg(feature = "full")]
+    pub(crate) fn verify_jacobian_finite_diff_sync(
+        &self,
+        prompt_ids: Vec<u32>,
+        boundaries: Vec<u32>,
+        epsilon: f64,
+    ) -> Result<crate::models::qwen3_5::jlens_fit::JlensFiniteDiffResult> {
+        let params = self.get_parameters_sync()?;
+        let ids_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
+        let boundaries: Vec<usize> = boundaries.iter().map(|&x| x as usize).collect();
+        crate::models::qwen3_5::jlens_fit::verify_finite_diff(
+            &self.config,
+            &params,
+            &ids_i32,
+            &boundaries,
+            epsilon,
+        )
+    }
+
     /// Tokenizer-only encode. Runs the loaded tokenizer over `text` with
     /// `add_special_tokens = false` (mirroring `run_for_inspector_sync`)
     /// and returns the resulting token ids. No forward pass, no cache
@@ -8142,6 +8211,44 @@ impl Qwen3_5Model {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::LoadLensPack {
             path,
             reply,
+        })
+        .await
+    }
+
+    /// Offline J-lens fit (T1.2). Fits the per-boundary Jacobians `J_l` over the
+    /// pre-tokenized prompts in `opts`, accumulating into a resumable fp32
+    /// checkpoint and (optionally) exporting a `J.{layer}` pack loadable by
+    /// [`Self::load_lens_pack_from_file`]. Native offline eval only.
+    #[napi]
+    pub async fn fit_jacobian_lens(
+        &self,
+        opts: crate::models::qwen3_5::jlens_fit::JlensFitOptions,
+    ) -> Result<crate::models::qwen3_5::jlens_fit::JlensFitResult> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::FitJacobianLens {
+            opts,
+            reply,
+        })
+        .await
+    }
+
+    /// Finite-difference gate (T1.2). Verifies MLX autograd flows correctly
+    /// through the requested GDN and full-attention boundaries, returning the
+    /// autograd-vs-numerical directional derivatives and their relative error.
+    /// THE pilot GO/NO-GO signal.
+    #[napi]
+    pub async fn verify_jacobian_finite_diff(
+        &self,
+        prompt_ids: Vec<u32>,
+        boundaries: Vec<u32>,
+        epsilon: f64,
+    ) -> Result<crate::models::qwen3_5::jlens_fit::JlensFiniteDiffResult> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::VerifyJacobianFiniteDiff {
+                prompt_ids,
+                boundaries,
+                epsilon,
+                reply,
+            }
         })
         .await
     }
