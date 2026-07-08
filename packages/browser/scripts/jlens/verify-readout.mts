@@ -39,8 +39,49 @@
  *
  * Run with: oxnode packages/browser/scripts/jlens/verify-readout.mts
  * (NOT tsx/ts-node — repo convention.)
+ *
+ * FAIL-CLOSED CONTRACT (gate integrity):
+ *   The native `@mlx-node/lm` import is DYNAMIC and lives only in the child
+ *   branch (inside `main()`), so the parent process has NO native dependency.
+ *   On invocation the parent re-execs THIS script under the SAME interpreter +
+ *   loader (see below) as a child, then exits non-zero UNLESS it observes BOTH
+ *   (a) a clean child exit (status 0, no terminating signal) AND (b) the
+ *   `ALL GATES PASS` sentinel in the child's stdout. An addon that cannot load
+ *   — a Rust panic during NAPI registration, an ABI/arch mismatch, or a hard
+ *   `abort()` — happens in the CHILD, before the sentinel is ever printed, so
+ *   it FAILS the gate. A native abort that some runtimes swallow to exit 0 is
+ *   still caught by the missing-sentinel check. A gate that could pass on a
+ *   crash would be no gate; this design cannot.
+ *
+ *   Re-exec detail: under `oxnode` the oxc TypeScript loader is injected via
+ *   `process.execArgv` (`--import .../register.mjs`), NOT via `process.argv0`
+ *   (which is plain `node`). We therefore re-exec with
+ *   `[...process.execArgv, ...process.argv.slice(1)]` so the child runs under
+ *   the identical interpreter + loader and loads the addon exactly as we do.
  */
-import { Qwen35Model } from '@mlx-node/lm';
+const SENTINEL = 'ALL GATES PASS';
+if (!process.env.__JLENS_GATE_CHILD) {
+  const { spawnSync } = await import('node:child_process');
+  const res = spawnSync(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
+    env: { ...process.env, __JLENS_GATE_CHILD: '1' },
+    encoding: 'utf8',
+    stdio: ['inherit', 'pipe', 'inherit'], // capture stdout (scan for sentinel), stream stderr live
+  });
+  if (res.stdout) process.stdout.write(res.stdout); // still show the child's report to the user
+  const cleanExit = res.status === 0 && res.signal == null;
+  const sawSentinel = (res.stdout ?? '').includes(SENTINEL);
+  if (!cleanExit || !sawSentinel) {
+    console.error(
+      `\n[GATE] FAIL — not fail-open: cleanExit=${cleanExit} (status=${res.status} signal=${res.signal}) sentinel=${sawSentinel}`,
+    );
+    process.exit(1);
+  }
+  process.exit(0);
+}
+// ---- child mode below: run the actual gates (native addon loaded here only) ----
+// Fail-closed self-test seam: a child that exits 0 WITHOUT ever printing the
+// sentinel MUST still fail the gate. Proves the contract above is enforced.
+if (process.env.__JLENS_SELFTEST_NO_SENTINEL) { console.log('child ran, no sentinel'); process.exit(0); }
 
 const MODEL_PATH =
   '/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16';
@@ -79,6 +120,10 @@ function maxAbsDiff(a: number[], b: number[]): number {
 }
 
 async function main() {
+  // Dynamic import (child branch only): keeps the parent guard native-free so a
+  // failed addon registration is caught by the parent as a non-clean/no-sentinel
+  // child, and a *catchable* import error routes through `main().catch` -> exit 1.
+  const { Qwen35Model } = await import('@mlx-node/lm');
   console.log(`Loading model from ${MODEL_PATH} ...`);
   // Cast to `any`: the freshly-built addon exposes `lensReadout`; the published
   // d.cts on disk may lag a native rebuild for a moment.
