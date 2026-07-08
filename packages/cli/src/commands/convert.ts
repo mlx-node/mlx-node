@@ -78,11 +78,19 @@ Quantization Arguments:
                         default --q-bits 3 only down_proj
                         (4b -> mxfp4) gets the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
-                        Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth
+                        Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth, nvidia
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
+                        "nvidia" is a data-free MXFP4 port of NVIDIA modelopt's
+                        recipe (dense qwen3_5 + MoE qwen3_5_moe): FFN + lm_head
+                        =mxfp4 4/32, attn q/k/v/o + GDN in_proj_qkv/z/out_proj
+                        =mxfp8 8/32, in_proj_a/b + router gates=8b affine,
+                        everything else bf16. Fixed map (ignores --q-bits/
+                        --q-group-size); runs under --q-mode affine; no imatrix.
+                        Example: mlx convert -m qwen3_5 -q --q-recipe nvidia \
+                          -i ./qwen3.6-27b -o ./qwen3.6-27b-nvidia-mxfp4-mlx
   --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi,
                         all, or split (alias drafter).
                         cyankiwi/all quantize MTP linears as 4-bit affine
@@ -225,7 +233,7 @@ export async function run(argv: string[]) {
     process.exit(1);
   }
 
-  const validRecipes = ['mixed_2_6', 'mixed_3_4', 'mixed_3_6', 'mixed_4_6', 'qwen3_5', 'unsloth'];
+  const validRecipes = ['mixed_2_6', 'mixed_3_4', 'mixed_3_6', 'mixed_4_6', 'qwen3_5', 'unsloth', 'nvidia'];
   if (quantRecipe !== undefined) {
     if (!args.quantize) {
       console.error('Error: --q-recipe requires --quantize (-q) to be enabled');
@@ -266,6 +274,37 @@ export async function run(argv: string[]) {
       console.error('       imatrix calibration data is needed for near-lossless attention/SSM quantization');
       console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
       process.exit(1);
+    }
+    // The nvidia recipe is a data-free port with a fixed format map: it reads
+    // no imatrix, emits mxfp4/mxfp8 per-layer directly (so --q-mxfp is
+    // redundant), and pins its float tensors to bits=4/group_size=32. Reject
+    // flags that would silently alter or contradict that map (mirrors the Rust
+    // validation in convert.rs); a bare `-q --q-recipe nvidia` still works.
+    if (quantRecipe === 'nvidia') {
+      if (args['imatrix-path']) {
+        console.error(
+          'Error: --q-recipe nvidia is a data-free port and does not accept --imatrix-path: an imatrix would trigger AWQ pre-scaling that silently alters weights, breaking the faithful modelopt format map',
+        );
+        process.exit(1);
+      }
+      if (args['q-mxfp']) {
+        console.error(
+          'Error: --q-recipe nvidia already emits mxfp4/mxfp8 per-layer; --q-mxfp is redundant. Drop --q-mxfp (the recipe runs under --q-mode affine).',
+        );
+        process.exit(1);
+      }
+      if (quantBits !== undefined && quantBits !== 4) {
+        console.error(
+          `Error: --q-recipe nvidia is a fixed format map (float tensors pinned to bits=4); it ignores --q-bits. Got --q-bits ${quantBits}; omit it.`,
+        );
+        process.exit(1);
+      }
+      if (quantGroupSize !== undefined && quantGroupSize !== 32) {
+        console.error(
+          `Error: --q-recipe nvidia is a fixed format map (float tensors pinned to group_size=32); it ignores --q-group-size. Got --q-group-size ${quantGroupSize}; omit it.`,
+        );
+        process.exit(1);
+      }
     }
   }
 

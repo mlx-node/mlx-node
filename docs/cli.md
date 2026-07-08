@@ -47,6 +47,25 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
+### NVIDIA modelopt recipe (data-free MXFP4 port)
+
+`--q-recipe nvidia` ports NVIDIA modelopt's `w4a16_nvfp4-fp8_attn-kv_fp8_cast`
+recipe with MXFP4 in place of NVFP4, for both dense `qwen3_5` and MoE
+`qwen3_5_moe`. It is a fixed per-layer format map (ignores `--q-bits` /
+`--q-group-size`), runs under `--q-mode affine`, and needs no imatrix: FFN +
+`lm_head` → mxfp4 4/32, attention q/k/v/o + GDN `in_proj_qkv`/`in_proj_z`/
+`out_proj` → mxfp8 8/32, GDN `in_proj_a`/`in_proj_b` + router gates → 8-bit
+affine, everything else bf16.
+
+```bash
+# dense
+mlx convert -m qwen3_5 -q --q-recipe nvidia \
+  -i ./qwen3.6-27b -o ./qwen3.6-27b-nvidia-mxfp4-mlx
+# MoE
+mlx convert -m qwen3_5_moe -q --q-recipe nvidia \
+  -i ./qwen3.6-35b-a3b -o ./qwen3.6-35b-a3b-nvidia-mxfp4-mlx
+```
+
 ### Qwen MTP quantization conversion
 
 ```bash
@@ -79,7 +98,7 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 | `-o`, `--output`   | Output directory (required)                                                     |
 | `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                |
 | `-q`, `--quantize` | Enable quantization                                                             |
-| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth` |
+| `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
 | `--q-mode`         | `affine` (default) or `mxfp8`                                                   |
 | `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)   |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                        |
