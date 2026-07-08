@@ -42,6 +42,7 @@ unsafe extern "C-unwind" {
         ndim: usize,
     ) -> *mut mlx_array;
     pub fn mlx_from_fp8(handle: *mut mlx_array, target_dtype: i32) -> *mut mlx_array;
+    pub fn mlx_to_fp8(handle: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_array_scalar_float(value: f64) -> *mut mlx_array;
     pub fn mlx_array_scalar_int(value: i32) -> *mut mlx_array;
     pub fn mlx_array_zeros(shape: *const i64, ndim: usize, dtype: i32) -> *mut mlx_array;
