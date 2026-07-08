@@ -13,6 +13,7 @@
 //! self-armed, then — only on full success — atomically persists the drained
 //! amax.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use napi::bindgen_prelude::*;
@@ -63,18 +64,28 @@ fn read_model_type(model_path: &str) -> Result<String> {
         })
 }
 
-/// Await the model-thread raw-text prefill and — ONLY on full success — drain +
-/// ATOMICALLY persist the amax into `<model_path>/config.json`. On ANY error the
-/// partial amax is discarded and `config.json` is left UNTOUCHED. Shared by the
-/// dense and MoE dispatch arms so the prefill→persist contract lives in exactly
-/// one place.
+/// Await the model-thread raw-text prefill and — ONLY on full success with a
+/// non-empty collection — drain + ATOMICALLY persist the amax into
+/// `<model_path>/config.json`. On ANY error the partial amax is discarded and
+/// `config.json` is left UNTOUCHED. Two extra no-op guards keep a vacuous run
+/// from silently succeeding or churning the config:
+///   * ZERO prefilled rows (empty `texts`, or every row tokenized/truncated to
+///     nothing so no forward ran) is an ERROR — no forward pass means nothing
+///     could be collected, so a `0` success would be misleading;
+///   * an EMPTY collected map (real prefill, but the checkpoint has no
+///     activation-fp8 sites) SKIPS the write and returns `0`, leaving
+///     `config.json` byte-untouched (see [`persist_amax_if_any`]).
+///
+/// Shared by the dense and MoE dispatch arms so the prefill→persist contract
+/// lives in exactly one place.
 ///
 /// The model thread SELF-ARMS its thread-local calibration flag for the prefill
 /// (RAII `CalibrationArmGuard` in `calibrate_prefill_raw_sync`), so this
 /// one-shot no longer toggles any process-global arm flag — it only drains +
 /// persists the collected amax after the command returns. The caller MUST hold
 /// [`calib_guard`] and MUST have loaded the model already. `prefill` runs the
-/// loaded model's `CalibratePrefillRaw` command.
+/// loaded model's `CalibratePrefillRaw` command and returns the number of rows
+/// actually prefilled.
 async fn prefill_and_persist<F, Fut>(model_path: &str, prefill: F) -> Result<u32>
 where
     F: FnOnce() -> Fut,
@@ -83,12 +94,26 @@ where
     let prefill_result = prefill().await;
 
     match prefill_result {
-        Ok(_rows_prefilled) => {
-            // Persist ONLY after the FULL loop succeeded (atomic write).
+        Ok(rows_prefilled) => {
+            // A run that prefilled ZERO rows ran no forward pass at all (empty
+            // `texts`, or every row tokenized/truncated to nothing), so it could
+            // not have collected anything. Fail LOUDLY rather than reporting a
+            // silent success `0`: a no-op calibration is a caller mistake (empty
+            // dataset), not a valid outcome. Drain the (empty) map and leave
+            // config.json UNTOUCHED.
+            if rows_prefilled == 0 {
+                let _ = ActivationAmaxCollector::take();
+                return Err(Error::from_reason(
+                    "calibration prefilled 0 rows — dataset empty or all rows tokenized empty",
+                ));
+            }
+
+            // Persist ONLY after the FULL loop succeeded (atomic write) — and
+            // ONLY when the collector actually captured something (see
+            // `persist_amax_if_any`; an empty map leaves config.json untouched).
             let amax = ActivationAmaxCollector::take();
             let config_path = Path::new(model_path).join("config.json");
-            write_amax_into_config(&config_path, &amax)?;
-            Ok(amax.len() as u32)
+            persist_amax_if_any(&config_path, &amax)
         }
         Err(e) => {
             // Discard the partial amax; do NOT mutate config.json.
@@ -96,6 +121,25 @@ where
             Err(e)
         }
     }
+}
+
+/// Persist the drained per-tensor `input_amax` into `config.json`, but ONLY when
+/// the collector actually captured something.
+///
+/// An EMPTY `amax` map means the run exercised no activation-fp8 (mxfp8
+/// attn/GDN) sites — the checkpoint is not an nvidia-recipe model. The CLI's
+/// contract for that case is that `config.json` is LEFT UNCHANGED, so we must
+/// NOT invoke [`write_amax_into_config`]: doing so would rewrite / pretty-print
+/// the file (churning its bytes and leaving any stale pre-existing `input_amax`
+/// in place) under a misleading success `0`. Skip the write and return `0`,
+/// leaving the file byte-untouched. A non-empty map is persisted atomically and
+/// its entry count returned.
+fn persist_amax_if_any(config_path: &Path, amax: &HashMap<String, f32>) -> Result<u32> {
+    if amax.is_empty() {
+        return Ok(0);
+    }
+    write_amax_into_config(config_path, amax)?;
+    Ok(amax.len() as u32)
 }
 
 /// Data-free static FP8 activation-amax calibration over RAW-text PREFILL
@@ -129,9 +173,13 @@ where
 ///
 /// On ANY error before the final write, the partial amax is discarded and
 /// `config.json` is left UNTOUCHED (a failed calibration must not mutate the
-/// live model in place). Returns the number of projections calibrated (the
-/// count of collected amax entries); 0 means the model exercised no
-/// activation-fp8 sites (not an nvidia-recipe checkpoint).
+/// live model in place). A run that prefilled ZERO rows (empty dataset, or every
+/// row tokenized to nothing) is likewise an ERROR that leaves `config.json`
+/// untouched — a no-op calibration must not report a silent success. Returns the
+/// number of projections calibrated (the count of collected amax entries); 0
+/// means a real prefill ran but the model exercised no activation-fp8 sites (not
+/// an nvidia-recipe checkpoint), and in that case `config.json` is left
+/// UNCHANGED (no rewrite).
 #[napi]
 pub async fn calibrate_activation_amax_raw(
     model_path: String,
@@ -253,6 +301,160 @@ mod tests {
             err.reason
         );
         std::fs::remove_dir_all(&no_type).ok();
+    }
+
+    /// An EMPTY collected map (a run that exercised no activation-fp8 sites)
+    /// must SKIP the config write entirely: `persist_amax_if_any` returns 0 and
+    /// leaves `config.json` BYTE-IDENTICAL, honoring the CLI's "config.json was
+    /// left unchanged" contract. The initial config is written COMPACT so that if
+    /// the skip guard regressed and `write_amax_into_config` ran, its
+    /// pretty-print would change the bytes and this assertion would fail (RED).
+    /// A stale pre-existing `input_amax` is included to prove it is NOT rewritten.
+    #[test]
+    fn empty_amax_map_skips_config_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_skip_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // COMPACT (single-line) on purpose: any rewrite pretty-prints to
+        // multi-line, so the byte comparison catches an errant write.
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8",
+                "layers.0.self_attn.q_proj": {"bits": 8, "mode": "mxfp8", "input_amax": 9.0}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let empty: HashMap<String, f32> = HashMap::new();
+        let n = persist_amax_if_any(&config_path, &empty).unwrap();
+        assert_eq!(n, 0, "empty map => 0 projections persisted");
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "empty-map calibration must leave config.json byte-identical (no rewrite, \
+             no pretty-print, stale input_amax preserved)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mirror of the skip guard: a NON-empty map DOES persist (returns the
+    /// entry count and writes `input_amax` into the config), proving the guard is
+    /// not over-broad and never swallows a real calibration.
+    #[test]
+    fn nonempty_amax_map_writes_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_write_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "qwen3_5",
+                "quantization": {
+                    "mode": "mxfp8",
+                    "layers.0.self_attn.q_proj": {"bits": 8, "mode": "mxfp8"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        let n = persist_amax_if_any(&config_path, &amax).unwrap();
+        assert_eq!(n, 1, "one collected entry => one projection persisted");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            after["quantization"]["layers.0.self_attn.q_proj"]["input_amax"]
+                .as_f64()
+                .unwrap() as f32,
+            4.0
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A calibration that prefilled ZERO rows (empty dataset, or every row
+    /// tokenized to nothing) must be an `Err` — NOT a silent `Ok(0)` — and must
+    /// leave `config.json` UNTOUCHED. Drives `prefill_and_persist` with a fake
+    /// prefill closure that reports 0 rows (no model needed). The config is
+    /// COMPACT so any errant write would be detectable as a byte change.
+    // `#[tokio::test]` runs on a CURRENT-THREAD runtime, so the future is never
+    // sent between threads and the (immediately-ready) `Ok(0)` prefill resolves
+    // synchronously — holding the std `CALIB_TEST_LOCK` guard across that await
+    // is safe here. The guard is required: `prefill_and_persist`'s zero-rows
+    // branch drains the process-global amax map, so without it this test's
+    // `take()` could steal a concurrently-recording calibration test's entries.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn zero_prefilled_rows_errors_without_writing_config() {
+        // The zero-rows branch drains the process-global amax map; serialize
+        // against the other calibration tests that record/drain it.
+        let _g = crate::calibration::activation_amax::CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_zerorows_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": { "mode": "mxfp8" }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        // Fake prefill: reports 0 rows actually prefilled.
+        let res = prefill_and_persist(dir.to_str().unwrap(), || async { Ok(0u32) }).await;
+
+        assert!(
+            res.is_err(),
+            "a zero-rows calibration must be an Err, not a silent Ok(0)"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.reason.contains("0 rows"),
+            "error must name the empty-dataset cause: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "zero-rows calibration must leave config.json untouched"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The finding-2 serialization primitive: `calib_guard` is a single
