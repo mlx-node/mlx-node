@@ -1,0 +1,1181 @@
+{
+  "items": [
+    {
+      "name": "spanish-opposite-big",
+      "prompt": "Lo opuesto de \"grande\" es \"",
+      "target": "pequeño",
+      "intermediates": [
+        "Spanish",
+        "opposite",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "french-season-summer",
+      "prompt": "La saison après l'été est l'",
+      "target": "automne",
+      "intermediates": [
+        "French",
+        "season",
+        "summer",
+        "autumn"
+      ]
+    },
+    {
+      "name": "german-opposite-loud",
+      "prompt": "Das Gegenteil von laut ist ",
+      "target": "leise",
+      "intermediates": [
+        "German",
+        "opposite",
+        "loud",
+        "quiet"
+      ]
+    },
+    {
+      "name": "chinese-color-banana",
+      "prompt": "\"香蕉\"的颜色是\"",
+      "target": "黄",
+      "intermediates": [
+        "Chinese",
+        "color",
+        "banana",
+        "yellow"
+      ]
+    },
+    {
+      "name": "japanese-day-monday",
+      "prompt": "月曜日の次の日は",
+      "target": "火曜日",
+      "intermediates": [
+        "Japanese",
+        "day",
+        "Monday",
+        "Tuesday"
+      ]
+    },
+    {
+      "name": "russian-opposite-heavy",
+      "prompt": "Противоположность тяжёлому - ",
+      "target": "лёгкий",
+      "intermediates": [
+        "Russian",
+        "opposite",
+        "heavy",
+        "light"
+      ]
+    },
+    {
+      "name": "italian-color-sky",
+      "prompt": "Il colore del \"cielo\" è \"",
+      "target": "azzurro",
+      "intermediates": [
+        "Italian",
+        "color",
+        "sky",
+        "blue"
+      ]
+    },
+    {
+      "name": "portuguese-season-spring",
+      "prompt": "A estação depois da primavera é o ",
+      "target": "verão",
+      "intermediates": [
+        "Portuguese",
+        "season",
+        "spring",
+        "summer"
+      ]
+    },
+    {
+      "name": "arabic-color-blood",
+      "prompt": "الدم لونه ",
+      "target": "أحمر",
+      "intermediates": [
+        "Arabic",
+        "color",
+        "blood",
+        "red"
+      ]
+    },
+    {
+      "name": "korean-opposite-hot",
+      "prompt": "뜨거운의 반대는 ",
+      "target": "차가운",
+      "intermediates": [
+        "Korean",
+        "opposite",
+        "hot",
+        "cold"
+      ]
+    },
+    {
+      "name": "dutch-opposite-big",
+      "prompt": "Het tegenovergestelde van groot is ",
+      "target": "klein",
+      "intermediates": [
+        "Dutch",
+        "opposite",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "greek-color-sea",
+      "prompt": "Το χρώμα της θάλασσας είναι ",
+      "target": "μπλε",
+      "intermediates": [
+        "Greek",
+        "color",
+        "sea",
+        "blue"
+      ]
+    },
+    {
+      "name": "hindi-color-snow",
+      "prompt": "बर्फ का रंग ",
+      "target": "सफेद",
+      "intermediates": [
+        "Hindi",
+        "color",
+        "snow",
+        "white"
+      ]
+    },
+    {
+      "name": "polish-opposite-wet",
+      "prompt": "Przeciwieństwo mokrego to ",
+      "target": "suchy",
+      "intermediates": [
+        "Polish",
+        "opposite",
+        "wet",
+        "dry"
+      ]
+    },
+    {
+      "name": "turkish-opposite-fast",
+      "prompt": "\"Hızlı\" kelimesinin zıttı \"",
+      "target": "yavaş",
+      "intermediates": [
+        "Turkish",
+        "opposite",
+        "fast",
+        "slow"
+      ]
+    },
+    {
+      "name": "swedish-opposite-hard",
+      "prompt": "Motsatsen till hård är ",
+      "target": "mjuk",
+      "intermediates": [
+        "Swedish",
+        "opposite",
+        "hard",
+        "soft"
+      ]
+    },
+    {
+      "name": "hebrew-color-moon",
+      "prompt": "הצבע של הירח הוא ",
+      "target": "לבן",
+      "intermediates": [
+        "Hebrew",
+        "color",
+        "moon",
+        "white"
+      ]
+    },
+    {
+      "name": "finnish-season-summer",
+      "prompt": "Kesän jälkeinen vuodenaika on ",
+      "target": "syksy",
+      "intermediates": [
+        "Finnish",
+        "season",
+        "summer",
+        "autumn"
+      ]
+    },
+    {
+      "name": "danish-color-ocean",
+      "prompt": "Farven på havet er ",
+      "target": "blå",
+      "intermediates": [
+        "Danish",
+        "color",
+        "ocean",
+        "blue"
+      ]
+    },
+    {
+      "name": "norwegian-season-spring",
+      "prompt": "Etter våren kommer ",
+      "target": "sommeren",
+      "intermediates": [
+        "Norwegian",
+        "season",
+        "spring",
+        "summer"
+      ]
+    },
+    {
+      "name": "czech-opposite-tall",
+      "prompt": "Opak slova \"vysoký\" je \"",
+      "target": "nízký",
+      "intermediates": [
+        "Czech",
+        "opposite",
+        "tall",
+        "short"
+      ]
+    },
+    {
+      "name": "thai-color-blood",
+      "prompt": "สีของ\"เลือด\"คือ\"",
+      "target": "แดง",
+      "intermediates": [
+        "Thai",
+        "color",
+        "blood",
+        "red"
+      ]
+    },
+    {
+      "name": "vietnamese-opposite-heavy",
+      "prompt": "Trái nghĩa của nặng là ",
+      "target": "nhẹ",
+      "intermediates": [
+        "Vietnamese",
+        "opposite",
+        "heavy",
+        "light"
+      ]
+    },
+    {
+      "name": "indonesian-color-grass",
+      "prompt": "Warna rumput adalah ",
+      "target": "hijau",
+      "intermediates": [
+        "Indonesian",
+        "color",
+        "grass",
+        "green"
+      ]
+    },
+    {
+      "name": "romanian-opposite-young",
+      "prompt": "Opusul cuvântului tânăr este ",
+      "target": "bătrân",
+      "intermediates": [
+        "Romanian",
+        "opposite",
+        "young",
+        "old"
+      ]
+    },
+    {
+      "name": "hungarian-color-sea",
+      "prompt": "A \"tenger\" színe \"",
+      "target": "kék",
+      "intermediates": [
+        "Hungarian",
+        "color",
+        "sea",
+        "blue"
+      ]
+    },
+    {
+      "name": "spanish-number-three",
+      "prompt": "Después del \"tres\" viene el \"",
+      "target": "cuatro",
+      "intermediates": [
+        "Spanish",
+        "number",
+        "three",
+        "four"
+      ]
+    },
+    {
+      "name": "german-number-five",
+      "prompt": "Nach \"fünf\" kommt \"",
+      "target": "sechs",
+      "intermediates": [
+        "German",
+        "number",
+        "five",
+        "six"
+      ]
+    },
+    {
+      "name": "french-number-seven",
+      "prompt": "Après \"sept\" vient \"",
+      "target": "huit",
+      "intermediates": [
+        "French",
+        "number",
+        "seven",
+        "eight"
+      ]
+    },
+    {
+      "name": "italian-number-two",
+      "prompt": "Dopo il \"due\" viene il \"",
+      "target": "tre",
+      "intermediates": [
+        "Italian",
+        "number",
+        "two",
+        "three"
+      ]
+    },
+    {
+      "name": "russian-number-four",
+      "prompt": "После \"четыре\" идёт \"",
+      "target": "пять",
+      "intermediates": [
+        "Russian",
+        "number",
+        "four",
+        "five"
+      ]
+    },
+    {
+      "name": "chinese-number-eight",
+      "prompt": "\"八\"后面是\"",
+      "target": "九",
+      "intermediates": [
+        "Chinese",
+        "number",
+        "eight",
+        "nine"
+      ]
+    },
+    {
+      "name": "portuguese-direction-up",
+      "prompt": "O oposto de \"cima\" é \"",
+      "target": "baixo",
+      "intermediates": [
+        "Portuguese",
+        "opposite",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "dutch-direction-left",
+      "prompt": "Het tegenovergestelde van \"links\" is \"",
+      "target": "rechts",
+      "intermediates": [
+        "Dutch",
+        "opposite",
+        "left",
+        "right"
+      ]
+    },
+    {
+      "name": "polish-direction-left",
+      "prompt": "Przeciwieństwo \"lewa\" to \"",
+      "target": "prawa",
+      "intermediates": [
+        "Polish",
+        "opposite",
+        "left",
+        "right"
+      ]
+    },
+    {
+      "name": "spanish-body-see",
+      "prompt": "Vemos con los \"",
+      "target": "ojos",
+      "intermediates": [
+        "Spanish",
+        "body",
+        "see",
+        "eyes"
+      ]
+    },
+    {
+      "name": "german-body-hear",
+      "prompt": "Wir hören mit den \"",
+      "target": "Ohren",
+      "intermediates": [
+        "German",
+        "body",
+        "hear",
+        "ears"
+      ]
+    },
+    {
+      "name": "french-body-walk",
+      "prompt": "Nous marchons avec nos ",
+      "target": "pieds",
+      "intermediates": [
+        "French",
+        "body",
+        "walk",
+        "feet"
+      ]
+    },
+    {
+      "name": "spanish-family-uncle",
+      "prompt": "El hermano de tu padre es tu \"",
+      "target": "tío",
+      "intermediates": [
+        "Spanish",
+        "family",
+        "brother",
+        "uncle"
+      ]
+    },
+    {
+      "name": "german-family-aunt",
+      "prompt": "Die Schwester deiner Mutter ist deine \"",
+      "target": "Tante",
+      "intermediates": [
+        "German",
+        "family",
+        "sister",
+        "aunt"
+      ]
+    },
+    {
+      "name": "french-family-nephew",
+      "prompt": "Le fils de ta sœur est ton \"",
+      "target": "neveu",
+      "intermediates": [
+        "French",
+        "family",
+        "son",
+        "nephew"
+      ]
+    },
+    {
+      "name": "italian-family-grandmother",
+      "prompt": "La madre di tua madre è tua \"",
+      "target": "nonna",
+      "intermediates": [
+        "Italian",
+        "family",
+        "mother",
+        "grandmother"
+      ]
+    },
+    {
+      "name": "spanish-phase-water",
+      "prompt": "Cuando el agua se congela se convierte en \"",
+      "target": "hielo",
+      "intermediates": [
+        "Spanish",
+        "freeze",
+        "water",
+        "ice"
+      ]
+    },
+    {
+      "name": "german-phase-water",
+      "prompt": "Wenn Wasser gefriert, wird es zu \"",
+      "target": "Eis",
+      "intermediates": [
+        "German",
+        "freeze",
+        "water",
+        "ice"
+      ]
+    },
+    {
+      "name": "ukrainian-opposite-day",
+      "prompt": "Протилежність \"день\" - це \"",
+      "target": "ніч",
+      "intermediates": [
+        "Ukrainian",
+        "opposite",
+        "day",
+        "night"
+      ]
+    },
+    {
+      "name": "bulgarian-color-grass",
+      "prompt": "Цветът на \"тревата\" е \"",
+      "target": "зелен",
+      "intermediates": [
+        "Bulgarian",
+        "color",
+        "grass",
+        "green"
+      ]
+    },
+    {
+      "name": "serbian-opposite-day",
+      "prompt": "Супротно од \"дан\" је \"",
+      "target": "ноћ",
+      "intermediates": [
+        "Serbian",
+        "opposite",
+        "day",
+        "night"
+      ]
+    },
+    {
+      "name": "croatian-opposite-big",
+      "prompt": "Suprotno od \"velik\" je \"",
+      "target": "mali",
+      "intermediates": [
+        "Croatian",
+        "opposite",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "slovak-opposite-young",
+      "prompt": "Opak slova \"mladý\" je \"",
+      "target": "starý",
+      "intermediates": [
+        "Slovak",
+        "opposite",
+        "young",
+        "old"
+      ]
+    },
+    {
+      "name": "estonian-opposite-open",
+      "prompt": "Sõna \"avatud\" vastand on \"",
+      "target": "suletud",
+      "intermediates": [
+        "Estonian",
+        "opposite",
+        "open",
+        "closed"
+      ]
+    },
+    {
+      "name": "irish-opposite-big",
+      "prompt": "Is é an focal atá contrártha le \"mór\" ná \"",
+      "target": "beag",
+      "intermediates": [
+        "Irish",
+        "opposite",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "persian-color-blood",
+      "prompt": "خون چه رنگی است؟ ",
+      "target": "قرمز",
+      "intermediates": [
+        "Persian",
+        "color",
+        "blood",
+        "red"
+      ]
+    },
+    {
+      "name": "bengali-opposite-up",
+      "prompt": "\"উপরে\" এর বিপরীত হল \"",
+      "target": "নিচে",
+      "intermediates": [
+        "Bengali",
+        "opposite",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "filipino-opposite-up",
+      "prompt": "Ang kabaligtaran ng \"taas\" ay \"",
+      "target": "baba",
+      "intermediates": [
+        "Filipino",
+        "opposite",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "fr-month-after-jan",
+      "prompt": "Le mois après janvier est \"",
+      "target": "février",
+      "intermediates": [
+        "French",
+        "month",
+        "January",
+        "February"
+      ]
+    },
+    {
+      "name": "fr-month-after-may",
+      "prompt": "Le mois après mai est \"",
+      "target": "juin",
+      "intermediates": [
+        "French",
+        "month",
+        "May",
+        "June"
+      ]
+    },
+    {
+      "name": "fr-month-before-mar",
+      "prompt": "Le mois avant mars est \"",
+      "target": "février",
+      "intermediates": [
+        "French",
+        "month",
+        "March",
+        "February"
+      ]
+    },
+    {
+      "name": "de-month-after-jan",
+      "prompt": "Der Monat nach Januar ist \"",
+      "target": "Februar",
+      "intermediates": [
+        "German",
+        "month",
+        "January",
+        "February"
+      ]
+    },
+    {
+      "name": "de-month-after-jul",
+      "prompt": "Der Monat nach Juli ist \"",
+      "target": "August",
+      "intermediates": [
+        "German",
+        "month",
+        "July",
+        "August"
+      ]
+    },
+    {
+      "name": "de-month-before-dec",
+      "prompt": "Der Monat vor Dezember ist \"",
+      "target": "November",
+      "intermediates": [
+        "German",
+        "month",
+        "December",
+        "November"
+      ]
+    },
+    {
+      "name": "es-month-after-mar",
+      "prompt": "El mes después de marzo es \"",
+      "target": "abril",
+      "intermediates": [
+        "español",
+        "month",
+        "March",
+        "April"
+      ]
+    },
+    {
+      "name": "es-month-after-sep",
+      "prompt": "El mes después de septiembre es \"",
+      "target": "octubre",
+      "intermediates": [
+        "español",
+        "month",
+        "September",
+        "October"
+      ]
+    },
+    {
+      "name": "es-month-before-jun",
+      "prompt": "El mes antes de junio es \"",
+      "target": "mayo",
+      "intermediates": [
+        "español",
+        "month",
+        "June",
+        "May"
+      ]
+    },
+    {
+      "name": "pt-month-after-apr",
+      "prompt": "O mês depois de abril é \"",
+      "target": "maio",
+      "intermediates": [
+        "português",
+        "month",
+        "April",
+        "May"
+      ]
+    },
+    {
+      "name": "pt-month-after-oct",
+      "prompt": "O mês depois de outubro é \"",
+      "target": "novembro",
+      "intermediates": [
+        "português",
+        "month",
+        "October",
+        "November"
+      ]
+    },
+    {
+      "name": "pt-month-before-aug",
+      "prompt": "O mês antes de agosto é \"",
+      "target": "julho",
+      "intermediates": [
+        "português",
+        "month",
+        "August",
+        "July"
+      ]
+    },
+    {
+      "name": "fr-half-six",
+      "prompt": "Six divisé par deux donne \"",
+      "target": "trois",
+      "intermediates": [
+        "French",
+        "half",
+        "six",
+        "three"
+      ]
+    },
+    {
+      "name": "fr-double-three",
+      "prompt": "Le double de trois est \"",
+      "target": "six",
+      "intermediates": [
+        "French",
+        "double",
+        "three",
+        "six"
+      ]
+    },
+    {
+      "name": "de-half-six",
+      "prompt": "Sechs geteilt durch zwei ist \"",
+      "target": "drei",
+      "intermediates": [
+        "German",
+        "half",
+        "six",
+        "three"
+      ]
+    },
+    {
+      "name": "de-double-two",
+      "prompt": "Das Doppelte von zwei ist \"",
+      "target": "vier",
+      "intermediates": [
+        "German",
+        "double",
+        "two",
+        "four"
+      ]
+    },
+    {
+      "name": "es-half-four",
+      "prompt": "La mitad de cuatro es \"",
+      "target": "dos",
+      "intermediates": [
+        "español",
+        "half",
+        "four",
+        "two"
+      ]
+    },
+    {
+      "name": "es-double-three",
+      "prompt": "El doble de tres es \"",
+      "target": "seis",
+      "intermediates": [
+        "español",
+        "double",
+        "three",
+        "six"
+      ]
+    },
+    {
+      "name": "pt-half-six",
+      "prompt": "Seis dividido por dois é \"",
+      "target": "três",
+      "intermediates": [
+        "português",
+        "half",
+        "six",
+        "three"
+      ]
+    },
+    {
+      "name": "pt-double-two",
+      "prompt": "O dobro de dois é \"",
+      "target": "quatro",
+      "intermediates": [
+        "português",
+        "double",
+        "two",
+        "four"
+      ]
+    },
+    {
+      "name": "fr-number-after-four",
+      "prompt": "Le nombre après quatre est \"",
+      "target": "cinq",
+      "intermediates": [
+        "French",
+        "number",
+        "four",
+        "five"
+      ]
+    },
+    {
+      "name": "de-number-after-three",
+      "prompt": "Die Zahl nach drei ist \"",
+      "target": "vier",
+      "intermediates": [
+        "German",
+        "number",
+        "three",
+        "four"
+      ]
+    },
+    {
+      "name": "es-number-after-two",
+      "prompt": "El número después de dos es \"",
+      "target": "tres",
+      "intermediates": [
+        "español",
+        "number",
+        "two",
+        "three"
+      ]
+    },
+    {
+      "name": "pt-number-after-five",
+      "prompt": "O número depois de cinco é \"",
+      "target": "seis",
+      "intermediates": [
+        "português",
+        "number",
+        "five",
+        "six"
+      ]
+    },
+    {
+      "name": "fr-color-night",
+      "prompt": "La couleur de la nuit est le \"",
+      "target": "noir",
+      "intermediates": [
+        "French",
+        "color",
+        "night",
+        "black"
+      ]
+    },
+    {
+      "name": "de-color-night",
+      "prompt": "Die Farbe der Nacht ist \"",
+      "target": "schwarz",
+      "intermediates": [
+        "German",
+        "color",
+        "night",
+        "black"
+      ]
+    },
+    {
+      "name": "es-color-night",
+      "prompt": "El color de la noche es \"",
+      "target": "negro",
+      "intermediates": [
+        "español",
+        "color",
+        "night",
+        "black"
+      ]
+    },
+    {
+      "name": "fr-time-after-night",
+      "prompt": "Après la nuit vient le \"",
+      "target": "jour",
+      "intermediates": [
+        "French",
+        "time",
+        "night",
+        "day"
+      ]
+    },
+    {
+      "name": "de-time-after-night",
+      "prompt": "Nach der Nacht kommt der \"",
+      "target": "Tag",
+      "intermediates": [
+        "German",
+        "time",
+        "night",
+        "day"
+      ]
+    },
+    {
+      "name": "es-time-after-day",
+      "prompt": "Después del día viene la \"",
+      "target": "noche",
+      "intermediates": [
+        "español",
+        "time",
+        "day",
+        "night"
+      ]
+    },
+    {
+      "name": "pt-time-after-night",
+      "prompt": "Depois da noite vem o \"",
+      "target": "dia",
+      "intermediates": [
+        "português",
+        "time",
+        "night",
+        "day"
+      ]
+    },
+    {
+      "name": "fr-size-big-small",
+      "prompt": "Le contraire de \"grand\" est \"",
+      "target": "petit",
+      "intermediates": [
+        "French",
+        "size",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "de-size-big-small",
+      "prompt": "Das Gegenteil von \"groß\" ist \"",
+      "target": "klein",
+      "intermediates": [
+        "German",
+        "size",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "es-size-big-small",
+      "prompt": "Lo contrario de \"grande\" es \"",
+      "target": "pequeño",
+      "intermediates": [
+        "español",
+        "size",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "pt-size-big-small",
+      "prompt": "O contrário de \"grande\" é \"",
+      "target": "pequeno",
+      "intermediates": [
+        "português",
+        "size",
+        "big",
+        "small"
+      ]
+    },
+    {
+      "name": "fr-place-up-down",
+      "prompt": "Le contraire de \"haut\" est \"",
+      "target": "bas",
+      "intermediates": [
+        "French",
+        "place",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "de-place-up-down",
+      "prompt": "Das Gegenteil von \"oben\" ist \"",
+      "target": "unten",
+      "intermediates": [
+        "German",
+        "place",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "es-place-up-down",
+      "prompt": "Lo contrario de \"arriba\" es \"",
+      "target": "abajo",
+      "intermediates": [
+        "español",
+        "place",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "pt-place-up-down",
+      "prompt": "O contrário de \"cima\" é \"",
+      "target": "baixo",
+      "intermediates": [
+        "português",
+        "place",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "name": "fr-place-near-far",
+      "prompt": "Le contraire de \"près\" est \"",
+      "target": "loin",
+      "intermediates": [
+        "French",
+        "place",
+        "near",
+        "far"
+      ]
+    },
+    {
+      "name": "de-place-near-far",
+      "prompt": "Das Gegenteil von \"nah\" ist \"",
+      "target": "fern",
+      "intermediates": [
+        "German",
+        "place",
+        "near",
+        "far"
+      ]
+    },
+    {
+      "name": "es-place-near-far",
+      "prompt": "Lo contrario de \"cerca\" es \"",
+      "target": "lejos",
+      "intermediates": [
+        "español",
+        "place",
+        "near",
+        "far"
+      ]
+    },
+    {
+      "name": "pt-place-near-far",
+      "prompt": "O contrário de \"perto\" é \"",
+      "target": "longe",
+      "intermediates": [
+        "português",
+        "place",
+        "near",
+        "far"
+      ]
+    },
+    {
+      "name": "fr-time-old-young",
+      "prompt": "Le contraire de \"vieux\" est \"",
+      "target": "jeune",
+      "intermediates": [
+        "French",
+        "time",
+        "old",
+        "young"
+      ]
+    },
+    {
+      "name": "de-time-old-new",
+      "prompt": "Das Gegenteil von \"alt\" ist \"",
+      "target": "neu",
+      "intermediates": [
+        "German",
+        "time",
+        "old",
+        "new"
+      ]
+    },
+    {
+      "name": "es-time-old-new",
+      "prompt": "Lo contrario de \"viejo\" es \"",
+      "target": "nuevo",
+      "intermediates": [
+        "español",
+        "time",
+        "old",
+        "new"
+      ]
+    },
+    {
+      "name": "pt-time-old-new",
+      "prompt": "O contrário de \"velho\" é \"",
+      "target": "novo",
+      "intermediates": [
+        "português",
+        "time",
+        "old",
+        "new"
+      ]
+    },
+    {
+      "name": "fr-order-first-last",
+      "prompt": "Le contraire de \"premier\" est \"",
+      "target": "dernier",
+      "intermediates": [
+        "French",
+        "order",
+        "first",
+        "last"
+      ]
+    },
+    {
+      "name": "de-order-first-last",
+      "prompt": "Das Gegenteil von \"erste\" ist \"",
+      "target": "letzte",
+      "intermediates": [
+        "German",
+        "order",
+        "first",
+        "last"
+      ]
+    },
+    {
+      "name": "es-order-first-last",
+      "prompt": "Lo contrario de \"primero\" es \"",
+      "target": "último",
+      "intermediates": [
+        "español",
+        "order",
+        "first",
+        "last"
+      ]
+    },
+    {
+      "name": "pt-order-first-last",
+      "prompt": "O contrário de \"primeiro\" é \"",
+      "target": "último",
+      "intermediates": [
+        "português",
+        "order",
+        "first",
+        "last"
+      ]
+    },
+    {
+      "name": "frn-number-after-one",
+      "prompt": "Le nombre après un est \"",
+      "target": "deux",
+      "intermediates": [
+        "français",
+        "number",
+        "one",
+        "two"
+      ]
+    },
+    {
+      "name": "frn-month-after-jun",
+      "prompt": "Le mois après juin est \"",
+      "target": "juillet",
+      "intermediates": [
+        "français",
+        "month",
+        "June",
+        "July"
+      ]
+    }
+  ]
+}

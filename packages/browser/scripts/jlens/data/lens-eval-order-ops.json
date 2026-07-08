@@ -1,0 +1,499 @@
+{
+  "items": [
+    {
+      "name": "parens-add-mult",
+      "prompt": "(2 + 3) * 4 = ",
+      "target": "20",
+      "intermediates": [
+        "5",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "parens-sub-mult",
+      "prompt": "(7 - 3) * 2 = 8. (9 - 4) * 3 = ",
+      "target": "15",
+      "intermediates": [
+        "5",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "mult-parens-add",
+      "prompt": "2 * (3 + 4) = ",
+      "target": "14",
+      "intermediates": [
+        "7",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "mult-parens-sub",
+      "prompt": "(9 - 6) * 2 = ",
+      "target": "6",
+      "intermediates": [
+        "3",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "add-mult-right",
+      "prompt": "2 + 3 * 4 = ",
+      "target": "14",
+      "intermediates": [
+        "12",
+        "addition"
+      ]
+    },
+    {
+      "name": "mult-add-left",
+      "prompt": "3 * 4 + 2 = ",
+      "target": "14",
+      "intermediates": [
+        "12",
+        "addition"
+      ]
+    },
+    {
+      "name": "sub-mult-right",
+      "prompt": "17 - 3 * 4 = ",
+      "target": "5",
+      "intermediates": [
+        "12",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "mult-sub-left",
+      "prompt": "4 * 5 - 8 = ",
+      "target": "12",
+      "intermediates": [
+        "20",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "add-sub-left-right",
+      "prompt": "10 + 5 - 3 = ",
+      "target": "12",
+      "intermediates": [
+        "15",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "sub-add-left-right",
+      "prompt": "15 - 5 + 3 = ",
+      "target": "13",
+      "intermediates": [
+        "10",
+        "addition"
+      ]
+    },
+    {
+      "name": "div-parens-add",
+      "prompt": "20 / (2 + 3) = ",
+      "target": "4",
+      "intermediates": [
+        "5",
+        "division"
+      ]
+    },
+    {
+      "name": "parens-add-div",
+      "prompt": "(10 + 5) / 3 = ",
+      "target": "5",
+      "intermediates": [
+        "15",
+        "division"
+      ]
+    },
+    {
+      "name": "parens-sub-div",
+      "prompt": "(14 - 2) / 4 = ",
+      "target": "3",
+      "intermediates": [
+        "12",
+        "division"
+      ]
+    },
+    {
+      "name": "div-sub-left",
+      "prompt": "20 / 5 - 1 = ",
+      "target": "3",
+      "intermediates": [
+        "4",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "chain-add-mult-add",
+      "prompt": "1 + 2 * 3 + 4 = ",
+      "target": "11",
+      "intermediates": [
+        "6",
+        "addition"
+      ]
+    },
+    {
+      "name": "chain-mult-sub-add",
+      "prompt": "2 * 3 - 4 + 5 = ",
+      "target": "7",
+      "intermediates": [
+        "6",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "chain-sub-mult-sub",
+      "prompt": "15 - 2 * 3 - 4 = ",
+      "target": "5",
+      "intermediates": [
+        "6",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "nested-add-mult-sub",
+      "prompt": "((1 + 2) * 3) - 4 = ",
+      "target": "5",
+      "intermediates": [
+        "9",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "nested-mult-add-div",
+      "prompt": "((2 * 3) + 6) / 4 = ",
+      "target": "3",
+      "intermediates": [
+        "12",
+        "division"
+      ]
+    },
+    {
+      "name": "nested-sub-add-mult",
+      "prompt": "((8 - 5) + 2) * 3 = ",
+      "target": "15",
+      "intermediates": [
+        "5",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "word-add-mult",
+      "prompt": "two plus three times four equals ",
+      "target": "fourteen",
+      "intermediates": [
+        "12",
+        "addition"
+      ]
+    },
+    {
+      "name": "word-mult-sub",
+      "prompt": "three times five minus eight equals ",
+      "target": "seven",
+      "intermediates": [
+        "15",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "word-parens",
+      "prompt": "Calculate: open paren two plus three close paren times four equals ",
+      "target": "twenty",
+      "intermediates": [
+        "5",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "mod-add",
+      "prompt": "(7 + 4) % 3 = ",
+      "target": "2",
+      "intermediates": [
+        "11",
+        "mod"
+      ]
+    },
+    {
+      "name": "mod-mult",
+      "prompt": "(2 * 8) % 5 = ",
+      "target": "1",
+      "intermediates": [
+        "16",
+        "mod"
+      ]
+    },
+    {
+      "name": "square-sub",
+      "prompt": "(7 - 4)^2 = ",
+      "target": "9",
+      "intermediates": [
+        "3",
+        "squared"
+      ]
+    },
+    {
+      "name": "mult-mult-left",
+      "prompt": "2 * 3 * 4 = ",
+      "target": "24",
+      "intermediates": [
+        "6",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "div-div-left",
+      "prompt": "24 / 4 / 2 = ",
+      "target": "3",
+      "intermediates": [
+        "6",
+        "division"
+      ]
+    },
+    {
+      "name": "mult-div-left",
+      "prompt": "6 * 4 / 3 = ",
+      "target": "8",
+      "intermediates": [
+        "24",
+        "division"
+      ]
+    },
+    {
+      "name": "div-mult-left",
+      "prompt": "12 / 3 * 2 = ",
+      "target": "8",
+      "intermediates": [
+        "4",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "mult-div-mult",
+      "prompt": "2 * 6 / 4 * 3 = ",
+      "target": "9",
+      "intermediates": [
+        "12",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "add-add-add",
+      "prompt": "1 + 2 + 3 + 4 = ",
+      "target": "10",
+      "intermediates": [
+        "3",
+        "addition"
+      ]
+    },
+    {
+      "name": "sub-sub-sub",
+      "prompt": "20 - 5 - 3 - 2 = ",
+      "target": "10",
+      "intermediates": [
+        "15",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "add-sub-add-sub",
+      "prompt": "10 + 3 - 5 + 2 = ",
+      "target": "10",
+      "intermediates": [
+        "13",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "chain-mult-mult-add",
+      "prompt": "2 * 3 + 4 * 5 = ",
+      "target": "26",
+      "intermediates": [
+        "6",
+        "addition"
+      ]
+    },
+    {
+      "name": "nested-add-add-mult",
+      "prompt": "((2 + 3) + 4) * 2 = ",
+      "target": "18",
+      "intermediates": [
+        "9",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "nested-mult-sub-add",
+      "prompt": "((3 * 4) - 5) + 2 = ",
+      "target": "9",
+      "intermediates": [
+        "7",
+        "addition"
+      ]
+    },
+    {
+      "name": "nested-div-add-sub",
+      "prompt": "((12 / 4) + 5) - 3 = ",
+      "target": "5",
+      "intermediates": [
+        "8",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "nested-sub-div-mult",
+      "prompt": "((10 - 4) / 2) * 5 = ",
+      "target": "15",
+      "intermediates": [
+        "3",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "nested4-add-mult-add-div",
+      "prompt": "(((1 + 2) * 3) + 3) / 4 = ",
+      "target": "3",
+      "intermediates": [
+        "12",
+        "division"
+      ]
+    },
+    {
+      "name": "nested4-sub-add-mult-sub",
+      "prompt": "(((8 - 5) + 1) * 3) - 2 = ",
+      "target": "10",
+      "intermediates": [
+        "12",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "redundant-parens-mult",
+      "prompt": "(2 * 3) + 5 = ",
+      "target": "11",
+      "intermediates": [
+        "6",
+        "addition"
+      ]
+    },
+    {
+      "name": "redundant-parens-div",
+      "prompt": "(12 / 4) - 1 = ",
+      "target": "2",
+      "intermediates": [
+        "3",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "word-sub-mult",
+      "prompt": "ten minus two times three equals ",
+      "target": "four",
+      "intermediates": [
+        "6",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "word-add-add",
+      "prompt": "three plus four plus five equals ",
+      "target": "twelve",
+      "intermediates": [
+        "7",
+        "addition"
+      ]
+    },
+    {
+      "name": "word-div-sub",
+      "prompt": "fifteen divided by three minus two equals ",
+      "target": "three",
+      "intermediates": [
+        "5",
+        "subtraction"
+      ]
+    },
+    {
+      "name": "mixed-mult-add",
+      "prompt": "Calculate: 3 times 4 plus 2 equals ",
+      "target": "14",
+      "intermediates": [
+        "12",
+        "addition"
+      ]
+    },
+    {
+      "name": "mixed-parens-mult",
+      "prompt": "Calculate: (1 plus 4) times 3 equals ",
+      "target": "15",
+      "intermediates": [
+        "5",
+        "multiplication"
+      ]
+    },
+    {
+      "name": "mod-sub",
+      "prompt": "(12 - 3) % 4 = ",
+      "target": "1",
+      "intermediates": [
+        "9",
+        "mod"
+      ]
+    },
+    {
+      "name": "square-div",
+      "prompt": "(12 / 4)^2 = ",
+      "target": "9",
+      "intermediates": [
+        "3",
+        "squared"
+      ]
+    },
+    {
+      "name": "square-mult",
+      "prompt": "(1 * 4)^2 = ",
+      "target": "16",
+      "intermediates": [
+        "4",
+        "squared"
+      ]
+    },
+    {
+      "name": "pystar-add",
+      "prompt": "(2 + 1)**2 = ",
+      "target": "9",
+      "intermediates": [
+        "3",
+        "squared"
+      ]
+    },
+    {
+      "name": "pystar-sub",
+      "prompt": "(6 - 2)**2 = ",
+      "target": "16",
+      "intermediates": [
+        "4",
+        "squared"
+      ]
+    },
+    {
+      "name": "floordiv-add",
+      "prompt": "(7 + 4) // 3 = ",
+      "target": "3",
+      "intermediates": [
+        "11",
+        "division"
+      ]
+    },
+    {
+      "name": "floordiv-mult",
+      "prompt": "(2 * 5) // 3 = ",
+      "target": "3",
+      "intermediates": [
+        "10",
+        "division"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,758 @@
+{
+  "items": [
+    {
+      "name": "carnival-ocean",
+      "prompt": "Fact: The ocean on the coast of the country where Carnival is most famously celebrated is the ",
+      "target": "Atlantic",
+      "intermediates": [
+        "Brazil"
+      ]
+    },
+    {
+      "name": "amazon-language",
+      "prompt": "Fact: The language spoken in the country where the Amazon River ends is ",
+      "target": "Portuguese",
+      "intermediates": [
+        "Brazil"
+      ]
+    },
+    {
+      "name": "mars-color",
+      "prompt": "Fact: The color of the planet fourth from the Sun is ",
+      "target": "red",
+      "intermediates": [
+        "Mars"
+      ]
+    },
+    {
+      "name": "spider-legs",
+      "prompt": "Fact: The number of legs on the animal that spins webs is ",
+      "target": "8",
+      "intermediates": [
+        "spider"
+      ]
+    },
+    {
+      "name": "basketball-players",
+      "prompt": "Fact: The number of players per side in the sport invented in Springfield, Massachusetts is ",
+      "target": "5",
+      "intermediates": [
+        "basketball"
+      ]
+    },
+    {
+      "name": "paper-continent",
+      "prompt": "Fact: The continent where the country that invented paper is located is ",
+      "target": "Asia",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "christmas-season",
+      "prompt": "Fact: The season when the holiday with a decorated tree occurs is ",
+      "target": "winter",
+      "intermediates": [
+        "Christmas"
+      ]
+    },
+    {
+      "name": "osu-rival-mascot",
+      "prompt": "Fact: The mascot of the college football rival of Ohio State is a ",
+      "target": "wolverine",
+      "intermediates": [
+        "Michigan"
+      ]
+    },
+    {
+      "name": "topeka-west",
+      "prompt": "Fact: The state west of the state with Topeka as its capital is ",
+      "target": "Colorado",
+      "intermediates": [
+        "Kansas"
+      ]
+    },
+    {
+      "name": "atomic-79-symbol",
+      "prompt": "Fact: The chemical symbol for the element with atomic number 79 is ",
+      "target": "Au",
+      "intermediates": [
+        "gold"
+      ]
+    },
+    {
+      "name": "atomic-26-symbol",
+      "prompt": "Fact: The chemical symbol for the element with atomic number 26 is ",
+      "target": "Fe",
+      "intermediates": [
+        "iron"
+      ]
+    },
+    {
+      "name": "atomic-29-symbol",
+      "prompt": "Fact: The chemical symbol for the element with atomic number 29 is ",
+      "target": "Cu",
+      "intermediates": [
+        "copper"
+      ]
+    },
+    {
+      "name": "atomic-80-state",
+      "prompt": "Fact: The state of matter at room temperature of the element with atomic number 80 is ",
+      "target": "liquid",
+      "intermediates": [
+        "mercury"
+      ]
+    },
+    {
+      "name": "atomic-29-flame",
+      "prompt": "Fact: The flame color produced by burning the element with atomic number 29 is ",
+      "target": "green",
+      "intermediates": [
+        "copper"
+      ]
+    },
+    {
+      "name": "planet-3-moons",
+      "prompt": "Fact: The number of natural moons orbiting the planet third from the Sun is ",
+      "target": "1",
+      "intermediates": [
+        "Earth"
+      ]
+    },
+    {
+      "name": "month-3-godof",
+      "prompt": "Fact: The third month of the year is named after the Roman god of ",
+      "target": "war",
+      "intermediates": [
+        "March"
+      ]
+    },
+    {
+      "name": "spaceneedle-border",
+      "prompt": "Fact: The US state where the Space Needle is located shares its northern border with ",
+      "target": "Canada",
+      "intermediates": [
+        "Seattle"
+      ]
+    },
+    {
+      "name": "rhyme-rain-neighbor",
+      "prompt": "Fact: The European country whose name rhymes with 'rain' shares its western border with ",
+      "target": "Portugal",
+      "intermediates": [
+        "Spain"
+      ]
+    },
+    {
+      "name": "rhyme-door-doubled",
+      "prompt": "Fact: Take the number whose name rhymes with the word door. Doubling it gives the number ",
+      "target": "8",
+      "intermediates": [
+        "four"
+      ]
+    },
+    {
+      "name": "rhyme-chair-flag",
+      "prompt": "Fact: The large mammal whose name rhymes with 'chair' appears on the state flag of ",
+      "target": "California",
+      "intermediates": [
+        "bear"
+      ]
+    },
+    {
+      "name": "rhyme-spoon-orbit",
+      "prompt": "Fact: The celestial body whose name rhymes with 'spoon' orbits the planet called ",
+      "target": "Earth",
+      "intermediates": [
+        "moon"
+      ]
+    },
+    {
+      "name": "etym-wargod-month",
+      "prompt": "Fact: The month named after the Roman god of war is month number ",
+      "target": "3",
+      "intermediates": [
+        "March"
+      ]
+    },
+    {
+      "name": "etym-frigg-position",
+      "prompt": "Fact: Counting Monday as day 1, the day of the week named after the Norse goddess Frigg is day number ",
+      "target": "5",
+      "intermediates": [
+        "Friday"
+      ]
+    },
+    {
+      "name": "etym-saturn-position",
+      "prompt": "Fact: The planet named after the Roman god of agriculture and time is planet number ",
+      "target": "6",
+      "intermediates": [
+        "Saturn"
+      ]
+    },
+    {
+      "name": "chem-photosynthesis-Z",
+      "prompt": "Fact: The atomic number of the gas that plants release during photosynthesis is ",
+      "target": "8",
+      "intermediates": [
+        "oxygen"
+      ]
+    },
+    {
+      "name": "chem-atmosphere-Z",
+      "prompt": "Fact: The atomic number of the gas that makes up about 78 percent of the atmosphere is ",
+      "target": "7",
+      "intermediates": [
+        "nitrogen"
+      ]
+    },
+    {
+      "name": "chem-organic-Z",
+      "prompt": "Fact: The atomic number of the element present in all organic compounds by definition is ",
+      "target": "6",
+      "intermediates": [
+        "carbon"
+      ]
+    },
+    {
+      "name": "chem-bones-Z",
+      "prompt": "Fact: The atomic number of the metal most abundant in human bones is ",
+      "target": "20",
+      "intermediates": [
+        "calcium"
+      ]
+    },
+    {
+      "name": "func-pumps-chambers",
+      "prompt": "Fact: In humans, the organ that pumps blood through the body has this many chambers: ",
+      "target": "4",
+      "intermediates": [
+        "heart"
+      ]
+    },
+    {
+      "name": "func-filters-count",
+      "prompt": "Fact: In humans, the number of organs that filter blood to make urine is ",
+      "target": "2",
+      "intermediates": [
+        "kidney"
+      ]
+    },
+    {
+      "name": "birthstone-emerald-month",
+      "prompt": "Fact: Emerald is the birthstone for month number ",
+      "target": "5",
+      "intermediates": [
+        "May"
+      ]
+    },
+    {
+      "name": "violin-strings",
+      "prompt": "Fact: The number of strings on the instrument that fiddlers play is ",
+      "target": "4",
+      "intermediates": [
+        "violin"
+      ]
+    },
+    {
+      "name": "nhop-primary-planet",
+      "prompt": "Count the legs on a spider. The planet at that position from the Sun is Neptune. Count the primary colors of light. The planet at that position from the Sun is ",
+      "target": "Earth",
+      "intermediates": [
+        "3",
+        "three",
+        "third"
+      ]
+    },
+    {
+      "name": "nhop-rings-planet",
+      "prompt": "Count the legs on a spider. The planet at that position from the Sun is Neptune. Count the Olympic rings. The planet at that position from the Sun is ",
+      "target": "Jupiter",
+      "intermediates": [
+        "5",
+        "five"
+      ]
+    },
+    {
+      "name": "nhop-guitar-planet",
+      "prompt": "Count the legs on a spider. The planet at that position from the Sun is Neptune. Count the strings on a standard guitar. The planet at that position from the Sun is ",
+      "target": "Saturn",
+      "intermediates": [
+        "6",
+        "six"
+      ]
+    },
+    {
+      "name": "nhop-compass-planet",
+      "prompt": "Count the legs on a spider. The planet at that position from the Sun is Neptune. Count the cardinal directions on a compass. The planet at that position from the Sun is ",
+      "target": "Mars",
+      "intermediates": [
+        "4",
+        "four"
+      ]
+    },
+    {
+      "name": "nhop-volleyball-planet",
+      "prompt": "Count the legs on a spider. The planet at that position from the Sun is Neptune. Count the players on a volleyball court per team. The planet at that position from the Sun is ",
+      "target": "Saturn",
+      "intermediates": [
+        "6",
+        "six"
+      ]
+    },
+    {
+      "name": "nhop-alphabet-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the letters in the English alphabet. The element at that position on the periodic table is ",
+      "target": "iron",
+      "intermediates": [
+        "26"
+      ]
+    },
+    {
+      "name": "nhop-fortnight-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the days in a fortnight. The element at that position on the periodic table is ",
+      "target": "silicon",
+      "intermediates": [
+        "14"
+      ]
+    },
+    {
+      "name": "nhop-cube-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the faces on a cube. The element at that position on the periodic table is ",
+      "target": "carbon",
+      "intermediates": [
+        "6",
+        "six"
+      ]
+    },
+    {
+      "name": "nhop-rainbow-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the colors in a rainbow. The element at that position on the periodic table is ",
+      "target": "nitrogen",
+      "intermediates": [
+        "7"
+      ]
+    },
+    {
+      "name": "nhop-spider-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the legs on a spider. The element at that position on the periodic table is ",
+      "target": "oxygen",
+      "intermediates": [
+        "8"
+      ]
+    },
+    {
+      "name": "nhop-insect-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the legs on an insect. The element at that position on the periodic table is ",
+      "target": "carbon",
+      "intermediates": [
+        "6",
+        "six"
+      ]
+    },
+    {
+      "name": "nhop-week-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the days in a week. The element at that position on the periodic table is ",
+      "target": "nitrogen",
+      "intermediates": [
+        "7"
+      ]
+    },
+    {
+      "name": "super-largest-country-capital",
+      "prompt": "Fact: The capital city of the largest country by area is ",
+      "target": "Moscow",
+      "intermediates": [
+        "Russia"
+      ]
+    },
+    {
+      "name": "super-smallest-continent",
+      "prompt": "Fact: The smallest country in the world is located on the continent of ",
+      "target": "Europe",
+      "intermediates": [
+        "Vatican"
+      ]
+    },
+    {
+      "name": "super-populous-capital",
+      "prompt": "Fact: The capital city of the most populous country in the world is ",
+      "target": "Beijing",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "super-largest-island-nation",
+      "prompt": "Fact: The country that is the largest island nation by area has its capital at ",
+      "target": "Jakarta",
+      "intermediates": [
+        "Indonesia"
+      ]
+    },
+    {
+      "name": "colosseum-currency",
+      "prompt": "Fact: The currency used in the country where the Colosseum stands is the ",
+      "target": "Euro",
+      "intermediates": [
+        "Italy"
+      ]
+    },
+    {
+      "name": "greatwall-ocean",
+      "prompt": "Fact: The ocean east of the country that built the Great Wall is the ",
+      "target": "Pacific",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "holiday-independence-monthnum",
+      "prompt": "Fact: The US Independence Day holiday is celebrated in month number ",
+      "target": "7",
+      "intermediates": [
+        "July"
+      ]
+    },
+    {
+      "name": "holiday-christmas-monthnum",
+      "prompt": "Fact: Christmas Day is celebrated in month number ",
+      "target": "12",
+      "intermediates": [
+        "December"
+      ]
+    },
+    {
+      "name": "holiday-halloween-monthnum",
+      "prompt": "Fact: Halloween is celebrated in month number ",
+      "target": "10",
+      "intermediates": [
+        "October"
+      ]
+    },
+    {
+      "name": "holiday-valentines-monthnum",
+      "prompt": "Fact: Valentine's Day is celebrated in month number ",
+      "target": "2",
+      "intermediates": [
+        "February"
+      ]
+    },
+    {
+      "name": "month-1-godof",
+      "prompt": "Fact: The first month of the year is named after the Roman god of ",
+      "target": "beginnings",
+      "intermediates": [
+        "January"
+      ]
+    },
+    {
+      "name": "etym-janus-monthnum",
+      "prompt": "Fact: The month named after the two-faced Roman god of doorways is month number ",
+      "target": "1",
+      "intermediates": [
+        "January"
+      ]
+    },
+    {
+      "name": "month-7-namedafter",
+      "prompt": "Fact: The seventh month of the year is named after the Roman leader Julius ",
+      "target": "Caesar",
+      "intermediates": [
+        "July"
+      ]
+    },
+    {
+      "name": "etym-caesar-monthnum",
+      "prompt": "Fact: The month named after Julius Caesar is month number ",
+      "target": "7",
+      "intermediates": [
+        "July"
+      ]
+    },
+    {
+      "name": "nhop-soccer-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the players on a soccer team on the field. The element at that position on the periodic table is ",
+      "target": "sodium",
+      "intermediates": [
+        "11"
+      ]
+    },
+    {
+      "name": "nhop-chess-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the pieces each player starts with in chess. The element at that position on the periodic table is ",
+      "target": "sulfur",
+      "intermediates": [
+        "16"
+      ]
+    },
+    {
+      "name": "nhop-suit-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the cards in one suit of a standard deck. The element at that position on the periodic table is ",
+      "target": "aluminum",
+      "intermediates": [
+        "13"
+      ]
+    },
+    {
+      "name": "nhop-clock-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the hours marked on a standard clock face. The element at that position on the periodic table is ",
+      "target": "magnesium",
+      "intermediates": [
+        "12"
+      ]
+    },
+    {
+      "name": "nhop-deck-element",
+      "prompt": "Count the items in a dozen. The element at that position on the periodic table is magnesium. Count the cards in a standard deck without jokers. The element at that position on the periodic table is ",
+      "target": "tellurium",
+      "intermediates": [
+        "52"
+      ]
+    },
+    {
+      "name": "inv-sunrise-opposite",
+      "prompt": "Fact: The cardinal direction opposite to the one where the sun rises is ",
+      "target": "west",
+      "intermediates": [
+        "east"
+      ]
+    },
+    {
+      "name": "inv-balloon-opposite",
+      "prompt": "Fact: The direction opposite to the one a helium balloon floats toward is \"",
+      "target": "down",
+      "intermediates": [
+        "up"
+      ]
+    },
+    {
+      "name": "inv-roots-opposite",
+      "prompt": "Fact: The direction opposite to the one tree roots grow is \"",
+      "target": "up",
+      "intermediates": [
+        "down"
+      ]
+    },
+    {
+      "name": "inv-antarctica-opposite",
+      "prompt": "Fact: The cardinal direction opposite to where Antarctica lies from the equator is ",
+      "target": "north",
+      "intermediates": [
+        "south"
+      ]
+    },
+    {
+      "name": "rhyme-tree-squared",
+      "prompt": "Fact: The square of the number whose name rhymes with tree is ",
+      "target": "9",
+      "intermediates": [
+        "three"
+      ]
+    },
+    {
+      "name": "rhyme-hive-plusone",
+      "prompt": "Fact: One more than the number whose name rhymes with hive is ",
+      "target": "6",
+      "intermediates": [
+        "five"
+      ]
+    },
+    {
+      "name": "rhyme-fix-halved",
+      "prompt": "Fact: Half of the number whose name rhymes with fix is ",
+      "target": "3",
+      "intermediates": [
+        "six"
+      ]
+    },
+    {
+      "name": "rhyme-shoe-doubled",
+      "prompt": "Fact: Double the number whose name rhymes with shoe is ",
+      "target": "4",
+      "intermediates": [
+        "two"
+      ]
+    },
+    {
+      "name": "tajmahal-continent",
+      "prompt": "Fact: The continent where the country that built the Taj Mahal is located is ",
+      "target": "Asia",
+      "intermediates": [
+        "India"
+      ]
+    },
+    {
+      "name": "louvre-language",
+      "prompt": "Fact: The primary language spoken in the country where the Louvre museum is located is ",
+      "target": "French",
+      "intermediates": [
+        "France"
+      ]
+    },
+    {
+      "name": "firstletter-halloween-month",
+      "prompt": "Fact: The first letter of the month containing Halloween is \"",
+      "target": "O",
+      "intermediates": [
+        "October"
+      ]
+    },
+    {
+      "name": "firstletter-valentines-month",
+      "prompt": "Fact: The first letter of the month containing Valentine's Day is \"",
+      "target": "F",
+      "intermediates": [
+        "February"
+      ]
+    },
+    {
+      "name": "firstletter-populous-country",
+      "prompt": "Fact: The first letter of the name of the world's most populous country is ",
+      "target": "C",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "firstletter-paris-country",
+      "prompt": "Fact: The first letter of the name of the country whose capital is Paris is ",
+      "target": "F",
+      "intermediates": [
+        "France"
+      ]
+    },
+    {
+      "name": "firstletter-greatwall-country",
+      "prompt": "Fact: The first letter of the name of the country that built the Great Wall is ",
+      "target": "C",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "succ-halloween-nextmonth",
+      "prompt": "Fact: The month immediately after the one containing Halloween is ",
+      "target": "November",
+      "intermediates": [
+        "October"
+      ]
+    },
+    {
+      "name": "pred-valentines-prevmonth",
+      "prompt": "Fact: The month immediately before the one containing Valentine's Day is \"",
+      "target": "January",
+      "intermediates": [
+        "February"
+      ]
+    },
+    {
+      "name": "dual-stars-visible-opposite",
+      "prompt": "Fact: The opposite of the time of day when stars are visible is \"",
+      "target": "day",
+      "intermediates": [
+        "night"
+      ]
+    },
+    {
+      "name": "dual-photosynthesis-opposite",
+      "prompt": "Fact: The opposite of the time of day when plants photosynthesize is \"",
+      "target": "night",
+      "intermediates": [
+        "day"
+      ]
+    },
+    {
+      "name": "roman-rings-olympic",
+      "prompt": "Fact: Written as a Roman numeral, the number of Olympic rings is ",
+      "target": "V",
+      "intermediates": [
+        "5",
+        "five"
+      ]
+    },
+    {
+      "name": "roman-states-us",
+      "prompt": "Fact: Written as a Roman numeral, the number of US states is ",
+      "target": "L",
+      "intermediates": [
+        "50"
+      ]
+    },
+    {
+      "name": "half-clock-hours",
+      "prompt": "Fact: Half the number of hours shown on a standard clock face is ",
+      "target": "6",
+      "intermediates": [
+        "12"
+      ]
+    },
+    {
+      "name": "double-dice-faces",
+      "prompt": "Fact: Double the number of faces on a standard die is ",
+      "target": "12",
+      "intermediates": [
+        "6",
+        "six"
+      ]
+    },
+    {
+      "name": "letterpos-water-symbol",
+      "prompt": "Fact: The position in the alphabet of the chemical symbol for hydrogen is ",
+      "target": "8",
+      "intermediates": [
+        "H"
+      ]
+    },
+    {
+      "name": "letterpos-oxygen-symbol",
+      "prompt": "Fact: The position in the alphabet of the chemical symbol for oxygen is ",
+      "target": "15",
+      "intermediates": [
+        "O"
+      ]
+    },
+    {
+      "name": "letterpos-carbon-symbol",
+      "prompt": "Fact: The position in the alphabet of the chemical symbol for carbon is ",
+      "target": "3",
+      "intermediates": [
+        "C"
+      ]
+    },
+    {
+      "name": "letterpos-nitrogen-symbol",
+      "prompt": "Fact: The position in the alphabet of the chemical symbol for nitrogen is ",
+      "target": "14",
+      "intermediates": [
+        "N"
+      ]
+    },
+    {
+      "name": "dbl-armistice-antonym",
+      "prompt": "Fact: The antonym of what an armistice ends is \"",
+      "target": "peace",
+      "intermediates": [
+        "war"
+      ]
+    },
+    {
+      "name": "dbl-obituary-antonym",
+      "prompt": "Fact: The antonym of what an obituary announces is \"",
+      "target": "birth",
+      "intermediates": [
+        "death"
+      ]
+    },
+    {
+      "name": "dbl-altitude-antonym",
+      "prompt": "Fact: The antonym of how you would describe an airplane's cruising altitude is \"",
+      "target": "low",
+      "intermediates": [
+        "high"
+      ]
+    }
+  ]
+}

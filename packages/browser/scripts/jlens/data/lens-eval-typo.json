@@ -1,0 +1,676 @@
+{
+  "items": [
+    {
+      "name": "typo-language",
+      "prompt": "The course required that every student learn a second langauge",
+      "intermediates": [
+        "language"
+      ]
+    },
+    {
+      "name": "typo-government",
+      "prompt": "The new policy was announced last week by the federal goverment",
+      "intermediates": [
+        "government"
+      ]
+    },
+    {
+      "name": "typo-across",
+      "prompt": "She picked up her bag and walked slowly accross",
+      "intermediates": [
+        "across"
+      ]
+    },
+    {
+      "name": "typo-search",
+      "prompt": "She typed the name into the box and clicked serach",
+      "intermediates": [
+        "search"
+      ]
+    },
+    {
+      "name": "typo-address",
+      "prompt": "Please write your full name and your current adress",
+      "intermediates": [
+        "address"
+      ]
+    },
+    {
+      "name": "typo-because",
+      "prompt": "He said he was going to be late becuase",
+      "intermediates": [
+        "because"
+      ]
+    },
+    {
+      "name": "typo-until",
+      "prompt": "The library will stay open every night untill",
+      "intermediates": [
+        "until"
+      ]
+    },
+    {
+      "name": "typo-people",
+      "prompt": "The stadium was packed with nearly forty thousand poeple",
+      "intermediates": [
+        "people"
+      ]
+    },
+    {
+      "name": "typo-something",
+      "prompt": "He paused at the door as if he had forgotten somthing",
+      "intermediates": [
+        "something"
+      ]
+    },
+    {
+      "name": "typo-business",
+      "prompt": "After college she moved to the city and started her own buisness",
+      "intermediates": [
+        "business"
+      ]
+    },
+    {
+      "name": "typo-different",
+      "prompt": "The second draft of the essay took a completely diferent",
+      "intermediates": [
+        "different"
+      ]
+    },
+    {
+      "name": "typo-really",
+      "prompt": "Even after reading it twice she was not realy",
+      "intermediates": [
+        "really"
+      ]
+    },
+    {
+      "name": "typo-field",
+      "prompt": "The players jogged out onto the freshly mowed feild",
+      "intermediates": [
+        "field"
+      ]
+    },
+    {
+      "name": "typo-review",
+      "prompt": "The editor asked her to write a short reveiw",
+      "intermediates": [
+        "review"
+      ]
+    },
+    {
+      "name": "typo-height",
+      "prompt": "He was surprised by the building's enormous hieght",
+      "intermediates": [
+        "height"
+      ]
+    },
+    {
+      "name": "typo-science",
+      "prompt": "Her favorite subject in school was always sceince",
+      "intermediates": [
+        "science"
+      ]
+    },
+    {
+      "name": "typo-library",
+      "prompt": "She returned the overdue books to the local libary",
+      "intermediates": [
+        "library"
+      ]
+    },
+    {
+      "name": "typo-February",
+      "prompt": "Her birthday falls on the last day of Febuary",
+      "intermediates": [
+        "February"
+      ]
+    },
+    {
+      "name": "typo-together",
+      "prompt": "The family finally sat down to eat togther",
+      "intermediates": [
+        "together"
+      ]
+    },
+    {
+      "name": "typo-account",
+      "prompt": "She could not remember the password for her bank acount",
+      "intermediates": [
+        "account"
+      ]
+    },
+    {
+      "name": "typo-function",
+      "prompt": "The programmer wrote a small helper funtion",
+      "intermediates": [
+        "function"
+      ]
+    },
+    {
+      "name": "typo-against",
+      "prompt": "The final vote was nine to two aganst",
+      "intermediates": [
+        "against"
+      ]
+    },
+    {
+      "name": "typo-around",
+      "prompt": "They walked slowly all the way aroud",
+      "intermediates": [
+        "around"
+      ]
+    },
+    {
+      "name": "typo-important",
+      "prompt": "The first page contained the most importnt",
+      "intermediates": [
+        "important"
+      ]
+    },
+    {
+      "name": "typo-building",
+      "prompt": "The fire alarm rang throughout the entire bulding",
+      "intermediates": [
+        "building"
+      ]
+    },
+    {
+      "name": "typo-without",
+      "prompt": "He left the house in a hurry and withot",
+      "intermediates": [
+        "without"
+      ]
+    },
+    {
+      "name": "typo-another",
+      "prompt": "She reached into the bag and pulled out anther",
+      "intermediates": [
+        "another"
+      ]
+    },
+    {
+      "name": "typo-between",
+      "prompt": "The cat squeezed itself into the gap betwen",
+      "intermediates": [
+        "between"
+      ]
+    },
+    {
+      "name": "typo-several",
+      "prompt": "The delay lasted for sevral",
+      "intermediates": [
+        "several"
+      ]
+    },
+    {
+      "name": "typo-special",
+      "prompt": "The chef prepared a dish for the specal",
+      "intermediates": [
+        "special"
+      ]
+    },
+    {
+      "name": "typo-country",
+      "prompt": "She had never traveled outside of her own contry",
+      "intermediates": [
+        "country"
+      ]
+    },
+    {
+      "name": "typo-company",
+      "prompt": "He worked at the same software compny",
+      "intermediates": [
+        "company"
+      ]
+    },
+    {
+      "name": "typo-already",
+      "prompt": "By noon the tickets were alredy",
+      "intermediates": [
+        "already"
+      ]
+    },
+    {
+      "name": "typo-which",
+      "prompt": "She could not decide whhich",
+      "intermediates": [
+        "which"
+      ]
+    },
+    {
+      "name": "typo-running",
+      "prompt": "The water in the sink was still runing",
+      "intermediates": [
+        "running"
+      ]
+    },
+    {
+      "name": "typo-college",
+      "prompt": "After high school she applied to colege",
+      "intermediates": [
+        "college"
+      ]
+    },
+    {
+      "name": "typo-million",
+      "prompt": "The painting sold for over ten milion",
+      "intermediates": [
+        "million"
+      ]
+    },
+    {
+      "name": "typo-village",
+      "prompt": "They stayed in a small fishing vilage",
+      "intermediates": [
+        "village"
+      ]
+    },
+    {
+      "name": "typo-message",
+      "prompt": "He checked his phone and saw a new mesage",
+      "intermediates": [
+        "message"
+      ]
+    },
+    {
+      "name": "typo-success",
+      "prompt": "The party was considered a great succes",
+      "intermediates": [
+        "success"
+      ]
+    },
+    {
+      "name": "typo-change",
+      "prompt": "She reached into her pocket for some loose chagne",
+      "intermediates": [
+        "change"
+      ]
+    },
+    {
+      "name": "typo-length",
+      "prompt": "She measured the table's exact lentgh",
+      "intermediates": [
+        "length"
+      ]
+    },
+    {
+      "name": "typo-always",
+      "prompt": "She said she would alwyas",
+      "intermediates": [
+        "always"
+      ]
+    },
+    {
+      "name": "typo-island",
+      "prompt": "The ferry took them out to the small isalnd",
+      "intermediates": [
+        "island"
+      ]
+    },
+    {
+      "name": "typo-single",
+      "prompt": "She did not want to waste a sinlge",
+      "intermediates": [
+        "single"
+      ]
+    },
+    {
+      "name": "typo-little",
+      "prompt": "He poured himself a litle",
+      "intermediates": [
+        "little"
+      ]
+    },
+    {
+      "name": "typo-already2",
+      "prompt": "By the time she arrived the food was allready",
+      "intermediates": [
+        "already"
+      ]
+    },
+    {
+      "name": "typo-although",
+      "prompt": "She agreed to help even allthough",
+      "intermediates": [
+        "although"
+      ]
+    },
+    {
+      "name": "typo-again",
+      "prompt": "He promised he would never do it agian",
+      "intermediates": [
+        "again"
+      ]
+    },
+    {
+      "name": "typo-program",
+      "prompt": "She enrolled in the graduate programm",
+      "intermediates": [
+        "program"
+      ]
+    },
+    {
+      "name": "typo-model",
+      "prompt": "The engineer built a scale moddel",
+      "intermediates": [
+        "model"
+      ]
+    },
+    {
+      "name": "typo-family",
+      "prompt": "He spent the holidays with his entire familly",
+      "intermediates": [
+        "family"
+      ]
+    },
+    {
+      "name": "typo-future",
+      "prompt": "Nobody could predict what lay in the futture",
+      "intermediates": [
+        "future"
+      ]
+    },
+    {
+      "name": "typo-level",
+      "prompt": "The water rose to a dangerous levell",
+      "intermediates": [
+        "level"
+      ]
+    },
+    {
+      "name": "typo-local",
+      "prompt": "She bought vegetables at the locall",
+      "intermediates": [
+        "local"
+      ]
+    },
+    {
+      "name": "typo-order",
+      "prompt": "He placed the same lunch ordder",
+      "intermediates": [
+        "order"
+      ]
+    },
+    {
+      "name": "typo-power",
+      "prompt": "The storm knocked out the powwer",
+      "intermediates": [
+        "power"
+      ]
+    },
+    {
+      "name": "typo-study",
+      "prompt": "She stayed up all night to studdy",
+      "intermediates": [
+        "study"
+      ]
+    },
+    {
+      "name": "typo-write",
+      "prompt": "The teacher asked them to writte",
+      "intermediates": [
+        "write"
+      ]
+    },
+    {
+      "name": "typo-young",
+      "prompt": "She started playing piano when she was very younng",
+      "intermediates": [
+        "young"
+      ]
+    },
+    {
+      "name": "typo-human",
+      "prompt": "The discovery changed the course of humman",
+      "intermediates": [
+        "human"
+      ]
+    },
+    {
+      "name": "typo-major",
+      "prompt": "The bridge repair was a majjor",
+      "intermediates": [
+        "major"
+      ]
+    },
+    {
+      "name": "typo-often",
+      "prompt": "She said she did not visit very offten",
+      "intermediates": [
+        "often"
+      ]
+    },
+    {
+      "name": "typo-present",
+      "prompt": "He unwrapped the birthday pressent",
+      "intermediates": [
+        "present"
+      ]
+    },
+    {
+      "name": "typo-product",
+      "prompt": "The company released its newest prodduct",
+      "intermediates": [
+        "product"
+      ]
+    },
+    {
+      "name": "typo-project",
+      "prompt": "She spent three months on the projject",
+      "intermediates": [
+        "project"
+      ]
+    },
+    {
+      "name": "typo-support",
+      "prompt": "He called the help line for technical suport",
+      "intermediates": [
+        "support"
+      ]
+    },
+    {
+      "name": "typo-division",
+      "prompt": "The company announced a new sales divission",
+      "intermediates": [
+        "division"
+      ]
+    },
+    {
+      "name": "typo-original",
+      "prompt": "The museum displayed the orignal",
+      "intermediates": [
+        "original"
+      ]
+    },
+    {
+      "name": "typo-position",
+      "prompt": "She accepted the new possition",
+      "intermediates": [
+        "position"
+      ]
+    },
+    {
+      "name": "typo-material",
+      "prompt": "The dress was made of a soft matterial",
+      "intermediates": [
+        "material"
+      ]
+    },
+    {
+      "name": "typo-property",
+      "prompt": "He inherited the family propperty",
+      "intermediates": [
+        "property"
+      ]
+    },
+    {
+      "name": "typo-security",
+      "prompt": "The building hired extra securrity",
+      "intermediates": [
+        "security"
+      ]
+    },
+    {
+      "name": "typo-training",
+      "prompt": "The new employees completed their trainning",
+      "intermediates": [
+        "training"
+      ]
+    },
+    {
+      "name": "typo-football",
+      "prompt": "Every Sunday he watched footbal",
+      "intermediates": [
+        "football"
+      ]
+    },
+    {
+      "name": "typo-course",
+      "prompt": "She signed up for the evening coruse",
+      "intermediates": [
+        "course"
+      ]
+    },
+    {
+      "name": "typo-house",
+      "prompt": "They moved into the new hosue",
+      "intermediates": [
+        "house"
+      ]
+    },
+    {
+      "name": "typo-great",
+      "prompt": "The view from the top was graet",
+      "intermediates": [
+        "great"
+      ]
+    },
+    {
+      "name": "typo-light",
+      "prompt": "She switched off the bedroom ligth",
+      "intermediates": [
+        "light"
+      ]
+    },
+    {
+      "name": "typo-night",
+      "prompt": "He worked late into the nigth",
+      "intermediates": [
+        "night"
+      ]
+    },
+    {
+      "name": "typo-right",
+      "prompt": "She turned at the corner and went rigth",
+      "intermediates": [
+        "right"
+      ]
+    },
+    {
+      "name": "typo-control",
+      "prompt": "The pilot fought hard to regain contorl",
+      "intermediates": [
+        "control"
+      ]
+    },
+    {
+      "name": "typo-would",
+      "prompt": "He asked whether she still woudl",
+      "intermediates": [
+        "would"
+      ]
+    },
+    {
+      "name": "typo-world",
+      "prompt": "He wanted to travel all over the wolrd",
+      "intermediates": [
+        "world"
+      ]
+    },
+    {
+      "name": "typo-water",
+      "prompt": "She poured a glass of cold watre",
+      "intermediates": [
+        "water"
+      ]
+    },
+    {
+      "name": "typo-market",
+      "prompt": "Every Saturday they visited the farmers makret",
+      "intermediates": [
+        "market"
+      ]
+    },
+    {
+      "name": "typo-person",
+      "prompt": "She was the last perosn",
+      "intermediates": [
+        "person"
+      ]
+    },
+    {
+      "name": "typo-number",
+      "prompt": "He wrote down her phone numbr",
+      "intermediates": [
+        "number"
+      ]
+    },
+    {
+      "name": "typo-within",
+      "prompt": "The package should arrive wihtin",
+      "intermediates": [
+        "within"
+      ]
+    },
+    {
+      "name": "typo-second",
+      "prompt": "He finished the race in secnod",
+      "intermediates": [
+        "second"
+      ]
+    },
+    {
+      "name": "typo-source",
+      "prompt": "The reporter refused to name her soruce",
+      "intermediates": [
+        "source"
+      ]
+    },
+    {
+      "name": "typo-action",
+      "prompt": "He decided to take immediate aciton",
+      "intermediates": [
+        "action"
+      ]
+    },
+    {
+      "name": "typo-since",
+      "prompt": "She had not seen him sicne",
+      "intermediates": [
+        "since"
+      ]
+    },
+    {
+      "name": "typo-first",
+      "prompt": "She was the one who arrived frist",
+      "intermediates": [
+        "first"
+      ]
+    },
+    {
+      "name": "typo-those",
+      "prompt": "He pointed across the room and said he wanted thsoe",
+      "intermediates": [
+        "those"
+      ]
+    },
+    {
+      "name": "typo-short",
+      "prompt": "The meeting was kept shrot",
+      "intermediates": [
+        "short"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,718 @@
+{
+  "items": [
+    {
+      "name": "grief",
+      "prompt": "She kept his coffee mug on the counter, washed it every morning and put it back, though no one had used it in eleven months.",
+      "intermediates": [
+        "grief"
+      ]
+    },
+    {
+      "name": "pregnant",
+      "prompt": "She turned down the wine with a small smile and kept one hand on the table edge, not quite touching her stomach.",
+      "intermediates": [
+        "pregnant"
+      ]
+    },
+    {
+      "name": "lie",
+      "prompt": "He couldn't meet her eyes when she asked, and the answer came out a half-second too fast.",
+      "intermediates": [
+        "lie"
+      ]
+    },
+    {
+      "name": "poverty",
+      "prompt": "She did the math twice before the cashier scanned the last item, and put the cereal back without explaining.",
+      "intermediates": [
+        "poverty"
+      ]
+    },
+    {
+      "name": "proposal",
+      "prompt": "He touched his jacket pocket for the fourth time that evening, rehearsing the words again while the waiter cleared the plates.",
+      "intermediates": [
+        "proposal"
+      ]
+    },
+    {
+      "name": "fired",
+      "prompt": "The box on his desk wasn't the one he came in with, and through the glass wall he could see HR waiting by the elevator.",
+      "intermediates": [
+        "fired"
+      ]
+    },
+    {
+      "name": "divorce",
+      "prompt": "She signed on the line her lawyer pointed to, slid the pen across the table, and didn't wait for him to pick it up.",
+      "intermediates": [
+        "divorce"
+      ]
+    },
+    {
+      "name": "relief",
+      "prompt": "She read the line twice before she let herself breathe, and the paper shook a little as she set it down.",
+      "intermediates": [
+        "relief"
+      ]
+    },
+    {
+      "name": "pennsylvania",
+      "prompt": "The scrapple was already on the table when he came down, and through the window the hex sign on the neighbor's barn caught the early light.",
+      "intermediates": [
+        "Pennsylvania"
+      ]
+    },
+    {
+      "name": "prohibition",
+      "prompt": "She tapped her cigarette holder against the bar while the gramophone crackled, and somewhere behind the bookcase the real party was just getting loud.",
+      "intermediates": [
+        "prohibition"
+      ]
+    },
+    {
+      "name": "nasa",
+      "prompt": "The countdown hit zero and the rumble under her seat became a roar that pressed her flat, the blue curve of the world falling away through the tiny window.",
+      "intermediates": [
+        "NASA"
+      ]
+    },
+    {
+      "name": "einstein",
+      "prompt": "He closed his eyes on the tram and let the buildings blur, chasing the beam of light in his head the way other men chased trains.",
+      "intermediates": [
+        "Einstein"
+      ]
+    },
+    {
+      "name": "darwin",
+      "prompt": "He reread the letter and felt twenty years of notes collapse — someone else had seen it too, and written it down first.",
+      "intermediates": [
+        "Darwin"
+      ]
+    },
+    {
+      "name": "beatles",
+      "prompt": "They crossed in single file, one of them barefoot, while the photographer counted to three and the traffic waited.",
+      "intermediates": [
+        "Beatles"
+      ]
+    },
+    {
+      "name": "lincoln",
+      "prompt": "He folded the two pages back into his coat — the other man had spoken for two hours, and he would need about two minutes.",
+      "intermediates": [
+        "Lincoln"
+      ]
+    },
+    {
+      "name": "obama",
+      "prompt": "The portraits on the wall had all been one color, and the desk was smaller than he'd expected when he sat down that first January morning.",
+      "intermediates": [
+        "Obama"
+      ]
+    },
+    {
+      "name": "olympics",
+      "prompt": "The anthem played and she touched the cold metal at her neck, four years compressed into a minute on the top step.",
+      "intermediates": [
+        "Olympics"
+      ]
+    },
+    {
+      "name": "churchill",
+      "prompt": "He lit another cigar in the war room and leaned into the microphone, knowing the sirens above ground were doing half his work for him.",
+      "intermediates": [
+        "Churchill"
+      ]
+    },
+    {
+      "name": "newton",
+      "prompt": "He watched the white light split into seven on the far wall and reached for a fresh page before the sun moved.",
+      "intermediates": [
+        "Newton"
+      ]
+    },
+    {
+      "name": "mozart",
+      "prompt": "The boy's feet didn't reach the pedals, but the emperor stopped talking when the first chord landed.",
+      "intermediates": [
+        "Mozart"
+      ]
+    },
+    {
+      "name": "berlin",
+      "prompt": "The hammers rang on the concrete all night, and by morning the gap was wide enough to reach her brother's hand on the other side for the first time in twenty-eight years.",
+      "intermediates": [
+        "Berlin"
+      ]
+    },
+    {
+      "name": "armstrong",
+      "prompt": "His boot sank an inch into the gray dust and the flag behind him wouldn't hang right with nothing there to move it.",
+      "intermediates": [
+        "Armstrong"
+      ]
+    },
+    {
+      "name": "wright",
+      "prompt": "Twelve seconds, his brother shouted from the dune, and the machine was already back on the sand — but for twelve seconds it hadn't been.",
+      "intermediates": [
+        "Wright"
+      ]
+    },
+    {
+      "name": "gandhi",
+      "prompt": "He reached the sea after three weeks on foot and bent to lift a handful of what the law said he could not make.",
+      "intermediates": [
+        "Gandhi"
+      ]
+    },
+    {
+      "name": "edison",
+      "prompt": "Filament nine hundred and something — he'd stopped counting the exact number — and this one held its glow past the first minute.",
+      "intermediates": [
+        "Edison"
+      ]
+    },
+    {
+      "name": "cia",
+      "prompt": "He'd used three names in as many cities and the folder on the table had more black bars than words, and none of them were his either.",
+      "intermediates": [
+        "CIA"
+      ]
+    },
+    {
+      "name": "vatican",
+      "prompt": "The doors had been sealed for two days when the smoke finally changed color, and the crowd in the square knew before the bells did.",
+      "intermediates": [
+        "Vatican"
+      ]
+    },
+    {
+      "name": "hollywood",
+      "prompt": "He'd pitched the same story in five rooms that week and watched the same polite smile close around it, and the valet still brought the wrong car.",
+      "intermediates": [
+        "Hollywood"
+      ]
+    },
+    {
+      "name": "pentagon",
+      "prompt": "The building had five sides and she'd walked the inside of all of them that morning, and the badge at her neck still didn't open the door she needed.",
+      "intermediates": [
+        "Pentagon"
+      ]
+    },
+    {
+      "name": "unesco",
+      "prompt": "The emblem had been Julian Huxley's idea, or near enough, and now it hung beside a thousand temple gates and a thousand ruins the world had agreed to keep.",
+      "intermediates": [
+        "UNESCO"
+      ]
+    },
+    {
+      "name": "anger",
+      "prompt": "\"It's fine,\" she said, and set the cup down so carefully it didn't make a sound.",
+      "intermediates": [
+        "anger"
+      ]
+    },
+    {
+      "name": "frustrated",
+      "prompt": "He explained it a third time, slower, and watched her eyes go to the clock again.",
+      "intermediates": [
+        "frustrated"
+      ]
+    },
+    {
+      "name": "lonely",
+      "prompt": "He cooked for two out of habit and scraped the second plate into the bin before sitting down.",
+      "intermediates": [
+        "lonely"
+      ]
+    },
+    {
+      "name": "shame",
+      "prompt": "She paid in cash and didn't meet the clerk's eyes, the small bag tucked inside her coat before she reached the door.",
+      "intermediates": [
+        "shame"
+      ]
+    },
+    {
+      "name": "noir",
+      "prompt": "The neon bled through the blinds in stripes across the desk, and the dame in the doorway had a problem and a cigarette and no intention of telling him which was which.",
+      "intermediates": [
+        "noir"
+      ]
+    },
+    {
+      "name": "horror",
+      "prompt": "The phone line had been cut sometime after midnight, and now the scratching in the walls had moved from the attic to just behind the bedroom door.",
+      "intermediates": [
+        "horror"
+      ]
+    },
+    {
+      "name": "fairy",
+      "prompt": "The youngest of three set out with nothing but a crust of bread and a promise, and the woods grew darker the deeper she went.",
+      "intermediates": [
+        "fairy"
+      ]
+    },
+    {
+      "name": "siblings",
+      "prompt": "She used the nickname nobody else knew and he rolled his eyes the same way he had at the dinner table twenty years ago.",
+      "intermediates": [
+        "siblings"
+      ]
+    },
+    {
+      "name": "rivals",
+      "prompt": "They shook hands for the cameras and held it a beat too long, each waiting for the other to let go first.",
+      "intermediates": [
+        "rivals"
+      ]
+    },
+    {
+      "name": "mother",
+      "prompt": "She pressed the back of her hand to his forehead before she said hello, and he let her, the way he had since before he could remember.",
+      "intermediates": [
+        "mother"
+      ]
+    },
+    {
+      "name": "boss",
+      "prompt": "She kept typing while he stood in her doorway, and he waited, because the meeting didn't start until she closed the laptop.",
+      "intermediates": [
+        "boss"
+      ]
+    },
+    {
+      "name": "neighbors",
+      "prompt": "She knew what time his car left and what night the bins went out, and had waved at him for six years without learning either of his names.",
+      "intermediates": [
+        "neighbors"
+      ]
+    },
+    {
+      "name": "teacher",
+      "prompt": "She circled the same mistake in the same red ink she'd used on the last thirty, and reached for the next one on the pile.",
+      "intermediates": [
+        "teacher"
+      ]
+    },
+    {
+      "name": "underwater",
+      "prompt": "Every sound reached her a half-second late and muffled, and the pressure behind her eyes grew with each meter down.",
+      "intermediates": [
+        "underwater"
+      ]
+    },
+    {
+      "name": "desert",
+      "prompt": "The horizon shook in the heat and his shadow had shrunk to a puddle at his feet; the last of the water was three swallows, maybe four.",
+      "intermediates": [
+        "desert"
+      ]
+    },
+    {
+      "name": "chess",
+      "prompt": "Neither of them had spoken in forty minutes when she finally moved the knight, and he tapped the clock without looking up.",
+      "intermediates": [
+        "chess"
+      ]
+    },
+    {
+      "name": "poker",
+      "prompt": "He pushed the last of his chips to the center and kept his face the way it had been for the last three hands — which was the problem.",
+      "intermediates": [
+        "poker"
+      ]
+    },
+    {
+      "name": "interview",
+      "prompt": "The question hung there and he realized the pause had already gone on too long; across the table, a pen hovered over a page he couldn't read.",
+      "intermediates": [
+        "interview"
+      ]
+    },
+    {
+      "name": "dawn",
+      "prompt": "The first bird started before the sky did, and the cold had that thin quality that wouldn't last another hour.",
+      "intermediates": [
+        "dawn"
+      ]
+    },
+    {
+      "name": "winter",
+      "prompt": "The light was already failing by four and the radiators clanked awake one by one through the building.",
+      "intermediates": [
+        "winter"
+      ]
+    },
+    {
+      "name": "death-h",
+      "prompt": "The flowers on the table had been changed twice already, and the black dress still hung on the closet door where she'd put it out the night before the service.",
+      "intermediates": [
+        "death"
+      ]
+    },
+    {
+      "name": "war-h",
+      "prompt": "The letters stopped coming after the telegram, and she kept the ration book in the drawer where his photograph used to be.",
+      "intermediates": [
+        "war"
+      ]
+    },
+    {
+      "name": "love-h",
+      "prompt": "They'd reached the point where silences didn't need filling, and her hand found his across the table without either of them looking.",
+      "intermediates": [
+        "love"
+      ]
+    },
+    {
+      "name": "home-h",
+      "prompt": "The smell hit him before the door was fully open — something his mother had made a thousand times, and he was seven years old again for exactly as long as it lasted.",
+      "intermediates": [
+        "home"
+      ]
+    },
+    {
+      "name": "school-h",
+      "prompt": "The bell rang and thirty chairs scraped at once, but she stayed at her desk, still staring at the red marks on page three.",
+      "intermediates": [
+        "school"
+      ]
+    },
+    {
+      "name": "church-h",
+      "prompt": "The organ held the last note longer than anyone expected, and she kept her head bowed until the echo had completely died.",
+      "intermediates": [
+        "church"
+      ]
+    },
+    {
+      "name": "office-h",
+      "prompt": "The coffee in the break room had been sitting since nine, and the clock above the copier ticked louder than anyone's typing.",
+      "intermediates": [
+        "office"
+      ]
+    },
+    {
+      "name": "court-h",
+      "prompt": "The gavel came down twice and she felt her lawyer's hand on her arm, but she couldn't read the verdict in his face.",
+      "intermediates": [
+        "court"
+      ]
+    },
+    {
+      "name": "park-h",
+      "prompt": "The bench had been there longer than she had, and the brass plaque said it had been someone's favorite spot before it was hers.",
+      "intermediates": [
+        "park"
+      ]
+    },
+    {
+      "name": "city-h",
+      "prompt": "The noise never stopped, just changed shape — sirens into traffic into construction into the 3 a.m. garbage truck she'd learned to sleep through.",
+      "intermediates": [
+        "city"
+      ]
+    },
+    {
+      "name": "town-h",
+      "prompt": "Everyone knew which house had the dog that barked and which porch light meant someone was still up, and the new family hadn't figured out yet that the curtains were optional.",
+      "intermediates": [
+        "town"
+      ]
+    },
+    {
+      "name": "field-h",
+      "prompt": "The stalks went past her shoulders and the path behind her had already closed, but the farmhouse roof was still visible if she stood on her toes.",
+      "intermediates": [
+        "field"
+      ]
+    },
+    {
+      "name": "store-h",
+      "prompt": "The cart had a wheel that pulled left, and by aisle six she'd given up fighting it and just let it lead.",
+      "intermediates": [
+        "store"
+      ]
+    },
+    {
+      "name": "art-h",
+      "prompt": "She stepped back three paces, tilted her head, then stepped forward and scraped the whole left corner back to canvas.",
+      "intermediates": [
+        "art"
+      ]
+    },
+    {
+      "name": "music-h",
+      "prompt": "The conductor's hand hung in the air one extra beat, and in the silence before it fell, two thousand people held their breath.",
+      "intermediates": [
+        "music"
+      ]
+    },
+    {
+      "name": "math-h",
+      "prompt": "He filled the third board, capped the marker, and stood back — somewhere in those six hundred symbols was either the proof or the mistake.",
+      "intermediates": [
+        "math"
+      ]
+    },
+    {
+      "name": "science-h",
+      "prompt": "The result came back the same the fourth time, and she stared at the readout until it stopped meaning anything, because if it was right, the textbook was wrong.",
+      "intermediates": [
+        "science"
+      ]
+    },
+    {
+      "name": "history-h",
+      "prompt": "He ran his fingers over the names carved into the stone, each one a boy his grandfather had mentioned once and never again.",
+      "intermediates": [
+        "history"
+      ]
+    },
+    {
+      "name": "law-h",
+      "prompt": "She read the clause a third time, initialed where the tab pointed, and tried not to think about what 4(b) would mean if anyone ever invoked it.",
+      "intermediates": [
+        "law"
+      ]
+    },
+    {
+      "name": "film-h",
+      "prompt": "The lights went down and the logo came up, and for two hours the whole room forgot it had bodies.",
+      "intermediates": [
+        "film"
+      ]
+    },
+    {
+      "name": "code-h",
+      "prompt": "The test went green on the forty-third run, and she immediately distrusted it — green after forty-two reds meant she'd fixed the wrong thing.",
+      "intermediates": [
+        "code"
+      ]
+    },
+    {
+      "name": "news-h",
+      "prompt": "The anchor's voice cracked on the second sentence, and by the third you could hear papers shuffling off-camera as someone handed her an update.",
+      "intermediates": [
+        "news"
+      ]
+    },
+    {
+      "name": "night-h",
+      "prompt": "The last porch light on the street clicked off, and the dark filled in so completely that the fence three feet away might as well have been a mile.",
+      "intermediates": [
+        "night"
+      ]
+    },
+    {
+      "name": "past-h",
+      "prompt": "The photograph was from before color, and she had to squint to see her own face under all those years.",
+      "intermediates": [
+        "past"
+      ]
+    },
+    {
+      "name": "future-h",
+      "prompt": "The child asked what she wanted to be, and she answered with the certainty of someone who had never yet been told no.",
+      "intermediates": [
+        "future"
+      ]
+    },
+    {
+      "name": "race-h",
+      "prompt": "The tape was fifty meters away and his lungs were already done, but the footsteps behind him were getting louder and that was all that mattered.",
+      "intermediates": [
+        "race"
+      ]
+    },
+    {
+      "name": "game-h",
+      "prompt": "She moved the piece, looked up, and waited — and in his face she saw exactly the three moves he hadn't seen coming.",
+      "intermediates": [
+        "game"
+      ]
+    },
+    {
+      "name": "test-h",
+      "prompt": "She filled in the last bubble, checked the clock, and decided that whatever she didn't know by now, thirty more seconds wasn't going to fix.",
+      "intermediates": [
+        "test"
+      ]
+    },
+    {
+      "name": "search-h",
+      "prompt": "They'd walked the same grid four times since sunrise, and the dog kept pulling toward the creek that wasn't on anyone's map.",
+      "intermediates": [
+        "search"
+      ]
+    },
+    {
+      "name": "free-h",
+      "prompt": "The gate buzzed and the first thing he noticed was how big the sky looked without a fence cutting it in half.",
+      "intermediates": [
+        "free"
+      ]
+    },
+    {
+      "name": "found-h",
+      "prompt": "The dog came back muddy with something in its mouth, and she knew before she'd unwrapped it that this was what three weeks of posters had been for.",
+      "intermediates": [
+        "found"
+      ]
+    },
+    {
+      "name": "king-h",
+      "prompt": "He sat where his father had sat, and his grandfather before that, and felt the weight of every eye in the hall waiting for the word that would become command.",
+      "intermediates": [
+        "king"
+      ]
+    },
+    {
+      "name": "father-h",
+      "prompt": "He showed her how to hold the wrench the way his own old man had shown him, and didn't mention that this was the third time this month she'd asked.",
+      "intermediates": [
+        "father"
+      ]
+    },
+    {
+      "name": "child-h",
+      "prompt": "The crayon drawings on the fridge had started with houses and suns and now included something that was either a dragon or a truck — she'd learned not to ask which.",
+      "intermediates": [
+        "child"
+      ]
+    },
+    {
+      "name": "water-h",
+      "prompt": "She held her breath without meaning to and counted the bubbles rising past the mask, each one a second she wasn't getting back.",
+      "intermediates": [
+        "water"
+      ]
+    },
+    {
+      "name": "space-h",
+      "prompt": "He let go of the handrail and for the first time in his life, there was no direction that counted as down.",
+      "intermediates": [
+        "space"
+      ]
+    },
+    {
+      "name": "air-h",
+      "prompt": "The tank gauge dropped past the red line and every breath became a calculation — how many more before the surface, and whether that math worked out.",
+      "intermediates": [
+        "air"
+      ]
+    },
+    {
+      "name": "light-h",
+      "prompt": "He'd been in the tunnel long enough to forget what color looked like, and when the far end finally brightened, his eyes watered before he could tell if it was real.",
+      "intermediates": [
+        "light"
+      ]
+    },
+    {
+      "name": "france-h",
+      "prompt": "The waiter corrected her pronunciation without looking up from the pad, and she felt every flat American syllable she'd ever spoken stack up behind her.",
+      "intermediates": [
+        "France"
+      ]
+    },
+    {
+      "name": "china-h",
+      "prompt": "The characters on every sign meant nothing to him, and the crowd moved with a rhythm he kept half a beat behind, a billion people who all knew something he didn't.",
+      "intermediates": [
+        "China"
+      ]
+    },
+    {
+      "name": "london-h",
+      "prompt": "She'd learned to carry the umbrella even when the forecast said clear, and to call the elevator something else entirely.",
+      "intermediates": [
+        "London"
+      ]
+    },
+    {
+      "name": "book-h",
+      "prompt": "She dog-eared the page, set it facedown on the arm of the chair, and told herself just one more chapter three chapters ago.",
+      "intermediates": [
+        "book"
+      ]
+    },
+    {
+      "name": "time-h",
+      "prompt": "She caught her reflection in the shop window and for a second didn't recognize the face — not older exactly, just further along than she'd noticed getting.",
+      "intermediates": [
+        "time"
+      ]
+    },
+    {
+      "name": "fr-ecole",
+      "prompt": "La sonnerie retentit et trente chaises raclèrent en même temps, mais elle resta à son pupitre, les yeux fixés sur les corrections rouges de la page trois.",
+      "intermediates": [
+        "école"
+      ]
+    },
+    {
+      "name": "fr-eglise",
+      "prompt": "L'orgue tint la dernière note plus longtemps que prévu, et elle garda la tête baissée jusqu'à ce que l'écho se soit complètement éteint.",
+      "intermediates": [
+        "église"
+      ]
+    },
+    {
+      "name": "fr-pere",
+      "prompt": "Il lui montra comment tenir la clé comme son vieux le lui avait montré, sans dire que c'était la troisième fois ce mois-ci qu'elle demandait.",
+      "intermediates": [
+        "père"
+      ]
+    },
+    {
+      "name": "fr-cafe",
+      "prompt": "Le garçon posa la tasse sans un mot et repartit, et elle resta une heure à regarder la rue par la vitre, le carnet ouvert mais vide.",
+      "intermediates": [
+        "café"
+      ]
+    },
+    {
+      "name": "de-konig",
+      "prompt": "Er saß, wo sein Vater gesessen hatte, und spürte das Gewicht jedes Blickes im Saal, der auf das Wort wartete, das zum Befehl würde.",
+      "intermediates": [
+        "König"
+      ]
+    },
+    {
+      "name": "es-dia",
+      "prompt": "El primer pájaro empezó antes que el cielo, y el frío tenía esa cualidad fina que no duraría otra hora.",
+      "intermediates": [
+        "día"
+      ]
+    },
+    {
+      "name": "es-rio",
+      "prompt": "La corriente tiraba más fuerte de lo que parecía desde la orilla, y para cuando lo notó ya estaba a diez metros de donde había entrado.",
+      "intermediates": [
+        "río"
+      ]
+    },
+    {
+      "name": "pt-agua",
+      "prompt": "Ela prendeu a respiração sem querer e contou as bolhas subindo pela máscara, cada uma um segundo que não voltava.",
+      "intermediates": [
+        "água"
+      ]
+    },
+    {
+      "name": "es-musica",
+      "prompt": "La mano del director quedó suspendida un instante de más, y en el silencio antes de caer, dos mil personas contuvieron el aliento.",
+      "intermediates": [
+        "música"
+      ]
+    }
+  ]
+}

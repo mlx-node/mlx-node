@@ -1,0 +1,41 @@
+Jacobian-lens evaluation suites (vendored)
+==========================================
+
+The six `lens-eval-*.json` prompt suites and `README.md` in this directory are
+vendored VERBATIM from the Jacobian lens reference implementation:
+
+    Project : jlens — Jacobian lens
+    Source  : https://github.com/anthropics/jacobian-lens
+    Commit  : 581d398 ("Initial release")
+    Paper   : "Verbalizable Representations Form a Global Workspace in Language
+              Models" — https://transformer-circuits.pub/2026/workspace/index.html
+    License : Apache License, Version 2.0 (full text in ./LICENSE)
+
+These files are the paper's §methods-comparison lens-quality evaluation prompts
+(multihop, multilingual, order-ops, poetry, typo, association). Each `{slug}.json`
+is prompts only: `items[*]` has `prompt` + `intermediates` (and, for
+multihop/multilingual/order-ops, a `target` used ONLY to locate the readout
+position — it is never scored). See `README.md` for the per-suite readout
+position and the pass@k metric definition.
+
+USAGE IN THIS REPO
+------------------
+`packages/browser/scripts/jlens/eval.mts` consumes these suites unmodified to
+score the pilot Jacobian lens pack (J-lens vs logit-lens, normalized log-k
+pass@k AUC). No file in this directory has been edited from the upstream copy.
+
+ATTRIBUTION / DISCLAIMER
+------------------------
+All causal, swap/ablation, and tuned-lens results referenced by the paper were
+produced by Anthropic on Anthropic's own models. The pass@k numbers computed in
+this repo are a READOUT-ONLY partial reproduction on a 0.8B open hybrid model
+(Qwen3.5-0.8B) and are NOT a reproduction of the paper's causal claims.
+
+Licensed under the Apache License, Version 2.0. You may obtain a copy of the
+License in the accompanying LICENSE file or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied.
