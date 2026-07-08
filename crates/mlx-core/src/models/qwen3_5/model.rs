@@ -12,9 +12,10 @@ use crate::array::MxArray;
 use crate::chat_stream::{ChatStreamSink, MIN_SAB_LEN, SabSink};
 use crate::inspector::{
     AttentionLayerNapi, AttentionRunNapi, INSPECTOR_MAX_NEW_TOKENS_CAP, InspectorRecorder,
-    InspectorRunOptions, LogitsStepNapi, ModelMetaNapi, SCORE_TOKENS_MAX_DRAFT,
-    SCORE_TOKENS_TOP_K_CAP, ScorePositionNapi, ScoreTokensResult, TokenInfoNapi, top_k_rows,
-    verify_logit_row_bounds,
+    InspectorRunOptions, LENS_MAX_PINNED, LENS_MAX_POSITIONS, LENS_NUM_BOUNDARIES, LENS_TOP_K_CAP,
+    LensCellNapi, LensPinnedNapi, LensReadoutOptions, LensReadoutResult, LogitsStepNapi,
+    ModelMetaNapi, SCORE_TOKENS_MAX_DRAFT, SCORE_TOKENS_TOP_K_CAP, ScorePositionNapi,
+    ScoreTokensResult, TokenInfoNapi, top_k_rows, verify_logit_row_bounds,
 };
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -301,6 +302,12 @@ pub(crate) struct Qwen35Inner {
     pub(crate) lm_head: Option<Linear>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
+    /// Fitted J-lens pack: one optional `[hidden, hidden]` Jacobian per
+    /// residual-stream boundary, indexed `0..=24` (`None` = no `J` for that
+    /// boundary ⇒ identity / plain logit lens at that depth). Empty until a
+    /// pack is loaded (see `load_lens_pack_from_file_sync`). Kept on-device in
+    /// the model's `h` dtype (bf16). Read by `lens_readout_sync`.
+    pub(crate) lens_pack: Vec<Option<MxArray>>,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
     pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
     pub(crate) spatial_merge_size: Option<i32>,
@@ -431,6 +438,23 @@ pub(crate) enum Qwen35Cmd {
     EmbedTokens {
         token_ids: Vec<u32>,
         reply: ResponseTx<EmbedTokensResult>,
+    },
+    /// J-lens readout: one forward over `prompt_ids` capturing the residual
+    /// stream at the requested boundaries, then per-boundary top-K + pinned
+    /// ranks through the tied unembedding. See
+    /// [`Qwen35Inner::lens_readout_sync`] for the contract.
+    LensReadout {
+        prompt_ids: Vec<u32>,
+        opts: LensReadoutOptions,
+        reply: ResponseTx<LensReadoutResult>,
+    },
+    /// Load a fitted J-lens pack (safetensors, tensors named `J.{layer}`) from
+    /// a local file into the model thread's `lens_pack` slot. Native offline
+    /// eval only. See [`Qwen35Inner::load_lens_pack_from_file_sync`].
+    #[cfg(feature = "full")]
+    LoadLensPack {
+        path: String,
+        reply: ResponseTx<u32>,
     },
     /// Tokenizer-only encode: run the loaded tokenizer over `text` and
     /// return the resulting token ids. No forward pass, no cache touch.
@@ -696,6 +720,17 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         }
         Qwen35Cmd::EmbedTokens { token_ids, reply } => {
             let _ = reply.send(inner.embed_tokens_sync(token_ids));
+        }
+        Qwen35Cmd::LensReadout {
+            prompt_ids,
+            opts,
+            reply,
+        } => {
+            let _ = reply.send(inner.lens_readout_sync(prompt_ids, opts));
+        }
+        #[cfg(feature = "full")]
+        Qwen35Cmd::LoadLensPack { path, reply } => {
+            let _ = reply.send(inner.load_lens_pack_from_file_sync(path));
         }
         Qwen35Cmd::EncodeTokens { text, reply } => {
             let _ = reply.send(inner.encode_tokens_sync(text));
@@ -1013,6 +1048,7 @@ impl Qwen35Inner {
             lm_head,
             caches: None,
             tokenizer: None,
+            lens_pack: Vec::new(),
             vision_encoder: None,
             image_processor: None,
             spatial_merge_size: None,
@@ -6060,6 +6096,372 @@ impl Qwen35Inner {
         })
     }
 
+    /// J-lens readout — read the model's vocabulary out of the intermediate
+    /// residual stream `h_ℓ` at chosen depths through the tied unembedding
+    /// `W_U` (the "logit lens"; with a fitted lens pack, the "Jacobian lens").
+    ///
+    /// Structurally a sibling of [`Self::score_tokens_sync`]:
+    ///   - Same validation-hoisted-before-`init_caches` discipline.
+    ///   - Same single-shot cache reset on *every* path (the hybrid GDN layers
+    ///     make cache rewind unsafe — full reset, not rewind).
+    ///   - Same device-slice-before-host-copy budget: per boundary only the
+    ///     `[P, K]` top-K ids/logits/probs and `[P]` pinned counts cross to
+    ///     host, never the `[P, vocab]` grid.
+    ///   - Same in-Rust tokenizer decode and zero-copy `Float32Array` return.
+    ///
+    /// Correctness anchor: `useJacobian=false` at the final boundary
+    /// (`ℓ==24`) is `final_norm(h_24) · W_Uᵀ` — *exactly* the model's own
+    /// output logits (see [`forward_inner`]) — so its top-K reproduces the
+    /// model's next-token distribution.
+    ///
+    /// One boundary is streamed at a time (design-freeze D7): compute its
+    /// `[P, vocab]` logits, extract top-K + pinned ranks on device, copy the
+    /// small results, drop the grid, move to the next boundary.
+    pub(crate) fn lens_readout_sync(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        opts: LensReadoutOptions,
+    ) -> Result<LensReadoutResult> {
+        // ---- validation (all before `init_caches_sync`) ----
+        if prompt_ids.is_empty() {
+            return Err(Error::from_reason(
+                "lens_readout: prompt_ids must contain at least 1 token",
+            ));
+        }
+        if prompt_ids.len() > LENS_MAX_POSITIONS {
+            return Err(Error::from_reason(format!(
+                "lens_readout: prompt supports at most {} positions, got {}",
+                LENS_MAX_POSITIONS,
+                prompt_ids.len()
+            )));
+        }
+        if self.config.vocab_size <= 0 {
+            return Err(Error::from_reason(format!(
+                "lens_readout: invalid vocab_size {} in model config",
+                self.config.vocab_size
+            )));
+        }
+        let vocab = self.config.vocab_size as usize;
+        for &id in &prompt_ids {
+            if id as usize >= vocab {
+                return Err(Error::from_reason(format!(
+                    "lens_readout: token id {} out of range for vocab {}",
+                    id, vocab
+                )));
+            }
+        }
+        if opts.top_k == 0 {
+            return Err(Error::from_reason("lens_readout: topK must be >= 1"));
+        }
+        let top_k = (opts.top_k.min(LENS_TOP_K_CAP) as usize).min(vocab);
+
+        // Resolve the requested boundaries (default = all 25), validated to
+        // `0..=24`, de-duplicated preserving first-seen order.
+        let max_boundary = (LENS_NUM_BOUNDARIES - 1) as i32; // 24
+        let layers: Vec<usize> = match opts.layers.as_ref() {
+            Some(v) if !v.is_empty() => {
+                let mut seen = [false; LENS_NUM_BOUNDARIES];
+                let mut out: Vec<usize> = Vec::with_capacity(v.len());
+                for &l in v {
+                    if l < 0 || l > max_boundary {
+                        return Err(Error::from_reason(format!(
+                            "lens_readout: layer {} out of range (must be 0..={})",
+                            l, max_boundary
+                        )));
+                    }
+                    let lu = l as usize;
+                    if !seen[lu] {
+                        seen[lu] = true;
+                        out.push(lu);
+                    }
+                }
+                out
+            }
+            _ => (0..LENS_NUM_BOUNDARIES).collect(),
+        };
+
+        // Pinned ids.
+        let pinned_ids: Vec<u32> = match opts.pinned_ids.as_ref() {
+            Some(v) => {
+                if v.len() > LENS_MAX_PINNED {
+                    return Err(Error::from_reason(format!(
+                        "lens_readout: at most {} pinned ids, got {}",
+                        LENS_MAX_PINNED,
+                        v.len()
+                    )));
+                }
+                for &id in v {
+                    if id as usize >= vocab {
+                        return Err(Error::from_reason(format!(
+                            "lens_readout: pinned id {} out of range for vocab {}",
+                            id, vocab
+                        )));
+                    }
+                }
+                v.clone()
+            }
+            None => Vec::new(),
+        };
+
+        let use_jacobian = opts.use_jacobian;
+        // A pack is "loaded" iff any boundary carries a Jacobian.
+        let pack_loaded = self.lens_pack.iter().any(|slot| slot.is_some());
+        if use_jacobian && !pack_loaded {
+            // Final boundary (ℓ==24) is J=I by definition and is always
+            // allowed; any other requested boundary needs a real pack.
+            if layers.iter().any(|&l| l != max_boundary as usize) {
+                return Err(Error::from_reason(
+                    "Jacobian lens requested but no lens pack is loaded",
+                ));
+            }
+        }
+        let jacobian_applied = use_jacobian && pack_loaded;
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let p = prompt_ids.len();
+        let mut requested = [false; LENS_NUM_BOUNDARIES];
+        for &l in &layers {
+            requested[l] = true;
+        }
+
+        let input = MxArray::from_uint32(&prompt_ids, &[1, p as i64])?;
+
+        // Hoist the unembedding transpose (tied embeddings ⇒ W_U = embedding
+        // weightᵀ). Lazy MLX op, no cache dependency — free to hoist, matching
+        // `score_tokens_sync`.
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        self.init_caches_sync()?;
+
+        // Per-cell raw payload collected on-device then copied to host; final
+        // decode happens after the cache reset (host-only). Wrapped in an
+        // immediately-invoked closure so the reset below runs on error paths.
+        type CellRaw = (usize, usize, Vec<i32>, Vec<f32>, Vec<f32>);
+        let forward_result: Result<(Vec<CellRaw>, Vec<Vec<i32>>)> = (|| {
+            let _stream_ctx = StreamContext::new(generation_stream);
+
+            let boundaries = forward_capture_hidden(
+                &input,
+                &embedding_weight,
+                &mut self.layers,
+                &mut self.caches,
+                &requested,
+            )?;
+
+            let mut cell_data: Vec<CellRaw> = Vec::with_capacity(layers.len() * p);
+            let mut pinned_ranks: Vec<Vec<i32>> = vec![Vec::with_capacity(layers.len() * p); pinned_ids.len()];
+
+            for &l in &layers {
+                let h_l = boundaries[l].as_ref().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "lens_readout: boundary {} was not captured (internal error)",
+                        l
+                    ))
+                })?;
+
+                // Apply J_ℓ per position if a pack Jacobian exists for this
+                // boundary; otherwise identity (plain logit lens). `x = h · Jᵀ`
+                // realizes the per-position `J·h`. Final boundary / missing J
+                // ⇒ identity (design-freeze D6).
+                let x = match (use_jacobian, self.lens_pack.get(l).and_then(|s| s.as_ref())) {
+                    (true, Some(j)) => {
+                        let j_t = j.transpose(Some(&[1, 0]))?;
+                        h_l.matmul(&j_t)?
+                    }
+                    _ => h_l.clone(),
+                };
+
+                let normed = self.final_norm.forward(&x)?;
+                let logits3d = normed.matmul(&embedding_weight_t)?;
+                // Reshape `[1, P, vocab]` → `[P, vocab]` and promote to f32 so
+                // logsumexp / probs / ranks are numerically safe.
+                let logits = logits3d
+                    .reshape(&[p as i64, vocab as i64])?
+                    .astype(crate::array::DType::Float32)?;
+
+                // Device top-K (argpartition → slice → gather → tiny argsort),
+                // the exact recipe from `sparse_distributions_from_logits`.
+                let neg_logits = logits.mul_scalar(-1.0)?;
+                let partitioned = neg_logits.argpartition((top_k as i32) - 1, Some(-1))?;
+                let top_idx = partitioned.slice(&[0, 0], &[p as i64, top_k as i64])?;
+                let top_vals = logits.take_along_axis(&top_idx, -1)?;
+                let sort_order = top_vals.mul_scalar(-1.0)?.argsort(Some(-1))?;
+                let top_idx = top_idx.take_along_axis(&sort_order, -1)?;
+                let top_vals = top_vals.take_along_axis(&sort_order, -1)?;
+
+                // Full-vocab-normalized probabilities for the retained K (an
+                // honest probability via a logsumexp over the whole row).
+                let log_total = logits.logsumexp(Some(&[-1]), Some(true))?;
+                let probs = top_vals
+                    .sub(&log_total)?
+                    .exp()?
+                    .astype(crate::array::DType::Float32)?;
+
+                // Pinned-token ranks: `rank = (#tokens with strictly greater
+                // logit) + 1`, via gt-count — never a sort (design-freeze D7).
+                let mut pinned_counts: Vec<MxArray> = Vec::with_capacity(pinned_ids.len());
+                for &pid in &pinned_ids {
+                    let col = MxArray::from_int32(&vec![pid as i32; p], &[p as i64, 1])?;
+                    let pinned_logit = logits.take_along_axis(&col, -1)?; // [P,1]
+                    let gt = logits.greater(&pinned_logit)?; // [P, vocab]
+                    let count = gt
+                        .astype(crate::array::DType::Float32)?
+                        .sum(Some(&[-1]), Some(false))?; // [P]
+                    pinned_counts.push(count);
+                }
+
+                // Materialize only the small results.
+                let mut to_eval: Vec<&MxArray> = vec![&top_idx, &top_vals, &probs];
+                for c in &pinned_counts {
+                    to_eval.push(c);
+                }
+                MxArray::eval_arrays(&to_eval)?;
+
+                let ids: Vec<i32> = top_idx.to_int32()?.to_vec();
+                let vals: Vec<f32> = top_vals.to_float32()?.to_vec();
+                let prob_v: Vec<f32> = probs.to_float32()?.to_vec();
+
+                for pos in 0..p {
+                    let base = pos * top_k;
+                    cell_data.push((
+                        l,
+                        pos,
+                        ids[base..base + top_k].to_vec(),
+                        vals[base..base + top_k].to_vec(),
+                        prob_v[base..base + top_k].to_vec(),
+                    ));
+                }
+
+                for (pi, count_arr) in pinned_counts.iter().enumerate() {
+                    let counts: Vec<f32> = count_arr.to_float32()?.to_vec(); // len P
+                    for &c in counts.iter().take(p) {
+                        let rank = (c.round() as i64) + 1;
+                        pinned_ranks[pi].push(rank.min(999) as i32);
+                    }
+                }
+            }
+
+            Ok((cell_data, pinned_ranks))
+        })();
+
+        // Always reset caches — single-shot, mirrors `score_tokens_sync`.
+        self.reset_caches_sync()?;
+        let (cell_data, pinned_ranks) = forward_result?;
+
+        // Decode the prompt token axis (host-only).
+        let mut tokens: Vec<TokenInfoNapi> = Vec::with_capacity(p);
+        for &id in &prompt_ids {
+            let text = tokenizer.decode_sync(&[id], false).unwrap_or_default();
+            tokens.push(TokenInfoNapi {
+                id: id as i32,
+                text,
+            });
+        }
+
+        // Assemble cells (decode top-K texts host-side).
+        let mut cells: Vec<LensCellNapi> = Vec::with_capacity(cell_data.len());
+        for (l, pos, ids, vals, probs) in cell_data {
+            let argmax_id = *ids.first().ok_or_else(|| {
+                Error::from_reason("lens_readout: empty top-K row (unreachable: top_k >= 1)")
+            })?;
+            let mut top_k_texts: Vec<String> = Vec::with_capacity(ids.len());
+            for &id in &ids {
+                let text = tokenizer
+                    .decode_sync(&[id as u32], false)
+                    .unwrap_or_default();
+                top_k_texts.push(text);
+            }
+            cells.push(LensCellNapi {
+                layer: l as i32,
+                position: pos as i32,
+                argmax_id,
+                top_k_ids: ids,
+                top_k_logits: Float32Array::new(vals),
+                top_k_probs: Float32Array::new(probs),
+                top_k_texts,
+            });
+        }
+
+        // Assemble pinned tracks.
+        let mut pinned: Vec<LensPinnedNapi> = Vec::with_capacity(pinned_ids.len());
+        for (pi, &pid) in pinned_ids.iter().enumerate() {
+            let token_text = tokenizer.decode_sync(&[pid], false).unwrap_or_default();
+            pinned.push(LensPinnedNapi {
+                token_id: pid as i32,
+                token_text,
+                ranks: Int32Array::new(pinned_ranks[pi].clone()),
+            });
+        }
+
+        Ok(LensReadoutResult {
+            prompt_len: p as u32,
+            top_k: top_k as u32,
+            use_jacobian,
+            jacobian_applied,
+            layers: layers.iter().map(|&l| l as i32).collect(),
+            tokens,
+            cells,
+            pinned,
+        })
+    }
+
+    /// Load a fitted J-lens pack from a local safetensors file into the
+    /// model-thread `lens_pack` slot. Tensors named `J.{layer}` (layer in
+    /// `0..=24`, each `[hidden, hidden]`) are cast to the model's `h` dtype
+    /// (bf16) and stashed on device. Returns how many Jacobians were loaded.
+    ///
+    /// Native offline-eval only (`full`): a later browser task loads packs
+    /// from GPU buffers instead. Uses the existing safetensors read path.
+    #[cfg(feature = "full")]
+    pub(crate) fn load_lens_pack_from_file_sync(&mut self, path: String) -> Result<u32> {
+        use crate::utils::safetensors::SafeTensorsFile;
+
+        let file = SafeTensorsFile::load(&path)?;
+        let tensors = file.load_tensors(&path)?;
+
+        let max_boundary = LENS_NUM_BOUNDARIES - 1; // 24
+        let mut pack: Vec<Option<MxArray>> = (0..LENS_NUM_BOUNDARIES).map(|_| None).collect();
+        let mut loaded = 0u32;
+        for (name, arr) in tensors {
+            let Some(layer_str) = name.strip_prefix("J.") else {
+                continue;
+            };
+            let Ok(layer) = layer_str.parse::<usize>() else {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' has a non-integer layer suffix",
+                    name
+                )));
+            };
+            if layer > max_boundary {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' layer {} out of range (0..={})",
+                    name, layer, max_boundary
+                )));
+            }
+            let arr_bf16 = arr.astype(crate::array::DType::BFloat16)?;
+            arr_bf16.eval();
+            pack[layer] = Some(arr_bf16);
+            loaded += 1;
+        }
+
+        if loaded == 0 {
+            return Err(Error::from_reason(format!(
+                "load_lens_pack: no `J.{{layer}}` tensors found in {}",
+                path
+            )));
+        }
+
+        self.lens_pack = pack;
+        Ok(loaded)
+    }
+
     /// Tokenizer-only encode. Runs the loaded tokenizer over `text` with
     /// `add_special_tokens = false` (mirroring `run_for_inspector_sync`)
     /// and returns the resulting token ids. No forward pass, no cache
@@ -7611,6 +8013,29 @@ pub struct Qwen3_5Model {
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
 }
 
+/// Native-only (`full`) J-lens methods. Kept in a SEPARATE, fully
+/// `#[cfg(feature = "full")]`-gated `#[napi] impl` block so the entire block —
+/// including the napi-generated registration callbacks — is stripped from the
+/// browser/wasm build. (A per-method `#[cfg]` inside the shared `#[napi] impl`
+/// below leaves the generated `_c_callback` referenced but undefined under
+/// wasm; gating the whole block avoids that.)
+#[cfg(feature = "full")]
+#[napi]
+impl Qwen3_5Model {
+    /// Load a fitted J-lens pack (safetensors, tensors named `J.{layer}`) from
+    /// a local file into the model thread's lens-pack slot. Returns the number
+    /// of Jacobians loaded. Native offline-eval only; the browser loads packs
+    /// from GPU buffers via a later task.
+    #[napi]
+    pub async fn load_lens_pack_from_file(&self, path: String) -> Result<u32> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::LoadLensPack {
+            path,
+            reply,
+        })
+        .await
+    }
+}
+
 #[napi]
 impl Qwen3_5Model {
     /// Reset all caches.
@@ -7750,6 +8175,37 @@ impl Qwen3_5Model {
     ) -> Result<EmbedTokensResult> {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::EmbedTokens {
             token_ids,
+            reply,
+        })
+        .await
+    }
+
+    /// J-lens readout: read the model's vocabulary out of the intermediate
+    /// residual stream at chosen depths through the tied unembedding.
+    ///
+    /// Runs ONE forward over `promptIds` (fed verbatim — no chat template, no
+    /// BOS, same as `scoreTokens`), captures the residual `h_ℓ` at each
+    /// requested boundary (`0..=24`: `h_0` = embedding output …
+    /// `h_24` = pre-final-norm), and for each (layer, position) cell returns
+    /// the top-K token ids, raw f32 logits, full-vocab-normalized
+    /// probabilities, and decoded texts, plus the 1-based full-vocab rank of
+    /// any `pinnedIds` at every cell.
+    ///
+    /// `useJacobian=false` is the plain "logit lens" (no pack needed); at the
+    /// final boundary it reproduces the model's own output distribution.
+    /// `useJacobian=true` applies the fitted `J_ℓ` and errors if no pack is
+    /// loaded — except the final boundary, which is `J=I` by definition.
+    /// Single-shot: caches are fully reset before returning (hybrid GDN layers
+    /// make cache rewind unsafe), exactly like `scoreTokens`.
+    #[napi]
+    pub async fn lens_readout(
+        &self,
+        prompt_ids: Vec<u32>,
+        opts: LensReadoutOptions,
+    ) -> Result<LensReadoutResult> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::LensReadout {
+            prompt_ids,
+            opts,
             reply,
         })
         .await
@@ -8554,6 +9010,57 @@ fn forward_inner_with_inspector(
             }
         },
     }
+}
+
+/// Residual-capture mirror of [`forward_inner`] for the J-lens readout.
+///
+/// Runs the same embedding → 24-layer loop but, instead of applying the final
+/// RMSNorm + unembedding (the lens does that itself, per-boundary, possibly
+/// after a Jacobian), it clones the live residual `MxArray` at each requested
+/// boundary and returns them on device.
+///
+/// Boundaries follow the paper's `h_ℓ` convention — the residual stream
+/// *entering* layer ℓ:
+///   - `h_0` = embedding output (before layer 0),
+///   - `h_i` = output of layer `i-1` = input to layer `i` (`1 ..= 23`),
+///   - `h_24` = output of the last layer = the model's pre-final-norm hidden
+///     state (the 25th boundary).
+///
+/// `requested[b] == true` means capture boundary `b`; only requested
+/// boundaries are cloned (the rest stay `None`) so a single-layer readout
+/// holds one `[1, P, hidden]` array, not all 25. The returned vector always
+/// has length [`LENS_NUM_BOUNDARIES`].
+///
+/// No final norm, no `lm_head`, no unembedding here — that keeps this fn a
+/// pure capture and lets the caller stream one boundary's `[P, vocab]` logits
+/// at a time (design-freeze D7). Nothing is `eval`'d; the arrays stay lazy
+/// until the caller materializes them.
+fn forward_capture_hidden(
+    input_ids: &MxArray,
+    embedding_weight: &MxArray,
+    layers: &mut [DecoderLayer],
+    caches: &mut Option<Vec<Qwen3_5LayerCache>>,
+    requested: &[bool],
+) -> Result<Vec<Option<MxArray>>> {
+    let embedding = Embedding::from_weight(embedding_weight)?;
+    let mut h = embedding.forward(input_ids)?;
+
+    let mut out: Vec<Option<MxArray>> = (0..LENS_NUM_BOUNDARIES).map(|_| None).collect();
+    if requested.first().copied().unwrap_or(false) {
+        out[0] = Some(h.clone());
+    }
+
+    let num_layers = layers.len();
+    for i in 0..num_layers {
+        let cache = caches.as_mut().map(|c| &mut c[i]);
+        h = layers[i].forward(&h, None, cache, None, true)?;
+        let boundary = i + 1;
+        if requested.get(boundary).copied().unwrap_or(false) {
+            out[boundary] = Some(h.clone());
+        }
+    }
+
+    Ok(out)
 }
 
 /// Compiled single-token decode step using mlx::core::compile().

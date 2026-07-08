@@ -888,6 +888,96 @@ pub struct ScoreTokensResult {
     pub positions: Vec<ScorePositionNapi>,
 }
 
+/// Options for a `lensReadout` call — the "logit lens" (and, when a fitted
+/// lens pack is loaded, the "Jacobian lens"): read the model's vocabulary out
+/// of an intermediate residual `h_ℓ` at chosen depths through the tied
+/// unembedding `W_U`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct LensReadoutOptions {
+    /// Residual-stream boundaries to read, each in `0..=24` (`h_0` = embedding
+    /// output … `h_24` = pre-final-norm). Default (`None`/empty): all 25.
+    /// Duplicates are de-duplicated; order is preserved as first-seen.
+    #[napi(ts_type = "number[] | undefined")]
+    pub layers: Option<Vec<i32>>,
+    /// Top-K token ids to return per cell. Clamped to
+    /// `min(topK, LENS_TOP_K_CAP=32, vocab)`.
+    pub top_k: u32,
+    /// Vocab ids whose full-vocab rank (1-based) is returned per cell. Clamped
+    /// to at most `LENS_MAX_PINNED=8`. Each id must be `< vocab`.
+    #[napi(ts_type = "number[] | undefined")]
+    pub pinned_ids: Option<Vec<u32>>,
+    /// Apply the fitted per-layer Jacobian `J_ℓ` before the unembedding. When
+    /// `true` and no lens pack is loaded, the call errors — EXCEPT when every
+    /// requested layer is the final boundary (`ℓ==24`), which is `J=I` by
+    /// definition and needs no pack.
+    pub use_jacobian: bool,
+}
+
+/// Per-(layer, position) readout cell. Sibling of [`ScorePositionNapi`]: same
+/// top-K contract (ids descending by logit, raw pre-softmax f32 logits,
+/// decoded texts), extended with full-vocab-normalized probabilities.
+#[napi(object)]
+pub struct LensCellNapi {
+    /// Residual-stream boundary this cell was read at (`0..=24`).
+    pub layer: i32,
+    /// 0-based prompt position (`0..prompt_len`).
+    pub position: i32,
+    /// Greedy argmax token id at this cell (`= top_k_ids[0]`).
+    pub argmax_id: i32,
+    /// Top-K token ids, descending by logit.
+    pub top_k_ids: Vec<i32>,
+    /// Raw (pre-softmax) logits matching `top_k_ids`, same order. NOT
+    /// probabilities — same contract as `ScorePositionNapi::top_k_logits`.
+    pub top_k_logits: Float32Array,
+    /// Full-vocab-normalized softmax probabilities for `top_k_ids` (computed
+    /// via a device `logsumexp` over the whole `[vocab]` row — an honest
+    /// probability, NOT a softmax over just the top-K).
+    pub top_k_probs: Float32Array,
+    /// Decoded text fragment for each id in `top_k_ids`.
+    pub top_k_texts: Vec<String>,
+}
+
+/// Full-vocab rank track for a single pinned token id across every cell.
+#[napi(object)]
+pub struct LensPinnedNapi {
+    /// The pinned vocab id.
+    pub token_id: i32,
+    /// Decoded text fragment for `token_id`.
+    pub token_text: String,
+    /// 1-based full-vocab rank of `token_id` at each cell, in the same
+    /// (layer, position) order as `LensReadoutResult::cells`. Display-capped
+    /// at 999. Rank = (count of tokens with strictly greater logit) + 1.
+    pub ranks: Int32Array,
+}
+
+/// Result of a `lensReadout` — a `layers × positions` grid of per-cell top-K
+/// readouts plus per-pinned-token rank tracks. Caches are fully reset before
+/// the call returns (single-shot, no persistent session — the hybrid GDN
+/// layers make cache rewind unsafe, so the full reset mirrors `scoreTokens`).
+#[napi(object)]
+pub struct LensReadoutResult {
+    /// Prompt length `P` in tokens.
+    pub prompt_len: u32,
+    /// Effective top-K after clamping: `min(requested, 32, vocab)`.
+    pub top_k: u32,
+    /// Echo of the request's `useJacobian` flag.
+    pub use_jacobian: bool,
+    /// `true` iff `useJacobian` was requested AND a lens pack was loaded. When
+    /// `useJacobian` is requested with no pack (final-boundary-only case),
+    /// this is `false` and the readout is the plain logit lens.
+    pub jacobian_applied: bool,
+    /// The readout depths actually returned, in cell-grid order.
+    pub layers: Vec<i32>,
+    /// Decoded prompt tokens (the UI position axis).
+    pub tokens: Vec<TokenInfoNapi>,
+    /// One entry per (layer, position), layer-major then position-minor.
+    /// Length == `layers.len() * prompt_len`.
+    pub cells: Vec<LensCellNapi>,
+    /// One entry per pinned id, in request order.
+    pub pinned: Vec<LensPinnedNapi>,
+}
+
 /// Summary stats for a single capture point. Matches `HiddenStatePointStats`
 /// in inspector-types.ts.
 ///
@@ -989,3 +1079,25 @@ pub const SCORE_TOKENS_MAX_DRAFT: usize = 8;
 /// this branch's in-crate `#[cfg(test)]` target has pre-existing unrelated
 /// breakage, and the helpers are `pub` anyway).
 pub const SCORE_TOKENS_TOP_K_CAP: u32 = 64;
+
+/// Cap on the requested top-K per cell for the J-lens readout
+/// (`lensReadout`). Smaller than [`SCORE_TOKENS_TOP_K_CAP`] because the lens
+/// grid multiplies `top_k` by (layers × positions) cells — 32 keeps the
+/// decoded-text + probability payload compact while still showing a full
+/// ranked column per cell.
+pub const LENS_TOP_K_CAP: u32 = 32;
+
+/// Cap on the number of pinned vocab ids whose full-vocab rank the readout
+/// tracks per cell. Each pinned id adds one device gt-count reduce per layer
+/// plus one `Int32Array` of length `cells` in the result.
+pub const LENS_MAX_PINNED: usize = 8;
+
+/// Cap on the prompt length (`P`, positions) accepted by `lensReadout`. Bounds
+/// the transient per-layer `[P, vocab]` logits materialized on device and the
+/// number of cells (`layers × P`) crossed to host.
+pub const LENS_MAX_POSITIONS: usize = 48;
+
+/// The number of residual-stream boundaries the J-lens can read: `h_0`
+/// (embedding output) through `h_24` (pre-final-norm hidden state, = the
+/// model's actual pre-unembed residual). Equals `num_hidden_layers + 1`.
+pub const LENS_NUM_BOUNDARIES: usize = 25;
