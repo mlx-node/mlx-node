@@ -4,14 +4,20 @@
  *
  * WHAT THIS MEASURES (paper Fig-52 / vendored data/README.md metric — the
  * AUDIT-CORRECTED protocol, NOT a band-restricted variant):
- *   - For each item, each `intermediate` gets a RANK = the MINIMUM, over the
- *     full fitted source-layer set (boundaries 1..=23) AND over the
- *     intermediate's single-token SURFACE-FORM set, of the intermediate's
- *     1-based full-vocab rank at that item's single readout position. "Recovered
- *     at any layer" — this is the paper/README metric; there is NO mid-band
- *     restriction.
- *   - pass@k(item) = fraction of the item's intermediates whose rank ≤ k.
- *   - suite pass@k = mean over items.
+ *   - For each item, each SCORABLE `intermediate` (one with ≥1 single-token
+ *     surface form) gets a RANK = the MINIMUM, over the full fitted source-layer
+ *     set (boundaries 1..=23) AND over the intermediate's single-token
+ *     SURFACE-FORM set, of the intermediate's 1-based full-vocab rank at that
+ *     item's single readout position. "Recovered at any layer" — this is the
+ *     paper/README metric; there is NO mid-band restriction.
+ *   - EXCLUSION (the reference metric scores single-token synonyms ONLY): an
+ *     intermediate with NO single-token surface form is UNSCORABLE and is
+ *     DROPPED (never scored on a token prefix). An item left with zero scorable
+ *     intermediates is excluded from its suite's mean (reduces the effective n).
+ *     Exclusions are a property of the intermediate → identical for J & logit.
+ *   - pass@k(item) = fraction of the item's SCORABLE intermediates whose rank ≤
+ *     k (denominator = the scorable count, NOT the raw intermediate count).
+ *   - suite pass@k = mean over SCORED items (those with ≥1 scorable intermediate).
  *   - Reported number per suite = NORMALIZED pass@k AUC: sweep k over a LOG
  *     grid, take the area under pass@k vs ln(k), normalized by ln(k_max) so a
  *     lens that always ranks the intermediate #1 scores exactly 1.0.
@@ -185,12 +191,20 @@ async function main() {
     return [...ids];
   }
 
-  // per-suite fallback bookkeeping (intermediates with ZERO single-token forms).
-  const deviations: { suite: string; item: string; intermediate: string; firstTokenOf: string }[] = [];
+  // EXCLUSIONS (codex F1): an intermediate with ZERO single-token surface forms
+  // is UNSCORABLE (the reference metric scores single-token synonyms only) — it
+  // is DROPPED from pass@k, never scored on a token prefix. An item left with
+  // zero scorable intermediates is excluded from its suite's mean. These are a
+  // property of the intermediate → applied identically to J and logit.
+  const excludedIntermediates: { suite: string; item: string; intermediate: string }[] = [];
+  const excludedItems: { suite: string; item: string; nIntermediates: number }[] = [];
 
   type SuiteResult = {
     slug: string;
-    nItems: number;
+    nItems: number; // total items in the suite
+    nScoredItems: number; // items with ≥1 scorable intermediate (mean denominator)
+    nExcludedItems: number; // items with zero scorable intermediates
+    nExcludedIntermediates: number; // unscorable intermediates dropped from scoring
     jAucHead: number;
     logitAucHead: number;
     jAucSupp: number;
@@ -216,6 +230,7 @@ async function main() {
       jSupp: new Array(K_GRID.length).fill(0),
       logitSupp: new Array(K_GRID.length).fill(0),
     };
+    let nScored = 0; // items that contributed to the mean (≥1 scorable intermediate)
 
     const t0 = Date.now();
     for (const item of items) {
@@ -236,19 +251,25 @@ async function main() {
         readoutPos = nl;
       }
 
-      // per-intermediate single-token surface-form id sets.
+      // per-intermediate single-token surface-form id sets. An intermediate with
+      // NO single-token surface form is UNSCORABLE (codex F1): the reference
+      // metric scores single-token synonyms only, so we EXCLUDE it rather than
+      // score a misleading first-token prefix.
       const interIds: number[][] = [];
       for (const inter of item.intermediates) {
         const bases = suite.synonyms ? expandSynonyms(inter) : [inter];
         const idset = new Set<number>();
         for (const b of bases) for (const id of await surfaceIds(b)) idset.add(id);
         if (idset.size === 0) {
-          // fallback: FIRST token of the leading-space form of the ORIGINAL key.
-          const enc = await encode(` ${inter}`);
-          idset.add(enc[0]);
-          deviations.push({ suite: suite.slug, item: item.name, intermediate: inter, firstTokenOf: ` ${inter}` });
+          excludedIntermediates.push({ suite: suite.slug, item: item.name, intermediate: inter });
+          continue; // unscorable — drop from the metric (no prefix fallback)
         }
         interIds.push([...idset]);
+      }
+      // Item with zero scorable intermediates → excluded from the suite mean.
+      if (interIds.length === 0) {
+        excludedItems.push({ suite: suite.slug, item: item.name, nIntermediates: item.intermediates.length });
+        continue;
       }
 
       // union of ids for this item, batched ≤8; rank tracks per id.
@@ -311,7 +332,7 @@ async function main() {
         logitHead.push(lh);
         logitSupp.push(ls);
       }
-      const M = item.intermediates.length;
+      const M = interIds.length; // SCORABLE intermediates only (codex F1)
       for (let ki = 0; ki < K_GRID.length; ki++) {
         const k = K_GRID[ki];
         acc.jHead[ki] += jHead.filter((r) => r <= k).length / M;
@@ -319,16 +340,23 @@ async function main() {
         acc.logitHead[ki] += logitHead.filter((r) => r <= k).length / M;
         acc.logitSupp[ki] += logitSupp.filter((r) => r <= k).length / M;
       }
+      nScored++;
     }
 
-    const n = items.length;
-    const jPassHead = acc.jHead.map((s) => s / n);
-    const logitPassHead = acc.logitHead.map((s) => s / n);
-    const jPassSupp = acc.jSupp.map((s) => s / n);
-    const logitPassSupp = acc.logitSupp.map((s) => s / n);
+    // mean over SCORED items (those with ≥1 scorable intermediate), NOT raw n.
+    if (nScored === 0) throw new Error(`${suite.slug}: all items excluded (zero scorable intermediates)`);
+    const jPassHead = acc.jHead.map((s) => s / nScored);
+    const logitPassHead = acc.logitHead.map((s) => s / nScored);
+    const jPassSupp = acc.jSupp.map((s) => s / nScored);
+    const logitPassSupp = acc.logitSupp.map((s) => s / nScored);
+    const nExInter = excludedIntermediates.filter((e) => e.suite === suite.slug).length;
+    const nExItems = excludedItems.filter((e) => e.suite === suite.slug).length;
     const r: SuiteResult = {
       slug: suite.slug,
-      nItems: n,
+      nItems: items.length,
+      nScoredItems: nScored,
+      nExcludedItems: nExItems,
+      nExcludedIntermediates: nExInter,
       jAucHead: normLogKAuc(jPassHead),
       logitAucHead: normLogKAuc(logitPassHead),
       jAucSupp: normLogKAuc(jPassSupp),
@@ -340,22 +368,23 @@ async function main() {
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
     const win = r.jAucHead > r.logitAucHead ? 'J' : r.jAucHead < r.logitAucHead ? 'logit' : 'tie';
     console.log(
-      `[${suite.slug.padEnd(13)}] n=${String(n).padStart(3)} (${dt}s)  ` +
+      `[${suite.slug.padEnd(13)}] n=${String(nScored).padStart(3)}/${items.length} (${dt}s)  ` +
         `J-AUC=${r.jAucHead.toFixed(4)}  logit-AUC=${r.logitAucHead.toFixed(4)}  ` +
-        `Δ=${(r.jAucHead - r.logitAucHead >= 0 ? '+' : '') + (r.jAucHead - r.logitAucHead).toFixed(4)}  win=${win}`,
+        `Δ=${(r.jAucHead - r.logitAucHead >= 0 ? '+' : '') + (r.jAucHead - r.logitAucHead).toFixed(4)}  win=${win}` +
+        `  [excl: ${nExItems} items, ${nExInter} inters]`,
     );
   }
 
   // ---- headline table + X/6 ----
   const jWins = results.filter((r) => r.jAucHead > r.logitAucHead).length;
   console.log(`\n================ HEADLINE (min-over-layers 1..=23, normalized log-k pass@k AUC) ================`);
-  console.log(`suite          nItems   J-AUC   logit-AUC     Δ(J−logit)   winner`);
+  console.log(`suite         scored/n   J-AUC   logit-AUC     Δ(J−logit)   winner   excl(items/inters)`);
   for (const r of results) {
     const d = r.jAucHead - r.logitAucHead;
     const win = d > 0 ? 'J' : d < 0 ? 'logit' : 'tie';
     console.log(
-      `${r.slug.padEnd(13)} ${String(r.nItems).padStart(5)}   ${r.jAucHead.toFixed(4)}   ${r.logitAucHead.toFixed(4)}     ` +
-        `${(d >= 0 ? '+' : '') + d.toFixed(4)}      ${win}`,
+      `${r.slug.padEnd(13)} ${(String(r.nScoredItems) + '/' + r.nItems).padStart(7)}   ${r.jAucHead.toFixed(4)}   ${r.logitAucHead.toFixed(4)}     ` +
+        `${(d >= 0 ? '+' : '') + d.toFixed(4)}      ${win.padEnd(5)}   ${r.nExcludedItems}/${r.nExcludedIntermediates}`,
     );
   }
   console.log(`\nJ beats logit on ${jWins}/6 suites (headline, layers 1..=23).`);
@@ -363,14 +392,17 @@ async function main() {
   for (const r of results) {
     console.log(`  ${r.slug.padEnd(13)} J=${r.jAucSupp.toFixed(4)}  logit=${r.logitAucSupp.toFixed(4)}`);
   }
-  if (deviations.length) {
-    console.log(
-      `\nSurface-form fallbacks (zero single-token forms → first token of leading-space form): ${deviations.length}`,
-    );
-    for (const d of deviations.slice(0, 20))
-      console.log(`  ${d.suite}/${d.item}: "${d.intermediate}" -> first token of "${d.firstTokenOf}"`);
-  } else {
-    console.log(`\nSurface-form fallbacks: 0 (every scored intermediate had ≥1 single-token surface form).`);
+  // ---- EXCLUSIONS (codex F1): unscorable intermediates + fully-excluded items ----
+  console.log(
+    `\nEXCLUSIONS (unscorable = zero single-token surface forms; dropped from the metric, NOT prefix-scored):` +
+      `\n  ${excludedIntermediates.length} intermediate(s) excluded, ${excludedItems.length} item(s) fully excluded (had zero scorable intermediates).`,
+  );
+  if (excludedIntermediates.length) {
+    for (const e of excludedIntermediates) console.log(`  [inter] ${e.suite}/${e.item}: "${e.intermediate}"`);
+  }
+  if (excludedItems.length) {
+    for (const e of excludedItems)
+      console.log(`  [item ] ${e.suite}/${e.item}: 0/${e.nIntermediates} scorable → excluded from suite mean`);
   }
   console.log(`\nmax eval prompt length = ${maxPromptLen} tok (LENS_MAX_POSITIONS=${LENS_MAX_POSITIONS}).`);
 
@@ -383,12 +415,14 @@ async function main() {
         model: MODEL_PATH,
         pack: PACK_PATH,
         generatedAt: new Date().toISOString(),
-        metric: 'normalized log-k pass@k AUC; rank = min over surface-form ids AND layers 1..=23; perfect=1.0',
+        metric:
+          'normalized log-k pass@k AUC; rank = min over single-token surface-form ids AND layers 1..=23; perfect=1.0; unscorable (multi-token) intermediates EXCLUDED (codex F1), symmetric across J & logit',
         kGrid: K_GRID,
         headlineLayers: HEADLINE_LAYERS,
         jWins6: jWins,
         results,
-        deviations,
+        excludedIntermediates,
+        excludedItems,
         maxPromptLen,
         note: 'Tuned-lens/causal/swap results belong to Anthropic models, not this run. <6/6 = partial reproduction on a 0.8B.',
       },

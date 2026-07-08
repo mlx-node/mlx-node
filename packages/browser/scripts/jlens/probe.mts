@@ -1,6 +1,6 @@
 /**
- * J-lens QUALITATIVE PROBE (Task T1.4) — J-vs-logit argmax grids + a cheap
- * workspace-onset detector (residual-stream tail index by boundary).
+ * J-lens QUALITATIVE PROBE (Task T1.4) — J-vs-logit argmax grids + a residual
+ * outlier / tail-index diagnostic (residual-stream absMax/std by boundary).
  *
  * PART A — argmax grids. For 4 hand-picked prompts (a sport verbal-report, an
  * arithmetic order-of-ops, a two-hop spider prompt, and a plain continuation)
@@ -11,16 +11,19 @@
  * known intermediate concept and report its J-vs-logit min-over-layers rank, so
  * the divergence is a hard number, not a vibe.
  *
- * PART B — workspace-onset detector. The paper's cheapest onset signal
- * (Fig-28) is the EXCESS KURTOSIS of the residual stream by layer. The
- * read-only inspector NAPI exposes per-layer summary stats (mean/std/absMax/
- * l2) but NOT the raw residual activations, and this task makes NO native
- * changes — so we report the closest available proxy: the residual TAIL INDEX
- * absMax/std of `post_mlp_residual` by boundary (max standardized activation).
- * It is monotone-aligned with excess kurtosis (both spike exactly when a few
- * massive activations appear) and answers the same question — WHERE does the
- * residual stream develop heavy-tailed / outlier structure past the early band.
- * This is a PROXY, explicitly labeled; it is NOT the literal 4th moment.
+ * PART B — residual OUTLIER / TAIL-INDEX diagnostic (NOT a kurtosis
+ * reproduction). The paper's cheapest onset signal (Fig-28) is the EXCESS
+ * KURTOSIS of the residual stream by layer. The read-only inspector NAPI
+ * exposes per-layer summary stats (mean/std/absMax/l2) but NOT the raw residual
+ * activations, and this task makes NO native changes — so we report a related
+ * but WEAKER statistic: the residual TAIL INDEX absMax/std of
+ * `post_mlp_residual` by boundary (the max standardized activation). It is
+ * SENSITIVE to the same heavy-tail structure that excess kurtosis measures (a
+ * few massive activations inflate both), but it is NOT the literal 4th moment
+ * and NOT a monotone stand-in for it — a max-coordinate statistic moves very
+ * differently from the 4th moment. Treat the observed rise as a QUALITATIVE
+ * observation on 4 hand-picked probe prompts (arbitrary 1.25× threshold), NOT
+ * as workspace-onset evidence.
  *
  * Run with: oxnode packages/browser/scripts/jlens/probe.mts
  *   (NOT tsx/ts-node; needs env PATH="/opt/homebrew/bin:$PATH")
@@ -178,12 +181,12 @@ async function main() {
     });
   }
 
-  // ---- PART B: residual tail-index (kurtosis proxy) by boundary ----
-  console.log(`\n================ residual tail-index by boundary (excess-kurtosis PROXY) ================`);
-  console.log(`(absMax/std of post_mlp_residual; PROXY for the paper's Fig-28 excess-kurtosis onset detector.`);
-  console.log(
-    ` raw residual activations are NOT exposed by the read-only NAPI and this task makes no native changes.)`,
-  );
+  // ---- PART B: residual outlier / tail-index diagnostic by boundary ----
+  console.log(`\n================ residual outlier / tail-index diagnostic by boundary ================`);
+  console.log(`(absMax/std of post_mlp_residual, the max standardized activation — a WEAK tail-index diagnostic,`);
+  console.log(` sensitive to the same heavy tails as the paper's Fig-28 excess kurtosis but NOT the 4th moment and`);
+  console.log(` NOT a monotone stand-in for it. Qualitative only, on 4 hand-picked probes. Raw residuals are not`);
+  console.log(` exposed by the read-only NAPI and this task makes no native changes.)`);
   // boundary ℓ (1..24) == post_mlp_residual at decoder layerIdx ℓ-1.
   const nB = 24;
   const tailSum = new Array(nB).fill(0);
@@ -218,7 +221,10 @@ async function main() {
       `  ${String(b + 1).padStart(2)}       | ${tail[b].toFixed(2).padStart(6)}           | ${stdMean[b].toFixed(4)} | ${absMaxMean[b].toFixed(3)}${rise}`,
     );
   }
-  console.log(`  early-band (ℓ1..5) mean tail-index = ${earlyBandMean.toFixed(2)}; boundaries >1.25× flagged ^rise.`);
+  console.log(
+    `  early-band (ℓ1..5) mean tail-index = ${earlyBandMean.toFixed(2)}; boundaries >1.25× flagged ^rise` +
+      ` — QUALITATIVE only (arbitrary threshold, 4 probes), NOT workspace-onset evidence.`,
+  );
 
   // tiny standalone SVG of the tail-index curve.
   const svgW = 640,
@@ -233,7 +239,7 @@ async function main() {
   const pts = tail.map((t, b) => `${xOf(b).toFixed(1)},${yOf(t).toFixed(1)}`).join(' ');
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">
 <rect width="${svgW}" height="${svgH}" fill="#0b0e14"/>
-<text x="${svgW / 2}" y="12" fill="#c9d1d9" font-family="sans-serif" font-size="11" text-anchor="middle">residual tail-index absMax/std by boundary (excess-kurtosis proxy) — mean over 4 probes</text>
+<text x="${svgW / 2}" y="12" fill="#c9d1d9" font-family="sans-serif" font-size="11" text-anchor="middle">residual outlier / tail-index absMax/std by boundary (weak tail diagnostic, NOT kurtosis) — mean over 4 probes</text>
 <line x1="${padL}" y1="${svgH - padB}" x2="${svgW - padR}" y2="${svgH - padB}" stroke="#30363d"/>
 <line x1="${padL}" y1="${padT}" x2="${padL}" y2="${svgH - padB}" stroke="#30363d"/>
 <line x1="${padL}" y1="${yOf(earlyBandMean).toFixed(1)}" x2="${svgW - padR}" y2="${yOf(earlyBandMean).toFixed(1)}" stroke="#f0883e" stroke-dasharray="4 3" opacity="0.7"/>
@@ -258,7 +264,7 @@ ${[1, 6, 12, 18, 24].map((ly) => `<text x="${xOf(ly - 1).toFixed(1)}" y="${svgH 
           stdMean,
           absMaxMean,
           earlyBandMean,
-          note: 'PROXY for excess kurtosis (raw residuals not exposed by read-only NAPI)',
+          note: 'Weak outlier / tail-index diagnostic (absMax/std, max standardized activation); sensitive to the same heavy tails as excess kurtosis but NOT the 4th moment and NOT a monotone stand-in; qualitative, 4 probes; raw residuals not exposed by read-only NAPI',
         },
       },
       null,
