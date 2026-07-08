@@ -457,6 +457,83 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Native token-truncation is the AUTHORITATIVE calibration boundary.
+    ///
+    /// The CLI (`packages/cli/src/commands/calibrate.ts`) must NOT pre-truncate
+    /// a row to a tight char proxy — `calibrate_prefill_raw_sync` tokenizes each
+    /// row with `encode_sync(text, Some(false))` (no chat template / special
+    /// tokens) then `tokens.truncate(cap)` where `cap = calib_seq.max(1)`. This
+    /// locks that contract with a REAL, hermetic inline WordLevel tokenizer (no
+    /// model dir, no network): a string of MORE than `calib_seq` whitespace
+    /// words encodes to > `calib_seq` tokens, and truncation keeps EXACTLY
+    /// `calib_seq` of them — the LEADING prefix — proving native (not the CLI)
+    /// is the one place that bounds the calibration window.
+    #[test]
+    fn calibration_native_truncation_keeps_exactly_calib_seq_tokens() {
+        use crate::tokenizer::Qwen3Tokenizer;
+
+        // WordLevel + Whitespace: one token per space-separated word, and with
+        // `add_special_tokens = Some(false)` and no post_processor, zero BOS /
+        // control tokens are added — exactly the raw-prefill encode.
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "a": 0, "b": 1, "<unk>": 2 },
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_trunc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, json).unwrap();
+        let tok = Qwen3Tokenizer::from_file(&path).unwrap();
+
+        let calib_seq: u32 = 8;
+        // 40 alternating "a b" words > calib_seq (8) tokens: a row that
+        // overflows the window so truncation is actually exercised.
+        let text = vec!["a b"; 20].join(" ");
+        let mut tokens = tok.encode_sync(&text, Some(false)).unwrap();
+        assert!(
+            tokens.len() > calib_seq as usize,
+            "fixture must overflow the window: got {} tokens for calib_seq={calib_seq}",
+            tokens.len()
+        );
+
+        // The EXACT native truncation step from `calibrate_prefill_raw_sync`.
+        let cap = calib_seq.max(1) as usize;
+        tokens.truncate(cap);
+
+        assert_eq!(
+            tokens.len(),
+            calib_seq as usize,
+            "native truncation must keep EXACTLY calib_seq tokens (authoritative boundary)"
+        );
+        // "a b a b …" encodes to ids [0,1,0,1,…]; the kept prefix is the FIRST
+        // `cap` ids, proving truncation preserves the leading window in order.
+        let expected: Vec<u32> = (0..cap).map(|i| (i % 2) as u32).collect();
+        assert_eq!(
+            tokens, expected,
+            "truncation keeps the LEADING prefix in order"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The finding-2 serialization primitive: `calib_guard` is a single
     /// process-global tokio mutex, so once `try_lock` holds it a SECOND
     /// `try_lock` fails (that path returns "another calibration is in progress"),
