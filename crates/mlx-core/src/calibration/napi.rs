@@ -5,14 +5,11 @@
 //! the Rust model forward (the mxfp8 attention/GDN tap in
 //! `QuantizedLinear::forward`), so the TS driver never touches per-layer state.
 //!
-//! The primary export is [`calibrate_activation_amax_raw`]: an all-in-native
+//! The sole export is [`calibrate_activation_amax_raw`]: an all-in-native
 //! one-shot that loads the model + tokenizer, arms the tap, runs RAW-text
 //! PREFILL over each calibration row (no chat template, no generated token),
 //! then disarms and — only on full success — atomically persists the drained
-//! amax. The finer-grained [`start_activation_calibration`] /
-//! [`finish_activation_calibration`] / [`discard_activation_calibration`]
-//! arm / persist / cleanup-only exports remain for callers that drive the
-//! forward themselves and want to separate cleanup from persistence.
+//! amax.
 
 use std::path::Path;
 
@@ -21,70 +18,14 @@ use napi_derive::napi;
 
 use super::activation_amax::{ActivationAmaxCollector, write_amax_into_config};
 
-/// Arm the process-global activation-amax collector.
-///
-/// While armed, every mxfp8 attention/GDN projection's forward folds
-/// `max|activation|` into a per-tensor running maximum (modelopt `MaxCalibrator`
-/// semantics). The TS driver calls this once, then prefills the model over the
-/// calibration mix so the tap fires on each projection.
-///
-/// CONCURRENCY: this and [`finish_activation_calibration`] /
-/// [`discard_activation_calibration`] drive the SAME process-global collector
-/// (a single shared running-max map + armed flag). They MUST NOT run
-/// concurrently with a [`calibrate_activation_amax_raw`] run, with each other on
-/// a second model, or with normal inference (any armed forward records into the
-/// one shared map). Calibration is a standalone one-shot operation.
-#[napi]
-pub fn start_activation_calibration() {
-    ActivationAmaxCollector::enable();
-}
-
-/// Disarm the collector, drain the accumulated per-tensor `input_amax`, and
-/// write it into `<model_path>/config.json` (both the `quantization` and
-/// `quantization_config` aliases).
-///
-/// Returns the number of projections calibrated (the count of collected amax
-/// entries). A count of 0 means the model exercised no activation-fp8 sites —
-/// e.g. it was not an nvidia-recipe (mxfp8 attn/GDN) checkpoint.
-///
-/// CONCURRENCY: see [`start_activation_calibration`] — shares the one
-/// process-global collector; MUST NOT overlap another calibration or inference.
-#[napi]
-pub fn finish_activation_calibration(model_path: String) -> Result<u32> {
-    ActivationAmaxCollector::disable();
-    let amax = ActivationAmaxCollector::take();
-    let config_path = Path::new(&model_path).join("config.json");
-    write_amax_into_config(&config_path, &amax)?;
-    Ok(amax.len() as u32)
-}
-
-/// Disarm the collector and DISCARD the accumulated per-tensor `input_amax`
-/// WITHOUT writing any config.
-///
-/// This is the cleanup-only counterpart to [`finish_activation_calibration`]:
-/// use it on an error / abort path so a FAILED calibration never persists a
-/// partial/unknown-subset `input_amax` into the live model `config.json` (a
-/// later inference run would then fake-quant against a half-calibrated amax).
-/// It leaves the collector disarmed and the running-max map empty, restoring
-/// the pristine pre-calibration state.
-///
-/// CONCURRENCY: see [`start_activation_calibration`] — shares the one
-/// process-global collector; MUST NOT overlap another calibration or inference.
-#[napi]
-pub fn discard_activation_calibration() {
-    ActivationAmaxCollector::disable();
-    // Drain and drop — never touch config.json.
-    let _ = ActivationAmaxCollector::take();
-}
-
 /// Process-wide calibration mutual-exclusion guard.
 ///
 /// [`calibrate_activation_amax_raw`] holds this (via `try_lock`) for its ENTIRE
 /// clear→enable→prefill→disable→take→write critical section. The
 /// [`ActivationAmaxCollector`] it drives is a SINGLE process-global map + armed
-/// flag; a second concurrent calibration (or a `start`/`finish` pair, or a
-/// normal inference forward while the tap is armed) would interleave
-/// `enable`/`record`/`take` and contaminate the persisted amax.
+/// flag; a second concurrent calibration (or a normal inference forward while
+/// the tap is armed) would interleave `enable`/`record`/`take` and contaminate
+/// the persisted amax.
 ///
 /// A tokio mutex (not `std::sync`): its guard is `Send`, so it can be held
 /// across the load + prefill `.await` points in an async fn without making the
@@ -177,8 +118,7 @@ where
 /// concurrent calibration fails fast with "another calibration is in progress"
 /// rather than contaminating the shared collector. The collector is CLEARED at
 /// the very start so stale amax from a prior PANICKED run cannot leak into this
-/// write. The `start`/`finish`/`discard` exports share the same collector and
-/// must not overlap this run (or normal inference).
+/// write.
 ///
 /// On ANY error before the final write, the partial amax is discarded and
 /// `config.json` is left UNTOUCHED (a failed calibration must not mutate the

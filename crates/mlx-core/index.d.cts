@@ -2729,19 +2729,6 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
 
-/**
- * Disarm the collector and DISCARD the accumulated per-tensor `input_amax`
- * WITHOUT writing any config.
- *
- * This is the cleanup-only counterpart to [`finish_activation_calibration`]:
- * use it on an error / abort path so a FAILED calibration never persists a
- * partial/unknown-subset `input_amax` into the live model `config.json` (a
- * later inference run would then fake-quant against a half-calibrated amax).
- * It leaves the collector disarmed and the running-max map empty, restoring
- * the pristine pre-calibration state.
- */
-export declare function discardActivationCalibration(): void;
-
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -2829,17 +2816,6 @@ export interface EngineStepMetrics {
   /** Active memory at end of step (MB) */
   activeMemoryMb: number;
 }
-
-/**
- * Disarm the collector, drain the accumulated per-tensor `input_amax`, and
- * write it into `<model_path>/config.json` (both the `quantization` and
- * `quantization_config` aliases).
- *
- * Returns the number of projections calibrated (the count of collected amax
- * entries). A count of 0 means the model exercised no activation-fp8 sites —
- * e.g. it was not an nvidia-recipe (mxfp8 attn/GDN) checkpoint.
- */
-export declare function finishActivationCalibration(modelPath: string): number;
 
 export interface ForeignConversionOptions {
   /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
@@ -4401,16 +4377,6 @@ export interface SftStepMetrics {
   /** Time for training step (ms) */
   trainingTimeMs: number;
 }
-
-/**
- * Arm the process-global activation-amax collector.
- *
- * While armed, every mxfp8 attention/GDN projection's forward folds
- * `max|activation|` into a per-tensor running maximum (modelopt `MaxCalibrator`
- * semantics). The TS driver calls this once, then prefills the model over the
- * calibration mix so the tap fires on each projection.
- */
-export declare function startActivationCalibration(): void;
 
 /** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
 export interface StepMetricSummary {
