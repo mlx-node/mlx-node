@@ -975,9 +975,16 @@ fn apply_weights_inner(
         // the tap skips it and calibration never fake-quants a non-attn/GDN
         // site.
         let nk = normalize_per_layer_key(prefix);
-        let amax_key =
-            crate::calibration::activation_amax::is_activation_fp8_site(&nk).then_some(nk);
-        Ok(built.map(move |ql| ql.with_input_amax(plq.input_amax).with_amax_key(amax_key)))
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let amax_key = is_site.then_some(nk);
+        // Gate the CONSUMED activation amax under the SAME predicate as the
+        // recorded `amax_key`: `QuantizedLinear::forward` fake-quants whenever
+        // `input_amax > 0 && mode == MXFP8_MODE`, so a stale / hand-edited /
+        // future-recipe config with `input_amax` on a NON-attn/GDN mxfp8
+        // projection must NOT thread it — else it would fake-quant a non-site's
+        // activations, violating "activation FP8 only on attn/GDN sites".
+        let input_amax = if is_site { plq.input_amax } else { None };
+        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
     };
 
     // Embedding
@@ -2889,6 +2896,199 @@ mod tests {
                 inner.lm_head.is_none(),
                 "tied lm_head must remain None when tie_word_embeddings=true"
             );
+        }
+    }
+
+    /// RED-first regression guard for the FP8-activation loader asymmetry
+    /// (codex [high]): the dense `try_build_ql` closure gated the recorded
+    /// `amax_key` behind `is_activation_fp8_site` but threaded the CONSUMED
+    /// `PerLayerQuant::input_amax` UNCONDITIONALLY. A stale / hand-edited /
+    /// future-recipe config that puts `input_amax` on a NON-activation-site
+    /// mxfp8 projection would have that amax survive the load and drive FP8
+    /// fake-quant in `QuantizedLinear::forward` (`input_amax > 0 && mode ==
+    /// MXFP8_MODE`) — violating the contract that only attn/GDN sites carry
+    /// activation FP8. The fix gates `input_amax` behind the SAME
+    /// `is_activation_fp8_site` predicate as `amax_key`.
+    ///
+    /// `lm_head` normalizes to `"lm_head"` (NOT in the activation-fp8 site set)
+    /// yet installs through the exact `try_build_ql` closure under test. Pre-fix
+    /// this observes `Some(2.0)` (RED); post-fix `None` (GREEN).
+    #[test]
+    fn mxfp8_non_site_lm_head_drops_input_amax_dense_loader() {
+        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        let label = "mxfp8_non_site_lm_head_drops_input_amax_dense_loader";
+
+        let untied_cfg = Qwen3_5Config {
+            vocab_size: 8,
+            tie_word_embeddings: false,
+            ..no_mtp_layer_cfg()
+        };
+        let vocab = untied_cfg.vocab_size as i64;
+        let hidden = untied_cfg.hidden_size as i64;
+
+        let mut inner = match Qwen35Inner::new(untied_cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("lm_head.weight".into(), u8_arr(&[vocab, hidden]));
+        params.insert("lm_head.scales".into(), u8_arr(&[vocab, hidden / 32]));
+
+        // Non-activation-site mxfp8 projection carrying a (stale/hand-edited)
+        // per-tensor activation amax that must NOT survive the load.
+        let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq.insert(
+            "lm_head".into(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(2.0),
+            },
+        );
+
+        // Install-only fixture: the partial checkpoint trips the end-of-load
+        // completeness gate AFTER lm_head is installed on `inner`.
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &untied_cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &plq,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        assert!(
+            matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+            "mxfp8 lm_head must install as LinearProj::Quantized"
+        );
+        if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+            assert_eq!(
+                ql.input_amax(),
+                None,
+                "dense loader must DROP input_amax on a non-activation-fp8-site mxfp8 projection \
+                 (lm_head); it was threaded unconditionally before the try_build_ql gate fix"
+            );
+        }
+    }
+
+    /// POSITIVE sibling to the non-site guard (dense) and to
+    /// `mxfp8_attention_q_proj_threads_input_amax_through_moe_loader` (MoE): an
+    /// activation-fp8 SITE (`self_attn.q_proj`) must KEEP its calibrated
+    /// `PerLayerQuant::input_amax` through the dense `try_build_ql` closure. The
+    /// symmetric-gate fix drops `input_amax` only on NON-sites, so a real site
+    /// must still thread it (over-correction guard). Layer 3 is the
+    /// full-attention layer (`full_attention_interval = 4`, `(i + 1) % 4 == 0`).
+    #[test]
+    fn mxfp8_attention_q_proj_threads_input_amax_dense_loader() {
+        use super::super::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE};
+        const AMAX: f32 = 37.5;
+        let label = "mxfp8_attention_q_proj_threads_input_amax_dense_loader";
+
+        let cfg = no_mtp_layer_cfg();
+        let hidden = cfg.hidden_size as i64;
+        let q_dim = (cfg.num_heads * cfg.head_dim) as i64;
+
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("Metal") || msg.contains("device") {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {msg}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {msg}");
+            }
+        };
+
+        let u8_arr = |shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![1.0f32; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.3.self_attn.q_proj.weight".into(),
+            u8_arr(&[q_dim, hidden]),
+        );
+        params.insert(
+            "layers.3.self_attn.q_proj.scales".into(),
+            u8_arr(&[q_dim, hidden / 32]),
+        );
+
+        let mut plq: HashMap<String, PerLayerQuant> = HashMap::new();
+        plq.insert(
+            "layers.3.self_attn.q_proj".into(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(AMAX),
+            },
+        );
+
+        match apply_weights_inner(
+            &mut inner,
+            &params,
+            &cfg,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &plq,
+            /* has_vision */ false,
+        ) {
+            Ok(()) => {}
+            Err(err) => {
+                let msg = err.reason.to_string();
+                assert!(
+                    msg.contains("missing mandatory weights"),
+                    "unexpected apply_weights_inner error in {label}: {msg}"
+                );
+            }
+        }
+
+        match &inner.layers[3].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.q_proj_input_amax(),
+                    Some(AMAX),
+                    "dense loader must thread PerLayerQuant::input_amax onto the built q_proj \
+                     (activation-fp8 site) after the gate fix"
+                );
+            }
+            AttentionType::Linear(_) => {
+                panic!("layers[3] must be Full attention (full_attention_interval = 4)")
+            }
         }
     }
 

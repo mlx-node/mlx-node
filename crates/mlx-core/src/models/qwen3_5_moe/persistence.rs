@@ -549,9 +549,17 @@ fn apply_weights_moe_inner(
         // `None` so the tap skips it and calibration never fake-quants a
         // non-attn/GDN site.
         let nk = normalize_per_layer_key(prefix);
-        let amax_key =
-            crate::calibration::activation_amax::is_activation_fp8_site(&nk).then_some(nk);
-        Ok(built.map(move |ql| ql.with_input_amax(plq.input_amax).with_amax_key(amax_key)))
+        let is_site = crate::calibration::activation_amax::is_activation_fp8_site(&nk);
+        let amax_key = is_site.then_some(nk);
+        // Gate the CONSUMED activation amax under the SAME predicate as the
+        // recorded `amax_key` — mirrors the dense qwen3_5 loader.
+        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0 &&
+        // mode == MXFP8_MODE`, so a stale / hand-edited / future-recipe config
+        // with `input_amax` on a NON-attn/GDN mxfp8 projection must NOT thread
+        // it — else it would fake-quant a non-site's activations, violating
+        // "activation FP8 only on attn/GDN sites".
+        let input_amax = if is_site { plq.input_amax } else { None };
+        Ok(built.map(move |ql| ql.with_input_amax(input_amax).with_amax_key(amax_key)))
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>,
@@ -2297,6 +2305,108 @@ mod tests {
             AttentionType::Linear(_) => {
                 panic!("tiny_sym8_moe_cfg (full_attention_interval=1) must assign Full attention")
             }
+        }
+    }
+
+    /// RED-first NEGATIVE sibling to
+    /// `mxfp8_attention_q_proj_threads_input_amax_through_moe_loader`: the MoE
+    /// `try_build_ql` closure gated the recorded `amax_key` behind
+    /// `is_activation_fp8_site` but threaded the CONSUMED `input_amax`
+    /// UNCONDITIONALLY. A stale / hand-edited / future-recipe config that puts
+    /// `input_amax` on a NON-activation-site mxfp8 projection (here `lm_head`)
+    /// would carry it into `QuantizedLinear::forward` FP8 fake-quant — violating
+    /// "activation FP8 only on attn/GDN sites". After the symmetric-gate fix a
+    /// non-site drops `input_amax` to `None`.
+    ///
+    /// `lm_head` normalizes to `"lm_head"` (NOT a site) yet installs through the
+    /// exact closure under test (`inner.lm_head = LinearProj::Quantized(ql)`):
+    /// pre-fix this observes `Some(2.0)` (RED), post-fix `None` (GREEN).
+    #[test]
+    fn mxfp8_non_site_lm_head_drops_input_amax_through_moe_loader() {
+        use super::super::quantized_linear::{LinearProj, MXFP8_BITS, MXFP8_GROUP_SIZE};
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let u8 = |v: f32, shape: &[i64]| {
+            let n: i64 = shape.iter().product();
+            MxArray::from_float32(&vec![v; n as usize], shape)
+                .expect("from_float32")
+                .astype(DType::Uint8)
+                .expect("astype uint8")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        // Attention q_proj + router gate keep the loader's completeness gate
+        // satisfied (mirrors the positive sibling); q_proj carries NO input_amax.
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            u8(0.0, &[64, 64]),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            u8(1.0, &[64, 2]),
+        );
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+        // The non-activation-site projection under test: mxfp8 lm_head carrying
+        // a stale per-tensor activation amax that must NOT survive the load.
+        params.insert("lm_head.weight".to_string(), u8(0.0, &[8, 64]));
+        params.insert("lm_head.scales".to_string(), u8(1.0, &[8, 2]));
+
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: None,
+            },
+        );
+        per_layer_quant.insert(
+            "lm_head".to_string(),
+            PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(2.0),
+            },
+        );
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("mxfp8 lm_head MoE checkpoint must load");
+
+        assert!(
+            matches!(inner.lm_head, Some(LinearProj::Quantized(_))),
+            "mxfp8 lm_head must install as LinearProj::Quantized"
+        );
+        if let Some(LinearProj::Quantized(ref ql)) = inner.lm_head {
+            assert_eq!(
+                ql.input_amax(),
+                None,
+                "MoE loader must DROP input_amax on a non-activation-fp8-site mxfp8 projection \
+                 (lm_head); it was threaded unconditionally before the try_build_ql gate fix"
+            );
         }
     }
 
