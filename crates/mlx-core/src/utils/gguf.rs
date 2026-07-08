@@ -1283,6 +1283,22 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
+    // The nvidia recipe is a data-free port with a fixed format map. Reject the
+    // flags that would silently alter or contradict it BEFORE the imatrix AWQ
+    // pre-scaling (below) can rewrite weights and BEFORE the recipe predicate is
+    // built/wrapped with `apply_mxfp_upgrade`. Shares one validator with the
+    // safetensors entry point (`convert_model_inner`) so both paths reject the
+    // same combinations with identical messages.
+    if options.quant_recipe.as_deref() == Some("nvidia") {
+        crate::convert::validate_nvidia_recipe_options(
+            options.imatrix_path.as_deref(),
+            options.quant_mxfp.unwrap_or(false),
+            options.quant_bits,
+            options.quant_group_size,
+        )
+        .map_err(Error::from_reason)?;
+    }
+
     // Serialize all conversions process-wide before touching MLX's default
     // device + stream. Then route every MLX op through CPU for the duration
     // of this call. See `crate::convert::convert_mutex` and

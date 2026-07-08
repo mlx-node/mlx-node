@@ -1877,39 +1877,16 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // reads no imatrix, ignores --q-mxfp (it emits mxfp4/mxfp8 directly),
         // and pins bits=4/group_size=32 for its float tensors. Reject flags
         // that would silently alter or contradict that map, but allow a bare
-        // `-q --q-recipe nvidia` (no explicit bits/group_size) to pass.
+        // `-q --q-recipe nvidia` (no explicit bits/group_size) to pass. Shared
+        // with the GGUF entry point (`convert_gguf_to_safetensors`).
         if recipe == "nvidia" {
-            if imatrix_path.is_some() {
-                return Err(Error::from_reason(
-                    "nvidia recipe is a data-free port and does not accept --imatrix-path: \
-                     an imatrix would trigger AWQ pre-scaling that silently alters weights, \
-                     breaking the faithful modelopt format map"
-                        .to_string(),
-                ));
-            }
-            if quant_mxfp {
-                return Err(Error::from_reason(
-                    "nvidia recipe already emits mxfp4/mxfp8 per-layer; --q-mxfp is redundant \
-                     and would try to re-upgrade an already-mxfp map. Drop --q-mxfp (the recipe \
-                     runs under --q-mode affine)."
-                        .to_string(),
-                ));
-            }
-            if let Some(bits) = options.quant_bits
-                && bits != 4
-            {
-                return Err(Error::from_reason(format!(
-                    "nvidia recipe is a fixed format map (its float tensors are pinned to \
-                     bits=4); it ignores --q-bits. Got --q-bits {bits}; omit it."
-                )));
-            }
-            if explicit_group_size && quant_group_size != 32 {
-                return Err(Error::from_reason(format!(
-                    "nvidia recipe is a fixed format map (its float tensors are pinned to \
-                     group_size=32); it ignores --q-group-size. Got --q-group-size \
-                     {quant_group_size}; omit it."
-                )));
-            }
+            validate_nvidia_recipe_options(
+                imatrix_path.as_deref(),
+                quant_mxfp,
+                options.quant_bits,
+                options.quant_group_size,
+            )
+            .map_err(Error::from_reason)?;
         }
     }
 
@@ -4255,6 +4232,64 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
         return Err(format!(
             "--q-mode nvfp4 + --q-recipe is currently supported only for 'unsloth' and 'qwen3_5' recipes (got '{}'). Other recipes lack tensor-class exclusions for NVFP4-sensitive layers (e.g. linear_attn.out_proj).",
             recipe
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the flags passed alongside `--q-recipe nvidia`.
+///
+/// The nvidia recipe is a data-free port with a fixed format map: it reads no
+/// imatrix, ignores `--q-mxfp` (it emits mxfp4/mxfp8 directly), and pins
+/// bits=4/group_size=32 for its float tensors. Reject flags that would silently
+/// alter or contradict that map, but allow a bare `-q --q-recipe nvidia` (no
+/// explicit bits/group_size) to pass.
+///
+/// Shared by the safetensors (`convert_model_inner`) and GGUF
+/// (`convert_gguf_to_safetensors`) entry points so both reject the same
+/// forbidden combinations with identical messages. Without this guard on the
+/// GGUF path an imatrix would trigger AWQ pre-scaling and `--q-mxfp` would
+/// re-upgrade the recipe's affine-8/64 in_proj_a/in_proj_b decisions to mxfp8,
+/// breaking the intended T=0 MTP↔AR bit-exactness. `quant_bits` /
+/// `quant_group_size` are `Some` only when the caller passed them explicitly;
+/// `None` means "use the recipe default" and always passes.
+pub(crate) fn validate_nvidia_recipe_options(
+    imatrix_path: Option<&str>,
+    quant_mxfp: bool,
+    quant_bits: Option<i32>,
+    quant_group_size: Option<i32>,
+) -> std::result::Result<(), String> {
+    if imatrix_path.is_some() {
+        return Err(
+            "nvidia recipe is a data-free port and does not accept --imatrix-path: \
+             an imatrix would trigger AWQ pre-scaling that silently alters weights, \
+             breaking the faithful modelopt format map"
+                .to_string(),
+        );
+    }
+    if quant_mxfp {
+        return Err(
+            "nvidia recipe already emits mxfp4/mxfp8 per-layer; --q-mxfp is redundant \
+             and would try to re-upgrade an already-mxfp map. Drop --q-mxfp (the recipe \
+             runs under --q-mode affine)."
+                .to_string(),
+        );
+    }
+    if let Some(bits) = quant_bits
+        && bits != 4
+    {
+        return Err(format!(
+            "nvidia recipe is a fixed format map (its float tensors are pinned to \
+             bits=4); it ignores --q-bits. Got --q-bits {bits}; omit it."
+        ));
+    }
+    if let Some(group_size) = quant_group_size
+        && group_size != 32
+    {
+        return Err(format!(
+            "nvidia recipe is a fixed format map (its float tensors are pinned to \
+             group_size=32); it ignores --q-group-size. Got --q-group-size \
+             {group_size}; omit it."
         ));
     }
     Ok(())
@@ -7276,6 +7311,68 @@ mod tests {
     fn nvfp4_recipe_accepts_unsloth_and_qwen3_5() {
         validate_nvfp4_recipe("unsloth").expect("unsloth recipe must be accepted");
         validate_nvfp4_recipe("qwen3_5").expect("qwen3_5 recipe must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_imatrix() {
+        let err = validate_nvidia_recipe_options(Some("/path/to.imatrix"), false, None, None)
+            .expect_err("nvidia recipe must reject --imatrix-path");
+        assert!(
+            err.contains("does not accept --imatrix-path"),
+            "error must mention imatrix rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_mxfp() {
+        let err = validate_nvidia_recipe_options(None, true, None, None)
+            .expect_err("nvidia recipe must reject --q-mxfp");
+        assert!(
+            err.contains("--q-mxfp is redundant"),
+            "error must mention --q-mxfp redundancy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_non_default_bits() {
+        let err = validate_nvidia_recipe_options(None, false, Some(8), None)
+            .expect_err("nvidia recipe must reject --q-bits != 4");
+        assert!(
+            err.contains("bits=4"),
+            "error must mention pinned bits=4, got: {err}"
+        );
+        assert!(
+            err.contains("Got --q-bits 8"),
+            "error must echo the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_non_default_group_size() {
+        let err = validate_nvidia_recipe_options(None, false, None, Some(64))
+            .expect_err("nvidia recipe must reject --q-group-size != 32");
+        assert!(
+            err.contains("group_size=32"),
+            "error must mention pinned group_size=32, got: {err}"
+        );
+        assert!(
+            err.contains("Got --q-group-size 64"),
+            "error must echo the offending value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_bare() {
+        validate_nvidia_recipe_options(None, false, None, None)
+            .expect("bare --q-recipe nvidia (no explicit flags) must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_explicit_matching_defaults() {
+        // Explicit-but-matching bits=4 / group_size=32 contradict nothing and
+        // must pass: the guard only rejects values that would alter the map.
+        validate_nvidia_recipe_options(None, false, Some(4), Some(32))
+            .expect("explicit bits=4 group_size=32 must be accepted");
     }
 
     #[test]
