@@ -37,6 +37,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -171,10 +172,15 @@ async function main() {
     if (used) recordsUsed++;
   }
 
-  if (sequences.length < EMIT_MIN) {
+  // The corpus contract is EXACTLY EMIT_MAX windows — the fit driver, checkpoint
+  // corpus-fingerprint, and pilot log all assume a fixed 30-sequence corpus. A
+  // stale/short raw-records cache could otherwise silently yield 20-29 sequences
+  // and exit 0, quietly changing the corpus. Require the exact count.
+  if (sequences.length !== EMIT_MAX) {
     fail(
-      `only ${sequences.length} sequences produced (< ${EMIT_MIN}). ` +
-        `Raise FETCH_WANT / EMIT_MAX or lower MIN_CHARS.`,
+      `produced ${sequences.length} sequences, need EXACTLY ${EMIT_MAX} (EMIT_MIN floor is ${EMIT_MIN}). ` +
+        `The raw-records cache is likely stale/short — delete ${RAW_RECORDS} and re-run ` +
+        `(and/or raise FETCH_WANT=${FETCH_WANT} or lower MIN_CHARS=${MIN_CHARS}) to refetch enough records.`,
     );
   }
 
@@ -193,9 +199,12 @@ async function main() {
     .update(JSON.stringify(sequences))
     .digest('hex');
 
-  // Write corpus JSONL (one sequence per line).
+  // Write corpus JSONL (one sequence per line) ATOMICALLY — write to a .tmp
+  // sibling then rename, so an interrupted run can never leave a torn/partial
+  // corpus that the fit driver would then read as valid.
   const jsonl = sequences.map((ids) => JSON.stringify({ ids })).join('\n') + '\n';
-  writeFileSync(CORPUS_PATH, jsonl);
+  writeFileSync(CORPUS_PATH + '.tmp', jsonl);
+  renameSync(CORPUS_PATH + '.tmp', CORPUS_PATH);
 
   const meta = {
     n_sequences: sequences.length,
@@ -217,7 +226,8 @@ async function main() {
     corpus_sha256: corpusSha,
     generated_at: new Date().toISOString(),
   };
-  writeFileSync(META_PATH, JSON.stringify(meta, null, 2) + '\n');
+  writeFileSync(META_PATH + '.tmp', JSON.stringify(meta, null, 2) + '\n');
+  renameSync(META_PATH + '.tmp', META_PATH);
 
   log('');
   log(`==================== CORPUS BUILT ====================`);

@@ -298,6 +298,14 @@ function runWorker(
     });
     let stdout = '';
     let killed = false;
+    // 'exit' fires when the process ends, but the stdout pipe may not have
+    // drained yet — reading `stdout` there can truncate/miss a valid
+    // __FIT_RESULT__ / __SMOKE_RESULT__ / __SWEEP_RESULT__ sentinel and discard
+    // an expensive fit. So capture the exit status here and only RESOLVE on
+    // 'close' (fires after ALL stdio streams have flushed → stdout is complete).
+    let exitCode: number | null = null;
+    let exitSignal: string | null = null;
+    let settled = false;
     child.stdout.on('data', (d: { toString(): string }) => {
       const s = d.toString();
       stdout += s;
@@ -316,7 +324,11 @@ function runWorker(
         }
       }, POLL_MS);
     }
-    child.on('exit', (code: number | null, signal: string | null) => {
+    // Single settle path: stop the poll timer + clean the job file + resolve
+    // ONCE, whichever of 'close'/'error' arrives first.
+    const finish = (code: number | null, signal: string | null): void => {
+      if (settled) return;
+      settled = true;
       if (timer) clearInterval(timer);
       try {
         rmSync(jobPath, { force: true });
@@ -324,7 +336,15 @@ function runWorker(
         /* ignore */
       }
       resolve({ code, signal, stdout, killed });
+    };
+    child.on('exit', (code: number | null, signal: string | null) => {
+      exitCode = code;
+      exitSignal = signal;
     });
+    child.on('close', () => finish(exitCode, exitSignal));
+    // A spawn failure never emits 'exit'/'close' — resolve cleanly (with a null
+    // status the callers already treat as failure) instead of hanging forever.
+    child.on('error', () => finish(exitCode, exitSignal));
   });
 }
 
@@ -380,6 +400,18 @@ async function runFitPhase(
     if (!scal) return false;
     if (scal.nDone > lastNDone) {
       // One (or more) new prompt(s) committed since last observation.
+      if (scal.nDone > lastNDone + 1) {
+        // Two+ commits landed between polls (or in the final catch-up). The
+        // checkpoint only stores the LATEST Jsum, so the intermediate prompts'
+        // snapshots are unrecoverable — this row's secPerPromptFit/meanRelChange
+        // is a MULTI-PROMPT delta, not per-prompt. Warn loudly (don't hard-fail
+        // mid-fit: the fit itself is fine, only the diagnostic series is coarse).
+        console.log(
+          `    [poll] WARNING: n_done jumped ${lastNDone} -> ${scal.nDone}; ` +
+            `snapshots for n_done ${lastNDone + 1}..${scal.nDone - 1} are UNRECOVERABLE ` +
+            `(checkpoint keeps only the latest Jsum) — the n_done=${scal.nDone} row is a multi-prompt delta`,
+        );
+      }
       const wallMs = Date.now();
       const snap = computeSnapshot(job.checkpointPath, scal.nDone, mtimeMs, wallMs, prevWallMs, conv);
       // Pure per-prompt fit time = checkpoint mtime delta from the previous save.
@@ -474,8 +506,27 @@ async function orchestrator(): Promise<void> {
     `[PHASE A] worker exited (killed=${phaseA.run.killed}, signal=${phaseA.run.signal}); ` +
       `checkpoint n_done=${afterKill.nDone} next_idx=${afterKill.nextIdx}`,
   );
-  if (afterKill.nDone < 1) fail(`Phase A committed no prompts (n_done=${afterKill.nDone}) — fit may be broken`);
   const killedNDone = afterKill.nDone;
+  // Resume proof is only genuine if Phase A REALLY crashed mid-fit with prompts
+  // left for Phase B to finish. Without these, a raced SIGKILL (worker finishes
+  // all 10 before the kill lands, or the poll misses the window) would let
+  // Phase B do 0 prompts and the `promptsThisRun === N_FIT - killedNDone` check
+  // degenerate to `0 !== 0` = false → a VACUOUS pass that proved nothing.
+  if (!phaseA.run.killed) {
+    fail(`Phase A worker was not killed (killed=false) — no crash to resume from; resume proof is vacuous`);
+  }
+  if (phaseA.run.signal !== 'SIGKILL') {
+    fail(`Phase A exit signal=${phaseA.run.signal} != SIGKILL — the SIGKILL never landed; resume proof is vacuous`);
+  }
+  if (killedNDone < KILL_AT) {
+    fail(`Phase A committed ${killedNDone} < KILL_AT=${KILL_AT} — kill raced ahead of the crash point; resume proof is vacuous`);
+  }
+  if (killedNDone >= N_FIT) {
+    fail(
+      `Phase A committed ${killedNDone} >= N_FIT=${N_FIT} — the worker finished ALL prompts before the kill landed, ` +
+        `so Phase B has nothing to resume; resume proof is vacuous`,
+    );
+  }
 
   // ---------- Corpus-mismatch resume MUST be rejected (T1.2 guard) ----------
   console.log(`\n[MISMATCH] resume same checkpoint with ONE flipped id -> expect clean rejection`);
@@ -536,6 +587,12 @@ async function orchestrator(): Promise<void> {
 
   // Resume assertions.
   if (resB.nDone !== N_FIT) fail(`final n_done=${resB.nDone} != ${N_FIT}`);
+  // Phase B must have actually resumed work — a fresh process that did 0 prompts
+  // proves nothing about cross-process resume (guards the vacuous `0 === 0` case
+  // together with the Phase-A `killedNDone < N_FIT` assertion above).
+  if (resB.promptsThisRun <= 0) {
+    fail(`Phase B promptsThisRun=${resB.promptsThisRun} <= 0 — the fresh process resumed NO work; resume proof is vacuous`);
+  }
   if (resB.promptsThisRun !== N_FIT - killedNDone) {
     fail(`Phase B promptsThisRun=${resB.promptsThisRun} != ${N_FIT - killedNDone} (resume skip broken)`);
   }
@@ -571,7 +628,11 @@ async function orchestrator(): Promise<void> {
   const smoke = parseSentinel<{
     loaded: number;
     jacobianApplied: boolean;
-    sameOrder: boolean;
+    // # of logit-lens top-K ids that the J-lens demotes OUT of its own top-K
+    // (J-lens full-vocab rank > K). >= 1 proves a real per-layer J moved the
+    // readout — robust to a single rank flip (unlike the old top-K-order proxy).
+    jDemotedLogitTop: number;
+    logitTopRanksUnderJ: number[];
     jIds: number[];
     jTexts: string[];
     lIds: number[];
@@ -593,12 +654,21 @@ async function orchestrator(): Promise<void> {
     if (smoke.loaded !== 23) smokeFail(`pack loaded ${smoke.loaded} Jacobians, expected 23`);
     if (!smoke.jacobianApplied) smokeFail(`jacobianApplied=false after loading a pack`);
     if (smoke.anyNaN) smokeFail(`J-lens readout produced NaN logits`);
-    if (smoke.sameOrder) smokeFail(`J-lens == logit lens at ℓ${SMOKE_LAYER} (J≈I, not doing anything)`);
+    if (!(smoke.jDemotedLogitTop >= 1)) {
+      smokeFail(
+        `J-lens demoted 0 of the logit-lens top-${SMOKE_TOPK} ids out of its top-${SMOKE_TOPK} at ℓ${SMOKE_LAYER} ` +
+          `(jDemotedLogitTop=${smoke.jDemotedLogitTop}) — J≈I, not doing anything`,
+      );
+    }
   }
   if (smokeOk && smoke) {
-    console.log(`[SMOKE] loaded=${smoke.loaded} jacobianApplied=${smoke.jacobianApplied} J!=logit  -> PASS`);
+    console.log(
+      `[SMOKE] loaded=${smoke.loaded} jacobianApplied=${smoke.jacobianApplied} ` +
+        `jDemotedLogitTop=${smoke.jDemotedLogitTop}/${SMOKE_TOPK} (J!=logit)  -> PASS`,
+    );
     console.log(`  J-lens ℓ${SMOKE_LAYER} top: [${smoke.jIds.slice(0, 5).join(', ')}] ("${smoke.jTexts.slice(0, 4).join('","')}")`);
     console.log(`  logit  ℓ${SMOKE_LAYER} top: [${smoke.lIds.slice(0, 5).join(', ')}] ("${smoke.lTexts.slice(0, 4).join('","')}")`);
+    console.log(`  logit-top-${SMOKE_TOPK} ranks under J: [${smoke.logitTopRanksUnderJ.join(', ')}] (rank>${SMOKE_TOPK} = demoted)`);
   } else {
     console.error(`[SMOKE] FAILED: ${smokeFailReason}  (the fit data below is still valid and will be written)`);
   }
@@ -619,6 +689,28 @@ async function orchestrator(): Promise<void> {
   const rels = perPrompt.filter((p) => p.meanRelChange != null).map((p) => p.meanRelChange as number);
   const convergesDown = rels.length >= 2 && rels[rels.length - 1] < rels[0];
 
+  // The per-prompt convergence series is LOAD-BEARING (secPerPromptFit +
+  // meanRelChange are read per-prompt). It is only trustworthy if it is exactly
+  // the contiguous run 1..N_FIT (one snapshot per committed prompt). A poll that
+  // missed a commit collapses two prompts into one row (see the [poll] jump
+  // WARNING) — surface that here as a non-fatal flag + a loud stderr warning so
+  // the corruption is visible, not silent. Exit stays governed by the smoke gate.
+  let convergenceContiguous = perPrompt.length === N_FIT;
+  for (let i = 0; i < perPrompt.length; i++) {
+    if (perPrompt[i].n_done !== i + 1) {
+      convergenceContiguous = false;
+      break;
+    }
+  }
+  if (!convergenceContiguous) {
+    console.error(
+      `[CONVERGENCE] WARNING: per-prompt n_done series is NOT contiguous 1..${N_FIT} ` +
+        `(len=${perPrompt.length}, got [${perPrompt.map((p) => p.n_done).join(',')}]); ` +
+        `rows spanning a poll gap are multi-prompt deltas — the convergence series is partially corrupted ` +
+        `(non-fatal; convergence.contiguous=false is recorded in the log).`,
+    );
+  }
+
   const log = {
     task: 'T1.3',
     generated_at: new Date().toISOString(),
@@ -638,6 +730,7 @@ async function orchestrator(): Promise<void> {
     convergence: {
       mean_rel_change_series: rels,
       trends_down: convergesDown,
+      contiguous: convergenceContiguous,
       note:
         'mean_rel_change = mean over J.1..J.23 of ||pack_n - pack_{n-1}||_F / (||pack_n||_F + 1e-12); ' +
         'running-mean pack -> ~1/n decay expected.',
@@ -749,25 +842,48 @@ async function worker(): Promise<void> {
     if (job.kind === 'smoke') {
       const loaded = await model.loadLensPackFromFile(job.packPath);
       const P = (job.promptIds as number[]).length;
-      const jro = await model.lensReadout(job.promptIds, { layers: [job.layer], topK: job.topK, useJacobian: true });
+      // 1) Logit lens FIRST (no Jacobian) — its top-K ids are the reference set.
       const lro = await model.lensReadout(job.promptIds, { layers: [job.layer], topK: job.topK, useJacobian: false });
-      const jCell = jro.cells.find((c: { position: number }) => c.position === P - 1);
       const lCell = lro.cells.find((c: { position: number }) => c.position === P - 1);
-      if (!jCell || !lCell) {
-        console.log('__WORKER_ERROR__ ' + JSON.stringify({ message: `no last-position cell at layer ${job.layer}` }));
+      if (!lCell) {
+        console.log('__WORKER_ERROR__ ' + JSON.stringify({ message: `no last-position logit cell at layer ${job.layer}` }));
+        process.exit(1);
+      }
+      const lIds: number[] = lCell.topKIds;
+      // 2) J lens, PINNING the logit-lens top-K ids so we get their J-lens
+      //    full-vocab ranks (pinnedIds is capped at LENS_MAX_PINNED=8; topK<=8).
+      const pinnedIds = lIds.slice(0, 8);
+      const jro = await model.lensReadout(job.promptIds, {
+        layers: [job.layer],
+        topK: job.topK,
+        pinnedIds,
+        useJacobian: true,
+      });
+      const jCellIdx = jro.cells.findIndex((c: { position: number }) => c.position === P - 1);
+      const jCell = jCellIdx >= 0 ? jro.cells[jCellIdx] : undefined;
+      if (!jCell) {
+        console.log('__WORKER_ERROR__ ' + JSON.stringify({ message: `no last-position J cell at layer ${job.layer}` }));
         process.exit(1);
       }
       const jLogits = Array.from(jCell.topKLogits as Float32Array);
       const anyNaN = jLogits.some((x) => !Number.isFinite(x));
       const jIds: number[] = jCell.topKIds;
-      const lIds: number[] = lCell.topKIds;
-      const sameOrder = jIds.length === lIds.length && jIds.every((v, i) => v === lIds[i]);
+      // `pinned[k].ranks` is aligned to `cells` (layer-major, position-minor);
+      // for our single requested layer the readout cell is at index jCellIdx.
+      // Count how many logit-lens top-K ids J demotes OUT of its own top-K
+      // (1-based full-vocab rank > K). A real per-layer J moves at least one.
+      const K = pinnedIds.length;
+      const logitTopRanksUnderJ: number[] = (jro.pinned as Array<{ ranks: Int32Array }>).map(
+        (p) => p.ranks[jCellIdx],
+      );
+      const jDemotedLogitTop = logitTopRanksUnderJ.filter((r) => r > K).length;
       console.log(
         '__SMOKE_RESULT__ ' +
           JSON.stringify({
             loaded,
             jacobianApplied: jro.jacobianApplied,
-            sameOrder,
+            jDemotedLogitTop,
+            logitTopRanksUnderJ,
             anyNaN,
             jIds,
             jTexts: jCell.topKTexts,
