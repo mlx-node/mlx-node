@@ -461,23 +461,7 @@ impl InspectorRecorder {
             )));
         }
 
-        let mut indexed: Vec<(u32, f32)> = buffer
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| (i as u32, v))
-            .collect();
-        indexed.select_nth_unstable_by(top_k - 1, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        indexed.truncate(top_k);
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut top_k_ids = Vec::with_capacity(top_k);
-        let mut top_k_logits = Vec::with_capacity(top_k);
-        for (id, logit) in indexed {
-            top_k_ids.push(id);
-            top_k_logits.push(logit);
-        }
+        let (top_k_ids, top_k_logits) = top_k_from_row(&buffer, top_k);
 
         self.logits.push(CapturedLogits {
             step,
@@ -629,6 +613,127 @@ impl InspectorRecorder {
 }
 
 // ============================================================================
+// Pure helpers shared by the inspector capture path and the `scoreTokens`
+// single-pass speculative-decode verify. Kept free of MxArray / model state
+// so they can be unit-tested without loaded weights.
+// ============================================================================
+
+/// Select the top-`top_k` `(token_id, logit)` pairs from one logits row,
+/// descending by logit.
+///
+/// Extracted verbatim from the original `capture_logits` body so the
+/// inspector's per-step capture and the `scoreTokens` verify path share one
+/// definition: O(vocab) partial select, then a full sort of the retained K.
+/// NaN-vs-number comparisons fall back to `Ordering::Equal`, matching the
+/// original behavior. `top_k` is clamped to `row.len()`; an empty row (or
+/// `top_k == 0`) yields empty outputs rather than panicking.
+pub fn top_k_from_row(row: &[f32], top_k: usize) -> (Vec<u32>, Vec<f32>) {
+    let top_k = top_k.min(row.len());
+    if top_k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut indexed: Vec<(u32, f32)> = row
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (i as u32, v))
+        .collect();
+    indexed.select_nth_unstable_by(top_k - 1, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    indexed.truncate(top_k);
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut top_k_ids = Vec::with_capacity(top_k);
+    let mut top_k_logits = Vec::with_capacity(top_k);
+    for (id, logit) in indexed {
+        top_k_ids.push(id);
+        top_k_logits.push(logit);
+    }
+    (top_k_ids, top_k_logits)
+}
+
+/// Per-row top-K over a flat row-major `[num_rows, vocab]` logits buffer.
+///
+/// Returns one `(top_k_ids, top_k_logits)` pair per row, in row order, with
+/// the same ordering semantics as [`top_k_from_row`]. `top_k` is clamped to
+/// `vocab`. Errors on shape mismatch instead of silently truncating so a bad
+/// device-side slice surfaces loudly.
+pub fn top_k_rows(
+    buffer: &[f32],
+    num_rows: usize,
+    vocab: usize,
+    top_k: usize,
+) -> Result<Vec<(Vec<u32>, Vec<f32>)>> {
+    if vocab == 0 {
+        return Err(Error::from_reason("top_k_rows: empty vocab"));
+    }
+    if top_k == 0 {
+        return Err(Error::from_reason("top_k_rows: top_k must be >= 1"));
+    }
+    if buffer.len() != num_rows * vocab {
+        return Err(Error::from_reason(format!(
+            "top_k_rows: got {} floats, expected {} ({} rows x {} vocab)",
+            buffer.len(),
+            num_rows * vocab,
+            num_rows,
+            vocab,
+        )));
+    }
+    let top_k = top_k.min(vocab);
+    let mut out = Vec::with_capacity(num_rows);
+    for r in 0..num_rows {
+        let row = &buffer[r * vocab..(r + 1) * vocab];
+        out.push(top_k_from_row(row, top_k));
+    }
+    Ok(out)
+}
+
+/// Row bounds (on the sequence axis) of the D verify positions inside the
+/// full-sequence `[1, T, vocab]` logits of a `[prefix + draft]` forced-token
+/// forward pass.
+///
+/// The logits row at sequence position `p` is the model's next-token
+/// distribution for position `p + 1`, so draft token `i` (0-based) is
+/// predicted by row `prefix_len - 1 + i`. The returned `(start, end)` is a
+/// half-open range suitable for `MxArray::slice_axis(1, start, end)`:
+/// `start = prefix_len - 1`, `end = start + draft_len`. The last row used is
+/// `prefix_len + draft_len - 2 == T - 2` — the `[1, T, vocab]` logits always
+/// cover the range (row `T - 1` predicts the token *after* the draft and is
+/// deliberately excluded).
+pub fn verify_logit_row_bounds(prefix_len: usize, draft_len: usize) -> Result<(i64, i64)> {
+    if prefix_len == 0 {
+        return Err(Error::from_reason(
+            "verify_logit_row_bounds: prefix must contain at least 1 token",
+        ));
+    }
+    if draft_len == 0 {
+        return Err(Error::from_reason(
+            "verify_logit_row_bounds: draft must contain at least 1 token",
+        ));
+    }
+    let start = prefix_len - 1;
+    Ok((start as i64, (start + draft_len) as i64))
+}
+
+/// Reference accept rule for the single-pass speculative-decode verify:
+/// `accept[i] ⇔ argmax_ids[i] == draft_ids[i]` (greedy / temp-0 only).
+///
+/// `argmax_ids[i]` is the greedy prediction at verify position `i` (i.e.
+/// `top_k_ids[0]` of row `prefix_len - 1 + i`). Returns the per-position
+/// flags without prefix-truncation — the standard speculative-decode
+/// "longest accepted prefix" is a caller-side fold over these flags. In
+/// production the JS consumer of `scoreTokens` computes this itself; the
+/// helper is kept here as the canonical, unit-tested definition.
+pub fn verify_accept_flags(argmax_ids: &[u32], draft_ids: &[u32]) -> Vec<bool> {
+    argmax_ids
+        .iter()
+        .zip(draft_ids.iter())
+        .map(|(a, d)| a == d)
+        .collect()
+}
+
+// ============================================================================
 // NAPI surface
 // ============================================================================
 
@@ -735,6 +840,54 @@ pub struct LogitsStepNapi {
     pub top_k_texts: Vec<String>,
 }
 
+/// Per-position payload for `scoreTokens` — the single-pass
+/// speculative-decode verify. Sibling of [`LogitsStepNapi`]: same top-K
+/// contract (ids descending by logit, raw pre-softmax f32 logits — the
+/// consumer softmaxes — plus decoded texts), but keyed by draft position
+/// instead of decode step.
+#[napi(object)]
+pub struct ScorePositionNapi {
+    /// 0-based draft index `i`. Entry `i` verifies `draft_ids[i]`.
+    pub index: i32,
+    /// Absolute sequence position of the logits row this entry was read
+    /// from: `prefix_len - 1 + index`. The next-token distribution at that
+    /// position is the model's prediction for `draft_ids[index]`.
+    pub position: i32,
+    /// Echo of `draft_ids[index]` — the token that was forced at this
+    /// position.
+    pub draft_token_id: i32,
+    /// Greedy / temp-0 prediction at this position. Always equals
+    /// `top_k_ids[0]` (host-side descending sort, ties broken by the sort —
+    /// deterministic for a given logits buffer). The accept rule — computed
+    /// by the CALLER, not here — is `argmax_token_id == draft_token_id`.
+    pub argmax_token_id: i32,
+    /// Top-K token ids at this position, descending by logit.
+    pub top_k_ids: Vec<i32>,
+    /// Raw (pre-softmax) logits matching `top_k_ids`, same order. NOT
+    /// softmax probabilities — same contract as `LogitsStepNapi`.
+    pub top_k_logits: Float32Array,
+    /// Decoded text fragment for each id in `top_k_ids`.
+    pub top_k_texts: Vec<String>,
+}
+
+/// Result of a `scoreTokens` single-pass forced-token verify. One forward
+/// pass over `[prefix + draft]`, per-position top-K logits for exactly the
+/// D draft positions. Caches are fully reset before the call returns
+/// (single-shot, no persistent session — the hybrid GDN layers make cache
+/// rewind unsafe, so the full reset mirrors `runForInspector`).
+#[napi(object)]
+pub struct ScoreTokensResult {
+    /// Echo of the request's prefix length in tokens.
+    pub prefix_len: u32,
+    /// Echo of the request's draft length D (`1 ..= 8`).
+    pub draft_len: u32,
+    /// Effective top-K after clamping: `min(requested, 64, vocab)`.
+    pub top_k: u32,
+    /// One entry per draft position, index-aligned with the request's
+    /// `draft_ids` (length == `draft_len`).
+    pub positions: Vec<ScorePositionNapi>,
+}
+
 /// Summary stats for a single capture point. Matches `HiddenStatePointStats`
 /// in inspector-types.ts.
 ///
@@ -820,3 +973,19 @@ pub struct AttentionRunNapi {
 /// case memory if someone requests attention capture on a long sequence.
 /// Refer to the module-level docs for the per-layer cost.
 pub const INSPECTOR_MAX_NEW_TOKENS_CAP: i32 = 64;
+
+/// Hard cap on the number of forced draft tokens (`D`) per `scoreTokens`
+/// verify call. Speculative-decode drafts beyond ~8 tokens have vanishing
+/// acceptance probability, and the cap bounds the host-side logits copy at
+/// `8 * vocab * 4` bytes (~4.8 MiB for Qwen3.5's ~151k vocab).
+pub const SCORE_TOKENS_MAX_DRAFT: usize = 8;
+
+/// Cap on the requested top-K for `scoreTokens`, mirroring the inspector's
+/// "top_k ≤ 64" convention (see [`InspectorRecorder::capture_logits`] — the
+/// O(vocab) host-side partial sort is sized for K in that range).
+///
+/// Unit tests for the pure verify helpers above live in
+/// `crates/mlx-core/tests/score_tokens_verify.rs` (an integration test:
+/// this branch's in-crate `#[cfg(test)]` target has pre-existing unrelated
+/// breakage, and the helpers are `pub` anyway).
+pub const SCORE_TOKENS_TOP_K_CAP: u32 = 64;

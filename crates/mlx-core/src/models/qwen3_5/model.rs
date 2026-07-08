@@ -12,7 +12,9 @@ use crate::array::MxArray;
 use crate::chat_stream::{ChatStreamSink, MIN_SAB_LEN, SabSink};
 use crate::inspector::{
     AttentionLayerNapi, AttentionRunNapi, INSPECTOR_MAX_NEW_TOKENS_CAP, InspectorRecorder,
-    InspectorRunOptions, LogitsStepNapi, ModelMetaNapi, TokenInfoNapi,
+    InspectorRunOptions, LogitsStepNapi, ModelMetaNapi, SCORE_TOKENS_MAX_DRAFT,
+    SCORE_TOKENS_TOP_K_CAP, ScorePositionNapi, ScoreTokensResult, TokenInfoNapi, top_k_rows,
+    verify_logit_row_bounds,
 };
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -412,6 +414,16 @@ pub(crate) enum Qwen35Cmd {
         opts: InspectorRunOptions,
         reply: ResponseTx<AttentionRunNapi>,
     },
+    /// Single-pass speculative-decode verify: ONE forward over
+    /// `[prefix + draft]` with the draft tokens forced as inputs, returning
+    /// per-position top-K logits for the D draft positions. See
+    /// [`Qwen35Inner::score_tokens_sync`] for semantics.
+    ScoreTokens {
+        prefix_ids: Vec<u32>,
+        draft_ids: Vec<u32>,
+        top_k: u32,
+        reply: ResponseTx<ScoreTokensResult>,
+    },
     /// Look up embedding rows for a list of token ids. Used by the
     /// education app's Embeddings chapter (chapter 2) to build a PCA
     /// scatter of the model's actual embedding matrix. See
@@ -673,6 +685,14 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.run_for_inspector_sync(prompt, opts));
+        }
+        Qwen35Cmd::ScoreTokens {
+            prefix_ids,
+            draft_ids,
+            top_k,
+            reply,
+        } => {
+            let _ = reply.send(inner.score_tokens_sync(prefix_ids, draft_ids, top_k));
         }
         Qwen35Cmd::EmbedTokens { token_ids, reply } => {
             let _ = reply.send(inner.embed_tokens_sync(token_ids));
@@ -5834,6 +5854,162 @@ impl Qwen35Inner {
         })
     }
 
+    /// Single-pass speculative-decode verify ("scoreTokens").
+    ///
+    /// Runs ONE forward pass over the concatenated `[1, prefix_len + D]`
+    /// token sequence with the D draft tokens forced as inputs (no sampling
+    /// loop), then surfaces the per-position logits that the chat / generate
+    /// paths discard: the full-sequence `[1, T, vocab]` prefill output is
+    /// sliced to the D verify rows (`prefix_len - 1 + i` predicts
+    /// `draft_ids[i]` — see [`crate::inspector::verify_logit_row_bounds`])
+    /// instead of just the last position.
+    ///
+    /// Structurally a sibling of [`Self::run_for_inspector_sync`]:
+    ///   - Same single un-chunked forward (`forward_inner`, minus the
+    ///     recorder — nothing per-layer is captured here).
+    ///   - Same greedy / temp-0 contract: `argmax_token_id` per position is
+    ///     `top_k_ids[0]` of the host-side descending sort, the same top-K
+    ///     selection `InspectorRecorder::capture_logits` uses.
+    ///   - Same one-shot cache discipline: `init_caches_sync` before the
+    ///     forward, `reset_caches_sync` before returning (success or error).
+    ///     The hybrid GDN layers make cache rewind unsafe, so a full reset —
+    ///     not a rewind — is the correct existing pattern.
+    ///
+    /// Accept semantics are computed by the CALLER, not here:
+    /// `accept[i] ⇔ argmax(position i) == draft_ids[i]` (the canonical
+    /// definition lives in `crate::inspector::verify_accept_flags`).
+    pub(crate) fn score_tokens_sync(
+        &mut self,
+        prefix_ids: Vec<u32>,
+        draft_ids: Vec<u32>,
+        top_k: u32,
+    ) -> Result<ScoreTokensResult> {
+        if prefix_ids.is_empty() {
+            return Err(Error::from_reason(
+                "score_tokens: prefix_ids must contain at least 1 token",
+            ));
+        }
+        if draft_ids.is_empty() {
+            return Err(Error::from_reason(
+                "score_tokens: draft_ids must contain at least 1 token",
+            ));
+        }
+        if draft_ids.len() > SCORE_TOKENS_MAX_DRAFT {
+            return Err(Error::from_reason(format!(
+                "score_tokens: draft_ids supports at most {} tokens, got {}",
+                SCORE_TOKENS_MAX_DRAFT,
+                draft_ids.len()
+            )));
+        }
+        if top_k == 0 {
+            return Err(Error::from_reason("score_tokens: top_k must be >= 1"));
+        }
+        if self.config.vocab_size <= 0 {
+            return Err(Error::from_reason(format!(
+                "score_tokens: invalid vocab_size {} in model config",
+                self.config.vocab_size
+            )));
+        }
+        let vocab = self.config.vocab_size as usize;
+        for &id in prefix_ids.iter().chain(draft_ids.iter()) {
+            if id as usize >= vocab {
+                return Err(Error::from_reason(format!(
+                    "score_tokens: token id {} out of range for vocab {}",
+                    id, vocab
+                )));
+            }
+        }
+        let top_k = (top_k.min(SCORE_TOKENS_TOP_K_CAP) as usize).min(vocab);
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?
+            .clone();
+
+        let prefix_len = prefix_ids.len();
+        let draft_len = draft_ids.len();
+        let mut all_ids: Vec<u32> = Vec::with_capacity(prefix_len + draft_len);
+        all_ids.extend_from_slice(&prefix_ids);
+        all_ids.extend_from_slice(&draft_ids);
+        let total_len = all_ids.len();
+        let input = MxArray::from_uint32(&all_ids, &[1, total_len as i64])?;
+
+        self.init_caches_sync()?;
+        let embedding_weight = self.embedding.get_weight();
+        let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        // Forward once and pull only the D verify rows to host: slicing on
+        // device first keeps the copy at `D * vocab * 4` bytes (≤ ~4.8 MiB
+        // for D = 8) instead of the full `T * vocab * 4`. Wrapped in an
+        // immediately-invoked closure so the cache reset below runs on the
+        // error paths too — this call is single-shot by contract.
+        let forward_result: Result<Vec<f32>> = (|| {
+            let logits = {
+                let _stream_ctx = StreamContext::new(generation_stream);
+                forward_inner(
+                    &input,
+                    &embedding_weight,
+                    &mut self.layers,
+                    &mut self.caches,
+                    &self.final_norm,
+                    &self.lm_head,
+                    Some(&embedding_weight_t),
+                )?
+            };
+            let seq_len = logits.shape_at(1)?;
+            if seq_len != total_len as i64 {
+                return Err(Error::from_reason(format!(
+                    "score_tokens: forward returned seq_len {} for {} input tokens",
+                    seq_len, total_len
+                )));
+            }
+            let (row_start, row_end) = verify_logit_row_bounds(prefix_len, draft_len)?;
+            let rows = logits.slice_axis(1, row_start, row_end)?;
+            let rows_f32 = rows.astype(crate::array::DType::Float32)?;
+            rows_f32.eval();
+            rows_f32.to_float32_vec()
+        })();
+
+        // Always reset caches — single-shot call, no persistent session.
+        // Mirrors the end of `run_for_inspector_sync`.
+        self.reset_caches_sync()?;
+        let buffer = forward_result?;
+
+        let per_row = top_k_rows(&buffer, draft_len, vocab, top_k)?;
+
+        let mut positions: Vec<ScorePositionNapi> = Vec::with_capacity(draft_len);
+        for (i, (ids, logit_values)) in per_row.into_iter().enumerate() {
+            let argmax_id = *ids.first().ok_or_else(|| {
+                Error::from_reason("score_tokens: empty top-K row (unreachable: top_k >= 1)")
+            })?;
+            let mut top_k_texts: Vec<String> = Vec::with_capacity(ids.len());
+            for &id in &ids {
+                let text = tokenizer
+                    .decode_sync(&[id], false)
+                    .unwrap_or_else(|_| String::new());
+                top_k_texts.push(text);
+            }
+            positions.push(ScorePositionNapi {
+                index: i as i32,
+                position: (prefix_len - 1 + i) as i32,
+                draft_token_id: draft_ids[i] as i32,
+                argmax_token_id: argmax_id as i32,
+                top_k_ids: ids.into_iter().map(|v| v as i32).collect(),
+                top_k_logits: Float32Array::new(logit_values),
+                top_k_texts,
+            });
+        }
+
+        Ok(ScoreTokensResult {
+            prefix_len: prefix_len as u32,
+            draft_len: draft_len as u32,
+            top_k: top_k as u32,
+            positions,
+        })
+    }
+
     /// Look up embedding rows for a list of token ids and return the flat
     /// row-major buffer of shape `[token_ids.len(), hidden_size]`.
     ///
@@ -7515,6 +7691,39 @@ impl Qwen3_5Model {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::RunForInspector {
             prompt,
             opts,
+            reply,
+        })
+        .await
+    }
+
+    /// Single-pass speculative-decode verify for the education-app
+    /// "single-pass MTP verify" widget.
+    ///
+    /// Runs ONE forward pass over `[prefixIds + draftIds]` with the draft
+    /// tokens forced as inputs (no sampling loop) and returns, for each of
+    /// the D draft positions, the top-K token ids, raw pre-softmax f32
+    /// logits (consumer softmaxes — same contract as the inspector's
+    /// `LogitsStepNapi`), decoded texts, and the greedy argmax id. Position
+    /// `prefixLen - 1 + i` predicts `draftIds[i]`. Accept semantics are
+    /// computed by the caller: `accept[i] ⇔ argmaxTokenId == draftTokenId`.
+    ///
+    /// Constraints: `1 <= draftIds.length <= 8`, `topK >= 1` (clamped to
+    /// `min(topK, 64, vocab)`), every id must be `< vocab`. Single-shot:
+    /// caches are fully reset before the call returns (the hybrid GDN
+    /// layers make cache rewind unsafe), exactly like `runForInspector`.
+    /// The chat / `generate` hot paths are unaffected — this goes through
+    /// its own command on the model thread.
+    #[napi]
+    pub async fn score_tokens(
+        &self,
+        prefix_ids: Vec<u32>,
+        draft_ids: Vec<u32>,
+        top_k: u32,
+    ) -> Result<ScoreTokensResult> {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::ScoreTokens {
+            prefix_ids,
+            draft_ids,
+            top_k,
             reply,
         })
         .await

@@ -564,6 +564,26 @@ export declare class Qwen35Model {
    */
   runForInspector(prompt: string, opts: InspectorRunOptions): Promise<AttentionRunNapi>;
   /**
+   * Single-pass speculative-decode verify for the education-app
+   * "single-pass MTP verify" widget.
+   *
+   * Runs ONE forward pass over `[prefixIds + draftIds]` with the draft
+   * tokens forced as inputs (no sampling loop) and returns, for each of
+   * the D draft positions, the top-K token ids, raw pre-softmax f32
+   * logits (consumer softmaxes — same contract as the inspector's
+   * `LogitsStepNapi`), decoded texts, and the greedy argmax id. Position
+   * `prefixLen - 1 + i` predicts `draftIds[i]`. Accept semantics are
+   * computed by the caller: `accept[i] ⇔ argmaxTokenId == draftTokenId`.
+   *
+   * Constraints: `1 <= draftIds.length <= 8`, `topK >= 1` (clamped to
+   * `min(topK, 64, vocab)`), every id must be `< vocab`. Single-shot:
+   * caches are fully reset before the call returns (the hybrid GDN
+   * layers make cache rewind unsafe), exactly like `runForInspector`.
+   * The chat / `generate` hot paths are unaffected — this goes through
+   * its own command on the model thread.
+   */
+  scoreTokens(prefixIds: Array<number>, draftIds: Array<number>, topK: number): Promise<ScoreTokensResult>;
+  /**
    * Look up embedding rows for a list of token ids.
    *
    * Returns a flat row-major `[token_ids.length, hidden_dim]` Float32Array
@@ -2591,6 +2611,66 @@ export interface SamplingConfig {
   topP?: number;
   /** Minimum probability threshold relative to max (min-p sampling). 0 = disabled */
   minP?: number;
+}
+
+/**
+ * Per-position payload for `scoreTokens` — the single-pass
+ * speculative-decode verify. Sibling of [`LogitsStepNapi`]: same top-K
+ * contract (ids descending by logit, raw pre-softmax f32 logits — the
+ * consumer softmaxes — plus decoded texts), but keyed by draft position
+ * instead of decode step.
+ */
+export interface ScorePositionNapi {
+  /** 0-based draft index `i`. Entry `i` verifies `draft_ids[i]`. */
+  index: number;
+  /**
+   * Absolute sequence position of the logits row this entry was read
+   * from: `prefix_len - 1 + index`. The next-token distribution at that
+   * position is the model's prediction for `draft_ids[index]`.
+   */
+  position: number;
+  /**
+   * Echo of `draft_ids[index]` — the token that was forced at this
+   * position.
+   */
+  draftTokenId: number;
+  /**
+   * Greedy / temp-0 prediction at this position. Always equals
+   * `top_k_ids[0]` (host-side descending sort, ties broken by the sort —
+   * deterministic for a given logits buffer). The accept rule — computed
+   * by the CALLER, not here — is `argmax_token_id == draft_token_id`.
+   */
+  argmaxTokenId: number;
+  /** Top-K token ids at this position, descending by logit. */
+  topKIds: Array<number>;
+  /**
+   * Raw (pre-softmax) logits matching `top_k_ids`, same order. NOT
+   * softmax probabilities — same contract as `LogitsStepNapi`.
+   */
+  topKLogits: Float32Array;
+  /** Decoded text fragment for each id in `top_k_ids`. */
+  topKTexts: Array<string>;
+}
+
+/**
+ * Result of a `scoreTokens` single-pass forced-token verify. One forward
+ * pass over `[prefix + draft]`, per-position top-K logits for exactly the
+ * D draft positions. Caches are fully reset before the call returns
+ * (single-shot, no persistent session — the hybrid GDN layers make cache
+ * rewind unsafe, so the full reset mirrors `runForInspector`).
+ */
+export interface ScoreTokensResult {
+  /** Echo of the request's prefix length in tokens. */
+  prefixLen: number;
+  /** Echo of the request's draft length D (`1 ..= 8`). */
+  draftLen: number;
+  /** Effective top-K after clamping: `min(requested, 64, vocab)`. */
+  topK: number;
+  /**
+   * One entry per draft position, index-aligned with the request's
+   * `draft_ids` (length == `draft_len`).
+   */
+  positions: Array<ScorePositionNapi>;
 }
 
 /** A table structure */
