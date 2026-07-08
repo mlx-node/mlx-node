@@ -59,7 +59,7 @@ mod tests {
         const MANT_BITS: i32 = 3;
         const E_MIN: i32 = 1 - BIAS; // -6: smallest normal (unbiased) exponent
         if v == 0.0 {
-            return 0.0;
+            return v; // preserve the sign bit: -0.0 -> -0.0, +0.0 -> +0.0
         }
         let sign = if v < 0.0 { -1.0f32 } else { 1.0f32 };
         let a = v.abs() as f64;
@@ -109,5 +109,36 @@ mod tests {
             .as_ref()
             .to_vec();
         assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn e4m3_oracle_preserves_signed_zero() {
+        // The zero early-return must carry the sign bit through: -0.0 -> -0.0,
+        // +0.0 -> +0.0 (Rust `-0.0 == 0.0`, so a bare `0.0` return would flip
+        // negative zero to positive and break the "sign preserving" contract).
+        assert!(e4m3_round(-0.0).is_sign_negative());
+        assert!(e4m3_round(0.0).is_sign_positive());
+    }
+
+    #[test]
+    fn e4m3_oracle_saturates_above_max() {
+        // Finite over-range magnitudes clamp to the E4M3 finite max ±448 ...
+        assert_eq!(e4m3_round(600.0), 448.0);
+        assert_eq!(e4m3_round(-600.0), -448.0);
+        // ... and so do the infinities: the `q > E4M3_MAX` clamp saturates
+        // them to ±448 (no NaN produced), matching the verified oracle.
+        assert_eq!(e4m3_round(f32::INFINITY), 448.0);
+        assert_eq!(e4m3_round(f32::NEG_INFINITY), -448.0);
+    }
+
+    #[test]
+    fn e4m3_oracle_rounds_ties_to_even() {
+        // In the [256, 512) binade the E4M3 grid step is 2^(8-3) = 32
+        // (grid: 256, 288, 320, ...). Exact midpoints must round to the even
+        // multiple of the step, not half-away-from-zero.
+        // 272.0 is the midpoint of 256 (=8*32, even) and 288 (=9*32, odd) -> 256.
+        assert_eq!(e4m3_round(272.0), 256.0);
+        // 304.0 is the midpoint of 288 (=9*32, odd) and 320 (=10*32, even) -> 320.
+        assert_eq!(e4m3_round(304.0), 320.0);
     }
 }
