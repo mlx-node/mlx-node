@@ -522,7 +522,11 @@ fn apply_weights_moe_inner(
         // int8 STORAGE with non-sym8 metadata = config drift — fail loud
         // before the int8 tensor can flow into the affine/mxfp builders.
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "qwen3_5_moe")?;
-        Ok(match plq.mode {
+        // Result<Option<..>>: `Ok(None)` = "prefix not quantized, fall back
+        // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
+        // layer must never silently fall back, see
+        // `try_build_sym8_quantized_linear`).
+        let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
@@ -530,7 +534,13 @@ fn apply_weights_moe_inner(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        })
+        };
+        // Thread the per-tensor FP8 activation scale from the resolved
+        // per-layer quant record onto the built projection — mirrors the dense
+        // qwen3_5 loader. Only calibrated mxfp8 attention/GDN overrides carry a
+        // `Some` amax in config (nvidia recipe activation-fp8 sites); every
+        // other layer stays `None`, so forward behaviour is unchanged here.
+        Ok(built.map(|ql| ql.with_input_amax(plq.input_amax)))
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>,
@@ -2180,6 +2190,97 @@ mod tests {
                     attn.get_q_proj_weight().dtype().unwrap(),
                     DType::Int8,
                     "q_proj must install the raw int8 sym8 backend, not affine-packed Uint32"
+                );
+            }
+            AttentionType::Linear(_) => {
+                panic!("tiny_sym8_moe_cfg (full_attention_interval=1) must assign Full attention")
+            }
+        }
+    }
+
+    /// RED-first regression guard for the MoE activation-fp8 plumbing gap: the
+    /// MoE loader's `try_build_ql` must thread the resolved
+    /// `PerLayerQuant::input_amax` onto the built attention `QuantizedLinear`,
+    /// exactly like the dense qwen3_5 loader (`persistence.rs` ~:970). Before
+    /// the fix `try_build_ql` returned the raw builder result (amax dropped),
+    /// so a MoE (agentworld-style) nvidia checkpoint with a calibrated
+    /// per-tensor `input_amax` on `self_attn.q_proj` silently loaded it as
+    /// `None`. Drives the real `apply_weights_moe_inner` loader seam (which
+    /// installs q_proj via `try_build_ql` + `set_quantized_q_proj`) and reads
+    /// the amax back off the loaded attention block. This assertion is RED on
+    /// the unfixed closure (observes `None`) and GREEN once the amax is
+    /// threaded (observes `Some(AMAX)`).
+    #[test]
+    fn mxfp8_attention_q_proj_threads_input_amax_through_moe_loader() {
+        const AMAX: f32 = 37.5;
+        let config = tiny_sym8_moe_cfg();
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        // Minimal in-memory mxfp8 q_proj group: packed fp8 weight (Uint8) +
+        // E8M0 Uint8 scales. `try_build_mxfp8_quantized_linear` only clones
+        // weight/scales into a QuantizedLinear (no load-time eval/kernel), so
+        // arbitrary bytes and the [64,64] / [64,2] shapes are load-inert.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 64], &[8, 64]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64], &[64]).expect("final_norm"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 64 * 64], &[64, 64])
+                .expect("q_proj weight")
+                .astype(DType::Uint8)
+                .expect("astype uint8 weight"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.scales".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 64 * 2], &[64, 2])
+                .expect("q_proj scales")
+                .astype(DType::Uint8)
+                .expect("astype uint8 scales"),
+        );
+        // Satisfies the loader's per-layer has_mlp completeness gate.
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 64], &[4, 64]).expect("gate"),
+        );
+
+        // The calibrated activation-fp8 override that must survive the load.
+        let mut per_layer_quant = HashMap::new();
+        per_layer_quant.insert(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: 8,
+                group_size: 32,
+                mode: PerLayerMode::Mxfp8,
+                input_amax: Some(AMAX),
+            },
+        );
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("mxfp8 q_proj MoE checkpoint must load");
+
+        match &inner.layers[0].attn {
+            AttentionType::Full(attn) => {
+                assert_eq!(
+                    attn.q_proj_input_amax(),
+                    Some(AMAX),
+                    "MoE loader must thread PerLayerQuant::input_amax onto the built q_proj \
+                     QuantizedLinear (was dropped before the try_build_ql fix)"
                 );
             }
             AttentionType::Linear(_) => {

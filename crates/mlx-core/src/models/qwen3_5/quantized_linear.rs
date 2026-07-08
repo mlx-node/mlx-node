@@ -93,6 +93,18 @@ impl LinearProj {
     pub fn is_quantized(&self) -> bool {
         matches!(self, LinearProj::Quantized(_))
     }
+
+    /// The per-tensor FP8 activation scale threaded onto the quantized backend
+    /// at load time (`None` for a dense projection). Test-only read-back seam
+    /// used to prove the loaders thread `PerLayerQuant::input_amax` onto the
+    /// built `QuantizedLinear`.
+    #[cfg(test)]
+    pub(crate) fn input_amax(&self) -> Option<f32> {
+        match self {
+            LinearProj::Standard(_) => None,
+            LinearProj::Quantized(ql) => ql.input_amax(),
+        }
+    }
 }
 
 /// An MLP that can be either standard or quantized.

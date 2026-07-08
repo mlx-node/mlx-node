@@ -329,6 +329,11 @@ impl Qwen3_5MoeMTPModule {
         let plq_for = |prefix: &str| -> PerLayerQuant {
             effective_plq_for(prefix, per_layer_quant, default_plq, Some(default_gate_plq))
         };
+        // Unlike the body loader's `try_build_ql`, this deliberately does NOT
+        // thread `plq.input_amax` onto the built projection: the nvidia
+        // activation-fp8 recipe keeps the MTP head Skip/bf16 (never an
+        // activation-fp8 site), so a calibrated per-tensor amax is never
+        // recorded for an `mtp.*` prefix — the threading would be a no-op here.
         let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
             let plq = plq_for(prefix);
             match plq.mode {

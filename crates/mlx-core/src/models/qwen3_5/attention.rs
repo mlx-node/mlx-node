@@ -876,6 +876,15 @@ impl Qwen3_5Attention {
             || self.v_proj.is_quantized()
             || self.o_proj.is_quantized()
     }
+
+    /// The per-tensor FP8 activation scale threaded onto the q_proj quantized
+    /// backend at load time. Test-only read-back seam: proves a loader carried
+    /// `PerLayerQuant::input_amax` from config through to the built
+    /// `QuantizedLinear` on this attention block.
+    #[cfg(test)]
+    pub(crate) fn q_proj_input_amax(&self) -> Option<f32> {
+        self.q_proj.input_amax()
+    }
 }
 
 #[cfg(test)]
