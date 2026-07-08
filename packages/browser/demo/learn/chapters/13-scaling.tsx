@@ -2,9 +2,11 @@ import * as React from 'react';
 
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { GradClipDemo } from '../widgets/GradClipDemo';
 import { LrScheduleViz } from '../widgets/LrScheduleViz';
+import { ScaleLadder } from '../widgets/ScaleLadder';
 import { WarmupLossCurve } from '../widgets/WarmupLossCurve';
 
 /**
@@ -146,6 +148,29 @@ export function ScalingChapterBody() {
           every modern training run uses all of them.
         </p>
 
+        <p>
+          First, what does &ldquo;scale&rdquo; even mean here? The word in the title is a parameter count. A straight
+          line <code>y = a·x + b</code> has two. This model has nearly a billion. GPT-3 (2020) already reached
+          hundreds of billions — and the largest research models today are well into the trillions. The ladder below
+          puts all of them on one log axis so the gulf is legible — and so it is honest about where this model
+          actually sits.
+        </p>
+
+        <ScaleLadder
+          renderLink={(slug, text) => <ChapterLink chapterId={slug}>{text}</ChapterLink>}
+        />
+
+        <p>
+          Before the tricks, one precondition the whole scaling story rests on: transformers are <em>worth</em> scaling
+          because their training compute is almost entirely matrix multiplication over every position at once. An RNN
+          must finish token <em>i</em> before it can touch token <em>i+1</em>; a transformer processes the whole
+          sequence in one parallel pass — the <ChapterLink chapterId="attention">causal mask</ChapterLink> is what keeps
+          that pass honest — and giant batched matmuls are exactly the workload GPUs are built for. (Our model's
+          GatedDeltaNet layers do run token-by-token at decode time; the parallelism win is about training and prefill.)
+          That's the real purchase the architecture made: not any single clever behavior, but computation cheap enough
+          to scale until clever behavior emerges.
+        </p>
+
         <h2>The optimizer: AdamW, not SGD</h2>
         <p>
           Plain stochastic gradient descent (<code>θ := θ - η·g</code> — nudge each weight <code>θ</code> against its
@@ -153,10 +178,13 @@ export function ScalingChapterBody() {
           Different parameters see gradients of wildly different magnitudes — a single global step size is either too
           big for the loud parameters or too small for the quiet ones. <strong>Adam</strong> tracks per-parameter
           running averages of <code>g</code> and <code>g²</code>, then takes a step normalized by <code>√g²</code>, so
-          each parameter's step is rescaled by its <em>own</em> gradient history rather than one shared rate. <strong>AdamW</strong> adds{' '}
-          <em>decoupled weight decay</em>: instead of penalising <code>||θ||²</code> through the loss, the optimizer
-          subtracts a small fraction of <code>θ</code> from itself at every step. This is the standard recipe for every
-          modern LLM pretrain.
+          each parameter's step is rescaled by its <em>own</em> gradient history rather than one shared rate. A
+          &ldquo;running average&rdquo; (the paper calls them <em>moments</em>) is nothing fancy:{' '}
+          <code>avg ← 0.9·avg + 0.1·g</code> — keep 90% of yesterday's estimate, blend in 10% of the new gradient.{' '}
+          <strong>AdamW</strong> adds <em>decoupled weight decay</em>: instead of penalising <code>||θ||²</code> through
+          the loss, the optimizer subtracts a small fraction of <code>θ</code> from itself at every step. Why pull
+          weights toward zero at all? Big weights let one feature shout over everything; keeping them small forces the
+          model to spread its evidence across many features. This is the standard recipe for every modern LLM pretrain.
         </p>
 
         <h2>The learning-rate schedule: warmup + cosine</h2>
@@ -234,6 +262,12 @@ batch_size:  4M tokens (gradient accumulation across many devices)
 seq_len:     8192
 total_steps: 500,000`}
         </pre>
+        <p>
+          Two of those numbers are worth multiplying out. A &ldquo;4M-token batch&rdquo; is{' '}
+          <code>512 sequences × 8,192 tokens = 4,194,304 ≈ 4M</code> tokens per optimizer step. And the whole run is{' '}
+          <code>4M × 500,000 steps ≈ 2 trillion tokens</code> — those are the &ldquo;trillions&rdquo; the training
+          chapter kept mentioning.
+        </p>
         <p>The less-obvious knobs in that block, in plain terms:</p>
         <ul>
           <li>

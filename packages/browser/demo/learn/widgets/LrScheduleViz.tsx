@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 13 (Scaling) supplement — visualize a learning-rate schedule.
  *
@@ -18,9 +20,66 @@ import * as React from 'react';
 const TOTAL_STEPS = 10_000;
 const LR_MIN = 1e-5;
 
+// Per-locale copy — every user-visible English string moved here verbatim.
+// LR values (3e-4, 1e-5…) and identifiers (lr_max) stay as-is in both locales.
+const COPY = {
+  en: {
+    title: 'Learning-rate schedule — linear warmup + cosine decay',
+    intro: (
+      <>
+        The standard recipe: linear warmup for ~10% of steps from <code>0</code> to <code>lr_max</code>, then cosine
+        decay down to ~<code>1e-5</code>. The warmup keeps early gradients from blowing up while the optimizer's moving
+        averages haven't filled in yet; the decay lets late training settle into a low-loss plateau.
+      </>
+    ),
+    svgAria: 'Learning-rate schedule',
+    xAxis: 'training step',
+    yAxis: 'learning rate',
+    warmupRegion: 'warmup',
+    cosineRegion: 'cosine decay',
+    peakLabel: 'peak LR (lr_max)',
+    warmupLabel: (pct: string) => `warmup steps (${pct}% of total)`,
+    cursorLabel: 'step cursor',
+    cursorReadout: (step: string, lr: string) => `step ${step} · lr = ${lr}`,
+    footer: (
+      <>
+        Slide warmup to 0 and watch the curve start at <code>lr_max</code> — that's what happens without warmup. Slide
+        the peak LR much higher (e.g. <code>1e-3</code>) and you can see why early training would diverge without
+        gradient clipping: <em>any</em> large step on a fresh model takes the weights somewhere they can't recover from.
+      </>
+    ),
+  },
+  zh: {
+    title: '学习率调度——线性预热 + 余弦衰减',
+    intro: (
+      <>
+        标准配方：最初约 10% 的步数里从 <code>0</code> 线性预热到 <code>lr_max</code>，随后余弦衰减到约{' '}
+        <code>1e-5</code>。预热让早期梯度不至于在优化器的滑动平均尚未积累时爆掉；衰减让训练后期安顿在一个低损失的平台上。
+      </>
+    ),
+    svgAria: '学习率调度',
+    xAxis: '训练步',
+    yAxis: '学习率',
+    warmupRegion: '预热',
+    cosineRegion: '余弦衰减',
+    peakLabel: '峰值学习率（lr_max）',
+    warmupLabel: (pct: string) => `预热步数（占总步数 ${pct}%）`,
+    cursorLabel: '步数游标',
+    cursorReadout: (step: string, lr: string) => `第 ${step} 步 · lr = ${lr}`,
+    footer: (
+      <>
+        把预热拉到 0，看曲线直接从 <code>lr_max</code> 起步——这就是没有预热时发生的事。把峰值学习率调得更高（例如{' '}
+        <code>1e-3</code>），你就能看出为什么没有梯度裁剪时训练初期会发散：在一个全新的模型上，<em>任何</em>
+        一记大步都会把权重带到无法恢复的地方。
+      </>
+    ),
+  },
+} as const;
+
 export function LrScheduleViz() {
+  const copy = COPY[useLocale()];
   const [lrMax, setLrMax] = React.useState(3e-4);
-  const [warmupSteps, setWarmupSteps] = React.useState(2_000);
+  const [warmupSteps, setWarmupSteps] = React.useState(1_000);
   const [cursor, setCursor] = React.useState(2_500);
 
   function lrAt(step: number): number {
@@ -61,17 +120,11 @@ export function LrScheduleViz() {
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">
-        Learning-rate schedule — linear warmup + cosine decay
-      </div>
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
 
-      <p className="text-[12px] text-foreground/85">
-        The standard recipe: linear warmup for ~10% of steps from <code>0</code> to <code>lr_max</code>, then cosine
-        decay down to ~<code>1e-5</code>. The warmup keeps early gradients from blowing up while the optimizer's moving
-        averages haven't filled in yet; the decay lets late training settle into a low-loss plateau.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label="Learning-rate schedule">
+      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* axes */}
         <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="currentColor" strokeOpacity={0.4} />
         <line x1={PAD} y1={PAD} x2={PAD} y2={H - PAD} stroke="currentColor" strokeOpacity={0.4} />
@@ -99,7 +152,7 @@ export function LrScheduleViz() {
           </g>
         ))}
         <text x={PAD + plotW / 2} y={H - 4} fontSize={9} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
-          training step
+          {copy.xAxis}
         </text>
         {/* y ticks at 0, max */}
         <text x={PAD - 4} y={PAD + plotH + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.55}>
@@ -116,7 +169,7 @@ export function LrScheduleViz() {
           fillOpacity={0.55}
           transform={`rotate(-90, 10, ${PAD + plotH / 2 + 3})`}
         >
-          learning rate
+          {copy.yAxis}
         </text>
 
         {/* warmup region shading */}
@@ -136,7 +189,7 @@ export function LrScheduleViz() {
           fill="oklch(0.7 0.15 60)"
           fillOpacity={0.9}
         >
-          warmup
+          {copy.warmupRegion}
         </text>
         <text
           x={PAD + (warmupSteps / TOTAL_STEPS) * plotW + ((TOTAL_STEPS - warmupSteps) / TOTAL_STEPS) * plotW * 0.5}
@@ -146,7 +199,7 @@ export function LrScheduleViz() {
           fill="oklch(0.65 0.13 250)"
           fillOpacity={0.9}
         >
-          cosine decay
+          {copy.cosineRegion}
         </text>
 
         {/* curve */}
@@ -168,7 +221,7 @@ export function LrScheduleViz() {
       <div className="space-y-2">
         <label className="block text-[11px]">
           <div className="mb-0.5 flex justify-between font-mono text-muted-foreground">
-            <span>peak LR (lr_max)</span>
+            <span>{copy.peakLabel}</span>
             <span>{lrMax.toExponential(1)}</span>
           </div>
           <input
@@ -183,7 +236,7 @@ export function LrScheduleViz() {
         </label>
         <label className="block text-[11px]">
           <div className="mb-0.5 flex justify-between font-mono text-muted-foreground">
-            <span>warmup steps ({((warmupSteps / TOTAL_STEPS) * 100).toFixed(0)}% of total)</span>
+            <span>{copy.warmupLabel(((warmupSteps / TOTAL_STEPS) * 100).toFixed(0))}</span>
             <span>{warmupSteps.toLocaleString()}</span>
           </div>
           <input
@@ -198,10 +251,8 @@ export function LrScheduleViz() {
         </label>
         <label className="block text-[11px]">
           <div className="mb-0.5 flex justify-between font-mono text-muted-foreground">
-            <span>step cursor</span>
-            <span>
-              step {cursor.toLocaleString()} · lr = {cursorLr.toExponential(2)}
-            </span>
+            <span>{copy.cursorLabel}</span>
+            <span>{copy.cursorReadout(cursor.toLocaleString(), cursorLr.toExponential(2))}</span>
           </div>
           <input
             type="range"
@@ -215,11 +266,7 @@ export function LrScheduleViz() {
         </label>
       </div>
 
-      <p className="text-[11px] text-muted-foreground">
-        Slide warmup to 0 and watch the curve start at <code>lr_max</code> — that's what happens without warmup. Slide
-        the peak LR much higher (e.g. <code>1e-3</code>) and you can see why early training would diverge without
-        gradient clipping: <em>any</em> large step on a fresh model takes the weights somewhere they can't recover from.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.footer}</p>
     </div>
   );
 }

@@ -6,13 +6,16 @@ import { tokenize } from '../../lib/tokenizer-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { CosineSimilarityTool } from '../widgets/CosineSimilarityTool';
+import { EmbeddingDirections } from '../widgets/EmbeddingDirections';
+import { EmbeddingLookupDiagram } from '../widgets/EmbeddingLookupDiagram';
 import { ShapeProblem } from '../widgets/ShapeProblem';
 import { VectorCosine } from '../widgets/VectorCosine';
 
 /**
- * Chapter 2 — Embeddings.
+ * Chapter 3 — Embeddings.
  *
  * Prose explains how tokens become vectors. The interactive widget tokenizes
  * a curated word list, looks up each word's first-token embedding through the
@@ -407,9 +410,9 @@ function topNeighbors(
 // =============================================================================
 
 /**
- * Scaffolding metadata for chapter 2 — drives the header, glossary,
+ * Scaffolding metadata for chapter 3 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
- * `chapterId` must match `CHAPTERS[1].id` in `learn/chapters.ts`.
+ * `chapterId` must match `CHAPTERS[2].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
   chapterId: 'embeddings',
@@ -447,6 +450,11 @@ export const learning: ChapterLearningData = {
       term: 'cosine similarity',
       definition:
         'Dot product of two vectors divided by their norms. Measures direction agreement and ignores magnitude; near 1 means very similar.',
+    },
+    {
+      term: 'semantic direction',
+      definition:
+        'A vector difference like E(woman) − E(man) that approximately encodes one feature (gender, plurality, country-of) and can be added to or subtracted from other embeddings.',
     },
   ],
   takeaways: [
@@ -528,6 +536,28 @@ export const learning: ChapterLearningData = {
       explanation:
         'Tying = literally one shared weight tensor for both directions. Saves parameters and forces a single coherent representation per token.',
     },
+    {
+      id: 'q4-analogy-honest',
+      prompt: "In Qwen3.5's raw embedding matrix, what does king − man + woman actually demonstrate?",
+      options: [
+        {
+          id: 'a',
+          label: "It conjures ' queen' out of nowhere — without the arithmetic, queen is unrelated to king.",
+        },
+        {
+          id: 'b',
+          label:
+            "It promotes ' queen' from king's #4 raw neighbor to #1, past the casing and plural variants of king — the direction nudges an already-nearby vector to the top.",
+        },
+        {
+          id: 'c',
+          label: 'It proves the matrix stores an exact gender axis: woman − man and queen − king point the same way.',
+        },
+      ],
+      correctId: 'b',
+      explanation:
+        "queen was already nearby (king's #4 raw neighbor); the arithmetic's real work is beating the King/kings variants. And the axis isn't exact: cosine(woman − man, queen − king) is only 0.292.",
+    },
   ],
 };
 
@@ -560,6 +590,14 @@ export function EmbeddingsChapterBody() {
           1024-dim vectors down to a picture, build the core intuition in a flat 2-D toy you can grab: meaning lives in
           a vector&apos;s <em>direction</em>, and the <em>angle</em> between two vectors measures how related they are.
         </p>
+        <p>
+          Two small pieces of math do all the measuring, and both fit on one line. The <strong>dot product</strong> is
+          "multiply matching slots, add up": for <code>a = [3, 4]</code> and <code>b = [4, 3]</code>,{' '}
+          <code>a·b = 3×4 + 4×3 = 24</code>. The <strong>norm</strong> <code>‖a‖</code> is the vector&apos;s length:{' '}
+          <code>‖a‖ = √(3² + 4²) = 5</code>, and <code>‖b‖ = 5</code> too. Cosine similarity is just the dot product
+          with the lengths divided out: <code>cos = 24 / (5 × 5) = 0.96</code> — these two vectors point almost the same
+          way. That one recipe — dot product over norms — is every similarity number in this chapter.
+        </p>
 
         <VectorCosine />
 
@@ -567,9 +605,24 @@ export function EmbeddingsChapterBody() {
         <p>
           The embedding lookup is a single matrix multiply (or, equivalently, a row gather): given an integer id, take
           row <code>id</code> of the embedding matrix. The matrix has shape <code>[vocab_size, hidden_dim]</code>. For
-          Qwen3.5-0.8B that's about <code>248,320 × 1,024 ≈ 254 million</code> parameters in this one table — roughly a
-          third of the whole model.
+          Qwen3.5-0.8B that's about <code>248,320 × 1,024 ≈ 254 million</code> parameters in this one table (a
+          parameter is one learned number; this whole model is ~853 million of them) — roughly a third of the whole
+          model.
         </p>
+        <p>
+          Worth pausing on: all 254 million of those numbers started life as <em>random noise</em>. Nobody sat down and
+          assigned <code>tiger</code> a row near <code>lion</code>, drew a gender axis, or wired up{' '}
+          <code>king − man + woman ≈ queen</code>. Every cluster, every semantic direction, and every analogy you'll
+          poke at in this chapter is an <em>emergent</em> by-product of fitting one objective — predict the next token —
+          across a huge amount of text. The geometry is a fossil left behind by{' '}
+          <ChapterLink chapterId="training">training</ChapterLink>, not a dictionary anyone hand-built.
+        </p>
+        <p>
+          Here is that lookup as a picture you can step through. One token id goes in, one row comes out — nothing is
+          computed along the way:
+        </p>
+
+        <EmbeddingLookupDiagram />
         <p>
           Modern LLMs (Qwen3.5 included) often <strong>tie</strong> the input embedding to the output unembedding (the{' '}
           <code>lm_head</code> that turns the final hidden state back into logits over the vocabulary — we cover that in
@@ -586,7 +639,7 @@ export function EmbeddingsChapterBody() {
             { label: 'vocab_size', value: '248,320' },
             { label: 'hidden_dim', value: '1024' },
           ]}
-          answer="248,320 × 1024 ≈ 254.3M parameters — about a third of Qwen3.5-0.8B's total 800M. Tied embeddings reuse this exact matrix for the output projection (unembed), saving another 254.3M. Without tying, the embedding+unembed alone would be roughly the size of a small standalone model."
+          answer="248,320 × 1024 ≈ 254.3M parameters — about a third of Qwen3.5-0.8B's total ~853M. Tied embeddings reuse this exact matrix for the output projection (unembed), saving another 254.3M. Without tying, the embedding+unembed alone would be roughly the size of a small standalone model."
         />
 
         <h2>PCA: a 2D window into a 1024-dim space</h2>
@@ -652,12 +705,44 @@ export function EmbeddingsChapterBody() {
 
         <h2>Cosine similarity, side by side</h2>
         <p>
-          The panel below skips the projection entirely: each pair&apos;s cosine similarity is measured in the
-          model&apos;s full 1024-dim embedding space and shown as a bar. The ordering teaches the lesson — identical
+          The panel below skips the projection entirely: each bar shows a ballpark cosine similarity for this model
+          family — the live scatter on the right uses the real embeddings. The ordering teaches the lesson — identical
           &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
         </p>
 
         <CosineSimilarityTool />
+
+        <h2>Directions carry meaning</h2>
+        <p>
+          So far we've treated similarity as a single number between two whole vectors. But the space has finer
+          structure: <em>differences</em> between embeddings can act like features. If{' '}
+          <code>E(woman) − E(man)</code> roughly captures "the gender axis", then adding that difference to another
+          vector should move it along the same axis — which is exactly the classic word2vec trick:{' '}
+          <code>E(king) − E(man) + E(woman)</code> should land near <code>queen</code>. Subtract out "male", add in
+          "female", and the royalty part comes along for the ride.
+        </p>
+        <p>
+          Does this still work in a 2026 LLM's embedding matrix? We measured it on this exact checkpoint, and the
+          honest answer is "yes, with an asterisk". <code>queen</code> is <em>already</em> the #4 raw neighbor of{' '}
+          <code>king</code> — behind the casing and plural variants <code>King</code>, <code>King</code> (no leading
+          space), and <code>kings</code> — so the arithmetic doesn't summon queen from nowhere. What it really does is{' '}
+          <strong>promote queen to #1</strong>, past every king-variant: the direction strips the "male" component
+          enough that the female counterpart wins. The same trick generalizes:{' '}
+          <code>E(Paris) − E(France) + E(Japan)</code> puts <code>Tokyo</code> at #1 — and because the 248,320-token
+          vocabulary is multilingual, <code>东京</code> and <code>日本</code> show up in the same top-10 as{' '}
+          <code>Osaka</code> and <code>Kyoto</code>.
+        </p>
+        <p>
+          Not every direction is so photogenic. A plurality direction <code>E(cats) − E(cat)</code> does exist —
+          plural nouns dot positively with it, singulars hover near zero — but the magnitudes are faint, and the
+          hoped-for "one &lt; two &lt; three" trend is barely visible. And the directions themselves are only loosely
+          consistent: <code>woman − man</code> and <code>queen − king</code> agree at cosine 0.292, far from parallel.
+          That's expected — this matrix was trained to help predict the next token (with input and output weights
+          tied, doing double duty), not to pass analogy quizzes. Linear feature directions emerge as a side effect,
+          smudged by everything else the one matrix has to encode.
+        </p>
+
+        <EmbeddingDirections />
 
         <h2>Why so many dimensions?</h2>
         <p>

@@ -507,6 +507,80 @@ pub(crate) enum Qwen35Cmd {
     },
 }
 
+/// Lift a model-neutral [`crate::engine::cmd::TrainCmd`] into this family's
+/// flat thread-command variants. All training variants are `full`-only.
+#[cfg(feature = "full")]
+impl crate::engine::cmd::FromTrainCmd for Qwen35Cmd {
+    fn from_train(cmd: crate::engine::cmd::TrainCmd) -> Self {
+        use crate::engine::cmd::TrainCmd;
+        match cmd {
+            TrainCmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            } => Qwen35Cmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            },
+            TrainCmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            } => Qwen35Cmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            },
+            TrainCmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            } => Qwen35Cmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            },
+            TrainCmd::BumpSkippedStep { reply } => Qwen35Cmd::BumpSkippedStep { reply },
+            TrainCmd::SetTrainingStep { step, reply } => {
+                Qwen35Cmd::SetTrainingStep { step, reply }
+            }
+            TrainCmd::ResetTraining { reply } => Qwen35Cmd::ResetTraining { reply },
+            TrainCmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            } => Qwen35Cmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            },
+            TrainCmd::SaveOptimizerState { path, reply } => {
+                Qwen35Cmd::SaveOptimizerState { path, reply }
+            }
+            TrainCmd::LoadOptimizerState { path, reply } => {
+                Qwen35Cmd::LoadOptimizerState { path, reply }
+            }
+        }
+    }
+}
+
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
@@ -1431,7 +1505,7 @@ impl Qwen35Inner {
             }
         }
 
-        let params_clone: HashMap<String, MxArray> =
+        let mut params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Weights metadata
@@ -1479,7 +1553,7 @@ impl Qwen35Inner {
             "format": "mlx-node",
             "version": "1.0"
         }));
-        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &mut params_clone, metadata)?;
         info!("Saved weights.safetensors");
 
         let weights_str = serde_json::to_string_pretty(&weights_json)?;
@@ -2962,6 +3036,7 @@ impl Qwen35Inner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -3168,6 +3243,7 @@ impl Qwen35Inner {
                             &embedding_weight_pure,
                             &layer_kinds,
                             adapter_mut,
+                            self.cached_rope_deltas.unwrap_or(0),
                         )?;
                         logits.squeeze(Some(&[1]))?
                     }
@@ -3194,6 +3270,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -3670,6 +3747,7 @@ impl Qwen35Inner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -3879,6 +3957,7 @@ impl Qwen35Inner {
                             &embedding_weight_pure,
                             &layer_kinds,
                             adapter_mut,
+                            self.cached_rope_deltas.unwrap_or(0),
                         )?;
                         logits.squeeze(Some(&[1]))?
                     }
@@ -3906,6 +3985,7 @@ impl Qwen35Inner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -5379,8 +5459,10 @@ impl Qwen35Inner {
                 content: prompt.clone(),
                 tool_calls: None,
                 tool_call_id: None,
+                is_error: None,
                 reasoning_content: None,
                 images: None,
+                audio: None,
             }];
             tokenizer.apply_chat_template_sync(&messages, Some(true), None, Some(false))?
         } else {

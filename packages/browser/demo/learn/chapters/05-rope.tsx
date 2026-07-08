@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
@@ -9,7 +10,7 @@ import { PermutationInvariance } from '../widgets/PermutationInvariance';
 import { RopeRelativeDial } from '../widgets/RopeRelativeDial';
 
 /**
- * Chapter 5 — Positional encoding (RoPE).
+ * Chapter 6 — Positional encoding (RoPE).
  *
  * JS-only: RoPE math is deterministic given the model's config, so this
  * chapter visualises the math directly without calling the worker. The
@@ -89,10 +90,16 @@ function formatPeriod(value: number): string {
   return value.toExponential(2);
 }
 
+// Matches the "θ = 1e7" convention used elsewhere (e.g. chapters/14-architecture.tsx)
+// instead of JS's native "1e+7".
+function formatThetaBase(value: number): string {
+  return value.toExponential(0).replace('e+', 'e');
+}
+
 /**
- * Scaffolding metadata for chapter 5 — drives the header, glossary,
+ * Scaffolding metadata for chapter 6 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
- * `chapterId` must match `CHAPTERS[4].id` in `learn/chapters.ts`.
+ * `chapterId` must match `CHAPTERS[5].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
   chapterId: 'rope',
@@ -278,6 +285,12 @@ export function RopeChapterBody() {
           latex={String.raw`\begin{pmatrix} x'_{2i} \\ x'_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos(m\theta_i) & -\sin(m\theta_i) \\ \sin(m\theta_i) & \cos(m\theta_i) \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}`}
         />
         <p>
+          Run that matrix once by hand, on pair 0 — whose frequency works out to exactly <code>θ₀ = base⁰ = 1</code>{' '}
+          radian per token, so pair 0 spins 1 rad every step. Take the pair <code>(1, 0)</code> at position{' '}
+          <code>m = 2</code>: it rotates by 2 rad, landing at <code>(cos 2, sin 2) ≈ (−0.42, 0.91)</code>. Same length,
+          new direction — and it is exactly the spin you will see on dial 0 (the high-frequency clock) further down.
+        </p>
+        <p>
           The pairs are drawn here as neighbours (<code>x_0</code> with <code>x_1</code>) for clarity; how Qwen3.5
           actually lays them out is an implementation detail you can skip on a first read (see <strong>Advanced</strong>{' '}
           below).
@@ -330,9 +343,14 @@ export function RopeChapterBody() {
           Qwen3.5 uses a head dimension of <code>{HEAD_DIM}</code>, a partial rotary factor of{' '}
           <code>{PARTIAL_ROTARY_FACTOR}</code> (so only the first <code>{ROPE_DIMS}</code> features per head are rotated
           — the rest pass through untouched), and an unusually large RoPE base of{' '}
-          <code>{ROPE_THETA.toExponential(0)}</code>. The large base stretches the frequency spectrum so the
+          <code>{formatThetaBase(ROPE_THETA)}</code>. The large base stretches the frequency spectrum so the
           lowest-frequency pairs barely rotate at all over the model's <code>{MAX_POSITION.toLocaleString()}</code>
           -token context window — a key ingredient for long-context extrapolation.
+        </p>
+        <p>
+          Why rotate only a quarter of the head? Because the unrotated {HEAD_DIM - ROPE_DIMS} dims carry no position at
+          all — they do pure content matching (&quot;does this key mean what my query is asking for?&quot;). Position
+          only needs to ride on part of the vector; the rest is free to care about meaning alone.
         </p>
         <p>
           One more wrinkle specific to Qwen3.5's hybrid design: this RoPE rotation is applied{' '}
@@ -380,6 +398,7 @@ export type RopeDemoProps = {
 };
 
 export function RopeDemo(_props: RopeDemoProps) {
+  const locale = useLocale();
   const [selectedPair, setSelectedPair] = React.useState(DEFAULT_SELECTED_PAIR);
   const [rotationPos, setRotationPos] = React.useState(8);
   // "Sweep position m" animation — drives `rotationPos` from 0 → MAX over
@@ -455,10 +474,15 @@ export function RopeDemo(_props: RopeDemoProps) {
 
   return (
     <div className="space-y-4">
+      {locale === 'zh' ? (
+        <div className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          此互动演示尚未翻译，界面文字为英文。
+        </div>
+      ) : null}
       <div className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
         This chapter visualises RoPE's math directly — no model inference needed. The numbers below come from
         Qwen3.5-0.8B's config: head_dim={HEAD_DIM}, rotated dims={ROPE_DIMS} ({NUM_PAIRS} pairs), rope_theta=
-        {ROPE_THETA.toExponential(0)}.
+        {formatThetaBase(ROPE_THETA)}.
       </div>
 
       <FrequencySpectrum frequencies={frequencies} selectedPair={selectedPair} onSelect={setSelectedPair} />
@@ -605,10 +629,12 @@ function RopeThetaSimulator() {
       <SeparabilityStrip theta={theta} />
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Qwen3.5-0.8B sets <code>rope_theta = {ROPE_THETA.toExponential(0)}</code> — a thousand times the original
-        transformer's <code>{ORIGINAL_ROPE_THETA.toExponential(0)}</code>. That larger base is what stretches the
+        Qwen3.5-0.8B sets <code>rope_theta = {formatThetaBase(ROPE_THETA)}</code> — a thousand times the base RoPE
+        itself defaults to (<code>{formatThetaBase(ORIGINAL_ROPE_THETA)}</code>, a convention inherited from the
+        original transformer's sinusoidal base). That larger base is what stretches the
         spectrum and buys the long context; slide back down toward <code>1e4</code> and watch the slow pair start
-        rotating fast enough to alias over a long document.
+        rotating fast enough to wrap past a full turn over a long document — two far-apart positions then land on the
+        same angle and look identical.
       </p>
 
       <div className="text-[10px] text-muted-foreground">
@@ -650,7 +676,8 @@ function SeparabilityStrip({ theta }: { theta: number }) {
                 {SEPARABILITY_POSITIONS.map((m) => {
                   const turns = (m * freq) / (2 * Math.PI);
                   // One full revolution fills the cell; cap the visual at a
-                  // single turn (more than that has already aliased).
+                  // single turn (past one turn the angle has wrapped, so two
+                  // positions can already look identical).
                   const fill = Math.min(1, turns);
                   return (
                     <div key={m} className="space-y-0.5">
@@ -676,9 +703,9 @@ function SeparabilityStrip({ theta }: { theta: number }) {
       </div>
       <div className="text-[11px] leading-relaxed text-muted-foreground">
         Bars show the fraction of a full turn each pair has rotated through at that position (capped at one turn). The
-        fast pair saturates and aliases within a handful of tokens; the slow pair stays a sliver out to tens of
-        thousands of positions — that separation is how one operation encodes both fine-grained and document-scale
-        position.
+        fast pair wraps past a full turn within a handful of tokens — beyond that, two far-apart positions can land on
+        the same angle and look identical. The slow pair stays a sliver out to tens of thousands of positions — that
+        separation is how one operation encodes both fine-grained and document-scale position.
       </div>
     </div>
   );
@@ -912,7 +939,9 @@ function DotProductChart({ values, queryPos }: { values: Float64Array; queryPos:
       </svg>
       <div className="pt-1 text-[11px] text-muted-foreground">
         With a constant query and key, the rotated dot product depends only on (n − m). The peak at n = m and smooth
-        decay either side is the relative-position property of RoPE.
+        decay either side is the relative-position property of RoPE. The peak height is no mystery either: at offset 0
+        every one of the {NUM_PAIRS} rotated pairs contributes 2·cos(0) = 2, so the peak = 2 × {NUM_PAIRS} ={' '}
+        {2 * NUM_PAIRS}.
       </div>
     </div>
   );

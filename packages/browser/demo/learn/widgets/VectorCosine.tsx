@@ -1,6 +1,8 @@
 import { cn } from '@/lib/utils';
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 2 supplement — the GEOMETRY behind cosine similarity.
  *
@@ -35,6 +37,118 @@ const WORDS: WordVec[] = [
 ];
 
 const PROBE_COLOR = 'oklch(0.75 0.12 185)'; // teal — distinct from every word vector
+
+// Per-locale copy. The fixed word labels (cat/dog/car) are example words and
+// stay English in both locales, like the model tokens elsewhere in the course.
+const COPY = {
+  en: {
+    title: 'Direction = meaning, angle = similarity',
+    hint: 'Drag the teal arrow, or use the sliders',
+    probeLabel: 'your word',
+    qual: {
+      related: '≈ same direction → related',
+      loose: 'partly aligned → loosely related',
+      unrelated: '≈ perpendicular → unrelated',
+      weakContrary: 'pointing apart → weakly contrary',
+      contrary: '≈ opposite → contrary',
+    },
+    svgAria: (angle: number, len: string, label: string, theta: number, cos: string) =>
+      `Vector plane. The probe vector is at ${angle} degrees with length ${len}. The angle to ${label} is ${theta} degrees, cosine ${cos}.`,
+    compareAgainst: 'Compare “your word” against',
+    compareGroupAria: 'Word vector to compare against',
+    angleLabel: 'probe angle',
+    angleValuetext: (deg: number) => `probe angle ${deg} degrees`,
+    lengthLabel: 'probe length',
+    lengthValuetext: (len: string) => `probe length ${len}`,
+    magnitudeNote: (
+      <>
+        Slide the length and watch <span className="font-mono">cos θ</span> below stay put — magnitude doesn’t
+        change the angle.
+      </>
+    ),
+    thetaCard: 'angle θ',
+    cosCard: (
+      <>
+        cos θ <span className="normal-case">(similarity)</span>
+      </>
+    ),
+    probeNorm: '|your word|',
+    lengthsLineTail: (
+      <>
+        {' '}
+        — different lengths, and <span className="font-mono">cos θ</span> only sees the <strong>angle</strong> between
+        them.
+      </>
+    ),
+    outro: (compareLabel: string) => (
+      <>
+        Swing the probe to line up with <span className="font-mono">{compareLabel}</span> →{' '}
+        <span className="font-mono">cos θ → 1</span> (“related”). Turn it to a right angle →{' '}
+        <span className="font-mono">cos θ → 0</span> (“unrelated”). Point it the opposite way →{' '}
+        <span className="font-mono">cos θ → −1</span> (“contrary”). The length never enters the cosine — which is
+        exactly why embedding similarity uses the <strong>angle</strong>, not straight-line (Euclidean) distance.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative only — these are hand-placed 2-D teaching arrows, NOT real embeddings. Qwen3.5-0.8B&apos;s vectors
+        live in <span className="font-mono">1,024</span> dimensions; this flat picture exists to build the intuition.
+      </>
+    ),
+  },
+  zh: {
+    title: '方向 = 含义，夹角 = 相似度',
+    hint: '拖动青色箭头，或使用滑块',
+    probeLabel: '你的词',
+    qual: {
+      related: '≈ 同方向 → 相关',
+      loose: '部分对齐 → 弱相关',
+      unrelated: '≈ 垂直 → 不相关',
+      weakContrary: '方向岔开 → 略相反',
+      contrary: '≈ 反向 → 相反',
+    },
+    svgAria: (angle: number, len: string, label: string, theta: number, cos: string) =>
+      `向量平面。探针向量位于 ${angle} 度，长度 ${len}。与 ${label} 的夹角为 ${theta} 度，余弦 ${cos}。`,
+    compareAgainst: '把“你的词”与谁比较',
+    compareGroupAria: '要比较的词向量',
+    angleLabel: '探针角度',
+    angleValuetext: (deg: number) => `探针角度 ${deg} 度`,
+    lengthLabel: '探针长度',
+    lengthValuetext: (len: string) => `探针长度 ${len}`,
+    magnitudeNote: (
+      <>
+        拖动长度，看下方的 <span className="font-mono">cos θ</span> 纹丝不动——长度不会改变夹角。
+      </>
+    ),
+    thetaCard: '夹角 θ',
+    cosCard: (
+      <>
+        cos θ <span className="normal-case">（相似度）</span>
+      </>
+    ),
+    probeNorm: '|你的词|',
+    lengthsLineTail: (
+      <>
+        ——长度不同，而 <span className="font-mono">cos θ</span> 只看它们之间的<strong>夹角</strong>。
+      </>
+    ),
+    outro: (compareLabel: string) => (
+      <>
+        把探针转到与 <span className="font-mono">{compareLabel}</span> 对齐 →{' '}
+        <span className="font-mono">cos θ → 1</span>（“相关”）。转到直角 →{' '}
+        <span className="font-mono">cos θ → 0</span>（“不相关”）。指向相反方向 →{' '}
+        <span className="font-mono">cos θ → −1</span>（“相反”）。长度从不进入余弦——这正是嵌入相似度用
+        <strong>夹角</strong>、而不用直线（欧氏）距离的原因。
+      </>
+    ),
+    footnote: (
+      <>
+        仅为示意——这些是手工摆放的 2-D 教学箭头，不是真实嵌入。Qwen3.5-0.8B 的向量住在{' '}
+        <span className="font-mono">1,024</span> 维空间里；这张平面图只为建立直觉。
+      </>
+    ),
+  },
+} as const;
 
 // SVG geometry. The plane is square so 1 unit is the same number of pixels on
 // both axes (angles stay visually honest). The origin sits at the center.
@@ -74,14 +188,14 @@ function angleBetween(aDeg: number, bDeg: number): number {
   return d > 180 ? 360 - d : d;
 }
 
-type Qual = { label: string; tone: string };
+type Qual = { key: keyof (typeof COPY)['en']['qual']; tone: string };
 
 function qualitative(cos: number): Qual {
-  if (cos >= 0.6) return { label: '≈ same direction → related', tone: 'text-emerald-400' };
-  if (cos > 0.2) return { label: 'partly aligned → loosely related', tone: 'text-foreground/80' };
-  if (cos >= -0.2) return { label: '≈ perpendicular → unrelated', tone: 'text-muted-foreground' };
-  if (cos > -0.6) return { label: 'pointing apart → weakly contrary', tone: 'text-foreground/80' };
-  return { label: '≈ opposite → contrary', tone: 'text-amber-400' };
+  if (cos >= 0.6) return { key: 'related', tone: 'text-emerald-400' };
+  if (cos > 0.2) return { key: 'loose', tone: 'text-foreground/80' };
+  if (cos >= -0.2) return { key: 'unrelated', tone: 'text-muted-foreground' };
+  if (cos > -0.6) return { key: 'weakContrary', tone: 'text-foreground/80' };
+  return { key: 'contrary', tone: 'text-amber-400' };
 }
 
 function Arrow({
@@ -136,6 +250,7 @@ function Arrow({
 }
 
 export function VectorCosine() {
+  const copy = COPY[useLocale()];
   const reducedMotion = usePrefersReducedMotion();
   const svgRef = React.useRef<SVGSVGElement>(null);
 
@@ -193,10 +308,8 @@ export function VectorCosine() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Direction = meaning, angle = similarity
-        </div>
-        <div className="text-[11px] text-muted-foreground">Drag the teal arrow, or use the sliders</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.hint}</div>
       </div>
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-[auto_minmax(0,1fr)]">
@@ -204,9 +317,7 @@ export function VectorCosine() {
         <svg
           ref={svgRef}
           role="img"
-          aria-label={`Vector plane. The probe vector is at ${Math.round(probeAngle)} degrees with length ${probeLen.toFixed(
-            2,
-          )}. The angle to ${compare.label} is ${Math.round(theta)} degrees, cosine ${cos.toFixed(2)}.`}
+          aria-label={copy.svgAria(Math.round(probeAngle), probeLen.toFixed(2), compare.label, Math.round(theta), cos.toFixed(2))}
           viewBox={`0 0 ${SIZE} ${SIZE}`}
           className="mx-auto block h-auto w-full max-w-[360px] touch-none rounded-md bg-muted/20"
           style={{ cursor: dragging ? 'grabbing' : 'grab' }}
@@ -312,7 +423,7 @@ export function VectorCosine() {
             angleDeg={probeAngle}
             length={probeLen}
             color={PROBE_COLOR}
-            label="your word"
+            label={copy.probeLabel}
             strokeWidth={3}
             markerId="vc-head-probe"
           />
@@ -321,8 +432,8 @@ export function VectorCosine() {
         {/* ---- Controls + readouts ---- */}
         <div className="space-y-3">
           <div className="space-y-1">
-            <div className="text-[11px] text-muted-foreground">Compare “your word” against</div>
-            <div className="flex flex-wrap gap-1.5" role="group" aria-label="Word vector to compare against">
+            <div className="text-[11px] text-muted-foreground">{copy.compareAgainst}</div>
+            <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.compareGroupAria}>
               {WORDS.map((w) => {
                 const active = w.id === compareId;
                 return (
@@ -352,7 +463,7 @@ export function VectorCosine() {
 
           <div className="space-y-1">
             <label htmlFor="vc-angle" className="block text-xs text-muted-foreground">
-              probe angle <span className="font-mono text-foreground/85">{Math.round(probeAngle)}°</span>
+              {copy.angleLabel} <span className="font-mono text-foreground/85">{Math.round(probeAngle)}°</span>
             </label>
             <input
               id="vc-angle"
@@ -363,13 +474,13 @@ export function VectorCosine() {
               value={Math.round(probeAngle)}
               onChange={(e) => setProbeAngle(Number(e.target.value))}
               className="w-full accent-primary"
-              aria-valuetext={`probe angle ${Math.round(probeAngle)} degrees`}
+              aria-valuetext={copy.angleValuetext(Math.round(probeAngle))}
             />
           </div>
 
           <div className="space-y-1">
             <label htmlFor="vc-length" className="block text-xs text-muted-foreground">
-              probe length <span className="font-mono text-foreground/85">|v| = {probeLen.toFixed(2)}</span>
+              {copy.lengthLabel} <span className="font-mono text-foreground/85">|v| = {probeLen.toFixed(2)}</span>
             </label>
             <input
               id="vc-length"
@@ -380,25 +491,20 @@ export function VectorCosine() {
               value={probeLen}
               onChange={(e) => setProbeLen(Number(e.target.value))}
               className="w-full accent-primary"
-              aria-valuetext={`probe length ${probeLen.toFixed(2)}`}
+              aria-valuetext={copy.lengthValuetext(probeLen.toFixed(2))}
             />
-            <p className="text-[11px] text-muted-foreground">
-              Slide the length and watch <span className="font-mono">cos θ</span> below stay put — magnitude doesn’t
-              change the angle.
-            </p>
+            <p className="text-[11px] text-muted-foreground">{copy.magnitudeNote}</p>
           </div>
 
           <div className="grid grid-cols-2 gap-2">
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">angle θ</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.thetaCard}</div>
               <div className="font-mono text-lg text-foreground/90" aria-live="polite">
                 {Math.round(theta)}°
               </div>
             </div>
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                cos θ <span className="normal-case">(similarity)</span>
-              </div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.cosCard}</div>
               <div className="font-mono text-lg text-foreground/90" aria-live="polite">
                 {cos.toFixed(2)}
               </div>
@@ -406,29 +512,20 @@ export function VectorCosine() {
           </div>
 
           <div className={cn('text-sm font-medium', qual.tone)} aria-live="polite">
-            {qual.label}
+            {copy.qual[qual.key]}
           </div>
 
           <div className="text-[11px] text-muted-foreground">
-            <span className="font-mono">|your word|</span> = {probeLen.toFixed(2)} ·{' '}
-            <span className="font-mono">|{compare.label}|</span> = {compare.length.toFixed(2)} — different lengths, and{' '}
-            <span className="font-mono">cos θ</span> only sees the <strong>angle</strong> between them.
+            <span className="font-mono">{copy.probeNorm}</span> = {probeLen.toFixed(2)} ·{' '}
+            <span className="font-mono">|{compare.label}|</span> = {compare.length.toFixed(2)}
+            {copy.lengthsLineTail}
           </div>
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Swing the probe to line up with <span className="font-mono">{compare.label}</span> →{' '}
-        <span className="font-mono">cos θ → 1</span> (“related”). Turn it to a right angle →{' '}
-        <span className="font-mono">cos θ → 0</span> (“unrelated”). Point it the opposite way →{' '}
-        <span className="font-mono">cos θ → −1</span> (“contrary”). The length never enters the cosine — which is
-        exactly why embedding similarity uses the <strong>angle</strong>, not straight-line (Euclidean) distance.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.outro(compare.label)}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative only — these are hand-placed 2-D teaching arrows, NOT real embeddings. Qwen3.5-0.8B&apos;s vectors
-        live in <span className="font-mono">1,024</span> dimensions; this flat picture exists to build the intuition.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

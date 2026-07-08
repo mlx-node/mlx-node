@@ -1,7 +1,9 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
- * Chapter 3 supplement — show the *consequence* of the causal mask by toggling
+ * Chapter 4 supplement — show the *consequence* of the causal mask by toggling
  * it on and off side-by-side. `CausalMaskAsSum` shows the mechanic ("mask is
  * an additive matrix of 0/-inf"); this widget shows why we bother.
  *
@@ -31,6 +33,87 @@ const RAW_SCORES: number[][] = [
   [ 0.6,  0.0,  0.4,  1.4,  0.7],
   [ 1.0,  0.5, -0.2,  0.8,  1.8],
 ];
+
+// Per-locale copy. English strings are moved verbatim from the original JSX.
+const COPY = {
+  en: {
+    heading: 'Why we mask — flip it off and watch the model cheat',
+    maskLabel: 'Causal mask',
+    toggleAria: 'Toggle causal mask',
+    on: 'ON',
+    off: 'OFF',
+    intro: (
+      <>
+        The matrix below is <code>softmax(QKᵀ / √d)</code> for the same five fixed scores as the widget above. Toggle
+        the mask off and watch the highlighted row — the query for <code>"The"</code> — start attending to tokens that
+        haven't happened yet.
+      </>
+    ),
+    maskOnBox: (
+      <>
+        <strong>Mask ON.</strong> Row 0 (the query for <code>"The"</code>) has only one position to look at — itself.
+        Its prediction must rely on what <code>"The"</code> alone tells the model. That's the regime the model trains
+        in: every next-token prediction is made <em>before</em> the answer is visible.
+      </>
+    ),
+    maskOffBox: (
+      <>
+        <strong>Mask OFF — the model is cheating.</strong> Row 0 now attends to <code>" cat"</code>,{' '}
+        <code>" sat"</code>, <code>" on"</code>, <code>" the"</code> — every future token. During training, the loss is
+        computed against
+        <em> the same future tokens</em> the model is now allowed to see. It would learn to copy position <em>i+1</em>{' '}
+        and score ~100% on the training set while learning nothing about language. At inference time there <em>is</em>{' '}
+        no future to copy and it falls apart.
+      </>
+    ),
+    footnote: (
+      <>
+        That single triangular mask is the only thing keeping training honest. It costs nothing at inference (the upper
+        triangle is never even computed for decode steps) and everything pedagogically — it's <em>the</em> structural
+        difference between encoder and decoder transformers.
+      </>
+    ),
+    captionOn: 'attention weights — causal mask applied',
+    captionOff: 'attention weights — no mask (cheating)',
+  },
+  zh: {
+    heading: '为什么要掩码——把它关掉，看模型怎么作弊',
+    maskLabel: '因果掩码',
+    toggleAria: '切换因果掩码',
+    on: '开',
+    off: '关',
+    intro: (
+      <>
+        下面的矩阵是 <code>softmax(QKᵀ / √d)</code>，使用与上方小部件相同的五个固定分数。把掩码关掉，盯住高亮的那一行——
+        <code>"The"</code> 的 query——看它开始关注还没发生的 token。
+      </>
+    ),
+    maskOnBox: (
+      <>
+        <strong>掩码已开。</strong>第 0 行（<code>"The"</code> 的 query）只有一个位置可看——它自己。它的预测只能依靠{' '}
+        <code>"The"</code> 本身告诉模型的信息。这正是模型训练时所处的状态：每一次下一 token 预测都在答案可见
+        <em>之前</em>做出。
+      </>
+    ),
+    maskOffBox: (
+      <>
+        <strong>掩码已关——模型在作弊。</strong>第 0 行现在关注 <code>" cat"</code>、<code>" sat"</code>、
+        <code>" on"</code>、<code>" the"</code>——所有未来的 token。训练时，损失恰恰是对照<em>这些未来 token</em>{' '}
+        计算的，而模型现在被允许直接看到它们。它会学会抄写位置 <em>i+1</em>，在训练集上拿到约 100%
+        的分数，却对语言一无所获。而推理时根本<em>没有</em>未来可抄，于是全盘崩溃。
+      </>
+    ),
+    footnote: (
+      <>
+        这一个三角形掩码，是让训练保持诚实的唯一机制。它在推理时毫无代价（decode
+        步骤甚至从不计算上三角），在教学上却举足轻重——它正是 encoder 与 decoder Transformer 之间<em>那个</em>
+        结构性区别。
+      </>
+    ),
+    captionOn: '注意力权重——已应用因果掩码',
+    captionOff: '注意力权重——无掩码（作弊）',
+  },
+} as const;
 
 function renderToken(text: string): string {
   return text.startsWith(' ') ? '·' + text.slice(1) : text;
@@ -93,6 +176,7 @@ function ColHeaders() {
 }
 
 export function CausalMaskToggle() {
+  const copy = COPY[useLocale()];
   const [maskOn, setMaskOn] = React.useState(true);
 
   // With mask: upper triangle set to -inf, then softmax. Without: softmax
@@ -110,11 +194,9 @@ export function CausalMaskToggle() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Why we mask — flip it off and watch the model cheat
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.heading}</div>
         <div className="inline-flex items-center gap-2">
-          <span className="text-[11px] text-muted-foreground">Causal mask</span>
+          <span className="text-[11px] text-muted-foreground">{copy.maskLabel}</span>
           <button
             type="button"
             onClick={() => setMaskOn((v) => !v)}
@@ -124,7 +206,7 @@ export function CausalMaskToggle() {
             ].join(' ')}
             role="switch"
             aria-checked={maskOn}
-            aria-label="Toggle causal mask"
+            aria-label={copy.toggleAria}
           >
             <span
               className={[
@@ -139,16 +221,12 @@ export function CausalMaskToggle() {
               maskOn ? 'text-primary' : 'text-amber-600 dark:text-amber-400',
             ].join(' ')}
           >
-            {maskOn ? 'ON' : 'OFF'}
+            {maskOn ? copy.on : copy.off}
           </span>
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        The matrix below is <code>softmax(QKᵀ / √d)</code> for the same five fixed scores as the widget above. Toggle
-        the mask off and watch the highlighted row — the query for <code>"The"</code> — start attending to tokens that
-        haven't happened yet.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
       <div className="overflow-x-auto">
         <table className="mx-auto border-collapse">
@@ -184,43 +262,22 @@ export function CausalMaskToggle() {
             : 'border-amber-500/40 bg-amber-500/10 text-foreground/95',
         ].join(' ')}
       >
-        {maskOn ? (
-          <>
-            <strong>Mask ON.</strong> Row 0 (the query for <code>"The"</code>) has only one position to look at —
-            itself. Its prediction must rely on what <code>"The"</code> alone tells the model. That's the regime the
-            model trains in: every next-token prediction is made <em>before</em> the answer is visible.
-          </>
-        ) : (
-          <>
-            <strong>Mask OFF — the model is cheating.</strong> Row 0 now attends to <code>" cat"</code>,{' '}
-            <code>" sat"</code>, <code>" on"</code>, <code>" the"</code> — every future token. During training, the loss
-            is computed against
-            <em> the same future tokens</em> the model is now allowed to see. It would learn to copy position{' '}
-            <em>i+1</em> and score ~100% on the training set while learning nothing about language. At inference time
-            there <em>is</em> no future to copy and it falls apart.
-          </>
-        )}
+        {maskOn ? copy.maskOnBox : copy.maskOffBox}
       </div>
 
-      <p className="text-[11px] text-muted-foreground">
-        That single triangular mask is the only thing keeping training honest. It costs nothing at inference (the upper
-        triangle is never even computed for decode steps) and everything pedagogically — it's <em>the</em> structural
-        difference between encoder and decoder transformers.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }
 
 function TableHeaderCaption({ maskOn }: { maskOn: boolean }) {
+  const copy = COPY[useLocale()];
   // A single full-width row above the column headers labelling the table.
   // Rendered inside <thead> with a colSpan so it scrolls with the matrix.
   return (
     <tr>
       <td colSpan={TOKENS.length + 1} className="pb-1">
-        <TableHeader
-          label={maskOn ? 'attention weights — causal mask applied' : 'attention weights — no mask (cheating)'}
-          highlight={!maskOn}
-        />
+        <TableHeader label={maskOn ? copy.captionOn : copy.captionOff} highlight={!maskOn} />
       </td>
     </tr>
   );

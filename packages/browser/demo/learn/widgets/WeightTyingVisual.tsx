@@ -1,7 +1,9 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
- * Chapter 9 (LM head) supplement — show that for Qwen3.5 (and most modern
+ * Chapter 10 (LM head) supplement — show that for Qwen3.5 (and most modern
  * decoder-only LLMs) the embedding matrix and the LM head are the *same*
  * tensor, just transposed.
  *
@@ -28,7 +30,98 @@ const STEPS = [
   'top-K vocab scores — model predicts " floor"',
 ] as const;
 
+const COPY = {
+  en: {
+    header: 'Weight tying — one matrix, used twice',
+    pause: 'Pause',
+    play: 'Play',
+    pauseAria: 'Pause weight-tying animation',
+    playAria: 'Play weight-tying animation',
+    stepCounter: (step: number, total: number) => `step ${step}/${total}`,
+    intro: (
+      <>
+        Qwen3.5-0.8B (and most modern decoder LLMs) sets <span className="font-mono">tie_word_embeddings = true</span>.
+        That means the embedding matrix at the input and the LM head at the output are{' '}
+        <em>literally the same tensor</em> in memory — the same <span className="font-mono">[248,320 × 1024]</span> grid
+        of floats, used once for <span className="font-mono">id → vector</span> and once (transposed) for{' '}
+        <span className="font-mono">vector → vocab scores</span>.
+      </>
+    ),
+    svgAria: 'Weight tying animation showing one tensor used at both ends of the model',
+    layersLabel: '24 layers',
+    embedSubLabel: 'token id → vector (lookup)',
+    lmHeadSubLabel: 'vector → vocab scores',
+    tiedLabel: 'tied — same tensor',
+    stepPrefix: (step: number) => `Step ${step}: `,
+    steps: STEPS,
+    savings: (
+      <>
+        <strong>Parameter savings:</strong> the matrix is{' '}
+        <span className="font-mono">248,320 × 1024 ≈ 254.3M floats</span>. Tying skips a second copy at the LM head — a
+        ~254M-parameter reduction on a 0.8B-parameter model. That's close to a third of the model, gone, just by reusing
+        the dictionary.
+      </>
+    ),
+    outro: (
+      <>
+        Conceptually tying says:{' '}
+        <em>
+          the same dictionary that maps a token id to its incoming representation also maps an outgoing representation
+          back to a vocab score
+        </em>
+        . Reading and writing share one alphabet. Not every model ties — large GPT-style models sometimes keep them
+        separate for a small quality win — but for sub-billion-parameter models, tying is the standard.
+      </>
+    ),
+  },
+  zh: {
+    header: '权重共享——同一个矩阵，用两次',
+    pause: '暂停',
+    play: '播放',
+    pauseAria: '暂停权重共享动画',
+    playAria: '播放权重共享动画',
+    stepCounter: (step: number, total: number) => `第 ${step}/${total} 步`,
+    intro: (
+      <>
+        Qwen3.5-0.8B（以及大多数现代解码器 LLM）设置了{' '}
+        <span className="font-mono">tie_word_embeddings = true</span>。这意味着输入端的嵌入矩阵和输出端的 LM head
+        在内存中<em>就是同一个张量</em>——同一个 <span className="font-mono">[248,320 × 1024]</span>{' '}
+        的浮点数网格，一次用于 <span className="font-mono">id → vector</span>，一次（转置后）用于{' '}
+        <span className="font-mono">vector → vocab scores</span>。
+      </>
+    ),
+    svgAria: '权重共享动画：同一个张量在模型两端各用一次',
+    layersLabel: '24 层',
+    embedSubLabel: 'token id → 向量（查表）',
+    lmHeadSubLabel: '向量 → 词表分数',
+    tiedLabel: '共享——同一个张量',
+    stepPrefix: (step: number) => `第 ${step} 步：`,
+    steps: [
+      '嵌入查表——读取 embed_tokens.weight 的一行',
+      '流经 24 个 transformer 层（残差流）',
+      '最终 RMSNorm + LM head——对着同一个矩阵做投影',
+      'top-K 词表分数——模型预测出 " floor"',
+    ],
+    savings: (
+      <>
+        <strong>参数节省：</strong>这个矩阵有 <span className="font-mono">248,320 × 1024 ≈ 254.3M</span>{' '}
+        个浮点数。权重共享省掉了 LM head 处的第二份拷贝——在一个 0.8B 参数的模型上少了约 254M
+        个参数。仅仅是复用这本字典，就省掉了接近模型三分之一的参数。
+      </>
+    ),
+    outro: (
+      <>
+        从概念上讲，权重共享是在说：
+        <em>把 token id 映射成输入表示的那本字典，同样把输出表示映射回词表分数</em>
+        。读和写共用同一套字母表。并非所有模型都做共享——大型 GPT
+        风格的模型有时为了一点质量提升而把两者分开——但对参数量低于十亿的模型来说，共享是标准做法。
+      </>
+    ),
+  },
+} as const;
+
 export function WeightTyingVisual() {
+  const copy = COPY[useLocale()];
   const [step, setStep] = React.useState(0);
   const [playing, setPlaying] = React.useState(true);
 
@@ -78,39 +171,26 @@ export function WeightTyingVisual() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Weight tying — one matrix, used twice
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <div className="inline-flex items-center gap-2">
           <button
             type="button"
             onClick={() => setPlaying((p) => !p)}
             className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
             aria-pressed={playing}
-            aria-label={playing ? 'Pause weight-tying animation' : 'Play weight-tying animation'}
+            aria-label={playing ? copy.pauseAria : copy.playAria}
           >
-            {playing ? 'Pause' : 'Play'}
+            {playing ? copy.pause : copy.play}
           </button>
           <span className="font-mono text-[11px] text-muted-foreground">
-            step {step + 1}/{STEPS.length}
+            {copy.stepCounter(step + 1, STEPS.length)}
           </span>
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Qwen3.5-0.8B (and most modern decoder LLMs) sets <span className="font-mono">tie_word_embeddings = true</span>.
-        That means the embedding matrix at the input and the LM head at the output are{' '}
-        <em>literally the same tensor</em> in memory — the same <span className="font-mono">[248,320 × 1024]</span> grid
-        of floats, used once for <span className="font-mono">id → vector</span> and once (transposed) for{' '}
-        <span className="font-mono">vector → vocab scores</span>.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        className="block h-auto w-full"
-        role="img"
-        aria-label="Weight tying animation showing one tensor used at both ends of the model"
-      >
+      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* Stack of decoder layers in the middle */}
         <rect
           x={stackX}
@@ -143,7 +223,7 @@ export function WeightTyingVisual() {
           fillOpacity={0.55}
           fontFamily="monospace"
         >
-          24 layers
+          {copy.layersLabel}
         </text>
 
         {/* Top matrix glyph — embedding lookup */}
@@ -185,7 +265,7 @@ export function WeightTyingVisual() {
           fill="currentColor"
           fillOpacity={0.55}
         >
-          token id → vector (lookup)
+          {copy.embedSubLabel}
         </text>
 
         {/* Bottom matrix glyph — LM head (transpose of same matrix) */}
@@ -227,7 +307,7 @@ export function WeightTyingVisual() {
           fill="currentColor"
           fillOpacity={0.55}
         >
-          vector → vocab scores
+          {copy.lmHeadSubLabel}
         </text>
 
         {/* Tied-weights arc connecting the two matrices — lights up when either matrix is "active" */}
@@ -248,7 +328,7 @@ export function WeightTyingVisual() {
           fillOpacity={arcLit ? 1 : 0.7}
           transform={`rotate(-90, 28, ${H / 2 - 6})`}
         >
-          tied — same tensor
+          {copy.tiedLabel}
         </text>
 
         {/* The traveling particle — small dot that pulses at the active step */}
@@ -283,26 +363,13 @@ export function WeightTyingVisual() {
       </svg>
 
       <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px] text-foreground/95">
-        <span className="text-muted-foreground">Step {step + 1}: </span>
-        {STEPS[step]}
+        <span className="text-muted-foreground">{copy.stepPrefix(step + 1)}</span>
+        {copy.steps[step]}
       </div>
 
-      <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[12px]">
-        <strong>Parameter savings:</strong> the matrix is{' '}
-        <span className="font-mono">248,320 × 1024 ≈ 254.3M floats</span>. Tying skips a second copy at the LM head — a
-        ~254M-parameter reduction on a 0.8B-parameter model. That's close to a third of the model, gone, just by reusing
-        the dictionary.
-      </div>
+      <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[12px]">{copy.savings}</div>
 
-      <p className="text-[11px] text-muted-foreground">
-        Conceptually tying says:{' '}
-        <em>
-          the same dictionary that maps a token id to its incoming representation also maps an outgoing representation
-          back to a vocab score
-        </em>
-        . Reading and writing share one alphabet. Not every model ties — large GPT-style models sometimes keep them
-        separate for a small quality win — but for sub-billion-parameter models, tying is the standard.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.outro}</p>
     </div>
   );
 }

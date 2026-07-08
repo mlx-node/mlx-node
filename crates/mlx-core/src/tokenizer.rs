@@ -120,6 +120,11 @@ pub struct ChatMessage {
     /// Tool call ID this message is responding to (for tool messages)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Whether this tool-role message represents an errored tool result.
+    /// When `Some(true)`, the wire renderer prepends a short `[tool error]`
+    /// prefix while leaving the structured `content` byte-for-byte intact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// Reasoning content for thinking mode (used with <think> tags)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -127,6 +132,10 @@ pub struct ChatMessage {
     #[napi(ts_type = "Array<Uint8Array> | undefined")]
     #[serde(skip)]
     pub images: Option<Vec<Uint8Array>>,
+    /// Audio data for unified Gemma 4 (encoded audio bytes: WAV, passed as Uint8Array/Buffer)
+    #[napi(ts_type = "Array<Uint8Array> | undefined")]
+    #[serde(skip)]
+    pub audio: Option<Vec<Uint8Array>>,
 }
 
 impl std::fmt::Debug for ChatMessage {
@@ -136,6 +145,7 @@ impl std::fmt::Debug for ChatMessage {
             .field("content", &self.content)
             .field("tool_calls", &self.tool_calls)
             .field("tool_call_id", &self.tool_call_id)
+            .field("is_error", &self.is_error)
             .field("reasoning_content", &self.reasoning_content)
             .field(
                 "images",
@@ -144,7 +154,28 @@ impl std::fmt::Debug for ChatMessage {
                     .as_ref()
                     .map(|imgs| imgs.iter().map(|i| i.len()).collect::<Vec<_>>()),
             )
+            .field(
+                "audio",
+                &self
+                    .audio
+                    .as_ref()
+                    .map(|clips| clips.iter().map(|a| a.len()).collect::<Vec<_>>()),
+            )
             .finish()
+    }
+}
+
+/// Marker prepended to a tool-role message's wire content when
+/// [`ChatMessage::is_error`] is `Some(true)`.
+pub const TOOL_ERROR_MARKER: &str = "[tool error] ";
+
+/// Prepend [`TOOL_ERROR_MARKER`] to a tool-result `content` when the message
+/// is flagged as an error, leaving the unmarked path allocation-free.
+pub fn apply_tool_error_marker(content: &str, is_error: Option<bool>) -> std::borrow::Cow<'_, str> {
+    if is_error == Some(true) {
+        std::borrow::Cow::Owned(format!("{TOOL_ERROR_MARKER}{content}"))
+    } else {
+        std::borrow::Cow::Borrowed(content)
     }
 }
 
@@ -745,10 +776,17 @@ impl Qwen3Tokenizer {
                 content: Self::sanitize_chatml_content(&msg.content),
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
+                is_error: msg.is_error,
                 reasoning_content: msg.reasoning_content.clone(),
                 images: msg.images.as_ref().map(|imgs| {
                     imgs.iter()
                         .map(|img| Uint8Array::with_data_copied(img.as_ref()))
+                        .collect()
+                }),
+                audio: msg.audio.as_ref().map(|clips| {
+                    clips
+                        .iter()
+                        .map(|a| Uint8Array::with_data_copied(a.as_ref()))
                         .collect()
                 }),
             })
@@ -1189,6 +1227,19 @@ impl Qwen3Tokenizer {
     ) -> Result<Vec<u32>> {
         let encoding = Self::encode_internal(&self.tokenizer, text, add_special_tokens)?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Encode text synchronously and return both token ids and per-token
+    /// byte offsets `(start, end)` into the original UTF-8 source string.
+    pub(crate) fn encode_with_offsets_sync(
+        &self,
+        text: &str,
+        add_special_tokens: Option<bool>,
+    ) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+        let encoding = Self::encode_internal(&self.tokenizer, text, add_special_tokens)?;
+        let ids = encoding.get_ids().to_vec();
+        let offsets = encoding.get_offsets().to_vec();
+        Ok((ids, offsets))
     }
 
     /// Decode token IDs synchronously (for internal use by generate())

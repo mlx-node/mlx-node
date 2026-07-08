@@ -22,7 +22,9 @@ import { useEffect } from 'react';
 import { z } from 'zod';
 
 import { ChatLayerOverlay } from '../components/ChatLayerOverlay';
-import { CHAPTERS, findChapter } from '../learn/chapters';
+import { findChapter } from '../learn/chapters';
+import { localizedChapter, localizedChapters } from '../learn/i18n/localized';
+import { stripLocalePrefix } from '../lib/i18n';
 import { applySeoHead } from '../lib/seo-head';
 import {
   chapterJsonLd,
@@ -31,6 +33,8 @@ import {
   getChaptersHubSeo,
   getChatSeo,
   getLandingSeo,
+  getSectionSeo,
+  sectionJsonLd,
 } from '../lib/seo-metadata';
 
 export const searchSchema = z.object({
@@ -79,33 +83,51 @@ function RootComponent() {
 
   // Centralized per-route <head> sync. The prerendered pages already carry the
   // correct head on DIRECT entry (what crawlers/unfurlers fetch); this keeps the
-  // title, canonical, description, OG/Twitter, and JSON-LD consistent with the
-  // active route after CLIENT-SIDE navigation — so a JS-executing crawler or an
-  // in-session transition never shows one route's title against another route's
-  // canonical/structured data. One place covers every route (no per-route omission).
+  // <html lang>, title, canonical, hreflang alternates, description, OG/Twitter,
+  // and JSON-LD consistent with the active route after CLIENT-SIDE navigation —
+  // so a JS-executing crawler or an in-session transition never shows one
+  // route's title against another route's canonical/structured data. One place
+  // covers every route (no per-route omission). Locale is derived from the URL
+  // prefix (/zh/… vs unprefixed) and meta strings come pre-localized from the
+  // overlay registry — the SEO builders never re-localize.
   useEffect(() => {
-    if (pathname === '/') {
-      applySeoHead(getLandingSeo(), courseJsonLd(CHAPTERS));
+    const { locale, path } = stripLocalePrefix(pathname);
+    if (path === '/') {
+      applySeoHead(getLandingSeo(locale), courseJsonLd(localizedChapters(locale), locale));
       return;
     }
-    if (pathname === '/chapters' || pathname === '/chapters/') {
-      applySeoHead(getChaptersHubSeo(), courseJsonLd(CHAPTERS));
+    if (path === '/chapters' || path === '/chapters/') {
+      applySeoHead(getChaptersHubSeo(locale), courseJsonLd(localizedChapters(locale), locale));
       return;
     }
-    const chapterMatch = pathname.match(/^\/chapters\/([^/]+)\/?$/);
-    if (chapterMatch) {
-      const chapter = findChapter(decodeURIComponent(chapterMatch[1]));
-      if (chapter) {
-        applySeoHead(getChapterSeo(chapter), chapterJsonLd(chapter));
+    // Section match is MORE specific than the chapter match — test it first so a
+    // /chapters/<id>/<section> URL never matches the chapter branch.
+    const sectionMatch = path.match(/^\/chapters\/([^/]+)\/([^/]+)\/?$/);
+    if (sectionMatch) {
+      const chapter = localizedChapter(locale, decodeURIComponent(sectionMatch[1]));
+      const sectionId = decodeURIComponent(sectionMatch[2]);
+      const section = chapter?.sections?.find((s) => s.id === sectionId);
+      if (chapter && section) {
+        applySeoHead(getSectionSeo(chapter, section, locale), sectionJsonLd(chapter, section, locale));
         return;
       }
     }
-    if (pathname === '/chat') {
+    const chapterMatch = path.match(/^\/chapters\/([^/]+)\/?$/);
+    if (chapterMatch) {
+      const chapter = localizedChapter(locale, decodeURIComponent(chapterMatch[1]));
+      if (chapter) {
+        applySeoHead(getChapterSeo(chapter, locale), chapterJsonLd(chapter, locale));
+        return;
+      }
+    }
+    // /chat exists in English only — /zh/chat (or any unknown /zh subpath)
+    // falls through to the locale-level landing identity below.
+    if (path === '/chat' && locale === 'en') {
       applySeoHead(getChatSeo(), null);
       return;
     }
-    // Unknown path — fall back to the site-level landing identity.
-    applySeoHead(getLandingSeo(), courseJsonLd(CHAPTERS));
+    // Unknown path — fall back to the site-level landing identity (same locale).
+    applySeoHead(getLandingSeo(locale), courseJsonLd(localizedChapters(locale), locale));
   }, [pathname]);
 
   return (

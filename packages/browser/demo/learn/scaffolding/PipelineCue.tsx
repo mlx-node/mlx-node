@@ -1,5 +1,8 @@
 import * as React from 'react';
 
+import { useUiStrings } from '../i18n/ui-react';
+import type { UiStrings } from '../i18n/ui';
+
 /**
  * A compact, non-interactive "you are here" strip shown at the top of every
  * chapter. It maps the current chapter onto the six canonical forward-pass
@@ -22,23 +25,20 @@ type StageSpec = ConcreteStage | readonly ConcreteStage[] | 'meta' | 'all';
 // One chip per forward-pass stage, in execution order. `key` is the stable
 // React key and the concrete stage this chip represents. `title` is an
 // optional hover tooltip (used to flag the hybrid layer stack without
-// lengthening the chip label).
+// lengthening the chip label). Labels/tooltips come from the locale dictionary
+// (reusing the same strings as ChapterIndex's fixed chips / layer header).
 type StageChip = { key: ConcreteStage; label: string; title?: string };
 
-// The six canonical stage labels, reusing the exact strings already shown to
-// users elsewhere in the course (see ChapterIndex's fixed chips / layer header).
-const STAGE_CHIPS: readonly StageChip[] = [
-  { key: 'tokenize', label: 'Tokenize' },
-  { key: 'embed', label: 'Embedding lookup' },
-  {
-    key: 'block',
-    label: '× 24 layers',
-    title: 'Hybrid stack: 6 full-attention layers + 18 cheaper linear-attention (GatedDeltaNet) layers',
-  },
-  { key: 'final-norm', label: 'Final RMSNorm' },
-  { key: 'lm-head', label: 'LM head' },
-  { key: 'sample', label: 'Sampling' },
-];
+function stageChips(ui: UiStrings): readonly StageChip[] {
+  return [
+    { key: 'tokenize', label: ui.pipeline.chipTokenize },
+    { key: 'embed', label: ui.pipeline.chipEmbedding },
+    { key: 'block', label: ui.pipeline.chipLayers, title: ui.pipeline.chipLayersTitle },
+    { key: 'final-norm', label: ui.pipeline.chipFinalNorm },
+    { key: 'lm-head', label: ui.pipeline.chipLmHead },
+    { key: 'sample', label: ui.pipeline.chipSampling },
+  ];
+}
 
 // Maps each chapter id to its forward-pass stage(s). Unknown ids fall back to
 // `meta` defensively (handled at the lookup site). RMSNorm maps to BOTH the
@@ -63,47 +63,38 @@ const STAGE_BY_CHAPTER: Readonly<Record<string, StageSpec>> = {
   architecture: 'all',
 };
 
-// Human-readable name for each lit stage, used to build the aria-label sentence.
-const STAGE_PHRASE: Readonly<Record<ConcreteStage, string>> = {
-  tokenize: 'tokenize',
-  embed: 'embed',
-  block: 'transformer block',
-  'final-norm': 'final norm',
-  'lm-head': 'LM head',
-  sample: 'sample',
-};
-
-const PIPELINE_SUMMARY = 'tokenize → embed → ×24 layers → final norm → LM head → sample';
-
 // The concrete chips a spec lights (empty for `meta`/`all`, which branch separately).
 function litStages(spec: StageSpec): readonly ConcreteStage[] {
   if (spec === 'meta' || spec === 'all') return [];
   return typeof spec === 'string' ? [spec] : spec;
 }
 
-function describe(spec: StageSpec): string {
+// aria-label sentence, built from the locale dictionary (stage phrases,
+// pipeline summary, and the sentence templates all localize together).
+function describe(ui: UiStrings, spec: StageSpec): string {
   if (spec === 'all') {
-    return `Forward-pass map: this chapter covers the whole pipeline (${PIPELINE_SUMMARY}).`;
+    return ui.pipeline.describeAll(ui.pipeline.summary);
   }
   if (spec === 'meta') {
-    return `Forward-pass map (this chapter zooms out from a single step): ${PIPELINE_SUMMARY}.`;
+    return ui.pipeline.describeMeta(ui.pipeline.summary);
   }
   const keys = litStages(spec);
-  const phrase = keys.map((k) => STAGE_PHRASE[k]).join(' and ');
-  return `Forward-pass map: you are at the ${phrase} stage${keys.length > 1 ? 's' : ''} (${PIPELINE_SUMMARY}).`;
+  const phrase = keys.map((k) => ui.pipeline.stagePhrases[k] ?? k).join(ui.pipeline.phraseJoin);
+  return ui.pipeline.describeStages(phrase, keys.length > 1, ui.pipeline.summary);
 }
 
 export function PipelineCue({ chapterId }: { chapterId: string }) {
+  const ui = useUiStrings();
   const spec: StageSpec = STAGE_BY_CHAPTER[chapterId] ?? 'meta';
   const isMeta = spec === 'meta';
   const isAll = spec === 'all';
   const litKeys = new Set<ConcreteStage>(litStages(spec));
 
   return (
-    <div role="img" aria-label={describe(spec)} className={isMeta ? 'opacity-50' : undefined}>
+    <div role="img" aria-label={describe(ui, spec)} className={isMeta ? 'opacity-50' : undefined}>
       <div className="flex flex-wrap items-center gap-1">
-        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">forward pass</span>
-        {STAGE_CHIPS.map((chip, i) => {
+        <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{ui.pipeline.eyebrow}</span>
+        {stageChips(ui).map((chip, i) => {
           const lit = isAll || litKeys.has(chip.key);
           return (
             <React.Fragment key={chip.key}>
@@ -126,7 +117,7 @@ export function PipelineCue({ chapterId }: { chapterId: string }) {
             </React.Fragment>
           );
         })}
-        {isMeta && <span className="text-[10px] text-muted-foreground">· whole pipeline</span>}
+        {isMeta && <span className="text-[10px] text-muted-foreground">{ui.pipeline.wholePipeline}</span>}
       </div>
     </div>
   );

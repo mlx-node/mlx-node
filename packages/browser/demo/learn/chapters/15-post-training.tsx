@@ -1,9 +1,10 @@
-import { Link } from '@tanstack/react-router';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import * as React from 'react';
 
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
+import { BaseVsInstructDiagram } from '../widgets/BaseVsInstructDiagram';
 import { ChatTemplateExplorer } from '../widgets/ChatTemplateExplorer';
 import { DataScaleBar } from '../widgets/DataScaleBar';
 import { PreferencePair } from '../widgets/PreferencePair';
@@ -127,15 +128,17 @@ export function PostTrainingChapterBody() {
         <h1>From base model to assistant</h1>
         <p>
           Here is a surprise that trips up almost everyone: the model the{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'training' }} search={(prev) => prev}>
+          <ChapterLink chapterId="training">
             Training chapter
-          </Link>{' '}
+          </ChapterLink>{' '}
           described — a pure next-token predictor — would <em>not</em> behave like ChatGPT. Type "What is 2 + 2?" into a
           raw base model and it might continue with another question, or a list of homework problems, or anything that
           plausibly follows that string somewhere on the web. It doesn't <em>answer</em>, because nothing ever taught it
           that a question should be followed by a helpful reply. Three post-training stages fix that — and none of them
-          touches the architecture.
+          touches the architecture. Here is that gap, side by side:
         </p>
+
+        <BaseVsInstructDiagram />
 
         <TrainingStages />
 
@@ -148,6 +151,11 @@ export function PostTrainingChapterBody() {
           the assistant's voice. That's <strong>supervised fine-tuning</strong>, or SFT. It is tiny next to pretraining
           — it adds almost no new knowledge; it teaches the model how to <em>use</em> what it already knows.
         </p>
+        <p>
+          One detail of the loss: the <em>user's</em> tokens get no loss — they're masked out, exactly like the unscored
+          last position in the training chapter — and only the assistant's reply tokens are scored. Otherwise the model
+          would be trained to imitate users too, instead of learning to answer them.
+        </p>
 
         <DataScaleBar />
 
@@ -155,7 +163,9 @@ export function PostTrainingChapterBody() {
         <p>
           SFT makes the model follow instructions; <strong>preference tuning</strong> makes it follow them <em>well</em>{' '}
           — more helpful, more honest, less likely to produce harmful or evasive answers. Humans compare candidate
-          responses ("A is better than B"), and the model is trained to prefer the responses people preferred.{' '}
+          responses ("A is better than B"), and the model is trained to prefer the responses people preferred. One quick
+          definition first: <strong>reinforcement learning (RL)</strong> = try outputs, score each one, make
+          high-scoring behavior more likely — learning from trial and error instead of from labeled targets.{' '}
           <strong>RLHF</strong> does this with a separate <strong>reward model</strong> — a second model trained on the
           human comparisons to predict how much people would like a given response, which the main model is then
           optimized to score well on — and reinforcement learning; <strong>DPO</strong> optimizes the preference
@@ -167,7 +177,8 @@ export function PostTrainingChapterBody() {
         </p>
         <p>
           Pick which response a human prefers and apply the update a few times to see what "training on a preference"
-          does:
+          does. For scale: typical preference datasets are ~10K–1M comparison pairs — the same order of magnitude as
+          SFT, nothing like pretraining's trillions of tokens.
         </p>
         <PreferencePair />
 
@@ -176,12 +187,25 @@ export function PostTrainingChapterBody() {
           Through all of this, the model still only ever sees a <em>flat string of tokens</em> — it has no native idea
           of "messages" or "roles." The <strong>chat template</strong> is the convention that flattens a multi-turn
           conversation into that string, using{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'tokenization' }} search={(prev) => prev}>
+          <ChapterLink chapterId="tokenization">
             special tokens
-          </Link>{' '}
+          </ChapterLink>{' '}
           to mark where each turn starts, who's speaking, and where a turn ends.
         </p>
         <ChatTemplateExplorer />
+        <p>
+          It's worth noticing how much of the "chatbot" feeling comes from this framing rather than from training. A base
+          model only autocompletes. But if you hand even a base model a scene-setting <strong>system prompt</strong> —
+          something like "the following is a conversation between a curious user and a knowledgeable, helpful assistant"
+          — and then start the user's turn, the most plausible continuation is already an assistant-style reply, simply
+          because that's what the surrounding text implies. Early GPT-3 demos in 2020 worked exactly this way: GPT-3 was
+          a base model, and people coaxed assistant-like behavior out of it purely by writing a vivid prelude and a
+          well-shaped prompt; the supervised and preference tuning that made it <em>reliable</em> came later. The Qwen
+          system block you see in the widget above is terse — just a short instruction like "You are a helpful assistant"
+          — so it does only <em>part</em> of that framing work, and SFT plus preference tuning does the rest. Framing
+          gets you the first plausible reply; post-training is what makes the assistant show up every time instead of
+          only when the scene is set just right.
+        </p>
         <p>
           When you chat with the model in this app, it wraps your conversation in this same format for you, appends a
           trailing <code>{'<|im_start|>assistant'}</code>, and lets the model generate the answer — stopping the moment
@@ -192,9 +216,9 @@ export function PostTrainingChapterBody() {
           The same template threads in two more things you'll see as pills in the live chat. The <strong>think</strong>{' '}
           pill controls a reasoning block: right after the assistant marker the template injects either{' '}
           <code>{'<think>\\n'}</code> (thinking on — the model reasons, then closes <code>{'</think>'}</code> before its
-          answer) or a pre-closed <code>{'<think>\\n\\n</think>\\n\\n'}</code> (thinking off). The <strong>tools</strong>{' '}
-          pill adds a <code>{'<tools>…</tools>'}</code> system block describing functions the model may call; instead of
-          prose it then emits a structured call —{' '}
+          answer) or a pre-closed <code>{'<think>\\n\\n</think>\\n\\n'}</code> (thinking off). The{' '}
+          <strong>tools</strong> pill adds a <code>{'<tools>…</tools>'}</code> system block describing functions the
+          model may call; instead of prose it then emits a structured call —{' '}
           <code>{'<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>'}</code> —
           which the app executes and feeds back as another turn. Both are pure formatting conventions: the network is
           unchanged; SFT taught it to honor them.

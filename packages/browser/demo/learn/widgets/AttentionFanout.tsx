@@ -4,7 +4,7 @@ import type { AttentionLayer, AttentionRun } from '../../../src/inspector-types'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 
 /**
- * Chapter 3 fan-out diagram — reinterpret one row of the attention matrix
+ * Chapter 4 fan-out diagram — reinterpret one row of the attention matrix
  * as a graph: the last query token in the centre, weighted edges fanning
  * back to each key token. Line thickness + opacity encode the attention
  * weight (post-softmax).

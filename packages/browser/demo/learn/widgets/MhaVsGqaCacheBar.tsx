@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * A horizontal bar chart comparing whole-model KV cache memory between a
  * hypothetical MHA Qwen3.5-0.8B and the actual GQA layout, at a fixed 8k
@@ -32,9 +34,8 @@ const MHA_BYTES = cacheBytes(NUM_HEADS);
 const GQA_BYTES = cacheBytes(NUM_KV_HEADS);
 const RATIO = GQA_BYTES > 0 ? MHA_BYTES / GQA_BYTES : 0;
 
+// Structural row data (bytes / colors); the prose label+detail live in COPY.
 type Row = {
-  label: string;
-  detail: string;
   bytes: number;
   color: string;
   accent: boolean;
@@ -42,47 +43,109 @@ type Row = {
 
 const ROWS: Row[] = [
   {
-    label: 'MHA hypothetical',
-    detail: `num_kv_heads = ${NUM_HEADS} (same as query heads)`,
     bytes: MHA_BYTES,
     color: '#94a3b8',
     accent: false,
   },
   {
-    label: 'GQA actual',
-    detail: `num_kv_heads = ${NUM_KV_HEADS} (Qwen3.5-0.8B config)`,
     bytes: GQA_BYTES,
     color: '#22c55e',
     accent: true,
   },
 ];
 
+// Per-locale copy: every user-visible string lives here so /zh localizes while
+// the English output stays byte-identical.
+const COPY = {
+  en: {
+    header: <>KV cache · whole model · seq_len = {SEQ_LEN.toLocaleString()}</>,
+    configLine: (
+      <>
+        {NUM_KV_LAYERS} full-attention layers · head_dim = {HEAD_DIM} · bf16
+      </>
+    ),
+    rows: [
+      {
+        label: 'MHA hypothetical',
+        detail: `num_kv_heads = ${NUM_HEADS} (same as query heads)`,
+      },
+      {
+        label: 'GQA actual',
+        detail: `num_kv_heads = ${NUM_KV_HEADS} (Qwen3.5-0.8B config)`,
+      },
+    ],
+    barAria: (label: string, bytes: number) => `${label}: ${formatBytes(bytes)}`,
+    layersNote: (
+      <>
+        Only the {NUM_KV_LAYERS} full-attention layers keep a KV cache; the other 18 linear layers hold a fixed-size
+        recurrent state, so they don&apos;t grow with context.
+      </>
+    ),
+    ratioBox: (
+      <>
+        GQA is <span className="font-mono">{RATIO.toFixed(1)}×</span> smaller than the equivalent MHA layout —
+        that&apos;s the whole reason it ships in every modern open model. Hidden behind every fast LLM inference is
+        grouped-query attention.
+      </>
+    ),
+  },
+  zh: {
+    header: <>KV 缓存 · 全模型 · seq_len = {SEQ_LEN.toLocaleString()}</>,
+    configLine: (
+      <>
+        {NUM_KV_LAYERS} 个全量注意力层 · head_dim = {HEAD_DIM} · bf16
+      </>
+    ),
+    rows: [
+      {
+        label: 'MHA 假想版',
+        detail: `num_kv_heads = ${NUM_HEADS}（与 query 头数相同）`,
+      },
+      {
+        label: 'GQA 实际版',
+        detail: `num_kv_heads = ${NUM_KV_HEADS}（Qwen3.5-0.8B 配置）`,
+      },
+    ],
+    barAria: (label: string, bytes: number) => `${label}：${formatBytes(bytes)}`,
+    layersNote: (
+      <>
+        只有这 {NUM_KV_LAYERS} 个全量注意力层保有 KV 缓存；其余 18
+        个线性层携带的是固定大小的循环状态，不会随上下文增长。
+      </>
+    ),
+    ratioBox: (
+      <>
+        GQA 比等价的 MHA 布局小 <span className="font-mono">{RATIO.toFixed(1)}×</span>
+        ——这就是它出现在每一个现代开源模型里的全部原因。每一次快速的 LLM 推理背后，都藏着分组查询注意力（GQA）。
+      </>
+    ),
+  },
+} as const;
+
 export function MhaVsGqaCacheBar() {
+  const copy = COPY[useLocale()];
   const max = Math.max(...ROWS.map((r) => r.bytes), 1);
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          KV cache · whole model · seq_len = {SEQ_LEN.toLocaleString()}
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          {NUM_KV_LAYERS} full-attention layers · head_dim = {HEAD_DIM} · bf16
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.configLine}</div>
       </div>
 
       <div className="space-y-2">
         {ROWS.map((r, i) => {
           const pct = (r.bytes / max) * 100;
+          const rowCopy = copy.rows[i]!;
           return (
             <div key={`row-${i}`} className="space-y-1">
               <div className="flex items-baseline justify-between text-[12px]">
-                <span className="font-mono text-foreground/90">{r.label}</span>
+                <span className="font-mono text-foreground/90">{rowCopy.label}</span>
                 <span className="font-mono text-foreground/80">{formatBytes(r.bytes)}</span>
               </div>
               <div
                 className="relative h-6 w-full overflow-hidden rounded-sm bg-muted/60"
                 role="img"
-                aria-label={`${r.label}: ${formatBytes(r.bytes)}`}
+                aria-label={copy.barAria(rowCopy.label, r.bytes)}
               >
                 <div
                   className={[
@@ -95,21 +158,16 @@ export function MhaVsGqaCacheBar() {
                   }}
                 />
               </div>
-              <div className="text-[11px] text-muted-foreground">{r.detail}</div>
+              <div className="text-[11px] text-muted-foreground">{rowCopy.detail}</div>
             </div>
           );
         })}
       </div>
 
-      <div className="text-[11px] text-muted-foreground">
-        Only the {NUM_KV_LAYERS} full-attention layers keep a KV cache; the other 18 linear layers hold a fixed-size
-        recurrent state, so they don&apos;t grow with context.
-      </div>
+      <div className="text-[11px] text-muted-foreground">{copy.layersNote}</div>
 
       <div className="rounded-md border border-primary/40 bg-primary/5 px-3 py-2 text-[12px] text-foreground/90">
-        GQA is <span className="font-mono">{RATIO.toFixed(1)}×</span> smaller than the equivalent MHA layout —
-        that&apos;s the whole reason it ships in every modern open model. Hidden behind every fast LLM inference is
-        grouped-query attention.
+        {copy.ratioBox}
       </div>
     </div>
   );

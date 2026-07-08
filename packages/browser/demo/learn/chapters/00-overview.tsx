@@ -1,12 +1,14 @@
-import { Link } from '@tanstack/react-router';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import * as React from 'react';
 
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { GenerationLoop } from '../widgets/GenerationLoop';
+import { LineOfBestFit } from '../widgets/LineOfBestFit';
 import { LogitsToSoftmax } from '../widgets/LogitsToSoftmax';
 import { TokenJourney } from '../widgets/TokenJourney';
+import { WeightsVsActivations } from '../widgets/WeightsVsActivations';
 
 /**
  * Chapter 1 (overview) — "What is an LLM?". The top-down on-ramp the course was
@@ -51,8 +53,23 @@ export const learning: ChapterLearningData = {
       definition: 'One evaluation of the model on a token sequence, producing the logits for the next position.',
     },
     {
+      term: 'weights',
+      definition:
+        "The model's 852,985,920 stored numbers — set once during training, then frozen. The same for every request; they ARE the model.",
+    },
+    {
+      term: 'activations',
+      definition:
+        'The intermediate vectors computed fresh for your specific prompt during a forward pass, and discarded when the pass is done.',
+    },
+    {
       term: 'autoregressive',
       definition: 'Generating one token at a time, feeding each output back in as input for the next step.',
+    },
+    {
+      term: 'sampling',
+      definition:
+        'Picking the next token at random, weighted by the softmax probabilities. "Greedy" decoding always takes the single top-scoring token instead.',
     },
     {
       term: 'generation loop',
@@ -124,13 +141,14 @@ export function OverviewChapterBody() {
         <h2>One call: tokens in, a score for every next token</h2>
         <p>
           Concretely, the input is just a list of integers — one id per token, produced by the{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'tokenization' }} search={(prev) => prev}>
+          <ChapterLink chapterId="tokenization">
             tokenizer
-          </Link>{' '}
+          </ChapterLink>{' '}
           — and the output is a big array of decimals, one score per vocabulary word:
         </p>
         <pre>
-          <code>{`tokens: number[]          // a list of integers, one id per token, e.g. [791, 9059, 7731, 389, 279]
+          <code>{`tokens: number[]          // a list of integers, one id per token,
+                          // e.g. [760, 7993, 7338, 383, 279] = "The cat sat on the"
    │
    ▼  one forward pass
 logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — one raw score per vocab word`}</code>
@@ -151,25 +169,75 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — on
           The <em>Sharpen ↔ flatten</em> slider scales the raw logits before the softmax: drag it up and the model
           commits harder to its single top guess (the distribution spikes), drag it down and probability spreads more
           evenly across the options. That is exactly the knob{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'sampling' }} search={(prev) => prev}>
+          <ChapterLink chapterId="sampling">
             <strong>temperature</strong>
-          </Link>{' '}
+          </ChapterLink>{' '}
           tunes when you generate text — here it acts as an inverse temperature (higher = sharper).
+        </p>
+
+        <h2>Two kinds of numbers: weights vs activations</h2>
+        <p>
+          Before going further, separate the numbers involved into two buckets — it makes everything later click. The
+          first bucket is the <strong>weights</strong>: the 852,985,920 stored numbers that <em>are</em> Qwen3.5-0.8B.
+          They were set once, during training, and have been frozen ever since — at inference they are read-only, and
+          they are bit-for-bit identical whether it's your prompt or anyone else's. The second bucket is the{' '}
+          <strong>activations</strong>: the intermediate vectors the forward pass computes <em>for your specific
+          tokens</em> as they flow through the layers. They're born when your request arrives and thrown away the
+          moment the pass finishes. (One sliver survives across loop steps — the{' '}
+          <ChapterLink chapterId="kv-cache">KV cache</ChapterLink> — but that's a within-conversation optimization,
+          not memory of you.)
+        </p>
+        <WeightsVsActivations />
+        <p>
+          The split is also a map of the course: <em>training</em> (the{' '}
+          <ChapterLink chapterId="training">training chapter</ChapterLink>) is the process that changes the left
+          bucket, while <em>inference</em> — everything you'll do in this course — only ever fills and empties the
+          right one. And it explains a fact people find surprising: the model is the same artifact for every user, and
+          it remembers nothing between calls, because nothing your prompt computes is ever written back into the
+          weights.
+        </p>
+
+        <h2>Where do those numbers come from? Fitting, not coding</h2>
+        <p>
+          So where did 852,985,920 specific numbers come from? Not from anyone writing them. Classic software is rules a
+          programmer spells out by hand: <em>if the email contains "free money", mark it as spam.</em> Every behavior is
+          a line of code someone reasoned out and typed. A language model is built the opposite way. Nobody could
+          possibly hand-write a rule for "what word comes next in any sentence" — so instead you start with the numbers
+          at random, show the model mountains of real text, and repeatedly nudge those numbers so its guesses inch
+          closer to what actually came next. The behavior is never spelled out; it is <em>fit</em> to examples. (That
+          fitting process — the <ChapterLink chapterId="training">training chapter</ChapterLink> — is the same idea for
+          every number in the model, no matter which kind of layer it lives in.)
+        </p>
+        <p>
+          The smallest version of this you can hold in your head is a straight line. The line <code>y = a·x + b</code>{' '}
+          has exactly two knobs: the slope <code>a</code> and the intercept <code>b</code>. Give it some scattered
+          example points and "training" just means turning those two dials until the line sits as close to the points as
+          it can:
+        </p>
+        <LineOfBestFit />
+        <p>
+          That is the entire trick, scaled up almost beyond belief. A line has 2 knobs. Qwen3.5-0.8B has{' '}
+          <strong>852,985,920</strong> — about <strong>426 million times</strong> more (852,985,920 ÷ 2 ={' '}
+          426,492,960). Same move, unimaginably more dials: instead of a slope and an intercept bending one line, you are
+          fitting hundreds of millions of numbers so that one enormous function lands close to "the next token humans
+          actually wrote," across nearly everything people have written down.
         </p>
 
         <h2>The generation loop</h2>
         <p>
           A single forward pass gives you one token's worth of prediction. To write a sentence, you call the function in
-          a loop — sample one token, append it, and run again on the slightly longer list:
+          a loop — sample one token, append it, and run again on the slightly longer list. ("Sample" just means: pick
+          one token at random, weighted by its probability — the likeliest token usually wins but doesn't always.
+          "Greedy" mode skips the dice and always takes the top one.)
         </p>
         <GenerationLoop />
         <p>
           This is what "generating text" means: it is <strong>autoregressive</strong>. Each new token is produced by
           re-running the whole model on a sequence that is one token longer than last time. (Re-running everything every
           step sounds wasteful — the{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'kv-cache' }} search={(prev) => prev}>
+          <ChapterLink chapterId="kv-cache">
             KV-cache chapter
-          </Link>{' '}
+          </ChapterLink>{' '}
           is how it's made cheap.)
         </p>
 
@@ -178,12 +246,12 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — on
           Inside that one forward pass, a token's journey is: text → <strong>tokens</strong> → <strong>vectors</strong>{' '}
           (embeddings) → a deep stack of <strong>attention + MLP</strong> blocks → a final{' '}
           <strong>score for every token</strong> (the LM head) → <strong>sample</strong> one → append, and loop. (That
-          "deep stack" is hybrid: only every 4th layer — 6 of its 24 — uses full softmax self-attention; the other 18
-          use a cheaper linear-attention variant, covered in the KV-cache chapter.) Every
+          "deep stack" is hybrid: 6 of the 24 layers use the attention you'll meet in the attention chapter; the other
+          18 use a cheaper shortcut, covered in the KV-cache chapter.) Every
           remaining chapter opens up one of those boxes; the{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'architecture' }} search={(prev) => prev}>
+          <ChapterLink chapterId="architecture">
             architecture chapter
-          </Link>{' '}
+          </ChapterLink>{' '}
           puts them back on one page.
         </p>
         <p>
@@ -202,9 +270,24 @@ logits: Float32Array(${VOCAB.toLocaleString()})   // an array of decimals — on
         <p>
           One honest caveat up front: what we've described is a <em>base model</em> — pure autocomplete. The jump to a
           ChatGPT-style assistant that follows your instructions is a separate <em>training</em> story, covered later in{' '}
-          <Link to="/chapters/$chapterId" params={{ chapterId: 'post-training' }} search={(prev) => prev}>
+          <ChapterLink chapterId="post-training">
             "From base model to assistant."
-          </Link>
+          </ChapterLink>
+        </p>
+        <p>
+          A second honest caveat: how <em>coherent</em> that next-token guessing feels depends heavily on size. More
+          knobs to fit means more of those grammar, fact, and reasoning patterns can be captured — so bigger models
+          tend to stay on-topic for longer. The one running in this course is{' '}
+          <strong>deliberately small — 0.85B parameters, chosen so it can run entirely inside your browser tab.</strong>{' '}
+          It is not a shrunken or out-of-date version of anything: it is Qwen3.5-0.8B, released in 2026, whose 24 layers mix{' '}
+          6 full-attention layers with 18 cheaper <code>GatedDeltaNet</code> layers. But at this size, with no
+          instruction tuning, expect it to <em>wander</em> — start a sentence well, then drift somewhere strange. For a
+          sense of the ladder it sits on: this model is ~0.85B parameters, a small open model might be ~1.5B, and the
+          original GPT-3 was ~175B — roughly 200× larger than the model running here (not the 1.5B one). You can watch our 0.85B model wander, and steer how
+          wildly it does, with the temperature controls in the{' '}
+          <ChapterLink chapterId="sampling">
+            sampling chapter.
+          </ChapterLink>
         </p>
       </Prose>
     </ChapterFrame>

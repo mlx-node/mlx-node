@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
@@ -64,7 +65,67 @@ const CANDIDATES: Record<Angle, { label: string; w: number[] }> = {
 
 const ORDER: Angle[] = ['aligned', 'orthogonal', 'opposed'];
 
+const COPY = {
+  en: {
+    header: 'A logit is an inner product',
+    angleLabels: {
+      aligned: 'Aligned (0°)',
+      orthogonal: 'Orthogonal (90°)',
+      opposed: 'Opposed (180°)',
+    } as Record<Angle, string>,
+    intro: (
+      <>
+        Every vocabulary token owns a row <span className="font-mono">w_t</span> in the output matrix (the tied
+        embedding); its logit is the dot product of that row with the final hidden state{' '}
+        <span className="font-mono">h</span>, and the softmax (shown elsewhere in the course) turns the whole vector of
+        logits into probabilities. All three candidates here have the <strong>same length</strong>{' '}
+        <span className="font-mono">|w| = {C.toFixed(1)}</span>, so the only thing that moves the logit is the{' '}
+        <strong>angle</strong> to <span className="font-mono">h</span>.
+      </>
+    ),
+    perDimLabel: 'Per-dimension contribution h_d · w_d',
+    legendPos: 'positive',
+    legendNeg: 'negative',
+    chartAria: (label: string, products: number[], logit: number) =>
+      `Per-dimension contributions for the ${label} token: ${products
+        .map((p, i) => `dimension ${i} contributes ${p.toFixed(3)}`)
+        .join('; ')}. They sum to the logit ${logit.toFixed(3)}.`,
+    rowTitle: (i: number, h: string, w: string, product: string) => `d=${i} · h=${h} · w=${w} · product=${product}`,
+    sumSuffix: ' — the eight bars above sum to this single score.',
+    footnote: 'Illustrative 8-dimensional toy vectors (the real hidden state is 1024-dim) — not live output from the model.',
+  },
+  zh: {
+    header: 'logit 就是一次内积',
+    angleLabels: {
+      aligned: '同向 (0°)',
+      orthogonal: '正交 (90°)',
+      opposed: '反向 (180°)',
+    } as Record<Angle, string>,
+    intro: (
+      <>
+        词表中的每个 token 在输出矩阵（也就是共享的嵌入矩阵）里都拥有一行{' '}
+        <span className="font-mono">w_t</span>；它的 logit 就是这一行与最后隐藏状态{' '}
+        <span className="font-mono">h</span> 的点积，而 softmax（课程其他地方展示过）会把整个 logits
+        向量变成概率。这里三个候选向量的<strong>长度相同</strong>（
+        <span className="font-mono">|w| = {C.toFixed(1)}</span>），所以唯一能改变 logit 的只有它与{' '}
+        <span className="font-mono">h</span> 的<strong>夹角</strong>。
+      </>
+    ),
+    perDimLabel: '每个维度的贡献 h_d · w_d',
+    legendPos: '正贡献',
+    legendNeg: '负贡献',
+    chartAria: (label: string, products: number[], logit: number) =>
+      `${label} 候选的每维贡献：${products
+        .map((p, i) => `第 ${i} 维贡献 ${p.toFixed(3)}`)
+        .join('；')}。它们加起来等于 logit ${logit.toFixed(3)}。`,
+    rowTitle: (i: number, h: string, w: string, product: string) => `d=${i} · h=${h} · w=${w} · 乘积=${product}`,
+    sumSuffix: '——上面八根柱子加起来就是这一个分数。',
+    footnote: '示意用的 8 维玩具向量（真实隐藏状态是 1024 维）——并非模型的实时输出。',
+  },
+} as const;
+
 export function InnerProductLogit() {
+  const copy = COPY[useLocale()];
   const [angle, setAngle] = React.useState<Angle>('aligned');
   const w = CANDIDATES[angle].w;
 
@@ -82,22 +143,15 @@ export function InnerProductLogit() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">A logit is an inner product</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <SegmentedToggle
           value={angle}
           onChange={setAngle}
-          options={ORDER.map((key) => ({ value: key, label: CANDIDATES[key].label }))}
+          options={ORDER.map((key) => ({ value: key, label: copy.angleLabels[key] }))}
         />
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Every vocabulary token owns a row <span className="font-mono">w_t</span> in the output matrix (the tied
-        embedding); its logit is the dot product of that row with the final hidden state{' '}
-        <span className="font-mono">h</span>, and the softmax (shown elsewhere in the course) turns the whole vector of
-        logits into probabilities. All three candidates here have the <strong>same length</strong>{' '}
-        <span className="font-mono">|w| = {C.toFixed(1)}</span>, so the only thing that moves the logit is the{' '}
-        <strong>angle</strong> to <span className="font-mono">h</span>.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
       <MathDisplay
         latex={String.raw`\text{logit}_t = h \cdot w_t = \sum_d h_d\, w_{t,d} = \lVert h\rVert\,\lVert w_t\rVert\cos\theta`}
@@ -109,23 +163,21 @@ export function InnerProductLogit() {
           legible without color. The bars sum to the logit shown below. */}
       <div className="space-y-1">
         <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-          <span>Per-dimension contribution h_d · w_d</span>
+          <span>{copy.perDimLabel}</span>
           <span className="flex items-center gap-3">
             <span className="flex items-center gap-1">
               <span className="inline-block h-2 w-2 rounded-sm" style={{ backgroundColor: POS_BG }} aria-hidden />
-              positive
+              {copy.legendPos}
             </span>
             <span className="flex items-center gap-1">
               <span className="inline-block h-2 w-2 rounded-sm" style={{ backgroundColor: NEG_BG }} aria-hidden />
-              negative
+              {copy.legendNeg}
             </span>
           </span>
         </div>
         <div
           role="img"
-          aria-label={`Per-dimension contributions for the ${CANDIDATES[angle].label} token: ${products
-            .map((p, i) => `dimension ${i} contributes ${p.toFixed(3)}`)
-            .join('; ')}. They sum to the logit ${logit.toFixed(3)}.`}
+          aria-label={copy.chartAria(copy.angleLabels[angle], products, logit)}
           className="space-y-1 rounded-md border border-border/60 bg-muted/20 p-2"
         >
           {products.map((p, i) => {
@@ -135,7 +187,7 @@ export function InnerProductLogit() {
               <div
                 key={i}
                 className="grid grid-cols-[2.5rem_minmax(0,1fr)_3.75rem] items-center gap-2 text-[11px]"
-                title={`d=${i} · h=${H[i]!.toFixed(2)} · w=${w[i]!.toFixed(3)} · product=${p.toFixed(3)}`}
+                title={copy.rowTitle(i, H[i]!.toFixed(2), w[i]!.toFixed(3), p.toFixed(3))}
               >
                 <span className="font-mono text-muted-foreground">d{i}</span>
                 {/* Two equal halves meeting at a center baseline; the active
@@ -176,7 +228,7 @@ export function InnerProductLogit() {
           {logit >= 0 ? '+' : ''}
           {logit.toFixed(3)}
         </span>
-        <span className="text-muted-foreground"> — the eight bars above sum to this single score.</span>
+        <span className="text-muted-foreground">{copy.sumSuffix}</span>
       </div>
 
       {/* Angle / cosine readout: connects the sum to |h|·|w|·cos θ. */}
@@ -196,9 +248,7 @@ export function InnerProductLogit() {
         </span>
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative 8-dimensional toy vectors (the real hidden state is 1024-dim) — not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

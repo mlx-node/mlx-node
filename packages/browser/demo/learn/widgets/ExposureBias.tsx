@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 13 (Training) supplement — exposure bias, the reason inference drifts.
  *
@@ -54,7 +56,80 @@ function freeRunCells(count: number): Cell[] {
   }));
 }
 
+// Per-locale copy — every user-visible English string moved here verbatim.
+// Model tokens (' mat', ' couch') stay English in both locales.
+const COPY = {
+  en: {
+    title: 'Exposure bias — why inference drifts',
+    pause: '❚❚ Pause',
+    play: '▶ Play',
+    stepCounter: (s: number, total: number) => `step ${s}/${total}`,
+    laneATitle: 'Teacher forcing (training)',
+    laneANote: 'next input = true token',
+    laneBTitle: 'Free-running (inference)',
+    laneBNote: 'next input = own prediction',
+    start: '(start)',
+    divergenceLabel: 'Divergence:',
+    divergence: (
+      <>
+        model predicted{' '}
+        <span className="font-mono text-rose-700 dark:text-rose-300">{renderToken(FREE_RUN[DIVERGE_STEP]!)}</span> —
+        training would have force-fed{' '}
+        <span className="font-mono text-emerald-700 dark:text-emerald-300">
+          {renderToken(REFERENCE[DIVERGE_STEP]!)}
+        </span>
+        . Now off-reference, the next tokens drift further.
+      </>
+    ),
+    notYet: 'Both lanes track the reference so far — the model has not yet had to recover from one of its own choices.',
+    scripted: 'Illustrative — the divergence is scripted, not live output from the model.',
+    summary: (
+      <>
+        Teacher forcing means training <em>never</em> lets the model see its own mistakes: at every position the input
+        is the true previous token. But at inference the model must consume its <em>own</em> outputs, so one off-gold
+        choice shifts the context onto a path it was never trained on, and small errors compound into drift. That gap
+        between the teacher-forced training distribution and the free-running inference distribution is{' '}
+        <strong>exposure bias</strong>.
+      </>
+    ),
+  },
+  zh: {
+    title: '曝光偏差（exposure bias）——推理为什么会跑偏',
+    pause: '❚❚ 暂停',
+    play: '▶ 播放',
+    stepCounter: (s: number, total: number) => `第 ${s}/${total} 步`,
+    laneATitle: 'Teacher forcing（训练）',
+    laneANote: '下一个输入 = 真实 token',
+    laneBTitle: '自由生成（推理）',
+    laneBNote: '下一个输入 = 自己的预测',
+    start: '（起点）',
+    divergenceLabel: '分叉：',
+    divergence: (
+      <>
+        模型预测了{' '}
+        <span className="font-mono text-rose-700 dark:text-rose-300">{renderToken(FREE_RUN[DIVERGE_STEP]!)}</span>
+        ——而训练时会强制喂入{' '}
+        <span className="font-mono text-emerald-700 dark:text-emerald-300">
+          {renderToken(REFERENCE[DIVERGE_STEP]!)}
+        </span>
+        。一旦偏离参考序列，后续 token 就越漂越远。
+      </>
+    ),
+    notYet: '到目前为止，两条通道都贴着参考序列——模型还没有被迫从自己的某个选择中恢复。',
+    scripted: '仅为示意——这处分叉是预先写好的脚本，不是模型的实时输出。',
+    summary: (
+      <>
+        Teacher forcing 意味着训练<em>从不</em>让模型看到自己的错误：每个位置的输入都是真实的前一个
+        token。但推理时模型必须消费自己的<em>输出</em>
+        ，于是一次偏离真实答案的选择就把上下文带上一条它从未被训练过的路径，小错误不断累积成漂移。teacher forcing
+        下的训练分布与自由生成的推理分布之间的这道鸿沟，就是<strong>exposure bias（曝光偏差）</strong>。
+      </>
+    ),
+  },
+} as const;
+
 export function ExposureBias() {
+  const copy = COPY[useLocale()];
   const [step, setStep] = React.useState(0);
   const [playing, setPlaying] = React.useState(() =>
     typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
@@ -77,9 +152,7 @@ export function ExposureBias() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Exposure bias — why inference drifts
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <div className="inline-flex items-center gap-2">
           <button
             type="button"
@@ -87,10 +160,10 @@ export function ExposureBias() {
             aria-pressed={playing}
             className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
-            {playing ? '❚❚ Pause' : '▶ Play'}
+            {playing ? copy.pause : copy.play}
           </button>
           <span className="font-mono text-[11px] text-muted-foreground">
-            step {Math.min(revealed, TOTAL_STEPS)}/{TOTAL_STEPS}
+            {copy.stepCounter(Math.min(revealed, TOTAL_STEPS), TOTAL_STEPS)}
           </span>
         </div>
       </div>
@@ -98,8 +171,8 @@ export function ExposureBias() {
       {/* Lane A — teacher forcing: always force-fed the gold token. */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Teacher forcing (training)</span>
-          <span className="text-[10px] text-muted-foreground">next input = true token</span>
+          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneATitle}</span>
+          <span className="text-[10px] text-muted-foreground">{copy.laneANote}</span>
         </div>
         <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
           {goldCells.map((t, i) => (
@@ -110,7 +183,7 @@ export function ExposureBias() {
               {renderToken(t)}
             </span>
           ))}
-          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">(start)</span> : null}
+          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span> : null}
           <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
             ▮
           </span>
@@ -120,8 +193,8 @@ export function ExposureBias() {
       {/* Lane B — free-running inference: feeds its own predictions back in. */}
       <div className="space-y-1">
         <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">Free-running (inference)</span>
-          <span className="text-[10px] text-muted-foreground">next input = own prediction</span>
+          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.laneBTitle}</span>
+          <span className="text-[10px] text-muted-foreground">{copy.laneBNote}</span>
         </div>
         <div className="flex min-h-9 flex-wrap items-center gap-1 rounded-md border border-border/60 bg-muted/30 p-2">
           {freeCells.map((c, i) => (
@@ -137,7 +210,7 @@ export function ExposureBias() {
               {renderToken(c.text)}
             </span>
           ))}
-          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">(start)</span> : null}
+          {revealed === 0 ? <span className="font-mono text-[11px] text-muted-foreground/60">{copy.start}</span> : null}
           <span className="ml-0.5 font-mono text-[11px] text-muted-foreground" aria-hidden>
             ▮
           </span>
@@ -156,32 +229,18 @@ export function ExposureBias() {
         {diverged ? (
           <>
             <span className={atDivergence ? 'font-semibold text-rose-700 dark:text-rose-300' : 'text-foreground/90'}>
-              Divergence:
+              {copy.divergenceLabel}
             </span>{' '}
-            model predicted{' '}
-            <span className="font-mono text-rose-700 dark:text-rose-300">{renderToken(FREE_RUN[DIVERGE_STEP]!)}</span> —
-            training would have force-fed{' '}
-            <span className="font-mono text-emerald-700 dark:text-emerald-300">
-              {renderToken(REFERENCE[DIVERGE_STEP]!)}
-            </span>
-            . Now off-reference, the next tokens drift further.
+            {copy.divergence}
           </>
         ) : (
-          'Both lanes track the reference so far — the model has not yet had to recover from one of its own choices.'
+          copy.notYet
         )}
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — the divergence is scripted, not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.scripted}</p>
 
-      <p className="text-[12px] text-foreground/85">
-        Teacher forcing means training <em>never</em> lets the model see its own mistakes: at every position the input
-        is the true previous token. But at inference the model must consume its <em>own</em> outputs, so one off-gold
-        choice shifts the context onto a path it was never trained on, and small errors compound into drift. That gap
-        between the teacher-forced training distribution and the free-running inference distribution is{' '}
-        <strong>exposure bias</strong>.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.summary}</p>
     </div>
   );
 }

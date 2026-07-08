@@ -1,4 +1,6 @@
 import { CHAPTERS } from '../../learn/chapters';
+import { useUiStrings } from '../../learn/i18n/ui-react';
+import { LanguageSwitcher } from '../LanguageSwitcher';
 import { DriftingLibrary } from './DriftingLibrary';
 
 export type LandingProps = {
@@ -27,48 +29,56 @@ export function Landing({
   loadDisabled = false,
   modelReady = false,
 }: LandingProps) {
+  const ui = useUiStrings();
+
   const primaryLabel =
     hostedModelAvailable === false ? (
-      'Choose Local Model'
+      ui.landing.chooseLocalModel
     ) : modelReady ? (
-      <>Open Chat →</>
+      <>{ui.landing.openChat}</>
     ) : (
-      <>
-        Load Model (<span>{MODEL_LABEL}</span>)
-      </>
+      <>{ui.landing.loadModel(MODEL_LABEL)}</>
     );
 
   return (
     <div className="overlay-screen">
       <DriftingLibrary />
+      {/* Language switcher pinned to the top-right corner — the landing has no
+          header bar, so this floats above the hero like the footer floats below. */}
+      <div className="absolute right-5 top-5 z-20">
+        <LanguageSwitcher />
+      </div>
       <div className="landing-content">
-        <div className="landing-tag">Real LLM · 100% Local · WebGPU</div>
+        <div className="landing-tag">{ui.landing.tag}</div>
         <h1 className="landing-title">
-          How LLMs <em>Work</em>
+          {ui.landing.heroTitlePre}
+          <em>{ui.landing.heroTitleEm}</em>
+          {ui.landing.heroTitlePost}
         </h1>
         <p className="landing-sub">
-          Run a real 0.8B language model (Qwen3.5) entirely in your browser, then learn exactly how it works —
-          layer by layer. No server, no API keys — powered by <code>@mlx-node/browser</code> and WebGPU.
+          {ui.landing.heroSubBeforeCode}
+          <code>@mlx-node/browser</code>
+          {ui.landing.heroSubAfterCode}
         </p>
 
-        <div className="landing-void-ad" aria-label="Hosted on Void Platform">
-          <span className="landing-void-eyebrow">Hosted on</span>
-          <span className="landing-void-mark">Void Platform</span>
-          <span className="landing-void-copy">Edge assets · WebGPU isolation</span>
+        <div className="landing-void-ad" aria-label={ui.landing.voidAdAria}>
+          <span className="landing-void-eyebrow">{ui.landing.voidEyebrow}</span>
+          <span className="landing-void-mark">{ui.landing.voidMark}</span>
+          <span className="landing-void-copy">{ui.landing.voidCopy}</span>
         </div>
 
         <div className="landing-specs">
           <div className="spec">
-            <div className="spec-value">0.8B params</div>
-            <div className="spec-label">Qwen3.5 · runs live</div>
+            <div className="spec-value">{ui.landing.specParams}</div>
+            <div className="spec-label">{ui.landing.specParamsLabel}</div>
           </div>
           <div className="spec">
-            <div className="spec-value">{CHAPTERS.length} chapters</div>
-            <div className="spec-label">Interactive course</div>
+            <div className="spec-value">{ui.landing.specChapters(CHAPTERS.length)}</div>
+            <div className="spec-label">{ui.landing.specChaptersLabel}</div>
           </div>
           <div className="spec">
-            <div className="spec-value">100% local</div>
-            <div className="spec-label">WebGPU · no server</div>
+            <div className="spec-value">{ui.landing.specLocal}</div>
+            <div className="spec-label">{ui.landing.specLocalLabel}</div>
           </div>
         </div>
 
@@ -79,13 +89,13 @@ export function Landing({
             onClick={onLoad}
             disabled={loadDisabled || hostedModelAvailable === null}
           >
-            {hostedModelAvailable === null ? 'Checking Model...' : primaryLabel}
+            {hostedModelAvailable === null ? ui.landing.checkingModel : primaryLabel}
           </button>
           <button
             type="button"
             className="btn-load-arrow"
-            title="Choose local model directory"
-            aria-label="Choose local model directory"
+            title={ui.landing.localPickerTitle}
+            aria-label={ui.landing.localPickerTitle}
             onClick={onLocalModel}
             disabled={loadDisabled}
           >
@@ -94,11 +104,9 @@ export function Landing({
         </div>
 
         <button type="button" className="btn-start-learning" onClick={onStartLearning}>
-          Start learning →
+          {ui.landing.startLearning}
         </button>
-        <p className="landing-learn-hint">
-          New to LLMs? Step through {CHAPTERS.length} chapters that explain how this model actually works.
-        </p>
+        <p className="landing-learn-hint">{ui.landing.learnHint(CHAPTERS.length)}</p>
 
         {errorBanner && (
           <div className="error-banner" style={{ marginTop: 24 }}>
@@ -107,13 +115,13 @@ export function Landing({
         )}
       </div>
 
-      <img className="landing-mascot" src="/capybara.png" alt="Capybara mascot" />
+      <img className="landing-mascot" src="/capybara.png" alt={ui.landing.mascotAlt} />
 
       <div className="landing-footer">
-        Built with <code>@mlx-node/browser</code>
-        <span className="landing-footer-void">Hosted on Void</span>
+        {ui.landing.builtWith} <code>@mlx-node/browser</code>
+        <span className="landing-footer-void">{ui.landing.hostedOnVoid}</span>
         <span className="local-link" onClick={onLocalModel}>
-          Local model…
+          {ui.landing.localModelLink}
         </span>
       </div>
     </div>

@@ -1191,6 +1191,7 @@ pub fn array_from_gpu_buffer(
         crate::array::DType::BFloat16 => 2, // bfloat16
         crate::array::DType::Int32 => 3,    // int32
         crate::array::DType::Uint32 => 4,   // uint32
+        crate::array::DType::Int8 => 5,     // int8
         crate::array::DType::Uint8 => 6,    // uint8
     };
 

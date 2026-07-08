@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { Button } from '../../components/ui/button';
+import { useLocale } from '../../lib/i18n-react';
 
 /**
  * Chapter 4 supplement — visualize the multi-head concat step.
@@ -33,7 +34,97 @@ function headColor(i: number, alpha = 0.7): string {
   return `oklch(0.7 0.13 ${hue} / ${alpha})`;
 }
 
+// Per-locale copy: every user-visible string lives here so /zh localizes while
+// the English output stays byte-identical.
+const COPY = {
+  en: {
+    header: (
+      <>
+        Concat heads → project with W<sub>O</sub>
+      </>
+    ),
+    replay: 'Replay animation',
+    intro: (
+      <>
+        Each of the <span className="font-mono">{H}</span> heads produces a slice of shape{' '}
+        <span className="font-mono">
+          [seq_len, d_head] = [{SEQ_LEN}, {D_HEAD}]
+        </span>
+        . We stack them side-by-side along the feature axis to recover a{' '}
+        <span className="font-mono">
+          [{SEQ_LEN}, {CONCAT_DIM}]
+        </span>{' '}
+        matrix, then project by the learned output matrix{' '}
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        back to the <span className="font-mono">{HIDDEN}</span>-dim residual stream. Heads don't talk to each other
+        inside attention — they only mix afterward, here.
+      </>
+    ),
+    svgAria: 'Multi-head concat diagram',
+    headLabel: (i: number) => `head ${i}`,
+    eachShape: `[seq=${SEQ_LEN}, d_head=${D_HEAD}] each`,
+    concatLabel: `concat · [seq=${SEQ_LEN}, ${H} × ${D_HEAD} = ${CONCAT_DIM}]`,
+    footer: (
+      <>
+        Color = head identity. In the concat block each color owns a fixed band of{' '}
+        <span className="font-mono">{D_HEAD}</span> feature dimensions;{' '}
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        is the only place head outputs ever mix. This is also why <em>cross-head</em> reasoning is shallow — anything
+        heads have to share has to be encoded through the residual stream across multiple layers. Widths here are
+        schematic for legibility — Qwen3.5-0.8B actually uses 8 heads of head-dim 256 (concat 8 × 256 = 2048), projected
+        back to the 1024-dim residual stream.
+      </>
+    ),
+  },
+  zh: {
+    header: (
+      <>
+        拼接各头 → 用 W<sub>O</sub> 投影
+      </>
+    ),
+    replay: '重播动画',
+    intro: (
+      <>
+        <span className="font-mono">{H}</span> 个头各产出一片形状为{' '}
+        <span className="font-mono">
+          [seq_len, d_head] = [{SEQ_LEN}, {D_HEAD}]
+        </span>{' '}
+        的切片。我们沿特征轴把它们并排堆起来，得到一个{' '}
+        <span className="font-mono">
+          [{SEQ_LEN}, {CONCAT_DIM}]
+        </span>{' '}
+        矩阵，再用学到的输出矩阵{' '}
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        投影回 <span className="font-mono">{HIDDEN}</span>{' '}
+        维的残差流。注意力内部各头之间互不交流——它们只在之后、也就是这里混合。
+      </>
+    ),
+    svgAria: '多头拼接示意图',
+    headLabel: (i: number) => `头 ${i}`,
+    eachShape: `每个 [seq=${SEQ_LEN}, d_head=${D_HEAD}]`,
+    concatLabel: `拼接 · [seq=${SEQ_LEN}, ${H} × ${D_HEAD} = ${CONCAT_DIM}]`,
+    footer: (
+      <>
+        颜色 = 头的身份。在拼接块中，每种颜色占据一条固定的 <span className="font-mono">{D_HEAD}</span> 维特征带；
+        <span className="font-mono">
+          W<sub>O</sub>
+        </span>{' '}
+        是各头输出唯一发生混合的地方。这也是<em>跨头</em>
+        推理浅薄的原因——头与头之间要共享的任何信息，都得跨多层经由残差流编码。这里的宽度只为易读而示意——Qwen3.5-0.8B
+        实际使用 8 个 head_dim 为 256 的头（拼接 8 × 256 = 2048），再投影回 1024 维的残差流。
+      </>
+    ),
+  },
+} as const;
+
 export function MultiheadConcat() {
+  const copy = COPY[useLocale()];
   // Replay key — bumping it remounts the animated svg so the slide-in
   // restarts. Lets the user re-play the animation on demand.
   const [playKey, setPlayKey] = React.useState(0);
@@ -59,37 +150,15 @@ export function MultiheadConcat() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Concat heads → project with W<sub>O</sub>
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <Button size="sm" variant="outline" onClick={() => setPlayKey((k) => k + 1)} className="text-[11px]">
-          Replay animation
+          {copy.replay}
         </Button>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Each of the <span className="font-mono">{H}</span> heads produces a slice of shape{' '}
-        <span className="font-mono">
-          [seq_len, d_head] = [{SEQ_LEN}, {D_HEAD}]
-        </span>
-        . We stack them side-by-side along the feature axis to recover a{' '}
-        <span className="font-mono">
-          [{SEQ_LEN}, {CONCAT_DIM}]
-        </span>{' '}
-        matrix, then project by the learned output matrix{' '}
-        <span className="font-mono">
-          W<sub>O</sub>
-        </span>{' '}
-        back to the <span className="font-mono">{HIDDEN}</span>-dim residual stream. Heads don't talk to each other
-        inside attention — they only mix afterward, here.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
-      <svg
-        viewBox={`0 0 ${W} ${totalH}`}
-        className="block h-auto w-full"
-        role="img"
-        aria-label="Multi-head concat diagram"
-      >
+      <svg viewBox={`0 0 ${W} ${totalH}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         <defs>
           <marker id="mh-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
             <path d="M 0 0 L 10 5 L 0 10 Z" fill="currentColor" opacity={0.55} />
@@ -133,7 +202,7 @@ export function MultiheadConcat() {
                 fill="currentColor"
                 fillOpacity={0.55}
               >
-                head {i}
+                {copy.headLabel(i)}
               </text>
             </g>
           );
@@ -144,7 +213,7 @@ export function MultiheadConcat() {
           {''}
         </text>
         <text x={W - 8} y={TOP_Y + HEAD_H / 2 + 3} fontSize={9} textAnchor="end" fill="currentColor" fillOpacity={0.5}>
-          [seq={SEQ_LEN}, d_head={D_HEAD}] each
+          {copy.eachShape}
         </text>
 
         {/* slide arrows from each head down into the concat slot */}
@@ -203,7 +272,7 @@ export function MultiheadConcat() {
           fill="currentColor"
           fillOpacity={0.8}
         >
-          concat · [seq={SEQ_LEN}, {H} × {D_HEAD} = {CONCAT_DIM}]
+          {copy.concatLabel}
         </text>
 
         {/* × W_O step */}
@@ -304,17 +373,7 @@ export function MultiheadConcat() {
         </text>
       </svg>
 
-      <div className="text-[11px] text-muted-foreground">
-        Color = head identity. In the concat block each color owns a fixed band of{' '}
-        <span className="font-mono">{D_HEAD}</span> feature dimensions;{' '}
-        <span className="font-mono">
-          W<sub>O</sub>
-        </span>{' '}
-        is the only place head outputs ever mix. This is also why <em>cross-head</em> reasoning is shallow — anything
-        heads have to share has to be encoded through the residual stream across multiple layers. Widths here are
-        schematic for legibility — Qwen3.5-0.8B actually uses 8 heads of head-dim 256 (concat 8 × 256 = 2048), projected
-        back to the 1024-dim residual stream.
-      </div>
+      <div className="text-[11px] text-muted-foreground">{copy.footer}</div>
     </div>
   );
 }

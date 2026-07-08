@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
@@ -59,7 +60,125 @@ const COLORS = [
 const ATTN_COLOR = 'oklch(0.7 0.16 60)'; // warm orange
 const MLP_COLOR = 'oklch(0.62 0.18 300)'; // purple
 
+const COPY = {
+  en: {
+    header: 'The residual stream — one vector, written into 2× per layer',
+    addOption: 'Add (h += Δ)',
+    overwriteOption: 'Overwrite (h = new)',
+    pause: 'Pause',
+    play: 'Play',
+    prevStepAria: 'Previous step',
+    nextStepAria: 'Next step',
+    addIntro: (
+      <>
+        The hidden state for one token, drawn as a column that grows as each sub-block writes a correction into it.
+        Attention writes from the left, MLP writes from the right. Nothing ever overwrites — every operation is{' '}
+        <code>h := h + Δ</code>. Two layers shown; Qwen3.5-0.8B does this 24 times.
+      </>
+    ),
+    overwriteIntro: (
+      <>
+        In this mode each sub-block <strong>replaces</strong> the stream — <code>h := Δ</code> — so the running state
+        is thrown away every write. Watch the column fail to climb.
+      </>
+    ),
+    svgAria: 'Residual stream animation',
+    entryLabel: 'entry — h₀',
+    stepPrefix: (step: number) => `Step ${step}: `,
+    nextTokenLabel: 'next token sampled →',
+    stepLabels: STEP_LABELS.map((s) => s.label),
+    overwriteStepLabels: OVERWRITE_STEP_LABELS,
+    addOutro: (
+      <>
+        Three things to notice. First, the stream never gets <em>narrower</em> — there is no operation in the layer
+        that subtracts or replaces. Second, the same column is read and written by every sub-block; it's a single
+        running address space the whole network shares. Third, the LM head at the top reads the <em>top</em> of the
+        stream — every layer's contribution is visible to the final prediction, not just the last one.
+      </>
+    ),
+    overwriteOutro: (
+      <>
+        This is a deliberately destructive toy — a pure <code>h := Δ</code> that throws the old state away on every
+        write, so the column never accumulates. Real non-residual networks aren&apos;t this extreme (they transform
+        the state, <code>h := F(h)</code>), but they still give up what the residual stream buys for free: a clean
+        identity path, every layer&apos;s contribution preserved by addition, and stable gradients straight back to
+        the input. That is why real transformers <em>add</em> (<code>h += Δ</code>) instead of replacing.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative — heights are a synthetic stand-in for the residual-stream magnitude; Qwen3.5-0.8B does this 24
+        times. Not live output from the model.
+      </>
+    ),
+  },
+  zh: {
+    header: '残差流——同一个向量，每层被写入 2 次',
+    addOption: '相加 (h += Δ)',
+    overwriteOption: '覆盖 (h = new)',
+    pause: '暂停',
+    play: '播放',
+    prevStepAria: '上一步',
+    nextStepAria: '下一步',
+    addIntro: (
+      <>
+        这是单个 token
+        的隐藏状态，画成一根柱子：每个子块向它写入一次修正，柱子随之长高。注意力从左侧写入，MLP
+        从右侧写入。从来没有任何操作会覆盖它——每次操作都是 <code>h := h + Δ</code>。图中只画了两层；Qwen3.5-0.8B
+        会做 24 次。
+      </>
+    ),
+    overwriteIntro: (
+      <>
+        在这个模式里，每个子块都<strong>替换</strong>整条流——<code>h := Δ</code>
+        ——运行中的状态在每次写入时都被丢弃。看看柱子是怎么爬不上去的。
+      </>
+    ),
+    svgAria: '残差流动画',
+    entryLabel: '入口——h₀',
+    stepPrefix: (step: number) => `第 ${step} 步：`,
+    nextTokenLabel: '采样下一个 token →',
+    stepLabels: [
+      'h₀  (嵌入 + RoPE)',
+      'h₁ = h₀ + attn(norm(h₀))',
+      'h₂ = h₁ + mlp(norm(h₁))',
+      'h₃ = h₂ + attn(norm(h₂))',
+      'h₄ = h₃ + mlp(norm(h₃))',
+      'lm_head(h₄) → logits',
+    ],
+    overwriteStepLabels: [
+      'h₀  (嵌入 + RoPE)',
+      'h₁ = attn(norm(h₀))',
+      'h₂ = mlp(norm(h₁))',
+      'h₃ = attn(norm(h₂))',
+      'h₄ = mlp(norm(h₃))',
+      'lm_head(h₄) → logits',
+    ],
+    addOutro: (
+      <>
+        有三点值得注意。第一，这条流从不会变<em>窄</em>
+        ——层里没有任何做减法或替换的操作。第二，每个子块读写的都是同一根柱子；它是整张网络共享的一段运行地址空间。第三，顶部的
+        LM head 读取的是流的<em>顶端</em>——每一层的贡献对最终预测都可见，而不只是最后一层。
+      </>
+    ),
+    overwriteOutro: (
+      <>
+        这是一个故意做坏的玩具——纯粹的 <code>h := Δ</code>
+        ，每次写入都把旧状态扔掉，所以柱子永远积累不起来。真实的非残差网络没有这么极端（它们会变换状态，
+        <code>h := F(h)</code>），但它们同样失去了残差流免费带来的东西：一条干净的恒等通路、每一层的贡献都靠加法保留、以及一路直达输入的稳定梯度。这就是真实的
+        transformer 选择<em>相加</em>（<code>h += Δ</code>）而不是替换的原因。
+      </>
+    ),
+    footnote: (
+      <>
+        示意图——柱高只是残差流幅度的合成替身；Qwen3.5-0.8B 会做 24 次。并非模型的实时输出。
+      </>
+    ),
+  },
+} as const;
+
 export function ResidualStream() {
+  const copy = COPY[useLocale()];
   const [step, setStep] = React.useState(0);
   const [playing, setPlaying] = React.useState(() =>
     typeof window !== 'undefined' ? !window.matchMedia('(prefers-reduced-motion: reduce)').matches : true,
@@ -109,16 +228,14 @@ export function ResidualStream() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          The residual stream — one vector, written into 2× per layer
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <div className="inline-flex items-center gap-2">
           <SegmentedToggle
             value={mode}
             onChange={setMode}
             options={[
-              { value: 'add', label: 'Add (h += Δ)' },
-              { value: 'overwrite', label: 'Overwrite (h = new)' },
+              { value: 'add', label: copy.addOption },
+              { value: 'overwrite', label: copy.overwriteOption },
             ]}
           />
           <button
@@ -127,7 +244,7 @@ export function ResidualStream() {
             className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
             aria-pressed={playing}
           >
-            {playing ? 'Pause' : 'Play'}
+            {playing ? copy.pause : copy.play}
           </button>
           <button
             type="button"
@@ -136,7 +253,7 @@ export function ResidualStream() {
               setStep((s) => (s - 1 + (STEP_LABELS.length + 1)) % (STEP_LABELS.length + 1));
             }}
             className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
-            aria-label="Previous step"
+            aria-label={copy.prevStepAria}
           >
             ◀
           </button>
@@ -147,7 +264,7 @@ export function ResidualStream() {
               setStep((s) => (s + 1) % (STEP_LABELS.length + 1));
             }}
             className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
-            aria-label="Next step"
+            aria-label={copy.nextStepAria}
           >
             ▶
           </button>
@@ -155,19 +272,12 @@ export function ResidualStream() {
       </div>
 
       {mode === 'add' ? (
-        <p className="text-[12px] text-foreground/85">
-          The hidden state for one token, drawn as a column that grows as each sub-block writes a correction into it.
-          Attention writes from the left, MLP writes from the right. Nothing ever overwrites — every operation is{' '}
-          <code>h := h + Δ</code>. Two layers shown; Qwen3.5-0.8B does this 24 times.
-        </p>
+        <p className="text-[12px] text-foreground/85">{copy.addIntro}</p>
       ) : (
-        <p className="text-[12px] text-foreground/85">
-          In this mode each sub-block <strong>replaces</strong> the stream — <code>h := Δ</code> — so the running state
-          is thrown away every write. Watch the column fail to climb.
-        </p>
+        <p className="text-[12px] text-foreground/85">{copy.overwriteIntro}</p>
       )}
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label="Residual stream animation">
+      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* baseline ticks for h0..h4 */}
         {heights.map((h, i) => {
           const y = baseY - h * 5;
@@ -222,7 +332,7 @@ export function ResidualStream() {
           strokeWidth={1}
         />
         <text x={streamX} y={baseY + 18} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.5}>
-          entry — h₀
+          {copy.entryLabel}
         </text>
 
         {/* Sub-block side write arrows. We mark them visible/active based on
@@ -337,37 +447,23 @@ export function ResidualStream() {
       </svg>
 
       <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-[12px]">
-        <span className="text-muted-foreground">Step {step}: </span>
+        <span className="text-muted-foreground">{copy.stepPrefix(step)}</span>
         <span className="font-mono text-foreground/95">
           {step < STEP_LABELS.length
             ? mode === 'add'
-              ? STEP_LABELS[step]!.label
-              : OVERWRITE_STEP_LABELS[step]!
-            : 'next token sampled →'}
+              ? copy.stepLabels[step]!
+              : copy.overwriteStepLabels[step]!
+            : copy.nextTokenLabel}
         </span>
       </div>
 
       {mode === 'add' ? (
-        <p className="text-[11px] text-muted-foreground">
-          Three things to notice. First, the stream never gets <em>narrower</em> — there is no operation in the layer
-          that subtracts or replaces. Second, the same column is read and written by every sub-block; it's a single
-          running address space the whole network shares. Third, the LM head at the top reads the <em>top</em> of the
-          stream — every layer's contribution is visible to the final prediction, not just the last one.
-        </p>
+        <p className="text-[11px] text-muted-foreground">{copy.addOutro}</p>
       ) : (
-        <p className="text-[11px] text-muted-foreground">
-          This is a deliberately destructive toy — a pure <code>h := Δ</code> that throws the old state away on every
-          write, so the column never accumulates. Real non-residual networks aren&apos;t this extreme (they transform
-          the state, <code>h := F(h)</code>), but they still give up what the residual stream buys for free: a clean
-          identity path, every layer&apos;s contribution preserved by addition, and stable gradients straight back to
-          the input. That is why real transformers <em>add</em> (<code>h += Δ</code>) instead of replacing.
-        </p>
+        <p className="text-[11px] text-muted-foreground">{copy.overwriteOutro}</p>
       )}
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — heights are a synthetic stand-in for the residual-stream magnitude; Qwen3.5-0.8B does this 24
-        times. Not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

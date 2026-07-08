@@ -138,7 +138,7 @@ impl DecoderLayer {
             AttentionType::Full(attn) => {
                 let _ = tape_sink;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, mask, kvc, position_ids)?
+                attn.forward(&normed, mask, kvc, position_ids, 0)?
             }
         };
 
@@ -206,8 +206,12 @@ impl DecoderLayer {
                     }
                 };
                 let normed = self.input_layernorm.forward(x)?;
-                // `position_ids` carries M-RoPE positions for an image-bearing
-                // prefill; `None` keeps the scalar-offset text path.
+                // The branch's paged attention takes the scalar-offset text
+                // path only; M-RoPE positions / mrope cache are not threaded
+                // through `forward_paged` on this backend.
+                let _ = position_ids;
+                let _ = rope_position_offset;
+                let _ = mrope_cache;
                 let attn_out = attn.forward_paged(
                     &normed,
                     adapter,
@@ -215,9 +219,6 @@ impl DecoderLayer {
                     first_logical_position,
                     cached_prefix_len,
                     is_prefill,
-                    position_ids,
-                    rope_position_offset,
-                    mrope_cache,
                 )?;
                 let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;

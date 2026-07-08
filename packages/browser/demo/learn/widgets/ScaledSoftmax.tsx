@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { TopKBars } from '../inspector/TopKBars';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 
@@ -35,6 +36,83 @@ const D_STOPS = [4, 16, 64, 256];
 const KEY_IDS = UNIT_SCORES.map((_, i) => i);
 const KEY_TEXTS = UNIT_SCORES.map((_, i) => `key ${i}`);
 
+// Per-locale copy. English strings are moved verbatim from the original JSX.
+// "key 0"… bar labels and the mono "top =" readout stay English in both
+// locales (math-adjacent identifiers).
+const COPY = {
+  en: {
+    heading: 'Why divide by √d_k',
+    sub: 'Same key alignments, swept across head_dim',
+    dimLabel: (d: number, sqrtD: number) => (
+      <>
+        head_dim <span className="font-mono text-foreground/85">d_k = {d}</span> (
+        <span className="font-mono">√d_k = {sqrtD}</span>)
+      </>
+    ),
+    ariaValue: (d: number) => `head dimension ${d}`,
+    withoutLabel: 'without ÷√d',
+    withLabel: 'with ÷√d',
+    unscaledCaption: (
+      <>
+        softmax(<span className="font-mono">U · √d</span>) — peaks higher as <span className="font-mono">d</span>{' '}
+        grows; near one-hot at 256.
+      </>
+    ),
+    scaledCaption: (
+      <>
+        softmax(<span className="font-mono">U · √d / √d</span>) = softmax(<span className="font-mono">U</span>) —{' '}
+        <strong>identical at every</strong> <span className="font-mono">d</span>.
+      </>
+    ),
+    mainPara: (
+      <>
+        As <span className="font-mono">d_k</span> grows, a random dot product&apos;s spread grows like{' '}
+        <span className="font-mono">√d_k</span>, so the <strong>unscaled</strong> scores blow up and softmax collapses
+        toward one key — vanishing gradients. Dividing by <span className="font-mono">√d_k</span> cancels exactly that
+        growth, so the <strong>scaled</strong> distribution is unchanged by the head width.{' '}
+        <strong>Qwen3.5-0.8B uses head_dim = 256</strong>, so it divides every score by{' '}
+        <span className="font-mono">√256 = 16</span>.
+      </>
+    ),
+    footnote: 'Illustrative — the six key alignments are fixed synthetic numbers scaled by √d, not live output from the model.',
+  },
+  zh: {
+    heading: '为什么要除以 √d_k',
+    sub: '相同的 key 对齐分数，沿 head_dim 扫一遍',
+    dimLabel: (d: number, sqrtD: number) => (
+      <>
+        head_dim <span className="font-mono text-foreground/85">d_k = {d}</span>（
+        <span className="font-mono">√d_k = {sqrtD}</span>）
+      </>
+    ),
+    ariaValue: (d: number) => `头维度 ${d}`,
+    withoutLabel: '不除以 √d',
+    withLabel: '除以 √d',
+    unscaledCaption: (
+      <>
+        softmax(<span className="font-mono">U · √d</span>)——随 <span className="font-mono">d</span>{' '}
+        增大峰值越来越高；到 256 时接近 one-hot。
+      </>
+    ),
+    scaledCaption: (
+      <>
+        softmax(<span className="font-mono">U · √d / √d</span>) = softmax(<span className="font-mono">U</span>)——在每个{' '}
+        <span className="font-mono">d</span> 下都<strong>完全相同</strong>。
+      </>
+    ),
+    mainPara: (
+      <>
+        随着 <span className="font-mono">d_k</span> 增大，随机点积的离散程度按 <span className="font-mono">√d_k</span>{' '}
+        增长，于是<strong>未缩放</strong>的分数会爆掉，softmax 坍缩到单个 key 上——梯度消失。除以{' '}
+        <span className="font-mono">√d_k</span> 恰好抵消这一增长，所以<strong>缩放后</strong>
+        的分布不随头宽变化。<strong>Qwen3.5-0.8B 的 head_dim = 256</strong>，所以它把每个分数都除以{' '}
+        <span className="font-mono">√256 = 16</span>。
+      </>
+    ),
+    footnote: '仅作示意——六个 key 的对齐分数是固定的合成数字，按 √d 放大，并非模型的实时输出。',
+  },
+} as const;
+
 function softmax(values: number[]): number[] {
   const max = Math.max(...values);
   const exps = values.map((v) => Math.exp(v - max));
@@ -43,6 +121,7 @@ function softmax(values: number[]): number[] {
 }
 
 export function ScaledSoftmax() {
+  const copy = COPY[useLocale()];
   const [dIdx, setDIdx] = React.useState(D_STOPS.length - 1); // default 256
   const d = D_STOPS[dIdx]!;
   const sqrtD = Math.sqrt(d);
@@ -62,16 +141,15 @@ export function ScaledSoftmax() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">Why divide by √d_k</div>
-        <div className="text-[11px] text-muted-foreground">Same key alignments, swept across head_dim</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.heading}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.sub}</div>
       </div>
 
       <MathDisplay latex={String.raw`\text{softmax}\!\left(\dfrac{QK^\top}{\sqrt{d_k}}\right)`} />
 
       <div className="space-y-1">
         <label htmlFor="scaled-softmax-d" className="block text-xs text-muted-foreground">
-          head_dim <span className="font-mono text-foreground/85">d_k = {d}</span> (
-          <span className="font-mono">√d_k = {sqrtD}</span>)
+          {copy.dimLabel(d, sqrtD)}
         </label>
         <input
           id="scaled-softmax-d"
@@ -83,7 +161,7 @@ export function ScaledSoftmax() {
           onChange={(e) => setDIdx(Number(e.target.value))}
           className="w-full accent-primary"
           list="scaled-softmax-stops"
-          aria-valuetext={`head dimension ${d}`}
+          aria-valuetext={copy.ariaValue(d)}
         />
         <datalist id="scaled-softmax-stops">
           {D_STOPS.map((stop, i) => (
@@ -100,40 +178,25 @@ export function ScaledSoftmax() {
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
         <div className="space-y-1">
           <div className="flex items-baseline justify-between text-[11px]">
-            <span className="font-medium text-foreground/85">without ÷√d</span>
+            <span className="font-medium text-foreground/85">{copy.withoutLabel}</span>
             <span className="font-mono text-muted-foreground">top = {unscaledTop.toFixed(3)}</span>
           </div>
           <TopKBars ids={KEY_IDS} probs={unscaled} texts={KEY_TEXTS} sampledTokenId={-1} runKey={runKey} />
-          <p className="text-[11px] text-muted-foreground">
-            softmax(<span className="font-mono">U · √d</span>) — peaks higher as <span className="font-mono">d</span>{' '}
-            grows; near one-hot at 256.
-          </p>
+          <p className="text-[11px] text-muted-foreground">{copy.unscaledCaption}</p>
         </div>
         <div className="space-y-1">
           <div className="flex items-baseline justify-between text-[11px]">
-            <span className="font-medium text-foreground/85">with ÷√d</span>
+            <span className="font-medium text-foreground/85">{copy.withLabel}</span>
             <span className="font-mono text-muted-foreground">top = {scaledTop.toFixed(3)}</span>
           </div>
           <TopKBars ids={KEY_IDS} probs={scaled} texts={KEY_TEXTS} sampledTokenId={-1} runKey={runKey} />
-          <p className="text-[11px] text-muted-foreground">
-            softmax(<span className="font-mono">U · √d / √d</span>) = softmax(<span className="font-mono">U</span>) —{' '}
-            <strong>identical at every</strong> <span className="font-mono">d</span>.
-          </p>
+          <p className="text-[11px] text-muted-foreground">{copy.scaledCaption}</p>
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        As <span className="font-mono">d_k</span> grows, a random dot product&apos;s spread grows like{' '}
-        <span className="font-mono">√d_k</span>, so the <strong>unscaled</strong> scores blow up and softmax collapses
-        toward one key — vanishing gradients. Dividing by <span className="font-mono">√d_k</span> cancels exactly that
-        growth, so the <strong>scaled</strong> distribution is unchanged by the head width.{' '}
-        <strong>Qwen3.5-0.8B uses head_dim = 256</strong>, so it divides every score by{' '}
-        <span className="font-mono">√256 = 16</span>.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.mainPara}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — the six key alignments are fixed synthetic numbers scaled by √d, not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

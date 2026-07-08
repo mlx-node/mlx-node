@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Small SVG line chart showing KV-cache memory as a function of context
  * length, log-scaled on X. Three curves — MHA hypothetical, GQA every
@@ -24,6 +26,47 @@ const LINEAR_STATE_BYTES = LINEAR_NUM_HEADS * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM 
 const X_TICKS = [1024, 4096, 16384, 65536, 262144];
 const X_MIN = X_TICKS[0]!;
 const X_MAX = X_TICKS[X_TICKS.length - 1]!;
+
+// Per-locale copy. COPY.en is the original English, moved verbatim.
+const COPY = {
+  en: {
+    title: 'KV cache growth · log-log',
+    subtitle: 'Whole-model bytes vs context length',
+    svgAria:
+      'Three KV-cache memory curves vs context length, log-log scale: MHA hypothetical, GQA every layer, and Qwen3.5 hybrid.',
+    xAxis: 'context length (tokens, log scale)',
+    legendMha: 'MHA hypothetical',
+    legendGqa: 'GQA every layer',
+    legendHybrid: 'Hybrid (Qwen3.5 actual)',
+    def2: '— keys and values are stored separately.',
+    defKvHeads: '— the number of K/V heads per layer (after GQA grouping).',
+    defD: (
+      <>
+        — the per-head dimension <code>head_dim</code>.
+      </>
+    ),
+    defSeq: '— context length in tokens (the X axis above).',
+    defBf16: '— 2 bytes per float in the cache.',
+  },
+  zh: {
+    title: 'KV 缓存增长 · log-log',
+    subtitle: '整个模型的字节数 vs 上下文长度',
+    svgAria: '三条 KV 缓存内存随上下文长度变化的曲线（log-log 刻度）：MHA 假想、GQA 全层、Qwen3.5 混合。',
+    xAxis: '上下文长度（token，对数刻度）',
+    legendMha: 'MHA 假想',
+    legendGqa: 'GQA 全层',
+    legendHybrid: '混合（Qwen3.5 实际）',
+    def2: '——key 和 value 分开存储。',
+    defKvHeads: '——每层的 K/V 头数（GQA 分组之后）。',
+    defD: (
+      <>
+        ——每个头的维度 <code>head_dim</code>。
+      </>
+    ),
+    defSeq: '——以 token 计的上下文长度（即上图的 X 轴）。',
+    defBf16: '——缓存中每个浮点数占 2 字节。',
+  },
+} as const;
 
 function mhaBytes(seqLen: number): number {
   return NUM_LAYERS * 2 * NUM_HEADS * HEAD_DIM * seqLen * BYTES_PER_FLOAT;
@@ -71,6 +114,7 @@ const INNER_W = WIDTH - PAD_LEFT - PAD_RIGHT;
 const INNER_H = HEIGHT - PAD_TOP - PAD_BOTTOM;
 
 export function KvGrowthCurve() {
+  const copy = COPY[useLocale()];
   const samples = React.useMemo(logSpace, []);
   const yMaxBytes = mhaBytes(X_MAX);
   const yMinBytes = Math.max(1024, hybridBytes(X_MIN));
@@ -105,14 +149,14 @@ export function KvGrowthCurve() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">KV cache growth · log-log</div>
-        <div className="text-[11px] text-muted-foreground">Whole-model bytes vs context length</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.subtitle}</div>
       </div>
 
       <svg
         viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
         role="img"
-        aria-label="Three KV-cache memory curves vs context length, log-log scale: MHA hypothetical, GQA every layer, and Qwen3.5 hybrid."
+        aria-label={copy.svgAria}
         className="block h-auto w-full"
       >
         {yTicks.map((b, idx) => {
@@ -146,7 +190,7 @@ export function KvGrowthCurve() {
           fill="currentColor"
           fillOpacity={0.55}
         >
-          context length (tokens, log scale)
+          {copy.xAxis}
         </text>
 
         <path d={mhaPath} fill="none" stroke="#94a3b8" strokeWidth={1.5} strokeDasharray="4 3" />
@@ -156,10 +200,10 @@ export function KvGrowthCurve() {
 
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
         <LegendDot color="#94a3b8" dashed>
-          MHA hypothetical
+          {copy.legendMha}
         </LegendDot>
-        <LegendDot color="#f59e0b">GQA every layer</LegendDot>
-        <LegendDot color="#22c55e">Hybrid (Qwen3.5 actual)</LegendDot>
+        <LegendDot color="#f59e0b">{copy.legendGqa}</LegendDot>
+        <LegendDot color="#22c55e">{copy.legendHybrid}</LegendDot>
       </div>
 
       <div className="rounded-md border border-border/60 bg-muted/20 p-2 font-mono text-[11px] leading-relaxed text-foreground/85">
@@ -175,20 +219,19 @@ export function KvGrowthCurve() {
 
       <div className="space-y-1 text-[11px] text-muted-foreground">
         <div>
-          <span className="font-mono text-foreground/80">2</span> — keys and values are stored separately.
+          <span className="font-mono text-foreground/80">2</span> {copy.def2}
         </div>
         <div>
-          <span className="font-mono text-foreground/80">kv_heads</span> — the number of K/V heads per layer (after GQA
-          grouping).
+          <span className="font-mono text-foreground/80">kv_heads</span> {copy.defKvHeads}
         </div>
         <div>
-          <span className="font-mono text-foreground/80">d</span> — the per-head dimension <code>head_dim</code>.
+          <span className="font-mono text-foreground/80">d</span> {copy.defD}
         </div>
         <div>
-          <span className="font-mono text-foreground/80">seq</span> — context length in tokens (the X axis above).
+          <span className="font-mono text-foreground/80">seq</span> {copy.defSeq}
         </div>
         <div>
-          <span className="font-mono text-foreground/80">bf16</span> — 2 bytes per float in the cache.
+          <span className="font-mono text-foreground/80">bf16</span> {copy.defBf16}
         </div>
       </div>
     </div>

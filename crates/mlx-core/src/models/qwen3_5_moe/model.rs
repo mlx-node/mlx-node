@@ -470,6 +470,80 @@ pub(crate) enum Qwen35MoeCmd {
     },
 }
 
+/// Lift a model-neutral [`crate::engine::cmd::TrainCmd`] into this family's
+/// flat thread-command variants. All training variants are `full`-only.
+#[cfg(feature = "full")]
+impl crate::engine::cmd::FromTrainCmd for Qwen35MoeCmd {
+    fn from_train(cmd: crate::engine::cmd::TrainCmd) -> Self {
+        use crate::engine::cmd::TrainCmd;
+        match cmd {
+            TrainCmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            } => Qwen35MoeCmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            },
+            TrainCmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            } => Qwen35MoeCmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            },
+            TrainCmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            } => Qwen35MoeCmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            },
+            TrainCmd::BumpSkippedStep { reply } => Qwen35MoeCmd::BumpSkippedStep { reply },
+            TrainCmd::SetTrainingStep { step, reply } => {
+                Qwen35MoeCmd::SetTrainingStep { step, reply }
+            }
+            TrainCmd::ResetTraining { reply } => Qwen35MoeCmd::ResetTraining { reply },
+            TrainCmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            } => Qwen35MoeCmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            },
+            TrainCmd::SaveOptimizerState { path, reply } => {
+                Qwen35MoeCmd::SaveOptimizerState { path, reply }
+            }
+            TrainCmd::LoadOptimizerState { path, reply } => {
+                Qwen35MoeCmd::LoadOptimizerState { path, reply }
+            }
+        }
+    }
+}
+
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
     match cmd {
@@ -2170,6 +2244,7 @@ impl Qwen35MoeInner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -2386,6 +2461,7 @@ impl Qwen35MoeInner {
                             &embedding_weight_pure,
                             &layer_kinds,
                             adapter_mut,
+                            self.cached_rope_deltas.unwrap_or(0),
                         )?;
                         logits.squeeze(Some(&[1]))?
                     }
@@ -2412,6 +2488,7 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 logits.squeeze(Some(&[1]))?
             };
@@ -2887,6 +2964,7 @@ impl Qwen35MoeInner {
                 &embedding_weight,
                 &layer_kinds,
                 adapter,
+                self.cached_rope_deltas.unwrap_or(0),
             )?
         };
 
@@ -3147,6 +3225,7 @@ impl Qwen35MoeInner {
                             &embedding_weight_pure,
                             &layer_kinds,
                             adapter_mut,
+                            self.cached_rope_deltas.unwrap_or(0),
                         )?;
                         if let Some(start) = fallback_trace_start {
                             decode_forward_ms += elapsed_ms(start);
@@ -3178,6 +3257,7 @@ impl Qwen35MoeInner {
                     &embedding_weight,
                     &layer_kinds,
                     adapter,
+                    self.cached_rope_deltas.unwrap_or(0),
                 )?;
                 if let Some(start) = forward_trace_start {
                     decode_forward_ms += elapsed_ms(start);
@@ -5377,7 +5457,7 @@ impl Qwen35MoeInner {
             }
         }
 
-        let params_clone: HashMap<String, MxArray> =
+        let mut params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Weights metadata (reference sidecar)
@@ -5425,7 +5505,7 @@ impl Qwen35MoeInner {
             "format": "mlx-node",
             "version": "1.0"
         }));
-        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &mut params_clone, metadata)?;
         info!("Saved weights.safetensors");
 
         let weights_str = serde_json::to_string_pretty(&weights_json)?;

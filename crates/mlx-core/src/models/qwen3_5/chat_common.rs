@@ -146,8 +146,10 @@ pub(crate) fn build_synthetic_user_message(user: &str) -> ChatMessage {
         content: user.to_string(),
         tool_calls: None,
         tool_call_id: None,
+        is_error: None,
         reasoning_content: None,
         images: None,
+        audio: None,
     }
 }
 
@@ -443,6 +445,12 @@ pub(crate) fn compute_performance_metrics(
         } else {
             0.0
         },
+        mtp_mean_accepted_tokens: None,
+        mtp_mean_accepted_tokens_total: None,
+        mtp_acceptance_by_position: None,
+        mtp_cycles: None,
+        mtp_mean_depth: None,
+        profile_phases: None,
     })
 }
 

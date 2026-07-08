@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 
 /**
@@ -57,7 +58,78 @@ function formatSigned(value: number, digits = 3): string {
   return value.toFixed(digits);
 }
 
+// Per-locale copy: every user-visible string lives here so /zh localizes while
+// the English output stays byte-identical.
+const COPY = {
+  en: {
+    header: 'SiLU vs ReLU — the soft gate',
+    range: 'z ∈ [−6, 6]',
+    svgAria:
+      'SiLU and ReLU activation curves over z from negative six to six. SiLU is a smooth curve that dips slightly negative near z = -1.278 before rising; ReLU is hard-zero for negative z and linear for positive z.',
+    sliderLabel: 'Input z',
+    gapLabel: 'gap (SiLU − ReLU)',
+    negativeBox: (zText: string, siluText: string) => (
+      <>
+        At <span className="font-mono">z = {zText}</span> (negative), ReLU hard-zeros to{' '}
+        <span className="font-mono">0.000</span>, but SiLU leaks{' '}
+        <span className="font-mono text-primary">{siluText}</span> — the <strong>soft gate</strong> still passes a
+        little signal.
+      </>
+    ),
+    nonNegativeBox: (zText: string) => (
+      <>
+        At <span className="font-mono">z = {zText}</span> (non-negative), both curves are close — but SiLU curves
+        smoothly through the origin while ReLU has a hard kink at <span className="font-mono">z = 0</span>.
+      </>
+    ),
+    body: (
+      <>
+        SiLU is smooth and dips slightly negative near <span className="font-mono">z = 0</span> (minimum ≈{' '}
+        <span className="font-mono">−0.278</span> at <span className="font-mono">z ≈ −1.278</span>) — a soft gate — so
+        gradients keep flowing for small negative inputs, unlike ReLU&apos;s hard zero. Qwen3.5-0.8B uses SiLU inside
+        its SwiGLU MLP.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative — SiLU and ReLU are plotted from their exact formulas; Qwen3.5-0.8B&apos;s MLP uses SiLU. Not live
+        output from the model.
+      </>
+    ),
+  },
+  zh: {
+    header: 'SiLU vs ReLU——软门',
+    range: 'z ∈ [−6, 6]',
+    svgAria:
+      'z 从 -6 到 6 的 SiLU 与 ReLU 激活曲线。SiLU 是一条平滑曲线，在 z = -1.278 附近先轻微下探到负值再上升；ReLU 在 z 为负时硬归零，z 为正时是线性。',
+    sliderLabel: '输入 z',
+    gapLabel: '差值（SiLU − ReLU）',
+    negativeBox: (zText: string, siluText: string) => (
+      <>
+        在 <span className="font-mono">z = {zText}</span>（负值）处，ReLU 硬归零到{' '}
+        <span className="font-mono">0.000</span>，而 SiLU 仍漏过{' '}
+        <span className="font-mono text-primary">{siluText}</span>——<strong>软门</strong>依然放行一点信号。
+      </>
+    ),
+    nonNegativeBox: (zText: string) => (
+      <>
+        在 <span className="font-mono">z = {zText}</span>（非负）处，两条曲线很接近——但 SiLU 平滑地穿过原点，而 ReLU 在{' '}
+        <span className="font-mono">z = 0</span> 处有一个硬拐点。
+      </>
+    ),
+    body: (
+      <>
+        SiLU 平滑，并在 <span className="font-mono">z = 0</span> 附近轻微下探到负值（最低 ≈{' '}
+        <span className="font-mono">−0.278</span>，位于 <span className="font-mono">z ≈ −1.278</span>
+        ）——一道软门——因此小的负输入仍有梯度流动，不像 ReLU 那样硬归零。Qwen3.5-0.8B 在它的 SwiGLU MLP 里用的就是 SiLU。
+      </>
+    ),
+    footnote: <>示意——SiLU 与 ReLU 按精确公式绘制；Qwen3.5-0.8B 的 MLP 使用 SiLU。不是模型的实时输出。</>,
+  },
+} as const;
+
 export function SiluVsRelu() {
+  const copy = COPY[useLocale()];
   const [z, setZ] = React.useState(-1);
 
   const siluPath = React.useMemo(() => pathFor(silu), []);
@@ -77,18 +149,13 @@ export function SiluVsRelu() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">SiLU vs ReLU — the soft gate</div>
-        <div className="text-[11px] text-muted-foreground">z ∈ [−6, 6]</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.range}</div>
       </div>
 
       <MathDisplay latex={String.raw`\mathrm{SiLU}(z)=z\,\sigma(z)=\dfrac{z}{1+e^{-z}}`} />
 
-      <svg
-        viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-        role="img"
-        aria-label="SiLU and ReLU activation curves over z from negative six to six. SiLU is a smooth curve that dips slightly negative near z = -1.278 before rising; ReLU is hard-zero for negative z and linear for positive z."
-        className="block h-auto w-full"
-      >
+      <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} role="img" aria-label={copy.svgAria} className="block h-auto w-full">
         {/* y = 0 axis */}
         <line x1={PAD_LEFT} x2={WIDTH - PAD_RIGHT} y1={zeroY} y2={zeroY} stroke="currentColor" strokeOpacity={0.18} />
         {/* x = 0 axis */}
@@ -146,7 +213,7 @@ export function SiluVsRelu() {
       <div className="space-y-1">
         <div className="flex items-center justify-between text-xs text-muted-foreground">
           <label htmlFor="silu-vs-relu-z" className="uppercase tracking-wider">
-            Input z
+            {copy.sliderLabel}
           </label>
           <span className="font-mono text-foreground/80">z = {z.toFixed(1)}</span>
         </div>
@@ -166,7 +233,7 @@ export function SiluVsRelu() {
       <div className="grid grid-cols-3 gap-2 text-[12px]">
         <Readout label="SiLU(z)" value={formatSigned(siluZ)} accent />
         <Readout label="ReLU(z)" value={formatSigned(reluZ)} />
-        <Readout label="gap (SiLU − ReLU)" value={formatSigned(gap)} />
+        <Readout label={copy.gapLabel} value={formatSigned(gap)} />
       </div>
 
       <div
@@ -177,32 +244,12 @@ export function SiluVsRelu() {
             : 'border-border bg-muted/20 text-foreground/85',
         ].join(' ')}
       >
-        {isNegative ? (
-          <>
-            At <span className="font-mono">z = {z.toFixed(1)}</span> (negative), ReLU hard-zeros to{' '}
-            <span className="font-mono">0.000</span>, but SiLU leaks{' '}
-            <span className="font-mono text-primary">{formatSigned(siluZ)}</span> — the <strong>soft gate</strong> still
-            passes a little signal.
-          </>
-        ) : (
-          <>
-            At <span className="font-mono">z = {z.toFixed(1)}</span> (non-negative), both curves are close — but SiLU
-            curves smoothly through the origin while ReLU has a hard kink at <span className="font-mono">z = 0</span>.
-          </>
-        )}
+        {isNegative ? copy.negativeBox(z.toFixed(1), formatSigned(siluZ)) : copy.nonNegativeBox(z.toFixed(1))}
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        SiLU is smooth and dips slightly negative near <span className="font-mono">z = 0</span> (minimum ≈{' '}
-        <span className="font-mono">−0.278</span> at <span className="font-mono">z ≈ −1.278</span>) — a soft gate — so
-        gradients keep flowing for small negative inputs, unlike ReLU&apos;s hard zero. Qwen3.5-0.8B uses SiLU inside
-        its SwiGLU MLP.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.body}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — SiLU and ReLU are plotted from their exact formulas; Qwen3.5-0.8B&apos;s MLP uses SiLU. Not live
-        output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

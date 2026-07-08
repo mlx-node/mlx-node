@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "browser-preview",
+      "runtimeExecutable": "yarn",
+      "runtimeArgs": ["workspace", "@mlx-node/browser", "preview"],
+      "port": 4173
+    }
+  ]
+}

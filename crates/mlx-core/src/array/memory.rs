@@ -636,6 +636,51 @@ pub fn check_memory_safety(required_mb: f64) -> (bool, String) {
     (is_safe, msg)
 }
 
+/// Default cadence for clearing MLX's cache during privacy-filter classify calls.
+pub const PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT: i32 = 8;
+
+/// Effective cadence — `MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL` env override
+/// or [`PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT`]. Read once and cached.
+pub fn privacy_filter_cache_clear_interval() -> i32 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<i32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_privacy_filter_cache_clear_interval(
+            std::env::var("MLX_PRIVACY_FILTER_CACHE_CLEAR_INTERVAL").ok(),
+        )
+    })
+}
+
+/// Pure parser for the privacy-filter cache-clear-interval env value.
+fn parse_privacy_filter_cache_clear_interval(env_value: Option<String>) -> i32 {
+    match env_value {
+        Some(s) => s
+            .trim()
+            .parse::<i32>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or(PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT),
+        None => PRIVACY_FILTER_CACHE_CLEAR_INTERVAL_DEFAULT,
+    }
+}
+
+/// Pure predicate: should call `call_number` (1-indexed) trigger a clear?
+fn should_clear_for_privacy_filter_call(call_number: i64, interval: i32) -> bool {
+    interval > 0 && call_number % i64::from(interval) == 0
+}
+
+/// Clear MLX's caching allocator on every Nth `classify()` call. Keeps its own
+/// process-wide counter (shared across every loaded `PrivacyFilterModel`).
+#[inline]
+pub fn maybe_clear_cache_for_privacy_filter_call() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static CALLS: AtomicI64 = AtomicI64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_clear_for_privacy_filter_call(n, privacy_filter_cache_clear_interval()) {
+        clear_cache();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

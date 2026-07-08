@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
-use crate::models::qwen3_5::persistence_common::{
+use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
 use crate::tokenizer::Qwen3Tokenizer;
@@ -62,6 +62,27 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
 
     // Gemma4 HF configs wrap text params in a `text_config` sub-dict
     let text_cfg = raw.get("text_config");
+
+    // Unified checkpoint detection (model_type `gemma4_unified` or the unified
+    // architecture string). Gates the encoder-free unified vision + audio paths.
+    let is_unified = raw.get("model_type").and_then(|v| v.as_str()) == Some("gemma4_unified")
+        || raw
+            .get("architectures")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            == Some("Gemma4UnifiedForConditionalGeneration");
+
+    // Audio is enabled ONLY for a unified checkpoint whose `audio_config` is a
+    // real (non-null) sub-dict, so non-unified gemma4 stays inert.
+    let has_audio = is_unified && raw.get("audio_config").is_some_and(|ac| !ac.is_null());
+
+    // `text_config.use_bidirectional_attention` (parsed for a stable struct
+    // surface; the text-only decode path does not read it).
+    let use_bidirectional_attention = text_cfg
+        .and_then(|tc| tc.get("use_bidirectional_attention"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // Helper to read EOS token IDs (can be int or array)
     let eos_token_ids = if let Some(tc) = text_cfg {
@@ -137,6 +158,8 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
         },
         // HF config uses `attention_k_eq_v` (not `k_is_v`)
         attention_k_eq_v: get_config_bool(&raw, text_cfg, &["attention_k_eq_v"], false),
+        is_unified,
+        use_bidirectional_attention,
         final_logit_softcapping: {
             let v = get_config_f64(&raw, text_cfg, &["final_logit_softcapping"], 0.0);
             if v > 0.0 { Some(v) } else { None }
@@ -173,10 +196,23 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             if v > 0 { Some(v) } else { None }
         },
 
-        // Vision fields — only present when config.json contains a vision_config sub-dict
-        vision_config: raw
-            .get("vision_config")
-            .map(super::vision_config::Gemma4VisionConfig::from_json),
+        // Vision fields — only present when config.json contains a vision_config sub-dict.
+        // The unified checkpoint's `vision_config` has a different (non-SigLIP) shape so
+        // we leave the dense parser unset and load the unified model as text-only.
+        vision_config: if is_unified {
+            None
+        } else {
+            raw.get("vision_config")
+                .map(super::vision_config::Gemma4VisionConfig::from_json)
+        },
+        // The unified checkpoint's encoder-free vision path parses the same
+        // `vision_config` sub-dict into its own struct.
+        unified_vision_config: if is_unified {
+            raw.get("vision_config")
+                .map(super::unified_vision_config::UnifiedVisionConfig::from_json)
+        } else {
+            None
+        },
         image_token_id: raw
             .get("image_token_id")
             .and_then(|v| v.as_i64())
@@ -193,6 +229,40 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
             .get("vision_soft_tokens_per_image")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+
+        // Audio fields — gated on `has_audio` (unified + non-null `audio_config`)
+        // so every non-unified gemma4 stays inert (all None).
+        has_audio,
+        audio_token_id: if has_audio {
+            raw.get("audio_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        boa_token_id: if has_audio {
+            raw.get("boa_token_id")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        // The end-of-audio token is stored under `eoa_token_index`.
+        eoa_token_id: if has_audio {
+            raw.get("eoa_token_index")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
+        audio_samples_per_token: if has_audio {
+            raw.get("audio_config")
+                .and_then(|ac| ac.get("audio_samples_per_token"))
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32)
+        } else {
+            None
+        },
 
         // Paged-attention knobs — opt-in, default to None so existing
         // checkpoints without these keys load unchanged.

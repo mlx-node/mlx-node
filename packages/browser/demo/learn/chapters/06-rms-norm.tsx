@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import type { AttentionRun, HiddenStatePointStats, HiddenStateStep } from '../../../src/inspector-types';
 import { Textarea } from '../../components/ui/textarea';
+import { useLocale } from '../../lib/i18n-react';
 import { runForInspector } from '../../lib/inspector-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
@@ -104,7 +105,7 @@ export const learning: ChapterLearningData = {
   chapterId: 'rmsnorm',
   objective: 'Explain what RMSNorm does to a hidden vector and why pre-norm makes deep transformers trainable.',
   problem:
-    "Each layer adds attention and MLP outputs back into the same residual stream — without normalization the magnitudes drift across 24 layers, softmaxes saturate, and training breaks. RMSNorm's whole job is to put the brakes on.",
+    "Each layer adds its token-mixer (attention or GatedDeltaNet) output and MLP output back into the same residual stream — without normalization the magnitudes drift across 24 layers, softmaxes saturate, and training breaks. RMSNorm's whole job is to put the brakes on.",
   minutes: 7,
   glossary: [
     {
@@ -126,6 +127,11 @@ export const learning: ChapterLearningData = {
       term: 'post-norm',
       definition:
         'The original 2017 transformer pattern: residual first, norm last. Easier to interpret, much harder to train deeply.',
+    },
+    {
+      term: 'variance / std',
+      definition:
+        'Variance = the average squared distance from the mean. Std (standard deviation) = the square root of the variance. LayerNorm divides by std; RMSNorm skips the mean entirely.',
     },
     {
       term: 'L2 norm',
@@ -150,7 +156,7 @@ export const learning: ChapterLearningData = {
   ],
   exercise: {
     prompt:
-      "After the auto-run, use the Layer selector to flip between layer 0 and layer 22. Compare the L2/tok numbers for 'Pre-attention norm input' vs 'Pre-attention norm output'. How does each value change with depth, and which one stays roughly constant?",
+      "After the auto-run, use the Layer selector to flip between layer 0 and layer 22. Compare the L2/tok numbers for 'Input RMSNorm input' vs 'Input RMSNorm output'. How does each value change with depth, and which one stays roughly constant?",
     answer:
       'The input L2/tok grows substantially with depth (residual additions accumulate), while the output L2/tok stays in the same order of magnitude (close to sqrt(1024) ≈ 32, modulated by the learned gain). That stability across depth is exactly the job of the norm.',
   },
@@ -229,8 +235,9 @@ export function RmsNormChapterBody() {
       <Prose>
         <h1>RMSNorm: keeping activations in check</h1>
         <p>
-          <strong>One sentence:</strong> each of Qwen3.5's 24 layers adds attention and MLP outputs back into the same
-          residual stream — without something holding magnitudes in check, the hidden vector grows until softmaxes
+          <strong>One sentence:</strong> each of Qwen3.5's 24 layers adds its token-mixer (attention or GatedDeltaNet)
+          output and MLP output back into the same residual stream — without something holding magnitudes in check,
+          the hidden vector grows until softmaxes
           saturate and gradient updates stop being meaningful. RMSNorm is the cheap, almost-stateless trick that puts
           the brakes on. The chart on the right shows a real prompt: the residual still climbs roughly an order of
           magnitude over depth (visible bottom line), but the input to each sub-block is held flat near √hidden_dim by
@@ -252,6 +259,13 @@ export function RmsNormChapterBody() {
         <MathDisplay
           latex={String.raw`\begin{aligned} \text{RMS}(x) &= \sqrt{\text{mean}(x^2) + \varepsilon} \\ y_i &= \frac{x_i}{\text{RMS}(x)} \cdot g_i \end{aligned}`}
         />
+        <p>
+          Work it once by hand with four numbers (ε is too small to matter, and g = 1 before training). Take{' '}
+          <code>x = [2, −1, 3, 0]</code>. Square each entry: <code>x² = [4, 1, 9, 0]</code>. Mean:{' '}
+          <code>(4 + 1 + 9 + 0) / 4 = 3.5</code>. So <code>RMS = √3.5 ≈ 1.87</code>, and dividing gives{' '}
+          <code>y ≈ [1.07, −0.53, 1.60, 0]</code>. Big entries shrink, the zero stays zero, and the vector keeps its
+          shape — only its size changes.
+        </p>
         <p>
           Here <code>ε</code> (epsilon) is a tiny constant so we never divide by zero, and the learned gain{' '}
           <code>g</code> is the only parameter the normalizer carries — one scalar per feature, length equal to{' '}
@@ -291,8 +305,11 @@ y = (x - mean(x)) / sqrt(var(x) + ε) * g + b
    subtract mean first        plus learned bias`}</code>
         </pre>
         <p>
-          Dropping the mean-subtraction and bias is the entire difference. Llama, Mistral, Qwen, DeepSeek — every open
-          LLM you'll meet uses RMSNorm; the simpler formula is empirically a wash on quality and modestly faster to run.
+          Two words in that LayerNorm line, since the demo&apos;s stat boxes use them too: <code>var(x)</code> — the{' '}
+          <strong>variance</strong> — is the average squared distance from the mean, and <strong>std</strong> (standard
+          deviation) is its square root. Dropping the mean-subtraction and bias is the entire difference. Llama,
+          Mistral, Qwen, DeepSeek — every open LLM you'll meet uses RMSNorm; the simpler formula is empirically a wash
+          on quality and modestly faster to run.
         </p>
 
         <h2>Pre-norm vs. post-norm</h2>
@@ -302,6 +319,13 @@ y = (x - mean(x)) / sqrt(var(x) + ε) * g + b
           (the 2017 original) places the norm <em>on</em> the residual highway — fine for 6 layers, painful at 24.
         </p>
         <NormFlowDiagram />
+
+        <p>
+          Why does post-norm get painful at depth? A norm doesn&apos;t just rescale the activations flowing forward — it
+          also rescales the learning signal flowing <em>backward</em> during training. With post-norm that signal passes
+          through a norm in every one of the 24 layers, and 24 small rescalings multiply up into a big one.
+          Pre-norm&apos;s identity path skips all 24.
+        </p>
 
         <h2>What the demo shows you</h2>
         <p>
@@ -368,6 +392,7 @@ function formatNumber(value: number, digits = 3): string {
 }
 
 export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
+  const locale = useLocale();
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
@@ -534,6 +559,15 @@ export function RmsNormDemo({ workerRef, abortRef }: RmsNormDemoProps) {
 
   return (
     <div className="space-y-4">
+      {locale === 'zh' ? (
+        <div
+          lang="zh-CN"
+          className="not-prose rounded-md border border-border bg-muted/40 px-3 py-2 text-[13px] text-muted-foreground"
+        >
+          此互动演示的界面文字尚未翻译为中文，以下内容显示为英文。
+          <span lang="en"> · This demo's UI text has not been translated yet; it is shown in English.</span>
+        </div>
+      ) : null}
       <div className="space-y-2">
         <label htmlFor="rms-norm-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
@@ -1093,7 +1127,8 @@ function ScaleInvariancePlayground() {
       </div>
       <div className="text-[10px] text-muted-foreground/80">
         Note: we use g = 1 here for clarity. Real models multiply each output element by a learned scalar g<sub>i</sub>{' '}
-        — that reweights features but never changes the cosine.
+        — that reweights features and, in general, DOES rotate the direction slightly (the cosine = 1.0000 you see
+        above is specific to this g = 1 demo, not to real trained models).
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { TopKBars, renderTokenDisplay } from '../inspector/TopKBars';
 
 /**
@@ -28,7 +29,47 @@ import { TopKBars, renderTokenDisplay } from '../inspector/TopKBars';
 const TOKENS = [' store', ' park', ' beach', ' gym', ' office', ' movies', ' airport', ' doctor', ' bank', ' moon'];
 const PROBS = [0.33, 0.22, 0.14, 0.11, 0.07, 0.055, 0.035, 0.025, 0.01, 0.005];
 
+const COPY = {
+  en: {
+    header: 'Nucleus (top-p) cutoff',
+    nucleusCount: (keptCount: number, total: number) => (
+      <>
+        Nucleus: <strong className="font-mono text-primary">{keptCount}</strong> of {total} tokens
+      </>
+    ),
+    massKept: 'Mass kept before renormalizing: ',
+    cutoffNote: (p: string) => `(cutoff: smallest set with cumulative ≥ ${p})`,
+    originalLabel: 'Original — sorted, tail dimmed past the cutoff',
+    originalAria: 'Original probabilities with nucleus cutoff',
+    rowTitle: (tok: string, prob: string, cumulative: string) => `${tok} · p=${prob} · cumulative=${cumulative}`,
+    dashedLineNote: 'The dashed line is the cutoff: everything below it is the discarded tail.',
+    nucleusLabel: 'Nucleus — renormalized to sum to 1, then sampled',
+    rescaleNote: (mass: string) =>
+      `Survivors rescaled by ÷ ${mass} so they sum to 1 — that rescale is why the kept bars jump up.`,
+    footnote: 'Illustrative ten-token distribution, sorted and scripted — not live output from the model.',
+  },
+  zh: {
+    header: '核（top-p）截断',
+    nucleusCount: (keptCount: number, total: number) => (
+      <>
+        核：{total} 个 token 中保留 <strong className="font-mono text-primary">{keptCount}</strong> 个
+      </>
+    ),
+    massKept: '重新归一化前保留的概率质量：',
+    cutoffNote: (p: string) => `（截断：累计概率 ≥ ${p} 的最小集合）`,
+    originalLabel: '原始分布——已排序，截断之后的尾部变暗',
+    originalAria: '带核截断标记的原始概率',
+    rowTitle: (tok: string, prob: string, cumulative: string) => `${tok} · p=${prob} · 累计=${cumulative}`,
+    dashedLineNote: '虚线就是截断线：它下方的一切都是被丢弃的尾部。',
+    nucleusLabel: '核——重新归一化到总和为 1，再从中采样',
+    rescaleNote: (mass: string) =>
+      `幸存者按 ÷ ${mass} 重缩放，使总和重新等于 1——这次重缩放正是被保留的柱子集体跳高的原因。`,
+    footnote: '示意用的十个 token 的分布，已排序、预先写定——并非模型的实时输出。',
+  },
+} as const;
+
 export function NucleusSlider() {
+  const copy = COPY[useLocale()];
   const [p, setP] = React.useState(0.9);
 
   // Walk the (already descending) list accumulating probability; keep the
@@ -68,7 +109,7 @@ export function NucleusSlider() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">Nucleus (top-p) cutoff</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
           <label htmlFor="nucleus-slider-p" className="uppercase tracking-wider">
             p
@@ -88,20 +129,19 @@ export function NucleusSlider() {
       </div>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-foreground/85">
+        <span>{copy.nucleusCount(keptCount, TOKENS.length)}</span>
         <span>
-          Nucleus: <strong className="font-mono text-primary">{keptCount}</strong> of {TOKENS.length} tokens
+          {copy.massKept}
+          <strong className="font-mono">{keptMass.toFixed(3)}</strong>
         </span>
-        <span>
-          Mass kept before renormalizing: <strong className="font-mono">{keptMass.toFixed(3)}</strong>
-        </span>
-        <span className="text-muted-foreground">(cutoff: smallest set with cumulative ≥ {p.toFixed(2)})</span>
+        <span className="text-muted-foreground">{copy.cutoffNote(p.toFixed(2))}</span>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2">
         {/* LEFT: original sorted distribution, tail dimmed, cutoff annotated. */}
         <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">Original — sorted, tail dimmed past the cutoff</div>
-          <div role="list" aria-label="Original probabilities with nucleus cutoff" className="space-y-1">
+          <div className="text-[11px] text-muted-foreground">{copy.originalLabel}</div>
+          <div role="list" aria-label={copy.originalAria} className="space-y-1">
             {TOKENS.map((tok, i) => {
               const prob = PROBS[i]!;
               const inNucleus = i < keptCount;
@@ -116,7 +156,7 @@ export function NucleusSlider() {
                     inNucleus ? '' : 'opacity-40',
                     isLastKept ? 'border-b border-dashed border-primary/50 pb-1.5' : '',
                   ].join(' ')}
-                  title={`${renderTokenDisplay(tok)} · p=${prob.toFixed(3)} · cumulative=${cumulative[i]!.toFixed(3)}`}
+                  title={copy.rowTitle(renderTokenDisplay(tok), prob.toFixed(3), cumulative[i]!.toFixed(3))}
                 >
                   <span
                     className={['truncate font-mono', inNucleus ? 'text-foreground/80' : 'text-muted-foreground'].join(
@@ -139,25 +179,19 @@ export function NucleusSlider() {
               );
             })}
           </div>
-          <div className="text-[10px] text-muted-foreground">
-            The dashed line is the cutoff: everything below it is the discarded tail.
-          </div>
+          <div className="text-[10px] text-muted-foreground">{copy.dashedLineNote}</div>
         </div>
 
         {/* RIGHT: renormalized nucleus via the shared TopKBars. Tail tokens are
             passed prob=0 so TopKBars dims them automatically. */}
         <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">Nucleus — renormalized to sum to 1, then sampled</div>
+          <div className="text-[11px] text-muted-foreground">{copy.nucleusLabel}</div>
           <TopKBars ids={ids} probs={renormProbs} texts={TOKENS} sampledTokenId={-1} runKey={keptCount} />
-          <div className="text-[10px] text-muted-foreground">
-            Survivors rescaled by ÷ {keptMass.toFixed(3)} so they sum to 1 — that rescale is why the kept bars jump up.
-          </div>
+          <div className="text-[10px] text-muted-foreground">{copy.rescaleNote(keptMass.toFixed(3))}</div>
         </div>
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative ten-token distribution, sorted and scripted — not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

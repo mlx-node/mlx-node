@@ -2,6 +2,7 @@ import { LightbulbIcon } from 'lucide-react';
 import * as React from 'react';
 
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
+import { useUiStrings } from '../i18n/ui-react';
 
 export type EngineeringTakeawaysProps = {
   /** Exactly 3 short bullets the reader could quote in an interview. */
@@ -14,12 +15,13 @@ export type EngineeringTakeawaysProps = {
  * without being shouty.
  */
 export function EngineeringTakeaways({ takeaways }: EngineeringTakeawaysProps) {
+  const ui = useUiStrings();
   return (
     <Card className="gap-3 border-amber-500/30 bg-amber-500/5 py-4">
       <CardHeader className="px-6 [.border-b]:pb-0">
         <CardTitle className="flex items-center gap-2 text-base text-foreground">
           <LightbulbIcon aria-hidden="true" className="size-4 text-amber-600 dark:text-amber-400" />
-          Engineering takeaways
+          {ui.scaffolding.takeawaysTitle}
         </CardTitle>
       </CardHeader>
       <CardContent>

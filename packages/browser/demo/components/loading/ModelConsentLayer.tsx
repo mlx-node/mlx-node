@@ -17,6 +17,8 @@
 
 import type { ReactNode } from 'react';
 
+import type { Locale } from '../../lib/i18n';
+import { useLocale } from '../../lib/i18n-react';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
 import { type ConsentMode, selectConsentLayerState } from '../../lib/model-loader-state';
 import { useModelLoader } from '../../providers/model-loader';
@@ -40,20 +42,56 @@ type ConsentCopy = {
   cta: string;
 };
 
-const COPY: Record<ConsentMode, ConsentCopy> = {
-  model: {
-    title: 'Run this live in your browser',
-    subtext: 'Loads the real Qwen3.5-0.8B (~1.6 GB) — runs entirely on your device; nothing leaves your browser.',
-    cta: 'Load model',
+const COPY: Record<Locale, Record<ConsentMode, ConsentCopy>> = {
+  en: {
+    model: {
+      title: 'Run this live in your browser',
+      subtext: 'Loads the real Qwen3.5-0.8B (~1.6 GB) — runs entirely on your device; nothing leaves your browser.',
+      cta: 'Load model',
+    },
+    device: {
+      title: 'Start the in-browser trainer',
+      subtext: 'Initializes the WebGPU device in your browser — no model download.',
+      cta: 'Initialize',
+    },
   },
-  device: {
-    title: 'Start the in-browser trainer',
-    subtext: 'Initializes the WebGPU device in your browser — no model download.',
-    cta: 'Initialize',
+  zh: {
+    model: {
+      title: '在你的浏览器里实时运行',
+      subtext: '加载真实的 Qwen3.5-0.8B（约 1.6 GB）——完全在你的设备上运行，数据不会离开浏览器。',
+      cta: '加载模型',
+    },
+    device: {
+      title: '启动浏览器内训练器',
+      subtext: '在浏览器中初始化 WebGPU 设备——无需下载模型。',
+      cta: '初始化',
+    },
   },
 };
 
+// Status/error chrome around the consent panel, per locale.
+const CHROME = {
+  en: {
+    hostedUnavailable:
+      'This live demo needs the model. No hosted model is available here — choose a local model directory to run it. Everything runs on your device.',
+    chooseLocal: 'Choose local model',
+    preparing: 'Preparing the model…',
+    errorTitle: 'Couldn’t load the model',
+    errorFallback: 'Something went wrong while loading. Please try again.',
+    retry: 'Retry',
+  },
+  zh: {
+    hostedUnavailable: '这个在线演示需要模型。当前没有可用的托管模型——请选择本地模型目录来运行。一切都在你的设备上进行。',
+    chooseLocal: '选择本地模型',
+    preparing: '正在准备模型……',
+    errorTitle: '模型加载失败',
+    errorFallback: '加载过程中出了点问题，请重试。',
+    retry: '重试',
+  },
+} satisfies Record<Locale, Record<string, string>>;
+
 export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
+  const locale = useLocale();
   const {
     status,
     deviceReady,
@@ -74,7 +112,8 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
     return <>{children}</>;
   }
 
-  const copy = COPY[mode];
+  const copy = COPY[locale][mode];
+  const chrome = CHROME[locale];
 
   // A model-mode demo with no hosted model available can't auto-download — the
   // user must point at a local model directory. The device mode never fetches
@@ -111,23 +150,23 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
   // the spinner instead of the button. `loadingText` is empty in the brief
   // pre-kickoff/probe window, so fall back to a neutral "Preparing…" label.
   if (effectiveState === 'loading') {
-    return <PanelLoading status={loadingText || 'Preparing the model…'} progress={loadingProgress} />;
+    return <PanelLoading status={loadingText || chrome.preparing} progress={loadingProgress} />;
   }
 
   // Error — surface the message + a Retry that re-triggers the kickoff.
   if (effectiveState === 'error') {
     return (
       <div className="flex flex-col items-start gap-3 rounded-lg border border-destructive/50 bg-destructive/5 p-4">
-        <p className="text-sm font-medium text-foreground">Couldn’t load the model</p>
+        <p className="text-sm font-medium text-foreground">{chrome.errorTitle}</p>
         <p className="text-xs leading-relaxed text-muted-foreground" role="alert">
-          {errorBanner ?? 'Something went wrong while loading. Please try again.'}
+          {errorBanner ?? chrome.errorFallback}
         </p>
         <button
           type="button"
           onClick={kickoff}
           className="rounded-lg border border-border bg-muted px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/70"
         >
-          Retry
+          {chrome.retry}
         </button>
       </div>
     );
@@ -140,16 +179,14 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
     <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
       <p className="text-sm font-medium text-foreground">{copy.title}</p>
       <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
-        {hostedUnavailable
-          ? 'This live demo needs the model. No hosted model is available here — choose a local model directory to run it. Everything runs on your device.'
-          : copy.subtext}
+        {hostedUnavailable ? chrome.hostedUnavailable : copy.subtext}
       </p>
       <button
         type="button"
         onClick={kickoff}
         className="rounded-lg border border-primary/50 bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
       >
-        {hostedUnavailable ? 'Choose local model' : copy.cta}
+        {hostedUnavailable ? chrome.chooseLocal : copy.cta}
       </button>
       {/* Polite aria-live region: empty in the prompt state, but present so the
           transition into loading (announced by <PanelLoading>) has a stable

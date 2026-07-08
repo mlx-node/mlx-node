@@ -10,12 +10,14 @@ import { DemoCallout } from '../inspector/DemoCallout';
 import { renderTokenDisplay } from '../inspector/TopKBars';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { AttentionPipeline } from '../widgets/AttentionPipeline';
 import { GqaGroupSweep } from '../widgets/GqaGroupSweep';
+import { HeadSplitDiagram } from '../widgets/HeadSplitDiagram';
 import { MhaVsGqaCacheBar } from '../widgets/MhaVsGqaCacheBar';
 import { MultiheadConcat } from '../widgets/MultiheadConcat';
 import { PatternDetectorPanel } from '../widgets/PatternDetectorPanel';
@@ -88,7 +90,12 @@ export const learning: ChapterLearningData = {
     {
       term: 'MQA',
       definition:
-        "Multi-query attention: GQA's extreme where num_kv_heads=1. Smallest cache, biggest expressivity loss.",
+        "Multi-query attention: GQA's extreme where num_kv_heads=1. Smallest cache, biggest cut in how many different things the heads can look for.",
+    },
+    {
+      term: 'output projection (W_O)',
+      definition:
+        'The learned matrix (2048 × 1024 here) that maps the concatenated heads back to the residual width. Each 256-wide slice of it is one head’s personal "write" back into the residual stream — concat-then-W_O is the same arithmetic as summing eight per-head contributions.',
     },
   ],
   takeaways: [
@@ -100,7 +107,7 @@ export const learning: ChapterLearningData = {
     prompt:
       'After the auto-run, the lane diagram starts on Q0 and the side-by-side compares it against Q1 (its group-mate). Click around the other Q0–Q3 chips in the same group and compare the heatmaps. Are the patterns identical, similar, or very different?',
     answer:
-      'They share the same K and V, so the patterns rhyme but are not identical — both still light up similar key positions, but the per-row weights differ because Q0 and Q1 have separate Wq. That is exactly the expressivity GQA preserves: same keys, different questions.',
+      'They share the same K and V, so the patterns rhyme but are not identical — both still light up similar key positions, but the per-row weights differ because Q0 and Q1 have separate Wq. That is exactly what GQA preserves: same keys, different questions.',
   },
   quiz: [
     {
@@ -137,7 +144,7 @@ export const learning: ChapterLearningData = {
         {
           id: 'a',
           label:
-            "MQA gives up too much expressivity (only one K/V head), while GQA with G=2-8 recovers most of MHA's quality at most of MQA's cache savings.",
+            "MQA gives up too much — with only one K/V head, the heads can look for far fewer distinct things — while GQA with G=2-8 recovers most of MHA's quality at most of MQA's cache savings.",
         },
         {
           id: 'b',
@@ -200,10 +207,20 @@ export function MultiheadGqaChapterBody() {
           into a <code>d</code>-wide vector that flows on through the layer.
         </p>
         <p>
+          Here is that split drawn out — one token&apos;s vector going in, eight head-bands coming out (and the narrower
+          K/V path that this chapter&apos;s GQA section is about):
+        </p>
+
+        <HeadSplitDiagram />
+
+        <p>
           At inference, K and V for each token are <strong>cached</strong> across generation steps — that's what makes
-          the second token onward fast. The cache size is <code>2 × H × d_head × seq_len</code> floats{' '}
-          <em>per layer</em>. For a 32k-context model with deep layer counts and wide hidden sizes, that's gigabytes —
-          and unlike weights, it grows with each new token.{' '}
+          the second token onward fast. Why K and V, but never Q? At decode time the model only needs the <em>new</em>{' '}
+          token's query — but that one query must dot against <em>every past token's</em> key and blend{' '}
+          <em>every past token's</em> value. So past K and V get saved and re-read at every step, while a past token's Q
+          was used once, at its own step, and is never needed again. The cache size is{' '}
+          <code>2 × H × d_head × seq_len</code> floats <em>per layer</em>. For a 32k-context model with deep layer
+          counts and wide hidden sizes, that's gigabytes — and unlike weights, it grows with each new token.{' '}
           <strong>The KV cache, not the weights, is what dominates memory at long context.</strong>
         </p>
 
@@ -254,7 +271,9 @@ export function MultiheadGqaChapterBody() {
           <em>full-attention</em> layers with softmax scores you can inspect (the other kind is covered in{' '}
           <strong>Advanced</strong> below). Only every fourth layer — <strong>6 of the 24</strong> — runs this
           full-softmax attention and keeps a growing KV cache; the other 18 are linear (GatedDeltaNet) layers that carry
-          a fixed-size recurrent state instead. So the cache numbers below count only those 6 layers, not all 24.
+          a fixed-size recurrent state instead — the{' '}
+          <ChapterLink chapterId="kv-cache">KV-cache chapter</ChapterLink> (chapter 12) covers them. So the cache
+          numbers below count only those 6 layers, not all 24.
         </p>
 
         {/* Optional deep-dive: the Qwen-3.5–specific complications that interrupt
@@ -293,13 +312,67 @@ export function MultiheadGqaChapterBody() {
           </div>
         </details>
 
+        <h2>Why W_O exists</h2>
+        <p>
+          One matrix in the pipeline diagram deserves a second look: the output projection <code>W_O</code> at the very
+          end. Step back and trace what a <em>single</em> head does to the residual stream, ignoring attention weights
+          for a moment. Its value path is two linear maps glued together: <code>v_proj</code> takes the{' '}
+          <code>{QWEN_HIDDEN_DIM}</code>-wide residual vector down to a <code>{QWEN_HEAD_DIM}</code>-dim value, and that
+          head's <code>{QWEN_HEAD_DIM}</code>-wide slice of <code>W_O</code> takes the result back up to{' '}
+          <code>{QWEN_HIDDEN_DIM}</code>. That is a <strong>low-rank</strong> map: it can only move the residual vector
+          within a {QWEN_HEAD_DIM}-dimensional subspace, but it costs far less than a free-form one. A full-rank
+          per-head map would be a <code>{QWEN_HIDDEN_DIM} × {QWEN_HIDDEN_DIM}</code> matrix — about 1.05M parameters{' '}
+          <em>per head</em> — while the factored down/up pair is{' '}
+          <code>
+            2 × ({QWEN_HIDDEN_DIM} × {QWEN_HEAD_DIM})
+          </code>{' '}
+          ≈ 0.52M, half the cost even before GQA shares the down half (more on that below). Eight constrained heads for
+          the price of four unconstrained ones is the trade the architecture makes.
+        </p>
+        <p>
+          The "concatenate, then multiply by <code>W_O</code>" recipe also looks more mysterious than it is. Slice the{' '}
+          <code>
+            {QWEN_NUM_HEADS * QWEN_HEAD_DIM} × {QWEN_HIDDEN_DIM}
+          </code>{' '}
+          matrix into {QWEN_NUM_HEADS} horizontal bands of{' '}
+          <code>
+            {QWEN_HEAD_DIM} × {QWEN_HIDDEN_DIM}
+          </code>
+          , one per head. Multiplying the concatenated <code>{QWEN_NUM_HEADS * QWEN_HEAD_DIM}</code>-vector by{' '}
+          <code>W_O</code> is <em>exactly</em> the same arithmetic as letting each head push its own{' '}
+          <code>{QWEN_HEAD_DIM}</code>-dim output through its own band and then <strong>summing</strong> the{' '}
+          {QWEN_NUM_HEADS} results — concatenation followed by one big projection ≡ a sum of per-head contributions. So
+          a better mental model than "glue the heads together" is: each head independently proposes a small low-rank
+          edit, and the edits are <em>added</em> onto the{' '}
+          <ChapterLink chapterId="full-block">residual stream</ChapterLink>. No head overwrites another; they
+          accumulate.
+        </p>
+        <p>
+          GQA adds one wrinkle to this picture for our model. The <em>down</em> half is shared per group:{' '}
+          <code>v_proj</code> only has {QWEN_NUM_KV_HEADS} KV heads (
+          <code>
+            {QWEN_HIDDEN_DIM} → {QWEN_NUM_KV_HEADS * QWEN_HEAD_DIM}
+          </code>
+          ), so four query heads in a group read the <em>same</em> {QWEN_HEAD_DIM}-dim value vectors. But the{' '}
+          <em>up</em> half stays fully per-head: <code>o_proj</code> is{' '}
+          <code>
+            {QWEN_NUM_HEADS * QWEN_HEAD_DIM} → {QWEN_HIDDEN_DIM}
+          </code>
+          , giving every one of the {QWEN_NUM_HEADS} query heads its own{' '}
+          <code>
+            {QWEN_HEAD_DIM} → {QWEN_HIDDEN_DIM}
+          </code>{' '}
+          band. Group-mates blend the same values with different attention weights, then write the result into the
+          residual stream through different projections — shared reading, private writing.
+        </p>
+
         <h2>The trade-off, and where MQA fits</h2>
         <p>
-          GQA gives up some expressivity — query heads in the same group cannot attend to different keys, because they
-          share K. They <em>can</em> still learn different attention patterns over those shared keys via their distinct
-          Q projections (you'll see this in the side-by-side below). The memory win is large, the quality loss is small,
-          and the decode speedup from a smaller cache is real. Mid-size open models like Llama 3 and Qwen3.5 all use
-          GQA.
+          GQA gives up a little of how many different things the heads can look for — query heads in the same group
+          cannot attend to different keys, because they share K. They <em>can</em> still learn different attention
+          patterns over those shared keys via their distinct Q projections (you'll see this in the side-by-side below).
+          The memory win is large, the quality loss is small, and the decode speedup from a smaller cache is real.
+          Mid-size open models like Llama 3 and Qwen3.5 all use GQA.
         </p>
         <p>
           Push GQA to the extreme — <code>num_kv_heads = 1</code> — and you get{' '}
@@ -310,7 +383,8 @@ export function MultiheadGqaChapterBody() {
         <p>
           Sweep the whole spectrum below. As you move from MHA (8 KV heads) down to MQA (1), the per-layer KV cache
           shrinks linearly. Every variant keeps all eight query heads, so the query side is untouched — what shrinks is
-          the number of distinct key/value subspaces, since the query heads in a group must now share one K/V.
+          the number of distinct sets of K/V features the heads can match against, since the query heads in a group must
+          now share one K/V.
         </p>
 
         <GqaGroupSweep />
@@ -966,12 +1040,22 @@ function KvCacheTicker({
       <Stat
         label="MHA cache / layer"
         value={`${formatCount(mha)} floats`}
-        sub={`2 · ${numHeads} · ${headDim} · ${formatCount(seqLen)}`}
+        sub={
+          <>
+            2 · {numHeads} · {headDim} · {formatCount(seqLen)}
+            <br />× 2 bytes (bf16) ≈ {formatBytes(mha * 2)}
+          </>
+        }
       />
       <Stat
         label="GQA cache / layer"
         value={`${formatCount(displayGqa)} floats`}
-        sub={`2 · ${numKvHeads} · ${headDim} · ${formatCount(seqLen)}`}
+        sub={
+          <>
+            2 · {numKvHeads} · {headDim} · {formatCount(seqLen)}
+            <br />× 2 bytes (bf16) ≈ {formatBytes(displayGqa * 2)}
+          </>
+        }
         accent
       />
       <Stat
@@ -1004,7 +1088,7 @@ function Stat({
 }: {
   label: string;
   value: React.ReactNode;
-  sub: string;
+  sub: React.ReactNode;
   accent?: boolean;
 }) {
   return (
@@ -1027,6 +1111,15 @@ function formatCount(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return `${n}`;
+}
+
+/** Bytes formatter for the ticker's "floats × 2 bytes (bf16)" sub-line. */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)} GB`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)} kB`;
+  return `${n} B`;
 }
 
 function GroupHeadCompare({

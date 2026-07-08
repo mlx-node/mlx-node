@@ -7,16 +7,18 @@ import { DemoCallout } from '../inspector/DemoCallout';
 import { TopKBars, renderTokenDisplay } from '../inspector/TopKBars';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { InnerProductLogit } from '../widgets/InnerProductLogit';
 import { LmHeadWalkthrough } from '../widgets/LmHeadWalkthrough';
+import { TiedUntiedLedger } from '../widgets/TiedUntiedLedger';
 import { WeightTyingVisual } from '../widgets/WeightTyingVisual';
 
 /**
- * Chapter 9 — LM head & weight tying.
+ * Chapter 10 — LM head & weight tying.
  *
  * Bridges the gap between "last hidden state" (the top of the residual
  * stream, chapter 9) and "vector of logits" (the input to sampling, chapter
@@ -77,7 +79,7 @@ export const learning: ChapterLearningData = {
   ],
   exercise: {
     prompt:
-      "Hit Run on 'The cat sat on the' and look at the top-K logits panel. The highest bar is the model's pick. Now find a token in the top-K whose text doesn't look 'like a real continuation' to you (e.g. ' floor' on a tiny model). What does its presence in the top-K tell you about the LM head's geometry?",
+      "Hit Run on 'The cat sat on the' and look at the top-K logits panel. The highest bar is the model's pick. Now find a token further down the top-K whose text doesn't look 'like a real continuation' to you (e.g. a pronoun like ' his' turning up in a noun slot). What does its presence in the top-K tell you about the LM head's geometry?",
     answer:
       "Even tokens you'd consider 'unlikely' end up in the top-K because their row vectors in the LM head point in roughly the same direction as the hidden state. The model's representation of 'what should come after `the`' is broad — anything sittable, nameable, or position-of-an-object-like is geometrically close. Sampling temperature and top-p are what trim this broad cloud into one choice.",
   },
@@ -156,18 +158,24 @@ export function LmHeadChapterBody() {
         <h2>One line of math</h2>
         <MathDisplay latex={String.raw`\text{logits} = h_{\text{last}} \cdot W_{\text{lm}}^\top`} />
         <p>
-          <code>h_last</code> is the last token's hidden state — shape <code>[1, 1024]</code> at decode time.{' '}
+          <code>h_last</code> is the last token's hidden state — shape <code>[1, 1024]</code> when the model is
+          generating one token at a time (called <em>decode</em> — the next chapters cover it).{' '}
           <code>W_lm</code> is the LM head weight matrix — shape <code>[V, d] = [248,320, 1024]</code> for Qwen3.5-0.8B.
           The transpose makes it <code>[1024, 248,320]</code>; multiplying gives an output of shape{' '}
           <code>[1, 248,320]</code> — one logit per token in the vocabulary.
         </p>
         <p>
+          One question worth pausing on: the stack produced a hidden vector for <em>every</em> token in the prompt, so
+          why does only the last one go into the LM head? Because each position predicts <em>its own</em> next token —
+          and when the model is generating, the only prediction it needs is the one after the final token. The other
+          positions' predictions aren't wasted: training scores all of them at once, as the training chapter shows.
+        </p>
+        <p>
           The animation walks the matmul cell by cell. The scan beam highlights one output column at a time, with the
           matrix column that produces it lit up beside it. Every output entry is one independent inner product — which
-          is also why this op parallelizes so cleanly on a GPU. Note the animation draws the <em>transposed</em> matrix{' '}
-          <code>embed_tokens.weight.T = [d, V]</code>, so token <code>j</code>'s fingerprint is a{' '}
-          <strong>column</strong> there — the same vector as <strong>row j</strong> of <code>W_lm = [V, d]</code>{' '}
-          discussed below (a row of a matrix is a column of its transpose).
+          is also why this op parallelizes so cleanly on a GPU. The matrix is drawn transposed, so each token's
+          fingerprint appears as a <em>column</em> — the label under the beam tracks which token's column is being
+          scored.
         </p>
 
         <LmHeadWalkthrough />
@@ -211,6 +219,13 @@ export function LmHeadChapterBody() {
         </p>
 
         <WeightTyingVisual />
+
+        <p>
+          <ChapterLink chapterId="embeddings">Chapter 3</ChapterLink> noted this saves a second copy — here&rsquo;s
+          that copy, drawn.
+        </p>
+
+        <TiedUntiedLedger />
 
         <p>
           This is called <strong>weight tying</strong>, controlled by <code>tie_word_embeddings = true</code> in the

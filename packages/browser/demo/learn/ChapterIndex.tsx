@@ -2,14 +2,18 @@ import { ArrowLeftIcon, MessageSquareIcon } from 'lucide-react';
 import * as React from 'react';
 
 import type { AttentionRun } from '../../src/inspector-types';
+import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { PanelLoading } from '../components/loading/PanelLoading';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Textarea } from '../components/ui/textarea';
+import { useLocale } from '../lib/i18n-react';
 import { runForInspector } from '../lib/inspector-client';
 import { useModelLoader } from '../providers/model-loader';
-import { CHAPTERS, findChapter, type ChapterMeta } from './chapters';
+import { findChapter, type ChapterMeta } from './chapters';
+import { localizedChapters } from './i18n/localized';
+import { useUiStrings } from './i18n/ui-react';
 import { cleanupTokenText, renderTokenDisplay } from './inspector/TopKBars';
 import { RunButton } from './scaffolding/RunButton';
 import { useRunFlash } from './scaffolding/useRunFlash';
@@ -47,6 +51,9 @@ export function ChapterIndex({
   modelReady,
   onLoadModel,
 }: ChapterIndexProps) {
+  const ui = useUiStrings();
+  // Locale overlay applied to the registry — English passes through untouched.
+  const chapters = localizedChapters(useLocale());
   return (
     <div className="absolute inset-0 z-10 overflow-y-auto bg-background">
       <div className="mx-auto flex w-full max-w-5xl flex-col px-6 py-10">
@@ -58,24 +65,24 @@ export function ChapterIndex({
             className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeftIcon className="size-4" />
-            Back
+            {ui.chapterIndex.back}
           </button>
-          <Button variant="outline" size="sm" onClick={onOpenFreeChat} className="gap-2">
-            <MessageSquareIcon className="size-4" />
-            Open free chat
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={onOpenFreeChat} className="gap-2">
+              <MessageSquareIcon className="size-4" />
+              {ui.chapterIndex.openFreeChat}
+            </Button>
+            <LanguageSwitcher />
+          </div>
         </div>
 
         {/* Title */}
         <div className="mb-8">
           <div className="mb-2 font-mono text-xs uppercase tracking-[0.2em] text-primary">
-            Learn LLMs · powered by Qwen3.5 in your browser
+            {ui.chapterIndex.eyebrow}
           </div>
-          <h1 className="text-4xl font-semibold tracking-tight text-foreground">Chapters</h1>
-          <p className="mt-3 max-w-2xl text-muted-foreground">
-            {CHAPTERS.length} guided lessons that explain how a modern transformer LLM works, using the real model
-            running in your browser via WebGPU. Read the prose on the left, then poke at the live model on the right.
-          </p>
+          <h1 className="text-4xl font-semibold tracking-tight text-foreground">{ui.chapterIndex.heading}</h1>
+          <p className="mt-3 max-w-2xl text-muted-foreground">{ui.chapterIndex.description(chapters.length)}</p>
         </div>
 
         {/* Real forward-pass flow — runs the live model, captures per-layer
@@ -92,7 +99,7 @@ export function ChapterIndex({
 
         {/* Grid of chapter cards */}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {CHAPTERS.map((chapter) => (
+          {chapters.map((chapter) => (
             <ChapterCard
               key={chapter.id}
               chapter={chapter}
@@ -101,10 +108,7 @@ export function ChapterIndex({
           ))}
         </div>
 
-        <p className="mt-10 text-xs text-muted-foreground">
-          Each chapter is self-contained, but the suggested order builds the model from the bottom up — text in,
-          attention through the middle, sampling out.
-        </p>
+        <p className="mt-10 text-xs text-muted-foreground">{ui.chapterIndex.footerNote}</p>
       </div>
     </div>
   );
@@ -280,6 +284,7 @@ type ForwardPassFlowProps = {
 };
 
 function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoadModel }: ForwardPassFlowProps) {
+  const ui = useUiStrings();
   const [prompt, setPrompt] = React.useState<string>(DEFAULT_PROMPT);
   const [status, setStatus] = React.useState<RunStatus>({ kind: 'idle' });
   const [run, setRun] = React.useState<AttentionRun | null>(null);
@@ -528,27 +533,29 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
   const statusText = (() => {
     switch (status.kind) {
       case 'idle':
-        return 'Ready to run.';
+        return ui.forwardPass.statusReady;
       case 'running':
-        return 'Running real inference…';
+        return ui.forwardPass.statusRunning;
       case 'replaying':
-        if (activeLayer) return `Replaying · layer ${layerProgress} / ${NUM_LAYERS}`;
-        if (activeStage === 'tokenize') return 'Replaying · tokenize';
-        if (activeStage === 'embedding') return 'Replaying · embedding';
-        if (activeStage === 'final_norm') return 'Replaying · final RMSNorm';
-        if (activeStage === 'lm_head') return 'Replaying · LM head';
-        if (activeStage === 'sampling') return 'Replaying · sampling';
-        return 'Replaying…';
+        if (activeLayer) return ui.forwardPass.statusReplayingLayer(layerProgress, NUM_LAYERS);
+        if (activeStage === 'tokenize') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageTokenize);
+        if (activeStage === 'embedding') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageEmbedding);
+        if (activeStage === 'final_norm') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageFinalNorm);
+        if (activeStage === 'lm_head') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageLmHead);
+        if (activeStage === 'sampling') return ui.forwardPass.statusReplayingStage(ui.forwardPass.stageSampling);
+        return ui.forwardPass.statusReplaying;
       case 'paused':
-        return activeLayer ? `Paused · layer ${layerProgress} / ${NUM_LAYERS}` : 'Paused';
+        return activeLayer
+          ? ui.forwardPass.statusPausedLayer(layerProgress, NUM_LAYERS)
+          : ui.forwardPass.statusPaused;
       case 'done':
-        return 'Done — token revealed below.';
+        return ui.forwardPass.statusDone;
       case 'aborted':
-        return 'Run cancelled.';
+        return ui.forwardPass.statusAborted;
       case 'empty-prompt':
-        return 'Enter a prompt to run.';
+        return ui.forwardPass.statusEmptyPrompt;
       case 'error':
-        return `Error: ${status.error}`;
+        return ui.forwardPass.statusError(status.error);
     }
   })();
 
@@ -620,10 +627,10 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
         <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
-              One forward pass, end to end — real model run
+              {ui.forwardPass.heroTitle}
             </div>
           </div>
-          <PanelLoading status={loadingText || 'Preparing the model…'} progress={loadingProgress} />
+          <PanelLoading status={loadingText || ui.forwardPass.preparingModel} progress={loadingProgress} />
         </div>
       );
     }
@@ -631,22 +638,24 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
       <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
           <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
-            One forward pass, end to end — real model run
+            {ui.forwardPass.heroTitle}
           </div>
         </div>
         <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
-          <p className="text-sm font-medium text-foreground">Watch the model think — live, in your browser</p>
+          <p className="text-sm font-medium text-foreground">{ui.forwardPass.consentTitle}</p>
           <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
-            {hostedModelAvailable === false
-              ? 'This live demo needs the model. No hosted model is available here — choose a local model directory to run it. Everything runs on your device.'
-              : 'Loads the real Qwen3.5-0.8B (~1.6 GB) and runs one forward pass, replaying every layer through a card stack. Runs entirely on your device — nothing leaves your browser. The chapters below are fully readable without it.'}
+            {hostedModelAvailable === false ? ui.forwardPass.consentBodyLocal : ui.forwardPass.consentBodyHosted}
           </p>
           <button
             type="button"
             onClick={onLoadModel}
             className="rounded-lg border border-primary/50 bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
           >
-            {loaderStatus === 'error' ? 'Retry' : hostedModelAvailable === false ? 'Choose local model' : 'Load model'}
+            {loaderStatus === 'error'
+              ? ui.forwardPass.ctaRetry
+              : hostedModelAvailable === false
+                ? ui.forwardPass.ctaChooseLocal
+                : ui.forwardPass.ctaLoadModel}
           </button>
         </div>
       </div>
@@ -657,18 +666,18 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
     <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
-          One forward pass, end to end — real model run
+          {ui.forwardPass.heroTitle}
         </div>
-        <div className="text-[11px] text-muted-foreground">
-          The card on top is the current layer. Click any sub-stage to open its chapter.
-        </div>
+        <div className="text-[11px] text-muted-foreground">{ui.forwardPass.heroHint}</div>
       </div>
 
       {/* Prompt + controls row */}
       <div className="space-y-2 rounded-md border border-dashed border-border bg-muted/20 px-3 py-2">
         <div className="flex flex-wrap items-end gap-2">
           <div className="min-w-[16rem] flex-1">
-            <label className="block font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Prompt</label>
+            <label className="block font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {ui.forwardPass.promptLabel}
+            </label>
             {/*
               Ghost-prediction overlay — same pattern as chapter 4 (Attention)
               and chapter 5 (GQA). A sibling div sits behind the textarea,
@@ -722,13 +731,13 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
             <RunButton
               onClick={handleRun}
               running={isBusy}
-              label={status.kind === 'done' ? 'Re-run' : 'Run'}
-              runningLabel={status.kind === 'running' ? 'Running…' : 'Replaying…'}
+              label={status.kind === 'done' ? ui.forwardPass.rerun : ui.forwardPass.run}
+              runningLabel={status.kind === 'running' ? ui.forwardPass.runningLabel : ui.forwardPass.replayingLabel}
             />
             <div className="flex items-center gap-1">
               {status.kind === 'paused' ? (
                 <Button size="sm" variant="outline" onClick={resume} className="h-7 px-2 text-xs">
-                  Play
+                  {ui.forwardPass.play}
                 </Button>
               ) : (
                 <Button
@@ -738,12 +747,14 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
                   disabled={status.kind !== 'replaying'}
                   className="h-7 px-2 text-xs"
                 >
-                  Pause
+                  {ui.forwardPass.pause}
                 </Button>
               )}
             </div>
-            <div className="flex items-center gap-1" role="group" aria-label="Replay speed">
-              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Speed</span>
+            <div className="flex items-center gap-1" role="group" aria-label={ui.forwardPass.speedAria}>
+              <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                {ui.forwardPass.speed}
+              </span>
               {([0.5, 1, 2, 4] as const).map((s) => (
                 <button
                   key={s}
@@ -781,11 +792,7 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
             )}
             {statusText}
           </span>
-          <span className="text-muted-foreground">
-            Real inference, real per-layer trace — replayed through a card stack at ~0.9–1.0 s/layer so you can watch
-            each sub-stage fire. Total replay ~{Math.round(totalReplayMs / 1000)}s at 1× speed (½× to slow down for
-            reading, 4× to skim).
-          </span>
+          <span className="text-muted-foreground">{ui.forwardPass.helperLine(Math.round(totalReplayMs / 1000))}</span>
         </div>
       </div>
 
@@ -805,46 +812,44 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
         />
       </div>
 
-      <p className="text-xs text-muted-foreground">
-        Watch the stack: full-attention layers (cyan) compute Q · Kᵀ · softmax over all past tokens; linear layers
-        (amber, GatedDeltaNet) maintain a recurrent state — Qwen3.5 interleaves them 1:3.
-      </p>
+      <p className="text-xs text-muted-foreground">{ui.forwardPass.footerStack}</p>
 
+      {/* Inline chapter links: the dictionary splits each paragraph around the
+          link/strong spans, so both locales keep the same interactive JSX. */}
       <p className="text-xs text-muted-foreground">
-        This is one turn of the loop. The model appends that next token and runs the whole stack again — but on the next
-        pass it doesn&apos;t recompute the prefix: the{' '}
+        {ui.forwardPass.footerLoop1}
         <button
           type="button"
           onClick={() => onOpenChapter('kv-cache')}
           className="underline underline-offset-2 hover:text-foreground"
         >
-          KV cache (chapter {chNum('kv-cache')})
-        </button>{' '}
-        is reused — the prefix isn&apos;t recomputed, so each new token is far cheaper than reprocessing the whole
-        context. Generation is this forward pass, looped.
+          {ui.forwardPass.footerLoopKvLink(chNum('kv-cache'))}
+        </button>
+        {ui.forwardPass.footerLoop2}
       </p>
 
       <p className="text-xs text-muted-foreground">
-        Honest framing: this diagram shows <strong>greedy</strong> completion — it always takes the single highest-logit
-        token, so the same prompt gives the same answer every time here. Real generation usually{' '}
+        {ui.forwardPass.footerHonest1}
+        <strong>{ui.forwardPass.footerHonestGreedy}</strong>
+        {ui.forwardPass.footerHonest2}
         <button
           type="button"
           onClick={() => onOpenChapter('sampling')}
           className="underline underline-offset-2 hover:text-foreground"
         >
-          samples
-        </button>{' '}
-        from the distribution, so an identical prompt can come out differently from run to run. The revealed
-        continuation is also <strong>capped</strong> at {REVEAL_TOKEN_CAP} tokens — raw greedy decoding loops past that
-        — so this is a window onto the first few predictions, not a full reply. See the{' '}
+          {ui.forwardPass.footerHonestSamplesLink}
+        </button>
+        {ui.forwardPass.footerHonest3}
+        <strong>{ui.forwardPass.footerHonestCapped}</strong>
+        {ui.forwardPass.footerHonest4(REVEAL_TOKEN_CAP)}
         <button
           type="button"
           onClick={() => onOpenChapter('architecture')}
           className="underline underline-offset-2 hover:text-foreground"
         >
-          whole-model chapter
-        </button>{' '}
-        for the finished picture and its limits.
+          {ui.forwardPass.footerHonestWholeModelLink}
+        </button>
+        {ui.forwardPass.footerHonest5}
       </p>
     </div>
   );
@@ -913,9 +918,20 @@ function StageStack({
   showTokenReveal,
   reducedMotion,
 }: StageStackProps) {
+  const ui = useUiStrings();
   const inLayerBlock = activeLayer !== null;
   const activeLayerIndex = activeLayer?.index ?? null;
   const activeSubId = activeLayer?.subId ?? null;
+
+  // Localized labels for the fixed head/tail chips (the ids/chapter wiring in
+  // FIXED_HEAD/FIXED_TAIL stay locale-free).
+  const chipLabel: Record<(typeof FIXED_HEAD | typeof FIXED_TAIL)[number]['id'], string> = {
+    tokenize: ui.forwardPass.chipTokenize,
+    embedding: ui.forwardPass.chipEmbedding,
+    final_norm: ui.forwardPass.chipFinalNorm,
+    lm_head: ui.forwardPass.chipLmHead,
+    sampling: ui.forwardPass.chipSampling,
+  };
 
   // Dot y-position — five logical slots: tokenize, embedding, layer-block,
   // final_norm, lm_head, sampling. Each fixed chip has its own slot; the
@@ -937,7 +953,7 @@ function StageStack({
             <FixedChip
               key={s.id}
               id={s.id}
-              label={s.label}
+              label={chipLabel[s.id]}
               chapterId={s.chapterId}
               chapterNum={s.chapterNum}
               active={s.id === activeStage}
@@ -948,9 +964,7 @@ function StageStack({
           {/* Card-stack viewport — Apple-Wallet-style coordinated shuffle. */}
           <div className="mt-2 rounded-md border border-dashed border-emerald-500/40 bg-emerald-500/[0.04] p-2">
             <div className="mb-2 flex items-center justify-between px-1 text-[10px] font-mono tracking-wider text-emerald-700/80 dark:text-emerald-300/80">
-              <span>
-                × {NUM_LAYERS} LAYERS · chapter {chNum('full-block')} (full block)
-              </span>
+              <span>{ui.forwardPass.layersHeader(NUM_LAYERS, chNum('full-block'))}</span>
               <span
                 className={[
                   'rounded-md border px-2 py-0.5 font-mono text-[11px] tracking-wider',
@@ -959,7 +973,7 @@ function StageStack({
                     : 'border-border bg-muted/40 text-muted-foreground',
                 ].join(' ')}
               >
-                Layer {(activeLayerIndex ?? -1) + 1} / {NUM_LAYERS}
+                {ui.forwardPass.layerProgress((activeLayerIndex ?? -1) + 1, NUM_LAYERS)}
               </span>
             </div>
 
@@ -995,7 +1009,7 @@ function StageStack({
             <FixedChip
               key={s.id}
               id={s.id}
-              label={s.label}
+              label={chipLabel[s.id]}
               chapterId={s.chapterId}
               chapterNum={s.chapterNum}
               active={s.id === activeStage}
@@ -1017,7 +1031,7 @@ function StageStack({
             style={{ opacity: showTokenReveal ? 1 : 0 }}
             aria-hidden={!showTokenReveal}
           >
-            <span className="font-mono text-[11px] text-muted-foreground">next tokens →</span>
+            <span className="font-mono text-[11px] text-muted-foreground">{ui.forwardPass.nextTokensLabel}</span>
             <span
               className="max-w-[42rem] rounded-md border border-primary/60 bg-primary/10 px-3 py-1.5 text-center font-mono text-sm font-semibold text-foreground"
               data-stage-id="generated-reply"
@@ -1029,8 +1043,7 @@ function StageStack({
               ) : null}
             </span>
             <span className="font-mono text-[10px] text-muted-foreground/70">
-              {echoedPrefixDisplay ? 'first new token highlighted · ' : 'first token highlighted · '}
-              {newTokenCount} predicted token{newTokenCount === 1 ? '' : 's'}
+              {ui.forwardPass.revealCaption(Boolean(echoedPrefixDisplay), newTokenCount)}
             </span>
           </div>
         </div>
@@ -1124,12 +1137,13 @@ function FixedChip({
   active: boolean;
   onOpenChapter: (chapterId: string) => void;
 }) {
+  const ui = useUiStrings();
   return (
     <div
       data-stage-id={id}
       role="button"
       tabIndex={0}
-      aria-label={`Open chapter ${chapterNum}: ${label}`}
+      aria-label={ui.forwardPass.chipAria(chapterNum, label)}
       onClick={() => onOpenChapter(chapterId)}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -1152,7 +1166,7 @@ function FixedChip({
             : 'border-border bg-muted/40 text-muted-foreground',
         ].join(' ')}
       >
-        ch {chapterNum}
+        {ui.forwardPass.chipChapter(chapterNum)}
       </span>
     </div>
   );
@@ -1178,6 +1192,7 @@ type LayerCardProps = {
 };
 
 function LayerCard({ index, isFull, rel, activeSubId, onOpenChapter, reducedMotion }: LayerCardProps) {
+  const ui = useUiStrings();
   // Map `rel` to a transform / opacity slot. Cards beyond ±3 fade away.
   const { translateY, scale, opacity, zIndex } = (() => {
     if (rel === 0) return { translateY: 0, scale: 1, opacity: 1, zIndex: 30 };
@@ -1230,18 +1245,18 @@ function LayerCard({ index, isFull, rel, activeSubId, onOpenChapter, reducedMoti
                 ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300'
                 : 'border-amber-500/50 bg-amber-500/10 text-amber-700 dark:text-amber-300',
             ].join(' ')}
-            title={isFull ? 'Full softmax attention layer' : 'Linear-attention layer (GatedDeltaNet)'}
+            title={isFull ? ui.forwardPass.fullAttnTitle : ui.forwardPass.linearAttnTitle}
           >
             {isFull ? 'FULL ATTN' : 'LINEAR · GDN'}
           </span>
-          <span className="text-xs text-muted-foreground">decoder layer</span>
+          <span className="text-xs text-muted-foreground">{ui.forwardPass.decoderLayer}</span>
         </span>
         <button
           type="button"
           onClick={() => onOpenChapter(chapterId)}
           className="rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/60"
         >
-          ch {chapterNum}
+          {ui.forwardPass.chipChapter(chapterNum)}
         </button>
       </div>
 
@@ -1275,7 +1290,9 @@ function LayerCard({ index, isFull, rel, activeSubId, onOpenChapter, reducedMoti
               <span aria-hidden="true" className="text-muted-foreground/40">
                 └─
               </span>
-              <span>{sub.label}</span>
+              {/* zh overrides by sub-stage id; missing keys (and en, whose
+                  override map is empty) fall back to the baked-in label. */}
+              <span>{ui.forwardPass.subStages[sub.id] ?? sub.label}</span>
             </div>
           );
         })}
@@ -1304,6 +1321,7 @@ function usePrefersReducedMotion(): boolean {
 }
 
 function ChapterCard({ chapter, onOpen }: { chapter: ChapterMeta; onOpen: () => void }) {
+  const ui = useUiStrings();
   const interactive = chapter.available;
   return (
     <Card
@@ -1325,16 +1343,20 @@ function ChapterCard({ chapter, onOpen }: { chapter: ChapterMeta; onOpen: () => 
       <CardHeader>
         <div className="mb-1 flex items-center justify-between">
           <span className="font-mono text-xs text-muted-foreground">
-            Ch. {chapter.number.toString().padStart(2, '0')}
+            {ui.chapterIndex.chapterChip(chapter.number.toString().padStart(2, '0'))}
           </span>
-          {chapter.available ? <Badge variant="default">Ready</Badge> : <Badge variant="secondary">Coming soon</Badge>}
+          {chapter.available ? (
+            <Badge variant="default">{ui.chapterIndex.readyBadge}</Badge>
+          ) : (
+            <Badge variant="secondary">{ui.chapterIndex.comingSoonBadge}</Badge>
+          )}
         </div>
         <CardTitle className="text-lg">{chapter.title}</CardTitle>
         <CardDescription>{chapter.blurb}</CardDescription>
       </CardHeader>
       <CardContent>
         <span className={interactive ? 'text-sm text-primary' : 'text-sm text-muted-foreground'}>
-          {interactive ? 'Open chapter →' : 'Not yet authored'}
+          {interactive ? ui.chapterIndex.openChapter : ui.chapterIndex.notYetAuthored}
         </span>
       </CardContent>
     </Card>

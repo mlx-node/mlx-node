@@ -1,6 +1,8 @@
 import { cn } from '@/lib/utils';
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 6 supplement — RoPE's RELATIVE-POSITION property, made tangible.
  *
@@ -78,16 +80,149 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
 }
 
-type Qual = { label: string; tone: string };
+type QualKey = 'aligned' | 'partlyAligned' | 'orthogonal' | 'pullingApart' | 'opposed';
+type Qual = { key: QualKey; tone: string };
 
-// Qualitative tag keyed on cos(Δ·ω) = q·k.
+// Qualitative tag keyed on cos(Δ·ω) = q·k. The per-locale label text for each
+// key lives in COPY.qual below.
 function qualitative(dot: number): Qual {
-  if (dot >= 0.85) return { label: 'aligned', tone: 'text-emerald-400' };
-  if (dot >= 0.2) return { label: 'partly aligned', tone: 'text-foreground/80' };
-  if (dot > -0.2) return { label: 'orthogonal', tone: 'text-muted-foreground' };
-  if (dot > -0.85) return { label: 'pulling apart', tone: 'text-foreground/80' };
-  return { label: 'opposed', tone: 'text-amber-400' };
+  if (dot >= 0.85) return { key: 'aligned', tone: 'text-emerald-400' };
+  if (dot >= 0.2) return { key: 'partlyAligned', tone: 'text-foreground/80' };
+  if (dot > -0.2) return { key: 'orthogonal', tone: 'text-muted-foreground' };
+  if (dot > -0.85) return { key: 'pullingApart', tone: 'text-foreground/80' };
+  return { key: 'opposed', tone: 'text-amber-400' };
 }
+
+// Per-locale copy. English strings are moved verbatim from the original JSX.
+// The arrow labels (`q · m=…`, `k · n=…`) and the q·k tile are math notation
+// and stay identical in both locales.
+const COPY = {
+  en: {
+    qual: {
+      aligned: 'aligned',
+      partlyAligned: 'partly aligned',
+      orthogonal: 'orthogonal',
+      pullingApart: 'pulling apart',
+      opposed: 'opposed',
+    },
+    heading: 'q·k depends only on the offset m − n',
+    sub: 'Shift both positions — the score stays put',
+    basePos: 'base (pos 0)',
+    ariaLabel: (m: number, n: number, delta: number, rot: string, dotStr: string, qualLabel: string) =>
+      `RoPE relative-position dial. Query at position m = ${m} and key at position n = ${n}. ` +
+      `Offset Δ = m − n = ${delta}. The query is rotated ${rot} radians relative to the key; ` +
+      `q·k = ${dotStr} (${qualLabel}).`,
+    mLabel: (m: number) => (
+      <>
+        query position <span className="font-mono text-foreground/85">m = {m}</span>
+      </>
+    ),
+    nLabel: (n: number) => (
+      <>
+        key position <span className="font-mono text-foreground/85">n = {n}</span>
+      </>
+    ),
+    mAria: (m: number) => `query position m equals ${m}`,
+    nAria: (n: number) => `key position n equals ${n}`,
+    shiftHint: (
+      <>
+        Shift <strong>both</strong> together (Δ unchanged) — watch the arrows sweep while q·k holds
+      </>
+    ),
+    shiftGroupAria: 'Shift both positions together',
+    shiftBoth: 'shift both',
+    offsetTile: 'offset Δ',
+    relRotTile: 'relative rotation',
+    lesson: (
+      <>
+        <strong>The lesson:</strong> the score <span className="font-mono">q·k = cos(Δ·ω)</span> depends only on the
+        offset m − n — shift both positions together and it doesn&apos;t change.
+      </>
+    ),
+    mainPara: (
+      <>
+        Both arrows start from the same base vector; RoPE turns the query by <span className="font-mono">m·ω</span> and
+        the key by <span className="font-mono">n·ω</span>, so the query&apos;s relative rotation is exactly{' '}
+        <span className="font-mono">Δ·ω = (m − n)·ω</span> and <span className="font-mono">q·k = cos((m − n)·ω)</span>.
+        Increase <span className="font-mono">m</span> and <span className="font-mono">n</span> together and the whole
+        picture rotates, but the gap — and the score — stays frozen. Move just one and the gap opens or closes: align
+        them (<span className="font-mono">Δ → 0</span>) and <span className="font-mono">q·k → 1</span>.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative — this uses ONE representative frequency (<span className="font-mono">ω = {OMEGA}</span> rad/token)
+        and simplifies the content vectors to a shared base so we isolate the positional part. As positions grow the
+        relative rotation <span className="font-mono">Δ·ω</span> can exceed a full turn, but because cosine repeats
+        every turn the score still depends only on the offset <span className="font-mono">Δ</span>. The real model
+        combines this with the actual query and key content across many frequency pairs at many different speeds (see
+        the frequency spectrum below).
+      </>
+    ),
+  },
+  zh: {
+    qual: {
+      aligned: '对齐',
+      partlyAligned: '部分对齐',
+      orthogonal: '正交',
+      pullingApart: '逐渐背离',
+      opposed: '方向相反',
+    },
+    heading: 'q·k 只取决于偏移 m − n',
+    sub: '同时移动两个位置——分数纹丝不动',
+    basePos: '基向量 (pos 0)',
+    ariaLabel: (m: number, n: number, delta: number, rot: string, dotStr: string, qualLabel: string) =>
+      `RoPE 相对位置表盘。query 在位置 m = ${m}，key 在位置 n = ${n}。` +
+      `偏移 Δ = m − n = ${delta}。query 相对 key 旋转了 ${rot} 弧度；` +
+      `q·k = ${dotStr}（${qualLabel}）。`,
+    mLabel: (m: number) => (
+      <>
+        query 位置 <span className="font-mono text-foreground/85">m = {m}</span>
+      </>
+    ),
+    nLabel: (n: number) => (
+      <>
+        key 位置 <span className="font-mono text-foreground/85">n = {n}</span>
+      </>
+    ),
+    mAria: (m: number) => `query 位置 m 等于 ${m}`,
+    nAria: (n: number) => `key 位置 n 等于 ${n}`,
+    shiftHint: (
+      <>
+        把<strong>两个位置</strong>一起移动（Δ 不变）——看两支箭头一起扫过，而 q·k 保持不动
+      </>
+    ),
+    shiftGroupAria: '同时移动两个位置',
+    shiftBoth: '同时移动',
+    offsetTile: '偏移 Δ',
+    relRotTile: '相对旋转',
+    lesson: (
+      <>
+        <strong>结论：</strong>分数 <span className="font-mono">q·k = cos(Δ·ω)</span> 只取决于偏移 m −
+        n——两个位置一起移动，它纹丝不动。
+      </>
+    ),
+    mainPara: (
+      <>
+        两支箭头都从同一个基向量出发；RoPE 把 query 旋转 <span className="font-mono">m·ω</span>，把 key 旋转{' '}
+        <span className="font-mono">n·ω</span>，所以 query 的相对旋转恰好是{' '}
+        <span className="font-mono">Δ·ω = (m − n)·ω</span>，且 <span className="font-mono">q·k = cos((m − n)·ω)</span>
+        。让 <span className="font-mono">m</span> 和 <span className="font-mono">n</span>{' '}
+        一起增大，整幅图都会旋转，但夹角——以及分数——冻结不动。只动其中一个，夹角就会张开或闭合：让它们对齐（
+        <span className="font-mono">Δ → 0</span>），<span className="font-mono">q·k → 1</span>。
+      </>
+    ),
+    footnote: (
+      <>
+        仅作示意——这里只用了一个代表性频率（<span className="font-mono">ω = {OMEGA}</span>{' '}
+        rad/token），并把内容向量简化为共享的基向量，以便单独观察位置部分。随着位置增大，相对旋转{' '}
+        <span className="font-mono">Δ·ω</span> 可能超过一整圈，但余弦每圈重复一次，所以分数仍然只取决于偏移{' '}
+        <span className="font-mono">Δ</span>。真实模型会把它与真正的 query/key
+        内容结合，在许多速度各异的频率对上同时进行（见下方的频率谱）。
+      </>
+    ),
+  },
+} as const;
 
 function Arrow({
   angleRad,
@@ -134,6 +269,8 @@ function Arrow({
 }
 
 export function RopeRelativeDial() {
+  const locale = useLocale();
+  const copy = COPY[locale];
   const reducedMotion = usePrefersReducedMotion();
 
   const [m, setM] = React.useState(6); // query position
@@ -187,18 +324,14 @@ export function RopeRelativeDial() {
   const [ringCx, ringCy] = toPx(0, 0);
   const [baseTx, baseTy] = toPx(1, 0); // base unit vector tip (angle 0)
 
-  const ariaLabel =
-    `RoPE relative-position dial. Query at position m = ${m} and key at position n = ${n}. ` +
-    `Offset Δ = m − n = ${delta}. The query is rotated ${relRotation.toFixed(2)} radians relative to the key; ` +
-    `q·k = ${dot.toFixed(2)} (${qual.label}).`;
+  const qualLabel = copy.qual[qual.key];
+  const ariaLabel = copy.ariaLabel(m, n, delta, relRotation.toFixed(2), dot.toFixed(2), qualLabel);
 
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          q·k depends only on the offset m − n
-        </div>
-        <div className="text-[11px] text-muted-foreground">Shift both positions — the score stays put</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.heading}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.sub}</div>
       </div>
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-[auto_minmax(0,1fr)]">
@@ -266,8 +399,17 @@ export function RopeRelativeDial() {
             strokeOpacity={0.45}
             strokeWidth={1}
           />
-          <text x={baseTx + 6} y={baseTy + 12} fontSize="9" className="select-none fill-foreground/45">
-            base (pos 0)
+          {/* zh label is wider (CJK glyphs) and would clip at the right viewBox
+              edge — anchor it to the LEFT of the marker instead. en keeps the
+              original markup byte-for-byte. */}
+          <text
+            x={locale === 'zh' ? baseTx - 6 : baseTx + 6}
+            y={baseTy + 12}
+            fontSize="9"
+            textAnchor={locale === 'zh' ? 'end' : undefined}
+            className="select-none fill-foreground/45"
+          >
+            {copy.basePos}
           </text>
 
           {/* Visual gap arc between the two arrows' rendered directions — drawn
@@ -293,7 +435,7 @@ export function RopeRelativeDial() {
         <div className="space-y-3">
           <div className="space-y-1">
             <label htmlFor="rrd-m" className="block text-xs text-muted-foreground">
-              query position <span className="font-mono text-foreground/85">m = {m}</span>
+              {copy.mLabel(m)}
             </label>
             <input
               id="rrd-m"
@@ -305,13 +447,13 @@ export function RopeRelativeDial() {
               onChange={(e) => setM(Number(e.target.value))}
               className="w-full accent-primary"
               style={{ accentColor: Q_COLOR }}
-              aria-valuetext={`query position m equals ${m}`}
+              aria-valuetext={copy.mAria(m)}
             />
           </div>
 
           <div className="space-y-1">
             <label htmlFor="rrd-n" className="block text-xs text-muted-foreground">
-              key position <span className="font-mono text-foreground/85">n = {n}</span>
+              {copy.nLabel(n)}
             </label>
             <input
               id="rrd-n"
@@ -323,15 +465,13 @@ export function RopeRelativeDial() {
               onChange={(e) => setN(Number(e.target.value))}
               className="w-full accent-primary"
               style={{ accentColor: K_COLOR }}
-              aria-valuetext={`key position n equals ${n}`}
+              aria-valuetext={copy.nAria(n)}
             />
           </div>
 
           <div className="space-y-1">
-            <div className="text-[11px] text-muted-foreground">
-              Shift <strong>both</strong> together (Δ unchanged) — watch the arrows sweep while q·k holds
-            </div>
-            <div className="flex gap-2" role="group" aria-label="Shift both positions together">
+            <div className="text-[11px] text-muted-foreground">{copy.shiftHint}</div>
+            <div className="flex gap-2" role="group" aria-label={copy.shiftGroupAria}>
               <button
                 type="button"
                 onClick={() => shiftBoth(-1)}
@@ -339,7 +479,7 @@ export function RopeRelativeDial() {
                 className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20 disabled:opacity-50"
               >
                 <span aria-hidden="true">−1</span>
-                shift both
+                {copy.shiftBoth}
               </button>
               <button
                 type="button"
@@ -348,20 +488,20 @@ export function RopeRelativeDial() {
                 className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20 disabled:opacity-50"
               >
                 <span aria-hidden="true">+1</span>
-                shift both
+                {copy.shiftBoth}
               </button>
             </div>
           </div>
 
           <div className="grid grid-cols-3 gap-2">
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">offset Δ</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.offsetTile}</div>
               <div className="font-mono text-lg text-foreground/90" aria-live="polite">
                 {delta}
               </div>
             </div>
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">relative rotation</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.relRotTile}</div>
               <div className="font-mono text-sm text-foreground/90" aria-live="polite">
                 Δ·ω = {relRotation.toFixed(2)} rad
               </div>
@@ -375,33 +515,18 @@ export function RopeRelativeDial() {
           </div>
 
           <div className={cn('text-sm font-medium', qual.tone)} aria-live="polite">
-            {qual.label} · q·k = cos(Δ·ω) = cos({relRotation.toFixed(2)}) = {dot.toFixed(2)}
+            {qualLabel} · q·k = cos(Δ·ω) = cos({relRotation.toFixed(2)}) = {dot.toFixed(2)}
           </div>
 
           <div className="rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1.5 text-[12px] text-foreground/90">
-            <strong>The lesson:</strong> the score <span className="font-mono">q·k = cos(Δ·ω)</span> depends only on the
-            offset m − n — shift both positions together and it doesn&apos;t change.
+            {copy.lesson}
           </div>
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Both arrows start from the same base vector; RoPE turns the query by <span className="font-mono">m·ω</span> and
-        the key by <span className="font-mono">n·ω</span>, so the query&apos;s relative rotation is exactly{' '}
-        <span className="font-mono">Δ·ω = (m − n)·ω</span> and <span className="font-mono">q·k = cos((m − n)·ω)</span>.
-        Increase <span className="font-mono">m</span> and <span className="font-mono">n</span> together and the whole
-        picture rotates, but the gap — and the score — stays frozen. Move just one and the gap opens or closes: align
-        them (<span className="font-mono">Δ → 0</span>) and <span className="font-mono">q·k → 1</span>.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.mainPara}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — this uses ONE representative frequency (<span className="font-mono">ω = {OMEGA}</span> rad/token)
-        and simplifies the content vectors to a shared base so we isolate the positional part. As positions grow the
-        relative rotation <span className="font-mono">Δ·ω</span> can exceed a full turn, but because cosine repeats
-        every turn the score still depends only on the offset <span className="font-mono">Δ</span>. The real model
-        combines this with the actual query and key content across many frequency pairs at many different speeds (see
-        the frequency spectrum below).
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

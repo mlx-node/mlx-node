@@ -17,7 +17,7 @@ use crate::tokenizer::Qwen3Tokenizer;
 use crate::vision::encoder::{VisionAttention, VisionEncoderLayer, VisionMLP};
 use crate::vision::projector::SpatialProjector;
 
-use super::persistence_common::{
+use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
 
@@ -32,6 +32,18 @@ use super::quantized_linear::{
     is_quantized_checkpoint, try_build_mxfp8_quantized_linear, try_build_quantized_linear,
 };
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
+
+/// Per-MTP-layer linear projection suffixes (attention + MLP). Consumed by the
+/// convert path to build per-layer quantization overrides for MTP draft layers.
+pub(crate) const MTP_LAYER_LINEAR_SUFFIXES: [&str; 7] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+];
 
 /// Descriptor for a single GPU-resident tensor, passed from the JS layer.
 ///
@@ -1079,6 +1091,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         linear_value_head_dim: gi(&["linear_value_head_dim"], 128),
         linear_conv_kernel_dim: gi(&["linear_conv_kernel_dim"], 4),
         full_attention_interval: gi(&["full_attention_interval"], 4),
+        n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         partial_rotary_factor,
         rope_theta,
         paged_cache_memory_mb: raw
@@ -1321,9 +1334,9 @@ pub(crate) fn load_vision_weights(
             } else {
                 conv2d_weight
             };
-            encoder.set_patch_embed(&conv2d_weight)?;
+            encoder.set_patch_embed(&conv2d_weight, None)?;
         } else {
-            encoder.set_patch_embed(&pe_weight)?;
+            encoder.set_patch_embed(&pe_weight, None)?;
         }
     }
     #[cfg(target_family = "wasm")]

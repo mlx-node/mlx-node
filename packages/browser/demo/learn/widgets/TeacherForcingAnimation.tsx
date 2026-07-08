@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 12 (Training) supplement — animate teacher forcing.
  *
@@ -62,7 +64,81 @@ function renderToken(t: string): string {
   return t.startsWith(' ') ? '·' + t.slice(1) : t;
 }
 
+// Per-locale copy — every user-visible English string moved here verbatim.
+// Model tokens and the [cat, sat, on, the, mat, dog] bucket labels stay English.
+const COPY = {
+  en: {
+    title: 'Teacher forcing — one training step on six tokens',
+    pause: 'Pause',
+    play: 'Play',
+    stepCounter: (s: number) => `step ${s}/4`,
+    stepLabels: [
+      'Step 1 — Feed the whole sequence in (one parallel forward pass).',
+      'Step 2 — At every position, predict a distribution over the next token. Causal mask keeps each prediction honest.',
+      'Step 3 — Compare each prediction to the actual next token. Per-position loss = −log p(target).',
+      'Step 4 — Mean across positions = the training loss. Backprop adjusts every parameter to push p(target) up.',
+    ],
+    inputRow: 'input sequence',
+    predictionsRow: 'per-position predictions (after softmax)',
+    lossRow: 'per-position cross-entropy = −log p(target)',
+    noTarget: 'no target',
+    meanRow: 'loss = mean(−log p(target_i)) over 5 trained positions',
+    bridgeNote: (
+      <>
+        Read the loss bars against the probabilities above them — the bridge is just <code>−ln</code>:{' '}
+        <span className="font-mono">−ln(0.78) = 0.25</span> (easy position, tiny bar) but{' '}
+        <span className="font-mono">−ln(0.28) = 1.27</span> (hard position) — low probability blows the bar up.
+      </>
+    ),
+    observations: (
+      <>
+        Two crucial observations. <strong>One</strong>: every position is trained simultaneously — the causal mask is
+        the only thing that keeps it valid. <strong>Two</strong>: the input fed to position <em>i+1</em> is the{' '}
+        <em>true</em> token from position <em>i</em>, not the model's prediction. That's "teacher forcing": during
+        training, the model never has to recover from its own mistakes. (At inference, of course, it does — which is the
+        small but real reason long-form generation sometimes drifts.)
+      </>
+    ),
+    illustrative:
+      'Illustrative — the per-position probabilities here are hand-picked to show the shape of the loss, not live output from the model.',
+  },
+  zh: {
+    title: 'Teacher forcing——在六个 token 上的一次训练步',
+    pause: '暂停',
+    play: '播放',
+    stepCounter: (s: number) => `第 ${s}/4 步`,
+    stepLabels: [
+      '第 1 步——把整条序列一次喂入（一次并行前向传播）。',
+      '第 2 步——在每个位置预测下一个 token 的分布。因果掩码让每个预测保持诚实。',
+      '第 3 步——把每个预测与真实的下一个 token 对照。逐位置损失 = −log p(target)。',
+      '第 4 步——对各位置取平均 = 训练损失。反向传播据此调整每个参数，把 p(target) 推高。',
+    ],
+    inputRow: '输入序列',
+    predictionsRow: '逐位置预测（softmax 之后）',
+    lossRow: '逐位置交叉熵 = −log p(target)',
+    noTarget: '无目标',
+    meanRow: 'loss = mean(−log p(target_i))，在 5 个受训位置上取平均',
+    bridgeNote: (
+      <>
+        把损失条与上方的概率对照着读——桥梁只是 <code>−ln</code>：<span className="font-mono">−ln(0.78) = 0.25</span>
+        （容易的位置，短条）；而 <span className="font-mono">−ln(0.28) = 1.27</span>
+        （困难的位置）——概率越低，条被推得越高。
+      </>
+    ),
+    observations: (
+      <>
+        两个关键观察。<strong>其一</strong>：所有位置同时被训练——唯一让这件事保持成立的是因果掩码。
+        <strong>其二</strong>：喂给位置 <em>i+1</em> 的输入是位置 <em>i</em> 的<em>真实</em>{' '}
+        token，而不是模型的预测。这就是「teacher
+        forcing」：训练期间，模型从不需要从自己的错误中恢复。（推理时它当然必须如此——这正是长文本生成有时会跑偏的那个虽小但真实的原因。）
+      </>
+    ),
+    illustrative: '仅为示意——这里的逐位置概率是手工挑选来展示损失形状的，不是模型的实时输出。',
+  },
+} as const;
+
 export function TeacherForcingAnimation() {
+  const copy = COPY[useLocale()];
   const [step, setStep] = React.useState<0 | 1 | 2 | 3>(0);
   const [playing, setPlaying] = React.useState(true);
 
@@ -74,12 +150,7 @@ export function TeacherForcingAnimation() {
     return () => window.clearInterval(t);
   }, [playing]);
 
-  const stepLabels = [
-    'Step 1 — Feed the whole sequence in (one parallel forward pass).',
-    'Step 2 — At every position, predict a distribution over the next token. Causal mask keeps each prediction honest.',
-    'Step 3 — Compare each prediction to the actual next token. Per-position loss = −log p(target).',
-    'Step 4 — Mean across positions = the training loss. Backprop adjusts every parameter to push p(target) up.',
-  ];
+  const stepLabels = copy.stepLabels;
 
   // Per-position cross-entropy: -log p(target).
   const losses = POSITIONS.map((p) => (p.targetIdx < 0 ? null : -Math.log(Math.max(1e-9, p.probs[p.targetIdx]!))));
@@ -89,9 +160,7 @@ export function TeacherForcingAnimation() {
   return (
     <div className="space-y-4 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Teacher forcing — one training step on six tokens
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <div className="inline-flex items-center gap-2">
           <button
             type="button"
@@ -99,9 +168,9 @@ export function TeacherForcingAnimation() {
             className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
             aria-pressed={playing}
           >
-            {playing ? 'Pause' : 'Play'}
+            {playing ? copy.pause : copy.play}
           </button>
-          <span className="font-mono text-[11px] text-muted-foreground">step {step + 1}/4</span>
+          <span className="font-mono text-[11px] text-muted-foreground">{copy.stepCounter(step + 1)}</span>
         </div>
       </div>
 
@@ -111,7 +180,7 @@ export function TeacherForcingAnimation() {
 
       {/* Row 1 — input tokens */}
       <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">input sequence</div>
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.inputRow}</div>
         <div className="flex gap-1.5">
           {SEQ.map((t, i) => (
             <div
@@ -131,9 +200,7 @@ export function TeacherForcingAnimation() {
 
       {/* Row 2 — per-position predicted distributions */}
       <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          per-position predictions (after softmax)
-        </div>
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.predictionsRow}</div>
         <div className="flex gap-1.5">
           {POSITIONS.map((pos, i) => {
             const visible = step >= 1;
@@ -185,9 +252,7 @@ export function TeacherForcingAnimation() {
 
       {/* Row 3 — per-position loss = -log p(target) */}
       <div className="space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          per-position cross-entropy = −log p(target)
-        </div>
+        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.lossRow}</div>
         <div className="flex gap-1.5">
           {POSITIONS.map((pos, i) => {
             const visible = step >= 2;
@@ -201,7 +266,7 @@ export function TeacherForcingAnimation() {
                     visible ? 'border-border/40 bg-muted/30' : 'border-border/20 bg-muted/10 opacity-30',
                   ].join(' ')}
                 >
-                  no target
+                  {copy.noTarget}
                 </div>
               );
             }
@@ -235,26 +300,17 @@ export function TeacherForcingAnimation() {
           step >= 3 ? 'border-amber-500/50 bg-amber-500/10' : 'border-border/40 bg-muted/30 opacity-50',
         ].join(' ')}
       >
-        <div className="font-mono text-[12px] text-foreground/95">
-          loss = mean(−log p(target_i)) over 5 trained positions
-        </div>
+        <div className="font-mono text-[12px] text-foreground/95">{copy.meanRow}</div>
         <div className="font-mono text-[14px] text-amber-700 dark:text-amber-400">
           = {step >= 3 ? meanLoss.toFixed(3) : '— —'}
         </div>
       </div>
 
-      <p className="text-[11px] text-muted-foreground">
-        Two crucial observations. <strong>One</strong>: every position is trained simultaneously — the causal mask is
-        the only thing that keeps it valid. <strong>Two</strong>: the input fed to position <em>i+1</em> is the{' '}
-        <em>true</em> token from position <em>i</em>, not the model's prediction. That's "teacher forcing": during
-        training, the model never has to recover from its own mistakes. (At inference, of course, it does — which is the
-        small but real reason long-form generation sometimes drifts.)
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.bridgeNote}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — the per-position probabilities here are hand-picked to show the shape of the loss, not live
-        output from the model.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.observations}</p>
+
+      <p className="text-[10px] text-muted-foreground">{copy.illustrative}</p>
     </div>
   );
 }

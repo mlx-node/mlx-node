@@ -14,7 +14,7 @@ use crate::models::paddleocr_vl::processing::ImageProcessorConfig;
 #[cfg(target_family = "wasm")]
 pub use crate::models::qwen3_5::persistence::GpuTensorInfo;
 use crate::models::qwen3_5::persistence::{load_vision_weights, parse_vision_config};
-use crate::models::qwen3_5::persistence_common::{
+use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
@@ -260,7 +260,7 @@ fn sanitize_weights(
     Ok(result)
 }
 
-fn try_build_quantized_switch_linear(
+pub(crate) fn try_build_quantized_switch_linear(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
     group_size: i32,
@@ -1143,6 +1143,7 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         linear_value_head_dim: gi(&["linear_value_head_dim"], 128),
         linear_conv_kernel_dim: gi(&["linear_conv_kernel_dim"], 4),
         full_attention_interval: gi(&["full_attention_interval"], 4),
+        n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
         partial_rotary_factor,
         rope_theta,
 

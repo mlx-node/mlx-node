@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { TopKBars, cleanupTokenText } from '../inspector/TopKBars';
 
 /**
@@ -65,16 +66,68 @@ const PHASES: Phase[] = ['forward', 'sample', 'append'];
 const TOTAL_FRAMES = STEPS.length * PHASES.length;
 const FRAME_MS = 1150;
 
-const LINES: { code: string; phase: Phase | null; comment?: string }[] = [
+// Pseudocode stays English in both locales; only the trailing `//` comments
+// localize (looked up per phase from COPY).
+const LINES: { code: string; phase: Phase | null }[] = [
   { code: 'tokens = tokenize(prompt)', phase: null },
   { code: 'while (!done) {', phase: null },
-  { code: '  logits = model(tokens)', phase: 'forward', comment: 'one forward pass' },
-  { code: '  next   = sample(logits)', phase: 'sample', comment: 'pick one token' },
-  { code: '  tokens.push(next)', phase: 'append', comment: 'append, then repeat' },
+  { code: '  logits = model(tokens)', phase: 'forward' },
+  { code: '  next   = sample(logits)', phase: 'sample' },
+  { code: '  tokens.push(next)', phase: 'append' },
   { code: '}', phase: null },
 ];
 
+const COPY = {
+  en: {
+    title: 'The generation loop',
+    pause: '❚❚ Pause',
+    play: '▶ Play',
+    lineComments: {
+      forward: 'one forward pass',
+      sample: 'pick one token',
+      append: 'append, then repeat',
+    },
+    phaseCaption: {
+      forward: 'Forward pass → a score for every token',
+      sample: 'Sample → keep one (greedy = the top bar)',
+      append: 'Append the kept token, then loop',
+    },
+    footnote: "Illustrative numbers, scripted to show the loop's shape — not live output from the model.",
+    outro: (
+      <>
+        An LLM is a function from a list of tokens to a score for <em>every</em> token in its vocabulary. To write more
+        than one token it runs in a loop: forward pass → sample one token → append it → run again on the longer list.
+        That single repeated step is all "generating text" is.
+      </>
+    ),
+  },
+  zh: {
+    title: '生成循环',
+    pause: '❚❚ 暂停',
+    play: '▶ 播放',
+    lineComments: {
+      forward: '一次前向传播',
+      sample: '挑出一个 token',
+      append: '追加，然后重复',
+    },
+    phaseCaption: {
+      forward: '前向传播 → 为每个 token 打一个分',
+      sample: '采样 → 留下一个（贪心 = 最高的那根条）',
+      append: '追加留下的 token，然后循环',
+    },
+    footnote: '数字为示意，按脚本演示循环的形状——不是模型的实时输出。',
+    outro: (
+      <>
+        LLM 是一个函数：输入一串 token，为词表中的<em>每一个</em> token 输出一个分数。要写出不止一个
+        token，它就放进循环里跑：前向传播 → 采样一个 token → 追加 →
+        在变长了的列表上再跑一遍。“生成文本”的全部含义，就是这一个反复执行的步骤。
+      </>
+    ),
+  },
+} as const;
+
 export function GenerationLoop() {
+  const copy = COPY[useLocale()];
   const [frame, setFrame] = React.useState(0);
   const [playing, setPlaying] = React.useState(true);
 
@@ -104,14 +157,14 @@ export function GenerationLoop() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">The generation loop</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <button
           type="button"
           onClick={() => setPlaying((p) => !p)}
           aria-pressed={playing}
           className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
         >
-          {playing ? '❚❚ Pause' : '▶ Play'}
+          {playing ? copy.pause : copy.play}
         </button>
       </div>
 
@@ -157,7 +210,7 @@ export function GenerationLoop() {
                 ].join(' ')}
               >
                 <span>{ln.code}</span>
-                {ln.comment ? <span className="text-muted-foreground"> {`// ${ln.comment}`}</span> : null}
+                {ln.phase ? <span className="text-muted-foreground"> {`// ${copy.lineComments[ln.phase]}`}</span> : null}
               </div>
             );
           })}
@@ -165,26 +218,14 @@ export function GenerationLoop() {
 
         {/* Candidate distribution for this step. */}
         <div className="space-y-1">
-          <div className="text-[11px] text-muted-foreground">
-            {phase === 'forward'
-              ? 'Forward pass → a score for every token'
-              : phase === 'sample'
-                ? 'Sample → keep one (greedy = the top bar)'
-                : 'Append the kept token, then loop'}
-          </div>
+          <div className="text-[11px] text-muted-foreground">{copy.phaseCaption[phase]}</div>
           <TopKBars ids={ids} probs={probs} texts={texts} sampledTokenId={sampledTokenId} runKey={frame} />
         </div>
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative numbers, scripted to show the loop's shape — not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
 
-      <p className="text-[12px] text-foreground/85">
-        An LLM is a function from a list of tokens to a score for <em>every</em> token in its vocabulary. To write more
-        than one token it runs in a loop: forward pass → sample one token → append it → run again on the longer list.
-        That single repeated step is all "generating text" is.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.outro}</p>
     </div>
   );
 }

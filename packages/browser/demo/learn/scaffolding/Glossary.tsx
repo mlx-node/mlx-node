@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useUiStrings } from '../i18n/ui-react';
 import type { GlossaryTerm } from './learning-data';
 
 export type GlossaryProps = {
@@ -14,15 +15,14 @@ export type GlossaryProps = {
  * forced to show a dangling header.
  */
 export function Glossary({ terms }: GlossaryProps) {
+  const ui = useUiStrings();
   if (terms.length === 0) return null;
   return (
     <details className="group rounded-lg border border-border bg-card/40 px-4 py-3 text-sm">
       <summary className="flex cursor-pointer list-none items-center justify-between gap-2 text-foreground/90 [&::-webkit-details-marker]:hidden">
         <span className="font-medium">
-          Glossary <span className="text-muted-foreground">·</span>{' '}
-          <span className="text-muted-foreground">
-            {terms.length} term{terms.length === 1 ? '' : 's'}
-          </span>
+          {ui.scaffolding.glossaryTitle} <span className="text-muted-foreground">·</span>{' '}
+          <span className="text-muted-foreground">{ui.scaffolding.glossaryCount(terms.length)}</span>
         </span>
         <span aria-hidden="true" className="text-xs text-muted-foreground transition-transform group-open:rotate-90">
           ▸

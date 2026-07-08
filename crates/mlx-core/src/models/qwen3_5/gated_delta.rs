@@ -189,6 +189,69 @@ fn gated_delta_kernel(
     Ok((y, new_state))
 }
 
+/// Per-step GDN recurrence record for the eager MTP tape replay.
+///
+/// Captures the EXACT inputs passed to [`gated_delta_kernel`] for the whole
+/// `[B, T, ...]` verify window — `q`/`k` are already GQA-expanded and
+/// RMS-norm-scaled, `g` is the post-`exp` decay (`g_log.exp()`), and `beta`
+/// is post-sigmoid. All handles are lazy `MxArray` clones (no eval, no copy).
+///
+/// On accept the replay slices each window tensor to step `t` as `[B, 1, ...]`
+/// and re-runs [`gated_delta_kernel`] AT T=1 per accepted step, threading the
+/// bf16 recurrent state between calls. Re-running the SAME kernel AR uses at
+/// T=1 reproduces the per-token bf16 round-trip of true autoregressive decode
+/// by construction — the windowed verify kernel keeps state fp32 across the
+/// whole window, which is the divergence the replay corrects.
+#[derive(Clone)]
+pub(crate) struct GdnKernelTape {
+    /// Queries `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    pub q: MxArray,
+    /// Keys `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    pub k: MxArray,
+    /// Values `[B, T, Hv, Dv]`.
+    pub v: MxArray,
+    /// Decay gate `[B, T, Hv]` (post-`exp`, i.e. `g_log.exp()`).
+    pub g: MxArray,
+    /// Beta `[B, T, Hv]` (post-sigmoid).
+    pub beta: MxArray,
+}
+
+impl GdnKernelTape {
+    /// Number of recorded window steps (`T`, = `depth + 1`).
+    pub(crate) fn window_len(&self) -> Result<i64> {
+        self.q.shape_at(1)
+    }
+
+    /// Replay the first `accepted_steps` recorded steps at T=1, threading the
+    /// bf16 recurrent state between kernel calls. Starts from `start_state`
+    /// (the pre-verify snapshot's bf16 recurrent state) and returns the
+    /// AR-exact carried state after `accepted_steps` tokens.
+    ///
+    /// Each T=1 [`gated_delta_kernel`] call casts the recurrent state to bf16
+    /// at the end (matching the AR per-token decode), so threading the bf16
+    /// state across the loop reproduces autoregressive decode bit-for-bit.
+    pub(crate) fn replay_recurrent_state(
+        &self,
+        start_state: &MxArray,
+        accepted_steps: usize,
+    ) -> Result<MxArray> {
+        let mut state = start_state.clone();
+        for t in 0..accepted_steps as i64 {
+            let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hv, Dk]
+            let k_t = self.k.slice_axis(1, t, t + 1)?;
+            let v_t = self.v.slice_axis(1, t, t + 1)?;
+            let g_t = self.g.slice_axis(1, t, t + 1)?; // [B, 1, Hv]
+            let beta_t = self.beta.slice_axis(1, t, t + 1)?;
+            // mask=None: the verify forward runs unmasked (same as AR decode),
+            // so the replay must too.
+            let (_y, new_state) =
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?;
+            state = new_state;
+        }
+        Ok(state)
+    }
+}
+
 /// Single timestep of the gated delta recurrence (delta rule) — ops-based fallback.
 ///
 /// Shapes:
@@ -570,4 +633,75 @@ pub(crate) fn gated_delta_update_inner(
     // Ops-based sequential loop fallback (also needs exp(g_log))
     let g = g_log.exp()?;
     gated_delta_ops_inner(&q, &k, v, &g, &beta, &initial_state, mask, layer_idx)
+}
+
+/// Tape-recording variant of [`gated_delta_update`].
+///
+/// When `tape_sink` is `Some`, records the EXACT per-step kernel inputs
+/// (`q`/`k` GQA-expanded, `v`, `g = compute_g(...)` post-`exp` decay, `beta =
+/// sigmoid(b)`) into a [`GdnKernelTape`] for the eager MTP rollback replay,
+/// then delegates the actual recurrence to [`gated_delta_update_inner`] so
+/// the returned `(y, new_state)` is byte-identical to [`gated_delta_update`].
+/// When `None`, this is a thin pass-through with no extra work.
+///
+/// All recording is by lazy `.clone()` (no eval), so it stays inside the
+/// fused MLX graph. The reconstructed `(q, k, g)` mirror exactly what the
+/// per-step kernel path inside `gated_delta_update_inner` feeds to
+/// [`gated_delta_kernel`]: `compute_g` returns `exp(g_log)`, which is the
+/// same decay the kernel consumes, and GQA expansion uses the identical
+/// `repeat` factor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gated_delta_update_with_tape(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    a_log: &MxArray,
+    dt_bias: &MxArray,
+    state: Option<&MxArray>,
+    mask: Option<&MxArray>,
+    use_kernel: bool,
+    tape_sink: Option<&mut Option<GdnKernelTape>>,
+) -> Result<(MxArray, MxArray)> {
+    if let Some(sink) = tape_sink {
+        let num_k_heads = q.shape_at(2)?;
+        let num_v_heads = v.shape_at(2)?;
+
+        // GQA head expansion — identical factor/axis to the kernel path.
+        let (q_exp, k_exp) = if num_v_heads != num_k_heads {
+            if num_k_heads == 0 {
+                return Err(Error::from_reason(
+                    "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
+                ));
+            }
+            if num_v_heads % num_k_heads != 0 {
+                return Err(Error::from_reason(format!(
+                    "GatedDelta: num_v_heads ({}) must be divisible by num_k_heads ({})",
+                    num_v_heads, num_k_heads
+                )));
+            }
+            let repeat_factor = num_v_heads / num_k_heads;
+            (
+                q.repeat(repeat_factor as i32, 2)?,
+                k.repeat(repeat_factor as i32, 2)?,
+            )
+        } else {
+            (q.clone(), k.clone())
+        };
+
+        // `compute_g` returns exp(g_log) — the exact decay the per-step
+        // kernel consumes; `beta = sigmoid(b)`.
+        let g = compute_g(a_log, a, dt_bias)?;
+        let beta = Activations::sigmoid(b)?;
+        *sink = Some(GdnKernelTape {
+            q: q_exp,
+            k: k_exp,
+            v: v.clone(),
+            g,
+            beta,
+        });
+    }
+
+    gated_delta_update_inner(q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, None)
 }

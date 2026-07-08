@@ -98,7 +98,7 @@ export const learning: ChapterLearningData = {
         {
           id: 'b',
           label:
-            'A word-level vocabulary would need to enumerate every name, typo, and rare word, which makes the embedding matrix impractically large.',
+            'A word-level vocabulary would need to enumerate every name, typo, and rare word, which makes the embedding matrix (the per-token lookup table — next chapter) impractically large.',
         },
         {
           id: 'c',
@@ -164,10 +164,17 @@ export function TokenizationChapterBody() {
         <h2>Why sub-words?</h2>
         <p>
           Tokenizers sit in an awkward middle. If we made every <em>word</em> a token, the vocabulary would need
-          millions of entries to cover the long tail of names, typos and made-up words — and the embedding matrix would
-          balloon along with it. If we went the other way and made every <em>character</em> a token, the model would
-          have to chew through sequences five-to-ten times longer than the same text in words, and every layer's cost is
-          at least linear in sequence length.
+          millions of entries to cover the long tail of names, typos and made-up words — and the embedding matrix (the
+          big lookup table holding one vector per vocabulary entry — next chapter) would balloon along with it. If we
+          went the other way and made every <em>character</em> a token, the model would have to chew through sequences
+          five-to-ten times longer than the same text in words, and every layer's cost is at least linear in sequence
+          length.
+        </p>
+        <p>
+          One fixed sentence makes the trade-off concrete. Take{' '}
+          <code>"The quick brown fox jumps over the lazy dog"</code>: as characters it is <strong>43</strong> tokens; as
+          whole words, <strong>9</strong>; a sub-word tokenizer lands at exactly <strong>9</strong> — as short as
+          words, but built from a vocabulary that never runs out of entries.
         </p>
         <p>
           BPE finds a middle path: start from raw bytes (or characters), then repeatedly merge the most frequent
@@ -207,8 +214,9 @@ export function TokenizationChapterBody() {
 
         <h2>Why this matters</h2>
         <p>
-          Every downstream cost a language model has is paid <em>per token</em>: API billing, context-window limits,
-          KV-cache memory, and the wall-clock latency of generation. A prompt that looks short to a human can be long to
+          Every downstream cost a language model has is paid <em>per token</em>: API billing, context-window limits (the
+          cap on how many tokens the model can hold at once), KV-cache memory (the per-token working memory kept during
+          generation — later chapter), and the wall-clock latency of generation. A prompt that looks short to a human can be long to
           the model if it uses rare punctuation, code, or languages the tokenizer didn't see much of in training. The{' '}
           <strong>characters-per-token ratio</strong> in the stats footer is the simplest way to feel this: prose in
           well-supported languages usually lands near 4 chars/token, code closer to 2-3, and an emoji-heavy or

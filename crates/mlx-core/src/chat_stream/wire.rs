@@ -125,6 +125,12 @@ impl From<WirePerf> for crate::profiling::PerformanceMetrics {
             ttft_ms: w.ttft_ms,
             prefill_tokens_per_second: w.prefill_tokens_per_second,
             decode_tokens_per_second: w.decode_tokens_per_second,
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-import { Link } from '@tanstack/react-router';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import * as React from 'react';
 
 import { Prose } from '../Prose';
@@ -6,6 +6,8 @@ import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { ContextWindow } from '../widgets/ContextWindow';
 import { HallucinationDemo } from '../widgets/HallucinationDemo';
+import { ModelSizeLadder } from '../widgets/ModelSizeLadder';
+import { ParamBudgetDiagram } from '../widgets/ParamBudgetDiagram';
 
 /**
  * Chapter 16 — The whole model, end to end (and what it isn't).
@@ -245,6 +247,19 @@ export function ArchitectureChapterBody() {
 
         <ArchitecturePoster />
 
+        <div className="mx-auto w-full max-w-3xl">
+          <Prose className="lg:max-w-none">
+            <p>
+              One thing the colors can hide: every box in that poster is a slab of <em>frozen weights</em>, fixed at
+              the end of training. The only thing that actually <em>flows up</em> through all of them, layer by layer,
+              is your text — and at this point it isn't words or meaning anymore, just a{' '}
+              <code>[your tokens × {HIDDEN_DIM}]</code> array of plain real numbers. The whole forward pass is that one
+              tensor being reshaped, added to, and reshaped again on its way to the top. The boxes are the program; the
+              tensor is the only thing moving.
+            </p>
+          </Prose>
+        </div>
+
         <Prose className="lg:max-w-none">
           <div className="grid grid-cols-1 gap-x-14 lg:grid-cols-2">
             <div>
@@ -262,6 +277,17 @@ export function ArchitectureChapterBody() {
                 checkpoint. The norm is RMSNorm, applied to the sub-block input only, so the residual highway itself
                 stays un-normalized and gradients reach all the way down. After the last layer, a final RMSNorm and the
                 LM head turn the hidden state into one logit per vocabulary token.
+              </p>
+              <p>
+                It's fair to ask why repeat one block {NUM_LAYERS} times at all. The common reading is that depth buys
+                composition: an early layer can settle something small and local — say, that a pronoun points back at a
+                name a few tokens ago — and a later layer can lean on that resolved fact to decide something larger,
+                like which clause the sentence is really about. Each block only adds a small nudge to the residual
+                stream, so stacking lets the nudges build into the kind of multi-step shaping a single block could never
+                do alone. That's the intuition, and it's a useful one — but it should be held loosely: this picture
+                comes mostly from studying dense, attention-only models, and how cleanly it carries over to this hybrid
+                stack, where {NUM_LINEAR} of {NUM_LAYERS} layers are linear-recurrent rather than full attention, is
+                itself not well established.
               </p>
             </div>
             <div>
@@ -284,6 +310,20 @@ export function ArchitectureChapterBody() {
             </div>
           </div>
         </Prose>
+
+        {/* Where the ~0.8B parameters live — a to-scale budget computed from
+            the checkpoint's real tensor shapes. Centered at article width like
+            the other reading sections. */}
+        <div className="mx-auto w-full max-w-3xl">
+          <Prose className="lg:max-w-none">
+            <p>
+              One more way to see the same machine: where do the ~0.8 billion parameters actually <em>live</em>? Count
+              them block by block and the FFN stack turns out to be the biggest single block of every layer — bigger
+              than both sequence mixers combined:
+            </p>
+          </Prose>
+          <ParamBudgetDiagram />
+        </div>
 
         {/* Optional deep-dive: what the GDN sub-boxes in the poster actually
             mean, in words. Collapsed by default and skippable — beginners can
@@ -315,7 +355,8 @@ export function ArchitectureChapterBody() {
               <ul className="list-disc space-y-1.5 pl-5">
                 <li>
                   <strong>Projections.</strong> Linear maps split the input into query/key, a value plus a{' '}
-                  <em>z-gate</em>, and a β (beta) / g (decay) pair — the knobs the recurrence below turns.
+                  <em>z-gate</em>, and a raw beta/decay pair (b, a) — a sigmoid turns b into β and a decay formula
+                  turns a into g, the knobs the recurrence below turns.
                 </li>
                 <li>
                   <strong>A short conv.</strong> A causal <em>depthwise</em> convolution (kernel 4, so each channel only
@@ -346,6 +387,23 @@ export function ArchitectureChapterBody() {
               </p>
             </div>
           </details>
+        </div>
+
+        {/* Model-size ladder — situates this 0.85B model among the rough scales
+            of language models, and sets up the limitations arc: even a well-built
+            model this size is ~100× smaller than frontier systems. Centered at
+            article width like the other reading sections. */}
+        <div className="mx-auto w-full max-w-3xl">
+          <Prose className="lg:max-w-none">
+            <p>
+              Before we name the limits, one more thing to keep in scale: this is a small model. Its{' '}
+              {(852_985_920).toLocaleString()} parameters put it near the bottom of the size ladder, far below the
+              systems most people mean by &ldquo;a large language model.&rdquo; That doesn&apos;t make it a toy — but it
+              does mean some of the limits below are partly about <em>size</em>, and would soften (never vanish) on a
+              much bigger model.
+            </p>
+          </Prose>
+          <ModelSizeLadder />
         </div>
 
         {/* The merged limitations arc is a reading section, not part of the
@@ -388,9 +446,9 @@ export function ArchitectureChapterBody() {
             <ContextWindow />
             <p>
               The model's only working memory is the tokens currently inside its{' '}
-              <Link to="/chapters/$chapterId" params={{ chapterId: 'kv-cache' }} search={(prev) => prev}>
+              <ChapterLink chapterId="kv-cache">
                 context window
-              </Link>
+              </ChapterLink>
               . Past that hard limit the oldest tokens have to be dropped to make room, and once dropped they're gone.
               And between two separate conversations it remembers nothing at all — every call starts blank, apart from
               whatever text you re-supply in the prompt.
@@ -402,9 +460,9 @@ export function ArchitectureChapterBody() {
               zero, the same prompt can produce different answers on different runs. That's a feature for creative
               writing and a footgun for anything you need to reproduce — decode greedily (temperature 0) when you want
               determinism, as the{' '}
-              <Link to="/chapters/$chapterId" params={{ chapterId: 'sampling' }} search={(prev) => prev}>
+              <ChapterLink chapterId="sampling">
                 Sampling chapter
-              </Link>{' '}
+              </ChapterLink>{' '}
               showed.
             </p>
 
@@ -617,7 +675,7 @@ const DETAILS: Record<string, Detail> = {
   'vision-encoder': {
     title: 'Vision encoder ×12',
     facts: 'hidden 768 · 12 heads',
-    body: `A 12-layer ViT-style encoder (hidden 768, with its own 12 attention heads — separate from the decoder's ${NUM_HEADS} query heads) turns image/video patches into visual tokens.`,
+    body: `A 12-layer transformer encoder for image patches (a "vision transformer", or ViT). Hidden 768, with its own 12 attention heads — separate from the decoder's ${NUM_HEADS} query heads — it turns image/video patches into visual tokens.`,
   },
   'vision-project': {
     title: 'Vision → hidden 1024',
@@ -940,7 +998,7 @@ function PosterSvg({
         full attention, quadratic prefill
       </text>
       <text x={1339} y={1132} fontSize={11} textAnchor="middle" fill="currentColor" fillOpacity={0.55}>
-        KV cache: flat by default, optional block-paged text-only path
+        KV cache: flat by default; block-paged is a native-server option, not used in this browser demo
       </text>
       <text x={295} y={943} fontSize={15} fontWeight={700} textAnchor="middle" fill={ACCENT.state}>
         Optional vision path
@@ -1687,15 +1745,13 @@ function DetailPanel({ detail }: { detail: Detail }) {
       {detail.related && detail.related.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
           {detail.related.map((r) => (
-            <Link
+            <ChapterLink
               key={r.chapterId}
-              to="/chapters/$chapterId"
-              params={{ chapterId: r.chapterId }}
-              search={(prev) => prev}
+              chapterId={r.chapterId}
               className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
             >
               Related: {r.label} →
-            </Link>
+            </ChapterLink>
           ))}
         </div>
       ) : null}

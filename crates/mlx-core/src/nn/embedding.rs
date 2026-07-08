@@ -80,6 +80,8 @@ impl Embedding {
             num_embeddings,
             embedding_dim,
             is_quantized_flag: false,
+            quantized_packed: None,
+            sharded: None,
         })
     }
 

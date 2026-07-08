@@ -5,10 +5,12 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { AttentionRun, HiddenStatePointStats, HiddenStateStep } from '../../../src/inspector-types';
 import { Button } from '../../components/ui/button';
 import { Textarea } from '../../components/ui/textarea';
+import { useLocale } from '../../lib/i18n-react';
 import { runForInspector } from '../../lib/inspector-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
@@ -219,8 +221,15 @@ export function FullBlockChapterBody() {
         <p>
           The single most important and least-named concept in a decoder LLM is the <strong>residual stream</strong>: a
           per-token vector that enters the layer stack from the embedding, gets <em>written into</em> by every
-          sub-block, and is read by the LM head at the top. Nothing inside the layer <em>replaces</em> it — both
-          attention and MLP results are <em>added</em> back. Every operation is literally <code>h := h + Δ</code>.
+          sub-block, and is read at the top by the LM head — the final projection that turns the vector into next-token
+          scores (next chapter). Nothing inside the layer <em>replaces</em> it — both attention and MLP results are{' '}
+          <em>added</em> back. Every operation is literally <code>h := h + Δ</code>.
+        </p>
+        <p>
+          Concretely, with a toy 4-slot stream: say <code>h = [1.2, −0.4, 0.8, 0.3]</code> and the attention sub-block
+          computes <code>Δ = [0.1, 0.3, −0.1, 0.0]</code>. The new stream is <code>h + Δ = [1.3, −0.1, 0.7, 0.3]</code>.
+          The write only nudges a few slots — the last one passes through untouched, and the rest keep most of their old
+          value.
         </p>
         <p>
           The animation below shows it concretely: a single hidden vector, two layers' worth of writes (attention and
@@ -249,13 +258,37 @@ export function FullBlockChapterBody() {
           to a shared running sum. The "thinking" is the accumulation.
         </p>
 
+        <h2>Reading the tower as a climb in meaning</h2>
+        <p>
+          The 3D widget colors each ring by raw magnitude (per-token L2), and that is genuinely all the inspector
+          measures. But there is a softer, harder-to-pin-down story layered on top of the same tower: <em>what</em> the
+          residual stream is carrying tends to shift as you climb. Probing studies of standard transformers suggest a
+          rough trend — early layers lean toward local, surface-level structure (which token sits next to which, basic
+          grammar), while later layers lean toward more abstract, sentence-level meaning. Treat that as loose intuition,
+          not a measurement: it is a statistical tendency people have read out of trained networks, not a label stamped
+          on any specific layer. And it is even fuzzier here, because 18 of our 24 layers are <em>GatedDeltaNet</em>{' '}
+          rather than the softmax-attention stacks that most of that literature studied — so the early→grammar,
+          late→abstract picture is at best a hand-wave for this particular model, not a per-layer guarantee.
+        </p>
+        <p>
+          You already saw the climb in action, one chapter back. The{' '}
+          <ChapterLink chapterId="attention">polysemy demo from the attention chapter</ChapterLink> fed three prompts
+          that all end in the byte-identical token <code>·bank</code> — finance, aviation, riverside — so the embedding
+          lookup hands the stack the <em>same</em> starting vector at that final position, yet the model's next-token
+          predictions split apart completely. That is the same divergence, now read as a climb up the tower: the three
+          copies enter at the bottom identical, and each layer's write nudges them a little further apart as context
+          accumulates, until by the top they point at <code>·account</code>, <code>·angle</code>, and a plain sentence
+          end. Nothing new is claimed here — it is the depth angle on a divergence you have already seen.
+        </p>
+
         <h2>Hybrid attention: not every layer is "full"</h2>
         <p>
           Qwen3.5 is a <strong>hybrid</strong> stack. Most layers use a fast linear-attention variant called{' '}
           <em>GatedDeltaNet</em>; only every fourth layer (indices 3, 7, 11, 15, 19, 23, 0-indexed, on the 0.8B model)
           uses the classic <code>softmax(QKᵀ/√d)</code> formulation from chapter 4. Linear-attention layers do almost all the
           across-token mixing under the tight memory budget of long contexts; full-attention layers appear at fixed
-          intervals to do the heavy modelling that linear attention can't. The 3D widget highlights full-attention
+          intervals to do the heavy modelling that linear attention can't — e.g. looking back at one exact earlier
+          token; chapter 12 shows a linear layer failing at exactly this. The 3D widget highlights full-attention
           layers in a warmer color so you can see the interleave at a glance. Chapter 12 will dig into how this hybrid
           recipe works and why it's the new default for high-throughput open LLMs.
         </p>
@@ -507,9 +540,18 @@ export function FullBlockDemo({ workerRef, abortRef }: FullBlockDemoProps) {
   const layerStats = React.useMemo(() => getLayerStats(hiddenSteps, selectedLayer), [hiddenSteps, selectedLayer]);
 
   const hasData = Boolean(hiddenSteps && hiddenSteps.length > 0);
+  const locale = useLocale();
 
   return (
     <div className="space-y-4">
+      {locale === 'zh' ? (
+        <div
+          role="status"
+          className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          此互动组件尚未汉化，以下内容为英文。
+        </div>
+      ) : null}
       <div className="space-y-2">
         <label htmlFor="full-block-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt

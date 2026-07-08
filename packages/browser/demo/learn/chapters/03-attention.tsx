@@ -7,14 +7,18 @@ import { runForInspector } from '../../lib/inspector-client';
 import { AttentionHeatmap } from '../inspector/AttentionHeatmap';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { renderTokenDisplay } from '../inspector/TopKBars';
+import { findChapter } from '../chapters';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
+import { SubChapterNav } from '../scaffolding/SubChapterNav';
 import { AttentionFanout } from '../widgets/AttentionFanout';
 import { CausalMaskToggle } from '../widgets/CausalMaskToggle';
 import { CausalMaskVisual } from '../widgets/CausalMaskVisual';
+import { PolysemyDivergence } from '../widgets/PolysemyDivergence';
 import { ScaledSoftmax } from '../widgets/ScaledSoftmax';
 import { ToyAttentionExample } from '../widgets/ToyAttentionExample';
 
@@ -89,6 +93,11 @@ export const learning: ChapterLearningData = {
       term: 'causal mask',
       definition:
         'Setting the upper triangle of the score matrix to -inf so position i can only attend to positions 0..i.',
+    },
+    {
+      term: 'self-attention vs cross-attention',
+      definition:
+        'Self-attention (this chapter) draws Q, K and V from one running sequence — tokens look at each other. Cross-attention is the sibling from machine translation: queries come from one sequence, keys/values from another. Our text-only decoder path only ever does self-attention.',
     },
   ],
   takeaways: [
@@ -181,10 +190,27 @@ export function AttentionChapterBody() {
           Imagine you're the model and someone hands you the prompt <code>"The cat sat on the ___"</code> and asks for
           the next word. To guess well you have to look back at the earlier tokens: <code>cat</code> tells you the
           subject is an animal, <code>sat</code> tells you it's resting on something, <code>on the</code> tells you a
-          noun is coming next. Self-attention is a learned, differentiable version of that "look back": for every token
+          noun is coming next. Self-attention is a learned, tunable-by-training version of that "look back": for every token
           in the sequence the model decides <em>how much</em> it should pay attention to every other token. The panel on
           the right runs exactly this prompt and shows you the attention pattern.
         </p>
+
+        <h2>Same word, same starting vector</h2>
+        <p>
+          Here's the cleanest way to see <em>why</em> that look-back is necessary. The embedding lookup from chapter 3
+          is context-free: it's a table indexed by token id, so the word <code>bank</code> fetches the <em>same</em>{' '}
+          row of <code>embed_tokens.weight</code> whether the sentence is about money, an aircraft turn, or a riverside
+          picnic. At the moment the last token enters the layer stack, the model literally cannot tell those meanings
+          apart — the three starting vectors are byte-identical.
+        </p>
+        <p>
+          Pulling those meanings apart is the whole job of the layers above, and you can watch the result at the other
+          end of the pipeline: feed this model three prompts that all end in the very same token and its next-token
+          bets diverge completely. One caveat to keep you honest — in this model the disambiguation work is shared by
+          the 6 full-attention layers <em>and</em> the 18 GatedDeltaNet linear-attention layers (chapter 12), so
+          "attention did it" is shorthand for "the context-mixing stack did it."
+        </p>
+        <PolysemyDivergence />
 
         <h2>Q, K, V — three projections of the same vector</h2>
         <p>
@@ -208,13 +234,26 @@ export function AttentionChapterBody() {
           Each is a vector of length <code>d_head</code> (the per-head dimension — the same number the original
           "Attention Is All You Need" paper calls <code>d_k</code> and the model's config calls <code>head_dim</code>).
           Crucially these aren't three different tokens — they're three different views of the same token, learned
-          separately so attention can do something more interesting than just "compare embeddings."
+          separately so attention can do something more interesting than just "compare embeddings." In this model:{' '}
+          <code>x</code> is 1,024 numbers → 8 query vectors of 256 each, plus 2 key/value pairs of 256 (the 8-vs-2 trick
+          is GQA, next chapter).
         </p>
         <p>
           One more thing a beginner has to get right: the same three matrices <code>Wq</code>, <code>Wk</code>,{' '}
           <code>Wv</code> are applied to <em>every</em> token at <em>every</em> position — they're learned once and
           shared across the whole sequence, so the projection itself carries no notion of <em>where</em> a token sits;
           positional information is injected separately (by RoPE, chapter 6).
+        </p>
+        <p className="text-muted-foreground">
+          A naming note while it's fresh: because <code>Q</code>, <code>K</code> and <code>V</code> all come from the
+          one running sequence, this whole chapter is <strong>self</strong>-attention. Its sibling, <em>cross</em>
+          -attention, draws queries from one sequence and keys/values from another — the original use was machine
+          translation, where a decoder query reads an encoder's keys. Cross-attention doesn't appear anywhere in this
+          model family, though — not even in the full multimodal checkpoint. Vision fuses in via <em>early fusion</em>{' '}
+          instead: projected image-patch tokens get spliced directly into the same self-attention sequence as the text
+          tokens, which is{' '}
+          <ChapterLink chapterId="architecture">off in this demo</ChapterLink> — none of the 6 full-attention layers
+          here do cross-attention.
         </p>
 
         <h2>The formula</h2>
@@ -223,7 +262,8 @@ export function AttentionChapterBody() {
           latex={String.raw`\text{attention}(Q, K, V) = \text{softmax}\!\left(\frac{Q K^\top}{\sqrt{d_\text{head}}}\right) V`}
         />
         <p>
-          Let's read it left to right. <code>Q · Kᵀ</code> is a <code>[seq_len, seq_len]</code> matrix: cell{' '}
+          Let's read it left to right. <code>Q · Kᵀ</code> (the ᵀ flips rows and columns — notation for "dot every query
+          with every key") is a <code>[seq_len, seq_len]</code> matrix: cell{' '}
           <code>(i, j)</code> is the dot product of token <em>i</em>'s query with token <em>j</em>'s key — a raw score
           for "how well does <em>i</em>'s question match <em>j</em>'s offer?"
         </p>
@@ -248,6 +288,21 @@ export function AttentionChapterBody() {
           mixes the values together, weighted by the pattern — and that mixture is what flows out of the attention layer
           as the new representation of token <em>i</em>.
         </p>
+        <p>
+          One thing that's easy to picture wrong: that mixed value vector is not a wholesale replacement for the token.
+          It's a small correction that gets <em>added back</em> onto the vector the token carried in — attention writes
+          a delta onto the running representation, it doesn't overwrite it. That running representation has a name, the{' '}
+          <em>residual stream</em>, and the add-don't-replace rule is the seam every block in this model is wired
+          around; the <ChapterLink chapterId="full-block">full transformer block</ChapterLink> chapter shows the wiring.
+        </p>
+
+        <p>
+          That <code>[seq_len, seq_len]</code> matrix is also where attention gets expensive. Three optional deep-dives
+          go one level further — into the memory cost, how to put a number on it, and the trick that sidesteps it. All
+          are skippable on a first read.
+        </p>
+
+        <SubChapterNav chapterId="attention" items={findChapter('attention')?.sections} />
 
         <h2>Causal masking — and why it's the load-bearing wall of decoder LLMs</h2>
         <p>
@@ -296,6 +351,14 @@ export function AttentionChapterBody() {
           </li>
           <li>every row sums to 1; the upper triangle is 0 because of causal masking</li>
         </ul>
+        <p>
+          Look at the long edges the fan-out graph draws under the heatmap: a single full-attention step can route a
+          far-back token's content straight to the current position, no matter how many tokens sit in between. Distance
+          is free here — only relevance costs, because the score is a dot product, not a function of how far apart two
+          tokens are. (This free-reach claim is about the 6 full-attention layers; the 18 GatedDeltaNet layers reach
+          back through a running state instead, and the{' '}
+          <ChapterLink chapterId="kv-cache">KV-cache chapter</ChapterLink> covers why the model still needs both.)
+        </p>
 
         <h2>Why multiple heads, multiple layers</h2>
         <p>

@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 7 supplement — the gated MLP drawn as a neuron-graph instead of
  * matrix multiplications, so the "wide intermediate scratch space" claim
@@ -22,7 +24,61 @@ function evenY(n: number, top: number, bottom: number, i: number): number {
   return top + (i / (n - 1)) * (bottom - top);
 }
 
+// Per-locale copy: every user-visible string lives here so /zh localizes while
+// the English output stays byte-identical.
+const COPY = {
+  en: {
+    header: 'Same MLP, drawn as neurons',
+    intro: (
+      <>
+        The matmul view above tells you the dimensions. The neuron view tells you the <em>topology</em>: two parallel
+        wide projections (the gate and the value), an element-wise product, and a narrow projection back. Symbolic
+        widths shown — Qwen3.5-0.8B uses <span className="font-mono">1024 → 3584 → 1024</span>.
+      </>
+    ),
+    svgAria: 'Gated MLP drawn as a node graph',
+    schematicNote: 'schematic — 6 / 12 nodes shown, model uses 1024 / 3584',
+    hiddenIn: 'hidden in',
+    intermediate: 'intermediate (gate & up)',
+    product: 'silu(gate) ⊙ up',
+    hiddenOut: 'hidden out',
+    footer: (
+      <>
+        Two parallel projections widen <span className="font-mono">hidden → intermediate</span>. Their element-wise
+        product is the gated activation — the gate branch decides which features survive, the up branch carries the
+        values. <span className="font-mono">down_proj</span> collapses back. Together these three matrices are about a
+        third of Qwen3.5-0.8B (≈264M), roughly on par with the embedding table.
+      </>
+    ),
+  },
+  zh: {
+    header: '同一个 MLP，画成神经元',
+    intro: (
+      <>
+        上面的矩阵乘法视角告诉你维度。神经元视角告诉你<em>拓扑</em>
+        ：两条并行的加宽投影（门控和取值）、一次逐元素相乘、再一条收窄的投影回来。图中宽度只是象征——Qwen3.5-0.8B 用的是{' '}
+        <span className="font-mono">1024 → 3584 → 1024</span>。
+      </>
+    ),
+    svgAria: '画成节点图的门控 MLP',
+    schematicNote: '示意——图中画 6 / 12 个节点，模型实际为 1024 / 3584',
+    hiddenIn: 'hidden 输入',
+    intermediate: 'intermediate（gate 和 up）',
+    product: 'silu(gate) ⊙ up',
+    hiddenOut: 'hidden 输出',
+    footer: (
+      <>
+        两条并行投影把 <span className="font-mono">hidden → intermediate</span>{' '}
+        加宽。它们的逐元素乘积就是门控后的激活——gate 分支决定哪些特征存活，up 分支携带取值。
+        <span className="font-mono">down_proj</span> 再收回去。这三个矩阵合起来约占 Qwen3.5-0.8B
+        的三分之一（≈264M），规模与嵌入表大致相当。
+      </>
+    ),
+  },
+} as const;
+
 export function FfnNeurons() {
+  const copy = COPY[useLocale()];
   const W = 560;
   const H = 280;
 
@@ -48,18 +104,9 @@ export function FfnNeurons() {
 
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
-      <div className="text-xs uppercase tracking-wider text-muted-foreground">Same MLP, drawn as neurons</div>
-      <p className="text-[12px] text-foreground/85">
-        The matmul view above tells you the dimensions. The neuron view tells you the <em>topology</em>: two parallel
-        wide projections (the gate and the value), an element-wise product, and a narrow projection back. Symbolic
-        widths shown — Qwen3.5-0.8B uses <span className="font-mono">1024 → 3584 → 1024</span>.
-      </p>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        className="block h-auto w-full"
-        role="img"
-        aria-label="Gated MLP drawn as a node graph"
-      >
+      <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
+      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* schematic note — make it explicit this is topology, not real activations */}
         <text
           x={W - 6}
@@ -70,20 +117,20 @@ export function FfnNeurons() {
           fillOpacity={0.45}
           fontStyle="italic"
         >
-          schematic — 6 / 12 nodes shown, model uses 1024 / 3584
+          {copy.schematicNote}
         </text>
         {/* column headers */}
         <text x={xIn} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
-          hidden in
+          {copy.hiddenIn}
         </text>
         <text x={(xGate + xUp) / 2} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
-          intermediate (gate & up)
+          {copy.intermediate}
         </text>
         <text x={xProd} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
-          silu(gate) ⊙ up
+          {copy.product}
         </text>
         <text x={xOut} y={14} fontSize={10} textAnchor="middle" fill="currentColor" fillOpacity={0.6}>
-          hidden out
+          {copy.hiddenOut}
         </text>
 
         {/* edges: input → gate */}
@@ -249,12 +296,7 @@ export function FfnNeurons() {
           down_proj
         </text>
       </svg>
-      <div className="text-[11px] text-muted-foreground">
-        Two parallel projections widen <span className="font-mono">hidden → intermediate</span>. Their element-wise
-        product is the gated activation — the gate branch decides which features survive, the up branch carries the
-        values. <span className="font-mono">down_proj</span> collapses back. Together these three matrices are about a
-        third of Qwen3.5-0.8B (≈264M), roughly on par with the embedding table.
-      </div>
+      <div className="text-[11px] text-muted-foreground">{copy.footer}</div>
     </div>
   );
 }

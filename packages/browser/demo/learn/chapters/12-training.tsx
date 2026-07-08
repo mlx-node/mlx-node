@@ -2,8 +2,10 @@ import * as React from 'react';
 
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
+import { BackpropFlowDiagram } from '../widgets/BackpropFlowDiagram';
 import { ExposureBias } from '../widgets/ExposureBias';
 import { GradientDescent } from '../widgets/GradientDescent';
 import { TeacherForcingAnimation } from '../widgets/TeacherForcingAnimation';
@@ -44,6 +46,11 @@ export const learning: ChapterLearningData = {
         'The update rule behind training: the gradient points uphill — the direction that increases the loss fastest — so each weight is nudged the opposite way (downhill): w ← w − lr·gradient. The learning rate (lr) is the step size: too small crawls, too large overshoots and diverges. AdamW runs this per-parameter for all ~800M weights at once.',
     },
     {
+      term: 'batch',
+      definition:
+        'Several to many training sequences processed together in one step (real pretraining batches are commonly hundreds of sequences / millions of tokens, assembled via gradient accumulation — see Chapter 14). The loss is averaged across them, so one weight update reflects many examples instead of one — steadier gradients, better hardware use.',
+    },
+    {
       term: 'cross-entropy loss',
       definition:
         'Loss for a single prediction: −log p(target). Sums or averages across positions and batch elements to get the total loss.',
@@ -56,7 +63,7 @@ export const learning: ChapterLearningData = {
     {
       term: 'one training step',
       definition:
-        'Forward pass on a batch of sequences → compute loss → backpropagate → optimizer updates weights. Repeated trillions of times.',
+        "Forward pass on a batch of sequences → compute loss → backpropagate → optimizer updates weights. Repeated hundreds of thousands to a few million times over a pretraining run (each step chews through millions of tokens, so the token count reaches into the trillions even though the step count doesn't).",
     },
     {
       term: 'parallel positions',
@@ -156,6 +163,26 @@ export function TrainingChapterBody() {
           They all train on the same objective.
         </p>
 
+        <h2>What &ldquo;training&rdquo; even means</h2>
+        <p>
+          Before the formula, the picture. Think of the model as a panel of tunable knobs. A wall thermostat has one:
+          turn it up, the room gets warmer; turn it down, it cools. You find the right setting by nudging — a little too
+          cold, bump it up; overshoot, ease it back — until the room feels right. Training is that same loop, with one
+          difference: instead of a human reading the room, an automatic procedure reads how wrong the model&apos;s
+          predictions are and nudges every knob a hair in the direction that makes them less wrong. Nobody hand-picks
+          the values; they are <em>found</em> by repeating that nudge.
+        </p>
+        <p>
+          The catch is the number of knobs. Fit a straight line to a scatter of points and you are tuning two knobs —
+          a slope and an intercept. Step up the ladder and the count explodes: the Qwen3.5 model running in your browser
+          has <strong>852,985,920</strong> of them, each a single number that backpropagation will nudge. (For a sense
+          of how far this ladder goes, GPT-3 carried 175 billion knobs — about 200× more; the per-knob nudge is
+          identical, there are just vastly more of them, which is the whole story of{' '}
+          <ChapterLink chapterId="scaling">scaling</ChapterLink>.) The error that those nudges are driving down — the
+          single number the whole procedure reads to decide which way to turn each knob — is exactly the{' '}
+          <code>−log p</code> below.
+        </p>
+
         <h2>The objective in one line</h2>
         <MathDisplay
           latex={String.raw`\mathcal{L} = -\frac{1}{N} \sum_{i=1}^{N} \log p_\theta(t_{i+1} \mid t_1, \dots, t_i)`}
@@ -166,8 +193,10 @@ export function TrainingChapterBody() {
             For every position in every sequence, predict the next token; minimize the negative log probability of the
             true next token.
           </strong>{' '}
-          Summed over positions and averaged over the batch, this is what the optimizer pushes down. No reward model, no
-          human in the loop (at pretraining time) — just enormous quantities of text and a shift-by-one target.
+          Averaged over positions within a sequence (as shown) and averaged again over the sequences in the batch (real
+          pretraining batches are commonly hundreds of sequences / millions of tokens — see Chapter 14), this is what
+          the optimizer pushes down. No reward model, no human in the loop (at pretraining time) — just enormous
+          quantities of text and a shift-by-one target.
         </p>
         <p>
           The per-position loss <code>-log p(target)</code> is called <strong>cross-entropy</strong>. When{' '}
@@ -178,6 +207,14 @@ export function TrainingChapterBody() {
           <code>-log p → ∞</code> as <code>p → 0</code>, a confidently-wrong prediction is punished arbitrarily hard —
           the model is penalized most exactly when it is both wrong and certain. The optimizer&apos;s job is to push the
           model&apos;s probability mass onto the actual next token.
+        </p>
+        <p>
+          So where does the loss <em>start</em>? At initialization the weights are random, so every one of the 248,320
+          vocabulary tokens gets roughly the same probability — about <code>1/248,320</code>. Plug that in:{' '}
+          <code>−ln(1/248,320) = ln(248,320) ≈ 12.4</code>. That is the loss before the model has learned anything, and
+          every drop below it is learning. The live training playground on this page starts the same way, just with a
+          tiny character vocabulary: its default corpus has only 3 distinct characters, so its curve starts near{' '}
+          <code>ln(3) ≈ 1.1</code> (the two 11-character corpora start near <code>ln(11) ≈ 2.4</code>).
         </p>
 
         <h2>Teacher forcing — the trick that makes it parallel</h2>
@@ -192,8 +229,11 @@ export function TrainingChapterBody() {
           at every position, so the model learns from correct context rather than its own initially-terrible guesses.
           The <em>parallelism</em> comes from a separate mechanism — the causal mask (chapter 4). Because each position
           can only attend backward, every position's loss can be computed in a <em>single</em> forward pass without any
-          position peeking at its own target. <em>Ground-truth targets (teacher forcing) + single-pass parallelism
-          (causal mask) together let all N positions train at once.</em>
+          position peeking at its own target.{' '}
+          <em>
+            Ground-truth targets (teacher forcing) + single-pass parallelism (causal mask) together let all N positions
+            train at once.
+          </em>
         </p>
 
         <TeacherForcingAnimation />
@@ -203,8 +243,9 @@ export function TrainingChapterBody() {
         <h2>Inference and training are the same forward pass</h2>
         <p>
           A consequence worth pausing on: there is no separate "training-time" architecture. The same forward pass —
-          embedding lookup, 24 transformer layers with attention + MLP, RMSNorm at the top, LM head matmul — is what
-          runs during both training and inference. Training just does it on a whole sequence at once and scores the
+          embedding lookup, 24 transformer layers each mixing tokens (6 via full attention, 18 via GatedDeltaNet) and
+          then transforming them with an MLP, RMSNorm at the top, LM head matmul — is what runs during both training
+          and inference. Training just does it on a whole sequence at once and scores the
           output against ground truth; inference does it one token at a time and samples from the output.
         </p>
         <p>
@@ -234,10 +275,25 @@ export function TrainingChapterBody() {
         <h2>What the optimizer actually does</h2>
         <p>
           The loss is one scalar. <strong>Backpropagation</strong> — working the chain rule backward through the forward
-          pass — computes its gradient with respect to every weight in the model (~800M of them for Qwen3.5-0.8B). An
-          optimizer (almost always <strong>AdamW</strong>, broken down in Chapter 14) takes a small step in the
-          direction that lowers the loss. Strip it down to a single weight and the rule is easy to see: the gradient
-          points uphill, so step the opposite way — and the size of that step (the learning rate) has a sweet spot.
+          pass — computes its gradient with respect to every weight in the model (~800M of them for Qwen3.5-0.8B). Here
+          is the whole algorithm without the calculus — the loss flows back down the stack one block at a time:
+        </p>
+
+        <BackpropFlowDiagram />
+
+        <p>
+          That single backward pass is <em>architecture-blind</em>. The chain rule does not care that 6 of Qwen3.5&apos;s
+          24 layers run softmax attention while the other 18 are linear-recurrent{' '}
+          <ChapterLink chapterId="architecture">GatedDeltaNet</ChapterLink> — every weight in both kinds gets its
+          gradient from the same downhill walk, which is exactly why a single AdamW loop trains the two flavors side by
+          side without ever knowing which is which.
+        </p>
+
+        <p>
+          Once every block has its gradient, an optimizer (almost always <strong>AdamW</strong>, broken down in Chapter
+          14) takes a small step in the direction that lowers the loss. Strip it down to a single weight and the rule is
+          easy to see: the gradient points uphill, so step the opposite way — and the size of that step (the learning
+          rate) has a sweet spot.
         </p>
 
         <GradientDescent />

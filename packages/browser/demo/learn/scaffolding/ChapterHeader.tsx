@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { Badge } from '../../components/ui/badge';
 import { Card } from '../../components/ui/card';
+import { useUiStrings } from '../i18n/ui-react';
 
 export type ChapterHeaderProps = {
   /** One short sentence: what the learner will be able to do. */
@@ -17,6 +18,7 @@ export type ChapterHeaderProps = {
  * the left, a minutes Badge on the right. Pairs with `ChapterFrame`.
  */
 export function ChapterHeader({ objective, problem, minutes }: ChapterHeaderProps) {
+  const ui = useUiStrings();
   return (
     <Card className="gap-2 border-b py-4">
       <div className="flex items-start justify-between gap-4 px-6">
@@ -25,7 +27,7 @@ export function ChapterHeader({ objective, problem, minutes }: ChapterHeaderProp
           <p className="text-sm italic text-muted-foreground">{problem}</p>
         </div>
         <Badge variant="secondary" className="shrink-0">
-          {minutes} min
+          {ui.scaffolding.minBadge(minutes)}
         </Badge>
       </div>
     </Card>

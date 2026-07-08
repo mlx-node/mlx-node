@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils';
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
@@ -43,17 +44,155 @@ const STEP = 0.09;
 const CLAMP_MIN = 0.02;
 const CLAMP_MAX = 0.98;
 
-const PROMPT = 'Explain recursion to a 5-year-old.';
-// Illustrative one-liners. A is the helpful answer; B is the evasive one — but
-// they're plausibly comparable, so "picking" the better one feels real.
-const RESPONSE_A =
-  "It's like a tiny robot that, to do a big job, makes a smaller copy of itself to do a smaller piece — until the piece is so small it just does it.";
-const RESPONSE_B =
-  "Recursion is when a function is recursive. It's a standard concept; you'll understand it eventually.";
-
 // Bar colors (winner / loser read clearly in the dark theme).
 const A_BG = 'oklch(0.72 0.15 150 / 0.5)'; // green-ish
 const B_BG = 'oklch(0.7 0.13 60 / 0.5)'; // amber-ish
+
+// Per-locale copy. The prompt and the two illustrative one-liners localize too:
+// the learner has to READ and judge them, and the zh chapter doesn't quote them
+// in English. A is the helpful answer; B is the evasive one — plausibly
+// comparable, so "picking" the better one feels real.
+const COPY = {
+  en: {
+    header: 'Preference tuning — pick a winner, nudge',
+    subnote: (
+      <>
+        A human prefers one response; the update raises <span className="font-mono">P(chosen)</span>
+      </>
+    ),
+    promptLabel: 'Prompt: ',
+    prompt: 'Explain recursion to a 5-year-old.',
+    responseA:
+      "It's like a tiny robot that, to do a big job, makes a smaller copy of itself to do a smaller piece — until the piece is so small it just does it.",
+    responseB: "Recursion is when a function is recursive. It's a standard concept; you'll understand it eventually.",
+    chosen: 'chosen',
+    pickAria: (side: Side) => `Human prefers response ${side}`,
+    responseLabel: (side: Side) => `Response ${side}`,
+    preferredChip: '👤 preferred',
+    humanPrefers: 'Human prefers:',
+    aBetter: 'A is better',
+    bBetter: 'B is better',
+    probLabel: (side: Side) => `P(${side}) — model probability of response ${side}`,
+    applyUpdate: 'Apply preference update →',
+    reset: 'Reset',
+    updatesCount: (n: number) => `${n} updates`,
+    chosenReadout: (side: Side) => `P(chosen) — ${side}`,
+    rejectedReadout: (side: Side) => `P(rejected) — ${side}`,
+    takeawayCeiling: (winner: Side, ceil: string) =>
+      `Response ${winner} is now near the ${ceil}% ceiling — the update raised the chosen response and lowered the rejected one. That's all preference tuning does, repeated over thousands of pairs.`,
+    takeawayStart: (winner: Side, loser: Side) =>
+      `Click "apply preference update" to nudge the chosen response (${winner}) up and the rejected one (${loser}) down.`,
+    takeawayProgress: (updates: number, winner: Side, loser: Side) =>
+      `${updates} update${updates === 1 ? '' : 's'}: P(${winner}) is rising, P(${loser}) is falling — the update raises the chosen response's probability and lowers the rejected one.`,
+    liveSummary: (preferred: Side, pa: string, pb: string, updates: number, method: Method) =>
+      `Human prefers response ${preferred}. ` +
+      `Model probability of A is ${pa} percent, of B is ${pb} percent, ` +
+      `after ${updates} preference update${updates === 1 ? '' : 's'}. Method: ${method}.`,
+    howComputed: 'How the update is computed',
+    methodAria: 'Preference-tuning method',
+    svgAria: (method: Method, preferred: Side, pa: string, pb: string, rlhf: boolean) =>
+      `Preference-tuning pipeline, ${method} mode. ` +
+      `A fixed prompt with two candidate responses (the human currently prefers response ${preferred}, ` +
+      `model probabilities P(A) ${pa} percent and P(B) ${pb} percent) ` +
+      (rlhf
+        ? 'flows into a separate reward model that scores the responses, then a reinforcement-learning step updates the model.'
+        : 'flows directly into the model update; the reward model is bypassed and greyed out.'),
+    svgPairTitle: 'prompt + pair',
+    svgPairSub: (preferred: Side) => `A vs B, human picked ${preferred}`,
+    svgReward: 'reward model',
+    svgScores: 'scores responses',
+    svgSkipped: 'skipped',
+    svgUpdate: 'model update',
+    svgRlStep: 'RL step',
+    svgPrefLoss: 'preference loss',
+    svgDirect: 'direct — skips the reward model',
+    rlhfExplain: (
+      <>
+        <strong>RLHF</strong> trains a <strong>separate reward model</strong> from the human comparisons, then
+        uses reinforcement learning to optimize the model against that reward.
+      </>
+    ),
+    dpoExplain: (
+      <>
+        <strong>DPO</strong> optimizes the preference pairs <strong>directly</strong> with a preference loss — no
+        separate reward model. Same goal as RLHF, one fewer moving part.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative — this is a cartoon. Real preference datasets are thousands of pairs, and the “nudge” is one
+        gradient step on a preference loss (DPO) or a reward-model-guided RL step (RLHF); the probabilities here are
+        hand-set, not from a model.
+      </>
+    ),
+  },
+  zh: {
+    header: '偏好微调——选出赢家，轻推一下',
+    subnote: (
+      <>
+        人类偏好其中一条回复；更新会提高 <span className="font-mono">P(chosen)</span>
+      </>
+    ),
+    promptLabel: '提示词：',
+    prompt: '向一个 5 岁小孩解释递归。',
+    responseA:
+      '它就像一个小机器人：要完成一件大事，就复制一个更小的自己去做更小的一块——直到那块小到可以直接做完。',
+    responseB: '递归就是一个函数是递归的。这是个标准概念；你以后总会懂的。',
+    chosen: '偏好',
+    pickAria: (side: Side) => `人类偏好回复 ${side}`,
+    responseLabel: (side: Side) => `回复 ${side}`,
+    preferredChip: '👤 偏好',
+    humanPrefers: '人类偏好：',
+    aBetter: 'A 更好',
+    bBetter: 'B 更好',
+    probLabel: (side: Side) => `P(${side})——模型给回复 ${side} 的概率`,
+    applyUpdate: '应用偏好更新 →',
+    reset: '重置',
+    updatesCount: (n: number) => `${n} 次更新`,
+    chosenReadout: (side: Side) => `P(偏好) — ${side}`,
+    rejectedReadout: (side: Side) => `P(拒绝) — ${side}`,
+    takeawayCeiling: (winner: Side, ceil: string) =>
+      `回复 ${winner} 已接近 ${ceil}% 的上限——更新提高了被选中的回复、压低了被拒绝的那条。偏好微调做的就是这件事，在成千上万个回复对上重复。`,
+    takeawayStart: (winner: Side, loser: Side) =>
+      `点击“应用偏好更新”，把被选中的回复（${winner}）往上推、把被拒绝的（${loser}）往下压。`,
+    takeawayProgress: (updates: number, winner: Side, loser: Side) =>
+      `${updates} 次更新：P(${winner}) 在上升，P(${loser}) 在下降——更新提高被选中回复的概率、降低被拒绝回复的概率。`,
+    liveSummary: (preferred: Side, pa: string, pb: string, updates: number, method: Method) =>
+      `人类偏好回复 ${preferred}。模型给 A 的概率为 ${pa}%，给 B 的为 ${pb}%，已应用 ${updates} 次偏好更新。方法：${method}。`,
+    howComputed: '更新是如何计算的',
+    methodAria: '偏好微调方法',
+    svgAria: (method: Method, preferred: Side, pa: string, pb: string, rlhf: boolean) =>
+      `偏好微调流水线，${method} 模式。一个固定的提示词和两条候选回复（人类当前偏好回复 ${preferred}，模型概率 P(A) ${pa}%、P(B) ${pb}%）` +
+      (rlhf ? '先流入一个独立的、为回复打分的奖励模型，再由一步强化学习更新模型。' : '直接流入模型更新；奖励模型被绕过并置灰。'),
+    svgPairTitle: '提示词 + 回复对',
+    svgPairSub: (preferred: Side) => `A vs B，人类选了 ${preferred}`,
+    svgReward: '奖励模型',
+    svgScores: '为回复打分',
+    svgSkipped: '被跳过',
+    svgUpdate: '模型更新',
+    svgRlStep: 'RL 更新',
+    svgPrefLoss: '偏好损失',
+    svgDirect: '直接——跳过奖励模型',
+    rlhfExplain: (
+      <>
+        <strong>RLHF</strong> 先用人类比较数据训练一个<strong>独立的奖励模型</strong>
+        ，再用强化学习去优化主模型在这个奖励上的得分。
+      </>
+    ),
+    dpoExplain: (
+      <>
+        <strong>DPO</strong> 用一个偏好损失<strong>直接</strong>在偏好对上优化——不需要单独的奖励模型。目标与 RLHF
+        相同，少一个活动部件。
+      </>
+    ),
+    footnote: (
+      <>
+        示意——这是一幅卡通。真实的偏好数据集有成千上万个回复对，而这里的“轻推”对应偏好损失上的一步梯度（DPO）
+        或一步由奖励模型引导的 RL 更新（RLHF）；这些概率是手工设定的，并非来自模型。
+      </>
+    ),
+  },
+} as const;
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = React.useState<boolean>(() => {
@@ -90,6 +229,7 @@ function ProbBar({
   isWinner: boolean;
   animate: boolean;
 }) {
+  const copy = COPY[useLocale()];
   return (
     <div className="space-y-1">
       <div className="flex items-baseline justify-between text-[11px]">
@@ -97,7 +237,7 @@ function ProbBar({
           {label}
           {isWinner ? (
             <span className="ml-1.5 rounded bg-primary/15 px-1 py-0.5 font-mono text-[9px] uppercase tracking-wider text-primary">
-              chosen
+              {copy.chosen}
             </span>
           ) : null}
         </span>
@@ -133,12 +273,13 @@ function PickButton({
   onClick: () => void;
   children: React.ReactNode;
 }) {
+  const copy = COPY[useLocale()];
   return (
     <button
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      aria-label={`Human prefers response ${side}`}
+      aria-label={copy.pickAria(side)}
       className={cn(
         'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
         active
@@ -158,6 +299,7 @@ const PW = 560;
 const PH = 132;
 
 function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred: Side; pA: number }) {
+  const copy = COPY[useLocale()];
   const rlhf = method === 'RLHF';
   const pB = 1 - pA;
 
@@ -175,13 +317,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
   const rewardR = rewardBox.x + rewardBox.w;
   const updateL = updateBox.x;
 
-  const ariaLabel =
-    `Preference-tuning pipeline, ${method} mode. ` +
-    `A fixed prompt with two candidate responses (the human currently prefers response ${preferred}, ` +
-    `model probabilities P(A) ${(pA * 100).toFixed(0)} percent and P(B) ${(pB * 100).toFixed(0)} percent) ` +
-    (rlhf
-      ? 'flows into a separate reward model that scores the responses, then a reinforcement-learning step updates the model.'
-      : 'flows directly into the model update; the reward model is bypassed and greyed out.');
+  const ariaLabel = copy.svgAria(method, preferred, (pA * 100).toFixed(0), (pB * 100).toFixed(0), rlhf);
 
   return (
     <svg
@@ -227,7 +363,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.9}
         >
-          prompt + pair
+          {copy.svgPairTitle}
         </text>
         <text
           x={pairBox.x + pairBox.w / 2}
@@ -237,7 +373,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.6}
         >
-          A vs B, human picked {preferred}
+          {copy.svgPairSub(preferred)}
         </text>
       </g>
 
@@ -262,7 +398,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.9}
         >
-          reward model
+          {copy.svgReward}
         </text>
         <text
           x={rewardBox.x + rewardBox.w / 2}
@@ -272,7 +408,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.6}
         >
-          {rlhf ? 'scores responses' : 'skipped'}
+          {rlhf ? copy.svgScores : copy.svgSkipped}
         </text>
       </g>
 
@@ -296,7 +432,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.9}
         >
-          model update
+          {copy.svgUpdate}
         </text>
         <text
           x={updateBox.x + updateBox.w / 2}
@@ -306,7 +442,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="currentColor"
           fillOpacity={0.6}
         >
-          {rlhf ? 'RL step' : 'preference loss'}
+          {rlhf ? copy.svgRlStep : copy.svgPrefLoss}
         </text>
       </g>
 
@@ -357,7 +493,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
           fill="oklch(0.72 0.15 150)"
           fillOpacity={0.95}
         >
-          direct — skips the reward model
+          {copy.svgDirect}
         </text>
       ) : null}
     </svg>
@@ -365,6 +501,7 @@ function PipelineDiagram({ method, preferred, pA }: { method: Method; preferred:
 }
 
 export function PreferencePair() {
+  const copy = COPY[useLocale()];
   const reducedMotion = usePrefersReducedMotion();
 
   const [preferred, setPreferred] = React.useState<Side>('A');
@@ -405,32 +542,26 @@ export function PreferencePair() {
   const atCeiling = winPct >= CLAMP_MAX * 100 - 1e-6;
 
   const takeaway = atCeiling
-    ? `Response ${winnerSide} is now near the ${(CLAMP_MAX * 100).toFixed(0)}% ceiling — the update raised the chosen response and lowered the rejected one. That's all preference tuning does, repeated over thousands of pairs.`
+    ? copy.takeawayCeiling(winnerSide, (CLAMP_MAX * 100).toFixed(0))
     : updates === 0
-      ? `Click "apply preference update" to nudge the chosen response (${winnerSide}) up and the rejected one (${loserSide}) down.`
-      : `${updates} update${updates === 1 ? '' : 's'}: P(${winnerSide}) is rising, P(${loserSide}) is falling — the update raises the chosen response's probability and lowers the rejected one.`;
+      ? copy.takeawayStart(winnerSide, loserSide)
+      : copy.takeawayProgress(updates, winnerSide, loserSide);
 
   // sr-only summary of the whole live state (the bars are DOM, not one SVG).
-  const liveSummary =
-    `Human prefers response ${preferred}. ` +
-    `Model probability of A is ${pAPct.toFixed(0)} percent, of B is ${pBPct.toFixed(0)} percent, ` +
-    `after ${updates} preference update${updates === 1 ? '' : 's'}. Method: ${method}.`;
+  const liveSummary = copy.liveSummary(preferred, pAPct.toFixed(0), pBPct.toFixed(0), updates, method);
 
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Preference tuning — pick a winner, nudge
-        </div>
-        <div className="text-[11px] text-muted-foreground">
-          A human prefers one response; the update raises <span className="font-mono">P(chosen)</span>
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.subnote}</div>
       </div>
 
       {/* ---- BEAT 1: the preference loop ---- */}
       <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
         <div className="text-[11px] text-muted-foreground">
-          Prompt: <span className="text-foreground/90">{PROMPT}</span>
+          {copy.promptLabel}
+          <span className="text-foreground/90">{copy.prompt}</span>
         </div>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {(['A', 'B'] as const).map((side) => {
@@ -444,13 +575,15 @@ export function PreferencePair() {
                 )}
               >
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="font-mono text-[11px] font-medium text-foreground/90">Response {side}</span>
+                  <span className="font-mono text-[11px] font-medium text-foreground/90">
+                    {copy.responseLabel(side)}
+                  </span>
                   {isWinner ? (
-                    <span className="text-[10px] uppercase tracking-wider text-primary">👤 preferred</span>
+                    <span className="text-[10px] uppercase tracking-wider text-primary">{copy.preferredChip}</span>
                   ) : null}
                 </div>
                 <p className="text-[11px] leading-relaxed text-foreground/80">
-                  {side === 'A' ? RESPONSE_A : RESPONSE_B}
+                  {side === 'A' ? copy.responseA : copy.responseB}
                 </p>
               </div>
             );
@@ -458,12 +591,12 @@ export function PreferencePair() {
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-[11px] text-muted-foreground">Human prefers:</span>
+          <span className="text-[11px] text-muted-foreground">{copy.humanPrefers}</span>
           <PickButton side="A" active={preferred === 'A'} onClick={() => setPreferred('A')}>
-            A is better
+            {copy.aBetter}
           </PickButton>
           <PickButton side="B" active={preferred === 'B'} onClick={() => setPreferred('B')}>
-            B is better
+            {copy.bBetter}
           </PickButton>
         </div>
       </div>
@@ -471,14 +604,14 @@ export function PreferencePair() {
       {/* ---- BEAT 1: probability bars + update controls + readout ---- */}
       <div className="space-y-2">
         <ProbBar
-          label="P(A) — model probability of response A"
+          label={copy.probLabel('A')}
           pct={pAPct}
           bg={A_BG}
           isWinner={preferred === 'A'}
           animate={!reducedMotion}
         />
         <ProbBar
-          label="P(B) — model probability of response B"
+          label={copy.probLabel('B')}
           pct={pBPct}
           bg={B_BG}
           isWinner={preferred === 'B'}
@@ -495,7 +628,7 @@ export function PreferencePair() {
             'transition-colors hover:bg-muted/70',
           )}
         >
-          Apply preference update →
+          {copy.applyUpdate}
         </button>
         <button
           type="button"
@@ -505,18 +638,22 @@ export function PreferencePair() {
             'transition-colors hover:text-foreground',
           )}
         >
-          Reset
+          {copy.reset}
         </button>
-        <span className="ml-auto font-mono text-[11px] text-muted-foreground">{updates} updates</span>
+        <span className="ml-auto font-mono text-[11px] text-muted-foreground">{copy.updatesCount(updates)}</span>
       </div>
 
       <div className="grid grid-cols-2 gap-2" aria-live="polite">
         <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">P(chosen) — {winnerSide}</div>
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            {copy.chosenReadout(winnerSide)}
+          </div>
           <div className="font-mono text-sm text-foreground/90">{winPct.toFixed(0)}%</div>
         </div>
         <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">P(rejected) — {loserSide}</div>
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            {copy.rejectedReadout(loserSide)}
+          </div>
           <div className="font-mono text-sm text-foreground/90">{losePct.toFixed(0)}%</div>
         </div>
       </div>
@@ -533,11 +670,11 @@ export function PreferencePair() {
       {/* ---- BEAT 2: RLHF vs DPO pipeline ---- */}
       <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="text-[11px] uppercase tracking-wider text-muted-foreground">How the update is computed</div>
+          <div className="text-[11px] uppercase tracking-wider text-muted-foreground">{copy.howComputed}</div>
           <SegmentedToggle
             value={method}
             onChange={setMethod}
-            ariaLabel="Preference-tuning method"
+            ariaLabel={copy.methodAria}
             options={[
               { value: 'RLHF', label: 'RLHF' },
               { value: 'DPO', label: 'DPO' },
@@ -548,25 +685,11 @@ export function PreferencePair() {
         <PipelineDiagram method={method} preferred={preferred} pA={pA} />
 
         <p className="text-[11px] leading-relaxed text-foreground/85">
-          {method === 'RLHF' ? (
-            <>
-              <strong>RLHF</strong> trains a <strong>separate reward model</strong> from the human comparisons, then
-              uses reinforcement learning to optimize the model against that reward.
-            </>
-          ) : (
-            <>
-              <strong>DPO</strong> optimizes the preference pairs <strong>directly</strong> with a preference loss — no
-              separate reward model. Same goal as RLHF, one fewer moving part.
-            </>
-          )}
+          {method === 'RLHF' ? copy.rlhfExplain : copy.dpoExplain}
         </p>
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — this is a cartoon. Real preference datasets are thousands of pairs, and the “nudge” is one
-        gradient step on a preference loss (DPO) or a reward-model-guided RL step (RLHF); the probabilities here are
-        hand-set, not from a model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

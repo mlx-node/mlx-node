@@ -2124,6 +2124,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -2578,6 +2584,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let parsed_tool_calls = stream_parser.tool_calls();
@@ -2979,6 +2991,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -3285,6 +3303,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         cb.call(
@@ -5061,6 +5085,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let mut parsed = super::output_parser::parse_gemma4_output(&raw_text);
@@ -5513,6 +5543,12 @@ impl Gemma4Inner {
             } else {
                 0.0
             },
+            mtp_mean_accepted_tokens: None,
+            mtp_mean_accepted_tokens_total: None,
+            mtp_acceptance_by_position: None,
+            mtp_cycles: None,
+            mtp_mean_depth: None,
+            profile_phases: None,
         });
 
         let parsed_tool_calls = stream_parser.tool_calls();

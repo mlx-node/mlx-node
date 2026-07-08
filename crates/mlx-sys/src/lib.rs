@@ -698,6 +698,7 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
     ) -> *mut mlx_array;
 
     /// Optimized sampling that returns BOTH token and logprobs
@@ -720,6 +721,7 @@ unsafe extern "C-unwind" {
         top_k: i32,
         top_p: f32,
         min_p: f32,
+        sampler_mode: i32,
         out_token: *mut *mut mlx_array,
         out_logprobs: *mut *mut mlx_array,
     );
@@ -2299,3 +2301,107 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     max_outputs: usize,
     context: *mut std::os::raw::c_void,
 ) -> usize;
+
+// ---------------------------------------------------------------------------
+// Bindings adopted from origin/main (int8/sym8 GEMM+QMV, compiled sampling,
+// stacked SwiGLU MLP, raw safetensor read, int8 array marshaling). Declared
+// here so native `cargo check -p mlx-core` (default features = full) resolves
+// these symbols. The matching C++ implementations live in mlx-sys/src and are
+// linked only by the native addon build (yarn build:native); the browser/WASM
+// build does not compile the convert/int8 code paths that reference them.
+// ---------------------------------------------------------------------------
+unsafe extern "C-unwind" {
+    pub fn mlx_array_from_int8(data: *const i8, shape: *const i64, ndim: usize) -> *mut mlx_array;
+    pub fn mlx_array_to_int8(handle: *mut mlx_array, out: *mut i8, len: usize) -> bool;
+
+    /// Read a raw byte range straight from a safetensors file into `out`,
+    /// bypassing MLX (no array constructed).
+    pub fn mlx_safetensor_read_raw(
+        file_path: *const std::os::raw::c_char,
+        file_offset: u64,
+        out: *mut u8,
+        out_len: usize,
+    ) -> bool;
+
+    // SwiGLU MLP with pre-stacked + pre-transposed weights.
+    pub fn mlx_swiglu_mlp_forward_stacked(
+        x: *mut mlx_array,
+        w_gate_up_t: *mut mlx_array,
+        w_down_t: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    // Compiled categorical sampling distribution.
+    pub fn mlx_compiled_sampling_distribution(
+        logits: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        sampler_mode: i32,
+    ) -> *mut mlx_array;
+
+    // Default device get/set (used by the convert CPU-pinning guard).
+    pub fn mlx_default_device() -> i32;
+    pub fn mlx_set_default_device(device_type: i32);
+
+    // CONVERT-time sym8 quantizer (checkpoint layout): STORABLE int8 [N,K]
+    // weight + f32 [N] scales.
+    pub fn mlx_sym8_quantize_store(
+        w: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_scales: *mut *mut mlx_array,
+    ) -> bool;
+
+    // int8 x @ w^T -> int32 [M,N].
+    pub fn mlx_matmul_int8(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        out_i32: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Per-output-channel symmetric int8 weight quant (load-time).
+    pub fn mlx_quantize_weight_int8(
+        w: *mut mlx_array,
+        out_w_i8: *mut *mut mlx_array,
+        out_s_w: *mut *mut mlx_array,
+    ) -> bool;
+
+    // LOAD-time sym8 kernel-operand builder.
+    pub fn mlx_sym8_kernel_operand(w: *mut mlx_array, out_w_kn: *mut *mut mlx_array) -> bool;
+
+    // W8A8 linear: per-token int8 act quant + int8 GEMM + rescale -> bf16 [M,N].
+    pub fn mlx_w8a8_linear(
+        x: *mut mlx_array,
+        w_i8: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // sym8 DECODE matvec (QMV).
+    pub fn mlx_int8_qmv(
+        x: *mut mlx_array,
+        w_i8: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // W8A16 sym8 DECODE matvec (QMV).
+    pub fn mlx_int8_qmv_w8a16(
+        x: *mut mlx_array,
+        w_kn: *mut mlx_array,
+        w_nk: *mut mlx_array,
+        s_w: *mut mlx_array,
+        out_bf16: *mut *mut mlx_array,
+    ) -> bool;
+
+    // Affine-group W8A8 linear (measurement).
+    pub fn mlx_affine_w8a8_linear(
+        x: *mut mlx_array,
+        packed_w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        out: *mut *mut mlx_array,
+    ) -> bool;
+}

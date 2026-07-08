@@ -105,6 +105,10 @@ pub(crate) struct Qwen3Inner {
     /// Created when `InitTraining` command is received, destroyed when training ends.
     #[cfg(feature = "full")]
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
+    /// Checkpoint `generation_config.json` sampling defaults, parsed at load
+    /// time. Consumed as the fallback layer under per-request sampling fields.
+    #[allow(dead_code)]
+    pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -255,6 +259,81 @@ pub(crate) enum Qwen3Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
+}
+
+/// Lift a model-neutral [`crate::engine::cmd::TrainCmd`] into this family's
+/// flat thread-command variants. Mirrors the field-for-field structure of
+/// [`crate::engine::cmd::TrainCmd`]; all training variants are `full`-only.
+#[cfg(feature = "full")]
+impl crate::engine::cmd::FromTrainCmd for Qwen3Cmd {
+    fn from_train(cmd: crate::engine::cmd::TrainCmd) -> Self {
+        use crate::engine::cmd::TrainCmd;
+        match cmd {
+            TrainCmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            } => Qwen3Cmd::InitTraining {
+                config,
+                model_type,
+                reply,
+            },
+            TrainCmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            } => Qwen3Cmd::GenerateForTraining {
+                prompts,
+                group_size,
+                gen_config,
+                enable_thinking,
+                tools,
+                reply,
+            },
+            TrainCmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            } => Qwen3Cmd::TrainStepGRPO {
+                rewards,
+                group_size,
+                loss_config,
+                valid_indices,
+                reply,
+            },
+            TrainCmd::BumpSkippedStep { reply } => Qwen3Cmd::BumpSkippedStep { reply },
+            TrainCmd::SetTrainingStep { step, reply } => {
+                Qwen3Cmd::SetTrainingStep { step, reply }
+            }
+            TrainCmd::ResetTraining { reply } => Qwen3Cmd::ResetTraining { reply },
+            TrainCmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            } => Qwen3Cmd::TrainStepSFT {
+                input_ids,
+                input_shape,
+                labels,
+                labels_shape,
+                config,
+                reply,
+            },
+            TrainCmd::SaveOptimizerState { path, reply } => {
+                Qwen3Cmd::SaveOptimizerState { path, reply }
+            }
+            TrainCmd::LoadOptimizerState { path, reply } => {
+                Qwen3Cmd::LoadOptimizerState { path, reply }
+            }
+        }
+    }
 }
 
 /// Command handler for the dedicated model thread.
@@ -602,7 +681,14 @@ impl Qwen3Inner {
             cached_image_key: None,
             #[cfg(feature = "full")]
             training_state: None,
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Store the checkpoint's parsed `generation_config.json` defaults.
+    /// Called once at load time after construction.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -1123,6 +1209,12 @@ impl Qwen3Inner {
                 } else {
                     0.0
                 },
+                mtp_mean_accepted_tokens: None,
+                mtp_mean_accepted_tokens_total: None,
+                mtp_acceptance_by_position: None,
+                mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -1472,6 +1564,12 @@ impl Qwen3Inner {
                 } else {
                     0.0
                 },
+                mtp_mean_accepted_tokens: None,
+                mtp_mean_accepted_tokens_total: None,
+                mtp_acceptance_by_position: None,
+                mtp_cycles: None,
+                mtp_mean_depth: None,
+                profile_phases: None,
             })
         } else {
             None
@@ -4285,8 +4383,10 @@ impl Qwen3Inner {
                         content: m.content.clone(),
                         tool_calls: m.tool_calls.clone(),
                         tool_call_id: m.tool_call_id.clone(),
+                        is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None,
+                        audio: None,
                     })
                     .collect()
             })
@@ -4311,8 +4411,10 @@ impl Qwen3Inner {
                         content: m.content.clone(),
                         tool_calls: m.tool_calls.clone(),
                         tool_call_id: m.tool_call_id.clone(),
+                        is_error: m.is_error,
                         reasoning_content: m.reasoning_content.clone(),
                         images: None,
+                        audio: None,
                     })
                     .collect();
                 let result = self.generate_sync(msgs, config.clone())?;
@@ -4494,7 +4596,7 @@ impl Qwen3Inner {
             }
         }
 
-        let params_clone: HashMap<String, MxArray> =
+        let mut params_clone: HashMap<String, MxArray> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Build weights.mlx metadata (shape + dtype only; full data is in safetensors).
@@ -4543,7 +4645,7 @@ impl Qwen3Inner {
             "format": "mlx-node",
             "version": "1.0"
         }));
-        crate::utils::safetensors::save_safetensors(&safetensors_path, &params_clone, metadata)?;
+        crate::utils::safetensors::save_safetensors(&safetensors_path, &mut params_clone, metadata)?;
         info!("Saved weights.safetensors");
 
         let weights_str = serde_json::to_string_pretty(&weights_json)?;

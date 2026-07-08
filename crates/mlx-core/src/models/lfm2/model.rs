@@ -59,6 +59,10 @@ pub(crate) struct Lfm2Inner {
     /// performs the per-layer dispatch.
     #[cfg(feature = "full")]
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Checkpoint `generation_config.json` sampling defaults, parsed at load
+    /// time. Consumed as the fallback layer under per-request sampling fields.
+    #[allow(dead_code)]
+    pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -321,7 +325,14 @@ impl Lfm2Inner {
             cached_image_key: None,
             #[cfg(feature = "full")]
             paged_adapter,
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Store the checkpoint's parsed `generation_config.json` defaults.
+    /// Called once at load time after construction.
+    pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
+        self.gen_defaults = defaults;
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {

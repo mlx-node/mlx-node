@@ -7,9 +7,7 @@
 /// Architecture: patch_embed → + pos_embed → 27 blocks with 2D RoPE → merger
 use crate::array::MxArray;
 use crate::vision::embeddings::PatchEmbedding;
-#[cfg(test)]
-use crate::vision::encoder::VisionAttention;
-use crate::vision::encoder::VisionEncoderLayer;
+use crate::vision::encoder::{VisionAttention, VisionEncoderLayer};
 use crate::vision::projector::SpatialProjector;
 use crate::vision::rope_vision::VisionRotaryEmbedding;
 use napi::bindgen_prelude::*;
@@ -92,17 +90,6 @@ impl Qwen3_5VisionEncoder {
             rotary_pos_emb: Arc::new(rotary_pos_emb),
             merger: None,
         })
-    }
-
-    /// Widths used by the vision transformer's largest per-patch
-    /// intermediates. The request planner combines these with the live input
-    /// dtype and allocator headroom to bound cache-miss microbatches.
-    pub(crate) fn memory_widths(&self) -> (u64, u64, u64) {
-        (
-            u64::try_from(self.config.hidden_size).unwrap_or(0),
-            u64::try_from(self.config.intermediate_size).unwrap_or(0),
-            u64::try_from(self.config.out_hidden_size).unwrap_or(0),
-        )
     }
 
     /// Set patch embedding weights (and optional Conv bias)
@@ -389,58 +376,25 @@ impl Qwen3_5VisionEncoder {
         // Compute 2D rotary position embeddings
         let rotary_pos_emb = self.compute_rot_pos_emb(grid_thw)?;
 
-        // Build cumulative image/frame boundaries. Qwen vision attention is
-        // block-diagonal across these segments. Keep the boundaries on the CPU
-        // and dispatch one fused SDPA per segment rather than allocating a
-        // `[total_patches, total_patches]` additive mask.
-        let mut segment_boundaries: Vec<i64> = vec![0];
+        // Build cumulative sequence lengths for attention masking
+        let mut cu_seqlens: Vec<i32> = vec![0];
         for img_idx in 0..num_images {
-            let t = i64::from(grid_data[img_idx * 3]);
-            let h_dim = i64::from(grid_data[img_idx * 3 + 1]);
-            let w_dim = i64::from(grid_data[img_idx * 3 + 2]);
-            let segment_len = h_dim
-                .checked_mul(w_dim)
-                .ok_or_else(|| Error::from_reason("Qwen3.5 vision segment length overflow"))?;
+            let t = grid_data[img_idx * 3];
+            let h_dim = grid_data[img_idx * 3 + 1];
+            let w_dim = grid_data[img_idx * 3 + 2];
             for _ in 0..t {
-                let prev = *segment_boundaries.last().unwrap_or(&0);
-                segment_boundaries.push(prev.checked_add(segment_len).ok_or_else(|| {
-                    Error::from_reason("Qwen3.5 vision cumulative segment length overflow")
-                })?);
+                let prev = *cu_seqlens.last().unwrap();
+                cu_seqlens.push(prev + h_dim * w_dim);
             }
         }
-        let total_seq_len = h.shape()?[0];
-        if segment_boundaries.last().copied() != Some(total_seq_len) {
-            return Err(Error::from_reason(format!(
-                "Qwen3.5 vision grid covers {} patches but patch embedding produced {total_seq_len}",
-                segment_boundaries.last().copied().unwrap_or(0),
-            )));
-        }
+        let cu_seqlens_arr = MxArray::from_int32(&cu_seqlens, &[cu_seqlens.len() as i64])?;
 
-        // Forward through encoder layers. MLX builds lazy graphs, so leaving all
-        // 27 blocks attached to the final merger output retains every layer's
-        // QKV and expanded MLP activations until the caller evaluates the final
-        // feature tensor. That is untenable for large multi-image requests (one
-        // 200k-patch FC1 activation alone is about 1.6 GiB in bf16). Materialize
-        // the residual stream after every block: evaluating this exact tensor
-        // detaches the complete upstream graph without changing any tensor
-        // shapes or arithmetic, and clearing the allocator cache releases those
-        // now-dead intermediates before constructing the next block.
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            h = layer.forward_segmented(&h, &segment_boundaries, Some(&rotary_pos_emb))?;
-            let context = format!("qwen3_5_vision_layer_{layer_idx}");
-            MxArray::eval_arrays_with_context(&[&h], &context).map_err(|error| {
-                Error::from_reason(format!(
-                    "Qwen3.5 vision layer {layer_idx} materialization failed: {error}"
-                ))
-            })?;
-            crate::array::clear_cache();
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "vision_layer_materialized",
-                layer = layer_idx,
-                patch_count = total_seq_len,
-                "Qwen3.5 vision layer residual materialized"
-            );
+        // Forward through encoder layers. Each layer's attention builds its
+        // additive mask internally from `cu_seqlens` (identical for every
+        // layer, since LayerNorm preserves dtype and no layer changes the
+        // token count).
+        for layer in &self.layers {
+            h = layer.forward(&h, &cu_seqlens_arr, Some(&rotary_pos_emb))?;
         }
 
         // Spatial projector (reduces token count by merge_size^2)
@@ -714,59 +668,26 @@ mod tests {
     }
 
     #[test]
-    fn test_forward_segments_multi_image_attention_without_dense_mask() {
+    fn test_forward_builds_attention_mask_once_per_call() {
         let num_layers = 3;
         let encoder = tiny_encoder(num_layers);
 
-        // Two images with 4 and 2 patches respectively. The production failure
-        // came from concatenating several images into one global quadratic
-        // mask; this path must not build that mask at all.
-        let hidden_states = random_array(&[1, 6, 3, 2, 2]);
-        let grid_thw = MxArray::from_int32(&[1, 2, 2, 1, 1, 2], &[2, 3]).unwrap();
+        // Single image, 1x2x2 patch grid = 4 patches, each patch_size x
+        // patch_size x 3 (channels) raw pixels.
+        let hidden_states = random_array(&[1, 4, 3, 2, 2]);
+        let grid_thw = MxArray::from_int32(&[1, 2, 2], &[1, 3]).unwrap();
 
         BUILD_ATTENTION_MASK_CALLS.with(|c| c.set(0));
         let output = encoder.forward(&hidden_states, &grid_thw).unwrap();
         let calls = BUILD_ATTENTION_MASK_CALLS.with(|c| c.get());
 
         assert_eq!(
-            calls, 0,
-            "segmented Qwen3.5 attention must not construct a global dense mask \
-             across any of the {num_layers} encoder layers"
+            calls, 1,
+            "build_attention_mask should be built once per forward call and reused \
+             across all {num_layers} encoder layers, not rebuilt once per layer"
         );
 
         let shape: Vec<i64> = output.shape().unwrap().as_ref().to_vec();
-        assert_eq!(shape, vec![6, 8]);
-    }
-
-    #[test]
-    fn test_combined_and_per_image_microbatches_are_numerically_equivalent() {
-        let encoder = tiny_encoder(2);
-        // Distinct grids, including t=2 for the second image, exercise both
-        // image ordering and per-frame attention boundaries.
-        let hidden_states = random_array(&[1, 8, 3, 2, 2]);
-        let combined_grid = MxArray::from_int32(&[1, 2, 2, 2, 1, 2], &[2, 3]).unwrap();
-        let combined = encoder.forward(&hidden_states, &combined_grid).unwrap();
-
-        let first_pixels = hidden_states.slice_axis(1, 0, 4).unwrap();
-        let second_pixels = hidden_states.slice_axis(1, 4, 8).unwrap();
-        let first_grid = MxArray::from_int32(&[1, 2, 2], &[1, 3]).unwrap();
-        let second_grid = MxArray::from_int32(&[2, 1, 2], &[1, 3]).unwrap();
-        let first = encoder.forward(&first_pixels, &first_grid).unwrap();
-        let second = encoder.forward(&second_pixels, &second_grid).unwrap();
-        let microbatched = MxArray::concatenate_many(vec![&first, &second], Some(0)).unwrap();
-
-        MxArray::eval_arrays(&[&combined, &microbatched]).unwrap();
-        let combined_values = combined.to_float32().unwrap().to_vec();
-        let microbatched_values = microbatched.to_float32().unwrap().to_vec();
-        assert_eq!(combined_values.len(), microbatched_values.len());
-        let max_abs_diff = combined_values
-            .iter()
-            .zip(microbatched_values.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_abs_diff <= 1e-4,
-            "combined/per-image vision output diverged: max abs diff {max_abs_diff}"
-        );
+        assert_eq!(shape, vec![4, 8]);
     }
 }

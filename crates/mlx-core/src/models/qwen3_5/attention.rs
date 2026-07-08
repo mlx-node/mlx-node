@@ -108,6 +108,15 @@ pub struct Qwen3_5Attention {
     num_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+
+    /// Pre-fused `[hidden, 2*H*D]` transpose of the per-head-interleaved
+    /// `q_proj` weight, split into contiguous `[q_block; g_block]` column
+    /// order. Populated by `finalize_q_gate_block()` after `q_proj` is
+    /// loaded; invalidated back to `None` when a quantized `q_proj` is set.
+    q_gate_block_t: Option<MxArray>,
+    /// Matching pre-fused bias in `q_gate_block_t`'s column order. `None`
+    /// when q_proj has no bias.
+    q_gate_block_bias: Option<MxArray>,
 }
 
 fn paged_prefill_paged_attention_enabled() -> bool {
@@ -182,6 +191,8 @@ impl Qwen3_5Attention {
             num_kv_heads,
             head_dim,
             scale,
+            q_gate_block_t: None,
+            q_gate_block_bias: None,
         })
     }
 
@@ -873,7 +884,49 @@ impl Qwen3_5Attention {
 
     // ========== Quantized setters ==========
 
+    /// Pre-fuse the per-head-interleaved `q_proj` weight into a single
+    /// `[hidden, 2*H*D]` transposed block with contiguous `[q; g]` column
+    /// order, so the forward path can do ONE matmul + two slices instead of
+    /// reshaping `[B,T,H,2D]` and slicing per head.
+    ///
+    /// Safe to call repeatedly (idempotent). No-op when `q_proj` is
+    /// quantized — mirrors `GatedDeltaNet::finalize_in_proj` (quantized
+    /// checkpoints stay on the unfused path).
+    pub fn finalize_q_gate_block(&mut self) -> Result<()> {
+        let LinearProj::Standard(q_lin) = &self.q_proj else {
+            return Ok(());
+        };
+        let h = self.num_heads as i64;
+        let d = self.head_dim as i64;
+
+        let weight = q_lin.get_weight(); // [2*H*D, hidden], per-head-interleaved
+        let hidden = weight.shape_at(1)?;
+        let w_per_head = weight.reshape(&[h, 2 * d, hidden])?;
+        let w_q = w_per_head.slice_axis(1, 0, d)?.reshape(&[h * d, hidden])?;
+        let w_g = w_per_head
+            .slice_axis(1, d, 2 * d)?
+            .reshape(&[h * d, hidden])?;
+        let w_block_t = MxArray::concatenate(&w_q, &w_g, 0)?.transpose(Some(&[1, 0]))?;
+        w_block_t.eval();
+        self.q_gate_block_t = Some(w_block_t);
+
+        self.q_gate_block_bias = match q_lin.get_bias() {
+            Some(b) => {
+                let b_per_head = b.reshape(&[h, 2 * d])?;
+                let b_q = b_per_head.slice_axis(1, 0, d)?.reshape(&[h * d])?;
+                let b_g = b_per_head.slice_axis(1, d, 2 * d)?.reshape(&[h * d])?;
+                let b_block = MxArray::concatenate(&b_q, &b_g, 0)?;
+                b_block.eval();
+                Some(b_block)
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
     pub fn set_quantized_q_proj(&mut self, ql: QuantizedLinear) {
+        self.q_gate_block_t = None;
+        self.q_gate_block_bias = None;
         self.q_proj.set_quantized(ql);
     }
     pub fn set_quantized_k_proj(&mut self, ql: QuantizedLinear) {
@@ -884,6 +937,19 @@ impl Qwen3_5Attention {
     }
     pub fn set_quantized_o_proj(&mut self, ql: QuantizedLinear) {
         self.o_proj.set_quantized(ql);
+    }
+
+    /// Whether any of the q/k/v/o projections hold quantized weights.
+    ///
+    /// Used by the dense/bf16-only MTP save path to detect a quantized MTP
+    /// head (loaded from a `--q-mtp all`/`cyankiwi` checkpoint) and refuse
+    /// to serialize stale dense weights (see
+    /// `Qwen3_5MTPModule::has_quantized_weights`).
+    pub fn is_quantized(&self) -> bool {
+        self.q_proj.is_quantized()
+            || self.k_proj.is_quantized()
+            || self.v_proj.is_quantized()
+            || self.o_proj.is_quantized()
     }
 
     // ========== Weight getters (for training parameter extraction) ==========

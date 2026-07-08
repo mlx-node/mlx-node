@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import type { AttentionRun, HiddenStatePointStats, HiddenStateStep } from '../../../src/inspector-types';
 import { Textarea } from '../../components/ui/textarea';
+import { useLocale } from '../../lib/i18n-react';
 import { runForInspector } from '../../lib/inspector-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
@@ -11,6 +12,7 @@ import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { FfnNeurons } from '../widgets/FfnNeurons';
+import { MlpNeuronPanel } from '../widgets/MlpNeuronPanel';
 import { SiluVsRelu } from '../widgets/SiluVsRelu';
 import { SwiGluVsPlain } from '../widgets/SwiGluVsPlain';
 
@@ -44,7 +46,7 @@ const POINT_META: Record<CapturePoint, { title: string; description: string }> =
 /**
  * Scaffolding metadata for chapter 7 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
- * `chapterId` must match `CHAPTERS[6].id` in `learn/chapters.ts`.
+ * `chapterId` must match `CHAPTERS[7].id` in `learn/chapters.ts`.
  */
 export const learning: ChapterLearningData = {
   chapterId: 'mlp',
@@ -165,6 +167,12 @@ export function MlpChapterBody() {
       <Prose>
         <h1>The MLP block: per-token feed-forward</h1>
         <p>
+          First, the name. <strong>MLP</strong> stands for <em>multi-layer perceptron</em> — the plainest neural network
+          there is: a matrix-multiply, then a squash function (the &quot;activation&quot;), then another
+          matrix-multiply. &quot;Feed-forward&quot; is just another name for the same thing — numbers flow straight
+          through, no loops.
+        </p>
+        <p>
           Attention is the part of a transformer that mixes information <em>across tokens</em>: every position can read
           from every other position via softmax(QKᵀ)·V. The MLP block is the opposite — it touches every token in{' '}
           <em>isolation</em>, running the same little neural network on each position's hidden vector and writing the
@@ -184,6 +192,13 @@ export function MlpChapterBody() {
           (you'll see the residual stream drawn in the next chapter, the full transformer block). Each block reads from
           the highway, computes a small contribution, and adds it back. The model's prediction is the accumulation of
           every block's contribution — not the output of the last block alone.
+        </p>
+
+        <p>
+          One more thing before the formulas: why have a squash function at all? Because stacking matrix-multiplies with
+          nothing between them buys nothing — <code>A·(B·x)</code> is just <code>(A·B)·x</code>, two linear maps
+          collapsed into one. The squash between them is what stops the collapse and lets the block compute genuinely
+          new things.
         </p>
 
         <h2>What "gated MLP" actually means</h2>
@@ -219,10 +234,15 @@ export function MlpChapterBody() {
           <code>down_proj</code>.
         </p>
         <p>
+          Walk one feature by hand. Say the gate path produces <code>z = 2</code> and the up path produces{' '}
+          <code>0.5</code>. Then <code>silu(2) = 2 / (1 + e⁻²) ≈ 1.76</code>, so the feature that passes through is{' '}
+          <code>1.76 × 0.5 ≈ 0.88</code>. A strongly negative gate would crush the same value toward zero instead.
+        </p>
+        <p>
           The intermediate dimension is where the model has its "scratch space" — around 3.5× the hidden dim here
           (Qwen3.5-0.8B uses 3584 for a 1024-dim hidden state; 3–4× is common across models). These three matrices are
-          one of the largest blocks of parameters in the model — about a third of the ~0.8B total (≈264M), roughly on
-          par with the embedding table.
+          one of the largest blocks of parameters in the model: 3 matrices × 1024 × 3584 numbers each, × 24 layers ={' '}
+          <code>264,241,152 ≈ 264M</code> — about a third of the ~0.8B total, roughly on par with the embedding table.
         </p>
 
         <FfnNeurons />
@@ -232,7 +252,8 @@ export function MlpChapterBody() {
         <h2>Why gated — and why it isn't any bigger</h2>
         <p>
           You might wonder why three matrices. The classic feed-forward block — the one in the original Transformer —
-          used just two: an up-projection, a fixed nonlinearity (ReLU or GELU), then a down-projection. SwiGLU keeps the
+          used just two matrices: an up-projection, a fixed nonlinearity (ReLU in the original paper; GELU in later
+          variants like BERT), then a down-projection. SwiGLU keeps the
           up and down matrices but adds a third, the <code>gate</code>, and replaces the fixed nonlinearity with a
           learned, multiplicative one. Instead of applying the same threshold to every feature, the gate lets the
           network decide — per token, per feature — <em>how much</em> of each up-projected value survives. That
@@ -249,6 +270,12 @@ export function MlpChapterBody() {
         </p>
 
         <SwiGluVsPlain />
+
+        <p>
+          So much for the plumbing — here is what those intermediate features end up <em>doing</em> once trained:
+        </p>
+
+        <MlpNeuronPanel />
 
         <h2>The MLP contributes a small correction</h2>
         <p>
@@ -267,9 +294,9 @@ export function MlpChapterBody() {
           transformers learnable.
         </p>
         <p>
-          One unifying point for Qwen3.5's hybrid stack: <strong>every layer — full-attention or linear — has this same
-          MLP block.</strong> Only the token-mixing half differs between the two layer kinds; the SwiGLU MLP that follows
-          it is identical everywhere.
+          One unifying point for Qwen3.5's hybrid stack:{' '}
+          <strong>every layer — full-attention or linear — has this same MLP block.</strong> Only the token-mixing half
+          differs between the two layer kinds; the SwiGLU MLP that follows it is identical everywhere.
         </p>
       </Prose>
     </ChapterFrame>
@@ -329,6 +356,7 @@ function formatNumber(value: number, digits = 3): string {
 }
 
 export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
+  const locale = useLocale();
   const [prompt, setPrompt] = React.useState(DEFAULT_PROMPT);
   const [run, setRun] = React.useState<AttentionRun | null>(null);
   const [status, setStatus] = React.useState<RunStatus | null>(null);
@@ -468,6 +496,11 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
 
   return (
     <div className="space-y-4">
+      {locale === 'zh' ? (
+        <div className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          此互动演示尚未翻译，界面文字为英文。
+        </div>
+      ) : null}
       <div className="space-y-2">
         <label htmlFor="mlp-demo-input" className="text-xs uppercase tracking-wider text-muted-foreground">
           Prompt
@@ -564,7 +597,7 @@ export function MlpDemo({ workerRef, abortRef }: MlpDemoProps) {
 
       <DemoCallout
         items={[
-          'SwiGLU multiplies a gate and a value: the bars are roughly gate × value before the down projection.',
+          'SwiGLU multiplies a gate and a value, then down_proj folds that product back to hidden_dim — the bars show that final correction (mlp_output), already past the down projection, not the raw gate × value product.',
           'Different layers spend wildly different amounts in their MLPs — find the tallest and the smallest.',
           'The MLP-to-output ratio shows how much the MLP changes the residual stream at each layer.',
         ]}

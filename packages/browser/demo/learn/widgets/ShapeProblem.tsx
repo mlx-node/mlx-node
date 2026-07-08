@@ -2,6 +2,20 @@ import * as React from 'react';
 
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
+import { useLocale } from '../../lib/i18n-react';
+
+// Per-locale strings owned by this widget. `question`/`formula`/`values`/
+// `answer` arrive as props already localized at the chapter call site.
+const COPY = {
+  en: {
+    hideAnswer: 'Hide answer',
+    showAnswer: 'Show answer',
+  },
+  zh: {
+    hideAnswer: '收起答案',
+    showAnswer: '显示答案',
+  },
+} as const;
 
 export type ShapeProblemProps = {
   /** Headline question, e.g. "How big is Qwen3's embedding matrix?" */
@@ -20,6 +34,7 @@ export type ShapeProblemProps = {
  * footprint, MLP intermediate size, etc.) instead of just reading prose.
  */
 export function ShapeProblem({ question, formula, values, answer }: ShapeProblemProps) {
+  const copy = COPY[useLocale()];
   const [open, setOpen] = React.useState(false);
   return (
     <Card className="gap-3 py-4">
@@ -41,7 +56,7 @@ export function ShapeProblem({ question, formula, values, answer }: ShapeProblem
           </tbody>
         </table>
         <Button variant="outline" size="sm" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-          {open ? 'Hide answer' : 'Show answer'}
+          {open ? copy.hideAnswer : copy.showAnswer}
         </Button>
         {open ? (
           <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground/85">

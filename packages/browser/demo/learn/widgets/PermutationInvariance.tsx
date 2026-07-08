@@ -1,6 +1,8 @@
 import { cn } from '@/lib/utils';
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 6 supplement — the FELT problem that motivates RoPE: plain
  * self-attention is PERMUTATION-INVARIANT in its weights.
@@ -78,6 +80,77 @@ export function attentionWeightsFrom(query: TokenId, keys: readonly TokenId[]): 
 // on-screen ordering — which is exactly the property we are demonstrating.
 const ALL_TOKENS: readonly TokenId[] = ['cat', 'sat', 'mat'];
 
+// Per-locale copy. English strings are moved verbatim from the original JSX;
+// the token names (cat/sat/mat) are model-example tokens and stay English.
+const COPY = {
+  en: {
+    heading: "Plain attention can't see order",
+    sub: "Reorder the bag — the weights don't move",
+    currentOrder: 'Current order',
+    slot: (slot: number) => `slot ${slot}`,
+    shuffle: 'Shuffle order',
+    howMuch: (query: React.ReactNode) => (
+      <>
+        How much {query} attends to each token · <span className="font-mono">softmax(content · content)</span>
+      </>
+    ),
+    payoff: (query: TokenId) => (
+      <>
+        <strong>Same weights, just relabeled positions.</strong> Shuffle the order and the bar for{' '}
+        <span className="font-mono">{query}</span> → every token holds its exact value — the slots above moved, the
+        numbers did not.
+      </>
+    ),
+    mainPara: (
+      <>
+        Plain attention only sees <em>which</em> tokens are present, not their order — swap the order and every weight
+        is unchanged. That blindness is exactly the gap RoPE fills by rotating Q and K by position.
+      </>
+    ),
+    footnote: (
+      <>
+        Illustrative — three fixed tokens with hand-picked 2-D content vectors and no positional signal. The weight from
+        one token to another is <span className="font-mono">softmax</span> of the dot product of their content vectors,
+        which depends only on the two tokens, never on their slots — so it is the same across every ordering. The real
+        model adds many dimensions, learned Q/K projections, and the RoPE rotation that breaks exactly this symmetry.
+      </>
+    ),
+  },
+  zh: {
+    heading: '朴素的注意力看不见顺序',
+    sub: '重新排列这袋 token——权重纹丝不动',
+    currentOrder: '当前顺序',
+    slot: (slot: number) => `槽位 ${slot}`,
+    shuffle: '打乱顺序',
+    howMuch: (query: React.ReactNode) => (
+      <>
+        {query} 对每个 token 的注意力 · <span className="font-mono">softmax(content · content)</span>
+      </>
+    ),
+    payoff: (query: TokenId) => (
+      <>
+        <strong>权重相同，只是位置重新贴了标签。</strong>打乱顺序，再看 <span className="font-mono">{query}</span>{' '}
+        的每根条——每个 token 的数值原封不动：上面的槽位换了，数字没有动。
+      </>
+    ),
+    mainPara: (
+      <>
+        朴素的注意力只看见<em>哪些</em>{' '}
+        token 在场，看不见它们的顺序——换个顺序，每个权重都保持不变。这种对顺序的失明，正是 RoPE 通过按位置旋转 Q 和 K
+        所填补的空缺。
+      </>
+    ),
+    footnote: (
+      <>
+        仅作示意——三个固定 token，使用手挑的 2 维内容向量，没有任何位置信号。一个 token 对另一个 token
+        的权重，是二者内容向量点积的 <span className="font-mono">softmax</span>，只取决于这两个
+        token 本身，与槽位无关——所以在任何排序下都相同。真实模型有更多维度、可学习的 Q/K
+        投影，以及恰好打破这种对称性的 RoPE 旋转。
+      </>
+    ),
+  },
+} as const;
+
 function WeightBar({ token, weight, dimmed }: { token: TokenId; weight: number; dimmed: boolean }) {
   const pct = Math.round(weight * 100);
   return (
@@ -94,6 +167,7 @@ function WeightBar({ token, weight, dimmed }: { token: TokenId; weight: number; 
 }
 
 export function PermutationInvariance() {
+  const copy = COPY[useLocale()];
   const [orderIdx, setOrderIdx] = React.useState(0);
   const [query, setQuery] = React.useState<TokenId>('cat');
 
@@ -113,17 +187,15 @@ export function PermutationInvariance() {
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Plain attention can&apos;t see order
-        </div>
-        <div className="text-[11px] text-muted-foreground">Reorder the bag — the weights don&apos;t move</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.heading}</div>
+        <div className="text-[11px] text-muted-foreground">{copy.sub}</div>
       </div>
 
       {/* Current on-screen order: the slots change when you shuffle, but each
           token keeps its identity (and its content vector). */}
       <div className="space-y-1.5">
         <div className="text-[11px] text-muted-foreground">
-          Current order · <span className="font-mono text-foreground/85">{orderLabel}</span>
+          {copy.currentOrder} · <span className="font-mono text-foreground/85">{orderLabel}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {order.map((tok, slot) => {
@@ -139,7 +211,7 @@ export function PermutationInvariance() {
                   active ? 'border-primary/60 bg-primary/10' : 'border-border/60 bg-muted/20 hover:bg-foreground/5',
                 )}
               >
-                <span className="font-mono text-[10px] tabular-nums text-muted-foreground">slot {slot}</span>
+                <span className="font-mono text-[10px] tabular-nums text-muted-foreground">{copy.slot(slot)}</span>
                 <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: COLOR[tok] }} />
                 <span className="font-mono text-[13px] text-foreground/90">{tok}</span>
               </button>
@@ -151,7 +223,7 @@ export function PermutationInvariance() {
             className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs font-medium text-foreground hover:bg-primary/20"
           >
             <span aria-hidden="true">⤭</span>
-            Shuffle order
+            {copy.shuffle}
           </button>
         </div>
       </div>
@@ -161,11 +233,11 @@ export function PermutationInvariance() {
           tokens sit on screen above. */}
       <div className="space-y-2 rounded-md border border-border/60 bg-muted/20 p-3">
         <div className="text-[11px] text-muted-foreground">
-          How much{' '}
-          <span className="font-mono text-foreground/85" style={{ color: COLOR[query] }}>
-            {query}
-          </span>{' '}
-          attends to each token · <span className="font-mono">softmax(content · content)</span>
+          {copy.howMuch(
+            <span className="font-mono text-foreground/85" style={{ color: COLOR[query] }}>
+              {query}
+            </span>,
+          )}
         </div>
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
           {ALL_TOKENS.map((tok) => (
@@ -175,22 +247,12 @@ export function PermutationInvariance() {
       </div>
 
       <div className="rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1.5 text-[12px] text-foreground/90">
-        <strong>Same weights, just relabeled positions.</strong> Shuffle the order and the bar for{' '}
-        <span className="font-mono">{query}</span> → every token holds its exact value — the slots above moved, the
-        numbers did not.
+        {copy.payoff(query)}
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        Plain attention only sees <em>which</em> tokens are present, not their order — swap the order and every weight
-        is unchanged. That blindness is exactly the gap RoPE fills by rotating Q and K by position.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.mainPara}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — three fixed tokens with hand-picked 2-D content vectors and no positional signal. The weight from
-        one token to another is <span className="font-mono">softmax</span> of the dot product of their content vectors,
-        which depends only on the two tokens, never on their slots — so it is the same across every ordering. The real
-        model adds many dimensions, learned Q/K projections, and the RoPE rotation that breaks exactly this symmetry.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

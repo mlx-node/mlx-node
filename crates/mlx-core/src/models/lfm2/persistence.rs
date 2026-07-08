@@ -1588,7 +1588,7 @@ impl Lfm2Model {
                 let paged_active = false;
                 Ok((inner, (config, cache_limit_guard, paged_active)))
             },
-            crate::engine::cmd::handle_chat_cmd::<Lfm2Inner>,
+            crate::models::lfm2::model::handle_lfm2_cmd,
         );
 
         let (config, cache_limit_guard, paged_active) = init_rx

@@ -15,9 +15,10 @@ import { useRunFlash } from '../scaffolding/useRunFlash';
 import { NucleusSlider } from '../widgets/NucleusSlider';
 import { SamplingFailureModes } from '../widgets/SamplingFailureModes';
 import { SoftmaxTemperatureSteps } from '../widgets/SoftmaxTemperatureSteps';
+import { TemperatureStories } from '../widgets/TemperatureStories';
 
 /**
- * Chapter 10 — Sampling.
+ * Chapter 11 — Sampling.
  *
  * Prose explains how logits → softmax → token works, including temperature
  * and top-p (nucleus) sampling. The interactive widget runs the real backend
@@ -31,7 +32,7 @@ const MAX_NEW_TOKENS = 6;
 const TOP_K = 16;
 
 /**
- * Scaffolding metadata for chapter 10 — drives the header, glossary,
+ * Scaffolding metadata for chapter 11 — drives the header, glossary,
  * takeaways, exercise, and quick-check rendered by `<ChapterFrame>`.
  * `chapterId` must match the 'sampling' entry in `learn/chapters.ts`.
  */
@@ -68,14 +69,20 @@ export const learning: ChapterLearningData = {
         'Keep the smallest set of tokens whose probabilities sum to >= p, renormalize, sample from those. Trims the long tail.',
     },
     {
-      term: 'top-K',
-      definition: 'Keep only the K highest-probability tokens. The widget shows top-K=16 logits per step.',
+      term: 'top-K sampling',
+      definition:
+        'A sampling rule: keep only the K highest-probability tokens, renormalize, sample from those. A fixed-size cousin of top-p.',
+    },
+    {
+      term: 'top-16 capture (this demo)',
+      definition:
+        "Display truncation, not sampling: the inspector records the 16 highest logits per step so the widget has something to draw. The model itself still sampled over the full vocabulary.",
     },
   ],
   takeaways: [
     "Logits become probabilities only after softmax. Within one step their order is what matters — the largest logit is the greedy pick — but the absolute values aren't comparable across different runs or models.",
     'Temperature reshapes the distribution; top-p truncates the tail. A common default is T=0.7 with top_p=0.9.',
-    "The model's actually-sampled token may not be the bar with the highest probability after you change the sliders — that's how the sliders steer generation.",
+    "The highlighted bar is always the model's greedy (argmax) pick for that step — the captured run uses temperature=0, and rescaling or trimming afterward can never change which bar is tallest. What the sliders do move is the confidence gap to the runner-up bars: a wide gap means a real sampler would almost always agree with greedy, a narrow gap means it would often pick something else.",
   ],
   exercise: {
     prompt:
@@ -198,12 +205,46 @@ export function SamplingChapterBody() {
           </li>
         </ul>
 
+        <h2>Why this exact function?</h2>
         <p>
-          To see <em>why</em> a temperature comes out the way it does, here is a single temperature broken into its four
-          mechanical phases — divide by <code>T</code>, exponentiate, normalize — looping one step at a time:
+          Softmax is really a smooth, differentiable stand-in for <code>argmax</code>. Where <code>argmax</code> snaps
+          hard to the single largest logit, softmax slides between the candidates. Feed it{' '}
+          <code>[5.0, 4.9, 1.0]</code> and you get roughly <code>[0.52, 0.47, 0.01]</code>: the two close leaders share
+          the mass almost evenly while the third stays negligible. Widen the gap to <code>[8.0, 4.9, 1.0]</code> and the
+          output sharpens to about <code>[0.96, 0.04, 0.00]</code> — nearly a hard <code>argmax</code>, which is exactly
+          the limit greedy decoding (<code>T = 0</code>) walks toward.
+        </p>
+        <p>
+          That smoothness is also why softmax turns up far beyond sampling: because it has a clean gradient everywhere,
+          it is the function the model is trained against, and it is the same normalization that weighs the keys inside{' '}
+          <strong>attention</strong>.
+        </p>
+
+        <p>
+          To see <em>why</em> the distribution comes out the way it does, here is the computation broken into its four
+          mechanical phases — raw logits, divide by <code>T</code>, exponentiate, normalize — looping one step at a
+          time. Use the T buttons to run the same eight logits at 0.2, 0.7 and 2.0: the normalize-phase bars spike onto
+          one token at 0.2 and flatten across all eight at 2.0.
         </p>
 
         <SoftmaxTemperatureSteps />
+
+        <h2>Same seed, three temperatures</h2>
+        <p>
+          The bars above are the cause; here is the effect. We gave the real Qwen3.5-0.8B checkpoint — the same one this
+          playground runs — the same seed text three times and only changed the temperature. At <code>T = 0</code> the
+          sampler is greedy: every step takes the single most probable token, so the output is identical on every rerun
+          and tends toward the safest, blandest phrasing — notice how quickly it starts orbiting the same few words. At{' '}
+          <code>T = 0.7</code> the distribution is sharpened but not collapsed, and the sampled story — this run, at least — reads naturally; reruns differ.
+        </p>
+        <p>
+          The <code>T = 1.5</code> run shows why high temperature degrades so fast: generation is a loop, and every
+          sampled token is appended to the context that produces the <em>next</em> distribution. One improbable pick
+          would be survivable — but at high temperature improbable picks pile up, each one dragging the context
+          further from anything the model has seen — in this run the errors compound until the output is word salad.
+        </p>
+
+        <TemperatureStories />
 
         <h2>Top-p (nucleus) sampling</h2>
         <p>
@@ -218,7 +259,11 @@ export function SamplingChapterBody() {
           </li>
           <li>Throw everything after that away.</li>
           <li>Renormalize the survivors so they sum to 1 again.</li>
-          <li>Sample from this nucleus.</li>
+          <li>
+            Sample from this nucleus: draw a random number <code>r</code> between 0 and 1, walk down the list adding up
+            probabilities, and stop at the first token whose running total passes <code>r</code> — bigger slices get hit
+            more often.
+          </li>
         </ul>
         <p>
           A common default is <code>T = 0.7</code> with <code>top_p = 0.9</code>: the temperature gives the model some
@@ -236,10 +281,14 @@ export function SamplingChapterBody() {
         <h2>How the widget works</h2>
         <p>
           Pressing <em>Run</em> generates <code>{MAX_NEW_TOKENS}</code> tokens with the inspector capturing the top-
-          <code>{TOP_K}</code> raw logits at every step. The temperature and top-p sliders then re-apply softmax +
-          truncation to the cached logits — no re-running the model. The bar that's highlighted is the token Qwen{' '}
-          <em>actually</em> sampled (using its own internal sampler); compare it to the highest bar under your slider
-          settings to see how a different temperature might have steered the generation.
+          <code>{TOP_K}</code> raw logits at every step — the capture itself always runs at temperature=0, i.e. greedy.
+          The temperature and top-p sliders then re-apply softmax + truncation to the cached logits — no re-running
+          the model. Because dividing every logit by the same <code>T</code> can't change their rank order, and top-p
+          can never drop the #1-ranked token, the highlighted bar is <em>guaranteed</em> to stay the tallest bar under
+          every slider setting — it's always the model's greedy pick for that step. What actually changes as you move
+          the sliders is the <strong>confidence gap</strong> to the runner-up bars: a wide gap means a real sampler
+          would almost always agree with this greedy pick, a narrow gap means it would often disagree and land on a
+          different token.
         </p>
         <p className="text-muted-foreground">
           One caveat on the heights: the bars are softmax/top-p renormalized over only the captured top-

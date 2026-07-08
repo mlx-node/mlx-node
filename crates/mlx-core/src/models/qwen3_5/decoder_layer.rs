@@ -346,6 +346,82 @@ impl DecoderLayer {
         }
     }
 
+    /// Tape-recording twin of [`DecoderLayer::forward_paged_or_flat`] for the
+    /// eager-MTP verify forward.
+    ///
+    /// For a `Linear` (GDN) layer, threads `tape_sink` into
+    /// `GatedDeltaNet::forward_with_tape` so the per-step recurrence window is
+    /// captured into the caller's `GdnLayerTape` slot. `FullAttentionPaged`
+    /// layers never record (their tape slot stays `None`) but still run the
+    /// paged attention forward. When `tape_sink` is `None`, behavior is
+    /// byte-identical to `forward_paged_or_flat`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_or_flat_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        rope_position_offset: i32,
+    ) -> Result<MxArray> {
+        let _ = rope_position_offset;
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                let gdn = match &mut self.attn {
+                    AttentionType::Linear(gdn) => gdn,
+                    AttentionType::Full(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_or_flat_with_tape: kind=Linear \
+                             applied to a FullAttention operator",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let ac = flat_cache.and_then(|c| c.as_arrays_cache_mut());
+                let attn_out =
+                    gdn.forward_with_tape(&normed, None, ac, /* use_kernel */ true, tape_sink)?;
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = self.mlp.forward(&normed)?;
+                h.add(&mlp_out)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let _ = flat_cache;
+                let _ = tape_sink;
+                let attn = match &self.attn {
+                    AttentionType::Full(a) => a,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_or_flat_with_tape: \
+                             kind=FullAttentionPaged applied to a Linear (GDN) operator",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                )?;
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = self.mlp.forward(&normed)?;
+                h.add(&mlp_out)
+            }
+        }
+    }
+
     #[cfg(target_family = "wasm")]
     pub fn forward_vlm_prefill(
         &mut self,

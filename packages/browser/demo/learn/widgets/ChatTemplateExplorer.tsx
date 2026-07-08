@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { SegmentedToggle } from '../scaffolding/SegmentedToggle';
 
 /**
@@ -39,6 +40,63 @@ const ROLE_BG: Record<Role, string> = {
 
 type Mode = 'raw' | 'chat';
 
+// Per-locale copy. The template text itself (turn contents, role names, and
+// the special tokens <|im_start|> / <|im_end|> / <think>) is literal model I/O
+// and stays byte-identical in both locales — only the labels around it change.
+const COPY = {
+  en: {
+    header: 'The chat template',
+    rawLabel: 'Raw text the model sees',
+    chatLabel: 'Chat view',
+    reasoningLabel: <>Reasoning (the &ldquo;think&rdquo; pill)</>,
+    reasoningAria: 'Reasoning toggle',
+    thinkingOn: 'thinking on',
+    thinkingOff: 'thinking off',
+    reasonsHere: '▮ the model reasons here, then closes ',
+    andAnswers: ' and answers',
+    generatesHere: '▮ the model generates the answer from here',
+    body: (
+      <>
+        The "assistant" is the <em>same</em> next-token predictor from every other chapter — it's just fed a string
+        wrapped in role markers. The special tokens <span className="font-mono">{'<|im_start|>'}</span> /{' '}
+        <span className="font-mono">{'<|im_end|>'}</span> tell it whose turn it is and where a turn stops. Instruction
+        tuning is what teaches it to continue a trailing <span className="font-mono">{'<|im_start|>assistant'}</span>{' '}
+        with a helpful answer instead of, say, inventing a third user question. The real Qwen3.5 template always injects
+        a <span className="font-mono">{'<think>'}</span> reasoning block right after that marker — open
+        (<span className="font-mono">{'<think>\\n'}</span>) when the live chat&apos;s <em>think</em> pill is on, or
+        pre-closed (<span className="font-mono">{'<think>\\n\\n</think>\\n\\n'}</span>) when it&apos;s off — which is the
+        sub-toggle above. (A couple of rarer markers, like the tool-calling block below, are still elided for
+        readability; the app fills those in for you.)
+      </>
+    ),
+  },
+  zh: {
+    header: '对话模板',
+    rawLabel: '模型实际看到的原始文本',
+    chatLabel: '对话视图',
+    reasoningLabel: <>推理（“think” 开关）</>,
+    reasoningAria: '推理开关',
+    thinkingOn: '思考开启',
+    thinkingOff: '思考关闭',
+    reasonsHere: '▮ 模型在这里推理，然后闭合 ',
+    andAnswers: ' 并给出答案',
+    generatesHere: '▮ 模型从这里开始生成答案',
+    body: (
+      <>
+        这个“助手”和其他每一章里的下一个 token 预测器是<em>同一个</em>——它只是被喂进了一个用角色标记包裹起来的字符串。
+        special token <span className="font-mono">{'<|im_start|>'}</span> /{' '}
+        <span className="font-mono">{'<|im_end|>'}</span> 告诉它现在轮到谁说话、一轮在哪里结束。正是指令微调教会了它在结尾的{' '}
+        <span className="font-mono">{'<|im_start|>assistant'}</span>{' '}
+        之后接上一段有用的回答，而不是（比如）编出第三个用户问题。真实的 Qwen3.5 模板总会在那个标记之后立刻注入一个{' '}
+        <span className="font-mono">{'<think>'}</span> 推理块——在线对话的 <em>think</em> 开关开启时是未闭合的（
+        <span className="font-mono">{'<think>\\n'}</span>），关闭时是预先闭合的（
+        <span className="font-mono">{'<think>\\n\\n</think>\\n\\n'}</span>）——也就是上面那个子开关。
+        （少数更罕见的标记，比如下方的工具调用块，为了可读性仍被省略；应用会替你补全它们。）
+      </>
+    ),
+  },
+} as const;
+
 function Special({ children }: { children: React.ReactNode }) {
   return (
     <span className="rounded border border-dashed border-border px-1 font-mono text-[10px] text-muted-foreground">
@@ -48,6 +106,7 @@ function Special({ children }: { children: React.ReactNode }) {
 }
 
 export function ChatTemplateExplorer() {
+  const copy = COPY[useLocale()];
   const [mode, setMode] = React.useState<Mode>('raw');
   // Mirrors the live chat "think" pill: when thinking is ON the template opens
   // an empty <think>\n for the model to reason into; when OFF it injects a
@@ -57,27 +116,27 @@ export function ChatTemplateExplorer() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">The chat template</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <SegmentedToggle
           value={mode}
           onChange={setMode}
           options={[
-            { value: 'raw', label: 'Raw text the model sees' },
-            { value: 'chat', label: 'Chat view' },
+            { value: 'raw', label: copy.rawLabel },
+            { value: 'chat', label: copy.chatLabel },
           ]}
         />
       </div>
 
       {mode === 'raw' ? (
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-          <span className="uppercase tracking-wider">Reasoning (the &ldquo;think&rdquo; pill)</span>
+          <span className="uppercase tracking-wider">{copy.reasoningLabel}</span>
           <SegmentedToggle
             value={thinking ? 'on' : 'off'}
             onChange={(v) => setThinking(v === 'on')}
-            ariaLabel="Reasoning toggle"
+            ariaLabel={copy.reasoningAria}
             options={[
-              { value: 'on', label: 'thinking on' },
-              { value: 'off', label: 'thinking off' },
+              { value: 'on', label: copy.thinkingOn },
+              { value: 'off', label: copy.thinkingOff },
             ]}
           />
         </div>
@@ -103,9 +162,9 @@ export function ChatTemplateExplorer() {
               <>
                 <Special>{'<think>'}</Special>
                 {'\n'}
-                <span className="text-primary">▮ the model reasons here, then closes </span>
+                <span className="text-primary">{copy.reasonsHere}</span>
                 <Special>{'</think>'}</Special>
-                <span className="text-primary"> and answers</span>
+                <span className="text-primary">{copy.andAnswers}</span>
               </>
             ) : (
               <>
@@ -113,7 +172,7 @@ export function ChatTemplateExplorer() {
                 {'\n\n'}
                 <Special>{'</think>'}</Special>
                 {'\n\n'}
-                <span className="text-primary">▮ the model generates the answer from here</span>
+                <span className="text-primary">{copy.generatesHere}</span>
               </>
             )}
           </div>
@@ -135,18 +194,7 @@ export function ChatTemplateExplorer() {
         </div>
       )}
 
-      <p className="text-[12px] text-foreground/85">
-        The "assistant" is the <em>same</em> next-token predictor from every other chapter — it's just fed a string
-        wrapped in role markers. The special tokens <span className="font-mono">{'<|im_start|>'}</span> /{' '}
-        <span className="font-mono">{'<|im_end|>'}</span> tell it whose turn it is and where a turn stops. Instruction
-        tuning is what teaches it to continue a trailing <span className="font-mono">{'<|im_start|>assistant'}</span>{' '}
-        with a helpful answer instead of, say, inventing a third user question. The real Qwen3.5 template always injects
-        a <span className="font-mono">{'<think>'}</span> reasoning block right after that marker — open
-        (<span className="font-mono">{'<think>\\n'}</span>) when the live chat&apos;s <em>think</em> pill is on, or
-        pre-closed (<span className="font-mono">{'<think>\\n\\n</think>\\n\\n'}</span>) when it&apos;s off — which is the
-        sub-toggle above. (A couple of rarer markers, like the tool-calling block below, are still elided for
-        readability; the app fills those in for you.)
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.body}</p>
     </div>
   );
 }

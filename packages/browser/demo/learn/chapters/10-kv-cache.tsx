@@ -1,9 +1,11 @@
 import * as React from 'react';
 
 import { Button } from '../../components/ui/button';
+import { useLocale } from '../../lib/i18n-react';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
+import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { GenerationLoopTrace } from '../widgets/GenerationLoopTrace';
 import { KvGrowthCurve } from '../widgets/KvGrowthCurve';
@@ -34,7 +36,7 @@ const FULL_ATTENTION_INTERVAL = 4;
 const BYTES_PER_FLOAT = 2; // bf16
 const MAX_POSITION = 262_144;
 const DEFAULT_CONTEXT_LEN = 32_768;
-const CHART_MAX_CONTEXT = 131_072;
+const CHART_MAX_CONTEXT = 262_144;
 const CHART_MIN_CONTEXT = 256;
 
 // Layer indices that use full softmax attention. Mirrors the layer_types
@@ -288,14 +290,27 @@ export function KvCacheChapterBody() {
             [{LINEAR_NUM_HEADS}, {LINEAR_HEAD_DIM}, {LINEAR_HEAD_DIM}]
           </code>{' '}
           (linear value-heads × value-dim × key-dim — distinct from the {NUM_HEADS} full-attention heads of head-dim{' '}
-          {HEAD_DIM}). The state is rolled forward at each step the way an RNN's hidden state is — independent of how
-          many tokens have streamed by.
+          {HEAD_DIM}). The state is rolled forward at each step the way older recurrent networks (RNNs) kept a running
+          summary of everything seen so far — independent of how many tokens have streamed by.
         </p>
         <p>
           With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
           is a constant <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> regardless of context. So total cache for
           Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart on the right plots that against a
           hypothetical Qwen with full attention on every layer.
+        </p>
+        <p>
+          This is also what makes the model's full{' '}
+          <ChapterLink chapterId="architecture">{formatTokens(MAX_POSITION)}-token window</ChapterLink> affordable.
+          Imagine pasting a 200-page novel — call it {formatTokens(MAX_POSITION)} tokens — into the prompt. If all{' '}
+          {NUM_LAYERS} layers kept a full token-by-token KV cache the way the {NUM_FULL_LAYERS} attention layers do, the
+          cache would track the amber GQA-every-layer curve — on the order of ~4× the hybrid&rsquo;s few-gigabyte
+          footprint at that length (the cache still grows linearly with context either way; the hybrid just keeps the
+          slope down). Instead,
+          the {NUM_LINEAR_LAYERS} linear layers each hold a flat{' '}
+          <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> at any length, so the window can grow roughly 8× past the
+          old {formatTokens(DEFAULT_CONTEXT_LEN)} mark without the cache exploding. Only the {NUM_FULL_LAYERS}{' '}
+          full-attention layers still pay the per-token price.
         </p>
         <p>
           Here is that contrast at the token level: feed the same stream through both kinds of memory and watch one
@@ -312,6 +327,16 @@ export function KvCacheChapterBody() {
           six full-attention layers brings the exact-recall capability back where it's needed. Concretely: linear layers
           run the long- context flow, full layers handle "look back to <em>that</em> one specific token" jobs.
         </p>
+        <p>
+          You have probably felt the human side of this: the model loses the thread in a long chat — you mention a name
+          early on, and forty turns later it has slipped. Two different things can cause that. First, you may have
+          scrolled past the {formatTokens(MAX_POSITION)}-token ceiling, in which case the early turn has fallen out of
+          the window entirely and is simply gone. Second — the more interesting case — the turn is still in-window, but
+          the detail only ever lived in the {NUM_LINEAR_LAYERS} linear layers' blurred recurrent state, exactly the
+          smeared distribution the panel below makes visible, with the {NUM_FULL_LAYERS} full-attention layers as the
+          occasional safety net that can still pin it down. Neither failure is absolute: a name repeated often enough
+          survives the blur, and even past the ceiling a summary the model wrote earlier can carry the fact forward.
+        </p>
 
         <RecallFailure />
 
@@ -319,7 +344,8 @@ export function KvCacheChapterBody() {
         <p>
           As context lengths push past 1M tokens, quadratic-memory attention becomes untenable — both as cache and as
           compute. Hybrid attention is one of the techniques the field is exploring. Pure state-space models like Mamba
-          take it further still by removing softmax attention entirely. The trend is clear: cache is the bottleneck, and
+          — models that replace attention entirely with a rolling state like the GDN slot above — take it further
+          still. The trend is clear: cache is the bottleneck, and
           architectures will keep getting reshaped around it.
         </p>
 
@@ -342,6 +368,19 @@ export function KvCacheChapterBody() {
         <p>
           Memory is one axis; wall-clock time is the other. The chart below contrasts prefill (one parallel matmul over
           the whole prompt) with decode (many small sequential matmuls, one per generated token).
+        </p>
+        <p>
+          Why is the per-token gap so huge — roughly 0.7 ms against 200 ms, about 293×? A decode step has to read every
+          weight in the model out of memory and gets just <em>one</em> token for the trip: it's memory-bound, with
+          nothing to parallelize over. Prefill reads the same weights once and applies them to all 1,024 prompt tokens
+          at the same time, so the cost of the trip is split 1,024 ways.
+        </p>
+        <p>
+          The hybrid layout adds one more wrinkle here. The linear layers' recurrent state must update strictly one token
+          at a time, in order — step <code>t</code>'s state can't be computed without step <code>t-1</code>'s — while a
+          full-attention layer has no such chain and could score every position at once. So the constant memory comes
+          partly at the cost of some of attention's decode-time parallelism. (This is a decode-only concern: at training
+          time linear attention has parallel-scan forms that recover the lost parallelism.)
         </p>
 
         <PrefillVsDecodeChart />
@@ -373,6 +412,7 @@ export type KvCacheDemoProps = {
 };
 
 export function KvCacheDemo(_props: KvCacheDemoProps) {
+  const locale = useLocale();
   const [contextLen, setContextLen] = React.useState(DEFAULT_CONTEXT_LEN);
   const [selectedLayer, setSelectedLayer] = React.useState(FULL_LAYER_INDICES[0] ?? 3);
   const [decodeStep, setDecodeStep] = React.useState(DECODE_PROMPT_TOKENS.length - 1);
@@ -403,6 +443,11 @@ export function KvCacheDemo(_props: KvCacheDemoProps) {
 
   return (
     <div className="space-y-4">
+      {locale === 'zh' ? (
+        <div className="rounded-md border border-dashed border-amber-500/50 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          此互动演示的界面文案尚未翻译，目前仅提供英文版本。
+        </div>
+      ) : null}
       <div className="rounded-md border border-dashed border-muted-foreground/40 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
         All numbers below are derived from Qwen3.5-0.8B's config: num_layers={NUM_LAYERS}, num_heads={NUM_HEADS},
         num_kv_heads=
@@ -508,7 +553,7 @@ function MemoryChart({ contextLen, onContextLen }: { contextLen: number; onConte
   const gqaPath = pathFor(gqaAllLayersBytes);
   const hybridPath = pathFor(hybridBytes);
 
-  const xTicks = [1_024, 8_192, 32_768, 131_072];
+  const xTicks = [1_024, 8_192, 32_768, 131_072, 262_144];
   const yTicks: number[] = [];
   for (let exp = Math.ceil(logYMin); exp <= Math.floor(logYMax); exp++) {
     yTicks.push(10 ** exp);

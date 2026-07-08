@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
+import { useUiStrings } from '../i18n/ui-react';
 import type { QuizQuestion } from './learning-data';
 
 export type QuickCheckProps = {
@@ -71,6 +72,7 @@ function clearAnswers(chapterId: string): void {
  * and in-memory state.
  */
 export function QuickCheck({ chapterId, questions }: QuickCheckProps) {
+  const ui = useUiStrings();
   const [answers, setAnswers] = React.useState<AnswerMap>({});
 
   // Hydrate from localStorage on mount. We deliberately do this in an effect
@@ -126,10 +128,10 @@ export function QuickCheck({ chapterId, questions }: QuickCheckProps) {
     <Card className="gap-3 py-4">
       <CardHeader className="px-6 [.border-b]:pb-0">
         <div className="flex items-center justify-between gap-3">
-          <CardTitle className="text-base text-foreground">Quick check</CardTitle>
+          <CardTitle className="text-base text-foreground">{ui.scaffolding.quickCheckTitle}</CardTitle>
           {answeredCount > 0 ? (
             <span aria-live="polite" className="font-mono text-xs text-muted-foreground">
-              {correctCount} / {questions.length} correct
+              {ui.scaffolding.score(correctCount, questions.length)}
             </span>
           ) : null}
         </div>
@@ -152,7 +154,7 @@ export function QuickCheck({ chapterId, questions }: QuickCheckProps) {
               onClick={handleReset}
               className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
             >
-              Reset answers
+              {ui.scaffolding.resetAnswers}
             </button>
           </div>
         ) : null}
@@ -170,6 +172,7 @@ type QuestionRowProps = {
 };
 
 function QuestionRow({ chapterId, question, index, selectedId, onSelect }: QuestionRowProps) {
+  const ui = useUiStrings();
   // Radio group name must be unique per (chapter, question) so multiple
   // QuickCheck instances or remounts don't bleed into each other.
   const name = `quickcheck-${chapterId}-${question.id}`;
@@ -211,17 +214,17 @@ function QuestionRow({ chapterId, question, index, selectedId, onSelect }: Quest
               <span className="flex-1">{opt.label}</span>
               {isThisCorrect ? (
                 <span
-                  aria-label="correct answer"
+                  aria-label={ui.scaffolding.correctAria}
                   className="flex h-5 shrink-0 items-center font-mono text-xs text-emerald-700 dark:text-emerald-400"
                 >
-                  correct
+                  {ui.scaffolding.correctLabel}
                 </span>
               ) : isThisWrongPick ? (
                 <span
-                  aria-label="incorrect"
+                  aria-label={ui.scaffolding.incorrectAria}
                   className="flex h-5 shrink-0 items-center font-mono text-xs text-destructive"
                 >
-                  not quite
+                  {ui.scaffolding.notQuiteLabel}
                 </span>
               ) : null}
             </label>

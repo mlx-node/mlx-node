@@ -1,7 +1,9 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
- * Chapter 9 (LM head) supplement — animate the final matmul that converts a
+ * Chapter 10 (LM head) supplement — animate the final matmul that converts a
  * hidden vector into a vector of logits.
  *
  *   last_hidden ∈ R^d    ×    embed_tokens.weight ∈ R^{V×d}^T  =  logits ∈ R^V
@@ -20,7 +22,83 @@ import * as React from 'react';
 const HIDDEN_CELLS = 12; // symbolic — stands in for d=1024
 const VOCAB_CELLS = 36; // symbolic — stands in for V=248k
 
+// One plausible next-token text per symbolic vocab column (after "The cat
+// sat on the"), so the beam can name the token whose fingerprint-column it
+// is scoring. The peaks in `fakeLogits` (indices 8, 14, 22, 30) line up with
+// ' floor', ' mat', ' rug', ' couch' — the same shortlist the KV-cache
+// chapter's scripted decode uses, with ' floor' the course's measured pick.
+const SAMPLE_TOKENS: ReadonlyArray<string> = [
+  ' the', ' a', ' it', ' his', ' her', ' top', ' old', ' warm',
+  ' floor', ' wall', ' step', ' lap', ' box', ' soft', ' mat', ' bed',
+  ' chair', ' table', ' grass', ' roof', ' porch', ' shelf', ' rug', ' bench',
+  ' tree', ' path', ' seat', ' lawn', ' hill', ' edge', ' couch', ' stone',
+  ' sand', ' deck', ' stairs', ' sofa',
+];
+
+const COPY = {
+  en: {
+    header: 'The final matmul — hidden state → logits',
+    pause: 'Pause',
+    play: 'Play',
+    intro: (
+      <>
+        One matrix-vector product at the very top of the stack:{' '}
+        <span className="font-mono">logits = last_hidden @ embed_tokens.weight.T</span>. For Qwen3.5-0.8B that means a
+        <span className="font-mono"> [1, 1024]</span> vector multiplied by a{' '}
+        <span className="font-mono">[1024, 248320]</span> matrix → a <span className="font-mono">[1, 248320]</span>{' '}
+        output, one score per vocab token. The scan beam shows which output column is being produced.
+      </>
+    ),
+    svgAria: 'LM head matmul animation',
+    hiddenLabel: 'hidden',
+    beamLabel: (col: number, token: string) => `col ${col} = "${token}"`,
+    fingerprintLabel: "column j = token j's fingerprint (row j of W_lm)",
+    vocabEntriesLabel: 'V = 248,320 entries',
+    outro: (
+      <>
+        Every output entry is one inner product:{' '}
+        <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>. Each column of this{' '}
+        <span className="font-mono">[d, V]</span> matrix — equivalently, a row of the untransposed{' '}
+        <span className="font-mono">[V, d]</span> weight — is the "fingerprint" of one vocab token; when that fingerprint
+        points in roughly the same direction as the hidden state, the logit for that token is high.
+      </>
+    ),
+    footnote:
+      'Illustrative/schematic — the 12×36 grid and bar heights are stand-ins for the real [1024 × 248,320] matmul, not actual model logits.',
+  },
+  zh: {
+    header: '最后的矩阵乘法——隐藏状态 → logits',
+    pause: '暂停',
+    play: '播放',
+    intro: (
+      <>
+        堆叠最顶端的一次矩阵-向量乘法：
+        <span className="font-mono">logits = last_hidden @ embed_tokens.weight.T</span>。对 Qwen3.5-0.8B
+        来说，就是一个<span className="font-mono"> [1, 1024]</span> 的向量乘以一个{' '}
+        <span className="font-mono">[1024, 248320]</span> 的矩阵 → 得到 <span className="font-mono">[1, 248320]</span>{' '}
+        的输出，词表中每个 token 一个分数。扫描光束标出当前正在产出的输出列。
+      </>
+    ),
+    svgAria: 'LM head 矩阵乘法动画',
+    hiddenLabel: '隐藏状态',
+    beamLabel: (col: number, token: string) => `第 ${col} 列 = "${token}"`,
+    fingerprintLabel: '第 j 列 = token j 的“指纹”（W_lm 的第 j 行）',
+    vocabEntriesLabel: 'V = 248,320 个条目',
+    outro: (
+      <>
+        每个输出条目都是一次内积：
+        <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>。这个{' '}
+        <span className="font-mono">[d, V]</span> 矩阵的每一列——等价于未转置的{' '}
+        <span className="font-mono">[V, d]</span> 权重的某一行——就是一个词表 token
+        的“指纹”；当这枚指纹与隐藏状态指向大致相同的方向时，该 token 的 logit 就高。
+      </>
+    ),
+    footnote: '示意图——12×36 的网格和柱高只是真实 [1024 × 248,320] 矩阵乘法的替身，并非模型的真实 logits。',
+  },
+} as const;
+
 export function LmHeadWalkthrough() {
+  const copy = COPY[useLocale()];
   const [beamCol, setBeamCol] = React.useState(0);
   const [playing, setPlaying] = React.useState(true);
 
@@ -32,7 +110,10 @@ export function LmHeadWalkthrough() {
     return () => window.clearInterval(t);
   }, [playing]);
 
-  const W = 640;
+  // Wide enough for hidden strip + matrix + logits strip side by side. The
+  // logits strip spans logitsX (556) + 36·11 = 952, so anything narrower
+  // clips the output bars (the old 640 cut off two thirds of the strip).
+  const W = 970;
   const H = 280;
 
   // Layout: hidden strip (left), matrix (middle), logits strip (right).
@@ -70,43 +151,35 @@ export function LmHeadWalkthrough() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          The final matmul — hidden state → logits
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.header}</div>
         <button
           type="button"
           onClick={() => setPlaying((p) => !p)}
           className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
           aria-pressed={playing}
         >
-          {playing ? 'Pause' : 'Play'}
+          {playing ? copy.pause : copy.play}
         </button>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        One matrix-vector product at the very top of the stack:{' '}
-        <span className="font-mono">logits = last_hidden @ embed_tokens.weight.T</span>. For Qwen3.5-0.8B that means a
-        <span className="font-mono"> [1, 1024]</span> vector multiplied by a{' '}
-        <span className="font-mono">[1024, 248320]</span> matrix → a <span className="font-mono">[1, 248320]</span>{' '}
-        output, one score per vocab token. The scan beam shows which output column is being produced.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
-      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label="LM head matmul animation">
+      <svg viewBox={`0 0 ${W} ${H}`} className="block h-auto w-full" role="img" aria-label={copy.svgAria}>
         {/* hidden state column */}
         <text
           x={hiddenX + hiddenCellW / 2}
           y={hiddenY - 8}
-          fontSize={10}
+          fontSize={13}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.6}
         >
-          hidden
+          {copy.hiddenLabel}
         </text>
         <text
           x={hiddenX + hiddenCellW / 2}
           y={hiddenY + HIDDEN_CELLS * matRowH + 14}
-          fontSize={9}
+          fontSize={12}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.45}
@@ -129,7 +202,7 @@ export function LmHeadWalkthrough() {
         <text
           x={(hiddenX + hiddenCellW + matX) / 2}
           y={hiddenY + (HIDDEN_CELLS * matRowH) / 2 + 4}
-          fontSize={16}
+          fontSize={20}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.55}
@@ -142,7 +215,7 @@ export function LmHeadWalkthrough() {
         <text
           x={matX + (VOCAB_CELLS * matColW) / 2}
           y={hiddenY - 8}
-          fontSize={10}
+          fontSize={13}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.6}
@@ -152,7 +225,7 @@ export function LmHeadWalkthrough() {
         <text
           x={matX + (VOCAB_CELLS * matColW) / 2}
           y={hiddenY + HIDDEN_CELLS * matRowH + 14}
-          fontSize={9}
+          fontSize={12}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.45}
@@ -190,12 +263,35 @@ export function LmHeadWalkthrough() {
           strokeWidth={1.5}
           style={{ transition: 'x 110ms linear' }}
         />
+        {/* Beam-following label: which token's fingerprint-column is being
+            scored right now. x clamped so the text never leaves the matrix. */}
+        <text
+          x={Math.max(matX + 70, Math.min(matX + VOCAB_CELLS * matColW - 70, matX + beamCol * matColW + matColW / 2))}
+          y={matY + matH + 30}
+          fontSize={13}
+          textAnchor="middle"
+          fill="oklch(0.7 0.15 60)"
+          fontFamily="monospace"
+          style={{ transition: 'x 110ms linear' }}
+        >
+          {copy.beamLabel(beamCol, SAMPLE_TOKENS[beamCol]!)}
+        </text>
+        <text
+          x={matX + (VOCAB_CELLS * matColW) / 2}
+          y={matY + matH + 46}
+          fontSize={12}
+          textAnchor="middle"
+          fill="currentColor"
+          fillOpacity={0.55}
+        >
+          {copy.fingerprintLabel}
+        </text>
 
         {/* equals + output logit strip */}
         <text
           x={(matX + VOCAB_CELLS * matColW + logitsX) / 2}
           y={hiddenY + (HIDDEN_CELLS * matRowH) / 2 + 4}
-          fontSize={16}
+          fontSize={20}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.55}
@@ -209,7 +305,7 @@ export function LmHeadWalkthrough() {
         <text
           x={logitsX + (VOCAB_CELLS * logitsCellW) / 2}
           y={logitsY - 70}
-          fontSize={10}
+          fontSize={13}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.6}
@@ -219,12 +315,12 @@ export function LmHeadWalkthrough() {
         <text
           x={logitsX + (VOCAB_CELLS * logitsCellW) / 2}
           y={logitsY + 16}
-          fontSize={9}
+          fontSize={12}
           textAnchor="middle"
           fill="currentColor"
           fillOpacity={0.45}
         >
-          V = 248,320 entries
+          {copy.vocabEntriesLabel}
         </text>
         {fakeLogits.map((v, i) => {
           const filled = i <= beamCol;
@@ -255,18 +351,9 @@ export function LmHeadWalkthrough() {
         />
       </svg>
 
-      <p className="text-[11px] text-muted-foreground">
-        Every output entry is one inner product:{' '}
-        <span className="font-mono">logit_j = sum_i (last_hidden[i] · W[i, j])</span>. Each column of this{' '}
-        <span className="font-mono">[d, V]</span> matrix — equivalently, a row of the untransposed{' '}
-        <span className="font-mono">[V, d]</span> weight — is the "fingerprint" of one vocab token; when that fingerprint
-        points in roughly the same direction as the hidden state, the logit for that token is high.
-      </p>
+      <p className="text-[11px] text-muted-foreground">{copy.outro}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative/schematic — the 12×36 grid and bar heights are stand-ins for the real [1024 × 248,320] matmul, not
-        actual model logits.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

@@ -10,6 +10,7 @@ pub mod cache_limit;
 pub mod chat_stream;
 pub mod compat;
 pub mod convert;
+pub mod convert_gemma_import;
 #[cfg(not(target_family = "wasm"))]
 pub mod dataset;
 #[cfg(not(target_family = "wasm"))]
@@ -21,8 +22,12 @@ pub mod gradients;
 pub mod grpo;
 pub(crate) mod inference_trace;
 pub mod inspector;
+#[cfg(not(target_family = "wasm"))]
+pub mod engine;
 pub mod model_thread;
 pub mod models;
+#[cfg(not(target_family = "wasm"))]
+pub mod moe;
 pub mod nn;
 pub mod optimizers;
 #[cfg(not(target_family = "wasm"))]

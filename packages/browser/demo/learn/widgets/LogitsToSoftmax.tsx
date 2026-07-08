@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
 import { TopKBars } from '../inspector/TopKBars';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 
@@ -24,6 +25,37 @@ import { MathDisplay } from '../scaffolding/MathDisplay';
 const TOKENS = [' cat', ' dog', ' ran', ' the', '.'];
 const BASE_LOGITS = [2.4, 1.6, 0.7, -0.3, -1.1];
 
+// Per-locale copy. Math identifiers (z_i, exp, Σ, p_i, "token", "logit"
+// column headers) stay English in both locales per the course glossary style.
+const COPY = {
+  en: {
+    title: 'Softmax on a 5-token toy vocabulary',
+    sliderLabel: 'Sharpen ↔ flatten',
+    intro: (
+      <>
+        The real model emits <strong>248,320</strong> logits — one per vocabulary token. The transform that turns them
+        into probabilities is the same no matter how many there are, so here it is on just five. Drag the slider to
+        scale the raw logits: a bigger factor sharpens the distribution onto the top token, a smaller one flattens it.
+      </>
+    ),
+    barsLabel: 'Probabilities (the last column, as bars)',
+    footnote: 'Illustrative five-token vocabulary with hand-picked logits — not live output from the model.',
+  },
+  zh: {
+    title: '在 5 个 token 的玩具词表上做 softmax',
+    sliderLabel: '锐化 ↔ 压平',
+    intro: (
+      <>
+        真实模型会输出 <strong>248,320</strong> 个 logits——词表中每个 token
+        一个。把它们变成概率的变换与个数无关，所以这里只用五个来演示。拖动滑块缩放原始
+        logits：放大让分布向第一候选收尖，缩小则把它摊平。
+      </>
+    ),
+    barsLabel: '概率（最后一列，画成条形）',
+    footnote: '五个 token 的词表与手挑的 logits 仅为示意——不是模型的实时输出。',
+  },
+} as const;
+
 function softmax(logits: number[]): number[] {
   const m = Math.max(...logits);
   const exps = logits.map((l) => Math.exp(l - m));
@@ -32,6 +64,7 @@ function softmax(logits: number[]): number[] {
 }
 
 export function LogitsToSoftmax() {
+  const copy = COPY[useLocale()];
   // Sharpness factor: <1 flattens the distribution, >1 sharpens it. We scale
   // the raw logits by this factor before softmax — mathematically the same
   // lever as an inverse temperature (sharpness = 1/T).
@@ -60,12 +93,10 @@ export function LogitsToSoftmax() {
   return (
     <div className="space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">
-          Softmax on a 5-token toy vocabulary
-        </div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
           <label htmlFor="logits-softmax-sharpness" className="uppercase tracking-wider">
-            Sharpen ↔ flatten
+            {copy.sliderLabel}
           </label>
           <input
             id="logits-softmax-sharpness"
@@ -81,11 +112,7 @@ export function LogitsToSoftmax() {
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        The real model emits <strong>248,320</strong> logits — one per vocabulary token. The transform that turns them
-        into probabilities is the same no matter how many there are, so here it is on just five. Drag the slider to
-        scale the raw logits: a bigger factor sharpens the distribution onto the top token, a smaller one flattens it.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.intro}</p>
 
       <MathDisplay latex={String.raw`p_i = \frac{e^{z_i}}{\sum_j e^{z_j}}`} />
 
@@ -133,13 +160,11 @@ export function LogitsToSoftmax() {
       {/* Probability bars — reuse the shared TopKBars primitive. No token is
           "sampled" in this transform-only demo, so nothing is highlighted. */}
       <div className="space-y-1">
-        <div className="text-[11px] text-muted-foreground">Probabilities (the last column, as bars)</div>
+        <div className="text-[11px] text-muted-foreground">{copy.barsLabel}</div>
         <TopKBars ids={ids} probs={probs} texts={TOKENS} sampledTokenId={-1} runKey={runKey} />
       </div>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative five-token vocabulary with hand-picked logits — not live output from the model.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.footnote}</p>
     </div>
   );
 }

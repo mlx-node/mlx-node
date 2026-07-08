@@ -1,8 +1,12 @@
 import { ArrowLeftIcon, CheckIcon, DownloadIcon, MessageSquareIcon, PlayIcon } from 'lucide-react';
 import * as React from 'react';
 
+import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { Button } from '../components/ui/button';
-import { CHAPTERS, type ChapterMeta } from './chapters';
+import { useLocale } from '../lib/i18n-react';
+import type { ChapterMeta, SectionMeta } from './chapters';
+import { localizedChapters } from './i18n/localized';
+import { useUiStrings } from './i18n/ui-react';
 
 export type LessonLayoutProps = {
   /** The chapter currently being viewed. */
@@ -23,7 +27,16 @@ export type LessonLayoutProps = {
    * architecture poster, which is ~1280px wide). Ignored when `tryItPanel` is set.
    */
   wideBody?: boolean;
+  /**
+   * When viewing a sub-chapter, the id of the active section. Highlights the
+   * nested sidebar row and drives the header breadcrumb. Omit on a chapter page.
+   */
+  currentSectionId?: string;
+  /** The active sub-chapter's title — appended to the header breadcrumb. */
+  sectionTitle?: string;
   onOpenChapter: (chapterId: string) => void;
+  /** Navigate to a sub-chapter (nested sidebar rows + in-chapter "go deeper"). */
+  onOpenSection?: (chapterId: string, sectionId: string) => void;
   onBackToIndex: () => void;
   onOpenFreeChat: () => void;
   /**
@@ -42,7 +55,10 @@ export function LessonLayout({
   children,
   tryItPanel,
   wideBody,
+  currentSectionId,
+  sectionTitle,
   onOpenChapter,
+  onOpenSection,
   onBackToIndex,
   onOpenFreeChat,
   modelReady = false,
@@ -63,9 +79,12 @@ export function LessonLayout({
   React.useEffect(() => {
     mainRef.current?.scrollTo({ top: 0, behavior: 'instant' });
     tryItRef.current?.scrollTo({ top: 0, behavior: 'instant' });
-  }, [current.id]);
+    // Also reset when moving between a chapter and one of its sub-chapters (the
+    // chapter id is unchanged across that hop, so key on the section too).
+  }, [current.id, currentSectionId]);
 
   const hasTryIt = Boolean(tryItPanel);
+  const ui = useUiStrings();
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-background">
@@ -77,10 +96,11 @@ export function LessonLayout({
           className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeftIcon className="size-4" />
-          All chapters
+          {ui.lessonLayout.allChapters}
         </button>
         <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
-          Chapter {current.number} · {current.title}
+          {ui.lessonLayout.breadcrumb(current.number, current.title)}
+          {sectionTitle ? <span className="text-foreground/80"> › {sectionTitle}</span> : null}
         </div>
         <div className="flex items-center gap-2">
           {/* Global pre-load affordance. Hidden once the model is ready (there
@@ -88,13 +108,14 @@ export function LessonLayout({
           {onLoadModel && !modelReady ? (
             <Button variant="outline" size="sm" onClick={onLoadModel} className="gap-2">
               <DownloadIcon className="size-4" />
-              Load model
+              {ui.lessonLayout.loadModel}
             </Button>
           ) : null}
           <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
             <MessageSquareIcon className="size-4" />
-            Free chat
+            {ui.lessonLayout.freeChat}
           </Button>
+          <LanguageSwitcher />
         </div>
       </div>
 
@@ -107,7 +128,12 @@ export function LessonLayout({
         ].join(' ')}
       >
         <aside className="hidden border-r border-border lg:block">
-          <ChapterSidebar currentId={current.id} onOpenChapter={onOpenChapter} />
+          <ChapterSidebar
+            currentId={current.id}
+            currentSectionId={currentSectionId}
+            onOpenChapter={onOpenChapter}
+            onOpenSection={onOpenSection}
+          />
         </aside>
 
         <main ref={mainRef} className="min-h-0 overflow-y-auto px-8 py-10">
@@ -130,7 +156,9 @@ export function LessonLayout({
           <section ref={tryItRef} className="min-h-0 overflow-y-auto border-l border-border bg-card/30 p-6">
             <div className="mb-4 flex items-center gap-2">
               <PlayIcon className="size-4 text-primary" />
-              <h2 className="text-sm font-semibold uppercase tracking-wider text-foreground">Try it now</h2>
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-foreground">
+                {ui.lessonLayout.tryItNow}
+              </h2>
             </div>
             {tryItPanel}
           </section>
@@ -142,27 +170,78 @@ export function LessonLayout({
 
 function ChapterSidebar({
   currentId,
+  currentSectionId,
   onOpenChapter,
+  onOpenSection,
 }: {
   currentId: string;
+  currentSectionId?: string;
   onOpenChapter: (chapterId: string) => void;
+  onOpenSection?: (chapterId: string, sectionId: string) => void;
 }) {
+  const ui = useUiStrings();
+  // Locale overlay applied to the registry — English passes through untouched.
+  const chapters = localizedChapters(useLocale());
   return (
     <nav className="flex h-full flex-col gap-1 overflow-y-auto p-4">
-      <div className="mb-2 px-2 font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">Chapters</div>
-      {CHAPTERS.map((c) => (
-        <SidebarRow
-          key={c.id}
-          chapter={c}
-          active={c.id === currentId}
-          onOpen={() => (c.available ? onOpenChapter(c.id) : undefined)}
-        />
-      ))}
+      <div className="mb-2 px-2 font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+        {ui.lessonLayout.chaptersHeading}
+      </div>
+      {chapters.map((c) => {
+        const active = c.id === currentId;
+        return (
+          <React.Fragment key={c.id}>
+            <SidebarRow chapter={c} active={active} onOpen={() => (c.available ? onOpenChapter(c.id) : undefined)} />
+            {/* Sub-chapters expand only under the ACTIVE chapter, so the sidebar
+                stays scannable. Each row deep-links to its own sub-route. */}
+            {active && c.sections && c.sections.length > 0 ? (
+              <div className="mb-1 ml-[1.05rem] flex flex-col gap-0.5 border-l border-border pl-2">
+                {c.sections.map((s) => (
+                  <SectionRow
+                    key={s.id}
+                    section={s}
+                    active={s.id === currentSectionId}
+                    onOpen={() => onOpenSection?.(c.id, s.id)}
+                  />
+                ))}
+              </div>
+            ) : null}
+          </React.Fragment>
+        );
+      })}
     </nav>
   );
 }
 
+function SectionRow({
+  section,
+  active,
+  onOpen,
+}: {
+  section: SectionMeta;
+  active: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      title={section.blurb}
+      className={[
+        'flex items-center gap-2 rounded-md px-2 py-1 text-left text-[0.8rem] transition-colors',
+        active ? 'bg-primary/10 text-primary' : 'text-foreground/70 hover:bg-accent/40 hover:text-foreground',
+      ].join(' ')}
+    >
+      <span aria-hidden="true" className="shrink-0 text-muted-foreground">
+        ↳
+      </span>
+      <span className="flex-1 truncate">{section.title}</span>
+    </button>
+  );
+}
+
 function SidebarRow({ chapter, active, onOpen }: { chapter: ChapterMeta; active: boolean; onOpen: () => void }) {
+  const ui = useUiStrings();
   const disabled = !chapter.available;
   return (
     <button
@@ -181,7 +260,9 @@ function SidebarRow({ chapter, active, onOpen }: { chapter: ChapterMeta; active:
       <span className="w-5 shrink-0 text-center font-mono text-[0.7rem] text-muted-foreground">{chapter.number}</span>
       <span className="flex-1 truncate">{chapter.title}</span>
       {disabled ? (
-        <span className="text-[0.65rem] uppercase tracking-wider text-muted-foreground/60">soon</span>
+        <span className="text-[0.65rem] uppercase tracking-wider text-muted-foreground/60">
+          {ui.lessonLayout.soonBadge}
+        </span>
       ) : active ? (
         <CheckIcon className="size-3.5 text-primary" />
       ) : null}

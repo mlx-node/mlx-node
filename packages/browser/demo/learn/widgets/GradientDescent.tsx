@@ -1,6 +1,8 @@
 import { cn } from '@/lib/utils';
 import * as React from 'react';
 
+import { useLocale } from '../../lib/i18n-react';
+
 /**
  * Chapter 13 (Training) supplement — gradient descent on ONE weight.
  *
@@ -115,7 +117,124 @@ const BOWL_D = (() => {
   return d.trim();
 })();
 
+// Per-locale copy — every user-visible English string moved here verbatim.
+// Math identifiers (w, lr, L(w), dL/dw) and numbers stay as-is in both locales.
+const COPY = {
+  en: {
+    title: 'Gradient descent on one weight',
+    stepDownhill: 'Step downhill:',
+    regimeDiverge: 'too large → diverges out of the bowl',
+    regimeKnifeEdge: 'knife-edge (lr = 2) → oscillates forever, never settles',
+    regimeOvershoot: 'large → overshoots & zig-zags (still converges)',
+    regimeTiny: 'tiny → crawls toward the bottom',
+    regimeGood: 'good → converges quickly',
+    ariaLabel: (w: number, steps: number, lVal: number, gVal: number, lr: number, outOfBowl: boolean) =>
+      `Loss bowl L(w) = ${A}·w². The weight is at ${w.toFixed(2)} after ${steps} ` +
+      `step${steps === 1 ? '' : 's'}, where the loss is ${lVal.toFixed(2)} and the gradient is ` +
+      `${gVal.toFixed(2)}. Learning rate ${lr.toFixed(2)}. ` +
+      (outOfBowl ? 'The weight has diverged out of the bowl.' : `The minimum is at w = ${W_STAR}.`),
+    xAxis: 'weight w',
+    yAxis: 'loss L(w)',
+    minimum: 'minimum',
+    divergingPlot: 'diverging — w has left the bowl',
+    lrLabel: 'learning rate',
+    lrValueText: (v: string) => `learning rate ${v}`,
+    criticalTitle: 'lands on the minimum in one step',
+    criticalLabel: (v: string) => `${v} (1-step)`,
+    divergeTitle: 'at lr = 2 the weight oscillates forever; past it the weight diverges',
+    divergeLabel: (v: string) => `${v} (oscillate)`,
+    stepBtn: 'Step',
+    runBtn: (n: number) => `Run ${n}`,
+    runningBtn: (r: number) => `Running… ${r}`,
+    resetBtn: 'Reset',
+    readoutWeight: 'weight w',
+    readoutLoss: 'loss L(w)',
+    readoutGrad: 'gradient dL/dw',
+    readoutSteps: 'steps taken',
+    divergingNote: 'diverging — lower the learning rate',
+    mainNote: (
+      <>
+        The{' '}
+        <span className="font-medium" style={{ color: 'oklch(0.80 0.13 80)' }}>
+          gold tangent
+        </span>{' '}
+        is the gradient <span className="font-mono">L&apos;(w)</span> — its sign says which way is uphill, so the step
+        (the{' '}
+        <span className="font-medium" style={{ color: 'oklch(0.72 0.18 350)' }}>
+          pink arrow
+        </span>
+        ) moves <span className="font-mono">w</span> the opposite way, downhill. A <strong>tiny</strong>{' '}
+        <span className="font-mono">lr</span> barely moves and crawls; a <strong>good</strong> one drops to the bottom
+        in a few steps; push <span className="font-mono">lr</span> past{' '}
+        <span className="font-mono">{LR_DIVERGE.toFixed(1)}</span> and each step{' '}
+        <strong>overshoots farther than the last</strong> — the weight bounces out of the bowl and the loss explodes.
+      </>
+    ),
+    illustrative: (
+      <>
+        Illustrative — a 1-parameter cartoon. A real model has ~800M weights, and the same rule (step each weight
+        downhill by its own gradient) runs on all of them at once — which is exactly what AdamW automates per parameter.
+      </>
+    ),
+  },
+  zh: {
+    title: '单个权重上的梯度下降',
+    stepDownhill: '朝下坡迈步：',
+    regimeDiverge: '太大 → 冲出碗外发散',
+    regimeKnifeEdge: '临界刀锋（lr = 2）→ 永远振荡，永不安顿',
+    regimeOvershoot: '偏大 → 越过头、来回拉锯（仍会收敛）',
+    regimeTiny: '太小 → 朝谷底缓慢爬行',
+    regimeGood: '合适 → 快速收敛',
+    ariaLabel: (w: number, steps: number, lVal: number, gVal: number, lr: number, outOfBowl: boolean) =>
+      `损失碗 L(w) = ${A}·w²。走了 ${steps} 步后，权重位于 ${w.toFixed(2)}，此处损失为 ${lVal.toFixed(2)}，梯度为 ${gVal.toFixed(2)}。学习率 ${lr.toFixed(2)}。` +
+      (outOfBowl ? '权重已发散出碗外。' : `极小值在 w = ${W_STAR} 处。`),
+    xAxis: '权重 w',
+    yAxis: '损失 L(w)',
+    minimum: '极小值',
+    divergingPlot: '发散中——w 已离开碗外',
+    lrLabel: '学习率',
+    lrValueText: (v: string) => `学习率 ${v}`,
+    criticalTitle: '一步正好落在极小值上',
+    criticalLabel: (v: string) => `${v}（一步）`,
+    divergeTitle: 'lr = 2 时权重永远振荡；超过它权重就发散',
+    divergeLabel: (v: string) => `${v}（振荡）`,
+    stepBtn: '单步',
+    runBtn: (n: number) => `运行 ${n} 步`,
+    runningBtn: (r: number) => `运行中… ${r}`,
+    resetBtn: '重置',
+    readoutWeight: '权重 w',
+    readoutLoss: '损失 L(w)',
+    readoutGrad: '梯度 dL/dw',
+    readoutSteps: '已走步数',
+    divergingNote: '发散中——请调低学习率',
+    mainNote: (
+      <>
+        <span className="font-medium" style={{ color: 'oklch(0.80 0.13 80)' }}>
+          金色切线
+        </span>
+        就是梯度 <span className="font-mono">L&apos;(w)</span>
+        ——它的符号指出哪边是上坡，所以这一步（
+        <span className="font-medium" style={{ color: 'oklch(0.72 0.18 350)' }}>
+          粉色箭头
+        </span>
+        ）让 <span className="font-mono">w</span> 朝相反方向、也就是下坡移动。<strong>太小</strong>的{' '}
+        <span className="font-mono">lr</span> 几乎不动、缓慢爬行；<strong>合适</strong>的几步就落到谷底；把{' '}
+        <span className="font-mono">lr</span> 推过 <span className="font-mono">{LR_DIVERGE.toFixed(1)}</span>
+        ，每一步都会<strong>比上一步越得更远</strong>——权重弹出碗外，损失爆炸。
+      </>
+    ),
+    illustrative: (
+      <>
+        仅为示意——一幅只有 1 个参数的卡通。真实模型约有 800M
+        个权重，同一条规则（每个权重沿自己的梯度往下坡迈一步）在所有权重上同时运行——这正是 AdamW
+        逐参数自动化的事情。
+      </>
+    ),
+  },
+} as const;
+
 export function GradientDescent() {
+  const copy = COPY[useLocale()];
   const reducedMotion = usePrefersReducedMotion();
 
   const [lr, setLr] = React.useState(LR_DEFAULT);
@@ -202,30 +321,26 @@ export function GradientDescent() {
     lr <= LR_MIN
       ? { label: '', tone: 'text-muted-foreground' }
       : lr > LR_DIVERGE + 1e-9
-        ? { label: 'too large → diverges out of the bowl', tone: 'text-amber-400' }
+        ? { label: copy.regimeDiverge, tone: 'text-amber-400' }
         : Math.abs(lr - LR_DIVERGE) <= 1e-9
-          ? { label: 'knife-edge (lr = 2) → oscillates forever, never settles', tone: 'text-amber-400' }
+          ? { label: copy.regimeKnifeEdge, tone: 'text-amber-400' }
           : m < 0
-            ? { label: 'large → overshoots & zig-zags (still converges)', tone: 'text-foreground/80' }
+            ? { label: copy.regimeOvershoot, tone: 'text-foreground/80' }
             : Math.abs(m) > 0.9
-              ? { label: 'tiny → crawls toward the bottom', tone: 'text-muted-foreground' }
-              : { label: 'good → converges quickly', tone: 'text-emerald-400' };
+              ? { label: copy.regimeTiny, tone: 'text-muted-foreground' }
+              : { label: copy.regimeGood, tone: 'text-emerald-400' };
 
   const minimumX = xPx(W_STAR);
   const minimumY = yPx(loss(W_STAR));
 
-  const ariaLabel =
-    `Loss bowl L(w) = ${A}·w². The weight is at ${w.toFixed(2)} after ${steps} ` +
-    `step${steps === 1 ? '' : 's'}, where the loss is ${lVal.toFixed(2)} and the gradient is ` +
-    `${gVal.toFixed(2)}. Learning rate ${lr.toFixed(2)}. ` +
-    (outOfBowl ? 'The weight has diverged out of the bowl.' : `The minimum is at w = ${W_STAR}.`);
+  const ariaLabel = copy.ariaLabel(w, steps, lVal, gVal, lr, outOfBowl);
 
   return (
     <div className="not-prose my-4 space-y-3 rounded-md border border-border bg-background p-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-muted-foreground">Gradient descent on one weight</div>
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">{copy.title}</div>
         <div className="text-[11px] text-muted-foreground">
-          Step downhill: <span className="font-mono">w ← w − lr·L&apos;(w)</span>
+          {copy.stepDownhill} <span className="font-mono">w ← w − lr·L&apos;(w)</span>
         </div>
       </div>
 
@@ -286,7 +401,7 @@ export function GradientDescent() {
             fill="currentColor"
             fillOpacity={0.55}
           >
-            weight w
+            {copy.xAxis}
           </text>
 
           {/* y axis label (loss) */}
@@ -311,7 +426,7 @@ export function GradientDescent() {
             fillOpacity={0.55}
             transform={`rotate(-90, 11, ${PAD_T + PLOT_H / 2 + 3})`}
           >
-            loss L(w)
+            {copy.yAxis}
           </text>
 
           {/* the convex loss bowl */}
@@ -329,7 +444,7 @@ export function GradientDescent() {
           />
           <circle cx={minimumX} cy={minimumY} r={3} fill="currentColor" fillOpacity={0.35} />
           <text x={minimumX} y={minimumY - 7} fontSize={9} textAnchor="middle" fill="currentColor" fillOpacity={0.5}>
-            minimum
+            {copy.minimum}
           </text>
 
           {/* tangent at the current weight — its slope IS the gradient */}
@@ -379,7 +494,7 @@ export function GradientDescent() {
               fill="oklch(0.78 0.16 40)"
               fillOpacity={0.95}
             >
-              diverging — w has left the bowl
+              {copy.divergingPlot}
             </text>
           ) : null}
         </svg>
@@ -388,7 +503,7 @@ export function GradientDescent() {
         <div className="flex min-w-[220px] flex-col gap-3">
           <div className="space-y-1">
             <label htmlFor="gd-lr" className="block text-xs text-muted-foreground">
-              learning rate <span className="font-mono text-foreground/85">lr = {lr.toFixed(2)}</span>
+              {copy.lrLabel} <span className="font-mono text-foreground/85">lr = {lr.toFixed(2)}</span>
             </label>
             <input
               id="gd-lr"
@@ -399,14 +514,12 @@ export function GradientDescent() {
               value={lr}
               onChange={(e) => setLr(Number(e.target.value))}
               className="w-full accent-primary"
-              aria-valuetext={`learning rate ${lr.toFixed(2)}`}
+              aria-valuetext={copy.lrValueText(lr.toFixed(2))}
             />
             <div className="flex justify-between font-mono text-[10px] text-muted-foreground">
               <span>0</span>
-              <span title="lands on the minimum in one step">{LR_CRITICAL.toFixed(1)} (1-step)</span>
-              <span title="at lr = 2 the weight oscillates forever; past it the weight diverges">
-                {LR_DIVERGE.toFixed(1)} (oscillate)
-              </span>
+              <span title={copy.criticalTitle}>{copy.criticalLabel(LR_CRITICAL.toFixed(1))}</span>
+              <span title={copy.divergeTitle}>{copy.divergeLabel(LR_DIVERGE.toFixed(1))}</span>
             </div>
           </div>
 
@@ -420,7 +533,7 @@ export function GradientDescent() {
                 'transition-colors hover:bg-muted/70 disabled:opacity-40',
               )}
             >
-              Step
+              {copy.stepBtn}
             </button>
             {!reducedMotion ? (
               <button
@@ -433,7 +546,7 @@ export function GradientDescent() {
                   'transition-colors hover:bg-muted/70 disabled:opacity-40',
                 )}
               >
-                {running ? `Running… ${runRemaining}` : `Run ${RUN_STEPS}`}
+                {running ? copy.runningBtn(runRemaining) : copy.runBtn(RUN_STEPS)}
               </button>
             ) : null}
             <button
@@ -444,29 +557,29 @@ export function GradientDescent() {
                 'transition-colors hover:text-foreground',
               )}
             >
-              Reset
+              {copy.resetBtn}
             </button>
           </div>
 
           <div className="grid grid-cols-2 gap-2" aria-live="polite">
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">weight w</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutWeight}</div>
               <div className="font-mono text-sm text-foreground/90">{w.toFixed(2)}</div>
             </div>
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">loss L(w)</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutLoss}</div>
               <div className="font-mono text-sm text-foreground/90">
                 {Number.isFinite(lVal) ? lVal.toFixed(2) : '∞'}
               </div>
             </div>
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">gradient dL/dw</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutGrad}</div>
               <div className="font-mono text-sm text-foreground/90">
                 {Number.isFinite(gVal) ? gVal.toFixed(2) : '∞'}
               </div>
             </div>
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">steps taken</div>
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutSteps}</div>
               <div className="font-mono text-sm text-foreground/90">{steps}</div>
             </div>
           </div>
@@ -479,33 +592,15 @@ export function GradientDescent() {
 
           {outOfBowl ? (
             <div className="text-[12px] font-medium text-amber-400" aria-live="polite">
-              diverging — lower the learning rate
+              {copy.divergingNote}
             </div>
           ) : null}
         </div>
       </div>
 
-      <p className="text-[12px] text-foreground/85">
-        The{' '}
-        <span className="font-medium" style={{ color: 'oklch(0.80 0.13 80)' }}>
-          gold tangent
-        </span>{' '}
-        is the gradient <span className="font-mono">L&apos;(w)</span> — its sign says which way is uphill, so the step
-        (the{' '}
-        <span className="font-medium" style={{ color: 'oklch(0.72 0.18 350)' }}>
-          pink arrow
-        </span>
-        ) moves <span className="font-mono">w</span> the opposite way, downhill. A <strong>tiny</strong>{' '}
-        <span className="font-mono">lr</span> barely moves and crawls; a <strong>good</strong> one drops to the bottom
-        in a few steps; push <span className="font-mono">lr</span> past{' '}
-        <span className="font-mono">{LR_DIVERGE.toFixed(1)}</span> and each step{' '}
-        <strong>overshoots farther than the last</strong> — the weight bounces out of the bowl and the loss explodes.
-      </p>
+      <p className="text-[12px] text-foreground/85">{copy.mainNote}</p>
 
-      <p className="text-[10px] text-muted-foreground">
-        Illustrative — a 1-parameter cartoon. A real model has ~800M weights, and the same rule (step each weight
-        downhill by its own gradient) runs on all of them at once — which is exactly what AdamW automates per parameter.
-      </p>
+      <p className="text-[10px] text-muted-foreground">{copy.illustrative}</p>
     </div>
   );
 }
