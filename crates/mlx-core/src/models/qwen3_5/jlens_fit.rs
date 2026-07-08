@@ -342,13 +342,64 @@ fn zero_state(num_layers: usize, hidden: usize) -> Result<FitState> {
     })
 }
 
+/// Constant fingerprint of the corpus a checkpoint was fitted on. Persisted in
+/// the checkpoint and revalidated on resume so the SAME `checkpointPath` can't
+/// be silently reused with a DIFFERENT prompt corpus or `maxSeqLen`. Without
+/// this, resuming skips every prompt with `idx < next_idx` and exports a
+/// stale/mixed running mean as a fresh J pack — a corruption path, not just bad
+/// UX (the driver skips by index and `export_pack` runs whenever `n_done > 0`).
+///
+/// NOTE: this guards ONLY the resume-into-the-same-checkpoint path. T1.3's
+/// future cross-shard merge deliberately combines DIFFERENT disjoint corpora by
+/// summing `Jsum.{l}` + `n_done` — a separate code path that must NOT be gated
+/// by this per-checkpoint check.
+#[derive(Clone, Copy)]
+struct CorpusFingerprint {
+    /// Per-prompt truncation length the corpus was hashed under.
+    max_seq_len: usize,
+    /// Number of prompts in the corpus (list length).
+    prompt_count: usize,
+    /// FNV-1a/64 over the TRUNCATED token-id sequences (see [`corpus_fingerprint`]).
+    hash: u64,
+}
+
+/// Deterministic, order- and content-sensitive fingerprint of the corpus being
+/// fit: FNV-1a/64 over, per prompt in list order, the truncated (to
+/// `max_seq_len`) token-id sequence hashed as `(u32 length, then each u32 id)`.
+/// Cheap (a single pass over the ids) and matches EXACTLY on a legitimate resume
+/// of the identical corpus, so the resume round-trip is preserved.
+fn corpus_fingerprint(prompt_ids: &[Vec<u32>], max_seq_len: usize) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    #[inline]
+    fn mix(h: &mut u64, v: u32) {
+        for b in v.to_le_bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    let mut h = FNV_OFFSET;
+    for ids in prompt_ids {
+        let take = ids.len().min(max_seq_len);
+        mix(&mut h, take as u32);
+        for &id in &ids[..take] {
+            mix(&mut h, id);
+        }
+    }
+    h
+}
+
 /// Load a fit checkpoint written by [`save_checkpoint`]. Returns `Ok(None)` if
-/// the file does not exist. Validates `skip_first` / `hidden` against the run.
+/// the file does not exist. Validates `skip_first` / `hidden` AND the corpus
+/// fingerprint (`max_seq_len` / `prompt_count` / `corpus_hash`) against the run,
+/// so a mismatched resume errors BEFORE any fit work rather than corrupting the
+/// running mean.
 fn load_checkpoint(
     path: &str,
     num_layers: usize,
     hidden: usize,
     skip_first: usize,
+    fp: &CorpusFingerprint,
 ) -> Result<Option<FitState>> {
     if !std::path::Path::new(path).exists() {
         return Ok(None);
@@ -377,6 +428,38 @@ fn load_checkpoint(
         )));
     }
 
+    // Corpus fingerprint: reject a resume against a DIFFERENT corpus or
+    // maxSeqLen BEFORE loading Jsum / doing any fit work. Resuming would
+    // otherwise skip prompts by index and export a stale/mixed J pack.
+    let ckpt_max_seq = read_meta("meta.max_seq_len")?;
+    if ckpt_max_seq != fp.max_seq_len as i64 {
+        return Err(Error::from_reason(format!(
+            "checkpoint {path} was fitted with maxSeqLen={ckpt_max_seq}, not {}; \
+             pass resume=false to discard it",
+            fp.max_seq_len
+        )));
+    }
+    let ckpt_prompt_count = read_meta("meta.prompt_count")?;
+    if ckpt_prompt_count != fp.prompt_count as i64 {
+        return Err(Error::from_reason(format!(
+            "checkpoint {path} was fitted on {ckpt_prompt_count} prompts, not {}; \
+             it belongs to a different corpus — pass resume=false to discard it",
+            fp.prompt_count
+        )));
+    }
+    // 64-bit hash stored LOSSLESSLY as a U32 [2] (hi, lo) tensor — read exactly.
+    let hash_t = tensors.get("meta.corpus_hash").ok_or_else(|| {
+        Error::from_reason(format!("checkpoint {path} missing 'meta.corpus_hash'"))
+    })?;
+    let ckpt_hash =
+        ((hash_t.item_at_uint32(0)? as u64) << 32) | (hash_t.item_at_uint32(1)? as u64);
+    if ckpt_hash != fp.hash {
+        return Err(Error::from_reason(format!(
+            "checkpoint {path} was fitted with a different prompt corpus (or maxSeqLen); \
+             pass resume=false to discard it"
+        )));
+    }
+
     let mut jacobian_sum = Vec::with_capacity(num_layers);
     for l in 0..num_layers {
         let key = format!("Jsum.{l}");
@@ -394,19 +477,38 @@ fn load_checkpoint(
     }))
 }
 
-/// Atomically write the fit checkpoint: `Jsum.{l}` fp32 + `meta.*` scalars,
-/// written to `{path}.tmp.{pid}` then renamed so a crash never leaves a
-/// half-written checkpoint.
-fn save_checkpoint(path: &str, state: &FitState, skip_first: usize, hidden: usize) -> Result<()> {
+/// Atomically write the fit checkpoint: `Jsum.{l}` fp32 + `meta.*` scalars +
+/// the corpus fingerprint, written to `{path}.tmp.{pid}` then renamed so a crash
+/// never leaves a half-written checkpoint.
+fn save_checkpoint(
+    path: &str,
+    state: &FitState,
+    skip_first: usize,
+    hidden: usize,
+    fp: &CorpusFingerprint,
+) -> Result<()> {
     let mut tensors: HashMap<String, MxArray> = HashMap::new();
     for (l, j) in state.jacobian_sum.iter().enumerate() {
         tensors.insert(format!("Jsum.{l}"), j.clone());
     }
+    // Small integer scalars: f32 [1] is exact for all of these (skip_first,
+    // hidden, maxSeqLen, prompt_count are all << 2^24).
     let meta_i = |v: i64| MxArray::from_float32(&[v as f32], &[1]);
     tensors.insert("meta.n_done".into(), meta_i(state.n_done)?);
     tensors.insert("meta.next_idx".into(), meta_i(state.next_idx)?);
     tensors.insert("meta.skip_first".into(), meta_i(skip_first as i64)?);
     tensors.insert("meta.hidden".into(), meta_i(hidden as i64)?);
+    tensors.insert("meta.max_seq_len".into(), meta_i(fp.max_seq_len as i64)?);
+    tensors.insert("meta.prompt_count".into(), meta_i(fp.prompt_count as i64)?);
+    // The 64-bit corpus hash MUST be stored losslessly: an f32 [1] rounds any
+    // value above 2^24 and would break the resume round-trip. Split into a U32
+    // [2] (hi, lo) tensor — U32 round-trips exactly through save/load_safetensors.
+    let hash_hi = (fp.hash >> 32) as u32;
+    let hash_lo = (fp.hash & 0xffff_ffff) as u32;
+    tensors.insert(
+        "meta.corpus_hash".into(),
+        MxArray::from_uint32(&[hash_hi, hash_lo], &[2])?,
+    );
 
     let tmp = format!("{path}.tmp.{}", std::process::id());
     save_safetensors(&tmp, &mut tensors, None)?;
@@ -496,9 +598,19 @@ pub(crate) fn fit_jacobian_lens(
         return Err(Error::from_reason("fitJacobianLens: dimBatch must be >= 1"));
     }
 
+    // Corpus fingerprint for the whole run — persisted in every checkpoint write
+    // and revalidated on resume so this `checkpointPath` can't be reused with a
+    // different corpus / maxSeqLen (which would skip prompts by index and export
+    // a stale/mixed J pack). Computed once (constant across the fit).
+    let fp = CorpusFingerprint {
+        max_seq_len,
+        prompt_count: opts.prompt_ids.len(),
+        hash: corpus_fingerprint(&opts.prompt_ids, max_seq_len),
+    };
+
     // Resume or start fresh.
     let mut state = if resume {
-        match load_checkpoint(&opts.checkpoint_path, num_layers, hidden, skip_first)? {
+        match load_checkpoint(&opts.checkpoint_path, num_layers, hidden, skip_first, &fp)? {
             Some(s) => s,
             None => zero_state(num_layers, hidden)?,
         }
@@ -537,7 +649,7 @@ pub(crate) fn fit_jacobian_lens(
             state.next_idx = idx as i64 + 1;
             heavy_cleanup();
             // Persist the advanced cursor so a crash doesn't reprocess this skip.
-            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
+            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden, &fp)?;
             continue;
         }
 
@@ -567,7 +679,7 @@ pub(crate) fn fit_jacobian_lens(
             heavy_cleanup();
             // Persist the advanced cursor so a crash doesn't reprocess this
             // (expensive) NaN prompt on resume.
-            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
+            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden, &fp)?;
             continue;
         }
 
@@ -590,11 +702,11 @@ pub(crate) fn fit_jacobian_lens(
 
         // Between prompts: release the compiled-graph cache, then persist.
         heavy_cleanup();
-        save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
+        save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden, &fp)?;
     }
 
     // Final checkpoint + optional pack export.
-    save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
+    save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden, &fp)?;
     if let Some(pack_path) = &opts.pack_path {
         if state.n_done > 0 {
             export_pack(pack_path, &state)?;
@@ -781,6 +893,20 @@ pub(crate) fn verify_finite_diff(
     if seq_len < 2 {
         return Err(Error::from_reason(
             "verify_finite_diff: prompt needs >= 2 tokens",
+        ));
+    }
+    // Guard bad inputs BEFORE any model work: an empty `boundaries` would panic
+    // at `boundaries[0]` (basis-batch check) and a non-positive/non-finite
+    // `epsilon` makes the `/ (2ε)` central difference inf/nan (or silently wrong
+    // for ε<0). Return clean NAPI errors instead of a panic across the boundary.
+    if boundaries.is_empty() {
+        return Err(Error::from_reason(
+            "verify_finite_diff: boundaries must be non-empty",
+        ));
+    }
+    if !(epsilon.is_finite() && epsilon > 0.0) {
+        return Err(Error::from_reason(
+            "verify_finite_diff: epsilon must be finite and > 0",
         ));
     }
     for &l in boundaries {
