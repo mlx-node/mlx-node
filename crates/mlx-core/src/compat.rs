@@ -23,9 +23,23 @@ pub mod decode_profiler {
 }
 
 /// Stub profiling — PerformanceMetrics is a plain struct on WASM.
+///
+/// Field set MUST stay in sync with the native `crate::profiling` struct
+/// (task #68 wasm-source parity); construction sites in `chat_stream::wire`
+/// and the model families set every field.
 #[cfg(target_family = "wasm")]
 pub mod profiling {
     use napi_derive::napi;
+
+    /// Mirror of the native `crate::profiling::PhaseProfile`.
+    #[napi(object)]
+    #[derive(Debug, Clone)]
+    pub struct PhaseProfile {
+        pub name: String,
+        pub total_ms: f64,
+        pub avg_us_per_token: f64,
+        pub count: u32,
+    }
 
     #[napi(object)]
     #[derive(Debug, Clone)]
@@ -33,5 +47,11 @@ pub mod profiling {
         pub ttft_ms: f64,
         pub prefill_tokens_per_second: f64,
         pub decode_tokens_per_second: f64,
+        pub mtp_mean_accepted_tokens: Option<f64>,
+        pub mtp_mean_accepted_tokens_total: Option<f64>,
+        pub mtp_acceptance_by_position: Option<Vec<f64>>,
+        pub mtp_cycles: Option<u32>,
+        pub mtp_mean_depth: Option<f64>,
+        pub profile_phases: Option<Vec<PhaseProfile>>,
     }
 }

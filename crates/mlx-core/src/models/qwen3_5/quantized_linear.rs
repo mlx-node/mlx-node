@@ -93,6 +93,18 @@ impl LinearProj {
     pub fn is_quantized(&self) -> bool {
         matches!(self, LinearProj::Quantized(_))
     }
+
+    /// The additive bias of a `Standard` projection, if any.
+    ///
+    /// Used by the wasm GDN post-fusion fast path in `gated_delta_net`, which
+    /// only runs when `out_proj` is `Standard`; the `Quantized` arm returns
+    /// `None` (its group biases are exposed via `QuantizedLinear::get_biases`).
+    pub fn get_bias(&self) -> Option<MxArray> {
+        match self {
+            LinearProj::Standard(l) => l.get_bias(),
+            LinearProj::Quantized(_) => None,
+        }
+    }
 }
 
 /// An MLP that can be either standard or quantized.

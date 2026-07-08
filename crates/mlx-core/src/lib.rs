@@ -24,6 +24,16 @@ pub(crate) mod inference_trace;
 pub mod inspector;
 #[cfg(not(target_family = "wasm"))]
 pub mod engine;
+// WASM parity shim: the browser model families (Qwen3 / Qwen3.5 dense) still
+// reference a small wasm-safe subset of `crate::engine`. `compat_engine`
+// mirrors exactly those items so the wasm build resolves them.
+#[cfg(target_family = "wasm")]
+mod compat_engine;
+#[cfg(target_family = "wasm")]
+pub mod engine {
+    pub use crate::compat_engine::ModelGenerationDefaults;
+    pub use crate::compat_engine::{decode, persistence};
+}
 pub mod model_thread;
 pub mod models;
 #[cfg(not(target_family = "wasm"))]

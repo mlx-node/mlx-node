@@ -17,6 +17,9 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::paddleocr_vl::persistence::load_paddleocr_vl_weights;
+// qianfan_ocr is native-only (excluded from the wasm build); its conversion
+// recipe is gated with it below.
+#[cfg(not(target_family = "wasm"))]
 use crate::models::qianfan_ocr::persistence::load_qianfan_ocr_weights;
 use crate::utils::safetensors::load_safetensors_lazy;
 
@@ -1291,8 +1294,12 @@ pub(crate) mod recipe {
     }
 
     /// Qianfan-OCR. Same shape as PaddleOCR-VL — generic flags.
+    ///
+    /// Native-only: `qianfan_ocr` is excluded from the wasm build.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) struct QianfanOcrRecipe;
 
+    #[cfg(not(target_family = "wasm"))]
     impl ConversionRecipe for QianfanOcrRecipe {
         fn model_types(&self) -> &'static [&'static str] {
             &["qianfan-ocr"]
@@ -1517,6 +1524,7 @@ pub(crate) mod recipe {
             "qwen3_5_moe" => Some(Box::new(Qwen35Recipe { is_moe: true })),
             "lfm2" | "lfm2_moe" => Some(Box::new(Lfm2Recipe)),
             "paddleocr-vl" => Some(Box::new(PaddleOcrVlRecipe)),
+            #[cfg(not(target_family = "wasm"))]
             "qianfan-ocr" => Some(Box::new(QianfanOcrRecipe)),
             "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
             "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),

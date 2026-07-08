@@ -355,6 +355,11 @@ impl DecoderLayer {
     /// layers never record (their tape slot stays `None`) but still run the
     /// paged attention forward. When `tape_sink` is `None`, behavior is
     /// byte-identical to `forward_paged_or_flat`.
+    // Paged-attention MTP-verify path: relies on `PagedKVCacheAdapter` and
+    // `Qwen3_5Attention::forward_paged`, both `#[cfg(feature = "full")]`
+    // (native/Metal only). The browser build (`--features browser`) never
+    // reaches it — its only caller, `paged_forward.rs`, is also feature-gated.
+    #[cfg(feature = "full")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_paged_or_flat_with_tape(
         &mut self,
