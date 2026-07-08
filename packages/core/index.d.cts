@@ -4164,7 +4164,7 @@ export declare function saveToXlsx(text: string, filePath: string): void;
 
 /**
  * Per-position payload for `scoreTokens` — the single-pass
- * speculative-decode verify. Sibling of `LogitsStepNapi`: same top-K
+ * speculative-decode verify. Sibling of [`LogitsStepNapi`]: same top-K
  * contract (ids descending by logit, raw pre-softmax f32 logits — the
  * consumer softmaxes — plus decoded texts), but keyed by draft position
  * instead of decode step.

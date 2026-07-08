@@ -5935,10 +5935,16 @@ impl Qwen35Inner {
         let total_len = all_ids.len();
         let input = MxArray::from_uint32(&all_ids, &[1, total_len as i64])?;
 
-        self.init_caches_sync()?;
+        // All fallible setup happens BEFORE `init_caches_sync` so that once
+        // caches exist, every subsequent `?` is covered by the reset below —
+        // no early return can leave them populated. (The transpose is a lazy
+        // MLX op with no cache dependency, so hoisting it is free;
+        // `get_weight` and `Stream::new` are infallible.)
         let embedding_weight = self.embedding.get_weight();
         let embedding_weight_t = embedding_weight.transpose(Some(&[1, 0]))?;
         let generation_stream = Stream::new(DeviceType::Gpu);
+
+        self.init_caches_sync()?;
 
         // Forward once and pull only the D verify rows to host: slicing on
         // device first keeps the copy at `D * vocab * 4` bytes (≤ ~4.8 MiB
