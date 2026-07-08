@@ -3958,9 +3958,17 @@ pub(crate) fn apply_mxfp_upgrade(
         // recipes emit Custom{8, gs64, affine} here so AR (M=1) and MTP-verify
         // (M>=2) both route through the M-invariant qmv kernel for T=0
         // MTP<->AR bit-exactness, and 8-bit *affine* (not mxfp8's coarse E8M0
-        // scales) keeps the worst-KLD out_proj near bf16. Preserve the recipe's
-        // decision (and any Skip for MTP-layer keys) rather than upgrading it.
-        if is_bitexact_affine_proj(key) {
+        // scales) keeps the worst-KLD out_proj near bf16. Preserve THAT pinned
+        // decision from the mxfp8 upgrade — but ONLY when the recipe actually
+        // pinned it to 8-bit affine. `apply_mxfp_upgrade` wraps every recipe,
+        // and generic `mixed_*` recipes give these keys low-bit decisions
+        // (e.g. mixed_4_6 -> 4-bit affine o_proj) that must still upgrade
+        // normally (4-bit -> mxfp4); gating on the pinned decision — not the
+        // key alone — keeps those working. A `Skip` (MTP-layer keys) falls
+        // through to the main match's `Skip => Skip` arm, so it is still kept.
+        if is_bitexact_affine_proj(key)
+            && matches!(&original, QuantDecision::Custom { bits: 8, mode, .. } if mode == "affine")
+        {
             return original;
         }
         // Router gates and shared_expert_gate: force 8-bit affine (group_size
@@ -6626,6 +6634,38 @@ mod tests {
                 mode: "mxfp4".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn apply_mxfp_upgrade_promotes_non_pinned_low_bit_projections() {
+        // The bitexact guard must protect ONLY the recipe-PINNED 8-bit affine
+        // decision (qwen3_5 / unsloth). Under a generic `mixed_*` recipe these
+        // same keys get low-bit decisions (e.g. mixed_4_6 -> 4-bit affine
+        // o_proj) which must still upgrade to mxfp4 — otherwise --q-mxfp is a
+        // silent no-op for them on mixed recipes.
+        let inner: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+            Box::new(|_key: &str| QuantDecision::Custom {
+                bits: 4,
+                group_size: 64,
+                mode: "affine".to_string(),
+            });
+        let wrapped = apply_mxfp_upgrade(inner, 4);
+        for key in [
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            assert_eq!(
+                wrapped(key),
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 32,
+                    mode: "mxfp4".to_string(),
+                },
+                "{key}: non-pinned 4-bit affine (mixed_* recipe) must upgrade to mxfp4"
+            );
+        }
     }
 
     #[test]
