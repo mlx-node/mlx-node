@@ -306,6 +306,22 @@ pub(crate) enum Qwen35MoeCmd {
         config: Qwen3_5MoeGenerationConfig,
         reply: ResponseTx<Qwen3_5MoeGenerationResult>,
     },
+    /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
+    /// `MaxCalibrator`). MoE counterpart of the dense
+    /// [`crate::models::qwen3_5::model::Qwen35Cmd::CalibratePrefillRaw`]. For
+    /// each raw text: tokenize WITHOUT the chat template, truncate to
+    /// `calib_seq` tokens, then run PREFILL ONLY (no generation, no generated
+    /// token) so every mxfp8 attn/GDN projection's activation tap fires once,
+    /// resetting caches between rows. Runs on the model thread where the
+    /// tokenizer lives. The process-global `ActivationAmaxCollector` is
+    /// armed/disarmed and drained+persisted by the NAPI caller — this command
+    /// never touches `config.json`. Replies with the number of rows actually
+    /// prefilled (rows that were empty after tokenize+truncate are skipped).
+    CalibratePrefillRaw {
+        texts: Vec<String>,
+        calib_seq: u32,
+        reply: ResponseTx<u32>,
+    },
     SaveModel {
         save_path: String,
         reply: ResponseTx<()>,
@@ -413,6 +429,13 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35MoeCmd::CalibratePrefillRaw {
+            texts,
+            calib_seq,
+            reply,
+        } => {
+            let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
         }
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -653,6 +676,68 @@ impl Qwen35MoeInner {
         self.caches = None;
         self.clear_reuse_state();
         Ok(())
+    }
+
+    /// Static FP8 activation-amax calibration prefill (runs on the model
+    /// thread). Inherent body of [`Qwen35MoeCmd::CalibratePrefillRaw`]; a
+    /// faithful mirror of the dense
+    /// [`crate::models::qwen3_5::model::Qwen35Inner::calibrate_prefill_raw_sync`].
+    ///
+    /// For each raw text: tokenize WITHOUT the chat template (`encode_sync` with
+    /// `add_special_tokens = false`, so no `<|im_start|>`/`<|im_end|>` control
+    /// tokens and no BOS), truncate to `calib_seq` tokens, then run PREFILL ONLY
+    /// (no generation) so every mxfp8 attention/GDN projection's activation tap
+    /// fires exactly once over realistic raw-text activations — the NVIDIA
+    /// modelopt `MaxCalibrator` is defined over raw-text prefill, NOT
+    /// chat-templated prompts plus a decode step. Caches are re-initialized per
+    /// row so each is an independent turn-0 position-0 prefill.
+    ///
+    /// The process-global [`crate::calibration::activation_amax::ActivationAmaxCollector`]
+    /// (armed/disarmed and drained+persisted by the NAPI caller) records each
+    /// projection's running `max|activation|` during the forward; this method
+    /// never touches `config.json`. Returns the number of rows actually
+    /// prefilled (rows that tokenized to nothing after truncation are skipped).
+    pub(crate) fn calibrate_prefill_raw_sync(
+        &mut self,
+        texts: Vec<String>,
+        calib_seq: u32,
+    ) -> Result<u32> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            Error::from_reason("calibration prefill requires a tokenizer, but none is loaded")
+        })?;
+        let cap = calib_seq.max(1) as usize;
+        let mut rows_prefilled: u32 = 0;
+
+        for text in &texts {
+            // RAW tokenize — no chat template, no special/control tokens. This
+            // is the crux of the modelopt-parity fix: repeated chat control
+            // tokens must not dominate a tensor's activation amax.
+            let mut tokens = tokenizer.encode_sync(text, Some(false))?;
+            tokens.truncate(cap);
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
+            // and a stale cache would append rows into one growing context).
+            self.init_caches_sync()?;
+            let generation_stream = Stream::new(DeviceType::Gpu);
+            // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
+            // token: a decode step would fold a synthetic argmax token's
+            // activations into the amax.
+            let logits = self.prefill(&tokens, generation_stream)?;
+            // Force the row's forward to complete (the taps already `.item()`
+            // each projection input, but eval bounds the lazy graph and makes
+            // per-row memory reclamation deterministic).
+            logits.eval();
+            self.reset_caches_sync()?;
+            rows_prefilled += 1;
+
+            // Bound resident scratch across many rows (large models × 1024 rows).
+            crate::array::synchronize_and_clear_cache();
+        }
+
+        Ok(rows_prefilled)
     }
 
     /// Clear cached token history, image key, and rope deltas.
@@ -8295,6 +8380,41 @@ mod mask_free_full_attention_parity_tests {
                 diff <= 1e-4,
                 "mask-free forward diverged from explicit-mask forward at {idx}: {a} vs {b} (diff {diff})"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod calibration_cmd_tests {
+    //! Reachability/construction tests for the MoE activation-amax calibration
+    //! command. A full model-load calibration is exercised end-to-end by the
+    //! dense/MoE e2e; here we lock in that the MoE command variant exists, is
+    //! constructible, and carries the same `{texts, calib_seq, reply}` shape the
+    //! NAPI dispatch (`calibrate_activation_amax_raw`) sends — so a `qwen3_5_moe`
+    //! checkpoint has a command to route to (the finding-1 gap was that no MoE
+    //! command existed at all).
+
+    use super::*;
+
+    /// The MoE `CalibratePrefillRaw` variant is constructible and matchable with
+    /// exactly the fields the NAPI driver sends. Proves finding-1's MoE command
+    /// is reachable without needing a 19GB model load.
+    #[test]
+    fn moe_calibrate_prefill_raw_cmd_constructs_and_carries_fields() {
+        let (tx, _rx) = tokio::sync::oneshot::channel::<napi::Result<u32>>();
+        let cmd = Qwen35MoeCmd::CalibratePrefillRaw {
+            texts: vec!["hello world".to_string(), "second row".to_string()],
+            calib_seq: 128,
+            reply: tx,
+        };
+        match cmd {
+            Qwen35MoeCmd::CalibratePrefillRaw {
+                texts, calib_seq, ..
+            } => {
+                assert_eq!(texts.len(), 2);
+                assert_eq!(calib_seq, 128);
+            }
+            _ => panic!("expected CalibratePrefillRaw variant"),
         }
     }
 }
