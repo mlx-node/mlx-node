@@ -571,6 +571,22 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        // Calibrated per-tensor FP8 (E4M3) activation fake-quant, matching
+        // NVIDIA modelopt's static W8A8 attention/GDN math. `input_amax` is
+        // `Some(>0)` ONLY on the calibrated mxfp8 attn/GDN projections (threaded
+        // from config); every other path (mxfp4 FFN, affine gates/a-b, sym8,
+        // lm_head) leaves it `None`, so `x` stays the original bf16 reference and
+        // this forward is byte-identical to before. Apple GPUs have no fp8
+        // matmul hardware — this is numeric parity, not speed.
+        let xq_owned;
+        let x = match self.input_amax {
+            Some(amax) if amax > 0.0 => {
+                xq_owned = crate::quant::fp8_activation::fp8_fake_quant(x, amax)?;
+                &xq_owned
+            }
+            _ => x,
+        };
+
         if self.mode == SYM8_MODE {
             return self.forward_sym8(x);
         }
@@ -892,5 +908,131 @@ mod sym8_tests {
             MxArray::from_float32(&short_scales, &[n - 1]).unwrap(),
         );
         assert!(try_build_sym8_quantized_linear(&p, "l").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fp8_activation_tests {
+    use super::*;
+    use crate::array::DType;
+    use crate::quant::fp8_activation::fp8_fake_quant;
+
+    /// Deterministic LCG float in `[-2, 2]` (failures reproduce exactly).
+    fn next_f32(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = ((*state >> 40) & 0xFFFF) as f32 / 65535.0; // [0, 1]
+        u * 4.0 - 2.0
+    }
+
+    /// MXFP8-quantize a 2D bf16 weight, returning `(packed_weight, uint8 scales)`
+    /// (mxfp8 has no biases) — mirrors the embedding-test helper.
+    fn quantize_mxfp8(weight: &MxArray) -> (MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                c"mxfp8".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize mxfp8 failed");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+        )
+    }
+
+    /// A fresh mxfp8 `QuantizedLinear` over shared (cloned) packed operands, so
+    /// the same weights back every instance in one test (`with_input_amax`
+    /// consumes `self`, so each variant needs its own struct).
+    fn make_mxfp8_linear(w_q: &MxArray, scales: &MxArray) -> QuantizedLinear {
+        QuantizedLinear::new(
+            w_q.clone(),
+            scales.clone(),
+            None,
+            None,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            MXFP8_MODE.to_string(),
+        )
+    }
+
+    fn to_f32(a: &MxArray) -> Vec<f32> {
+        a.astype(DType::Float32)
+            .expect("astype f32")
+            .to_float32()
+            .expect("to_float32")
+            .to_vec()
+    }
+
+    /// Max absolute elementwise difference between two same-shape arrays.
+    fn max_abs_diff(a: &MxArray, b: &MxArray) -> f32 {
+        let av = to_f32(a);
+        let bv = to_f32(b);
+        assert_eq!(av.len(), bv.len(), "shape mismatch in max_abs_diff");
+        av.iter()
+            .zip(&bv)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The mxfp8 forward fake-quantizes its activation input to per-tensor E4M3
+    /// when `input_amax` is set: the output matches a "fake-quant x then the
+    /// same matmul" reference, and differs from the `input_amax == None`
+    /// (bf16-activation) baseline. Proves Task 4's forward routing.
+    #[test]
+    fn forward_applies_fp8_fake_quant_when_amax_present() {
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let mut state = 0x0F80_1234u64;
+
+        // Random bf16 weight [N, K], mxfp8-quantized.
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp8(&w_bf16);
+
+        // Random bf16 activations [M, K] spanning [-2, 2] so amax=2.0 pushes
+        // magnitudes to the top of the E4M3 grid (meaningful quant error).
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Baseline: input_amax = None (bf16 activations, current behaviour).
+        let base = make_mxfp8_linear(&w_q, &scales).forward(&x).unwrap();
+
+        // amax path: forward should fake-quant x internally.
+        let got = make_mxfp8_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .forward(&x)
+            .unwrap();
+
+        // Reference: fake-quant x explicitly, then the plain (None) matmul.
+        let xq = fp8_fake_quant(&x, 2.0).unwrap();
+        let want = make_mxfp8_linear(&w_q, &scales).forward(&xq).unwrap();
+
+        let d_got_want = max_abs_diff(&got, &want);
+        assert!(
+            d_got_want <= 1e-3,
+            "amax forward must equal fake-quant-then-matmul reference; max|Δ|={d_got_want}"
+        );
+
+        let d_got_base = max_abs_diff(&got, &base);
+        assert!(
+            d_got_base > 1e-3,
+            "amax path must change the output vs the None baseline; max|Δ|={d_got_base}"
+        );
     }
 }
