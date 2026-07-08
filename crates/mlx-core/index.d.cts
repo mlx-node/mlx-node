@@ -2787,6 +2787,17 @@ export interface EngineStepMetrics {
   activeMemoryMb: number;
 }
 
+/**
+ * Disarm the collector, drain the accumulated per-tensor `input_amax`, and
+ * write it into `<model_path>/config.json` (both the `quantization` and
+ * `quantization_config` aliases).
+ *
+ * Returns the number of projections calibrated (the count of collected amax
+ * entries). A count of 0 means the model exercised no activation-fp8 sites —
+ * e.g. it was not an nvidia-recipe (mxfp8 attn/GDN) checkpoint.
+ */
+export declare function finishActivationCalibration(modelPath: string): number;
+
 export interface ForeignConversionOptions {
   /** Path to the input weights file (.pdparams, .pkl, .pt, .pth) */
   inputPath: string;
@@ -4347,6 +4358,16 @@ export interface SftStepMetrics {
   /** Time for training step (ms) */
   trainingTimeMs: number;
 }
+
+/**
+ * Arm the process-global activation-amax collector.
+ *
+ * While armed, every mxfp8 attention/GDN projection's forward folds
+ * `max|activation|` into a per-tensor running maximum (modelopt `MaxCalibrator`
+ * semantics). The TS driver calls this once, then prefills the model over the
+ * calibration mix so the tap fires on each projection.
+ */
+export declare function startActivationCalibration(): void;
 
 /** Metrics from a single training step for sparkline restoration (NAPI wrapper) */
 export interface StepMetricSummary {

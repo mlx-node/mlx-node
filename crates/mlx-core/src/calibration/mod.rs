@@ -7,3 +7,4 @@
 //! forward path can fake-quant activations to E4M3 for W8A8 numeric parity.
 
 pub mod activation_amax;
+pub mod napi;
