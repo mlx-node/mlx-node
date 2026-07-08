@@ -572,15 +572,19 @@ impl QuantizedLinear {
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         // Calibrated per-tensor FP8 (E4M3) activation fake-quant, matching
-        // NVIDIA modelopt's static W8A8 attention/GDN math. `input_amax` is
-        // `Some(>0)` ONLY on the calibrated mxfp8 attn/GDN projections (threaded
-        // from config); every other path (mxfp4 FFN, affine gates/a-b, sym8,
-        // lm_head) leaves it `None`, so `x` stays the original bf16 reference and
-        // this forward is byte-identical to before. Apple GPUs have no fp8
-        // matmul hardware — this is numeric parity, not speed.
+        // NVIDIA modelopt's static W8A8 attention/GDN math. The gate requires
+        // BOTH a positive `input_amax` AND `self.mode == MXFP8_MODE`: in the
+        // nvidia recipe the mxfp8 projections are EXACTLY the attn/GDN
+        // activation-fp8 sites, so the mode check enforces the invariant at the
+        // point of use rather than trusting the loaders. Even if a stale,
+        // malformed, or hand-edited config erroneously threads `input_amax` onto
+        // a non-mxfp8 projection (mxfp4 FFN, affine gates/in_proj_ba, lm_head,
+        // sym8), `x` stays the original bf16 reference there and that forward is
+        // byte-identical to before. Apple GPUs have no fp8 matmul hardware —
+        // this is numeric parity, not speed.
         let xq_owned;
         let x = match self.input_amax {
-            Some(amax) if amax > 0.0 => {
+            Some(amax) if amax > 0.0 && self.mode == MXFP8_MODE => {
                 xq_owned = crate::quant::fp8_activation::fp8_fake_quant(x, amax)?;
                 &xq_owned
             }
@@ -965,6 +969,60 @@ mod fp8_activation_tests {
         )
     }
 
+    /// MXFP4-quantize a 2D bf16 weight, returning `(packed_weight, uint8 E2M1
+    /// scales)` (mxfp4 has no biases) — mirrors [`quantize_mxfp8`] with the
+    /// mxfp4 mode / group_size / bits. Used to build a NON-mxfp8 projection for
+    /// the negative gate test.
+    fn quantize_mxfp4(weight: &MxArray) -> (MxArray, MxArray) {
+        let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_s: *mut sys::mlx_array = std::ptr::null_mut();
+        let mut out_b: *mut sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::mlx_quantize(
+                weight.as_raw_ptr(),
+                MXFP4_GROUP_SIZE,
+                MXFP4_BITS,
+                c"mxfp4".as_ptr(),
+                &mut out_q,
+                &mut out_s,
+                &mut out_b,
+            )
+        };
+        assert!(ok, "mlx_quantize mxfp4 failed");
+        (
+            MxArray::from_handle(out_q, "q").expect("q"),
+            MxArray::from_handle(out_s, "s").expect("s"),
+        )
+    }
+
+    /// A fresh mxfp4 `QuantizedLinear` over shared (cloned) packed operands
+    /// (`with_input_amax` consumes `self`, so each variant needs its own
+    /// struct).
+    fn make_mxfp4_linear(w_q: &MxArray, scales: &MxArray) -> QuantizedLinear {
+        QuantizedLinear::new(
+            w_q.clone(),
+            scales.clone(),
+            None,
+            None,
+            MXFP4_GROUP_SIZE,
+            MXFP4_BITS,
+            MXFP4_MODE.to_string(),
+        )
+    }
+
+    /// Assert two bf16 outputs are byte-for-byte identical via their native u16
+    /// payload (no f32 round-trip — see project memory: an f32 cast can hide a
+    /// 1-ULP bf16 divergence).
+    fn assert_bf16_bit_identical(a: &MxArray, b: &MxArray, ctx: &str) {
+        a.eval();
+        b.eval();
+        let av = a.to_uint16_native().unwrap();
+        let bv = b.to_uint16_native().unwrap();
+        assert_eq!(av.len(), bv.len(), "{ctx}: length mismatch");
+        let bad = av.iter().zip(bv.iter()).filter(|(x, y)| x != y).count();
+        assert_eq!(bad, 0, "{ctx}: {bad}/{} bf16 words differ", av.len());
+    }
+
     fn to_f32(a: &MxArray) -> Vec<f32> {
         a.astype(DType::Float32)
             .expect("astype f32")
@@ -1033,6 +1091,56 @@ mod fp8_activation_tests {
         assert!(
             d_got_base > 1e-3,
             "amax path must change the output vs the None baseline; max|Δ|={d_got_base}"
+        );
+    }
+
+    /// Invariant guard: a NON-mxfp8 projection that erroneously carries a
+    /// positive `input_amax` (stale / malformed / hand-edited config) must NOT
+    /// fake-quant its activations — its forward is byte-identical to the same
+    /// projection with `input_amax == None`. Only `mode == MXFP8_MODE` (the
+    /// nvidia recipe's attn/GDN activation-fp8 sites) gets FP8 activations;
+    /// mxfp4 FFN, affine gates/in_proj_ba, lm_head, and sym8 stay bf16.
+    ///
+    /// RED on the unfixed gate (before the `&& self.mode == MXFP8_MODE` guard):
+    /// this mxfp4 linear WOULD fake-quant `x` and diverge from the baseline, so
+    /// the bit-identical assert fails.
+    #[test]
+    fn forward_ignores_input_amax_on_non_mxfp8() {
+        let (n, k) = (32i64, 64i64); // k % MXFP4_GROUP_SIZE == 0
+        let mut state = 0x4F40_9AB1u64;
+
+        // Random bf16 weight [N, K], mxfp4-quantized (a NON-mxfp8 projection —
+        // stands in for the mxfp4 FFN / affine / lm_head paths).
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp4(&w_bf16);
+
+        // Random bf16 activations [M, K] spanning [-2, 2] so an amax=2.0
+        // fake-quant WOULD visibly perturb them if it were (wrongly) applied.
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Baseline: input_amax = None (bf16 activations).
+        let base = make_mxfp4_linear(&w_q, &scales).forward(&x).unwrap();
+
+        // Erroneous amax on a non-mxfp8 mode: the mode guard must ignore it, so
+        // forward stays byte-identical to the None baseline.
+        let got = make_mxfp4_linear(&w_q, &scales)
+            .with_input_amax(Some(2.0))
+            .forward(&x)
+            .unwrap();
+
+        assert_bf16_bit_identical(
+            &got,
+            &base,
+            "non-mxfp8 projection with erroneous input_amax must NOT fake-quant",
         );
     }
 }
