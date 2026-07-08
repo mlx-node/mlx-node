@@ -202,7 +202,8 @@ const COPY = {
       'Every draft token matched the model’s own greedy pick — a real engine would commit all of them from this single pass.',
     correctionNote:
       'At the first mismatch the model’s own pick (beside the ✗) continues the text — that correction is why speculative decoding stays lossless.',
-    barsSummary: (i: number, t: string, k: number) => `position ${i + 1} · draft "${t}" · real top-${k} probabilities`,
+    barsSummary: (i: number, t: string, k: number) =>
+      `position ${i + 1} · draft "${t}" · top-${k} logits, softmaxed over just these ${k} — renormalized share, not full-vocab probability`,
     barsRolledBack: 'computed in the same pass, discarded after the reject',
     barsDraftMissing: (t: string, k: number) => `The draft token "${t}" is not in the model’s top-${k} here.`,
     chipProposedAria: (t: string) => `draft token "${t}" — proposed, not yet verified`,
@@ -245,7 +246,8 @@ const COPY = {
     tallyAccepted: (k: number, d: number) => `${d} 个中接受了 ${k} 个`,
     fullAcceptNote: '每个 draft token 都与模型自己的 greedy 选择一致——真实引擎会把它们从这一次前向里全部提交。',
     correctionNote: '在第一个不匹配处，模型自己的选择（✗ 旁边）会接着往下写——正是这个纠正让推测式解码保持无损。',
-    barsSummary: (i: number, t: string, k: number) => `位置 ${i + 1} · draft "${t}" · 真实 top-${k} 概率`,
+    barsSummary: (i: number, t: string, k: number) =>
+      `位置 ${i + 1} · draft "${t}" · top-${k} logits，只对这 ${k} 个做 softmax——是重新归一化的份额，不是全词表概率`,
     barsRolledBack: '同一次前向里算出，但在拒绝之后被丢弃',
     barsDraftMissing: (t: string, k: number) => `draft token "${t}" 不在模型这里的 top-${k} 里。`,
     chipProposedAria: (t: string) => `draft token "${t}"——已提议，尚未 verify`,
