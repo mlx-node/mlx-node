@@ -66,6 +66,10 @@ const DEFAULT_SKIP_FIRST: usize = 16;
 /// Default per-prompt token truncation (reference `max_seq_len`; the paper uses
 /// equal-length 128-token prompts).
 const DEFAULT_MAX_SEQ_LEN: usize = 128;
+/// Random directions probed (in addition to the gradient direction) by the
+/// finite-difference gate, so it is an all-direction gradcheck rather than a
+/// single projection along the implementation's own gradient.
+const N_RAND_DIRS: usize = 3;
 
 /// Options for [`fit_jacobian_lens`] / the `fitJacobianLens` NAPI method.
 #[napi(object)]
@@ -116,7 +120,8 @@ pub struct JlensFitResult {
 
 /// Result of [`verify_finite_diff`] — THE pilot GO/NO-GO gate. Per requested
 /// boundary: the autograd directional derivative vs the numerical
-/// central-difference along a random unit direction, and their relative error.
+/// central-difference, probed along the gradient direction AND several random
+/// directions (see `dir_check_max_err`), plus a causality and basis-batch check.
 #[napi(object)]
 pub struct JlensFiniteDiffResult {
     pub boundaries: Vec<u32>,
@@ -125,8 +130,16 @@ pub struct JlensFiniteDiffResult {
     pub predicted: Vec<f64>,
     /// Numerical `(L(z_l=+εδ) − L(z_l=−εδ)) / (2ε)`.
     pub numerical: Vec<f64>,
-    /// `|predicted − numerical| / max(|numerical|, 1e-6)`.
+    /// `|predicted − numerical| / max(|numerical|, 1e-6)` along the gradient
+    /// direction (max SNR).
     pub rel_error: Vec<f64>,
+    /// Per boundary: `max` over `1 + N_RAND_DIRS` probe directions (gradient +
+    /// random) of `|predicted_d − numerical_d| / ‖g_l‖`. Normalizing by `‖g_l‖`
+    /// keeps this well-conditioned for ALL directions, so a VJP error orthogonal
+    /// to the gradient still surfaces. This is the rigorous all-direction check.
+    pub dir_check_max_err: Vec<f64>,
+    /// Directions probed per boundary (`1 + N_RAND_DIRS`).
+    pub dir_check_n: i32,
     /// `true` iff boundary `l`'s downstream block is GatedDeltaNet (linear).
     pub is_gdn: Vec<bool>,
     /// Causality probe split position `p` (a mid-sequence position). A probe
@@ -418,6 +431,12 @@ fn save_checkpoint(path: &str, state: &FitState, skip_first: usize, hidden: usiz
 /// output) is left UNFITTED to match the reference (`fitting.py` starts at the
 /// first block's output), and `J.24` (final boundary = identity) is NEVER
 /// written (the loader rejects it).
+///
+/// CALLER CONTRACT: since the pack omits `J.0`, a `lensReadout(useJacobian=true)`
+/// MUST pass `layers` within the fitted set `1..=24` — the readout's DEFAULT
+/// `layers` is all 25 boundaries, which would request `J.0` and error. This
+/// matches the reference `JacobianLens.apply`, whose default `layers` is the
+/// fitted `source_layers`, not every boundary.
 fn export_pack(path: &str, state: &FitState) -> Result<()> {
     if state.n_done == 0 {
         return Err(Error::from_reason(
@@ -503,27 +522,35 @@ pub(crate) fn fit_jacobian_lens(
         let take = ids.len().min(max_seq_len);
         let ids_i32: Vec<i32> = ids[..take].iter().map(|&x| x as i32).collect();
 
+        // Too-short prompt (no valid source position) is a LEGITIMATE skip, not
+        // an error. Detect it up front so that any Err from `jacobian_for_prompt`
+        // below is a REAL failure (missing params, shape/graph error, a broken
+        // autograd path) and PROPAGATES — the pilot must never silently skip a
+        // broken fit and export a stale running mean (fail-open).
+        if ids_i32.len() < skip_first + 2 {
+            tracing::warn!(
+                "jlens fit: skipping prompt {idx}: too short (len {} <= skip_first+1={})",
+                ids_i32.len(),
+                skip_first + 1
+            );
+            prompts_skipped += 1;
+            state.next_idx = idx as i64 + 1;
+            heavy_cleanup();
+            // Persist the advanced cursor so a crash doesn't reprocess this skip.
+            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
+            continue;
+        }
+
         let start = Instant::now();
-        let per_prompt = jacobian_for_prompt(
+        // Real errors propagate (`?`) — do NOT swallow them as a skip.
+        let (per_j, n_valid, prompt_peak_mb, prompt_active_mb) = jacobian_for_prompt(
             config,
             params,
             &ids_i32,
             dim_batch,
             skip_first,
             use_checkpointing,
-        );
-        let per_prompt = match per_prompt {
-            Ok(v) => v,
-            Err(e) => {
-                // Too-short / degenerate prompt — skip without re-processing.
-                tracing::warn!("jlens fit: skipping prompt {idx}: {e}");
-                prompts_skipped += 1;
-                state.next_idx = idx as i64 + 1;
-                heavy_cleanup();
-                continue;
-            }
-        };
-        let (per_j, n_valid, prompt_peak_mb, prompt_active_mb) = per_prompt;
+        )?;
 
         // NaN/Inf guard — a poisoned prompt must not corrupt the running mean.
         let mut invalid = false;
@@ -538,6 +565,9 @@ pub(crate) fn fit_jacobian_lens(
             prompts_skipped += 1;
             state.next_idx = idx as i64 + 1;
             heavy_cleanup();
+            // Persist the advanced cursor so a crash doesn't reprocess this
+            // (expensive) NaN prompt on resume.
+            save_checkpoint(&opts.checkpoint_path, &state, skip_first, hidden)?;
             continue;
         }
 
@@ -730,10 +760,14 @@ fn estimator_rows_f32(
 ///
 /// For each requested boundary `l` it compares the autograd directional
 /// derivative `⟨∂L/∂z_l, δ⟩` against the numerical central difference
-/// `(L(+εδ) − L(−εδ)) / 2ε` along a random unit direction `δ`, where
-/// `L(z) = Σ h_final(z) · c` for a fixed random cotangent `c`. A broken GDN /
-/// attention VJP would blow the relative error up (or NaN); agreement to a few
-/// digits is the proof the Jacobian is real.
+/// `Σ (h(+εδ) − h(−εδ)) · c / 2ε`, where `L(z) = Σ h_final(z) · c` for a fixed
+/// cotangent `c = randn/(|h_baseline|+1)`. It probes `1 + N_RAND_DIRS`
+/// directions per boundary — `δ = g_l/‖g_l‖` (max SNR, reported) plus random
+/// unit directions — with the error normalized by `‖g_l‖` (`dir_check_max_err`)
+/// so it catches a VJP error in ANY direction, not just along the gradient. A
+/// broken GDN / attention VJP blows the error up (or NaNs); agreement to a few
+/// digits over all directions is the proof the Jacobian is real. Also checks
+/// causality (single-position perturbation) and basis-batch independence.
 pub(crate) fn verify_finite_diff(
     config: &Qwen3_5Config,
     params_bf16: &HashMap<String, MxArray>,
@@ -819,6 +853,7 @@ pub(crate) fn verify_finite_diff(
     let mut out_pred = Vec::new();
     let mut out_num = Vec::new();
     let mut out_rel = Vec::new();
+    let mut out_maxerr = Vec::new();
     let mut out_gdn = Vec::new();
     let mut out_leak = Vec::new();
     let mut out_signal = Vec::new();
@@ -830,48 +865,75 @@ pub(crate) fn verify_finite_diff(
     let pos_mask = MxArray::from_float32(&mask_host, &[1, seq_len as i64, 1])?;
 
     for &l in boundaries {
-        // Direction δ = g_l / ‖g_l‖ (the gradient direction itself). This
-        // MAXIMIZES the directional-derivative signal — `⟨g_l, δ⟩ = ‖g_l‖`, never
-        // the near-zero a random direction can hit (which makes the f32 rel error
-        // explode). It is still a valid gradcheck: a wrong VJP gives a wrong g_l
-        // direction/magnitude, so the numerical-vs-autograd match still fails.
+        // MULTI-DIRECTION gradcheck. We probe several directions δ and compare
+        // the autograd directional derivative `⟨g_l, δ⟩` against the numerical
+        // one, with the error normalized by `‖g_l‖` (NOT by `|numerical|`). That
+        // normalization stays well-conditioned even for directions near-
+        // orthogonal to g_l (where `|numerical|→0` would make a relative error
+        // explode in f32), so this is an ALL-DIRECTION check: a VJP error
+        // ORTHOGONAL to the implementation's own gradient still surfaces here.
+        // Direction 0 is `g_l/‖g_l‖` (max SNR, reported as predicted/numerical);
+        // the rest are random unit directions.
         let g_l = &grads[l];
         let g_norm = g_l.square()?.sum(None, None)?.sqrt()?;
-        let d_unit = g_l.div(&g_norm)?;
-        d_unit.eval();
+        let g_norm_v = (g_norm.item_at_float32(0)? as f64).max(1e-12);
 
-        // Autograd directional derivative ⟨g_l, δ⟩ = ‖g_l‖.
-        let predicted = grads[l].mul(&d_unit)?.sum(None, None)?;
-        let predicted_v = predicted.item_at_float32(0)? as f64;
+        let grad_dir = g_l.div(&g_norm)?;
+        grad_dir.eval();
+        let mut dirs: Vec<MxArray> = Vec::with_capacity(1 + N_RAND_DIRS);
+        dirs.push(grad_dir);
+        for _ in 0..N_RAND_DIRS {
+            let r = MxArray::random_normal(&probe_shape, 0.0, 1.0, Some(DType::Float32))?;
+            let rn = r.square()?.sum(None, None)?.sqrt()?;
+            let ru = r.div(&rn)?;
+            ru.eval();
+            dirs.push(ru);
+        }
 
-        // Numerical central difference along δ, differenced IN h-SPACE first:
-        // `Σ (h(+εδ) − h(−εδ)) · c / 2ε`. Computing `Δh = h₊ − h₋` elementwise
-        // (each ~O(ε), well below the outlier magnitude) BEFORE the contraction
-        // avoids the catastrophic cancellation of two huge scalar losses.
-        let pert_p = d_unit.mul_scalar(epsilon)?;
-        let pert_m = d_unit.mul_scalar(-epsilon)?;
-        let h_p = forward_single_probe(
-            config,
-            &params,
-            &input_ids,
-            &probe_shape,
-            num_layers,
-            l,
-            &pert_p,
-        )?;
-        let h_m = forward_single_probe(
-            config,
-            &params,
-            &input_ids,
-            &probe_shape,
-            num_layers,
-            l,
-            &pert_m,
-        )?;
-        let dh = h_p.sub(&h_m)?;
-        let numerical_v =
-            dh.mul(&cotangent)?.sum(None, None)?.item_at_float32(0)? as f64 / (2.0 * epsilon);
+        let mut predicted_v = 0.0f64;
+        let mut numerical_v = 0.0f64;
+        let mut max_err_norm = 0.0f64;
+        for (di, d) in dirs.iter().enumerate() {
+            // Autograd directional derivative ⟨g_l, δ⟩.
+            let pred = grads[l].mul(d)?.sum(None, None)?.item_at_float32(0)? as f64;
+            // Numerical central difference along δ, differenced IN h-SPACE first:
+            // `Σ (h(+εδ) − h(−εδ)) · c / 2ε`. Computing `Δh = h₊ − h₋` elementwise
+            // (each ~O(ε), well below the outlier magnitude) BEFORE the
+            // contraction avoids the catastrophic cancellation of two huge losses.
+            let pert_p = d.mul_scalar(epsilon)?;
+            let pert_m = d.mul_scalar(-epsilon)?;
+            let h_p = forward_single_probe(
+                config,
+                &params,
+                &input_ids,
+                &probe_shape,
+                num_layers,
+                l,
+                &pert_p,
+            )?;
+            let h_m = forward_single_probe(
+                config,
+                &params,
+                &input_ids,
+                &probe_shape,
+                num_layers,
+                l,
+                &pert_m,
+            )?;
+            let num = h_p
+                .sub(&h_m)?
+                .mul(&cotangent)?
+                .sum(None, None)?
+                .item_at_float32(0)? as f64
+                / (2.0 * epsilon);
+            max_err_norm = max_err_norm.max((pred - num).abs() / g_norm_v);
+            if di == 0 {
+                predicted_v = pred; // gradient direction — reported
+                numerical_v = num;
+            }
+        }
         let rel = (predicted_v - numerical_v).abs() / numerical_v.abs().max(1e-6);
+        let d_unit = &dirs[0]; // gradient direction, reused by the causality check
 
         // Causality check: perturb probe `l` at ONLY position `split_pos`
         // (`δ_unit · pos_mask · ε`), run forward, and measure how much h_final
@@ -907,6 +969,7 @@ pub(crate) fn verify_finite_diff(
         out_pred.push(predicted_v);
         out_num.push(numerical_v);
         out_rel.push(rel);
+        out_maxerr.push(max_err_norm);
         out_gdn.push(config.is_linear_layer(l));
         out_leak.push(leak);
         out_signal.push(signal);
@@ -979,6 +1042,8 @@ pub(crate) fn verify_finite_diff(
         predicted: out_pred,
         numerical: out_num,
         rel_error: out_rel,
+        dir_check_max_err: out_maxerr,
+        dir_check_n: (1 + N_RAND_DIRS) as i32,
         is_gdn: out_gdn,
         causality_split_pos: split_pos as i32,
         causality_leak_before: out_leak,

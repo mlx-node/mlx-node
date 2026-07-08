@@ -84,6 +84,16 @@ const EPSILON = 5e-2;
 // A correct VJP matches to well under this in f32 along the gradient direction;
 // a broken one is O(1)+/NaN, so the threshold is decisive with generous slack.
 const FD_TOL = 5e-2;
+// All-direction check tolerance: max over the gradient + random directions of
+// |predicted−numerical|/‖g_l‖. Well-conditioned for every direction (~few e-4
+// observed); a VJP error in ANY direction is O(1), so this is decisive.
+const DIR_TOL = 1e-2;
+// Boundaries probed by the gate. 5=GDN + 7=full-attention are the brief's
+// required pair; 1 and 23 broaden coverage — boundary 1's backward path runs
+// through blocks 1..23 (ALL 6 full-attention layers incl. the first, block 3,
+// plus 17 of 18 GDN layers), and boundary 23 isolates the last (attention)
+// block's shallow path.
+const FD_BOUNDARIES = [1, GDN_BOUNDARY, ATTN_BOUNDARY, 23];
 
 // Smoke-fit config: dimBatch=32 => ceil(1024/32)=32 backward passes (fast).
 const FIT_DIM_BATCH = 32;
@@ -118,27 +128,40 @@ async function main() {
 
   // ===================== GATE 1 — finite-difference (GO/NO-GO) =====================
   console.log(`\n[GATE 1] finite-difference through BOTH mixer types (f32, ε=${EPSILON})`);
-  const fd = await model.verifyJacobianFiniteDiff(promptIds, [GDN_BOUNDARY, ATTN_BOUNDARY], EPSILON);
+  const fd = await model.verifyJacobianFiniteDiff(promptIds, FD_BOUNDARIES, EPSILON);
+  console.log(`  directions probed per boundary: ${fd.dirCheckN} (gradient + ${fd.dirCheckN - 1} random)`);
   for (let i = 0; i < fd.boundaries.length; i++) {
     const l = fd.boundaries[i];
-    const kind = fd.isGdn[i] ? 'GDN     ' : 'ATTN    ';
+    const kind = fd.isGdn[i] ? 'GDN ' : 'ATTN';
     console.log(
       `  ℓ=${l} (${kind}) predicted=${fd.predicted[i].toExponential(6)} ` +
-        `numerical=${fd.numerical[i].toExponential(6)} relErr=${fd.relError[i].toExponential(3)}`,
+        `numerical=${fd.numerical[i].toExponential(6)} relErr(gradDir)=${fd.relError[i].toExponential(3)} ` +
+        `maxErr(allDirs/‖g‖)=${fd.dirCheckMaxErr[i].toExponential(3)}`,
     );
   }
-  // Assert BOTH boundaries: rel error finite and under tolerance.
+  // Every probed boundary must pass BOTH the gradient-direction rel error AND
+  // the all-direction ‖g‖-normalized error (which catches a VJP error in any
+  // direction, not just along the gradient).
+  for (let i = 0; i < fd.boundaries.length; i++) {
+    const l = fd.boundaries[i];
+    const re = fd.relError[i];
+    const de = fd.dirCheckMaxErr[i];
+    if (!Number.isFinite(re) || !Number.isFinite(de)) {
+      fail(`boundary ${l}: non-finite error (rel=${re}, dir=${de}) — autograd does NOT flow`);
+    }
+    if (re > FD_TOL) fail(`boundary ${l}: gradient-dir relErr ${re} > tol ${FD_TOL} — autograd does NOT flow correctly`);
+    if (de > DIR_TOL) fail(`boundary ${l}: all-direction maxErr ${de} > tol ${DIR_TOL} — VJP wrong in some direction`);
+  }
+  // Brief's required pair: assert boundary 5 is GDN and boundary 7 is full-attn.
   const gdnIdx = fd.boundaries.indexOf(GDN_BOUNDARY);
   const attnIdx = fd.boundaries.indexOf(ATTN_BOUNDARY);
-  if (gdnIdx < 0 || attnIdx < 0) fail('finite-diff did not return both requested boundaries');
+  if (gdnIdx < 0 || attnIdx < 0) fail('finite-diff did not return the required GDN(5)/ATTN(7) boundaries');
   if (fd.isGdn[gdnIdx] !== true) fail(`boundary ${GDN_BOUNDARY} was not classified GDN`);
   if (fd.isGdn[attnIdx] !== false) fail(`boundary ${ATTN_BOUNDARY} was not classified full-attention`);
-  for (const [name, idx] of [['GDN', gdnIdx], ['ATTN', attnIdx]] as const) {
-    const re = fd.relError[idx];
-    if (!Number.isFinite(re)) fail(`${name} boundary rel error is not finite (${re}) — autograd does NOT flow`);
-    if (re > FD_TOL) fail(`${name} boundary rel error ${re} > tol ${FD_TOL} — autograd does NOT flow correctly`);
-  }
-  console.log(`  BOTH mixer types pass (relErr < ${FD_TOL}) -> autograd flows through GDN AND attention  -> PASS`);
+  console.log(
+    `  all ${fd.boundaries.length} boundaries pass (gradDir relErr<${FD_TOL}, allDirs maxErr<${DIR_TOL}); ` +
+      `ℓ=5 GDN + ℓ=7 attention confirmed  -> autograd flows through GDN AND attention  -> PASS`,
+  );
 
   // Causality sub-check: a probe injected ONLY at position p must not change
   // h_final BEFORE p (the Σ_{t'≥t} assumption the autograd-vs-finite-diff gate
