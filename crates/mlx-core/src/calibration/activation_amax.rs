@@ -129,51 +129,28 @@ pub fn is_activation_fp8_site(normalized_key: &str) -> bool {
 /// `"input_amax"`; the top-level scalars (`mode`/`bits`/`group_size`) and any
 /// entry with no collected amax (mxfp4 FFN, affine gates, in_proj_a/b, lm_head)
 /// are left untouched. Every other field of the config is preserved.
+///
+/// Converted nvidia configs write the per-layer block under BOTH the
+/// `quantization` and `quantization_config` aliases as equal clones
+/// (`convert.rs`: `output_config["quantization"] = quant_obj.clone();
+/// output_config["quantization_config"] = quant_obj;`). Calibrating only one
+/// would leave the mirror stale and internally inconsistent, so we apply the
+/// per-entry amax to EVERY present object-valued alias. If neither alias exists
+/// the function is a no-op; a single alias is fine (updates just that one).
 pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -> Result<()> {
-    use crate::models::mtp_drafter::strip_wrapper_prefix;
-
     let data = std::fs::read_to_string(config_path)
         .map_err(|e| Error::from_reason(format!("read {}: {e}", config_path.display())))?;
     let mut config: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| Error::from_reason(format!("parse {}: {e}", config_path.display())))?;
 
-    // The nvidia recipe writes the per-layer block under `quantization`; some
-    // HF exports use the `quantization_config` alias. Prefer `quantization`.
-    let block_key = if config
-        .get("quantization")
-        .map(|v| v.is_object())
-        .unwrap_or(false)
-    {
-        "quantization"
-    } else {
-        "quantization_config"
-    };
-
-    if let Some(block) = config.get_mut(block_key).and_then(|v| v.as_object_mut()) {
-        for (ck, entry_val) in block.iter_mut() {
-            // Only per-layer OBJECT entries carry an `input_amax`. This skips
-            // the top-level `mode`/`bits`/`group_size` scalars (and any other
-            // non-object member) without a hardcoded name list.
-            let Some(entry) = entry_val.as_object_mut() else {
-                continue;
-            };
-            // Config keys are RAW/WRAPPED; collector keys are STRIPPED.
-            let sck = strip_wrapper_prefix(ck);
-            // Fan the MERGED GDN input-projection amax out to BOTH split config
-            // entries (`in_proj_qkv`, `in_proj_z` share the same input `x`).
-            let source = if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_qkv") {
-                format!("{base}.linear_attn.in_proj_qkvz")
-            } else if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_z") {
-                format!("{base}.linear_attn.in_proj_qkvz")
-            } else {
-                sck.to_string()
-            };
-            if let Some(&val) = amax.get(&source) {
-                // Skip non-finite maxima (NaN/inf would serialize as JSON null).
-                if val.is_finite() {
-                    entry.insert("input_amax".to_string(), serde_json::Value::from(val));
-                }
-            }
+    // The nvidia recipe writes the per-layer block under `quantization`; HF
+    // exports (and our own converter) also mirror it into the
+    // `quantization_config` alias. Update EVERY present object-valued alias so
+    // the two never drift out of sync — one alias with stale (uncalibrated)
+    // amax would be an internally-inconsistent config for a consumer reading it.
+    for name in ["quantization", "quantization_config"] {
+        if let Some(block) = config.get_mut(name).and_then(|v| v.as_object_mut()) {
+            apply_amax_to_block(block, amax);
         }
     }
 
@@ -182,6 +159,48 @@ pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -
     std::fs::write(config_path, out)
         .map_err(|e| Error::from_reason(format!("write {}: {e}", config_path.display())))?;
     Ok(())
+}
+
+/// Thread each collected per-tensor `input_amax` into a single quantization
+/// `block` (the object under `quantization` / `quantization_config`), in place.
+///
+/// Per-entry mapping (see [`write_amax_into_config`] for the block-selection
+/// contract): config keys are RAW/WRAPPED and store the GDN input projection
+/// SPLIT (`in_proj_qkv`, `in_proj_z`); collector keys are STRIPPED with it
+/// MERGED (`in_proj_qkvz`). Only per-layer OBJECT entries with a matching finite
+/// collected amax gain `"input_amax"`; top-level scalars and uncollected entries
+/// are left untouched.
+fn apply_amax_to_block(
+    block: &mut serde_json::Map<String, serde_json::Value>,
+    amax: &HashMap<String, f32>,
+) {
+    use crate::models::mtp_drafter::strip_wrapper_prefix;
+
+    for (ck, entry_val) in block.iter_mut() {
+        // Only per-layer OBJECT entries carry an `input_amax`. This skips
+        // the top-level `mode`/`bits`/`group_size` scalars (and any other
+        // non-object member) without a hardcoded name list.
+        let Some(entry) = entry_val.as_object_mut() else {
+            continue;
+        };
+        // Config keys are RAW/WRAPPED; collector keys are STRIPPED.
+        let sck = strip_wrapper_prefix(ck);
+        // Fan the MERGED GDN input-projection amax out to BOTH split config
+        // entries (`in_proj_qkv`, `in_proj_z` share the same input `x`).
+        let source = if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_qkv") {
+            format!("{base}.linear_attn.in_proj_qkvz")
+        } else if let Some(base) = sck.strip_suffix(".linear_attn.in_proj_z") {
+            format!("{base}.linear_attn.in_proj_qkvz")
+        } else {
+            sck.to_string()
+        };
+        if let Some(&val) = amax.get(&source) {
+            // Skip non-finite maxima (NaN/inf would serialize as JSON null).
+            if val.is_finite() {
+                entry.insert("input_amax".to_string(), serde_json::Value::from(val));
+            }
+        }
+    }
 }
 
 /// Serializes tests that toggle the process-global collector so parallel
@@ -382,6 +401,85 @@ mod tests {
             8
         );
         assert_eq!(q["mode"], "mxfp8");
+        assert_eq!(after["model_type"], "qwen3_5");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Converted nvidia configs mirror the per-layer block into BOTH the
+    /// `quantization` and `quantization_config` aliases as equal clones.
+    /// `write_amax_into_config` must calibrate BOTH so the two never drift out
+    /// of sync (a single stale alias is an internally-inconsistent config).
+    /// Wrapped keys are mapped and the merged `in_proj_qkvz` amax fans out to
+    /// both split entries in EACH alias.
+    #[test]
+    fn write_amax_into_config_updates_both_aliases() {
+        let path = std::env::temp_dir().join(format!(
+            "mlx_calib_dualalias_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // BOTH aliases present with IDENTICAL content, exactly as the converter
+        // writes them (`quantization` == `quantization_config` clone).
+        let block = serde_json::json!({
+            "mode": "mxfp8",
+            "group_size": 32,
+            "language_model.model.layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+            "language_model.model.layers.0.linear_attn.in_proj_qkv": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+            "language_model.model.layers.0.linear_attn.in_proj_z": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+            "language_model.model.layers.0.mlp.gate_proj": {"bits": 4, "group_size": 32, "mode": "mxfp4"}
+        });
+        let initial = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": block,
+            "quantization_config": block,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        // Collected map: STRIPPED keys, GDN input projection under MERGED key.
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 3.0f32);
+        amax.insert("layers.0.linear_attn.in_proj_qkvz".to_string(), 5.0f32);
+
+        write_amax_into_config(&path, &amax).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        // Assert the SAME calibration landed in BOTH aliases.
+        for alias in ["quantization", "quantization_config"] {
+            let q = &after[alias];
+            let amax_of =
+                |k: &str| -> Option<f32> { q[k]["input_amax"].as_f64().map(|v| v as f32) };
+
+            assert_eq!(
+                amax_of("language_model.model.layers.0.self_attn.q_proj"),
+                Some(3.0),
+                "{alias}: q_proj must be calibrated to 3.0"
+            );
+            // Merged in_proj_qkvz fans out to BOTH split entries -> 5.0.
+            assert_eq!(
+                amax_of("language_model.model.layers.0.linear_attn.in_proj_qkv"),
+                Some(5.0),
+                "{alias}: in_proj_qkv fanout -> 5.0"
+            );
+            assert_eq!(
+                amax_of("language_model.model.layers.0.linear_attn.in_proj_z"),
+                Some(5.0),
+                "{alias}: in_proj_z fanout -> 5.0"
+            );
+            // mxfp4 FFN has no collected amax -> untouched.
+            assert_eq!(
+                amax_of("language_model.model.layers.0.mlp.gate_proj"),
+                None,
+                "{alias}: mxfp4 gate_proj must gain no input_amax"
+            );
+        }
+        // Rest of the config preserved.
         assert_eq!(after["model_type"], "qwen3_5");
 
         let _ = std::fs::remove_file(&path);
