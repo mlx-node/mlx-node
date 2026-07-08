@@ -2019,6 +2019,7 @@ mod tests {
                 bits,
                 group_size,
                 mode: PerLayerMode::Affine,
+                input_amax: None,
             },
         );
 

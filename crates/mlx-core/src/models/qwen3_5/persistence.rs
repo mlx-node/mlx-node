@@ -501,6 +501,7 @@ fn mtplx_mtp_quant(raw: &Value) -> Option<(String, PerLayerQuant)> {
             bits,
             group_size,
             mode,
+            input_amax: None,
         },
     ))
 }
@@ -603,6 +604,7 @@ pub(crate) fn augment_mtplx_mtp_quantization_with_suffixes(
                 bits,
                 group_size,
                 mode,
+                input_amax: None,
             });
     }
 
@@ -625,6 +627,7 @@ fn parse_draft_lm_head_spec(value: &Value) -> Option<PerLayerQuant> {
         bits,
         group_size,
         mode,
+        input_amax: None,
     })
 }
 
@@ -951,7 +954,7 @@ fn apply_weights_inner(
         // to the dense-weight branch"; `Err` = fail-loud (a malformed sym8
         // layer must never silently fall back, see
         // `try_build_sym8_quantized_linear`).
-        Ok(match plq.mode {
+        let built = match plq.mode {
             PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
             PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
             PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
@@ -959,7 +962,12 @@ fn apply_weights_inner(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        })
+        };
+        // Thread the per-tensor FP8 activation scale from the resolved
+        // per-layer quant record onto the built projection. Only calibrated
+        // mxfp8 attention/GDN overrides carry a `Some` amax in config; every
+        // other layer stays `None`, so forward behaviour is unchanged here.
+        Ok(built.map(|ql| ql.with_input_amax(plq.input_amax)))
     };
 
     // Embedding
@@ -2357,6 +2365,7 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         for key in [
             "mtp.layers.0.self_attn.o_proj",
@@ -2620,6 +2629,7 @@ mod tests {
                 bits,
                 group_size,
                 mode: PerLayerMode::Affine,
+                input_amax: None,
             },
         );
 
@@ -2767,6 +2777,7 @@ mod tests {
                     bits: MXFP8_BITS,
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
+                    input_amax: None,
                 },
             );
             apply_install_only(&mut inner, &params, &plq);
@@ -2799,6 +2810,7 @@ mod tests {
                     bits: 4,
                     group_size: 32,
                     mode: PerLayerMode::Affine,
+                    input_amax: None,
                 },
             );
             apply_install_only(&mut inner, &params, &plq);

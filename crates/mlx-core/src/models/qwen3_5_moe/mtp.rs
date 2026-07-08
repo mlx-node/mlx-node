@@ -1074,6 +1074,7 @@ mod tests {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         if let Err(err) =
             mtp.apply_weights(&q_params, default_plq, default_gate_plq, &per_layer_quant)
@@ -1281,11 +1282,13 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         // Empty override table — MTP keys are never recorded here, so
         // `effective_plq_for` must take the gate-default fallback.
@@ -1408,11 +1411,13 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let default_gate_plq = PerLayerQuant {
             bits: 8,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -1431,6 +1436,7 @@ mod tests {
                     bits: 4,
                     group_size: 32,
                     mode: PerLayerMode::Affine,
+                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(
@@ -1472,6 +1478,7 @@ mod tests {
                     bits: MXFP8_BITS,
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
+                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(

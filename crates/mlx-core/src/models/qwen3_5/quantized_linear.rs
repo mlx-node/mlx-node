@@ -409,6 +409,13 @@ pub struct QuantizedLinear {
     // `mlx_quantized_matmul` (there is no affine pack for sym8).
     w_i8: Option<MxArray>,
     s_w: Option<MxArray>,
+    // Per-tensor static FP8 (E4M3) activation scale (modelopt MaxCalibrator
+    // amax), threaded from the layer's `config.json` quantization override via
+    // `PerLayerQuant::input_amax`. `Some` only on calibrated mxfp8 attention/GDN
+    // projections; `None` everywhere else. Carried here for a later task to
+    // fake-quant activations to E4M3 for W8A8 numeric parity — forward does NOT
+    // yet read it, so behaviour is unchanged while `None`.
+    input_amax: Option<f32>,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -452,7 +459,24 @@ impl QuantizedLinear {
             mode,
             w_i8: None,
             s_w: None,
+            input_amax: None,
         }
+    }
+
+    /// Attach a per-tensor FP8 activation scale (`PerLayerQuant::input_amax`).
+    ///
+    /// Consuming builder used at the load-time dispatch site to thread the
+    /// calibrated amax onto a freshly built projection. `None` is the no-op /
+    /// default (bf16 activations, current behaviour). A later task reads this
+    /// field in `forward` to fake-quant activations to E4M3.
+    pub fn with_input_amax(mut self, input_amax: Option<f32>) -> Self {
+        self.input_amax = input_amax;
+        self
+    }
+
+    /// The calibrated per-tensor FP8 activation scale, if any.
+    pub fn input_amax(&self) -> Option<f32> {
+        self.input_amax
     }
 
     /// Construct a sym8 linear from pre-validated operands (see
@@ -474,6 +498,7 @@ impl QuantizedLinear {
             mode: SYM8_MODE.to_string(),
             w_i8: Some(w_kn),
             s_w: Some(s_w),
+            input_amax: None,
         }
     }
 

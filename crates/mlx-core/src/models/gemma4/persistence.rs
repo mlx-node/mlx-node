@@ -3494,6 +3494,7 @@ mod tests {
                 bits: 2,
                 group_size: 64,
                 mode: PerLayerMode::Affine,
+                input_amax: None,
             },
         );
 
@@ -3563,6 +3564,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         per_layer_quant.insert("layers.0.experts.switch_glu.gate_proj".to_string(), mxfp8);
         per_layer_quant.insert("layers.0.experts.switch_glu.up_proj".to_string(), mxfp8);
@@ -3738,6 +3740,7 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         let packed = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .expect("mxfp8 with affine-default bits must resolve, not error");
@@ -3767,6 +3770,7 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()
@@ -3789,6 +3793,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let packed =
             resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, Some(&biases))
@@ -3810,6 +3815,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         };
         // `.err()` (not `expect_err`) so the success type needs no `Debug` bound
         // (`PackedEmbedParams` holds `Option<&MxArray>`, and `MxArray: !Debug`).
@@ -3833,6 +3839,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
         let err = resolve_packed_embed_params("embed_tokens", plq, &weight, &scales, None)
             .err()

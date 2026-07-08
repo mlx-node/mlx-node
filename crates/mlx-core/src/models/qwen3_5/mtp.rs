@@ -817,6 +817,7 @@ mod tests {
             bits: 4,
             group_size: 64,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         };
 
         // (a) affine quantized fc → Quantized (mode "affine").
@@ -835,6 +836,7 @@ mod tests {
                     bits: 4,
                     group_size: 32,
                     mode: PerLayerMode::Affine,
+                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(&mut mtp, &params, default_plq, &plq, label) {
@@ -869,6 +871,7 @@ mod tests {
                     bits: MXFP8_BITS,
                     group_size: MXFP8_GROUP_SIZE,
                     mode: PerLayerMode::Mxfp8,
+                    input_amax: None,
                 },
             );
             if !apply_fc_or_skip(&mut mtp, &params, default_plq, &plq, label) {

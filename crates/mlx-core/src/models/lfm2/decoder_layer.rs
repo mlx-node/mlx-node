@@ -30,6 +30,15 @@ pub(crate) enum Lfm2LayerKind {
 }
 
 /// Operator type: either a conv layer or an attention layer.
+///
+/// The `Attention` variant is inherently larger than `Conv` (four `LinearProj`
+/// projections vs a short-conv kernel); this is a per-decoder-layer field on a
+/// hot dispatch path, so we deliberately keep it inline rather than `Box` it —
+/// boxing would add a heap indirection to every attention forward for no
+/// memory win that matters here. (The variant-size gap is right at clippy's
+/// threshold and tipped over when `QuantizedLinear` — which `LinearProj`
+/// wraps — gained its per-tensor FP8 `input_amax` field.)
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum OperatorType {
     Conv(ShortConv),
     Attention(Lfm2Attention),

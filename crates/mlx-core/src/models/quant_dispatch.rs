@@ -52,11 +52,24 @@ pub enum PerLayerMode {
 /// `bits` and `group_size` are the affine packing parameters; for `Mxfp8`,
 /// `Mxfp4`, and `Nvfp4` they are forced to the matching constants by the
 /// builders and are kept here only for fallback/reporting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `input_amax` is the per-tensor static FP8 (E4M3) activation scale calibrated
+/// by NVIDIA modelopt's MaxCalibrator (`max|activation|` over the calib mix),
+/// read from an optional `"input_amax"` field on the tensor's `config.json`
+/// quantization override. It is `None` for every layer whose config carries no
+/// such field (all non-`Mxfp8` attention/GDN sites and unquantized layers).
+/// Carrying it here lets the attention/GDN `QuantizedLinear` fake-quant its
+/// activations to E4M3 for modelopt W8A8 numeric parity (consumed downstream).
+//
+// NOTE: `Eq` is intentionally NOT derived — `Option<f32>` is not `Eq` (floats
+// have no total equality). `PartialEq` is sufficient for the map-value and
+// merge-conflict comparisons this type is used in.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PerLayerQuant {
     pub bits: i32,
     pub group_size: i32,
     pub mode: PerLayerMode,
+    pub input_amax: Option<f32>,
 }
 
 /// Decode a `quantization.mode` string into a `PerLayerMode`.
@@ -163,6 +176,9 @@ pub fn default_per_layer_quant(
         bits,
         group_size,
         mode: default_mode,
+        // Fallback default for layers without an explicit override never
+        // carries a calibrated activation scale.
+        input_amax: None,
     }
 }
 
@@ -228,12 +244,16 @@ pub fn parse_quant_block(
                         .as_i64()
                         .unwrap_or(fallback_group_size as i64) as i32;
                     let mode = parse_mode_str(v["mode"].as_str()).unwrap_or(PerLayerMode::Affine);
+                    // Optional per-tensor FP8 activation scale (modelopt
+                    // MaxCalibrator amax); `None` when the field is absent.
+                    let input_amax = v["input_amax"].as_f64().map(|f| f as f32);
                     Some((
                         normalize_per_layer_key(k),
                         PerLayerQuant {
                             bits,
                             group_size: gs,
                             mode,
+                            input_amax,
                         },
                     ))
                 })
@@ -434,6 +454,24 @@ mod tests {
         assert_eq!(normalize_per_layer_key("layers.0.self_attn.q_proj"), bare);
     }
 
+    /// The per-layer parse lifts an optional `"input_amax"` (the calibrated
+    /// FP8 activation scale) off each tensor's quantization override — present
+    /// → `Some`, absent → `None`. Keys are stored under the normalized bare
+    /// form, so we look them up through `normalize_per_layer_key`.
+    #[test]
+    fn parse_quant_block_reads_input_amax() {
+        let cfg = serde_json::json!({
+            "mode": "affine",
+            "language_model.model.layers.0.self_attn.q_proj": {"bits":8,"group_size":32,"mode":"mxfp8","input_amax":37.5},
+            "language_model.model.layers.0.self_attn.k_proj": {"bits":8,"group_size":32,"mode":"mxfp8"}
+        });
+        let (_mode, per_layer) = parse_quant_block(Some(&cfg), 64);
+        let q = normalize_per_layer_key("language_model.model.layers.0.self_attn.q_proj");
+        let k = normalize_per_layer_key("language_model.model.layers.0.self_attn.k_proj");
+        assert_eq!(per_layer[&q].input_amax, Some(37.5));
+        assert_eq!(per_layer[&k].input_amax, None);
+    }
+
     #[test]
     fn parse_mode_str_recognises_nvfp4() {
         assert_eq!(parse_mode_str(Some("nvfp4")), Some(PerLayerMode::Nvfp4));
@@ -499,6 +537,7 @@ mod tests {
                 bits: 8,
                 group_size: 64,
                 mode: PerLayerMode::Sym8,
+                input_amax: None,
             },
         );
         assert!(has_sym8_mode(None, &overrides));
@@ -526,6 +565,7 @@ mod tests {
             bits,
             group_size,
             mode: PerLayerMode::Affine,
+            input_amax: None,
         }
     }
 
@@ -534,6 +574,7 @@ mod tests {
             bits: 8,
             group_size: 32,
             mode: PerLayerMode::Mxfp8,
+            input_amax: None,
         }
     }
 
@@ -542,6 +583,7 @@ mod tests {
             bits: 4,
             group_size: 32,
             mode: PerLayerMode::Mxfp4,
+            input_amax: None,
         }
     }
 
