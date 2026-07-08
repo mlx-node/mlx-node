@@ -12,6 +12,7 @@ import { MtpModuleDiagram } from '../../widgets/MtpModuleDiagram';
 import { SelfConsistencyVoting } from '../../widgets/SelfConsistencyVoting';
 import { SpecDecodeVariantsDiagram } from '../../widgets/SpecDecodeVariantsDiagram';
 import { SpeculativeDecodeDiagram } from '../../widgets/SpeculativeDecodeDiagram';
+import { SpeculativeVerifyLive } from '../../widgets/SpeculativeVerifyLive';
 
 /** 子章节 11.1——多 token 预测，以及由它驱动的推测式解码。 */
 export function SamplingMtpSection() {
@@ -144,6 +145,29 @@ export function SamplingMtpSection() {
         <strong>低 batch</strong> 时收益最大，此时 GPU 有富余算力去白跑那趟 verify；在高 batch
         时芯片已经被占满（<a href="/zh/chapters/kv-cache/batching">batching</a> 子章节会讲为什么），于是服务器会把推测
         <em>关掉</em>。而 <strong>temperature</strong> 越高，下一个 token 越难预测，接受率就越低。空闲且文本可预测时，推测为你买来速度；反之，它会安静地让到一边。
+      </p>
+
+      <h2>看真实模型做 verify——就在一次前向里</h2>
+      <p>
+        上面的一切都是示意——预设的 token、写好的剧本。下面这个是<strong>现场版</strong>：你可以把真正的 Qwen3.5-0.8B
+        加载进这个标签页，让它在<em>一次真实的前向</em>里 verify 一份廉价的 draft，每个判定都来自模型自己的
+        logits。这份 draft 来自 <strong>prompt-lookup</strong>——就是上面动物园里那个 n-gram
+        drafter，这里是真实现的：拿前缀末尾的几个 token
+        去前缀更早的位置查一查，当时紧跟其后的内容就成了猜测——或者干脆你自己输入一段续写。它<em>不是</em>来自 Qwen 的
+        MTP head：这份 checkpoint 里没有任何 <code>mtp.*</code>{' '}
+        tensor，下一节会讲清楚。还有一句诚实声明：前缀是以原始文本喂给模型的，不套 chat
+        template——这是一次原始语言模型续写，不是一轮对话。
+      </p>
+
+      <SpeculativeVerifyLive />
+
+      <p>
+        有三点值得注意。这里的 verify 是 greedy、temperature 0——一个 draft token 被接受，<em>当且仅当</em>
+        它就是模型在那个位置自己的 argmax，没有任何放水。被拒时，接着往下写的是模型自己的选择（绿色的纠正
+        chip）——这正是推测式解码无损的原因：输出就是朴素解码本来也会产出的东西。而这整个检查——每个位置、以及上面每一份可以展开的
+        top-K 分布——只花了<strong>一次</strong>
+        过权重的前向。这一次前向，就是这个子章节一直在讲的全部速度故事。（这个小部件是专为演示接出来的一次性 verify
+        探针——浏览器实际的聊天解码循环仍是朴素自回归，下一节会说明。）
       </p>
 
       <h2>你浏览器里的 Qwen 用它吗？</h2>

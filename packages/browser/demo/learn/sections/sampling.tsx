@@ -32,6 +32,7 @@ import { MtpModuleDiagram } from '../widgets/MtpModuleDiagram';
 import { SelfConsistencyVoting } from '../widgets/SelfConsistencyVoting';
 import { SpecDecodeVariantsDiagram } from '../widgets/SpecDecodeVariantsDiagram';
 import { SpeculativeDecodeDiagram } from '../widgets/SpeculativeDecodeDiagram';
+import { SpeculativeVerifyLive } from '../widgets/SpeculativeVerifyLive';
 
 /** Sub-chapter 11.1 — multi-token prediction and the speculative decoding it powers. */
 export function SamplingMtpSection() {
@@ -198,6 +199,30 @@ export function SamplingMtpSection() {
         <em>off</em>. And higher <strong>temperature</strong> makes the next token harder to predict, which lowers the
         acceptance rate. Speculation buys speed when you&apos;re idle and the text is predictable, and quietly steps
         aside when it isn&apos;t.
+      </p>
+
+      <h2>Watch the real model verify — in one pass</h2>
+      <p>
+        Everything above was illustrative — canned tokens, scripted verdicts. This one is <strong>live</strong>: the
+        actual Qwen3.5-0.8B you can load into this tab verifies a cheap draft in a <em>single real forward pass</em>,
+        and every verdict below comes from the model&apos;s own logits. The draft comes from{' '}
+        <strong>prompt-lookup</strong> — the n-gram drafter from the zoo above, really implemented here: the last few
+        tokens of the prefix are looked up earlier in the prefix, and whatever followed there becomes the guess — or
+        from your own typed continuation. It does <em>not</em> come from Qwen&apos;s MTP head; this checkpoint ships
+        zero <code>mtp.*</code> tensors, as the next section explains. One more honesty note: the prefix is fed to the
+        model as raw text, with no chat template — a raw language-model continuation, not a chat turn.
+      </p>
+
+      <SpeculativeVerifyLive />
+
+      <p>
+        Three things to notice. The verify is greedy, temperature 0 — a draft token is accepted <em>exactly</em> when
+        it is the model&apos;s own argmax at that position, nothing softer. On a reject, the model&apos;s own pick (the
+        green correction chip) is what continues the text — that is why speculative decoding is lossless: the output is
+        what plain decoding would have produced anyway. And the whole check — every position, every top-K distribution
+        you can expand above — cost <strong>one</strong> forward pass over the weights. That single pass is the entire
+        speed story this sub-chapter has been telling. (This widget is a one-off verify probe wired up for this demo —
+        the browser&apos;s actual chat decode loop stays plain autoregressive, as the next section explains.)
       </p>
 
       <h2>Does your in-browser Qwen use it?</h2>
