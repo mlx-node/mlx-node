@@ -37,6 +37,9 @@ import {
   INSPECTOR_ERROR_TYPE,
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
+  SCORE_TOKENS_ERROR_TYPE,
+  SCORE_TOKENS_REQUEST_TYPE,
+  SCORE_TOKENS_RESULT_TYPE,
   TOKENIZE_ERROR_TYPE,
   TOKENIZE_REQUEST_TYPE,
   TOKENIZE_RESULT_TYPE,
@@ -2538,6 +2541,97 @@ async function handleEmbed(data: { id: string; tokenIds: number[] }) {
   }
 }
 
+// Speculative-decoding chapter hook. Verifies D draft tokens in ONE forward
+// pass over [prefix + draft] via the model's NAPI `scoreTokens` method and
+// replies with a {type:'scoreTokensResult'|'scoreTokensError', id, ...}
+// message correlated by the caller-supplied id. Single-shot like the
+// inspector run — the backend resets its caches internally on both success
+// and error, so this never touches the SAB/streaming chat paths. The accept
+// rule (argmaxTokenId === draftTokenId) is computed by the CALLER, not here.
+async function handleScoreTokens(data: { id: string; prefixIds: number[]; draftIds: number[]; topK: number }) {
+  const id = data.id;
+  if (!model || typeof model.scoreTokens !== 'function') {
+    (self as any).postMessage({
+      type: SCORE_TOKENS_ERROR_TYPE,
+      id,
+      error: 'Model not loaded',
+    });
+    return;
+  }
+  try {
+    const prefixIds = Array.isArray(data.prefixIds) ? data.prefixIds : [];
+    const draftIds = Array.isArray(data.draftIds) ? data.draftIds : [];
+    const topK = data.topK;
+    // Mirror the backend's bounds up front so obviously-bad requests fail
+    // with a clear message before crossing into wasm. The backend re-checks
+    // (plus vocab-range checks we can't do here) and clamps the effective
+    // topK to min(requested, 64, vocab).
+    if (prefixIds.length === 0) {
+      (self as any).postMessage({
+        type: SCORE_TOKENS_ERROR_TYPE,
+        id,
+        error: 'scoreTokens: prefixIds must be non-empty',
+      });
+      return;
+    }
+    if (draftIds.length < 1 || draftIds.length > 8) {
+      (self as any).postMessage({
+        type: SCORE_TOKENS_ERROR_TYPE,
+        id,
+        error: `scoreTokens: draftIds length must be 1..8 (got ${draftIds.length})`,
+      });
+      return;
+    }
+    if (!Number.isInteger(topK) || topK < 1) {
+      (self as any).postMessage({
+        type: SCORE_TOKENS_ERROR_TYPE,
+        id,
+        error: `scoreTokens: topK must be an integer >= 1 (got ${String(topK)})`,
+      });
+      return;
+    }
+
+    const result = await model.scoreTokens(prefixIds, draftIds, topK);
+
+    // Float32Array.buffer is transferable for zero-copy postMessage. Collect
+    // every distinct per-position logits buffer so we hand off ownership in
+    // one call (same pattern as the inspector handler's topKLogits transfer).
+    const transfer: ArrayBuffer[] = [];
+    const seen = new Set<ArrayBuffer>();
+    const positions = Array.isArray(result?.positions) ? result.positions : [];
+    for (const pos of positions) {
+      const buf = pos?.topKLogits;
+      if (buf && typeof buf === 'object' && buf.buffer instanceof ArrayBuffer && !seen.has(buf.buffer)) {
+        seen.add(buf.buffer);
+        transfer.push(buf.buffer);
+      }
+    }
+    (self as any).postMessage(
+      {
+        type: SCORE_TOKENS_RESULT_TYPE,
+        id,
+        result: {
+          prefixLen: result?.prefixLen ?? prefixIds.length,
+          draftLen: result?.draftLen ?? draftIds.length,
+          topK: result?.topK ?? topK,
+          // Echo the request's draftIds so the UI can render the draft row
+          // without holding onto the original request.
+          draftIds,
+          positions,
+        },
+      },
+      transfer,
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({
+      type: SCORE_TOKENS_ERROR_TYPE,
+      id,
+      error: message,
+    });
+  }
+}
+
 // Training chapter playground hooks (chapter 13 — Training). Each drives the
 // worker-scoped `trainer` (a `TinyTrainer` NAPI instance) and replies with a
 // {type:'train*Result'|'train*Error', id, ...} message correlated by the
@@ -2687,6 +2781,9 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case EMBED_REQUEST_TYPE:
       void handleEmbed(e.data);
+      break;
+    case SCORE_TOKENS_REQUEST_TYPE:
+      void handleScoreTokens(e.data);
       break;
     case TRAIN_INIT_REQUEST_TYPE:
       handleTrainInit(e.data);

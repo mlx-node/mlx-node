@@ -273,6 +273,79 @@ export const EMBED_RESULT_TYPE = 'embedResult' as const;
 export const EMBED_ERROR_TYPE = 'embedError' as const;
 
 // -----------------------------------------------------------------------------
+// ScoreTokens worker bridge (speculative-decoding chapter — draft verify).
+// -----------------------------------------------------------------------------
+//
+// Single-pass forced-token verify: ONE forward over `[prefix + draft]` returns
+// per-position top-K logits for exactly the D draft positions. The worker
+// handler calls the NAPI method `model.scoreTokens(prefixIds, draftIds, topK)`
+// (sibling of `runForInspector`; single-shot — caches reset internally on both
+// success and error). Each position's `topKLogits` buffer is transferred for
+// zero-copy postMessage. The accept rule is computed by the CALLER:
+// `accept[i] ⇔ positions[i].argmaxTokenId === positions[i].draftTokenId`.
+
+export type ScoreTokensRequest = {
+  type: 'scoreTokens';
+  /** Caller-supplied correlation id. The worker echoes this in the response. */
+  id: string;
+  /** Committed context token ids. Must be non-empty. */
+  prefixIds: number[];
+  /** Draft token ids to verify in one forward pass. Length must be 1..8. */
+  draftIds: number[];
+  /** Requested top-K per position. Must be >= 1; the backend clamps the
+   *  effective value to `min(requested, 64, vocab)`. */
+  topK: number;
+};
+
+/** Per-draft-position verify payload. Sibling of `LogitsStep`: same top-K
+ *  contract (ids descending by logit, RAW pre-softmax f32 logits — the
+ *  consumer softmaxes — plus decoded texts), but keyed by draft position
+ *  instead of decode step. */
+export type ScorePosition = {
+  /** 0-based draft index `i`. Entry `i` verifies `draftIds[i]`. */
+  index: number;
+  /** Absolute sequence position of the logits row this entry was read from:
+   *  `prefixLen - 1 + index`. The next-token distribution at that position is
+   *  the model's prediction for `draftIds[index]`. */
+  position: number;
+  /** Echo of `draftIds[index]` — the token that was forced at this position. */
+  draftTokenId: number;
+  /** Greedy / temp-0 prediction at this position. Always equals `topKIds[0]`.
+   *  The accept rule — computed by the CALLER, not here — is
+   *  `argmaxTokenId === draftTokenId`. */
+  argmaxTokenId: number;
+  /** Top-K token ids at this position, descending by logit. */
+  topKIds: number[];
+  /** Raw logits matching `topKIds`, same order. NOT softmax probabilities. */
+  topKLogits: Float32Array;
+  /** Decoded text for each id in `topKIds`. */
+  topKTexts: string[];
+};
+
+export type ScoreTokensRun = {
+  /** Echo of the request's prefix length in tokens. */
+  prefixLen: number;
+  /** Echo of the request's draft length D (1..8). */
+  draftLen: number;
+  /** Effective top-K after backend clamping: `min(requested, 64, vocab)`. */
+  topK: number;
+  /** Echo of the request's `draftIds` so the UI can render the draft row
+   *  without holding onto the original request. */
+  draftIds: number[];
+  /** One entry per draft position, index-aligned with `draftIds`.
+   *  Length === draftLen. */
+  positions: ScorePosition[];
+};
+
+export type ScoreTokensResponse =
+  | { type: 'scoreTokensResult'; id: string; result: ScoreTokensRun }
+  | { type: 'scoreTokensError'; id: string; error: string };
+
+export const SCORE_TOKENS_REQUEST_TYPE = 'scoreTokens' as const;
+export const SCORE_TOKENS_RESULT_TYPE = 'scoreTokensResult' as const;
+export const SCORE_TOKENS_ERROR_TYPE = 'scoreTokensError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //
