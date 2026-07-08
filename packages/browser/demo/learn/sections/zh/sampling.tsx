@@ -10,6 +10,7 @@ import { ConstrainedDecodeMask } from '../../widgets/ConstrainedDecodeMask';
 import { MtpLineageDiagram } from '../../widgets/MtpLineageDiagram';
 import { MtpModuleDiagram } from '../../widgets/MtpModuleDiagram';
 import { SelfConsistencyVoting } from '../../widgets/SelfConsistencyVoting';
+import { SpecDecodeFlamechart } from '../../widgets/SpecDecodeFlamechart';
 import { SpecDecodeVariantsDiagram } from '../../widgets/SpecDecodeVariantsDiagram';
 import { SpeculativeDecodeDiagram } from '../../widgets/SpeculativeDecodeDiagram';
 import { SpeculativeVerifyLive } from '../../widgets/SpeculativeVerifyLive';
@@ -120,6 +121,23 @@ export function SamplingMtpSection() {
       <MathDisplay latex={String.raw`\mathcal{L}_{\text{MTP}} = \frac{\lambda}{D} \sum_{k=1}^{D} \mathcal{L}_{\text{MTP}}^{k}`} />
       <p>
         Qwen 把自己的 MTP 描述为<em>同时</em>提升预训练效率和推理速度。在<strong>推理</strong>时，同样的这些权重就变成了上面那个循环里白送的自我 draft 者。一个模块，两份工作：一个训练得更好的模型，外加一个更快的模型。
+      </p>
+
+      <h2>时间都花在了哪里</h2>
+      <p>
+        前面我们说过，解码步是访存受限的——芯片大多在闲着、等权重。只有亲眼<em>看到</em>这一点，speculative
+        decoding 才真正讲得通。下面就是 GPU profiler 会画出来的那幅图：同一条时钟上的两条时间线，上面是朴素解码，下面是
+        draft → verify → accept。每次前向画成 ≈20 ms 宽，因为这大致就是这个标签页自己的朴素 decode
+        实测出来的数字（M 系列 Mac 上约 50 tok/s）——而 verify 前向和朴素前向<em>一样宽</em>，因为不管哪种，都只是把权重过一遍。把
+        draft 深度调高、把文本换得更难猜，看看 trace 会发生什么：
+      </p>
+
+      <SpecDecodeFlamechart />
+
+      <p>
+        有两件事值得注意。第一，<code>D</code> 的收益是递减的：第四个 draft 只有在前三个全部存活时才算数，所以每多猜一个，价值都比上一个低。第二，可预测性卡住一切——在难猜的文本上，speculative
+        那条会塌回朴素解码外加 ≈1 ms 的草稿税，draft 得再深也没用。再看看红色小格对时间线做了什么：什么也没做。被拒的位置从不会把一次前向拉宽——浪费搭的是一趟你反正要付钱的访存。这也正是为什么这个把戏在
+        batch = 1 时划算、在打满的服务器上会被关掉：白车只有在算力那一行还空着的时候才存在。
       </p>
 
       <h2>一座 drafter 动物园</h2>

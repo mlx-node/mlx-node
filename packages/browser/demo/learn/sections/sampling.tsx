@@ -30,6 +30,7 @@ import { ConstrainedDecodeMask } from '../widgets/ConstrainedDecodeMask';
 import { MtpLineageDiagram } from '../widgets/MtpLineageDiagram';
 import { MtpModuleDiagram } from '../widgets/MtpModuleDiagram';
 import { SelfConsistencyVoting } from '../widgets/SelfConsistencyVoting';
+import { SpecDecodeFlamechart } from '../widgets/SpecDecodeFlamechart';
 import { SpecDecodeVariantsDiagram } from '../widgets/SpecDecodeVariantsDiagram';
 import { SpeculativeDecodeDiagram } from '../widgets/SpeculativeDecodeDiagram';
 import { SpeculativeVerifyLive } from '../widgets/SpeculativeVerifyLive';
@@ -167,6 +168,29 @@ export function SamplingMtpSection() {
         Qwen describes its own MTP as boosting <em>both</em> pretraining efficiency and inference speed. During{' '}
         <strong>inference</strong>, the very same weights become the free self-drafter from the loop above. One module,
         two jobs: a better-trained model, and a faster one.
+      </p>
+
+      <h2>Where the time goes</h2>
+      <p>
+        Earlier we said a decode step is memory-bound &mdash; the chip mostly idle, waiting for weights. Speculative
+        decoding only makes sense once you <em>see</em> that. Below is the story the way a GPU profiler would draw it:
+        two timelines on one clock, plain decoding on top, draft &rarr; verify &rarr; accept underneath. Each pass is
+        &asymp;20&nbsp;ms wide because that is roughly what this tab&apos;s own plain decode measures (~50 tok/s on an
+        M-series Mac) &mdash; and the verify pass is <em>just as wide</em> as a plain one, because either way it is one
+        pass over the weights. Raise the draft depth, make the text harder to guess, and watch what happens to the
+        trace:
+      </p>
+
+      <SpecDecodeFlamechart />
+
+      <p>
+        Two things to notice. First, <code>D</code> has diminishing returns: draft number four only counts if drafts
+        one through three all survived, so each extra guess is worth less than the one before it. Second,
+        predictability gates everything &mdash; on hard-to-guess text the speculative lane collapses back to plain
+        decoding plus a &asymp;1&nbsp;ms drafting tax, no matter how deep you draft. And look at what the red slots do
+        to the timeline: nothing. Rejected positions never widen a pass &mdash; the waste rides a memory sweep you were
+        paying for anyway. That is also why the trick pays at batch 1 and gets switched off on saturated servers: the
+        free ride exists only while the compute row is empty.
       </p>
 
       <h2>A zoo of drafters</h2>
