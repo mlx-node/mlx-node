@@ -908,9 +908,11 @@ pub struct LensReadoutOptions {
     #[napi(ts_type = "number[] | undefined")]
     pub pinned_ids: Option<Vec<u32>>,
     /// Apply the fitted per-layer Jacobian `J_ℓ` before the unembedding. When
-    /// `true` and no lens pack is loaded, the call errors — EXCEPT when every
-    /// requested layer is the final boundary (`ℓ==24`), which is `J=I` by
-    /// definition and needs no pack.
+    /// `true`, EVERY requested non-final layer must have a fitted `J_ℓ` in the
+    /// loaded pack; if any is missing the call errors (naming the missing
+    /// layers) rather than silently falling back to a logit lens. The final
+    /// boundary (`ℓ==24`) is `J=I` by definition and needs no pack, so a
+    /// final-boundary-only request is always allowed even with no pack loaded.
     pub use_jacobian: bool,
 }
 
@@ -963,9 +965,12 @@ pub struct LensReadoutResult {
     pub top_k: u32,
     /// Echo of the request's `useJacobian` flag.
     pub use_jacobian: bool,
-    /// `true` iff `useJacobian` was requested AND a lens pack was loaded. When
-    /// `useJacobian` is requested with no pack (final-boundary-only case),
-    /// this is `false` and the readout is the plain logit lens.
+    /// `true` iff `useJacobian` was requested AND a real per-layer `J` was
+    /// actually applied to at least one requested non-final boundary. Because a
+    /// missing Jacobian for a requested non-final layer is now a hard error,
+    /// this equals `useJacobian && (any requested layer != 24)`. When only the
+    /// final boundary is requested (`J=I@24`), this is `false` and the readout
+    /// is the plain logit lens — never a Jacobian readout mislabeled as applied.
     pub jacobian_applied: bool,
     /// The readout depths actually returned, in cell-grid order.
     pub layers: Vec<i32>,

@@ -1135,6 +1135,13 @@ export declare class QianfanOCRModel {
  * routed through `TrainingDispatch` to the model thread.
  */
 export declare class Qwen35Model {
+  /**
+   * Load a fitted J-lens pack (safetensors, tensors named `J.{layer}`) from
+   * a local file into the model thread's lens-pack slot. Returns the number
+   * of Jacobians loaded. Native offline-eval only; the browser loads packs
+   * from GPU buffers via a later task.
+   */
+  loadLensPackFromFile(path: string): Promise<number>;
   /** Reset all caches. */
   resetCaches(): void;
   /**
@@ -1210,6 +1217,26 @@ export declare class Qwen35Model {
    * fix the tokenization upstream.
    */
   embedTokens(tokenIds: Array<number>): Promise<EmbedTokensResult>;
+  /**
+   * J-lens readout: read the model's vocabulary out of the intermediate
+   * residual stream at chosen depths through the tied unembedding.
+   *
+   * Runs ONE forward over `promptIds` (fed verbatim — no chat template, no
+   * BOS, same as `scoreTokens`), captures the residual `h_ℓ` at each
+   * requested boundary (`0..=24`: `h_0` = embedding output …
+   * `h_24` = pre-final-norm), and for each (layer, position) cell returns
+   * the top-K token ids, raw f32 logits, full-vocab-normalized
+   * probabilities, and decoded texts, plus the 1-based full-vocab rank of
+   * any `pinnedIds` at every cell.
+   *
+   * `useJacobian=false` is the plain "logit lens" (no pack needed); at the
+   * final boundary it reproduces the model's own output distribution.
+   * `useJacobian=true` applies the fitted `J_ℓ` and errors if no pack is
+   * loaded — except the final boundary, which is `J=I` by definition.
+   * Single-shot: caches are fully reset before returning (hybrid GDN layers
+   * make cache rewind unsafe), exactly like `scoreTokens`.
+   */
+  lensReadout(promptIds: Array<number>, opts: LensReadoutOptions): Promise<LensReadoutResult>;
   /**
    * Tokenizer-only encode: run the loaded tokenizer over `text` and
    * return the resulting token ids. No forward pass, no cache touch.
@@ -4402,6 +4429,118 @@ export interface TextConfig {
    * These define how the head_dim is split for 3D position encoding
    */
   mropeSection: Array<number>;
+}
+
+/**
+ * Per-(layer, position) readout cell. Sibling of [`ScorePositionNapi`]: same
+ * top-K contract (ids descending by logit, raw pre-softmax f32 logits,
+ * decoded texts), extended with full-vocab-normalized probabilities.
+ */
+export interface LensCellNapi {
+  /** Residual-stream boundary this cell was read at (`0..=24`). */
+  layer: number;
+  /** 0-based prompt position (`0..prompt_len`). */
+  position: number;
+  /** Greedy argmax token id at this cell (`= top_k_ids[0]`). */
+  argmaxId: number;
+  /** Top-K token ids, descending by logit. */
+  topKIds: Array<number>;
+  /**
+   * Raw (pre-softmax) logits matching `top_k_ids`, same order. NOT
+   * probabilities — same contract as `ScorePositionNapi::top_k_logits`.
+   */
+  topKLogits: Float32Array;
+  /**
+   * Full-vocab-normalized softmax probabilities for `top_k_ids` (computed
+   * via a device `logsumexp` over the whole `[vocab]` row — an honest
+   * probability, NOT a softmax over just the top-K).
+   */
+  topKProbs: Float32Array;
+  /** Decoded text fragment for each id in `top_k_ids`. */
+  topKTexts: Array<string>;
+}
+
+/** Full-vocab rank track for a single pinned token id across every cell. */
+export interface LensPinnedNapi {
+  /** The pinned vocab id. */
+  tokenId: number;
+  /** Decoded text fragment for `token_id`. */
+  tokenText: string;
+  /**
+   * 1-based full-vocab rank of `token_id` at each cell, in the same
+   * (layer, position) order as `LensReadoutResult::cells`. Display-capped
+   * at 999. Rank = (count of tokens with strictly greater logit) + 1.
+   */
+  ranks: Int32Array;
+}
+
+/**
+ * Options for a `lensReadout` call — the "logit lens" (and, when a fitted
+ * lens pack is loaded, the "Jacobian lens"): read the model's vocabulary out
+ * of an intermediate residual `h_ℓ` at chosen depths through the tied
+ * unembedding `W_U`.
+ */
+export interface LensReadoutOptions {
+  /**
+   * Residual-stream boundaries to read, each in `0..=24` (`h_0` = embedding
+   * output … `h_24` = pre-final-norm). Default (`None`/empty): all 25.
+   * Duplicates are de-duplicated; order is preserved as first-seen.
+   */
+  layers?: number[] | undefined;
+  /**
+   * Top-K token ids to return per cell. Clamped to
+   * `min(topK, LENS_TOP_K_CAP=32, vocab)`.
+   */
+  topK: number;
+  /**
+   * Vocab ids whose full-vocab rank (1-based) is returned per cell. Clamped
+   * to at most `LENS_MAX_PINNED=8`. Each id must be `< vocab`.
+   */
+  pinnedIds?: number[] | undefined;
+  /**
+   * Apply the fitted per-layer Jacobian `J_ℓ` before the unembedding. When
+   * `true`, EVERY requested non-final layer must have a fitted `J_ℓ` in the
+   * loaded pack; if any is missing the call errors (naming the missing
+   * layers) rather than silently falling back to a logit lens. The final
+   * boundary (`ℓ==24`) is `J=I` by definition and needs no pack, so a
+   * final-boundary-only request is always allowed even with no pack loaded.
+   */
+  useJacobian: boolean;
+}
+
+/**
+ * Result of a `lensReadout` — a `layers × positions` grid of per-cell top-K
+ * readouts plus per-pinned-token rank tracks. Caches are fully reset before
+ * the call returns (single-shot, no persistent session — the hybrid GDN
+ * layers make cache rewind unsafe, so the full reset mirrors `scoreTokens`).
+ */
+export interface LensReadoutResult {
+  /** Prompt length `P` in tokens. */
+  promptLen: number;
+  /** Effective top-K after clamping: `min(requested, 32, vocab)`. */
+  topK: number;
+  /** Echo of the request's `useJacobian` flag. */
+  useJacobian: boolean;
+  /**
+   * `true` iff `useJacobian` was requested AND a real per-layer `J` was
+   * actually applied to at least one requested non-final boundary. Because a
+   * missing Jacobian for a requested non-final layer is now a hard error,
+   * this equals `useJacobian && (any requested layer != 24)`. When only the
+   * final boundary is requested (`J=I@24`), this is `false` and the readout
+   * is the plain logit lens — never a Jacobian readout mislabeled as applied.
+   */
+  jacobianApplied: boolean;
+  /** The readout depths actually returned, in cell-grid order. */
+  layers: Array<number>;
+  /** Decoded prompt tokens (the UI position axis). */
+  tokens: Array<TokenInfoNapi>;
+  /**
+   * One entry per (layer, position), layer-major then position-minor.
+   * Length == `layers.len() * prompt_len`.
+   */
+  cells: Array<LensCellNapi>;
+  /** One entry per pinned id, in request order. */
+  pinned: Array<LensPinnedNapi>;
 }
 
 /** Tokenized token entry. Matches `TokenInfo` in inspector-types.ts. */

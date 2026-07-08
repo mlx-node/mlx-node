@@ -6155,6 +6155,22 @@ impl Qwen35Inner {
         }
         let top_k = (opts.top_k.min(LENS_TOP_K_CAP) as usize).min(vocab);
 
+        // Defensive: the 25 residual boundaries assume exactly 24 decoder
+        // layers (`h_0` = embedding output … `h_24` = pre-final-norm).
+        // `forward_capture_hidden` walks `self.layers` and writes boundary
+        // `i+1` per layer; if a future checkpoint changes the layer count, the
+        // fixed `LENS_NUM_BOUNDARIES` indexing would read the wrong boundaries.
+        // Fail loudly rather than silently reading a bogus depth.
+        if self.layers.len() != LENS_NUM_BOUNDARIES - 1 {
+            return Err(Error::from_reason(format!(
+                "lens_readout: model has {} decoder layers but LENS_NUM_BOUNDARIES={} \
+                 assumes {}; boundary indexing is invalid for this model",
+                self.layers.len(),
+                LENS_NUM_BOUNDARIES,
+                LENS_NUM_BOUNDARIES - 1
+            )));
+        }
+
         // Resolve the requested boundaries (default = all 25), validated to
         // `0..=24`, de-duplicated preserving first-seen order.
         let max_boundary = (LENS_NUM_BOUNDARIES - 1) as i32; // 24
@@ -6204,18 +6220,44 @@ impl Qwen35Inner {
         };
 
         let use_jacobian = opts.use_jacobian;
-        // A pack is "loaded" iff any boundary carries a Jacobian.
-        let pack_loaded = self.lens_pack.iter().any(|slot| slot.is_some());
-        if use_jacobian && !pack_loaded {
-            // Final boundary (ℓ==24) is J=I by definition and is always
-            // allowed; any other requested boundary needs a real pack.
-            if layers.iter().any(|&l| l != max_boundary as usize) {
-                return Err(Error::from_reason(
-                    "Jacobian lens requested but no lens pack is loaded",
-                ));
+        // Requested non-final boundaries. The final boundary (ℓ==24) is `J=I`
+        // by definition and NEVER consults the pack, so it is excluded here.
+        let non_final_requested: Vec<usize> = layers
+            .iter()
+            .copied()
+            .filter(|&l| l != max_boundary as usize)
+            .collect();
+        if use_jacobian {
+            // Honesty contract: when `useJacobian` is requested, EVERY requested
+            // non-final layer must carry a real Jacobian. A partial pack that is
+            // missing a requested layer must NOT silently fall back to identity
+            // (a plain logit lens) while the result claims `jacobianApplied=true`
+            // — that would mislabel a logit-lens readout as a Jacobian one.
+            // (When only the final boundary is requested, `non_final_requested`
+            // is empty and a fully-empty pack is still allowed — `J=I@24`.)
+            let missing: Vec<usize> = non_final_requested
+                .iter()
+                .copied()
+                .filter(|&l| self.lens_pack.get(l).and_then(|s| s.as_ref()).is_none())
+                .collect();
+            if !missing.is_empty() {
+                let names = missing
+                    .iter()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::from_reason(format!(
+                    "lens_readout: useJacobian=true but no Jacobian is loaded for requested \
+                     layer(s) [{}]; load a lens pack covering these layers (the final boundary \
+                     {} is identity by definition and needs none)",
+                    names, max_boundary
+                )));
             }
         }
-        let jacobian_applied = use_jacobian && pack_loaded;
+        // `jacobianApplied` is true iff a real per-layer `J` is actually applied
+        // to at least one requested non-final boundary. With the validation
+        // above, that is exactly: `useJacobian` AND ≥1 requested layer != 24.
+        let jacobian_applied = use_jacobian && !non_final_requested.is_empty();
 
         let tokenizer = self
             .tokenizer
@@ -6268,9 +6310,16 @@ impl Qwen35Inner {
 
                 // Apply J_ℓ per position if a pack Jacobian exists for this
                 // boundary; otherwise identity (plain logit lens). `x = h · Jᵀ`
-                // realizes the per-position `J·h`. Final boundary / missing J
-                // ⇒ identity (design-freeze D6).
-                let x = match (use_jacobian, self.lens_pack.get(l).and_then(|s| s.as_ref())) {
+                // realizes the per-position `J·h`. The final boundary (ℓ==24) is
+                // `J=I` by definition and is ALWAYS identity — never apply a
+                // `J.24` even if one were somehow present in the pack
+                // (design-freeze D6). Non-final requested layers are guaranteed
+                // to carry a real `J` by the up-front validation above.
+                let is_final = l == max_boundary as usize;
+                let x = match (
+                    use_jacobian && !is_final,
+                    self.lens_pack.get(l).and_then(|s| s.as_ref()),
+                ) {
                     (true, Some(j)) => {
                         let j_t = j.transpose(Some(&[1, 0]))?;
                         h_l.matmul(&j_t)?
@@ -6414,8 +6463,14 @@ impl Qwen35Inner {
 
     /// Load a fitted J-lens pack from a local safetensors file into the
     /// model-thread `lens_pack` slot. Tensors named `J.{layer}` (layer in
-    /// `0..=24`, each `[hidden, hidden]`) are cast to the model's `h` dtype
-    /// (bf16) and stashed on device. Returns how many Jacobians were loaded.
+    /// `0..=23`, each a square `[hidden, hidden]` matrix) are cast to the
+    /// model's `h` dtype (bf16) and stashed on device. Returns how many
+    /// Jacobians were loaded.
+    ///
+    /// Rejects: non-integer / out-of-range layer suffixes, a `J.24` (the final
+    /// boundary is identity by definition and must not be carried), duplicate
+    /// entries for a layer, and any tensor whose rank/shape is not
+    /// `[hidden_size, hidden_size]`.
     ///
     /// Native offline-eval only (`full`): a later browser task loads packs
     /// from GPU buffers instead. Uses the existing safetensors read path.
@@ -6427,6 +6482,27 @@ impl Qwen35Inner {
         let tensors = file.load_tensors(&path)?;
 
         let max_boundary = LENS_NUM_BOUNDARIES - 1; // 24
+
+        // Defensive: pack boundaries assume exactly 24 decoder layers (see the
+        // same check in `lens_readout_sync`). A pack fitted for a different
+        // layer count must not silently load into the wrong slots.
+        if self.layers.len() != LENS_NUM_BOUNDARIES - 1 {
+            return Err(Error::from_reason(format!(
+                "load_lens_pack: model has {} decoder layers but LENS_NUM_BOUNDARIES={} \
+                 assumes {}; pack boundary indexing is invalid for this model",
+                self.layers.len(),
+                LENS_NUM_BOUNDARIES,
+                LENS_NUM_BOUNDARIES - 1
+            )));
+        }
+        if self.config.hidden_size <= 0 {
+            return Err(Error::from_reason(format!(
+                "load_lens_pack: invalid hidden_size {} in model config",
+                self.config.hidden_size
+            )));
+        }
+        let hidden = self.config.hidden_size as i64;
+
         let mut pack: Vec<Option<MxArray>> = (0..LENS_NUM_BOUNDARIES).map(|_| None).collect();
         let mut loaded = 0u32;
         for (name, arr) in tensors {
@@ -6443,6 +6519,41 @@ impl Qwen35Inner {
                 return Err(Error::from_reason(format!(
                     "load_lens_pack: tensor '{}' layer {} out of range (0..={})",
                     name, layer, max_boundary
+                )));
+            }
+            // The final boundary is `J=I` by definition — a pack must NOT carry
+            // a `J.24`. Reject it explicitly so a mislabeled/over-complete pack
+            // fails loudly instead of shipping a tensor the readout ignores.
+            if layer == max_boundary {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' targets the final boundary {} which is identity \
+                     by definition; a pack must not carry a J.{}",
+                    name, max_boundary, max_boundary
+                )));
+            }
+            // Reject duplicate entries for the same layer.
+            if pack[layer].is_some() {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: duplicate tensor for layer {} ('{}')",
+                    layer, name
+                )));
+            }
+            // Validate shape: a per-layer Jacobian must be a square
+            // `[hidden, hidden]` matrix (`x = h · Jᵀ`). Shape/rank are metadata,
+            // available without evaluating the lazy array.
+            let ndim = arr.ndim()?;
+            if ndim != 2 {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' must be rank-2 [hidden, hidden], got rank {}",
+                    name, ndim
+                )));
+            }
+            let d0 = arr.shape_at(0)?;
+            let d1 = arr.shape_at(1)?;
+            if d0 != hidden || d1 != hidden {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' must be [{}, {}] (hidden_size²), got [{}, {}]",
+                    name, hidden, hidden, d0, d1
                 )));
             }
             let arr_bf16 = arr.astype(crate::array::DType::BFloat16)?;
