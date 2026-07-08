@@ -54,3 +54,9 @@ export function useModelLoader(): ModelLoaderContextValue {
   if (!ctx) throw new Error('useModelLoader must be used within <ModelLoaderProvider>');
   return ctx;
 }
+
+// Non-throwing variant for widgets that render under SSG prerender
+// (no provider mounted) — returns null instead of throwing.
+export function useModelLoaderOptional(): ModelLoaderContextValue | null {
+  return React.useContext(ModelLoaderContext);
+}

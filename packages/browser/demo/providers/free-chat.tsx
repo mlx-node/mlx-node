@@ -41,3 +41,9 @@ export function useFreeChat(): FreeChatContextValue {
   if (!ctx) throw new Error('useFreeChat must be used within <FreeChatProvider>');
   return ctx;
 }
+
+/** Non-throwing variant for widgets that render under SSG prerender
+ *  (no provider mounted) — returns null instead of throwing. */
+export function useFreeChatOptional(): FreeChatContextValue | null {
+  return React.useContext(FreeChatContext);
+}
