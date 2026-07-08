@@ -9,14 +9,14 @@ import { calibrate } from '../../packages/cli/src/commands/calibrate.js';
 
 /**
  * Whole-branch codex [medium] regression: the CLI must NOT pre-truncate a row
- * to a tight `calibSeq * CHARS_PER_TOKEN * 2` char proxy before handing it to
- * the native `calibrateActivationAmaxRaw`. The native side is the ONE
- * authoritative truncation boundary — it tokenizes each row
- * (add_special_tokens=false) and truncates to EXACTLY `calibSeq` TOKENS. A
- * tight char proxy under-feeds char-dense rows (long URLs / base64 / byte-level
- * tokenizer edge cases exceed ~2 chars/token), calibrating on a SHORTER prefix
- * than modelopt's token window and biasing `input_amax` low while still
- * reporting success.
+ * with ANY fixed UTF-16-char cap before handing it to the native
+ * `calibrateActivationAmaxRaw`. Every char cap is tokenizer-blind — e.g.
+ * `' '.repeat(70000)` encodes to ~548 tokens under the local Qwen tokenizer
+ * (runs of spaces merge to ~128 chars/token), so even a generous 16×
+ * chars/token guard would slice it to a SHORTER prefix than modelopt's token
+ * window and bias `input_amax` low while still reporting success. The native
+ * side is the SOLE authoritative boundary — it tokenizes each row
+ * (add_special_tokens=false) and truncates to EXACTLY `calibSeq` TOKENS.
  *
  * We `vi.mock('@mlx-node/core')` and delegate EVERY export to the real binding
  * via `vi.importActual` (so the presence-gated e2e block below keeps using the
@@ -189,9 +189,9 @@ describe.skipIf(!canRun)('mlx calibrate (0.8B nvidia)', () => {
 /**
  * Weightless unit coverage for the char-slice fix (codex [medium]): drives the
  * CLI `calibrate()` with a spied native `calibrateActivationAmaxRaw` and asserts
- * the CLI hands native the FULL char-dense row — NOT the old tight
- * `calibSeq * CHARS_PER_TOKEN * 2` char slice. Native token-truncation is the
- * only truncation boundary. Runs without any model weights.
+ * the CLI hands native the FULL row text UNSLICED regardless of length — NO
+ * fixed UTF-16-char cap of any kind. Native token-truncation is the sole
+ * boundary. Runs without any model weights.
  */
 describe('mlx calibrate — native token-truncation is the only boundary (codex [medium])', () => {
   let scratch: string;
@@ -205,19 +205,18 @@ describe('mlx calibrate — native token-truncation is the only boundary (codex 
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   });
 
-  it('hands the FULL char-dense row to native (no tight *2 char slice)', async () => {
+  it('hands the FULL row to native unsliced regardless of length (no fixed char cap)', async () => {
     const calibSeq = 128;
-    // A char-dense row LONGER than the old tight proxy (calibSeq*4*2 = 1024
-    // chars) but SHORTER than the coarse memory guard (calibSeq*4*16 = 8192),
-    // so the CLI must pass it through UNTRUNCATED. The 4000 single-code-unit
-    // string stands in for a long URL / base64 blob whose real chars/token
-    // exceeds 2 — exactly the input the old `*2` proxy under-fed to native.
-    const OLD_TIGHT_BOUND = calibSeq * 4 * 2; // 1024 — pre-fix slice length
-    const MEMORY_GUARD = calibSeq * 4 * 16; // 8192 — post-fix memory ceiling
-    const rowLen = 4000;
-    expect(rowLen, 'row must exceed the old tight *2 proxy').toBeGreaterThan(OLD_TIGHT_BOUND);
-    expect(rowLen, 'row must fit under the coarse memory guard').toBeLessThan(MEMORY_GUARD);
-    const rowText = 'a'.repeat(rowLen);
+    // Concrete tokenizer-blind failure: `' '.repeat(70000)` encodes to ~548
+    // tokens under the local Qwen tokenizer (runs of spaces merge to ~128
+    // chars/token), so it carries WELL over `calibSeq` tokens and native must
+    // see all 70000 chars to truncate at the right token boundary. The removed
+    // f217371f "16× memory guard" (calibSeq*4*16 = 8192) would slice this to
+    // 8192 chars = only ~256 tokens, recreating the original under-feed bug.
+    const OLD_16X_GUARD = calibSeq * 4 * 16; // 8192 — removed pre-fix slice length
+    const rowLen = 70000;
+    expect(rowLen, 'row must exceed the removed 16× guard').toBeGreaterThan(OLD_16X_GUARD);
+    const rowText = ' '.repeat(rowLen);
 
     const datasetPath = join(scratch, 'calib.jsonl');
     writeFileSync(datasetPath, `${JSON.stringify({ text: rowText })}\n`, 'utf-8');
@@ -244,9 +243,9 @@ describe('mlx calibrate — native token-truncation is the only boundary (codex 
     expect(capturedTexts, 'native was invoked').not.toBeNull();
     const texts = capturedTexts as unknown as string[];
     expect(texts.length, 'exactly one row').toBe(1);
-    // The crux: native received the FULL row, not the old 1024-char slice.
-    // Against pre-fix code (`t.slice(0, calibSeq * 4 * 2)`) this is 1024 vs
-    // 4000 → RED. Native (not the CLI) is the sole token-truncation boundary.
+    // The crux: native received the FULL row, not any fixed-char slice. Against
+    // pre-fix code (`t.slice(0, calibSeq * 4 * 16)`) this is 8192 vs 70000 →
+    // RED. Native (not the CLI) is the sole token-truncation boundary.
     expect(texts[0].length, 'full row length reaches native').toBe(rowLen);
     expect(texts[0], 'row content is untruncated').toBe(rowText);
   });

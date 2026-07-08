@@ -27,13 +27,6 @@ export interface CalibrateResult {
 }
 
 /**
- * Rough tokens→chars scale factor for the COARSE per-row memory guard below.
- * NOT a token-count boundary — the native calibration does the exact token
- * truncation; this only sizes a memory ceiling far above any realistic need.
- */
-const CHARS_PER_TOKEN = 4;
-
-/**
  * Read the first `count` `{"text": ...}` rows from a JSONL calibration file.
  * Blank lines and rows without a string `text` field are skipped.
  */
@@ -86,23 +79,19 @@ export async function calibrate(opts: CalibrateOptions): Promise<CalibrateResult
   if (rows.length === 0) {
     throw new Error(`No {"text": ...} rows found in dataset ${opts.dataset}`);
   }
-  // The native `calibrateActivationAmaxRaw` is the ONE authoritative truncation
-  // boundary: it tokenizes each row (add_special_tokens=false) and truncates to
-  // EXACTLY `calibSeq` tokens. So pass rows through untruncated in token terms.
-  // `maxChars` is ONLY a coarse memory ceiling guarding against a pathological
-  // multi-MB row bloating the NAPI payload — deliberately 16× the nominal
-  // chars/token budget, i.e. far above the char length of any realistic
-  // `calibSeq`-token row for any tokenizer, so it can NEVER cut a row below
-  // `calibSeq` tokens. It is a memory bound, NOT a token-count guarantee.
-  const maxChars = calibSeq * CHARS_PER_TOKEN * 16;
-  const texts = rows.map((t) => t.slice(0, maxChars));
-
+  // Hand the FULL row text to native untouched. `calibrateActivationAmaxRaw` is
+  // the SOLE, tokenizer-correct calibration boundary: it tokenizes each row
+  // (add_special_tokens=false) and truncates to EXACTLY `calibSeq` tokens. Any
+  // JS-side char cap is tokenizer-blind — space runs and byte-level merges pack
+  // far more than a fixed chars/token estimate, so a fixed cap could slice a row
+  // BELOW `calibSeq` tokens and bias `input_amax` low — so we do NOT pre-truncate.
+  //
   // One native call: load + arm + raw-prefill-only over every row + drain +
   // atomic config write, returning the number of projections calibrated.
-  const projectionsCalibrated = await calibrateActivationAmaxRaw(modelPath, texts, calibSeq);
+  const projectionsCalibrated = await calibrateActivationAmaxRaw(modelPath, rows, calibSeq);
   // Native runs as a single blocking pass (no per-row callback), so report
   // completion once.
-  opts.onProgress?.(texts.length, texts.length);
+  opts.onProgress?.(rows.length, rows.length);
   return { projectionsCalibrated, configPath: join(modelPath, 'config.json') };
 }
 
