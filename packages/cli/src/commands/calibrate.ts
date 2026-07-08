@@ -2,8 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { startActivationCalibration, finishActivationCalibration } from '@mlx-node/core';
-import { loadSession } from '@mlx-node/lm';
+import { calibrateActivationAmaxRaw } from '@mlx-node/core';
 
 /** Options for {@link calibrate}. */
 export interface CalibrateOptions {
@@ -57,66 +56,44 @@ function readCalibTexts(datasetPath: string, count: number): string[] {
 
 /**
  * Drive NVIDIA modelopt-style static FP8 activation-amax calibration over a
- * model.
+ * model, using RAW-text PREFILL (no chat template, no generated token).
  *
- * Arms the process-global activation collector, prefills the model over each
- * calibration prompt through a normal chat session (one token is enough — the
- * prefill trips every mxfp8 attention/GDN projection's tap once), then drains
- * the per-tensor `max|activation|` into the model `config.json`. The session is
- * `reset()` between rows so each row is a fresh turn-0 prefill (the native KV
- * cache is wiped, avoiding unbounded context growth across rows).
+ * Thin wrapper over the native {@link calibrateActivationAmaxRaw}: read the
+ * first `calibSize` `{"text": ...}` rows, then hand them to native code, which
+ * loads the model + tokenizer, arms the process-global activation collector,
+ * and for each row tokenizes the RAW text (no `<|im_start|>`/`<|im_end|>`
+ * control tokens), truncates to `calibSeq` tokens, and runs a PREFILL-ONLY
+ * forward so every mxfp8 attention/GDN projection's tap fires once over
+ * realistic raw-text activations (modelopt `MaxCalibrator` is defined over
+ * raw-text prefill, NOT chat-templated prompts + a decode step). Caches are
+ * reset between rows.
  *
- * Edits `<input>/config.json` in place, writing `input_amax` onto the attn/GDN
- * quantization entries under BOTH the `quantization` and `quantization_config`
- * aliases.
+ * On success it ATOMICALLY writes `input_amax` into `<input>/config.json`
+ * (temp file + rename) under BOTH the `quantization` and `quantization_config`
+ * aliases. On ANY error before the final write, `config.json` is left
+ * UNTOUCHED — a failed calibration never mutates the live model in place.
  */
 export async function calibrate(opts: CalibrateOptions): Promise<CalibrateResult> {
   const modelPath = resolve(opts.input);
   const calibSize = opts.calibSize ?? 1024;
   const calibSeq = opts.calibSeq ?? 512;
-  const maxChars = calibSeq * CHARS_PER_TOKEN;
+  // Char bound only to keep the NAPI payload small: native does the EXACT
+  // per-row token truncation to `calibSeq`. A 2× chars/token margin guarantees
+  // at least `calibSeq` tokens survive the slice for the native truncation.
+  const maxChars = calibSeq * CHARS_PER_TOKEN * 2;
 
-  const texts = readCalibTexts(resolve(opts.dataset), calibSize);
-  if (texts.length === 0) {
+  const rows = readCalibTexts(resolve(opts.dataset), calibSize);
+  if (rows.length === 0) {
     throw new Error(`No {"text": ...} rows found in dataset ${opts.dataset}`);
   }
+  const texts = rows.map((t) => t.slice(0, maxChars));
 
-  const session = await loadSession(modelPath);
-
-  startActivationCalibration();
-  try {
-    for (let i = 0; i < texts.length; i++) {
-      // Bound the prefill length: truncate the raw text to ~calibSeq tokens via
-      // a chars-per-token proxy. Exact token truncation is unnecessary — amax is
-      // a running max over activations and is robust to the precise length.
-      const prompt = texts[i].slice(0, maxChars);
-      // A single-token prefill trips every projection's tap during the prompt
-      // forward; we don't need the generated token, just the forward pass.
-      for await (const event of session.sendStream(prompt, {
-        config: { maxNewTokens: 1, temperature: 0 },
-      })) {
-        if (event.done) break;
-      }
-      // Wipe the native KV cache + turn counter so the next row is a fresh
-      // turn-0 prefill (otherwise the reused cache would accumulate context
-      // across all rows and blow past the model's max length).
-      await session.reset();
-      opts.onProgress?.(i + 1, texts.length);
-    }
-  } catch (err) {
-    // Best-effort drain so a failed calibration doesn't leave the process-global
-    // collector armed. This also flushes whatever partial amax was collected;
-    // the caller treats the throw as a hard failure (CLI exits nonzero), so the
-    // partially-written config is surfaced as an error, not silently trusted.
-    try {
-      finishActivationCalibration(modelPath);
-    } catch {
-      // ignore — the original error is the one that matters
-    }
-    throw err;
-  }
-
-  const projectionsCalibrated = finishActivationCalibration(modelPath);
+  // One native call: load + arm + raw-prefill-only over every row + drain +
+  // atomic config write, returning the number of projections calibrated.
+  const projectionsCalibrated = await calibrateActivationAmaxRaw(modelPath, texts, calibSeq);
+  // Native runs as a single blocking pass (no per-row callback), so report
+  // completion once.
+  opts.onProgress?.(texts.length, texts.length);
   return { projectionsCalibrated, configPath: join(modelPath, 'config.json') };
 }
 
@@ -138,13 +115,15 @@ Optional Arguments:
   --help, -h            Show this help message
 
 What it does:
-  Runs the model over the NVIDIA calibration mix with the activation collector
-  armed, recording each attention/GDN mxfp8 projection's per-tensor
-  max|activation| (modelopt MaxCalibrator semantics). The collected input_amax
-  is written into the model's config.json IN PLACE (both the "quantization" and
+  Runs the model over the NVIDIA calibration mix as RAW-text PREFILL (no chat
+  template, no generated token) with the activation collector armed, recording
+  each attention/GDN mxfp8 projection's per-tensor max|activation| (modelopt
+  MaxCalibrator semantics). The collected input_amax is written ATOMICALLY into
+  the model's config.json IN PLACE (both the "quantization" and
   "quantization_config" blocks) so a later inference run fake-quantizes those
   activations to E4M3 for W8A8 numeric parity with NVIDIA modelopt. Only the
   mxfp8 attn/GDN sites are calibrated; the mxfp4 FFN keeps bf16 activations.
+  A failed run leaves config.json untouched.
 
 Example:
   mlx calibrate -i ./qwen3.6-27b-nvidia-mxfp4-mlx \\
@@ -203,6 +182,7 @@ export async function run(argv: string[]) {
   console.log(`Calib size: ${calibSize} rows`);
   console.log(`Calib seq:  ~${calibSeq} tokens/row`);
   console.log('');
+  console.log('Running raw-text prefill calibration (this may take a while)...');
 
   const startTime = Date.now();
   let lastLogged = 0;

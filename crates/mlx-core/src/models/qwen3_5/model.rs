@@ -335,6 +335,20 @@ pub(crate) enum Qwen35Cmd {
         config: Qwen3_5GenerationConfig,
         reply: ResponseTx<Qwen3_5GenerationResult>,
     },
+    /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
+    /// `MaxCalibrator`). For each raw text: tokenize WITHOUT the chat template,
+    /// truncate to `calib_seq` tokens, then run PREFILL ONLY (no generation, no
+    /// generated token) so every mxfp8 attn/GDN projection's activation tap
+    /// fires once, resetting caches between rows. Runs on the model thread where
+    /// the tokenizer lives. The process-global `ActivationAmaxCollector` is
+    /// armed/disarmed and drained+persisted by the NAPI caller — this command
+    /// never touches `config.json`. Replies with the number of rows actually
+    /// prefilled (rows that were empty after tokenize+truncate are skipped).
+    CalibratePrefillRaw {
+        texts: Vec<String>,
+        calib_seq: u32,
+        reply: ResponseTx<u32>,
+    },
     SaveModel {
         save_path: String,
         reply: ResponseTx<()>,
@@ -461,6 +475,13 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
             reply,
         } => {
             let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+        }
+        Qwen35Cmd::CalibratePrefillRaw {
+            texts,
+            calib_seq,
+            reply,
+        } => {
+            let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
         }
         Qwen35Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
@@ -5263,6 +5284,66 @@ impl Qwen35Inner {
             num_tokens: generated_tokens.len() as u32,
             finish_reason: finish_reason.to_string(),
         })
+    }
+
+    /// Static FP8 activation-amax calibration prefill (runs on the model
+    /// thread). Inherent body of [`Qwen35Cmd::CalibratePrefillRaw`].
+    ///
+    /// For each raw text: tokenize WITHOUT the chat template (`encode_sync` with
+    /// `add_special_tokens = false`, so no `<|im_start|>`/`<|im_end|>` control
+    /// tokens and no BOS), truncate to `calib_seq` tokens, then run PREFILL ONLY
+    /// (no generation) so every mxfp8 attention/GDN projection's activation tap
+    /// fires exactly once over realistic raw-text activations — the NVIDIA
+    /// modelopt `MaxCalibrator` is defined over raw-text prefill, NOT
+    /// chat-templated prompts plus a decode step. Caches are re-initialized per
+    /// row so each is an independent turn-0 position-0 prefill.
+    ///
+    /// The process-global [`ActivationAmaxCollector`] (armed/disarmed and
+    /// drained+persisted by the NAPI caller) records each projection's running
+    /// `max|activation|` during the forward; this method never touches
+    /// `config.json`. Returns the number of rows actually prefilled (rows that
+    /// tokenized to nothing after truncation are skipped).
+    pub(crate) fn calibrate_prefill_raw_sync(
+        &mut self,
+        texts: Vec<String>,
+        calib_seq: u32,
+    ) -> Result<u32> {
+        let tokenizer = self.tokenizer.clone().ok_or_else(|| {
+            Error::from_reason("calibration prefill requires a tokenizer, but none is loaded")
+        })?;
+        let cap = calib_seq.max(1) as usize;
+        let mut rows_prefilled: u32 = 0;
+
+        for text in &texts {
+            // RAW tokenize — no chat template, no special/control tokens. This
+            // is the crux of the modelopt-parity fix: repeated chat control
+            // tokens must not dominate a tensor's activation amax.
+            let mut tokens = tokenizer.encode_sync(text, Some(false))?;
+            tokens.truncate(cap);
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
+            // and a stale cache would append rows into one growing context).
+            self.init_caches_sync()?;
+            let generation_stream = Stream::new(DeviceType::Gpu);
+            // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
+            // token: a decode step would fold a synthetic argmax token's
+            // activations into the amax.
+            let logits = self.prefill(&tokens, generation_stream)?;
+            // Force the row's forward to complete (the taps already `.item()`
+            // each projection input, but eval bounds the lazy graph and makes
+            // per-row memory reclamation deterministic).
+            logits.eval();
+            self.reset_caches_sync()?;
+            rows_prefilled += 1;
+
+            // Bound resident scratch across many rows (large models × 1024 rows).
+            crate::array::synchronize_and_clear_cache();
+        }
+
+        Ok(rows_prefilled)
     }
 
     // ========== Training methods (run on model thread) ==========

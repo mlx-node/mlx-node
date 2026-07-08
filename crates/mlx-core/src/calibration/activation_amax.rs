@@ -156,8 +156,39 @@ pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -
 
     let out = serde_json::to_string_pretty(&config)
         .map_err(|e| Error::from_reason(format!("serialize config: {e}")))?;
-    std::fs::write(config_path, out)
-        .map_err(|e| Error::from_reason(format!("write {}: {e}", config_path.display())))?;
+
+    // Atomic write: serialize into a sibling temp file, then `rename` over
+    // `config.json`. A `rename(2)` within one directory is atomic, so a crash
+    // (or a failed serialize/write) can never leave a half-written config — a
+    // reader sees either the old file or the fully-written new one, never a
+    // truncated JSON. The temp file lives in the SAME directory as the target
+    // so the rename stays within one filesystem (cross-device rename fails).
+    let dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = config_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config.json");
+    // Unique per (process, nanos) so concurrent writers can't clobber each
+    // other's temp file before their own rename.
+    let tmp_path = dir.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp_path, out)
+        .map_err(|e| Error::from_reason(format!("write {}: {e}", tmp_path.display())))?;
+    std::fs::rename(&tmp_path, config_path).map_err(|e| {
+        // Best-effort cleanup so a failed rename doesn't strand the temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+        Error::from_reason(format!(
+            "rename {} -> {}: {e}",
+            tmp_path.display(),
+            config_path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -483,6 +514,65 @@ mod tests {
         assert_eq!(after["model_type"], "qwen3_5");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `write_amax_into_config` writes ATOMICALLY: it replaces `config.json`
+    /// via a temp-file + `rename`, so on success the target holds the complete
+    /// calibrated JSON and NO temp file is left behind in the directory (a crash
+    /// mid-write could only ever leave the old file or the full new one, never a
+    /// truncated config).
+    #[test]
+    fn write_amax_into_config_is_atomic_leaves_no_temp_file() {
+        // A dedicated dir so we can scan it for stray temp files afterwards.
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_atomic_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let initial = serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8",
+                "layers.0.self_attn.q_proj": {"bits": 8, "mode": "mxfp8"}
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 7.5f32);
+
+        write_amax_into_config(&path, &amax).unwrap();
+
+        // The target is the fully-written new config (in place, valid JSON).
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["quantization"]["layers.0.self_attn.q_proj"]["input_amax"]
+                .as_f64()
+                .unwrap() as f32,
+            7.5
+        );
+        assert_eq!(after["model_type"], "qwen3_5");
+
+        // No sibling temp file was left behind — exactly one file (config.json).
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["config.json".to_string()],
+            "atomic write must leave only config.json, found: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `is_activation_fp8_site` matches ONLY the 6 nvidia-recipe attn/GDN

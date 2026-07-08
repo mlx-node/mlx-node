@@ -12,6 +12,11 @@ import { calibrate } from '../../packages/cli/src/commands/calibrate.js';
  * over a small subset of the NVIDIA calibration mix and assert the collected
  * per-tensor FP8 activation `input_amax` lands in the model `config.json`.
  *
+ * Exercises the native RAW-text PREFILL path (`calibrateActivationAmaxRaw` via
+ * `calibrate()`): no chat template, no generated token — each row is tokenized
+ * raw and prefilled once with the collector armed, then the amax is written
+ * atomically into config.json.
+ *
  * The calibration tap fires on the mxfp8 attention/GDN projections only, so the
  * post-calibration config must gain `input_amax` on:
  *   - every `*.self_attn.{q,k,v,o}_proj`
