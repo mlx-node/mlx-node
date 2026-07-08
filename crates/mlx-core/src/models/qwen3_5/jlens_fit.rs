@@ -57,7 +57,7 @@ use crate::array::{DType, MxArray, heavy_cleanup};
 use crate::autograd;
 use crate::models::qwen3_5::Qwen3_5Config;
 use crate::utils::functional;
-use crate::utils::safetensors::{SafeTensorsFile, save_safetensors};
+use crate::utils::safetensors::save_safetensors;
 
 /// Default output basis dims computed per backward pass (design D4).
 const DEFAULT_DIM_BATCH: usize = 8;
@@ -393,7 +393,11 @@ fn corpus_fingerprint(prompt_ids: &[Vec<u32>], max_seq_len: usize) -> u64 {
 /// the file does not exist. Validates `skip_first` / `hidden` AND the corpus
 /// fingerprint (`max_seq_len` / `prompt_count` / `corpus_hash`) against the run,
 /// so a mismatched resume errors BEFORE any fit work rather than corrupting the
-/// running mean.
+/// running mean. The checkpoint is opened with the LAZY safetensors loader, so
+/// only the small `meta.*` scalars read below are materialized during
+/// validation — a mismatched corpus rejects before any `Jsum.*` byte
+/// (~96 MB total) is read from disk; `Jsum.*` is materialized only in the
+/// per-layer loop, reached only on a matching corpus.
 fn load_checkpoint(
     path: &str,
     num_layers: usize,
@@ -404,8 +408,9 @@ fn load_checkpoint(
     if !std::path::Path::new(path).exists() {
         return Ok(None);
     }
-    let file = SafeTensorsFile::load(path)?;
-    let tensors = file.load_tensors(path)?;
+    // Lazy handles: reading the small meta.* scalars below materializes only those,
+    // so a corpus/maxSeqLen mismatch rejects BEFORE any Jsum.* is read from disk.
+    let tensors = crate::utils::safetensors::load_safetensors_lazy(path)?;
 
     let read_meta = |key: &str| -> Result<i64> {
         let t = tensors
