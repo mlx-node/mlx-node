@@ -8,6 +8,7 @@ pub mod array;
 pub mod autograd;
 pub mod benchmarks;
 pub mod cache_limit;
+pub mod calibration;
 pub mod convert;
 pub mod convert_gemma_import;
 pub mod dataset;

@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, has_sym8_mode, merge_per_layer, parse_mode_str,
-    parse_quant_block, resolve_default_mode,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, merge_per_layer, normalize_per_layer_key,
+    parse_mode_str, parse_quant_block, resolve_default_mode,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -967,7 +967,12 @@ fn apply_weights_inner(
         // per-layer quant record onto the built projection. Only calibrated
         // mxfp8 attention/GDN overrides carry a `Some` amax in config; every
         // other layer stays `None`, so forward behaviour is unchanged here.
-        Ok(built.map(|ql| ql.with_input_amax(plq.input_amax)))
+        // Also thread the normalized config key so the activation-amax
+        // calibration tap can bucket recorded `max|activation|` by projection.
+        Ok(built.map(|ql| {
+            ql.with_input_amax(plq.input_amax)
+                .with_amax_key(Some(normalize_per_layer_key(prefix)))
+        }))
     };
 
     // Embedding

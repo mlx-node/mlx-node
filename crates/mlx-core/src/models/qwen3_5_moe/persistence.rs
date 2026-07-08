@@ -16,7 +16,8 @@ use crate::engine::persistence::{
 use crate::models::mtp_drafter::{DrafterBodyVariant, MTP_MOE_LAYER_LINEAR_SUFFIXES};
 use crate::models::quant_dispatch::{
     default_per_layer_quant, effective_plq_for, ensure_dense_weight_floating,
-    ensure_int8_storage_resolves_sym8, has_sym8_mode, parse_quant_block, resolve_default_mode,
+    ensure_int8_storage_resolves_sym8, has_sym8_mode, normalize_per_layer_key, parse_quant_block,
+    resolve_default_mode,
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, load_vision_weights,
@@ -540,7 +541,12 @@ fn apply_weights_moe_inner(
         // qwen3_5 loader. Only calibrated mxfp8 attention/GDN overrides carry a
         // `Some` amax in config (nvidia recipe activation-fp8 sites); every
         // other layer stays `None`, so forward behaviour is unchanged here.
-        Ok(built.map(|ql| ql.with_input_amax(plq.input_amax)))
+        // Also thread the normalized config key so the activation-amax
+        // calibration tap can bucket recorded `max|activation|` by projection.
+        Ok(built.map(|ql| {
+            ql.with_input_amax(plq.input_amax)
+                .with_amax_key(Some(normalize_per_layer_key(prefix)))
+        }))
     };
 
     let try_build_qsl = |params: &HashMap<String, MxArray>,

@@ -428,6 +428,15 @@ pub struct QuantizedLinear {
     // fake-quant activations to E4M3 for W8A8 numeric parity — forward does NOT
     // yet read it, so behaviour is unchanged while `None`.
     input_amax: Option<f32>,
+    // The projection's normalized per-layer config key
+    // (`normalize_per_layer_key(prefix)`), threaded at load so the
+    // activation-amax calibration tap can bucket recorded `max|activation|` by
+    // projection. `Some` on every projection built by the two `try_build_ql`
+    // loaders (dense + MoE); `None` on test-fabricated / non-loader instances.
+    // Read ONLY by the calibration tap in `forward` (gated by
+    // `mode == MXFP8_MODE` + collector-enabled), so it never affects normal
+    // inference.
+    amax_key: Option<String>,
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -472,6 +481,7 @@ impl QuantizedLinear {
             w_i8: None,
             s_w: None,
             input_amax: None,
+            amax_key: None,
         }
     }
 
@@ -489,6 +499,17 @@ impl QuantizedLinear {
     /// The calibrated per-tensor FP8 activation scale, if any.
     pub fn input_amax(&self) -> Option<f32> {
         self.input_amax
+    }
+
+    /// Attach the projection's normalized config key for the calibration tap.
+    ///
+    /// Consuming builder used at the load-time dispatch site (next to
+    /// [`with_input_amax`](Self::with_input_amax)) so the activation-amax
+    /// collector can bucket recorded `max|activation|` by projection. `None` is
+    /// the default (no calibration bucket — test-fabricated instances).
+    pub fn with_amax_key(mut self, amax_key: Option<String>) -> Self {
+        self.amax_key = amax_key;
+        self
     }
 
     /// Construct a sym8 linear from pre-validated operands (see
@@ -511,6 +532,7 @@ impl QuantizedLinear {
             w_i8: Some(w_kn),
             s_w: Some(s_w),
             input_amax: None,
+            amax_key: None,
         }
     }
 
@@ -571,6 +593,22 @@ impl QuantizedLinear {
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        // Activation-amax calibration tap (modelopt MaxCalibrator): when the
+        // process-global collector is armed, record this projection's raw bf16
+        // activation `max|x|` BEFORE any fake-quant. Gated to mxfp8 sites (the
+        // recipe's activation-fp8 attn/GDN projections) via the same mode check
+        // the fake-quant gate below uses. During calibration `input_amax` is
+        // `None`, so that gate is skipped and the recorded value is the clean
+        // bf16 input — exactly as modelopt calibrates before quantizing. When
+        // the collector is disabled this is a single atomic load then skip, so
+        // forward is behaviorally unchanged for normal inference.
+        if self.mode == MXFP8_MODE
+            && crate::calibration::activation_amax::ActivationAmaxCollector::is_enabled()
+            && let Some(key) = &self.amax_key
+        {
+            crate::calibration::activation_amax::ActivationAmaxCollector::record(key, x)?;
+        }
+
         // Calibrated per-tensor FP8 (E4M3) activation fake-quant, matching
         // NVIDIA modelopt's static W8A8 attention/GDN math. The gate requires
         // BOTH a positive `input_amax` AND `self.mode == MXFP8_MODE`: in the
@@ -1142,5 +1180,79 @@ mod fp8_activation_tests {
             &base,
             "non-mxfp8 projection with erroneous input_amax must NOT fake-quant",
         );
+    }
+
+    /// The calibration tap records the raw `max|x|` for an mxfp8 projection when
+    /// the process-global collector is armed, bucketed by `amax_key`. A
+    /// NON-mxfp8 projection records nothing (mode gate), and a disabled
+    /// collector records nothing (enable gate). Proves Task 5's forward tap.
+    #[test]
+    fn forward_tap_records_max_abs_for_mxfp8() {
+        use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+
+        // Serialize against every other test that toggles the process-global
+        // collector (this file's tap test + the calibration module tests).
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disable();
+        let _ = ActivationAmaxCollector::take();
+
+        let (n, k) = (32i64, 64i64); // k % MXFP8_GROUP_SIZE == 0
+        let mut state = 0x7A9_0055u64;
+
+        let wv: Vec<f32> = (0..n * k).map(|_| next_f32(&mut state)).collect();
+        let w_bf16 = MxArray::from_float32(&wv, &[n, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let (w_q, scales) = quantize_mxfp8(&w_bf16);
+
+        let m = 4i64;
+        let xv: Vec<f32> = (0..m * k).map(|_| next_f32(&mut state)).collect();
+        let x = MxArray::from_float32(&xv, &[m, k])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        // Expected max|x| computed from the bf16-rounded values (read back via
+        // to_f32), independent of the tap's abs->max->item path.
+        let expected = to_f32(&x).iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+        // --- mxfp8 + armed collector => records max|x| under amax_key ---
+        let key = "layers.0.self_attn.q_proj";
+        let lin = make_mxfp8_linear(&w_q, &scales).with_amax_key(Some(key.to_string()));
+        ActivationAmaxCollector::enable();
+        let _ = lin.forward(&x).unwrap();
+        ActivationAmaxCollector::disable();
+        let recorded = ActivationAmaxCollector::take();
+        let got = recorded
+            .get(key)
+            .copied()
+            .expect("mxfp8 tap must record under its amax_key");
+        assert!(
+            (got - expected).abs() <= 1e-4,
+            "tapped max|x| {got} vs expected {expected}"
+        );
+        assert_eq!(recorded.len(), 1, "only the tapped key; got {recorded:?}");
+
+        // --- NON-mxfp8 (mxfp4) armed => records nothing (mode gate) ---
+        // --- mxfp8 but collector disabled => records nothing (enable gate) ---
+        let _ = ActivationAmaxCollector::take();
+        let (w_q4, scales4) = quantize_mxfp4(&w_bf16);
+        let lin4 = make_mxfp4_linear(&w_q4, &scales4)
+            .with_amax_key(Some("layers.0.mlp.gate_proj".to_string()));
+        ActivationAmaxCollector::enable();
+        let _ = lin4.forward(&x).unwrap(); // mxfp4 while armed -> skip (mode gate)
+        ActivationAmaxCollector::disable();
+        let lin8 = make_mxfp8_linear(&w_q, &scales)
+            .with_amax_key(Some("layers.0.self_attn.v_proj".to_string()));
+        let _ = lin8.forward(&x).unwrap(); // mxfp8 while disabled -> skip (enable gate)
+        let empty = ActivationAmaxCollector::take();
+        assert!(
+            empty.is_empty(),
+            "non-mxfp8 (mode gate) and disabled-collector (enable gate) must record nothing; got {empty:?}"
+        );
+
+        ActivationAmaxCollector::disable();
     }
 }
