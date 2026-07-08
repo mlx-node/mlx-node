@@ -340,10 +340,12 @@ pub(crate) enum Qwen35Cmd {
     /// truncate to `calib_seq` tokens, then run PREFILL ONLY (no generation, no
     /// generated token) so every mxfp8 attn/GDN projection's activation tap
     /// fires once, resetting caches between rows. Runs on the model thread where
-    /// the tokenizer lives. The process-global `ActivationAmaxCollector` is
-    /// armed/disarmed and drained+persisted by the NAPI caller — this command
-    /// never touches `config.json`. Replies with the number of rows actually
-    /// prefilled (rows that were empty after tokenize+truncate are skipped).
+    /// the tokenizer lives. The command body SELF-ARMS this model thread's
+    /// thread-local `ActivationAmaxCollector` flag (via `CalibrationArmGuard`)
+    /// for the prefill's duration; the NAPI caller drains+persists the collected
+    /// amax afterwards — this command never touches `config.json`. Replies with
+    /// the number of rows actually prefilled (rows that were empty after
+    /// tokenize+truncate are skipped).
     CalibratePrefillRaw {
         texts: Vec<String>,
         calib_seq: u32,
@@ -5298,9 +5300,11 @@ impl Qwen35Inner {
     /// chat-templated prompts plus a decode step. Caches are re-initialized per
     /// row so each is an independent turn-0 position-0 prefill.
     ///
-    /// The process-global [`ActivationAmaxCollector`] (armed/disarmed and
-    /// drained+persisted by the NAPI caller) records each projection's running
-    /// `max|activation|` during the forward; this method never touches
+    /// This method SELF-ARMS the model thread's thread-local
+    /// [`ActivationAmaxCollector`] flag for the prefill's duration (RAII
+    /// `CalibrationArmGuard`, disarmed on every exit path), so the tap records
+    /// each projection's running `max|activation|` during the forward. The NAPI
+    /// caller drains+persists afterwards; this method never touches
     /// `config.json`. Returns the number of rows actually prefilled (rows that
     /// tokenized to nothing after truncation are skipped).
     pub(crate) fn calibrate_prefill_raw_sync(
@@ -5313,6 +5317,15 @@ impl Qwen35Inner {
         })?;
         let cap = calib_seq.max(1) as usize;
         let mut rows_prefilled: u32 = 0;
+
+        // Arm THIS (model) thread's calibration flag for the whole prefill loop.
+        // The tap in `QuantizedLinear::forward` runs synchronously on this same
+        // thread, so it observes the armed flag and records raw `max|x|`; any
+        // other loaded model on its own thread stays unaffected. The RAII guard
+        // disarms on EVERY exit path — normal return, a `?` error, or a panic —
+        // so a later inference command on this thread never sees a stray armed
+        // flag. The NAPI caller drains + persists the collected amax afterwards.
+        let _calib_guard = crate::calibration::activation_amax::CalibrationArmGuard::arm();
 
         for text in &texts {
             // RAW tokenize — no chat template, no special/control tokens. This

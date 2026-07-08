@@ -1,14 +1,16 @@
 //! NAPI surface for driving activation-amax calibration from the TypeScript
 //! `mlx calibrate` CLI.
 //!
-//! The collector ([`ActivationAmaxCollector`]) is a PROCESS-GLOBAL tripped by
-//! the Rust model forward (the mxfp8 attention/GDN tap in
-//! `QuantizedLinear::forward`), so the TS driver never touches per-layer state.
+//! The collector ([`ActivationAmaxCollector`]) has a THREAD-LOCAL arm flag,
+//! self-armed by the model thread's `CalibratePrefillRaw` command (the mxfp8
+//! attention/GDN tap in `QuantizedLinear::forward` runs on that same thread), so
+//! the TS driver never touches per-layer state and a concurrently-loaded model
+//! on a different thread cannot contaminate the run.
 //!
 //! The sole export is [`calibrate_activation_amax_raw`]: an all-in-native
-//! one-shot that loads the model + tokenizer, arms the tap, runs RAW-text
-//! PREFILL over each calibration row (no chat template, no generated token),
-//! then disarms and — only on full success — atomically persists the drained
+//! one-shot that loads the model + tokenizer, runs RAW-text PREFILL over each
+//! calibration row (no chat template, no generated token) with the model thread
+//! self-armed, then — only on full success — atomically persists the drained
 //! amax.
 
 use std::path::Path;
@@ -21,11 +23,13 @@ use super::activation_amax::{ActivationAmaxCollector, write_amax_into_config};
 /// Process-wide calibration mutual-exclusion guard.
 ///
 /// [`calibrate_activation_amax_raw`] holds this (via `try_lock`) for its ENTIRE
-/// clear→enable→prefill→disable→take→write critical section. The
-/// [`ActivationAmaxCollector`] it drives is a SINGLE process-global map + armed
-/// flag; a second concurrent calibration (or a normal inference forward while
-/// the tap is armed) would interleave `enable`/`record`/`take` and contaminate
-/// the persisted amax.
+/// clear→prefill→take→write critical section. The [`ActivationAmaxCollector`]'s
+/// arm flag is now thread-local (the model thread self-arms), so a concurrent
+/// inference model on its own thread can no longer contaminate the run — but the
+/// running-max MAP is still a SINGLE process-global, so two concurrent
+/// calibrations would interleave `record`/`take` on the shared map. This guard
+/// keeps calibration RUNS serialized so exactly one model thread is armed and
+/// draining the map at a time.
 ///
 /// A tokio mutex (not `std::sync`): its guard is `Send`, so it can be held
 /// across the load + prefill `.await` points in an async fn without making the
@@ -59,23 +63,24 @@ fn read_model_type(model_path: &str) -> Result<String> {
         })
 }
 
-/// Arm the tap, await the model-thread raw-text prefill, disarm, and — ONLY on
-/// full success — drain + ATOMICALLY persist the amax into
-/// `<model_path>/config.json`. On ANY error the partial amax is discarded and
-/// `config.json` is left UNTOUCHED. Shared by the dense and MoE dispatch arms so
-/// the enable→disable→persist contract lives in exactly one place.
+/// Await the model-thread raw-text prefill and — ONLY on full success — drain +
+/// ATOMICALLY persist the amax into `<model_path>/config.json`. On ANY error the
+/// partial amax is discarded and `config.json` is left UNTOUCHED. Shared by the
+/// dense and MoE dispatch arms so the prefill→persist contract lives in exactly
+/// one place.
 ///
-/// The caller MUST hold [`calib_guard`] and MUST have loaded the model already
-/// (the tap is armed here, AFTER load, so no load-time warmup eval is recorded).
-/// `prefill` runs the loaded model's `CalibratePrefillRaw` command.
-async fn arm_prefill_persist<F, Fut>(model_path: &str, prefill: F) -> Result<u32>
+/// The model thread SELF-ARMS its thread-local calibration flag for the prefill
+/// (RAII `CalibrationArmGuard` in `calibrate_prefill_raw_sync`), so this
+/// one-shot no longer toggles any process-global arm flag — it only drains +
+/// persists the collected amax after the command returns. The caller MUST hold
+/// [`calib_guard`] and MUST have loaded the model already. `prefill` runs the
+/// loaded model's `CalibratePrefillRaw` command.
+async fn prefill_and_persist<F, Fut>(model_path: &str, prefill: F) -> Result<u32>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<u32>>,
 {
-    ActivationAmaxCollector::enable();
     let prefill_result = prefill().await;
-    ActivationAmaxCollector::disable();
 
     match prefill_result {
         Ok(_rows_prefilled) => {
@@ -102,21 +107,23 @@ where
 /// clear error). Both loaders are the SAME ones the inference session uses
 /// ([`persistence::load_with_thread`]) — the model is only usable on its
 /// dedicated model thread. Then:
-///   1. arms the process-global [`ActivationAmaxCollector`] (AFTER load, so no
-///      load-time eval is recorded);
-///   2. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
-///      model thread tokenizes each `text` WITHOUT the chat template, truncates
+///   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
+///      model thread SELF-ARMS that thread's thread-local
+///      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
+///      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
 ///      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
 ///      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
-///      activations, resetting caches between rows;
-///   3. disarms the collector, then — ONLY if the full loop succeeded — drains
-///      the per-tensor amax and ATOMICALLY writes it into
-///      `<model_path>/config.json` (temp file + `rename`).
+///      activations, resetting caches between rows, then disarms on exit;
+///   2. ONLY if the full loop succeeded — drains the per-tensor amax and
+///      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
+///      `rename`).
 ///
-/// CONCURRENCY: the whole clear→enable→prefill→disable→take→write section is
-/// serialized by [`calib_guard`] (a process-wide `try_lock`); a second
-/// concurrent calibration fails fast with "another calibration is in progress"
-/// rather than contaminating the shared collector. The collector is CLEARED at
+/// CONCURRENCY: the whole clear→prefill→take→write section is serialized by
+/// [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
+/// fails fast with "another calibration is in progress". The arm flag is
+/// thread-local (so a concurrent inference model can't contaminate the run), but
+/// the running-max MAP is process-global, so serializing RUNS keeps two
+/// calibrations from interleaving `record`/`take` on it. The map is CLEARED at
 /// the very start so stale amax from a prior PANICKED run cannot leak into this
 /// write.
 ///
@@ -134,24 +141,25 @@ pub async fn calibrate_activation_amax_raw(
     use crate::models::qwen3_5::model::Qwen35Cmd;
     use crate::models::qwen3_5_moe::model::Qwen35MoeCmd;
 
-    // Serialize the WHOLE clear→enable→prefill→disable→take→write section
-    // against any other calibration run: the collector is process-global, so an
-    // interleaved run would contaminate the persisted amax. `try_lock` so a
-    // second caller fails fast instead of blocking on the model load + prefill.
+    // Serialize the WHOLE clear→prefill→take→write section against any other
+    // calibration run: the running-max map is process-global, so two interleaved
+    // runs would contaminate the persisted amax. `try_lock` so a second caller
+    // fails fast instead of blocking on the model load + prefill.
     let _calib_lock = calib_guard().try_lock().map_err(|_| {
         Error::from_reason(
-            "another calibration is in progress (the activation-amax collector is process-global \
-             and cannot be shared)",
+            "another calibration is in progress (the activation-amax running-max map is \
+             process-global and cannot be shared)",
         )
     })?;
 
-    // Pick the loader/command by model_type BEFORE arming the tap or loading.
+    // Pick the loader/command by model_type BEFORE loading. The tap is armed by
+    // the model thread itself inside CalibratePrefillRaw, not here.
     let model_type = read_model_type(&model_path)?;
 
     // Clear any residue from a prior PANICKED run (normal runs already drain on
-    // both success and error paths, but a panic between enable and take would
-    // strand amax in the shared map). This is the very START of the guarded
-    // section, so no stale amax can leak into this write.
+    // both success and error paths, but a panic mid-prefill — before the caller
+    // drains — would strand amax in the shared map). This is the very START of
+    // the guarded section, so no stale amax can leak into this write.
     let _ = ActivationAmaxCollector::take();
 
     match model_type.as_str() {
@@ -159,7 +167,7 @@ pub async fn calibrate_activation_amax_raw(
         // dedicated model thread via a command.
         "qwen3_5" => {
             let model = crate::models::qwen3_5::persistence::load_with_thread(&model_path).await?;
-            arm_prefill_persist(&model_path, || async {
+            prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35Cmd::CalibratePrefillRaw {
                         texts,
@@ -176,7 +184,7 @@ pub async fn calibrate_activation_amax_raw(
         "qwen3_5_moe" => {
             let model =
                 crate::models::qwen3_5_moe::persistence::load_with_thread(&model_path).await?;
-            arm_prefill_persist(&model_path, || async {
+            prefill_and_persist(&model_path, || async {
                 crate::model_thread::send_and_await(&model.thread, |reply| {
                     Qwen35MoeCmd::CalibratePrefillRaw {
                         texts,

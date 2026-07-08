@@ -1,69 +1,88 @@
-//! Process-global static activation-amax collector — the mlx-node port of
+//! Thread-scoped static activation-amax collector — the mlx-node port of
 //! NVIDIA modelopt's `MaxCalibrator`.
 //!
 //! Calibration is a whole-model pass: one forward sweep over the calib dataset
-//! with the collector enabled, during which every activation-fp8 (mxfp8
+//! with the calibrating thread ARMED, during which every activation-fp8 (mxfp8
 //! attention/GDN) projection taps its raw bf16 input and folds `max|x|` into a
 //! per-projection running maximum. The drained result ([`ActivationAmaxCollector::take`])
 //! is the per-tensor `input_amax` that [`write_amax_into_config`] persists into
 //! the model `config.json`, so a calibrated forward can fake-quant activations
 //! to E4M3 for W8A8 numeric parity.
 //!
-//! The state is a pair of module statics (an `AtomicBool` enable flag + a
-//! `Mutex<HashMap>` running-max map) rather than an owned instance: the forward
-//! tap in `QuantizedLinear::forward` has no handle to thread a collector
-//! through, so it reaches the global directly — exactly like the compiled-forward
-//! process globals in `qwen3_5/model.rs`.
+//! State layout: the "am I calibrating" flag is a **thread-local** cell, while
+//! the running-max map is a process-global `Mutex<HashMap>`. Scoping the arm
+//! flag to the thread (not the process) is deliberate — the model runs on its
+//! own dedicated OS thread (`model_thread`), so arming the calibrating model's
+//! thread lets ITS `QuantizedLinear::forward` record, while a DIFFERENT loaded
+//! model running normal inference on its own thread stays a no-op (`record`
+//! early-returns unless the calling thread is armed) and cannot contaminate the
+//! calibration. The map stays global because the NAPI driver drains it from the
+//! tokio thread after the model-thread command returns; calibration RUNS are
+//! serialized by `calib_guard` (see `napi.rs`), so only one thread is ever
+//! armed at a time and the two never race to write/drain the shared map.
+//!
+//! The forward tap in `QuantizedLinear::forward` has no handle to thread a
+//! collector through, so it reaches this module directly — exactly like the
+//! compiled-forward process globals in `qwen3_5/model.rs`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::array::MxArray;
 use napi::bindgen_prelude::*;
 
-/// Whether the forward tap should record activation maxima this pass.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Whether THIS thread is the calibrating model thread (armed by the
+    /// model-thread `CalibratePrefillRaw` command via [`CalibrationArmGuard`]).
+    /// Thread-local so a concurrently-running inference model on a different
+    /// thread never records into the calibration map.
+    static CALIBRATING: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Per-projection running `max|activation|`, keyed by the normalized per-layer
-/// config key (`normalize_per_layer_key(prefix)`).
+/// config key (`normalize_per_layer_key(prefix)`). Process-global (drained by
+/// the NAPI driver off-thread); written only by the single armed thread.
 static AMAX: LazyLock<Mutex<HashMap<String, f32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Process-global activation-amax collector (modelopt `MaxCalibrator`
+/// Thread-scoped activation-amax collector (modelopt `MaxCalibrator`
 /// semantics: static per-tensor `amax = max over all calib samples of
 /// max(|activation|)`).
 ///
-/// All methods are associated (no instance): the running-max map and enable
-/// flag are module statics owned by a single whole-model calibration pass, and
-/// the forward tap reaches them without a handle.
-pub struct ActivationAmaxCollector;
+/// All methods are associated (no instance): the arm flag is a thread-local
+/// cell and the running-max map is a module static, so the forward tap reaches
+/// them without a handle.
+pub(crate) struct ActivationAmaxCollector;
 
 impl ActivationAmaxCollector {
-    /// Arm the forward tap so mxfp8 projections start recording `max|x|`.
-    pub fn enable() {
-        ENABLED.store(true, Ordering::SeqCst);
+    /// Arm the CURRENT thread so its mxfp8 projections start recording `max|x|`.
+    /// Scoped to this thread only — a forward on any other thread stays a no-op.
+    pub(crate) fn arm_current_thread() {
+        CALIBRATING.with(|c| c.set(true));
     }
 
-    /// Disarm the forward tap. Once disabled, forward is behaviorally unchanged
-    /// for normal inference (the tap is a single atomic load then skip).
-    pub fn disable() {
-        ENABLED.store(false, Ordering::SeqCst);
+    /// Disarm the CURRENT thread. Once disarmed, forward is behaviorally
+    /// unchanged for normal inference (the tap is a single thread-local load
+    /// then skip).
+    pub(crate) fn disarm_current_thread() {
+        CALIBRATING.with(|c| c.set(false));
     }
 
-    /// Whether the tap is armed.
-    pub fn is_enabled() -> bool {
-        ENABLED.load(Ordering::SeqCst)
+    /// Whether the CURRENT thread is armed for calibration.
+    pub(crate) fn is_calibrating() -> bool {
+        CALIBRATING.with(Cell::get)
     }
 
-    /// Fold `max|x|` for `key` into the running maximum. No-op when disabled.
+    /// Fold `max|x|` for `key` into the running maximum. No-op unless the
+    /// CALLING thread is armed ([`Self::arm_current_thread`]).
     ///
     /// `max|x|` is the scalar reduction `x.abs().max()` (all axes), read as f32
     /// — the same `abs -> max -> item` sequence the KV-scale calibrator uses
     /// (`crates/mlx-paged-attn/src/metal/kv_scale.rs:187`). The merge keeps the
     /// running maximum per key (inserts when absent).
-    pub fn record(key: &str, x: &MxArray) -> Result<()> {
-        if !Self::is_enabled() {
+    pub(crate) fn record(key: &str, x: &MxArray) -> Result<()> {
+        if !Self::is_calibrating() {
             return Ok(());
         }
         let new_val = x.abs()?.max(None, None)?.item_at_float32(0)?;
@@ -77,11 +96,36 @@ impl ActivationAmaxCollector {
     }
 
     /// Drain and return the accumulated per-key amax (leaves the map empty).
-    pub fn take() -> HashMap<String, f32> {
+    pub(crate) fn take() -> HashMap<String, f32> {
         let mut map = AMAX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *map)
+    }
+}
+
+/// RAII arm guard for the model-thread calibration prefill.
+///
+/// Arms the current thread's calibration flag on construction and disarms it on
+/// `Drop`, so EVERY exit path out of the prefill loop — normal return, a `?`
+/// error, or a panic unwinding through the guard — disarms the thread. This
+/// scopes "calibrating" to exactly the prefill region on the model thread; a
+/// later inference command on the same thread sees a disarmed flag.
+pub(crate) struct CalibrationArmGuard {
+    _private: (),
+}
+
+impl CalibrationArmGuard {
+    /// Arm the current thread for the lifetime of the returned guard.
+    pub(crate) fn arm() -> Self {
+        ActivationAmaxCollector::arm_current_thread();
+        Self { _private: () }
+    }
+}
+
+impl Drop for CalibrationArmGuard {
+    fn drop(&mut self) {
+        ActivationAmaxCollector::disarm_current_thread();
     }
 }
 
@@ -98,7 +142,7 @@ impl ActivationAmaxCollector {
 /// it and a later persist would fake-quant it, violating "activation-FP8 applies
 /// only to attn/GDN sites". `in_proj_ba` (a/b, affine 8/64) is not mxfp8 and is
 /// deliberately absent.
-pub fn is_activation_fp8_site(normalized_key: &str) -> bool {
+pub(crate) fn is_activation_fp8_site(normalized_key: &str) -> bool {
     const SITES: [&str; 6] = [
         ".self_attn.q_proj",
         ".self_attn.k_proj",
@@ -137,7 +181,10 @@ pub fn is_activation_fp8_site(normalized_key: &str) -> bool {
 /// would leave the mirror stale and internally inconsistent, so we apply the
 /// per-entry amax to EVERY present object-valued alias. If neither alias exists
 /// the function is a no-op; a single alias is fine (updates just that one).
-pub fn write_amax_into_config(config_path: &Path, amax: &HashMap<String, f32>) -> Result<()> {
+pub(crate) fn write_amax_into_config(
+    config_path: &Path,
+    amax: &HashMap<String, f32>,
+) -> Result<()> {
     let data = std::fs::read_to_string(config_path)
         .map_err(|e| Error::from_reason(format!("read {}: {e}", config_path.display())))?;
     let mut config: serde_json::Value = serde_json::from_str(&data)
@@ -234,11 +281,14 @@ fn apply_amax_to_block(
     }
 }
 
-/// Serializes tests that toggle the process-global collector so parallel
-/// `cargo test` workers don't race the shared enable flag / running-max map.
-/// Both this module's tests and the forward-tap test in `quantized_linear.rs`
-/// hold this for their enable -> act -> take -> disable window. Poison is
-/// recovered (a panicking test must not spuriously fail the rest).
+/// Serializes tests that record into the process-global running-max map so
+/// parallel `cargo test` workers don't drain each other's entries. The arm flag
+/// is now thread-local (each test thread arms only itself), but the MAP is still
+/// shared, so a `record` on one test thread would land in the map a concurrent
+/// test's `take` drains. Both this module's tests and the forward-tap tests in
+/// `quantized_linear.rs` hold this for their arm -> record -> take -> disarm
+/// window. Poison is recovered (a panicking test must not spuriously fail the
+/// rest).
 #[cfg(test)]
 pub(crate) static CALIB_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -247,18 +297,18 @@ mod tests {
     use super::*;
 
     /// The collector folds `max|x|` per key across records, isolates keys, and
-    /// is a no-op once disabled; `take()` drains the map.
+    /// is a no-op once the thread is disarmed; `take()` drains the map.
     #[test]
     fn collector_running_max_over_records() {
         let _g = CALIB_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Start from a clean slate (any residue from a prior serialized test).
-        ActivationAmaxCollector::disable();
+        ActivationAmaxCollector::disarm_current_thread();
         let _ = ActivationAmaxCollector::take();
 
-        ActivationAmaxCollector::enable();
-        assert!(ActivationAmaxCollector::is_enabled());
+        ActivationAmaxCollector::arm_current_thread();
+        assert!(ActivationAmaxCollector::is_calibrating());
 
         let a1 = MxArray::from_float32(&[-3.0, 1.0], &[2]).unwrap();
         let a2 = MxArray::from_float32(&[2.0, -0.5], &[2]).unwrap();
@@ -267,9 +317,9 @@ mod tests {
         ActivationAmaxCollector::record("a", &a2).unwrap();
         ActivationAmaxCollector::record("b", &b).unwrap();
 
-        // Disabled => record is a no-op (must NOT bump "a" to 100).
-        ActivationAmaxCollector::disable();
-        assert!(!ActivationAmaxCollector::is_enabled());
+        // Disarmed => record is a no-op (must NOT bump "a" to 100).
+        ActivationAmaxCollector::disarm_current_thread();
+        assert!(!ActivationAmaxCollector::is_calibrating());
         let ignored = MxArray::from_float32(&[100.0], &[1]).unwrap();
         ActivationAmaxCollector::record("a", &ignored).unwrap();
 
@@ -284,7 +334,48 @@ mod tests {
         // take() drained the map.
         assert!(ActivationAmaxCollector::take().is_empty());
 
-        ActivationAmaxCollector::disable();
+        ActivationAmaxCollector::disarm_current_thread();
+    }
+
+    /// `record` is a no-op unless the CALLING thread is armed: without arming,
+    /// `record` then `take` is empty; after `arm_current_thread` the record is
+    /// captured; `disarm_current_thread` restores the no-op. (Same-thread —
+    /// arming is thread-local, and this whole test runs on one thread.)
+    #[test]
+    fn record_is_noop_unless_thread_armed() {
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+
+        let x = MxArray::from_float32(&[-4.0, 1.0, 2.0], &[3]).unwrap();
+
+        // Not armed => record is a no-op.
+        assert!(!ActivationAmaxCollector::is_calibrating());
+        ActivationAmaxCollector::record("k", &x).unwrap();
+        assert!(
+            ActivationAmaxCollector::take().is_empty(),
+            "record before arming must capture nothing"
+        );
+
+        // Armed => record is captured.
+        ActivationAmaxCollector::arm_current_thread();
+        ActivationAmaxCollector::record("k", &x).unwrap();
+        let m = ActivationAmaxCollector::take();
+        assert_eq!(
+            m.get("k").copied(),
+            Some(4.0),
+            "armed record captures max|x|"
+        );
+
+        // Disarmed again => back to no-op.
+        ActivationAmaxCollector::disarm_current_thread();
+        ActivationAmaxCollector::record("k", &x).unwrap();
+        assert!(
+            ActivationAmaxCollector::take().is_empty(),
+            "record after disarming must capture nothing"
+        );
     }
 
     /// `write_amax_into_config` sets `input_amax` on matching quantization
