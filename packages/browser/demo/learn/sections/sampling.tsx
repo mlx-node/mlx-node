@@ -186,9 +186,10 @@ export function SamplingMtpSection() {
       <p>
         Two things to notice. First, <code>D</code> has diminishing returns: draft number four only counts if drafts
         one through three all survived, so each extra guess is worth less than the one before it. Second,
-        predictability gates everything &mdash; on hard-to-guess text the speculative lane collapses back to plain
-        decoding plus a &asymp;1&nbsp;ms drafting tax, no matter how deep you draft. And look at what the red slots do
-        to the timeline: nothing. Rejected positions never widen a pass &mdash; the waste rides a memory sweep you were
+        predictability gates everything &mdash; on hard-to-guess text the speculative lane sinks to scraps, barely
+        ahead of plain decoding once the drafting tax is paid, and drafting deeper only grows the tax (watch{' '}
+        <code>D&nbsp;=&nbsp;2</code> on surprising text fall behind <code>D&nbsp;=&nbsp;1</code>). And look at what
+        the red slots do to the timeline: nothing. Rejected positions never widen a pass &mdash; the waste rides a memory sweep you were
         paying for anyway. That is also why the trick pays at batch 1 and gets switched off on saturated servers: the
         free ride exists only while the compute row is empty.
       </p>

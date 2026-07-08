@@ -26,8 +26,10 @@ import { useLocale } from '../../lib/i18n-react';
  *     M-series Mac — the number the chat HUD shows. NOT an exact constant;
  *     labelled "≈" and "synthetic axis" in the UI.
  *   - ~1.6 GB: the course's Qwen3.5-0.8B bf16 weight footprint.
- *   - ≈1 ms draft: the MTP head is ≈ 1 transformer layer of 24 → ~0.8 ms of a
- *     20 ms pass. Illustrative — labelled as such.
+ *   - ≈1 ms PER DRAFT TOKEN: the MTP head is ≈ 1 transformer layer of 24 →
+ *     ~0.8 ms of a 20 ms pass, and the head runs once per draft token (each
+ *     guess feeds the next — see "The loop" in the chapter), so a depth-D
+ *     cycle pays a D × 1 ms drafting tax. Illustrative — labelled as such.
  *   - D = 1 default: Qwen3.5's real MTP depth; higher D is engine-raised.
  *   - 1.06–1.46×: the ONLY measured speculative speedup in this project
  *     (native Metal engine, depth D = 1). The ACCEPTS tables below are
@@ -39,9 +41,10 @@ import { useLocale } from '../../lib/i18n-react';
  * already busy and servers switch speculation off. The illustrative caption,
  * footnote, and batch note below the chart are never gated on state.
  *
- * Reduced motion: the frame is pinned to the tally, Play/Step are removed from
- * the DOM, and all CSS transitions are nulled. The D/scenario toggles — the
- * core interaction — still fully work.
+ * Reduced motion: the frame is pinned to the tally (including when the
+ * preference flips on mid-animation), Play/Step are removed from the DOM, and
+ * all CSS transitions are nulled. The D/scenario toggles — the core
+ * interaction — still fully work.
  */
 
 type ScenarioId = 'predictable' | 'typical' | 'surprising';
@@ -52,8 +55,17 @@ type ScenarioId = 'predictable' | 'typical' | 'surprising';
 // INVARIANTS (checkable mechanically):
 //   - every K ≤ its D (no accepting more than was drafted)
 //   - every pass emits K + 1 ≥ 1 tokens (K+1 rule; no pass emits 0)
-//   - totals: plain lane always 6 tokens / 120 ms; spec lane per cell = sum(K)+6 tokens / 126 ms
+//   - totals: plain lane always 6 tokens / 120 ms; spec lane per cell =
+//     sum(K)+6 tokens / (120 + 6·D) ms — the head drafts one token at a time,
+//     so every cycle pays a D × 1 ms drafting tax
+//   - VERIFIED speedup matrix, ×(20 · tokens / (120 + 6·D)) to 2 dp:
+//                    D=1     D=2     D=3     D=4
+//     predictable   ×1.75   ×2.27   ×2.61   ×2.78
+//     typical       ×1.43   ×1.67   ×1.74   ×1.81
+//     surprising    ×1.27   ×1.21   ×1.30   ×1.25
 //   - DEFAULT cell (typical, D=1) must compute to ×1.43 — inside the measured 1.06–1.46× range
+//   - surprising is NON-monotonic in D (×1.27 → ×1.21 at D=2): on hard text a
+//     deeper draft grows the tax faster than acceptance — deliberate, teachable
 const ACCEPTS: Record<ScenarioId, [number[], number[], number[], number[]]> = {
   predictable: [
     [1, 1, 0, 1, 1, 1],
@@ -82,11 +94,16 @@ const PASS_MS = 20; // ≈20 ms per forward pass — from this tab's measured ~5
 //                     (M-series Mac, the number the chat HUD shows). NOT an exact constant —
 //                     labelled "≈" in the UI. Cross-check: 1.6 GB / 20 ms = 80 GB/s effective
 //                     bandwidth, physically sane for M-series WebGPU.
-const DRAFT_MS = 1; // MTP head ≈ 1 transformer layer of 24 → ~0.8 ms of a 20 ms pass. Illustrative — labelled as such.
+const DRAFT_MS = 1; // per DRAFT TOKEN — the MTP head runs once per guess (each feeds the next),
+//                     so a depth-D cycle pays D × 1 ms. The head ≈ 1 transformer layer of 24 →
+//                     ~0.8 ms of a 20 ms pass. Illustrative — labelled as such.
+const D_MAX = 4; // deepest engine-raised setting the toggle offers
 const N_PASSES = 6; // fixed pass count per lane; keeps geometry stable across D/scenario
-const SPEC_STEP_MS = DRAFT_MS + PASS_MS; // 21
 const PLAIN_TOTAL_MS = N_PASSES * PASS_MS; // 120 → 6 tokens ⇒ 50 tok/s, matching the anchor
-const SPEC_TOTAL_MS = N_PASSES * SPEC_STEP_MS; // 126
+// The spec lane's clock depends on D: step = 20 + D·1 ms, total = 120 + 6·D ms
+// (126/132/138/144). Computed IN the component so the trace geometry, the axis
+// and the readout all derive from the one specTotalMs — never duplicated.
+const MAX_SPEC_TOTAL_MS = N_PASSES * (PASS_MS + D_MAX * DRAFT_MS); // 144 — the fixed axis extent
 const EMERALD = '#10b981'; // emerald-500 — accepted
 const RED = '#ef4444'; // red-500 — rejected
 const FRAME_MS = 1500;
@@ -104,10 +121,12 @@ const COPY = {
     dNote: "D = 1 is Qwen3.5's own MTP depth; higher D is an engine-raised, illustrative setting.",
     scenarioLabel: 'how predictable is the text?',
     scenarioNames: { predictable: 'predictable', typical: 'typical', surprising: 'surprising' },
-    scenarioAria: (name: string, pct: number) => `${name} text — about ${pct}% of draft positions survive (scripted)`,
-    scenarioHint: (pct: number) => `scripted odds: ~${pct}% of draft positions survive verify`,
+    scenarioAria: (name: string, pct: number) =>
+      `${name} text — per-position draft survival odds around ${pct}% (scripted)`,
+    scenarioHint: (acc: number, total: number, pct: number) =>
+      `scripted outcome here: ${acc}/${total} draft positions survive verify — per-position odds ~${pct}%, but a position only counts if everything before it survived`,
     laneAName: 'plain autoregressive — one ≈20 ms pass per token',
-    laneBName: 'speculative — ≈1 ms draft + one ≈20 ms verify pass',
+    laneBName: 'speculative — ≈1 ms per draft token + one ≈20 ms verify pass',
     axisLabel: 'ms — synthetic axis, anchored at ≈20 ms per pass',
     passTok: (n: number) => `${n} tok`,
     zoomTitle: 'one pass, magnified — where its ≈20 ms actually go',
@@ -120,7 +139,7 @@ const COPY = {
     equalNote:
       'Same width on purpose: checking D + 1 positions is still one pass over the weights, so it costs about the same as producing one token.',
     legendPass: 'verify pass (streams all the weights)',
-    legendDraft: 'draft — MTP head, ≈1 ms',
+    legendDraft: 'draft — MTP head, ≈1 ms per draft token',
     legendAccepted: 'accepted draft position',
     legendWasted: 'wasted position — computed, then discarded',
     legendFreeTok: 'free token (from an accepted draft)',
@@ -128,7 +147,7 @@ const COPY = {
     readoutPlainTitle: 'plain lane',
     readoutPlainValue: '6 tokens / 120 ms ≈ 50 tok/s',
     readoutSpecTitle: 'speculative lane',
-    readoutSpecValue: (t: number, r: number) => `${t} tokens / 126 ms ≈ ${r} tok/s`,
+    readoutSpecValue: (t: number, ms: number, r: number) => `${t} tokens / ${ms} ms ≈ ${r} tok/s`,
     readoutSpeedupTitle: 'speedup (this scripted trace)',
     readoutSpeedupValue: (x: string) => `×${x}`,
     readoutMeasured: 'measured, for real: 1.06–1.46× at D = 1',
@@ -138,27 +157,27 @@ const COPY = {
         passes that were paid for anyway
       </>
     ),
-    readoutTax: 'drafting tax: 6 ms of 126 ms',
+    readoutTax: (tax: number, total: number) => `drafting tax: ${tax} ms of ${total} ms`,
     captionStart: 'Two GPUs, same job. Press Play — or step — to sweep the playhead and watch tokens land.',
     captionSweep: (p: number, a: number, b: number) =>
       `After pass ${p}: the plain lane has ${a} token${a === 1 ? '' : 's'}, the speculative lane has ${b}. Every verify pass emits at least one.`,
     captionTally: (x: string) =>
-      `Same wall-clock, ×${x} the tokens — each verify pass rides the weight stream a plain pass pays for anyway. Now raise D, or make the text harder to guess.`,
+      `Six passes each: with the drafting tax paid, the speculative lane comes out at ×${x} the throughput — each verify pass rides the weight stream a plain pass pays for anyway. Now raise D, or make the text harder to guess.`,
     batchChip: 'batch = 1 — you are here',
     batchNote:
       'The free ride exists because at batch 1 the compute row above is nearly empty. At high batch the chip is already busy — servers switch speculation off.',
     rules: [
       'One pass ≈ 20 ms whether it scores 1 position or D + 1 — the weights stream through either way.',
       'If K of D drafts are accepted, the pass emits K + 1 tokens; the worst case still emits 1.',
-      'Rejected positions add zero wall-clock — the only real extra cost is the ≈1 ms draft.',
+      'Rejected positions add zero wall-clock — the only real extra cost is the drafting, ≈1 ms per draft token.',
       'Accept verdicts here are scripted (greedy, temperature-0-style); higher temperature lowers acceptance.',
     ],
     illustrativeCaption:
       "Illustrative trace on a synthetic millisecond axis — scripted accept/reject verdicts, not a real profiler capture, and not this tab: the browser's WebGPU decode loop is plain autoregressive.",
     footnote:
-      "Anchor: this tab's plain WebGPU decode measures roughly 50 tok/s on an M-series Mac — about 20 ms per pass, the number the chat HUD shows (it varies by machine and run). The only measured speculative speedup in this project is ~1.06–1.46× (native Metal engine, Qwen3.5's default depth D = 1); the larger ratios this widget can show come from scripted, favorable acceptance at engine-raised depths.",
+      "Anchor: this tab's plain WebGPU decode measures roughly 50 tok/s on an M-series Mac — about 20 ms per pass, the number the chat HUD shows (it varies by machine and run). The only measured speculative speedup in this project is ~1.06–1.46× (native Metal engine, Qwen3.5's default depth D = 1); the larger ratios this widget can show come from scripted, favorable acceptance — and, past D = 1, from engine-raised depths on top.",
     ariaLabel:
-      'Illustrative GPU timeline comparing plain autoregressive decoding with speculative decoding. Top lane: six 20-millisecond forward passes, one token each. Bottom lane: each pass adds a roughly 1-millisecond draft sliver, and the verify pass is the same 20 milliseconds wide but emits one token plus every accepted draft, shown in emerald; rejected draft positions are shown struck through in red inside the same pass and add no extra time. A magnified panel shows that in both kinds of pass the memory row streams roughly 1.6 gigabytes of weights the whole time while the compute row sits mostly idle.',
+      'Illustrative GPU timeline comparing plain autoregressive decoding with speculative decoding. Top lane: six 20-millisecond forward passes, one token each. Bottom lane: each pass starts with a draft sliver of roughly 1 millisecond per draft token — about D milliseconds per cycle — and the verify pass is the same 20 milliseconds wide but emits one token plus every accepted draft, shown in emerald; rejected draft positions are shown struck through in red inside the same pass and add no extra time. A magnified panel shows that in both kinds of pass the memory row streams roughly 1.6 gigabytes of weights the whole time while the compute row sits mostly idle.',
   },
   zh: {
     title: '时间都花在了哪里——一条示意 GPU 时间线',
@@ -170,10 +189,11 @@ const COPY = {
     dNote: 'D = 1 是 Qwen3.5 自己的 MTP 深度；更大的 D 是推理引擎调高后的示意设置。',
     scenarioLabel: '文本有多好猜？',
     scenarioNames: { predictable: '好猜', typical: '一般', surprising: '难猜' },
-    scenarioAria: (name: string, pct: number) => `${name}——约 ${pct}% 的 draft 位置能存活（脚本设定）`,
-    scenarioHint: (pct: number) => `脚本设定的几率：约 ${pct}% 的 draft 位置能通过 verify`,
+    scenarioAria: (name: string, pct: number) => `${name}——单个 draft 位置的存活几率约 ${pct}%（脚本设定）`,
+    scenarioHint: (acc: number, total: number, pct: number) =>
+      `这里的脚本结果：${total} 个 draft 位置里有 ${acc} 个通过 verify——单个位置的几率约 ${pct}%，但一个位置只有在它前面的全部存活时才算数`,
     laneAName: '朴素自回归——每个 token 一次 ≈20 ms 的前向',
-    laneBName: 'speculative——≈1 ms 的 draft + 一次 ≈20 ms 的 verify 前向',
+    laneBName: 'speculative——每个 draft token ≈1 ms + 一次 ≈20 ms 的 verify 前向',
     axisLabel: 'ms——示意时间轴，锚定在每次前向 ≈20 ms',
     passTok: (n: number) => `${n} tok`,
     zoomTitle: '把一次前向放大——这 ≈20 ms 究竟花在哪',
@@ -185,7 +205,7 @@ const COPY = {
     computeIdleLabel: '大多在闲着——那点数学只是零头',
     equalNote: '两条一样宽是故意的：核验 D + 1 个位置仍然只是把权重过一遍，代价和产出一个 token 差不太多。',
     legendPass: 'verify 前向（把全部权重流一遍）',
-    legendDraft: 'draft——MTP 头，≈1 ms',
+    legendDraft: 'draft——MTP 头，每个 draft token ≈1 ms',
     legendAccepted: '被 accept 的 draft 位置',
     legendWasted: '浪费的位置——算完即弃',
     legendFreeTok: '白赚的 token（来自被 accept 的 draft）',
@@ -193,7 +213,7 @@ const COPY = {
     readoutPlainTitle: '朴素那条',
     readoutPlainValue: '6 个 token / 120 ms ≈ 50 tok/s',
     readoutSpecTitle: 'speculative 那条',
-    readoutSpecValue: (t: number, r: number) => `${t} 个 token / 126 ms ≈ ${r} tok/s`,
+    readoutSpecValue: (t: number, ms: number, r: number) => `${t} 个 token / ${ms} ms ≈ ${r} tok/s`,
     readoutSpeedupTitle: '加速比（这条脚本化 trace）',
     readoutSpeedupValue: (x: string) => `×${x}`,
     readoutMeasured: '真实测量：D = 1 时约 1.06–1.46×',
@@ -203,27 +223,27 @@ const COPY = {
         ——但它们搭的是反正要付钱的那几次前向
       </>
     ),
-    readoutTax: '草稿税：126 ms 里的 6 ms',
+    readoutTax: (tax: number, total: number) => `草稿税：${total} ms 里的 ${tax} ms`,
     captionStart: '两块 GPU，同一份活。按播放——或单步——扫过播放头，看 token 一个个落地。',
     captionSweep: (p: number, a: number, b: number) =>
       `第 ${p} 次前向之后：朴素那条攒了 ${a} 个 token，speculative 那条攒了 ${b} 个。每次 verify 前向至少吐出一个。`,
     captionTally: (x: string) =>
-      `同样的墙钟时间，token 是 ×${x}——每次 verify 前向搭的正是朴素前向反正要付钱的那条权重流。现在把 D 调高，或把文本换难猜些。`,
+      `同样六次前向：付完草稿税，speculative 那条的吞吐是 ×${x}——每次 verify 前向搭的正是朴素前向反正要付钱的那条权重流。现在把 D 调高，或把文本换难猜些。`,
     batchChip: 'batch = 1——你就在这里',
     batchNote:
       '这趟白车之所以存在，是因为 batch = 1 时上面那条算力行几乎是空的。batch 一大芯片本来就忙——服务器就会把 speculation 关掉。',
     rules: [
       '一次前向 ≈ 20 ms——不管给 1 个还是 D + 1 个位置打分，权重反正都要整个流一遍。',
       'D 个 draft 里有 K 个被 accept，这一步就吐出 K + 1 个 token；最差情形也有 1 个。',
-      '被拒的位置不增加一毫秒墙钟时间——真正多花的只有那 ≈1 ms 的 draft。',
+      '被拒的位置不增加一毫秒墙钟时间——真正多花的只有 draft 本身：每个 draft token ≈1 ms。',
       '这里的 accept 判决是脚本化的（greedy、相当于 temperature 0）；temperature 越高，接受率越低。',
     ],
     illustrativeCaption:
       '示意 trace，时间轴是合成的——判决是脚本，不是真实的 profiler 抓取，也不是这个标签页：浏览器里的 WebGPU 解码循环就是朴素自回归。',
     footnote:
-      '锚点：这个标签页的朴素 WebGPU decode 在 M 系列 Mac 上实测约 50 tok/s——每次前向约 20 ms，就是聊天 HUD 显示的那个数（随机器与批次波动）。本项目唯一实测过的 speculative 加速是 ~1.06–1.46×（原生 Metal 引擎，Qwen3.5 默认深度 D = 1）；这个小部件能摆出的更大倍数，来自脚本化的、偏乐观的接受率和引擎调高的深度。',
+      '锚点：这个标签页的朴素 WebGPU decode 在 M 系列 Mac 上实测约 50 tok/s——每次前向约 20 ms，就是聊天 HUD 显示的那个数（随机器与批次波动）。本项目唯一实测过的 speculative 加速是 ~1.06–1.46×（原生 Metal 引擎，Qwen3.5 默认深度 D = 1）；这个小部件能摆出的更大倍数，来自脚本化的、偏乐观的接受率——在 D 大于 1 时，还叠加了引擎调高的深度。',
     ariaLabel:
-      '示意 GPU 时间线，对比朴素自回归解码与 speculative 解码。上面一条：六次各 20 毫秒的前向，每次产出一个 token。下面一条：每次前向前多一条约 1 毫秒的 draft 细条；verify 前向同样是 20 毫秒宽，但除了自己的一个 token，还吐出所有被 accept 的 draft（绿色）；被拒的 draft 位置以红色划掉画在同一次前向内部，不增加任何时间。放大面板显示：无论哪种前向，访存一行都在整趟流式读入约 1.6 GB 权重，而算力一行大多闲着。',
+      '示意 GPU 时间线，对比朴素自回归解码与 speculative 解码。上面一条：六次各 20 毫秒的前向，每次产出一个 token。下面一条：每次前向前多一条 draft 细条，每个 draft token 约 1 毫秒——每轮约 D 毫秒；verify 前向同样是 20 毫秒宽，但除了自己的一个 token，还吐出所有被 accept 的 draft（绿色）；被拒的 draft 位置以红色划掉画在同一次前向内部，不增加任何时间。放大面板显示：无论哪种前向，访存一行都在整趟流式读入约 1.6 GB 权重，而算力一行大多闲着。',
   },
 } as const;
 
@@ -246,16 +266,16 @@ function usePrefersReducedMotion(): boolean {
 const VB_W = 760;
 const VB_H = 324;
 const X0 = 14;
-const PX_PER_MS = 5.8;
-const tx = (ms: number) => X0 + ms * PX_PER_MS; // trace x-mapping (126 ms → x 744.8, inside 760)
+const PX_PER_MS = 5; // sized so the LONGEST spec lane fits: tx(144) = 734, inside 760
+const tx = (ms: number) => X0 + ms * PX_PER_MS; // trace x-mapping, shared by lanes, axis and playhead
 const ZX0 = 96;
 const ZW = 634;
 const zx = (ms: number) => ZX0 + ms * (ZW / 20); // zoom x-mapping; BOTH strips span exactly zx(0)→zx(20)
 // CRITICAL: both lanes' pass widths and both zoom strips derive from these
 // shared consts, never duplicated literals — equal width IS the lesson, and a
 // 1-px difference visually breaks the "costs about the same" claim.
-const PASS_W = PASS_MS * PX_PER_MS - 2; // 114 — one pass, minus a 2-px hairline inset
-const DRAFT_W = DRAFT_MS * PX_PER_MS - 1; // ≈4.8 — the 1 ms draft sliver
+const PASS_W = PASS_MS * PX_PER_MS - 2; // 98 — one pass, minus a 2-px hairline inset
+// The draft sliver's width is D-dependent (D × 1 ms) — computed in the component.
 const LANE_H = 26;
 const LANE_A_Y = 24;
 const LANE_A_CHIP_Y = 58;
@@ -265,9 +285,9 @@ const CHIP = 9; // token chip side
 const CHIP_PITCH = 11; // chip spacing inside a cluster (max 5 chips = 55 px < PASS_W)
 const SLOT_H = 7; // accept/reject slot strip along the verify block's bottom edge
 const SLOT_INSET = 4;
-const SLOT_SPAN = PASS_W - SLOT_INSET * 2; // 106
+const SLOT_SPAN = PASS_W - SLOT_INSET * 2; // 90
 const AXIS_Y = 150;
-const AXIS_TICKS = [0, 20, 40, 60, 80, 100, 120];
+const AXIS_TICKS = [0, 20, 40, 60, 80, 100, 120, 140];
 const ZOOM_TITLE_Y = 208;
 const ZOOM_PLAIN_LABEL_Y = 222; // → memory row y228, compute row y245
 const ZOOM_VERIFY_LABEL_Y = 280; // → memory row y286, compute row y303
@@ -289,14 +309,30 @@ export function SpecDecodeFlamechart() {
     return () => window.clearInterval(t);
   }, [playing, reducedMotion]);
 
+  // If the reduced-motion preference flips on WHILE the animation runs, honor
+  // the same contract as the initializers: pin to the completed tally, stop.
+  // (The useState initializers above only ran once, on mount.)
+  React.useEffect(() => {
+    if (!reducedMotion) return;
+    setFrame(TOTAL_FRAMES - 1);
+    setPlaying(false);
+  }, [reducedMotion]);
+
   const d = dIdx + 1;
   const ks = ACCEPTS[scenario][dIdx];
+  // The head drafts ONE TOKEN AT A TIME (each guess feeds the next), so every
+  // cycle pays D × 1 ms — the sliver, the clock and the readout all share these.
+  const draftMsPerCycle = d * DRAFT_MS;
+  const specStepMs = PASS_MS + draftMsPerCycle; // 21 / 22 / 23 / 24
+  const specTotalMs = N_PASSES * specStepMs; // 126 / 132 / 138 / 144
+  const draftW = draftMsPerCycle * PX_PER_MS - 1; // the D × 1 ms draft sliver
   // The readout counts the drawn trace — the same ACCEPTS row drives the bars,
   // slots, chips, zoom slivers AND this math, so picture and numbers can never diverge.
   const specTokens = ks.reduce((s, k) => s + k + 1, 0);
+  const accepted = specTokens - N_PASSES; // Σ K — draft positions that survived verify
   const wasted = ks.reduce((s, k) => s + (d - k), 0);
-  const specRate = Math.round((specTokens * 1000) / SPEC_TOTAL_MS);
-  const speedup = (specTokens / SPEC_TOTAL_MS / (N_PASSES / PLAIN_TOTAL_MS)).toFixed(2);
+  const specRate = Math.round((specTokens * 1000) / specTotalMs);
+  const speedup = (specTokens / specTotalMs / (N_PASSES / PLAIN_TOTAL_MS)).toFixed(2);
 
   const passesDone = Math.min(frame, N_PASSES);
   const isTally = frame === TOTAL_FRAMES - 1;
@@ -414,7 +450,9 @@ export function SpecDecodeFlamechart() {
             {copy.batchChip}
           </span>
         </div>
-        <p className="text-[10px] text-muted-foreground">{copy.scenarioHint(SCENARIO_ODDS[scenario])}</p>
+        <p className="text-[10px] text-muted-foreground">
+          {copy.scenarioHint(accepted, N_PASSES * d, SCENARIO_ODDS[scenario])}
+        </p>
         <p className="text-[10px] text-muted-foreground">{copy.dNote}</p>
       </div>
 
@@ -445,22 +483,22 @@ export function SpecDecodeFlamechart() {
           />
         ))}
 
-        {/* Lane B — speculative: draft sliver + verify pass, 0–126 ms */}
+        {/* Lane B — speculative: D×1 ms draft sliver + verify pass, 0–(120+6·D) ms */}
         <text x={X0} y={92} style={{ fill: 'var(--muted-foreground)' }} className="text-[11px]">
           {copy.laneBName}
         </text>
         {ks.map((k, i) => (
           <g key={`b${i}`}>
             <rect
-              x={tx(SPEC_STEP_MS * i) + 0.5}
+              x={tx(specStepMs * i) + 0.5}
               y={LANE_B_Y}
-              width={DRAFT_W}
+              width={draftW}
               height={LANE_H}
               fill="var(--primary)"
               fillOpacity={0.5}
             />
             <LanePass
-              x={tx(SPEC_STEP_MS * i + DRAFT_MS) + 1}
+              x={tx(specStepMs * i + draftMsPerCycle) + 1}
               y={LANE_B_Y}
               variant="verify"
               label={copy.passTok(k + 1)}
@@ -469,7 +507,7 @@ export function SpecDecodeFlamechart() {
               depth={d}
             />
             <TokenChips
-              rightX={tx(SPEC_STEP_MS * (i + 1)) - 4}
+              rightX={tx(specStepMs * (i + 1)) - 4}
               y={LANE_B_CHIP_Y}
               emeraldCount={k}
               visible={i < passesDone}
@@ -478,8 +516,9 @@ export function SpecDecodeFlamechart() {
           </g>
         ))}
 
-        {/* Shared ms axis */}
-        <line x1={tx(0)} y1={AXIS_Y} x2={tx(SPEC_TOTAL_MS)} y2={AXIS_Y} stroke="var(--border)" strokeWidth={1} />
+        {/* Shared ms axis — a FIXED ruler out to the longest cell (144 ms at
+            D = 4), so the spec lane visibly grows against it as D rises */}
+        <line x1={tx(0)} y1={AXIS_Y} x2={tx(MAX_SPEC_TOTAL_MS)} y2={AXIS_Y} stroke="var(--border)" strokeWidth={1} />
         {AXIS_TICKS.map((t) => (
           <g key={t}>
             <line x1={tx(t)} y1={AXIS_Y} x2={tx(t)} y2={AXIS_Y + 5} stroke="var(--border)" strokeWidth={1} />
@@ -495,7 +534,7 @@ export function SpecDecodeFlamechart() {
           </g>
         ))}
         <text
-          x={tx(SPEC_TOTAL_MS)}
+          x={tx(MAX_SPEC_TOTAL_MS)}
           y={AXIS_Y + 34}
           textAnchor="end"
           style={{ fill: 'var(--muted-foreground)' }}
@@ -511,11 +550,11 @@ export function SpecDecodeFlamechart() {
         <ZoomStrip label={copy.zoomPlainLabel} y={ZOOM_PLAIN_LABEL_Y} slivers={plainSlivers} showIdleLabel />
         <ZoomStrip label={copy.zoomVerifyLabel(d + 1)} y={ZOOM_VERIFY_LABEL_Y} slivers={verifySlivers} />
 
-        {/* Playhead — tracks the spec lane's clock (21·i ≥ 20·i, so lane A is always behind it) */}
+        {/* Playhead — tracks the spec lane's clock ((20+D)·i ≥ 20·i, so lane A is always behind it) */}
         <g
           aria-hidden
           style={{
-            transform: `translateX(${SPEC_STEP_MS * passesDone * PX_PER_MS}px)`,
+            transform: `translateX(${specStepMs * passesDone * PX_PER_MS}px)`,
             transition: reducedMotion ? undefined : 'transform 1100ms cubic-bezier(0.4, 0, 0.2, 1)',
             opacity: frame === TOTAL_FRAMES - 1 ? 0 : 1,
           }}
@@ -584,7 +623,9 @@ export function SpecDecodeFlamechart() {
         </div>
         <div className="rounded border border-border bg-card/40 p-2">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutSpecTitle}</div>
-          <div className="font-mono text-[13px] text-foreground/90">{copy.readoutSpecValue(specTokens, specRate)}</div>
+          <div className="font-mono text-[13px] text-foreground/90">
+            {copy.readoutSpecValue(specTokens, specTotalMs, specRate)}
+          </div>
         </div>
         <div className="rounded border border-border bg-card/40 p-2" aria-live="polite">
           <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.readoutSpeedupTitle}</div>
@@ -595,7 +636,8 @@ export function SpecDecodeFlamechart() {
 
       {/* [8] Waste + drafting tax */}
       <p className="text-[12px] text-foreground/90">
-        {copy.readoutWaste(wasted)} <span className="text-muted-foreground">· {copy.readoutTax}</span>
+        {copy.readoutWaste(wasted)}{' '}
+        <span className="text-muted-foreground">· {copy.readoutTax(N_PASSES * draftMsPerCycle, specTotalMs)}</span>
       </p>
 
       {/* [9] Rules box */}
