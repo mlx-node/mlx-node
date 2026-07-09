@@ -215,20 +215,54 @@ function safetensorsHeader(path: string): StHeader {
  *  Returns the sorted key list + file size in bytes. */
 function assertPackF32(packPath: string): { keys: string[]; bytes: number } {
   if (!existsSync(packPath)) fail(`pack not found at ${packPath}`);
+  const fileBytes = statSync(packPath).size;
+  // Where does the tensor BODY start? = 8 (length prefix) + header JSON length.
+  // data_offsets in the header are RELATIVE to that body start (safetensors spec;
+  // cf. readJsumArrays which reads at dataStart = 8 + headerLen + offset).
+  const lenBuf = Buffer.alloc(8);
+  const fd = openSync(packPath, 'r');
+  try {
+    if (readSync(fd, lenBuf, 0, 8, 0) < 8) fail(`pack ${packPath} truncated (<8 bytes)`);
+  } finally {
+    closeSync(fd);
+  }
+  const headerLen = Number(lenBuf.readBigUInt64LE(0));
+  const bodyBytes = fileBytes - 8 - headerLen;
+  if (bodyBytes < 0) fail(`pack ${packPath} header (${headerLen}B) exceeds file (${fileBytes}B) — truncated`);
+
   const header = safetensorsHeader(packPath);
   const keys = Object.keys(header)
     .filter((k) => k !== '__metadata__')
     .sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)));
   const expected = Array.from({ length: 23 }, (_, i) => `J.${i + 1}`);
   if (keys.join(',') !== expected.join(',')) fail(`pack keys != exactly J.1..J.23: got [${keys.join(', ')}]`);
+  const SPAN = HIDDEN * HIDDEN * 4; // bytes per J.{l} = F32 [1024,1024]
   for (const k of keys) {
     if (header[k].dtype !== 'F32') fail(`pack ${k} dtype ${header[k].dtype} != F32`);
     const sh = header[k].shape;
     if (sh.length !== 2 || sh[0] !== HIDDEN || sh[1] !== HIDDEN) {
       fail(`pack ${k} shape [${sh.join(',')}] != [${HIDDEN},${HIDDEN}]`);
     }
+    const [lo, hi] = header[k].data_offsets;
+    if (!Number.isInteger(lo) || !Number.isInteger(hi) || hi - lo !== SPAN) {
+      fail(`pack ${k} data_offsets [${lo},${hi}] span ${hi - lo} != ${SPAN} (F32 [${HIDDEN},${HIDDEN}])`);
+    }
+    if (lo < 0 || hi > bodyBytes) fail(`pack ${k} data_offsets [${lo},${hi}] out of body bounds [0,${bodyBytes}]`);
   }
-  return { keys, bytes: statSync(packPath).size };
+  // The 23 bodies must TILE the data section exactly — contiguous, no gaps, no
+  // overlaps, and the last one ends precisely at the file's end. This catches a
+  // torn/truncated or mispointed pack that the name/dtype/shape checks alone pass
+  // (the smoke only reads one layer, so it is not a whole-pack integrity check).
+  const spans = keys.map((k) => header[k].data_offsets).sort((a, b) => a[0] - b[0]);
+  let cursor = 0;
+  for (const [lo, hi] of spans) {
+    if (lo !== cursor) fail(`pack body not contiguous at offset ${cursor}: next tensor starts at ${lo} (gap/overlap)`);
+    cursor = hi;
+  }
+  if (cursor !== bodyBytes) {
+    fail(`pack body ends at ${cursor} but file body is ${bodyBytes} bytes (torn/truncated or trailing bytes)`);
+  }
+  return { keys, bytes: fileBytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -983,6 +1017,19 @@ async function productionOrchestrator(): Promise<void> {
   console.log(`  log =${cfg.logPath}`);
 
   const existing = readCheckpointScalars(cfg.ckptPath);
+  if (!existing && existsSync(cfg.ckptPath)) {
+    // Fail CLOSED: a checkpoint FILE exists but its meta scalars are unreadable
+    // (torn / corrupt / incompatible schema). Treating it as "fresh" would run the
+    // fit with resume=false and OVERWRITE a possibly-many-hours-old partial WITHOUT
+    // the native's corpus-fingerprint revalidation. Refuse and require operator
+    // intervention instead of silently clobbering it. (readCheckpointScalars returns
+    // null for BOTH absent and unreadable — this branch separates the two.)
+    fail(
+      `checkpoint ${cfg.ckptPath} EXISTS but its meta scalars are unreadable ` +
+        `(torn/corrupt/incompatible). Refusing to overwrite a partial fit. Inspect it, then ` +
+        `either delete it to start fresh (0 -> ${cfg.nFit}) or restore a good copy to resume.`,
+    );
+  }
   if (existing) {
     console.log(`[RESUME] existing checkpoint n_done=${existing.nDone} next_idx=${existing.nextIdx}`);
   } else {
@@ -1019,8 +1066,19 @@ async function productionOrchestrator(): Promise<void> {
       const err = parseSentinel<{ message: string }>(reexportRun.stdout, '__WORKER_ERROR__');
       fail(`re-export worker failed (code ${reexportRun.code}): ${err?.message ?? 'no __FIT_RESULT__'}`);
     }
-    if (res.promptsThisRun !== 0) {
-      console.log(`[COMPLETE] note: re-export processed ${res.promptsThisRun} prompt(s) (checkpoint was not fully complete)`);
+    // The re-export MUST be a pure re-serialize, not a fit. The native resume skips
+    // every prompt with idx < next_idx, and the checkpoint invariant is
+    // next_idx >= n_done >= N_FIT here, so ZERO new prompts should run and n_done
+    // must be unchanged. Assert it rather than trusting it: a nonzero count or a
+    // changed n_done means the checkpoint was inconsistent (or the native invariant
+    // broke) and the re-exported pack would NOT faithfully represent n_done fitted
+    // prompts. Fail closed instead of accepting a mutated pack.
+    if (res.promptsThisRun !== 0 || res.nDone !== existing.nDone) {
+      fail(
+        `re-export was not a pure re-serialize: promptsThisRun=${res.promptsThisRun} (expected 0), ` +
+          `n_done ${existing.nDone} -> ${res.nDone} (expected unchanged). The checkpoint is ` +
+          `inconsistent; refusing to accept the re-exported pack.`,
+      );
     }
   } else {
     mode = existing ? 'resume-fit' : 'fresh-fit';
