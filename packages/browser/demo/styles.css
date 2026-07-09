@@ -415,6 +415,22 @@
     .landing-void-copy {
       font-size: 0.72rem;
     }
+    /* Narrow screens cram the hero into one viewport, so the decorative mascot
+       and the footer caption used to collide (the footer text ran under the
+       capybara). Shrink + corner the mascot and reserve its column so the footer
+       wraps clear of it. */
+    .landing-mascot {
+      width: 52px;
+      bottom: 6px;
+      right: 8px;
+    }
+    .landing-footer {
+      left: 14px;
+      right: 66px;
+      bottom: 8px;
+      font-size: 0.6rem;
+      line-height: 1.5;
+    }
   }
 
   /* ── Loading screen ───────────────────────────────── */

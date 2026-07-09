@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "browser-dev",
+      "runtimeExecutable": "yarn",
+      "runtimeArgs": ["workspace", "@mlx-node/browser", "dev"],
+      "port": 5173
+    },
+    {
       "name": "browser-preview",
       "runtimeExecutable": "yarn",
       "runtimeArgs": ["workspace", "@mlx-node/browser", "preview"],

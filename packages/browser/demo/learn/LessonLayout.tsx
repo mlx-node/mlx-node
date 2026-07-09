@@ -89,31 +89,35 @@ export function LessonLayout({
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-background">
       {/* Header bar */}
-      <div className="flex shrink-0 items-center justify-between border-b border-border px-6 py-3">
+      {/* Header bar. On mobile the three groups (back · title · actions) can't
+          all fit at full size, so the back-link and the action buttons collapse
+          to icon-only (labels return at >=sm) and the breadcrumb truncates in a
+          flexible middle — nothing clips off-screen. */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2.5 sm:gap-3 sm:px-6 sm:py-3">
         <button
           type="button"
           onClick={onBackToIndex}
-          className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+          className="inline-flex shrink-0 items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeftIcon className="size-4" />
-          {ui.lessonLayout.allChapters}
+          <span className="hidden sm:inline">{ui.lessonLayout.allChapters}</span>
         </button>
-        <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+        <div className="min-w-0 flex-1 truncate text-center font-mono text-[0.65rem] uppercase tracking-[0.1em] text-muted-foreground sm:text-xs sm:tracking-[0.15em]">
           {ui.lessonLayout.breadcrumb(current.number, current.title)}
           {sectionTitle ? <span className="text-foreground/80"> › {sectionTitle}</span> : null}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1 sm:gap-2">
           {/* Global pre-load affordance. Hidden once the model is ready (there
               is nothing left to load); omit `onLoadModel` to drop it entirely. */}
           {onLoadModel && !modelReady ? (
             <Button variant="outline" size="sm" onClick={onLoadModel} className="gap-2">
               <DownloadIcon className="size-4" />
-              {ui.lessonLayout.loadModel}
+              <span className="hidden sm:inline">{ui.lessonLayout.loadModel}</span>
             </Button>
           ) : null}
           <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
             <MessageSquareIcon className="size-4" />
-            {ui.lessonLayout.freeChat}
+            <span className="hidden sm:inline">{ui.lessonLayout.freeChat}</span>
           </Button>
           <LanguageSwitcher />
         </div>
