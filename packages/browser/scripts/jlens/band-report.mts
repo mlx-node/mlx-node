@@ -21,9 +21,13 @@
  *      single-token surface-form ids). This is MEASURED, not a summary-stat
  *      proxy — the lens analog of the interpretable band, the most defensible of
  *      the four. Also reports the mean rank-improvement.
- *   3. answer-surfacing = per boundary, the fraction of items whose answer/target
+ *   3. answer-surfacing = per boundary, the fraction of SCORABLE-answer items
+ *      (denominator disclosed as answerSurfacingScorableItems; multi-token answers
+ *      are excluded as unmeasurable, NOT scored as misses) whose answer/target
  *      concept has entered the J-lens top-K (rank ≤ K) at that boundary; plus the
- *      corpus-mean SHALLOWEST such boundary. Where answers become legible.
+ *      corpus-mean SHALLOWEST such boundary over items that ACTUALLY surfaced
+ *      (never-surfaced items counted separately, not right-censored to ℓ24).
+ *      Where answers become legible.
  *   4. residual RMS = mean(l2Norm/√count) of post_mlp_residual by boundary — a
  *      LENGTH-NORMALIZED per-coordinate l2 magnitude (raw l2Norm grows ~√P with
  *      prompt length, so it is NOT corpus-averageable; RMS removes that). A
@@ -194,8 +198,9 @@ async function main() {
   let nLegIntermediates = 0; // scorable intermediates (denominator, same at every boundary)
   // det3 answer-surfacing (per boundary: #items whose answer rank ≤ K)
   const surfCount = new Array(N_BOUND).fill(0);
-  const surfShallowest: number[] = []; // per-item shallowest surfacing boundary (24 if never)
-  let nAnswerItems = 0; // items with ≥1 single-token answer surface id
+  const surfShallowestSurfaced: number[] = []; // shallowest surfacing boundary, ONLY for items that surfaced
+  let nAnswerItems = 0; // scorable-answer items (≥1 single-token answer surface id) = the surfFrac denominator
+  let nAnswerNeverSurfaced = 0; // scorable-answer items whose answer never reached rank ≤ K at ANY boundary
 
   let maxPromptLen = 0;
 
@@ -293,18 +298,25 @@ async function main() {
       }
 
       // det3: per boundary answer rank (J-lens) = min over answer surface ids.
+      // Denominator = scorable-answer items (answerIdSet non-empty). Items whose
+      // answer is multi-token are UNMEASURABLE by a single-token readout, so they
+      // are excluded (counted in nAnswerExcluded), NOT scored as a miss — the same
+      // rule eval.mts applies to unscorable intermediates. "Never surfaced" (rank
+      // > K at every boundary) is tracked separately from a genuine ℓ24 surfacing,
+      // so the corpus-mean shallowest boundary is not right-censored to 24.
       if (answerIdSet.size > 0) {
         nAnswerItems++;
-        let shallowest = N_BOUND; // 24 = never surfaced (sentinel = last boundary)
+        let shallowest = 0; // 0 = never surfaced (NOT a real boundary)
         for (let b = 0; b < N_BOUND; b++) {
           let jr = RANK_CENSOR;
           for (const id of answerIdSet) jr = Math.min(jr, jRank.get(id)![b]);
           if (jr <= TOPK_LEGIBLE) {
             surfCount[b]++;
-            if (b + 1 < shallowest) shallowest = b + 1;
+            if (shallowest === 0) shallowest = b + 1; // ascending loop → first hit is the shallowest
           }
         }
-        surfShallowest.push(shallowest);
+        if (shallowest > 0) surfShallowestSurfaced.push(shallowest);
+        else nAnswerNeverSurfaced++;
       }
     }
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
@@ -317,8 +329,11 @@ async function main() {
   const stdCurve = stdSum.map((v) => v / nResidualPrompts);
   const legFrac = legImproved.map((v) => v / nLegIntermediates); // det2 fraction-improved
   const legDeltaMean = legRankDelta.map((v) => v / nLegIntermediates); // det2 mean rank-improvement
-  const surfFrac = surfCount.map((v) => v / nAnswerItems); // det3 fraction-surfaced
-  const meanShallowest = mean(surfShallowest); // det3 corpus-mean shallowest surfacing boundary
+  const surfFrac = surfCount.map((v) => v / nAnswerItems); // det3 fraction-surfaced (of scorable-answer items)
+  const nAnswerSurfaced = surfShallowestSurfaced.length; // items whose answer reached rank ≤ K at ≥1 boundary
+  const meanShallowest = mean(surfShallowestSurfaced); // corpus-mean shallowest boundary, SURFACED items ONLY (0 if none)
+  const surfacedFraction = nAnswerItems ? nAnswerSurfaced / nAnswerItems : 0; // share of scorable-answer items that ever surfaced
+  const nAnswerExcluded = nResidualPrompts - nAnswerItems; // items dropped: answer had no single-token surface id
 
   // ---- per-detector onset + band-structure verdict ----
   const detectors = [
@@ -345,9 +360,13 @@ async function main() {
     },
     {
       id: 'answer_surfacing',
-      title: `answer-surfacing: fraction of items with answer/target rank ≤ ${TOPK_LEGIBLE} in the J-lens by boundary`,
+      title: `answer-surfacing: fraction of SCORABLE-answer items with answer/target rank ≤ ${TOPK_LEGIBLE} in the J-lens by boundary`,
       curve: surfFrac,
-      auxMeanShallowestBoundary: meanShallowest,
+      denominator: nAnswerItems,
+      auxMeanShallowestBoundarySurfaced: meanShallowest,
+      auxSurfacedFraction: surfacedFraction,
+      auxNeverSurfaced: nAnswerNeverSurfaced,
+      auxExcludedUnscorable: nAnswerExcluded,
       earlyBandBaseline: earlyMean(surfFrac),
       onsetBoundary: onsetBoundary(surfFrac, RISE_THRESH),
       threshold: `early-band(ℓ1..5) mean × ${RISE_THRESH}`,
@@ -376,7 +395,7 @@ async function main() {
       return `J beats logit most at boundary ℓ${peakB} (frac=${d.curve[peakB - 1].toFixed(3)}); early-band frac=${d.earlyBandBaseline.toFixed(3)} → J's per-layer advantage is a mid-stack band`;
     },
     answer_surfacing: (d: any) =>
-      `answers enter the J-lens top-${TOPK_LEGIBLE} at corpus-mean shallowest boundary ℓ${d.auxMeanShallowestBoundary.toFixed(1)}; per-boundary surfacing onset ℓ${d.onsetBoundary || 'n/a'}`,
+      `${(d.auxSurfacedFraction * 100).toFixed(0)}% of ${d.denominator} scorable-answer items ever enter the J-lens top-${TOPK_LEGIBLE} (${d.auxNeverSurfaced} never do; ${d.auxExcludedUnscorable} more items excluded as multi-token/unscorable). Of those that surface, corpus-mean shallowest boundary ℓ${d.auxMeanShallowestBoundarySurfaced.toFixed(1)}; per-boundary surfacing onset ℓ${d.onsetBoundary || 'n/a'}`,
     residual_rms: (d: any) =>
       d.onsetBoundary
         ? `residual RMS grows past ${RISE_THRESH}× the early band at boundary ℓ${d.onsetBoundary} (magnitude structure develops with depth)`
@@ -397,6 +416,12 @@ async function main() {
       `  ${String(b + 1).padStart(2)} | ${tail[b].toFixed(3).padStart(14)} | ${legFrac[b].toFixed(3).padStart(11)} | ${surfFrac[b].toFixed(3).padStart(15)} | ${rms[b].toFixed(4).padStart(9)}`,
     );
   }
+  console.log(
+    `\ndenominators (disclosed — they differ per detector):` +
+      `\n  tail_index / residual_rms : ${nResidualPrompts} prompts (all)` +
+      `\n  lens_legibility_gap       : ${nLegIntermediates} scorable (single-token) intermediates` +
+      `\n  answer_surfacing          : ${nAnswerItems} scorable-answer items (${nAnswerExcluded} excluded as multi-token; ${nAnswerNeverSurfaced} never surfaced)`,
+  );
   console.log(`\ndetector summary:`);
   for (const d of detectors) {
     console.log(
@@ -418,10 +443,22 @@ async function main() {
         pack: PACK_PATH,
         corpus: 'six eval suites (lens-eval-*.json), file order — 551 prompts; the same set Part A scores',
         nPrompts: nResidualPrompts,
+        // Per-detector denominators DIFFER and are disclosed here (the four curves
+        // are NOT all fractions of the same nPrompts): tail/RMS average over all
+        // prompts; legibility over scorable single-token intermediates; answer-
+        // surfacing over scorable-answer items only.
+        denominators: {
+          tailIndexResidualRms: nResidualPrompts,
+          legibilityIntermediates: nLegIntermediates,
+          answerSurfacingScorableItems: nAnswerItems,
+          answerSurfacingExcludedUnscorable: nAnswerExcluded,
+          answerSurfacingNeverSurfaced: nAnswerNeverSurfaced,
+          answerSurfacingSurfaced: nAnswerSurfaced,
+        },
         boundaries: REQUEST_LAYERS,
         params: { topKLegible: TOPK_LEGIBLE, riseThreshold: RISE_THRESH, earlyBand: `ℓ1..${EARLY_BAND}` },
         honesty:
-          'Four PROXY band-onset detectors, NOT the paper Fig-28 residual excess kurtosis (the read-only NAPI exposes only per-layer summary stats mean/std/absMax/l2Norm over the whole prefill tensor, not raw residuals; no native changes made). Supporting signal only — the load-bearing GO criterion is Part A (eval.mts J-vs-logit).',
+          'Four PROXY band-onset detectors, NOT the paper Fig-28 residual excess kurtosis (the read-only NAPI exposes only per-layer summary stats mean/std/absMax/l2Norm over the whole prefill tensor, not raw residuals; no native changes made). Supporting signal only — the load-bearing GO criterion is Part A (eval.mts J-vs-logit). Per-detector denominators differ and are disclosed in `denominators` (see above): tail_index/residual_rms average over all prompts, lens_legibility_gap over scorable single-token intermediates, answer_surfacing over scorable-answer items ONLY — multi-token answers are unmeasurable by a single-token readout and are excluded (counted, not scored as misses; same rule eval.mts uses for intermediates). The answer_surfacing "shallowest boundary" is averaged over items that ACTUALLY surfaced (rank ≤ K at ≥1 boundary); never-surfaced items are counted separately (auxNeverSurfaced), NOT right-censored to ℓ24.',
         detectors,
         bandStructurePresent,
         nDetectorsWithBandStructure: nStruct,
