@@ -92,7 +92,7 @@ impl ToolCallResult {
             name: String::new(),
             arguments: Value::Object(serde_json::Map::new()),
             status: "missing_name".to_string(),
-            error: Some(format!("Tool call missing name: {}", &raw_content)),
+            error: Some(format!("Tool call missing name: {raw_content}")),
             raw_content,
         }
     }
