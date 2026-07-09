@@ -57,6 +57,11 @@ recipe with MXFP4 in place of NVFP4, for both dense `qwen3_5` and MoE
 `out_proj` → mxfp8 8/32, GDN `in_proj_a`/`in_proj_b` + router gates → 8-bit
 affine, everything else bf16.
 
+It is supported **only** for `qwen3_5` / `qwen3_5_moe` (the port targets the
+Qwen3.5/3.6 hybrid modelopt recipe); passing it with any other `--model-type`,
+an omitted one, or a GGUF input is rejected upfront. Other families (e.g.
+`gemma4`) need their own recipe.
+
 ```bash
 # dense
 mlx convert -m qwen3_5 -q --q-recipe nvidia \

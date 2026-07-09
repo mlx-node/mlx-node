@@ -1873,14 +1873,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // The nvidia recipe is a data-free port with a fixed format map: it
+        // The nvidia recipe is documented + validated only for qwen3_5 /
+        // qwen3_5_moe, and is a data-free port with a fixed format map: it
         // reads no imatrix, ignores --q-mxfp (it emits mxfp4/mxfp8 directly),
-        // and pins bits=4/group_size=32 for its float tensors. Reject flags
-        // that would silently alter or contradict that map, but allow a bare
-        // `-q --q-recipe nvidia` (no explicit bits/group_size) to pass. Shared
-        // with the GGUF entry point (`convert_gguf_to_safetensors`).
+        // and pins bits=4/group_size=32 for its float tensors. Reject any other
+        // model type (or an omitted one) plus flags that would silently alter
+        // or contradict the map, but allow a bare `-q --q-recipe nvidia` (no
+        // explicit bits/group_size) to pass. Shared with the GGUF entry point
+        // (`convert_gguf_to_safetensors`).
         if recipe == "nvidia" {
             validate_nvidia_recipe_options(
+                model_type.as_deref(),
                 imatrix_path.as_deref(),
                 quant_mxfp,
                 options.quant_bits,
@@ -4237,28 +4240,56 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
     Ok(())
 }
 
-/// Validate the flags passed alongside `--q-recipe nvidia`.
+/// Validate `--q-recipe nvidia`: its model type and the flags passed alongside
+/// it.
 ///
-/// The nvidia recipe is a data-free port with a fixed format map: it reads no
-/// imatrix, ignores `--q-mxfp` (it emits mxfp4/mxfp8 directly), and pins
-/// bits=4/group_size=32 for its float tensors. Reject flags that would silently
-/// alter or contradict that map, but allow a bare `-q --q-recipe nvidia` (no
-/// explicit bits/group_size) to pass.
+/// The nvidia recipe is a data-free port of NVIDIA modelopt's Qwen3.5/3.6
+/// *hybrid* recipe and is documented + validated ONLY for `qwen3_5` /
+/// `qwen3_5_moe`. Its per-layer map (`build_nvidia_recipe`) is a pure
+/// key-pattern predicate with no model-family awareness, so applying it to any
+/// other family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
+/// per-layer metadata on generic substrings (`lm_head`, `self_attn`, `.mlp.*`)
+/// that those loaders were never designed for — producing an unloadable or
+/// numerically invalid checkpoint instead of failing upfront. Reject any
+/// model type outside the supported set first.
+///
+/// It also has a fixed format map: it reads no imatrix, ignores `--q-mxfp` (it
+/// emits mxfp4/mxfp8 directly), and pins bits=4/group_size=32 for its float
+/// tensors. Reject flags that would silently alter or contradict that map, but
+/// allow a bare `-q --q-recipe nvidia` (no explicit bits/group_size) to pass.
 ///
 /// Shared by the safetensors (`convert_model_inner`) and GGUF
 /// (`convert_gguf_to_safetensors`) entry points so both reject the same
-/// forbidden combinations with identical messages. Without this guard on the
-/// GGUF path an imatrix would trigger AWQ pre-scaling and `--q-mxfp` would
-/// re-upgrade the recipe's affine-8/64 in_proj_a/in_proj_b decisions to mxfp8,
-/// breaking the intended T=0 MTP↔AR bit-exactness. `quant_bits` /
-/// `quant_group_size` are `Some` only when the caller passed them explicitly;
-/// `None` means "use the recipe default" and always passes.
+/// forbidden combinations with identical messages. The GGUF path has no HF
+/// `model_type` in scope (its arch is inferred from GGUF metadata as e.g.
+/// `qwen3`, never the exact `qwen3_5`/`qwen3_5_moe`), so it passes `None` and
+/// nvidia-on-GGUF is rejected wholesale by the model-type gate — correct, since
+/// the recipe is a faithful full-precision→mxfp port and re-quantizing an
+/// already-lossy GGUF was never a supported path. Without the flag guards an
+/// imatrix would trigger AWQ pre-scaling and `--q-mxfp` would re-upgrade the
+/// recipe's affine-8/64 in_proj_a/in_proj_b decisions to mxfp8, breaking the
+/// intended T=0 MTP↔AR bit-exactness. `model_type` is `Some` only when the
+/// caller passed/auto-detected one; `quant_bits` / `quant_group_size` are
+/// `Some` only when the caller passed them explicitly; `None` means "use the
+/// recipe default" and always passes the flag checks.
 pub(crate) fn validate_nvidia_recipe_options(
+    model_type: Option<&str>,
     imatrix_path: Option<&str>,
     quant_mxfp: bool,
     quant_bits: Option<i32>,
     quant_group_size: Option<i32>,
 ) -> std::result::Result<(), String> {
+    if !matches!(model_type, Some("qwen3_5") | Some("qwen3_5_moe")) {
+        return Err(format!(
+            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe \
+             (got {}). It ports the Qwen3.5/3.6 hybrid modelopt recipe; other families \
+             (e.g. gemma4) need their own recipe.",
+            match model_type {
+                Some(mt) => format!("'{mt}'"),
+                None => "none".to_string(),
+            }
+        ));
+    }
     if imatrix_path.is_some() {
         return Err(
             "nvidia recipe is a data-free port and does not accept --imatrix-path: \
@@ -7315,8 +7346,14 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_imatrix() {
-        let err = validate_nvidia_recipe_options(Some("/path/to.imatrix"), false, None, None)
-            .expect_err("nvidia recipe must reject --imatrix-path");
+        let err = validate_nvidia_recipe_options(
+            Some("qwen3_5"),
+            Some("/path/to.imatrix"),
+            false,
+            None,
+            None,
+        )
+        .expect_err("nvidia recipe must reject --imatrix-path");
         assert!(
             err.contains("does not accept --imatrix-path"),
             "error must mention imatrix rejection, got: {err}"
@@ -7325,7 +7362,7 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_mxfp() {
-        let err = validate_nvidia_recipe_options(None, true, None, None)
+        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, true, None, None)
             .expect_err("nvidia recipe must reject --q-mxfp");
         assert!(
             err.contains("--q-mxfp is redundant"),
@@ -7335,7 +7372,7 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_non_default_bits() {
-        let err = validate_nvidia_recipe_options(None, false, Some(8), None)
+        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, false, Some(8), None)
             .expect_err("nvidia recipe must reject --q-bits != 4");
         assert!(
             err.contains("bits=4"),
@@ -7349,7 +7386,7 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_rejects_non_default_group_size() {
-        let err = validate_nvidia_recipe_options(None, false, None, Some(64))
+        let err = validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, Some(64))
             .expect_err("nvidia recipe must reject --q-group-size != 32");
         assert!(
             err.contains("group_size=32"),
@@ -7363,7 +7400,7 @@ mod tests {
 
     #[test]
     fn nvidia_recipe_options_accepts_bare() {
-        validate_nvidia_recipe_options(None, false, None, None)
+        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, None)
             .expect("bare --q-recipe nvidia (no explicit flags) must be accepted");
     }
 
@@ -7371,8 +7408,55 @@ mod tests {
     fn nvidia_recipe_options_accepts_explicit_matching_defaults() {
         // Explicit-but-matching bits=4 / group_size=32 contradict nothing and
         // must pass: the guard only rejects values that would alter the map.
-        validate_nvidia_recipe_options(None, false, Some(4), Some(32))
+        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, Some(4), Some(32))
             .expect("explicit bits=4 group_size=32 must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_qwen3_5_and_moe() {
+        // The recipe is documented + validated for exactly these two families.
+        // A bare invocation (no aux flags) on either must pass.
+        validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, None)
+            .expect("qwen3_5 must be accepted");
+        validate_nvidia_recipe_options(Some("qwen3_5_moe"), None, false, None, None)
+            .expect("qwen3_5_moe must be accepted");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_non_qwen_model_types() {
+        // Other families' loaders were never designed for the nvidia recipe's
+        // mxfp4/mxfp8 per-layer map — reject upfront. The model-type gate fires
+        // before the aux-flag checks, so it holds even with otherwise-valid
+        // (bare) flags.
+        for mt in ["gemma4", "lfm2", "lfm2_moe", "qwen3"] {
+            let err = validate_nvidia_recipe_options(Some(mt), None, false, None, None)
+                .expect_err("nvidia recipe must reject a non-qwen3_5 model type");
+            assert!(
+                err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+                "error must name the supported model types, got: {err}"
+            );
+            assert!(
+                err.contains(&format!("'{mt}'")),
+                "error must echo the offending model type {mt}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn nvidia_recipe_options_rejects_omitted_model_type() {
+        // `None` = no `--model-type` (safetensors auto-detect fell through) or
+        // the GGUF entry point (which has no HF model_type in scope). Both must
+        // fail upfront rather than run the generic-substring predicate.
+        let err = validate_nvidia_recipe_options(None, None, false, None, None)
+            .expect_err("nvidia recipe must reject an omitted model type");
+        assert!(
+            err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+            "error must name the supported model types, got: {err}"
+        );
+        assert!(
+            err.contains("got none"),
+            "error must report the omitted model type as 'none', got: {err}"
+        );
     }
 
     #[test]
