@@ -46,14 +46,29 @@ const MODEL_PATH =
   '/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16';
 const CACHE_DIR = '/Users/brooklyn/workspace/github/mlx-node/.cache/jlens';
 const RAW_RECORDS = join(CACHE_DIR, 'wikitext-raw-records.jsonl');
-const CORPUS_PATH = join(CACHE_DIR, 'corpus-128.jsonl');
-const META_PATH = join(CACHE_DIR, 'corpus-meta.json');
 
-const MIN_CHARS = 600; // matches reference `min_chars`
-const WINDOW = 128; // design-freeze D2 equal-length prompts
-const EMIT_MAX = 30; // emit up to this many 128-tok sequences (>=20 for the pilot)
-const EMIT_MIN = 20; // hard floor — the pilot needs 10 fit + sweep + margin
-const FETCH_WANT = 60; // qualifying raw records to cache (margin over EMIT_MAX)
+// ---------------------------------------------------------------------------
+// Parameterization (T3.1). The PILOT defaults are UNCHANGED when no env var is
+// set — env only re-targets the output paths + emit/fetch counts so the SAME
+// script can build the production `-v1` corpus (100 windows) or a tiny smoke
+// corpus without touching the pilot artifacts. Deterministic streaming means a
+// bigger raw-records cache still yields the identical first-N records.
+//   JLENS_CORPUS_OUT  — corpus jsonl output (default pilot corpus-128.jsonl)
+//   JLENS_META_OUT    — meta sidecar (default: derived from CORPUS_OUT, or the
+//                       pilot corpus-meta.json when CORPUS_OUT is the pilot path)
+//   JLENS_EMIT_MAX    — EXACT window count to emit (default 30)
+//   JLENS_EMIT_MIN    — hard floor sanity bound (default 20)
+//   JLENS_FETCH_WANT  — qualifying raw records to cache; must exceed the records
+//                       needed to yield EMIT_MAX windows (default 60)
+//   JLENS_MIN_CHARS   — min stripped chars per raw record (default 600)
+// ---------------------------------------------------------------------------
+const PILOT_CORPUS_PATH = join(CACHE_DIR, 'corpus-128.jsonl');
+const CORPUS_PATH = process.env.JLENS_CORPUS_OUT ?? PILOT_CORPUS_PATH;
+const META_PATH =
+  process.env.JLENS_META_OUT ??
+  (CORPUS_PATH === PILOT_CORPUS_PATH
+    ? join(CACHE_DIR, 'corpus-meta.json') // preserve the pilot's exact meta filename
+    : CORPUS_PATH.replace(/\.jsonl$/, '-meta.json'));
 
 function log(msg: string): void {
   console.log(msg);
@@ -62,6 +77,20 @@ function fail(msg: string): never {
   console.error(`\nFAIL: ${msg}`);
   process.exit(1);
 }
+/** Parse a positive-integer env override, falling back to the pilot default. */
+function envInt(name: string, dflt: number): number {
+  const v = process.env[name];
+  if (v == null || v === '') return dflt;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n <= 0) fail(`env ${name}=${JSON.stringify(v)} is not a positive integer`);
+  return n;
+}
+
+const MIN_CHARS = envInt('JLENS_MIN_CHARS', 600); // matches reference `min_chars`
+const WINDOW = 128; // design-freeze D2 equal-length prompts
+const EMIT_MAX = envInt('JLENS_EMIT_MAX', 30); // emit EXACTLY this many 128-tok sequences
+const EMIT_MIN = envInt('JLENS_EMIT_MIN', 20); // hard floor — pilot needs 10 fit + sweep + margin
+const FETCH_WANT = envInt('JLENS_FETCH_WANT', 60); // qualifying raw records to cache (margin over EMIT_MAX)
 
 /**
  * Ensure the raw-text record cache exists. If missing/short, stream
@@ -72,11 +101,15 @@ function fail(msg: string): never {
 function ensureRawRecords(): void {
   if (existsSync(RAW_RECORDS)) {
     const n = readFileSync(RAW_RECORDS, 'utf8').trim().split('\n').filter(Boolean).length;
-    if (n >= EMIT_MIN) {
-      log(`raw records cache present (${n} records) -> ${RAW_RECORDS}`);
+    // Reuse only when the cache holds enough records to cover FETCH_WANT (which
+    // must be sized above the records needed for EMIT_MAX windows). A pilot cache
+    // of exactly FETCH_WANT=60 still reuses; a larger production FETCH_WANT (e.g.
+    // 300) forces a deterministic refetch (identical first-60, plus more).
+    if (n >= FETCH_WANT) {
+      log(`raw records cache present (${n} >= FETCH_WANT=${FETCH_WANT}) -> ${RAW_RECORDS}`);
       return;
     }
-    log(`raw records cache too small (${n} < ${EMIT_MIN}); refetching`);
+    log(`raw records cache too small (${n} < FETCH_WANT=${FETCH_WANT}); refetching`);
   }
   log(`fetching WikiText-103-raw-v1 (train, len>=${MIN_CHARS}) via uv+datasets streaming ...`);
   const py = `

@@ -103,11 +103,11 @@ function fail(msg: string): never {
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
-function loadCorpus(): number[][] {
-  if (!existsSync(CORPUS_PATH)) {
-    fail(`corpus not found at ${CORPUS_PATH} — run prepare-corpus.mts first`);
+function loadCorpus(corpusPath: string = CORPUS_PATH): number[][] {
+  if (!existsSync(corpusPath)) {
+    fail(`corpus not found at ${corpusPath} — run prepare-corpus.mts first`);
   }
-  const seqs = readFileSync(CORPUS_PATH, 'utf8')
+  const seqs = readFileSync(corpusPath, 'utf8')
     .trim()
     .split('\n')
     .filter(Boolean)
@@ -191,6 +191,44 @@ function safetensorsKeys(path: string): string[] {
   const headerLen = Number(buf.readBigUInt64LE(0));
   const header = JSON.parse(buf.subarray(8, 8 + headerLen).toString('utf8'));
   return Object.keys(header).filter((k) => k !== '__metadata__');
+}
+
+/** Read the full safetensors header map (name -> {dtype, shape, data_offsets}). */
+function safetensorsHeader(path: string): StHeader {
+  const buf = readFileSync(path);
+  const headerLen = Number(buf.readBigUInt64LE(0));
+  return JSON.parse(buf.subarray(8, 8 + headerLen).toString('utf8')) as StHeader;
+}
+
+// ---------------------------------------------------------------------------
+// Pack export = the PROVEN native F32 path (T3.1). The native `export_pack`
+// (crates/mlx-core .../qwen3_5/jlens_fit.rs) writes J.{l} = Jsum.{l}/n_done as
+// F32 (~96 MB), the SAME serializer the pilot uses. We pass `packPath` to the
+// fit worker so the native writes the pack on completion, and re-export from an
+// already-complete checkpoint by invoking the native fit with 0 new prompts
+// (export is gated on n_done>0, not prompts_this_run). f16 is DEFERRED to
+// browser-shipping time (Phase 4): T3.2/T3.3 read this pack NATIVELY via
+// lensReadout, so f16 adds no value here and a hand-written f16 pack would be an
+// unnecessary correctness risk on the critical path of an ~11 h fit.
+// ---------------------------------------------------------------------------
+/** Assert a pack has EXACTLY keys J.1..J.23, all dtype F32, shape [HIDDEN,HIDDEN].
+ *  Returns the sorted key list + file size in bytes. */
+function assertPackF32(packPath: string): { keys: string[]; bytes: number } {
+  if (!existsSync(packPath)) fail(`pack not found at ${packPath}`);
+  const header = safetensorsHeader(packPath);
+  const keys = Object.keys(header)
+    .filter((k) => k !== '__metadata__')
+    .sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)));
+  const expected = Array.from({ length: 23 }, (_, i) => `J.${i + 1}`);
+  if (keys.join(',') !== expected.join(',')) fail(`pack keys != exactly J.1..J.23: got [${keys.join(', ')}]`);
+  for (const k of keys) {
+    if (header[k].dtype !== 'F32') fail(`pack ${k} dtype ${header[k].dtype} != F32`);
+    const sh = header[k].shape;
+    if (sh.length !== 2 || sh[0] !== HIDDEN || sh[1] !== HIDDEN) {
+      fail(`pack ${k} shape [${sh.join(',')}] != [${HIDDEN},${HIDDEN}]`);
+    }
+  }
+  return { keys, bytes: statSync(packPath).size };
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +826,403 @@ async function orchestrator(): Promise<void> {
   process.exit(1);
 }
 
+// ===========================================================================
+// PRODUCTION ORCHESTRATOR (T3.1) — selected by JLENS_MODE=production.
+//
+// A single STRAIGHT fit 0 -> N_FIT (default 100) over the v1 corpus with:
+//   - NO artificial self-kill (the pilot's KILL_AT was only a resume proof);
+//   - per-prompt checkpointing (the native saves the checkpoint after EVERY
+//     prompt when useCheckpointing=true, so a crash at n_done=k resumes from k);
+//   - a Bv sweep re-run at the REAL window length (SWEEP_TOKENS=128) to pick the
+//     fastest dimBatch that fits memory;
+//   - an F32 pack export (J.1..J.23) via the proven native export_pack;
+//   - an "already-complete" fast path (n_done>=N_FIT -> skip fit, re-export pack);
+//   - the pilot's convergence logging + final lensReadout smoke gate.
+//
+// The pilot orchestrator above is UNCHANGED; when JLENS_MODE is unset the pilot
+// path runs byte-identically. All v1 paths default under .cache/jlens and are
+// individually overridable, so the smoke uses fully separate files.
+// ===========================================================================
+interface ProdConfig {
+  corpusPath: string;
+  ckptPath: string;
+  packPath: string;
+  logPath: string;
+  sweepDir: string;
+  nFit: number;
+  sweepTokens: number;
+  bvs: number[];
+  dimBatchPinned: number | null;
+  testKillAt: number | null;
+}
+interface SweepRow {
+  bv: number;
+  secPerPrompt: number;
+  peakMemoryMb: number;
+  nValidLast: number;
+}
+interface SmokeResult {
+  loaded: number;
+  jacobianApplied: boolean;
+  jDemotedLogitTop: number;
+  logitTopRanksUnderJ: number[];
+  jIds: number[];
+  jTexts: string[];
+  lIds: number[];
+  lTexts: string[];
+  anyNaN: boolean;
+}
+
+function prodEnvInt(name: string, dflt: number): number {
+  const v = process.env[name];
+  if (v == null || v === '') return dflt;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n <= 0) fail(`env ${name}=${JSON.stringify(v)} is not a positive integer`);
+  return n;
+}
+
+function prodConfig(): ProdConfig {
+  const bvs = (process.env.JLENS_BVS ?? '8,16,32')
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (bvs.length === 0) fail(`JLENS_BVS parsed to no valid ints`);
+  return {
+    corpusPath: process.env.JLENS_CORPUS_PATH ?? join(CACHE_DIR, 'corpus-128-v1.jsonl'),
+    ckptPath: process.env.JLENS_CKPT_PATH ?? join(CACHE_DIR, 'v1.ckpt.safetensors'),
+    packPath: process.env.JLENS_PACK_PATH ?? join(CACHE_DIR, 'lens-pack-v1.safetensors'),
+    logPath: process.env.JLENS_LOG_PATH ?? join(CACHE_DIR, 'fit-v1-log.json'),
+    sweepDir: process.env.JLENS_SWEEP_DIR ?? join(CACHE_DIR, 'sweep-v1'),
+    nFit: prodEnvInt('JLENS_N_FIT', 100),
+    sweepTokens: prodEnvInt('JLENS_SWEEP_TOKENS', 128),
+    bvs,
+    dimBatchPinned: process.env.JLENS_DIM_BATCH ? Number(process.env.JLENS_DIM_BATCH) : null,
+    testKillAt: process.env.JLENS_TEST_KILL_AT ? Number(process.env.JLENS_TEST_KILL_AT) : null,
+  };
+}
+
+/** Best-effort corpus-meta read (informational log field only; never fatal). */
+function readCorpusMeta(corpusPath: string): unknown | null {
+  const candidates = [
+    process.env.JLENS_META_PATH,
+    corpusPath.replace(/\.jsonl$/, '-meta.json'),
+    join(CACHE_DIR, 'corpus-meta.json'),
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) return JSON.parse(readFileSync(c, 'utf8'));
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+/** Load pack + lensReadout(useJacobian) smoke — the production gate. */
+async function runReadoutSmoke(
+  cfg: ProdConfig,
+  corpus: number[][],
+  smokeIdx: number,
+): Promise<{ ok: boolean; reason: string | null; smoke: SmokeResult | { error: string } }> {
+  console.log(
+    `\n[SMOKE] loadLensPackFromFile + lensReadout(useJacobian, layer=${SMOKE_LAYER}) on corpus seq #${smokeIdx}`,
+  );
+  const smokePrompt = corpus[smokeIdx].slice(0, SMOKE_PROMPT_TOKENS);
+  const smokeRun = await runWorker({
+    kind: 'smoke',
+    packPath: cfg.packPath,
+    promptIds: smokePrompt,
+    layer: SMOKE_LAYER,
+    topK: SMOKE_TOPK,
+  });
+  const smoke = parseSentinel<SmokeResult>(smokeRun.stdout, '__SMOKE_RESULT__');
+  const smokeErr = parseSentinel<{ message: string }>(smokeRun.stdout, '__WORKER_ERROR__');
+  if (!smoke || smokeRun.code !== 0) {
+    return {
+      ok: false,
+      reason: `smoke worker failed (code ${smokeRun.code}): ${smokeErr?.message ?? 'no __SMOKE_RESULT__'}`,
+      smoke: smoke ?? { error: smokeErr?.message ?? 'no __SMOKE_RESULT__' },
+    };
+  }
+  if (smoke.loaded !== 23) return { ok: false, reason: `pack loaded ${smoke.loaded} Jacobians, expected 23`, smoke };
+  if (!smoke.jacobianApplied) return { ok: false, reason: `jacobianApplied=false after loading a pack`, smoke };
+  if (smoke.anyNaN) return { ok: false, reason: `J-lens readout produced NaN logits`, smoke };
+  if (!(smoke.jDemotedLogitTop >= 1)) {
+    return {
+      ok: false,
+      reason: `J-lens demoted 0 of the logit-top-${SMOKE_TOPK} ids at ℓ${SMOKE_LAYER} (J≈I, not doing anything)`,
+      smoke,
+    };
+  }
+  console.log(
+    `[SMOKE] loaded=${smoke.loaded} jacobianApplied=${smoke.jacobianApplied} ` +
+      `jDemotedLogitTop=${smoke.jDemotedLogitTop}/${SMOKE_TOPK} (J!=logit)  -> PASS`,
+  );
+  console.log(`  J-lens ℓ${SMOKE_LAYER} top: [${smoke.jIds.slice(0, 5).join(', ')}] ("${smoke.jTexts.slice(0, 4).join('","')}")`);
+  console.log(`  logit  ℓ${SMOKE_LAYER} top: [${smoke.lIds.slice(0, 5).join(', ')}] ("${smoke.lTexts.slice(0, 4).join('","')}")`);
+  return { ok: true, reason: null, smoke };
+}
+
+async function productionOrchestrator(): Promise<void> {
+  const t0 = Date.now();
+  const cfg = prodConfig();
+  mkdirSync(CACHE_DIR, { recursive: true });
+
+  const corpus = loadCorpus(cfg.corpusPath);
+  if (corpus.length < cfg.nFit) {
+    fail(`corpus has ${corpus.length} sequences at ${cfg.corpusPath}, need >= N_FIT=${cfg.nFit}`);
+  }
+  const fitCorpus = corpus.slice(0, cfg.nFit);
+  // Held-out seq for the readout smoke; when corpus == N_FIT, use the last fitted.
+  const smokeIdx = corpus.length > cfg.nFit ? cfg.nFit : cfg.nFit - 1;
+
+  console.log(`\n==================== T3.1 PRODUCTION FIT ====================`);
+  console.log(`corpus: ${corpus.length} seqs (128 tok) @ ${cfg.corpusPath}; fitting first ${cfg.nFit}`);
+  console.log(`  ckpt=${cfg.ckptPath}`);
+  console.log(`  pack=${cfg.packPath}  (F32)`);
+  console.log(`  log =${cfg.logPath}`);
+
+  const existing = readCheckpointScalars(cfg.ckptPath);
+  if (existing) {
+    console.log(`[RESUME] existing checkpoint n_done=${existing.nDone} next_idx=${existing.nextIdx}`);
+  } else {
+    console.log(`[FRESH] no checkpoint at ${cfg.ckptPath} — straight fit 0 -> ${cfg.nFit}`);
+  }
+
+  const snapshots: Snapshot[] = [];
+  let sweep: SweepRow[] | null = null;
+  let dimBatch: number | null = null;
+  let res: any | null = null;
+  let mode: 'reexport-complete' | 'fresh-fit' | 'resume-fit';
+
+  if (existing && existing.nDone >= cfg.nFit) {
+    // -------- Already complete: skip fit + sweep, re-export the F32 pack via the
+    // native fit with 0 NEW prompts. `export_pack` is gated on n_done>0 (not
+    // prompts_this_run), so a fully-complete resumed checkpoint still re-writes the
+    // pack. Requires the IDENTICAL corpus (the checkpoint fingerprint is
+    // revalidated on resume) — we pass the same fitCorpus. --------
+    mode = 'reexport-complete';
+    console.log(`[COMPLETE] n_done=${existing.nDone} >= N_FIT=${cfg.nFit}; skipping fit, re-exporting F32 pack (0 new prompts)`);
+    const reexportRun = await runWorker({
+      kind: 'fit',
+      promptIds: fitCorpus,
+      dimBatch: cfg.dimBatchPinned ?? 8, // irrelevant with 0 new prompts
+      skipFirst: SKIP_FIRST,
+      maxSeqLen: MAX_SEQ_LEN,
+      useCheckpointing: USE_CHECKPOINTING,
+      resume: true,
+      checkpointPath: cfg.ckptPath,
+      packPath: cfg.packPath,
+    });
+    res = parseSentinel<any>(reexportRun.stdout, '__FIT_RESULT__');
+    if (!res || reexportRun.code !== 0) {
+      const err = parseSentinel<{ message: string }>(reexportRun.stdout, '__WORKER_ERROR__');
+      fail(`re-export worker failed (code ${reexportRun.code}): ${err?.message ?? 'no __FIT_RESULT__'}`);
+    }
+    if (res.promptsThisRun !== 0) {
+      console.log(`[COMPLETE] note: re-export processed ${res.promptsThisRun} prompt(s) (checkpoint was not fully complete)`);
+    }
+  } else {
+    mode = existing ? 'resume-fit' : 'fresh-fit';
+
+    // -------- Bv sweep at the REAL window length (unless pinned) --------
+    if (cfg.dimBatchPinned != null) {
+      dimBatch = cfg.dimBatchPinned;
+      if (dimBatch > 32) fail(`pinned dimBatch=${dimBatch} exceeds the 32 ceiling (never exceed 32)`);
+      console.log(`[SWEEP] skipped — dimBatch pinned to ${dimBatch} via JLENS_DIM_BATCH`);
+    } else {
+      console.log(`[SWEEP] dimBatch ∈ {${cfg.bvs.join(', ')}} on ONE ${cfg.sweepTokens}-tok prompt (throwaway ckpts)`);
+      rmSync(cfg.sweepDir, { recursive: true, force: true });
+      mkdirSync(cfg.sweepDir, { recursive: true });
+      const sweepPrompt = fitCorpus[0].slice(0, cfg.sweepTokens);
+      const sweepRun = await runWorker({
+        kind: 'sweep',
+        promptIds: [sweepPrompt],
+        bvs: cfg.bvs,
+        dir: cfg.sweepDir,
+        skipFirst: SKIP_FIRST,
+        maxSeqLen: cfg.sweepTokens,
+        useCheckpointing: USE_CHECKPOINTING,
+      });
+      sweep = parseSentinel<SweepRow[]>(sweepRun.stdout, '__SWEEP_RESULT__');
+      if (!sweep || sweepRun.code !== 0) fail(`Bv sweep worker failed (code ${sweepRun.code})`);
+      const fastest = sweep.reduce((a, b) => (b.secPerPrompt < a.secPerPrompt ? b : a));
+      dimBatch = fastest.bv;
+      console.log(
+        `[SWEEP] @${cfg.sweepTokens}tok: ` +
+          `${sweep.map((s) => `bv${s.bv}=${s.secPerPrompt.toFixed(1)}s/${s.peakMemoryMb.toFixed(0)}MB`).join('  ')}`,
+      );
+      console.log(`[SWEEP] winner: bv=${dimBatch} (fastest per-prompt @${cfg.sweepTokens} tok)`);
+    }
+    if (dimBatch > 32) fail(`dimBatch=${dimBatch} exceeds the 32 ceiling (never exceed 32)`);
+
+    // -------- Straight fit, per-prompt ckpt, NO artificial kill --------
+    const conv: ConvState = { prevJsum: null, prevN: existing?.nDone ?? 0 };
+    const resume = existing != null;
+    if (resume && existsSync(cfg.ckptPath)) {
+      // Seed convergence chain so the first post-resume prompt has a real delta.
+      try {
+        conv.prevJsum = readJsumArrays(cfg.ckptPath);
+        conv.prevN = existing!.nDone;
+      } catch {
+        /* non-fatal — first post-resume row just reports meanRelChange=null */
+      }
+    }
+    const killAt = cfg.testKillAt; // null in real production; SMOKE-ONLY crash injection
+    if (killAt != null) {
+      console.log(`[TEST-KILL] SMOKE-ONLY crash injection: SIGKILL once n_done>=${killAt}`);
+    }
+    console.log(
+      `[FIT] resume=${resume} dimBatch=${dimBatch} skipFirst=${SKIP_FIRST} ` +
+        `maxSeqLen=${MAX_SEQ_LEN} useCheckpointing=${USE_CHECKPOINTING} (per-prompt checkpoint)`,
+    );
+    const fitPhase = await runFitPhase(
+      {
+        kind: 'fit',
+        promptIds: fitCorpus,
+        dimBatch,
+        skipFirst: SKIP_FIRST,
+        maxSeqLen: MAX_SEQ_LEN,
+        useCheckpointing: USE_CHECKPOINTING,
+        resume,
+        checkpointPath: cfg.ckptPath,
+        packPath: cfg.packPath, // native writes the F32 pack on completion (proven pilot path)
+      },
+      snapshots,
+      conv,
+      killAt,
+    );
+
+    if (fitPhase.run.killed) {
+      // SMOKE-ONLY crash injection landed. Do NOT export — leave the partial
+      // checkpoint so a re-run resumes from it. Exit non-zero (simulated crash).
+      const afterKill = readCheckpointScalars(cfg.ckptPath);
+      console.log(
+        `[TEST-KILL] SIGKILL landed; checkpoint n_done=${afterKill?.nDone} next_idx=${afterKill?.nextIdx} — re-run to resume`,
+      );
+      process.exit(137);
+    }
+    if (!fitPhase.result) {
+      fail(`fit worker returned no result (code ${fitPhase.run.code}; signal ${fitPhase.run.signal})`);
+    }
+    res = fitPhase.result;
+    console.log(
+      `[FIT] nDone=${res.nDone} promptsThisRun=${res.promptsThisRun} skipped=${res.promptsSkipped} ` +
+        `secPerPrompt=${res.secPerPrompt.toFixed(1)}s maxJ/sqrtD=${res.maxJNormOverSqrtD.toFixed(4)} peakMb=${res.peakMemoryMb.toFixed(0)}`,
+    );
+    if (res.nDone !== cfg.nFit) fail(`final n_done=${res.nDone} != N_FIT=${cfg.nFit}`);
+  }
+
+  // ==================== FINALIZE (common to all modes) ====================
+  // The native fit already wrote the F32 pack to packPath (on completion, or on
+  // the 0-prompt re-export). Assert it is EXACTLY J.1..J.23 / F32 [HIDDEN,HIDDEN].
+  const { keys: packKeys, bytes: packBytes } = assertPackF32(cfg.packPath);
+  console.log(
+    `[PACK] ${packKeys.length} keys = EXACTLY J.1..J.23, all F32 [${HIDDEN},${HIDDEN}], ` +
+      `${(packBytes / 1e6).toFixed(1)} MB (checkpoint n_done=${res ? res.nDone : existing?.nDone})  -> PASS`,
+  );
+
+  // Readout smoke gate.
+  const smokeRes = await runReadoutSmoke(cfg, corpus, smokeIdx);
+
+  // Convergence series (mean_rel_change should trend down ~1/n).
+  const perPrompt = snapshots.map((s) => ({
+    n_done: s.nDone,
+    secPerPromptFit: s.secPerPromptFit,
+    maxJNormOverSqrtD: s.maxJNormOverSqrtD,
+    meanRelChange: s.meanRelChange,
+    maxRelChange: s.maxRelChange,
+  }));
+  const rels = perPrompt.filter((p) => p.meanRelChange != null).map((p) => p.meanRelChange as number);
+  const convergesDown = rels.length >= 2 && rels[rels.length - 1] < rels[0];
+  const finalNDone = res ? res.nDone : existing!.nDone;
+  // Re-export runs 0 prompts, so its native secPerPrompt is meaningless — null it.
+  const secPerPrompt = res && res.promptsThisRun > 0 ? res.secPerPrompt : null;
+  const totalWallSec = (Date.now() - t0) / 1000;
+
+  const log = {
+    task: 'T3.1',
+    mode,
+    generated_at: new Date().toISOString(),
+    model: MODEL_PATH,
+    corpus_path: cfg.corpusPath,
+    corpus_meta: readCorpusMeta(cfg.corpusPath),
+    settings: {
+      n_fit: cfg.nFit,
+      dim_batch: dimBatch,
+      dim_batch_pinned: cfg.dimBatchPinned,
+      skip_first: SKIP_FIRST,
+      max_seq_len: MAX_SEQ_LEN,
+      use_checkpointing: USE_CHECKPOINTING,
+      sweep_tokens: cfg.sweepTokens,
+      kill_at: null,
+      test_kill_at: cfg.testKillAt,
+    },
+    bv_sweep: sweep ? { tokens: cfg.sweepTokens, results: sweep, fastest_bv: dimBatch } : null,
+    per_prompt: perPrompt,
+    convergence: {
+      mean_rel_change_series: rels,
+      trends_down: convergesDown,
+      note:
+        'mean_rel_change = mean over J.1..J.23 of ||pack_n - pack_{n-1}||_F / (||pack_n||_F + 1e-12); ' +
+        'running-mean pack -> ~1/n decay expected.',
+    },
+    resume: {
+      resumed: mode !== 'fresh-fit',
+      resumed_from_n_done: existing?.nDone ?? 0,
+      prompts_this_run: res ? res.promptsThisRun : 0,
+      final_n_done: finalNDone,
+    },
+    timing: {
+      sec_per_prompt: secPerPrompt,
+      total_wall_sec: totalWallSec,
+      projected_100_prompt_hours: secPerPrompt != null ? (secPerPrompt * 100) / 3600 : null,
+    },
+    native_result: res,
+    pack: { path: cfg.packPath, dtype: 'F32', keys: packKeys.length, bytes: packBytes, checkpoint_n_done: finalNDone },
+    checkpoint_path: cfg.ckptPath,
+    smoke_ok: smokeRes.ok,
+    smoke_fail_reason: smokeRes.reason,
+    smoke: smokeRes.smoke,
+  };
+  writeFileSync(cfg.logPath, JSON.stringify(log, null, 2) + '\n');
+
+  // ---------- Summary ----------
+  console.log(`\n==================== PRODUCTION SUMMARY (${mode}) ====================`);
+  if (perPrompt.length) {
+    console.log(`  per-prompt (n_done | secFit | maxJ/sqrtD | meanRelChg):`);
+    for (const p of perPrompt) {
+      console.log(
+        `    ${String(p.n_done).padStart(3)} | ` +
+          `${p.secPerPromptFit != null ? p.secPerPromptFit.toFixed(1).padStart(6) + 's' : '   n/a'} | ` +
+          `${p.maxJNormOverSqrtD.toFixed(4)} | ` +
+          `${p.meanRelChange != null ? p.meanRelChange.toExponential(3) : '   n/a'}`,
+      );
+    }
+  }
+  if (sweep) {
+    console.log(
+      `  Bv sweep (@${cfg.sweepTokens}tok): ${sweep.map((s) => `bv${s.bv}=${s.secPerPrompt.toFixed(1)}s`).join(' ')}  winner=bv${dimBatch}`,
+    );
+  }
+  if (secPerPrompt != null) {
+    console.log(`  secPerPrompt @128 (dimBatch=${dimBatch}): ${secPerPrompt.toFixed(1)}s`);
+    console.log(`  projected 100 prompts: ${((secPerPrompt * 100) / 3600).toFixed(2)} h`);
+  }
+  console.log(`  convergence trends_down=${convergesDown} (series ${rels.map((r) => r.toExponential(2)).join(' -> ')})`);
+  console.log(`  resume: from n_done=${existing?.nDone ?? 0}, +${res ? res.promptsThisRun : 0} this run -> ${finalNDone}/${cfg.nFit}`);
+  console.log(`  pack: ${cfg.packPath} (F32, ${(packBytes / 1e6).toFixed(1)} MB)`);
+  console.log(`  log:  ${cfg.logPath}`);
+  console.log(`  total wall: ${(totalWallSec / 60).toFixed(1)} min`);
+  if (smokeRes.ok) {
+    console.log(`\n==================== ALL GATES PASS ====================`);
+    process.exit(0);
+  }
+  console.error(`\n============ SMOKE GATE FAILED (fit data preserved at ${cfg.logPath}) ============`);
+  console.error(`  reason: ${smokeRes.reason}`);
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
 // WORKER (loads the model; runs ONE job)
 // ---------------------------------------------------------------------------
@@ -904,8 +1339,14 @@ async function worker(): Promise<void> {
 
 // ---------------------------------------------------------------------------
 if (process.env.__JLENS_FIT_WORKER) {
+  // WORKER is mode-agnostic (all paths come from the job file) — dispatch first.
   worker().catch((e) => {
     console.log('__WORKER_ERROR__ ' + JSON.stringify({ message: String(e?.message ?? e) }));
+    process.exit(1);
+  });
+} else if ((process.env.JLENS_MODE ?? 'pilot') === 'production') {
+  productionOrchestrator().catch((e) => {
+    console.error(e);
     process.exit(1);
   });
 } else {
