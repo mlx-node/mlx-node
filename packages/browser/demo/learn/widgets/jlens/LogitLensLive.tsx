@@ -119,7 +119,7 @@ const COPY = {
     gridTitle: 'Per-layer top token (deepest at the top)',
     gridAria: (nLayers: number, promptLen: number) =>
       `Logit-lens argmax grid: ${nLayers} residual boundaries as rows, deepest at the top, by ${promptLen} prompt positions as columns. Each cell is the model’s top token read at that depth through the final unembedding; the highlighted final column is the next-token prediction, which sharpens into the real answer only in the late layers.`,
-    finalColNote: 'The highlighted final column is the next-token prediction — read it top-to-bottom to see depth resolve the answer.',
+    finalColNote: 'The highlighted final column is the next-token prediction — read it bottom-to-top (shallow → deep) to watch depth resolve the answer.',
     heatmapTitle: 'Answer-token rank by depth (final position)',
     heatmapAria: (nPins: number) =>
       `Rank heatmap: ${nPins} pinned answer tokens as columns, residual boundaries as rows with the deepest at the top. Brighter cells mean a better (lower) full-vocab rank at the final position; the correct answer brightens only near the top of the stack.`,
@@ -165,7 +165,7 @@ const COPY = {
     gridTitle: '每一层的 top token（最深的在最上面）',
     gridAria: (nLayers: number, promptLen: number) =>
       `Logit-lens argmax 网格：${nLayers} 个 residual 边界作为行（最深的在最上面），${promptLen} 个提示位置作为列。每个格子是在该深度经过最终 unembedding 读出的 top token；高亮的最后一列是下一个 token 的预测，只有在靠后的 layer 才会收敛到真正的答案。`,
-    finalColNote: '高亮的最后一列是下一个 token 的预测——从上往下读，就能看到深度如何把答案解出来。',
+    finalColNote: '高亮的最后一列是下一个 token 的预测——从下往上读（从浅层到深层），就能看到深度如何把答案解出来。',
     heatmapTitle: '答案 token 的 rank 随深度变化（最后一个位置）',
     heatmapAria: (nPins: number) =>
       `Rank 热力图：${nPins} 个被 pin 的答案 token 作为列，residual 边界作为行（最深的在最上面）。格子越亮表示在最后位置的全词表 rank 越好（越低）；正确答案只有在最上面几层才会变亮。`,
