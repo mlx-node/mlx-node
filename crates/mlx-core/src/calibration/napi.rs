@@ -134,29 +134,40 @@ where
 /// in place) under a misleading success `0`. Skip the write and return `0`,
 /// leaving the file byte-untouched.
 ///
-/// A NON-empty map that nonetheless writes NOTHING is a distinct failure: the
-/// run DID exercise activation-fp8 sites, but the config has no per-layer mxfp8
-/// override object to attach `input_amax` to (a uniform `--q-mode mxfp8`
-/// checkpoint whose attn/GDN layers inherit the top-level mode). Reporting the
-/// collected `amax.len()` there would be a phantom success — the loader has
-/// nowhere to read the amax back. Fail LOUDLY instead (config.json is left
-/// byte-untouched by the zero-write guard in [`write_amax_into_config`]). Only a
-/// non-empty map that actually homed at least one `input_amax` returns its
-/// persisted-entry count.
+/// A NON-empty map that does not FULLY home is a distinct failure: the run DID
+/// exercise activation-fp8 sites, but the loader-preferred `quantization` alias
+/// has no (or too few) per-layer mxfp8 override objects to attach every
+/// `input_amax` to — a uniform `--q-mode mxfp8` checkpoint (attn/GDN inherit the
+/// top-level mode; zero homed), or a partial/drifted config (some homed, some
+/// not). Reporting the collected `amax.len()` there would be a phantom success —
+/// the loader would read no / incomplete amax back. Fail LOUDLY instead
+/// (config.json is left byte-untouched by the completeness guard in
+/// [`write_amax_into_config`], which only writes when the loader-preferred alias
+/// homes every finite collected key). Only a fully-homed map returns its
+/// persisted-key count.
 fn persist_amax_if_any(config_path: &Path, amax: &HashMap<String, f32>) -> Result<u32> {
     if amax.is_empty() {
         return Ok(0);
     }
+    // Completeness is measured against the FINITE collected count (non-finite
+    // maxima never home — see `write_amax_into_config`). Calibration succeeds only
+    // when the loader-preferred `quantization` alias homed EVERY finite collected
+    // key; zero (uniform-mxfp8) or partial (drifted config) homing is a loud
+    // failure, and `write_amax_into_config` has left config.json byte-untouched.
+    let expected = amax.values().filter(|v| v.is_finite()).count();
     let written = write_amax_into_config(config_path, amax)?;
-    if written == 0 {
+    if written == 0 || written < expected {
         return Err(Error::from_reason(format!(
-            "calibration collected {} activation-amax value(s) but config.json has no per-layer \
-             mxfp8 override entries to attach them to — this is a uniform/non-nvidia checkpoint \
-             (its attention/GDN layers inherit a top-level quantization mode with no per-layer \
-             overrides, so there is nowhere for the loader to read `input_amax`); config.json left \
-             unchanged. Re-quantize with `--q-recipe nvidia` to get per-layer FP8-activation \
-             calibration.",
-            amax.len()
+            "calibration collected {} activation-amax value(s) ({} finite) but only {} homed to \
+             per-layer mxfp8 override entries in the loader's `quantization` block — the \
+             checkpoint's attention/GDN activation-fp8 sites are not fully represented as \
+             per-layer overrides (a uniform `--q-mode mxfp8` checkpoint, or a partial/drifted \
+             config), so the loader would read no / incomplete `input_amax`; config.json left \
+             unchanged. Re-quantize with `--q-recipe nvidia` to get complete per-layer \
+             FP8-activation calibration.",
+            amax.len(),
+            expected,
+            written
         )));
     }
     Ok(written as u32)
@@ -449,7 +460,7 @@ mod tests {
         amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
         let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
         assert!(
-            err.reason.contains("no per-layer mxfp8 override entries")
+            err.reason.contains("per-layer mxfp8 override entries")
                 && err.reason.contains("left unchanged"),
             "must fail loudly naming the uniform/non-nvidia case, got: {}",
             err.reason
@@ -459,6 +470,104 @@ mod tests {
         assert_eq!(
             before, after,
             "a non-writable calibration must leave config.json byte-identical (no churn)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PARTIAL homing is also a phantom success: some collected activation-fp8
+    /// sites home to per-layer override objects but others (still mxfp8, inherited
+    /// from the top-level mode) do not, so the loader would read INCOMPLETE
+    /// `input_amax`. Must FAIL LOUDLY and leave config.json byte-identical (the
+    /// completeness guard skips the write when the preferred alias is not fully
+    /// homed).
+    #[test]
+    fn partially_homed_amax_errors_and_leaves_config_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_partial_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // q_proj HAS a per-layer override object; k_proj does NOT (inherits mxfp8).
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32); // homes
+        amax.insert("layers.0.self_attn.k_proj".to_string(), 5.0f32); // no object -> does NOT home
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("per-layer mxfp8 override entries")
+                && err.reason.contains("left unchanged"),
+            "partial homing must fail loudly, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a partial-home calibration must leave config.json byte-identical (no churn)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ALIAS DRIFT: the loader reads `quantization` first (quant_dispatch.rs:292),
+    /// falling back to `quantization_config`. If only the fallback alias homes the
+    /// site while the loader-preferred `quantization` alias has no matching object,
+    /// the loader would read NOTHING. Must FAIL LOUDLY (preferred alias homes 0)
+    /// and leave config.json byte-identical.
+    #[test]
+    fn alias_drift_only_fallback_homes_errors_and_leaves_config_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_aliasdrift_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // `quantization` (loader-preferred) has NO matching object; only the
+        // fallback `quantization_config` carries the q_proj override.
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": { "mode": "mxfp8", "bits": 8, "group_size": 32 },
+            "quantization_config": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("per-layer mxfp8 override entries")
+                && err.reason.contains("left unchanged"),
+            "alias drift (only fallback homes) must fail loudly, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "an alias-drift calibration must leave config.json byte-identical (no churn)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

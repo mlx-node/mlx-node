@@ -195,22 +195,38 @@ pub(crate) fn write_amax_into_config(
     // `quantization_config` alias. Update EVERY present object-valued alias so
     // the two never drift out of sync — one alias with stale (uncalibrated)
     // amax would be an internally-inconsistent config for a consumer reading it.
-    // `matched` records the deduped SOURCE keys that actually homed into a
-    // per-layer override object (so the two aliases can't double-count, and the
-    // qkv/z fanout to one merged source counts once).
-    let mut matched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The loader reads the `quantization` block first, falling back to
+    // `quantization_config` (quant_dispatch.rs:292). Calibration only counts as
+    // REAL when that loader-preferred alias homes EVERY collected activation-fp8
+    // key: a uniform `--q-mode mxfp8` checkpoint (no per-layer objects), a
+    // partially drifted config, or one where only the fallback alias homes would
+    // otherwise imply a phantom success while leaving sites uncalibrated. We still
+    // apply to every present alias in place (keep them in sync), but gate the
+    // write on the loader-preferred alias's completeness. Each alias's `matched`
+    // dedups the SOURCE keys (the two aliases can't double-count; the qkv/z fanout
+    // to one merged source counts once). Non-finite collected maxima never home
+    // (skipped in `apply_amax_to_block`), so completeness is measured against the
+    // FINITE collected count.
+    let expected = amax.values().filter(|v| v.is_finite()).count();
+    let mut preferred_homed: Option<usize> = None;
     for name in ["quantization", "quantization_config"] {
         if let Some(block) = config.get_mut(name).and_then(|v| v.as_object_mut()) {
+            let mut matched: std::collections::HashSet<String> = std::collections::HashSet::new();
             apply_amax_to_block(block, amax, &mut matched);
+            // First present alias == the one the loader will read.
+            preferred_homed.get_or_insert(matched.len());
         }
     }
+    let homed = preferred_homed.unwrap_or(0);
 
-    // Nothing was attached (e.g. a uniform `--q-mode mxfp8` checkpoint whose attn/GDN
-    // layers inherit the top-level mode and thus have no per-layer override object to
-    // hold `input_amax`). Do NOT rewrite/churn config.json, and report zero writes so
-    // the caller can fail loudly instead of claiming a phantom success.
-    if matched.is_empty() {
-        return Ok(0);
+    // The loader-preferred alias did not home every finite collected key: zero for
+    // a uniform-mxfp8 checkpoint (attn/GDN inherit the top-level mode with no
+    // per-layer override object), fewer than collected for a partial/drifted
+    // config, or an empty preferred alias when only the fallback homes. Do NOT
+    // rewrite/churn config.json; report the (insufficient) homed count so the
+    // caller fails loudly instead of claiming a phantom success.
+    if homed == 0 || homed < expected {
+        return Ok(homed);
     }
 
     let out = serde_json::to_string_pretty(&config)
@@ -248,7 +264,7 @@ pub(crate) fn write_amax_into_config(
             config_path.display()
         ))
     })?;
-    Ok(matched.len())
+    Ok(homed)
 }
 
 /// Thread each collected per-tensor `input_amax` into a single quantization
@@ -397,8 +413,11 @@ mod tests {
         );
     }
 
-    /// `write_amax_into_config` sets `input_amax` on matching quantization
-    /// entries, ignores keys with no entry, and preserves the rest of the config.
+    /// `write_amax_into_config` sets `input_amax` on the matching per-layer
+    /// quantization entries (every collected key homes here, so the completeness
+    /// guard writes), leaves non-collected config entries (mxfp4 FFN) untouched,
+    /// and preserves the rest of the config. (A collected key with NO homing entry
+    /// is a distinct failure exercised at the `persist_amax_if_any` layer.)
     #[test]
     fn write_amax_into_config_sets_input_amax() {
         let path = std::env::temp_dir().join(format!(
@@ -426,8 +445,6 @@ mod tests {
         let mut amax = HashMap::new();
         amax.insert("layers.0.self_attn.q_proj".to_string(), 12.5f32);
         amax.insert("layers.0.self_attn.k_proj".to_string(), 3.25f32);
-        // No entry for v_proj -> must be ignored (not created).
-        amax.insert("layers.0.self_attn.v_proj".to_string(), 99.0f32);
 
         write_amax_into_config(&path, &amax).unwrap();
 
@@ -450,8 +467,6 @@ mod tests {
         // Existing fields on a touched entry are intact.
         assert_eq!(q["layers.0.self_attn.q_proj"]["bits"], 8);
         assert_eq!(q["layers.0.self_attn.q_proj"]["mode"], "mxfp8");
-        // Key with no entry was ignored (not fabricated).
-        assert!(q.get("layers.0.self_attn.v_proj").is_none());
         // Untouched entry keeps its fields and gains no input_amax.
         assert!(q["layers.0.mlp.gate_proj"].get("input_amax").is_none());
         assert_eq!(q["layers.0.mlp.gate_proj"]["mode"], "mxfp4");
