@@ -5,12 +5,14 @@ import { Textarea } from '../../components/ui/textarea';
 import { runForInspector } from '../../lib/inspector-client';
 import { DemoCallout } from '../inspector/DemoCallout';
 import { TopKBars, renderTokenDisplay } from '../inspector/TopKBars';
+import { findChapter } from '../chapters';
 import { Prose } from '../Prose';
 import { ChapterFrame } from '../scaffolding/ChapterFrame';
 import { ChapterLink } from '../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../scaffolding/learning-data';
 import { MathDisplay } from '../scaffolding/MathDisplay';
 import { RunButton } from '../scaffolding/RunButton';
+import { SubChapterNav } from '../scaffolding/SubChapterNav';
 import { useRunFlash } from '../scaffolding/useRunFlash';
 import { InnerProductLogit } from '../widgets/InnerProductLogit';
 import { LmHeadWalkthrough } from '../widgets/LmHeadWalkthrough';
@@ -253,6 +255,14 @@ export function LmHeadChapterBody() {
           arbitrary real numbers that can be negative and whose magnitudes aren't comparable across prompts. Chapter 11
           is where temperature and top-p reshape that softmax into the model's actual choice.
         </p>
+
+        <p>
+          One matmul, but not a dead end. That same <code>W_U</code> read is a probe you can aim anywhere in the stack —
+          the deep-dive below points it at the middle layers and watches the answer emerge with depth, live on this
+          model.
+        </p>
+
+        <SubChapterNav chapterId="lm-head" items={findChapter('lm-head')?.sections} />
       </Prose>
     </ChapterFrame>
   );

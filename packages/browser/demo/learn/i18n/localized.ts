@@ -74,6 +74,12 @@ export const ZH_CHAPTER_META: Record<string, ChapterMetaOverlay> = {
   'lm-head': {
     title: 'LM head 与权重共享',
     blurb: 'last_hidden 如何变成 logits——一次矩阵乘法，而且用的就是嵌入矩阵本身。',
+    sections: {
+      'logit-lens': {
+        title: 'Logit lens',
+        blurb: '把 LM head 对准中间层，而不只是最后一层：从每个深度读出词表，看答案如何逐层浮现——logit lens，在你浏览器里的 Qwen3.5 上实时运行。',
+      },
+    },
   },
   sampling: {
     title: '采样',

@@ -119,6 +119,13 @@ export const CHAPTERS: ChapterMeta[] = [
     title: 'LM head & weight tying',
     blurb: 'How last_hidden becomes logits — one matmul, and the same matrix as the embedding.',
     available: true,
+    sections: [
+      {
+        id: 'logit-lens',
+        title: 'The logit lens',
+        blurb: 'Point the LM head at a middle layer instead of the last one: read the vocabulary out of every depth and watch the answer emerge — the logit lens, live on your in-browser Qwen3.5.',
+      },
+    ],
   },
   {
     id: 'sampling',
