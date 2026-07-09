@@ -2,11 +2,13 @@
 // Demo 组件保持英文，仍从英文模块 ../09-lm-head.tsx 渲染；本文件只翻译
 // 正文 Body 与 learning 数据。术语表的 term 字段保持英文原样。
 
+import { findChapter } from '../../chapters';
 import { Prose } from '../../Prose';
 import { ChapterFrame } from '../../scaffolding/ChapterFrame';
 import { ChapterLink } from '../../scaffolding/ChapterLink';
 import type { ChapterLearningData } from '../../scaffolding/learning-data';
 import { MathDisplay } from '../../scaffolding/MathDisplay';
+import { SubChapterNav } from '../../scaffolding/SubChapterNav';
 import { InnerProductLogit } from '../../widgets/InnerProductLogit';
 import { LmHeadWalkthrough } from '../../widgets/LmHeadWalkthrough';
 import { TiedUntiedLedger } from '../../widgets/TiedUntiedLedger';
@@ -218,6 +220,13 @@ export function LmHeadChapterBody() {
           1）。但 LM head 输出的原始分数是 <em>logits</em>——可正可负的任意实数，其大小在不同提示词之间不可比。第 11
           章将讲到 temperature 和 top-p 如何把这个 softmax 重塑成模型的最终选择。
         </p>
+
+        <p>
+          一次矩阵乘法，但不是死胡同。同样的 <code>W_U</code> 读法其实是一个可以对准 stack
+          中任意位置的探针——下面的深入阅读就把它对准中间层，实时地看着答案随深度逐层浮现。
+        </p>
+
+        <SubChapterNav chapterId="lm-head" items={findChapter('lm-head')?.sections} />
       </Prose>
     </ChapterFrame>
   );

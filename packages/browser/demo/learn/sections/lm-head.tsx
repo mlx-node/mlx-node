@@ -7,8 +7,9 @@
 // 2020). Unlike the other sub-chapters this one embeds a LIVE widget
 // (<LogitLensLive/>) that runs the plain logit lens on the in-browser
 // Qwen3.5-0.8B. Honesty (binding): this page runs the PLAIN logit lens only —
-// no Jacobian/tuned lens. The fitted-lens line of work is Anthropic's, on their
-// own models; this page neither runs nor reproduces it. The widget is SSG-safe
+// no Jacobian/tuned lens. The tuned lens is Belrose et al./EleutherAI (2023); the
+// Jacobian lens is Anthropic's, on their own models; this page neither runs nor
+// reproduces either fitted lens. The widget is SSG-safe
 // (renders a static frame under prerender when no providers are mounted).
 
 import { Prose } from '../Prose';
@@ -74,8 +75,8 @@ export function LmHeadLogitLensSection() {
       <p>
         The blind spot has a fix: instead of the raw <code>W_U</code>, transport each <code>h_ℓ</code> through a small
         learned map first, so the read matches what that particular layer actually encodes. A <em>tuned lens</em> learns
-        a per-layer affine probe; a <strong>Jacobian lens</strong> reads each <code>h_ℓ</code> through the network&rsquo;s
-        own averaged Jacobian. This fitted-lens line of work — the Jacobian lens in particular — is{' '}
+        a per-layer affine probe (Belrose et al., EleutherAI, 2023); a <strong>Jacobian lens</strong> reads each{' '}
+        <code>h_ℓ</code> through the network&rsquo;s own averaged Jacobian. That <em>Jacobian</em> lens is{' '}
         <strong>Anthropic&rsquo;s</strong>, developed and evaluated on <em>their</em> models, and it sharpens exactly the
         blurry middle layers you just watched refuse to resolve.
       </p>

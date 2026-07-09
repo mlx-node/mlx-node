@@ -3,7 +3,8 @@
 // （logit lens、token、layer、logits、W_U、Qwen3.5、Jacobian lens、tuned lens、
 // nostalgebraist、unembedding、residual、softmax、off-distribution），只翻译外围
 // 讲解。诚实约束（绑定）：本页只跑 PLAIN logit lens，不跑 Jacobian/tuned lens；
-// fitted-lens 那条线是 Anthropic 在他们自己模型上的工作，本页既不运行也不复现。
+// tuned lens 是 Belrose 等人/EleutherAI（2023），Jacobian lens 是 Anthropic 在
+// 他们自己模型上的工作，本页两种 fitted lens 都不运行也不复现。
 // 同一个 <LogitLensLive/> widget（已双语，按 useLocale() 切换文案）在此渲染。
 
 import { Prose } from '../../Prose';
@@ -51,8 +52,8 @@ export function LmHeadLogitLensSection() {
 
       <h2>怎么修：一个 fitted lens（以及本页不主张什么）</h2>
       <p>
-        盲区是有修法的：不用裸的 <code>W_U</code>，而是先让每个 <code>h_ℓ</code> 经过一个小小的、学出来的映射，让读法去匹配那一层真正编码的东西。<em>tuned lens</em> 为每一层学一个 affine 探针；<strong>Jacobian lens</strong> 则让每个{' '}
-        <code>h_ℓ</code> 经过网络自身的平均 Jacobian 来读。这条 fitted-lens 的线——尤其是 Jacobian lens——是 <strong>Anthropic</strong> 在<em>他们自己</em>的模型上做并评估的工作，它锐化的，正是你刚才看着迟迟不肯收敛的那些模糊的中间层。
+        盲区是有修法的：不用裸的 <code>W_U</code>，而是先让每个 <code>h_ℓ</code> 经过一个小小的、学出来的映射，让读法去匹配那一层真正编码的东西。<em>tuned lens</em> 为每一层学一个 affine 探针（Belrose 等人，EleutherAI，2023）；<strong>Jacobian lens</strong> 则让每个{' '}
+        <code>h_ℓ</code> 经过网络自身的平均 Jacobian 来读。其中 <em>Jacobian lens</em> 是 <strong>Anthropic</strong> 在<em>他们自己</em>的模型上做并评估的工作，它锐化的，正是你刚才看着迟迟不肯收敛的那些模糊的中间层。
       </p>
       <p className="text-muted-foreground">
         把范围说清楚：本页只跑 <strong>plain logit lens</strong>。它<em>不</em>跑 Jacobian lens，也不跑 tuned lens，更不主张复现 Anthropic 的结果——它只是把 fitted lens 想去补上的那块盲区，实时摆给你看。
