@@ -37,6 +37,9 @@ import {
   INSPECTOR_ERROR_TYPE,
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
+  LENS_READOUT_ERROR_TYPE,
+  LENS_READOUT_REQUEST_TYPE,
+  LENS_READOUT_RESULT_TYPE,
   SCORE_TOKENS_ERROR_TYPE,
   SCORE_TOKENS_REQUEST_TYPE,
   SCORE_TOKENS_RESULT_TYPE,
@@ -2632,6 +2635,146 @@ async function handleScoreTokens(data: { id: string; prefixIds: number[]; draftI
   }
 }
 
+// Interpretability chapter hook. Reads the model's vocabulary out of chosen
+// residual-stream boundaries via the NAPI `lensReadout` method and replies with
+// a {type:'lensReadoutResult'|'lensReadoutError', id, ...} message correlated by
+// the caller-supplied id. Single-shot like scoreTokens — the backend resets its
+// caches internally on both success and error, so this never touches the
+// SAB/streaming chat paths. `useJacobian` is forwarded verbatim: the browser
+// ships no lens pack, so callers pass `false` (the logit lens); a `true` with a
+// non-final layer and no pack HARD-ERRORS in the backend and that error is
+// surfaced as-is (never downgraded).
+async function handleLensReadout(data: {
+  id: string;
+  promptIds: number[];
+  layers?: number[];
+  topK: number;
+  pinnedIds?: number[];
+  useJacobian: boolean;
+}) {
+  const id = data.id;
+  if (!model || typeof model.lensReadout !== 'function') {
+    (self as any).postMessage({
+      type: LENS_READOUT_ERROR_TYPE,
+      id,
+      error: 'Model not loaded',
+    });
+    return;
+  }
+  try {
+    const promptIds = Array.isArray(data.promptIds) ? data.promptIds : [];
+    const layers = Array.isArray(data.layers) ? data.layers : undefined;
+    const pinnedIds = Array.isArray(data.pinnedIds) ? data.pinnedIds : undefined;
+    const topK = data.topK;
+    // Mirror the backend's bounds up front so obviously-bad requests fail with a
+    // clear message before crossing into wasm. The backend re-checks (plus
+    // vocab-range checks we can't do here), clamps topK to min(requested, 32,
+    // vocab), and truncates pinnedIds past the cap. Constants:
+    // LENS_MAX_POSITIONS=48, LENS_MAX_PINNED=8, boundaries 0..=24.
+    if (promptIds.length === 0) {
+      (self as any).postMessage({
+        type: LENS_READOUT_ERROR_TYPE,
+        id,
+        error: 'lensReadout: promptIds must be non-empty',
+      });
+      return;
+    }
+    if (promptIds.length > 48) {
+      (self as any).postMessage({
+        type: LENS_READOUT_ERROR_TYPE,
+        id,
+        error: `lensReadout: promptIds length must be <= 48 (LENS_MAX_POSITIONS) (got ${promptIds.length})`,
+      });
+      return;
+    }
+    if (!Number.isInteger(topK) || topK < 1) {
+      (self as any).postMessage({
+        type: LENS_READOUT_ERROR_TYPE,
+        id,
+        error: `lensReadout: topK must be an integer >= 1 (got ${String(topK)})`,
+      });
+      return;
+    }
+    if (pinnedIds && pinnedIds.length > 8) {
+      (self as any).postMessage({
+        type: LENS_READOUT_ERROR_TYPE,
+        id,
+        error: `lensReadout: pinnedIds length must be <= 8 (LENS_MAX_PINNED) (got ${pinnedIds.length})`,
+      });
+      return;
+    }
+    if (layers) {
+      for (const layer of layers) {
+        if (!Number.isInteger(layer) || layer < 0 || layer > 24) {
+          (self as any).postMessage({
+            type: LENS_READOUT_ERROR_TYPE,
+            id,
+            error: `lensReadout: layers must be integers in 0..=24 (got ${String(layer)})`,
+          });
+          return;
+        }
+      }
+    }
+
+    const result = await model.lensReadout(promptIds, {
+      layers,
+      topK,
+      pinnedIds,
+      useJacobian: data.useJacobian,
+    });
+
+    // Float32Array/Int32Array buffers are transferable for zero-copy
+    // postMessage. There are MANY buffers here (two per cell + one per pinned),
+    // so collect every DISTINCT ArrayBuffer via a `seen` set so we hand off
+    // ownership in one call without transferring any buffer twice (same dedup
+    // pattern as the scoreTokens handler's topKLogits transfer).
+    const transfer: ArrayBuffer[] = [];
+    const seen = new Set<ArrayBuffer>();
+    const pushBuf = (view: { buffer?: unknown } | null | undefined) => {
+      const buf = view?.buffer;
+      if (buf instanceof ArrayBuffer && !seen.has(buf)) {
+        seen.add(buf);
+        transfer.push(buf);
+      }
+    };
+    const cells = Array.isArray(result?.cells) ? result.cells : [];
+    for (const cell of cells) {
+      pushBuf(cell?.topKLogits);
+      pushBuf(cell?.topKProbs);
+    }
+    const pinned = Array.isArray(result?.pinned) ? result.pinned : [];
+    for (const p of pinned) {
+      pushBuf(p?.ranks);
+    }
+    (self as any).postMessage(
+      {
+        type: LENS_READOUT_RESULT_TYPE,
+        id,
+        // Echo the NAPI result through with its fields intact (same style as
+        // the scoreTokens handler), so the client gets the exact grid shape.
+        result: {
+          promptLen: result?.promptLen ?? promptIds.length,
+          topK: result?.topK ?? topK,
+          useJacobian: result?.useJacobian ?? data.useJacobian,
+          jacobianApplied: result?.jacobianApplied ?? false,
+          layers: result?.layers ?? [],
+          tokens: result?.tokens ?? [],
+          cells,
+          pinned,
+        },
+      },
+      transfer,
+    );
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({
+      type: LENS_READOUT_ERROR_TYPE,
+      id,
+      error: message,
+    });
+  }
+}
+
 // Training chapter playground hooks (chapter 13 — Training). Each drives the
 // worker-scoped `trainer` (a `TinyTrainer` NAPI instance) and replies with a
 // {type:'train*Result'|'train*Error', id, ...} message correlated by the
@@ -2784,6 +2927,9 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case SCORE_TOKENS_REQUEST_TYPE:
       void handleScoreTokens(e.data);
+      break;
+    case LENS_READOUT_REQUEST_TYPE:
+      void handleLensReadout(e.data);
       break;
     case TRAIN_INIT_REQUEST_TYPE:
       handleTrainInit(e.data);

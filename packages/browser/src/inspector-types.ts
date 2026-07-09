@@ -346,6 +346,107 @@ export const SCORE_TOKENS_RESULT_TYPE = 'scoreTokensResult' as const;
 export const SCORE_TOKENS_ERROR_TYPE = 'scoreTokensError' as const;
 
 // -----------------------------------------------------------------------------
+// LensReadout worker bridge (interpretability chapter — logit / Jacobian lens).
+// -----------------------------------------------------------------------------
+//
+// Read the model's vocabulary out of intermediate residual boundaries `h_ℓ`
+// through the tied unembedding `W_U`: ONE forward over `promptIds` yields a
+// `layers × positions` grid of per-cell top-K readouts plus per-pinned-token
+// full-vocab rank tracks. The worker handler calls the NAPI method
+// `model.lensReadout(promptIds, opts)` (sibling of `scoreTokens`; single-shot —
+// caches fully reset internally on both success and error, so this never
+// touches the SAB/streaming chat paths). Each cell's `topKLogits`/`topKProbs`
+// buffers and each pinned's `ranks` buffer are transferred for zero-copy
+// postMessage. `useJacobian` is forwarded verbatim: the browser ships no lens
+// pack, so real callers pass `false` (the logit lens); a `true` with a
+// non-final layer and no pack HARD-ERRORS in the backend (naming the missing
+// layers) and that error is surfaced as `lensReadoutError`, never downgraded.
+
+export type LensReadoutRequest = {
+  type: 'lensReadout';
+  /** Caller-supplied correlation id. The worker echoes this in the response. */
+  id: string;
+  /** Prompt token ids to read. Must be non-empty; length 1..48
+   *  (LENS_MAX_POSITIONS). */
+  promptIds: number[];
+  /** Residual-stream boundaries to read, each `0..=24` (`h_0` = embedding
+   *  output … `h_24` = pre-final-norm). Empty/undefined = all 25. */
+  layers?: number[];
+  /** Requested top-K per cell. Must be >= 1; the backend clamps the effective
+   *  value to `min(requested, 32, vocab)`. */
+  topK: number;
+  /** Vocab ids whose 1-based full-vocab rank is returned per cell. At most 8
+   *  (LENS_MAX_PINNED); each must be `< vocab`. */
+  pinnedIds?: number[];
+  /** Apply the fitted per-layer Jacobian before the unembedding. `false` is
+   *  the plain logit lens (the browser has no pack). Forwarded faithfully — a
+   *  `true` with a non-final layer and no pack errors in the backend. */
+  useJacobian: boolean;
+};
+
+/** Per-(layer, position) readout cell. Sibling of `ScorePosition`: same top-K
+ *  contract (ids descending by logit, RAW pre-softmax f32 logits plus decoded
+ *  texts), extended with full-vocab-normalized softmax probabilities. */
+export type LensCell = {
+  /** Residual-stream boundary this cell was read at (`0..=24`). */
+  layer: number;
+  /** 0-based prompt position (`0..promptLen`). */
+  position: number;
+  /** Greedy argmax token id at this cell (`= topKIds[0]`). */
+  argmaxId: number;
+  /** Top-K token ids at this cell, descending by logit. */
+  topKIds: number[];
+  /** Raw logits matching `topKIds`, same order. NOT softmax probabilities. */
+  topKLogits: Float32Array;
+  /** Full-vocab-normalized softmax probabilities for `topKIds` (logsumexp over
+   *  the whole `[vocab]` row — an honest probability, not top-K softmax). */
+  topKProbs: Float32Array;
+  /** Decoded text for each id in `topKIds`. */
+  topKTexts: string[];
+};
+
+/** Full-vocab rank track for a single pinned token id across every cell. */
+export type LensPinned = {
+  /** The pinned vocab id. */
+  tokenId: number;
+  /** Decoded text for `tokenId`. */
+  tokenText: string;
+  /** 1-based full-vocab rank of `tokenId` at each cell, in the same
+   *  (layer, position) order as `LensReadoutRun::cells`. Display-capped at 999. */
+  ranks: Int32Array;
+};
+
+export type LensReadoutRun = {
+  /** Prompt length `P` in tokens. */
+  promptLen: number;
+  /** Effective top-K after backend clamping: `min(requested, 32, vocab)`. */
+  topK: number;
+  /** Echo of the request's `useJacobian` flag. */
+  useJacobian: boolean;
+  /** `true` iff a real per-layer Jacobian was actually applied to at least one
+   *  requested non-final boundary. A final-only (`[24]`, `J=I`) request or a
+   *  logit-lens request is `false`. */
+  jacobianApplied: boolean;
+  /** The readout depths actually returned, in cell-grid order. */
+  layers: number[];
+  /** Decoded prompt tokens (the UI position axis). */
+  tokens: TokenInfo[];
+  /** One entry per (layer, position), layer-major then position-minor.
+   *  Length === `layers.length * promptLen`. */
+  cells: LensCell[];
+  /** One rank track per requested pinned id, index-aligned with `pinnedIds`. */
+  pinned: LensPinned[];
+};
+
+export type LensReadoutResponse =
+  | { type: 'lensReadoutResult'; id: string; result: LensReadoutRun }
+  | { type: 'lensReadoutError'; id: string; error: string };
+
+export const LENS_READOUT_REQUEST_TYPE = 'lensReadout' as const;
+export const LENS_READOUT_RESULT_TYPE = 'lensReadoutResult' as const;
+export const LENS_READOUT_ERROR_TYPE = 'lensReadoutError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //
