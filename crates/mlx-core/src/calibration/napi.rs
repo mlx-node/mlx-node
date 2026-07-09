@@ -143,30 +143,45 @@ where
 /// the loader would read no / incomplete amax back. Fail LOUDLY instead
 /// (config.json is left byte-untouched by the completeness guard in
 /// [`write_amax_into_config`], which only writes when the loader-preferred alias
-/// homes every finite collected key). Only a fully-homed map returns its
-/// persisted-key count.
+/// homes every collected key). Only a fully-homed map returns its persisted-key
+/// count.
+///
+/// A NON-FINITE collected maximum (inf / NaN) is rejected up front: it signals a
+/// numerically degenerate prefill (a runtime fault or corrupted weights), and
+/// silently skipping that site would report a partial success. Fail loudly and
+/// leave `config.json` untouched.
 fn persist_amax_if_any(config_path: &Path, amax: &HashMap<String, f32>) -> Result<u32> {
     if amax.is_empty() {
         return Ok(0);
     }
-    // Completeness is measured against the FINITE collected count (non-finite
-    // maxima never home — see `write_amax_into_config`). Calibration succeeds only
-    // when the loader-preferred `quantization` alias homed EVERY finite collected
-    // key; zero (uniform-mxfp8) or partial (drifted config) homing is a loud
-    // failure, and `write_amax_into_config` has left config.json byte-untouched.
-    let expected = amax.values().filter(|v| v.is_finite()).count();
+    // A non-finite collected maximum (inf / NaN) means a site's activations
+    // overflowed or went NaN during the calibration prefill — a numerically
+    // degenerate run (corrupted weights or a runtime numerical fault), NOT a
+    // valid calibration. `write_amax_into_config` would silently skip that site
+    // (a non-finite value never homes) and calibrate only the rest, reporting a
+    // partial success. Fail LOUDLY up front, before touching config.json.
+    if let Some((key, val)) = amax.iter().find(|(_, v)| !v.is_finite()) {
+        return Err(Error::from_reason(format!(
+            "calibration produced a non-finite activation maximum ({val}) for `{key}` — the \
+             calibration data or checkpoint is numerically degenerate; config.json left \
+             unchanged. Inspect the source weights and the calibration dataset."
+        )));
+    }
+    // Every collected maximum is finite here, so calibration succeeds only when
+    // the loader-preferred `quantization` alias homed EVERY collected key. Zero
+    // (uniform-mxfp8) or partial (drifted config) homing is a loud failure;
+    // `write_amax_into_config` leaves config.json byte-untouched in that case.
+    let expected = amax.len();
     let written = write_amax_into_config(config_path, amax)?;
     if written == 0 || written < expected {
         return Err(Error::from_reason(format!(
-            "calibration collected {} activation-amax value(s) ({} finite) but only {} homed to \
-             per-layer mxfp8 override entries in the loader's `quantization` block — the \
-             checkpoint's attention/GDN activation-fp8 sites are not fully represented as \
-             per-layer overrides (a uniform `--q-mode mxfp8` checkpoint, or a partial/drifted \
-             config), so the loader would read no / incomplete `input_amax`; config.json left \
-             unchanged. Re-quantize with `--q-recipe nvidia` to get complete per-layer \
-             FP8-activation calibration.",
+            "calibration collected {} activation-amax value(s) but only {} homed to per-layer \
+             mxfp8 override entries in the loader's `quantization` block — the checkpoint's \
+             attention/GDN activation-fp8 sites are not fully represented as per-layer overrides \
+             (a uniform `--q-mode mxfp8` checkpoint, or a partial/drifted config), so the loader \
+             would read no / incomplete `input_amax`; config.json left unchanged. Re-quantize \
+             with `--q-recipe nvidia` to get complete per-layer FP8-activation calibration.",
             amax.len(),
-            expected,
             written
         )));
     }
@@ -665,6 +680,54 @@ mod tests {
         assert_eq!(
             before, after,
             "a non-object-preferred-alias calibration must leave config.json byte-identical"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A non-finite collected maximum (a site whose activations overflowed to inf
+    /// during the calibration prefill) marks the whole run as numerically
+    /// degenerate: `persist_amax_if_any` must FAIL LOUDLY up front rather than
+    /// silently calibrate only the finite sites, and leave config.json
+    /// byte-identical (both q_proj and k_proj have homing objects, so the failure
+    /// is the non-finite guard, not a homing shortfall).
+    #[test]
+    fn non_finite_collected_amax_errors_and_leaves_config_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_nonfinite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "layers.0.self_attn.k_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        amax.insert("layers.0.self_attn.k_proj".to_string(), f32::INFINITY);
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("non-finite") && err.reason.contains("left unchanged"),
+            "a non-finite collected maximum must fail loudly, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a non-finite calibration must leave config.json byte-identical (no partial write)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
