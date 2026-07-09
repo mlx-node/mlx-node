@@ -52,8 +52,17 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const MODEL_PATH = '/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16';
-const PACK_PATH = '/Users/brooklyn/workspace/github/mlx-node/.cache/jlens/lens-pack-pilot.safetensors';
 const OUT_DIR = '/Users/brooklyn/workspace/github/mlx-node/.cache/jlens';
+// PACK_PATH is parameterized via JLENS_PACK (T3.2): default = the pilot pack, so
+// the original pilot call site (no env) is byte-for-byte unchanged. A bare
+// filename resolves against OUT_DIR; a value containing '/' is used verbatim.
+// The v1 (100-prompt) run sets JLENS_PACK=lens-pack-v1.safetensors.
+const PACK_ENV = process.env.JLENS_PACK ?? 'lens-pack-pilot.safetensors';
+const PACK_PATH = PACK_ENV.includes('/') ? PACK_ENV : join(OUT_DIR, PACK_ENV);
+// Output filename parameterized via JLENS_OUT (default preserves the pilot
+// output name 'eval-results.json'); the v1 run writes 'eval-results-v1.json' so
+// the pilot results are never clobbered.
+const OUT_NAME = process.env.JLENS_OUT ?? 'eval-results.json';
 const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
 
 // Fitted-J domain (boundaries 1..=23) is the HEADLINE metric; 24 (J=I) is a
@@ -165,9 +174,10 @@ async function main() {
   const { Qwen35Model } = await import('@mlx-node/lm');
   console.log(`Loading model from ${MODEL_PATH} ...`);
   const model = (await Qwen35Model.load(MODEL_PATH)) as any;
+  console.log(`Loading lens pack from ${PACK_PATH} ...`);
   const loaded = await model.loadLensPackFromFile(PACK_PATH);
-  if (loaded !== 23) throw new Error(`expected 23 Jacobians in the pilot pack, got ${loaded}`);
-  console.log(`Model loaded; pilot pack = ${loaded} Jacobians (J.1..J.23).\n`);
+  if (loaded !== 23) throw new Error(`expected 23 Jacobians in the pack, got ${loaded}`);
+  console.log(`Model loaded; pack = ${loaded} Jacobians (J.1..J.23).\n`);
 
   // memoized tokenizer encode (surface-form candidates repeat heavily).
   const encCache = new Map<string, number[]>();
@@ -407,14 +417,18 @@ async function main() {
   console.log(`\nmax eval prompt length = ${maxPromptLen} tok (LENS_MAX_POSITIONS=${LENS_MAX_POSITIONS}).`);
 
   mkdirSync(OUT_DIR, { recursive: true });
-  const outPath = join(OUT_DIR, 'eval-results.json');
+  const outPath = join(OUT_DIR, OUT_NAME);
   writeFileSync(
     outPath,
     JSON.stringify(
       {
         model: MODEL_PATH,
         pack: PACK_PATH,
-        generatedAt: new Date().toISOString(),
+        // No wall-clock field: the eval is fully deterministic (fixed prompt set,
+        // greedy/no-RNG readout), so two runs are byte-identical — a generatedAt
+        // timestamp would be the sole non-reproducible byte (matches the
+        // deliberate no-wall-clock design of band-report.mts). Run provenance
+        // lives in the run logs, not the results artifact.
         metric:
           'normalized log-k pass@k AUC; rank = min over single-token surface-form ids AND layers 1..=23; perfect=1.0; unscorable (multi-token) intermediates EXCLUDED (codex F1), symmetric across J & logit',
         kGrid: K_GRID,
