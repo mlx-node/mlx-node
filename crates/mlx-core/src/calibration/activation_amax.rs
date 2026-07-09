@@ -81,6 +81,13 @@ impl ActivationAmaxCollector {
     /// — the same `abs -> max -> item` sequence the KV-scale calibrator uses
     /// (`crates/mlx-paged-attn/src/metal/kv_scale.rs:187`). The merge keeps the
     /// running maximum per key (inserts when absent).
+    ///
+    /// The fold is NON-FINITE-PRESERVING: once a key has seen an inf/NaN sample it
+    /// STAYS non-finite. Plain `f32::max` ignores NaN (`4.0.max(NaN) == 4.0`), so a
+    /// later finite sample would silently erase a NaN and the degenerate run would
+    /// slip past `persist_amax_if_any`'s non-finite guard. Preserving it lets that
+    /// guard reject the run (a non-finite activation maximum signals a numerically
+    /// degenerate prefill — corrupted weights or a runtime fault).
     pub(crate) fn record(key: &str, x: &MxArray) -> Result<()> {
         if !Self::is_calibrating() {
             return Ok(());
@@ -90,7 +97,17 @@ impl ActivationAmaxCollector {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key.to_string())
-            .and_modify(|e| *e = e.max(new_val))
+            .and_modify(|e| {
+                *e = if !e.is_finite() {
+                    // Already degenerate — keep it; do NOT let a finite `max` erase it.
+                    *e
+                } else if !new_val.is_finite() {
+                    // Become degenerate and stay that way.
+                    new_val
+                } else {
+                    e.max(new_val)
+                };
+            })
             .or_insert(new_val);
         Ok(())
     }
@@ -434,6 +451,47 @@ mod tests {
         assert!(
             ActivationAmaxCollector::take().is_empty(),
             "record after disarming must capture nothing"
+        );
+    }
+
+    /// The fold is non-finite-preserving: a NaN sample must NOT be erased by a
+    /// finite sample for the same key, in EITHER order. Plain `f32::max` ignores
+    /// NaN, which would let a numerically degenerate run slip past the
+    /// persist-time non-finite guard.
+    #[test]
+    fn record_preserves_non_finite_max_in_both_orders() {
+        let _g = CALIB_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ActivationAmaxCollector::disarm_current_thread();
+        let _ = ActivationAmaxCollector::take();
+        ActivationAmaxCollector::arm_current_thread();
+
+        let finite = MxArray::from_float32(&[-4.0, 1.0, 2.0], &[3]).unwrap();
+        let nan = MxArray::from_float32(&[f32::NAN, 0.5], &[2]).unwrap();
+
+        // NaN first, then finite: the finite `max` must not erase the NaN.
+        ActivationAmaxCollector::record("nan_then_finite", &nan).unwrap();
+        ActivationAmaxCollector::record("nan_then_finite", &finite).unwrap();
+        // Finite first, then NaN: the NaN must overwrite to a degenerate marker.
+        ActivationAmaxCollector::record("finite_then_nan", &finite).unwrap();
+        ActivationAmaxCollector::record("finite_then_nan", &nan).unwrap();
+
+        ActivationAmaxCollector::disarm_current_thread();
+        let m = ActivationAmaxCollector::take();
+        assert!(
+            m.get("nan_then_finite")
+                .copied()
+                .is_some_and(|v| !v.is_finite()),
+            "NaN-then-finite must stay non-finite, got {:?}",
+            m.get("nan_then_finite")
+        );
+        assert!(
+            m.get("finite_then_nan")
+                .copied()
+                .is_some_and(|v| !v.is_finite()),
+            "finite-then-NaN must become non-finite, got {:?}",
+            m.get("finite_then_nan")
         );
     }
 
