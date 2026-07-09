@@ -223,7 +223,11 @@ async function main() {
       }
 
       // per concept, per boundary (fitted-J domain 1..23): J-only-legible slice.
-      let shallowest: Slice | null = null;
+      // We persist top-K EVIDENCE at each concept's BEST-rank (deepest-legibility)
+      // J-only boundary — the cleanest, most legible slice — so EVERY dump the
+      // verdict cites lives in this deterministic artifact, not an untracked
+      // scratch run (codex T3.3 finding).
+      const bestByConcept = new Map<string, Slice>();
       for (const c of concepts) {
         for (let b = 0; b < HEADLINE_MAX_BOUND; b++) {
           let jr = RANK_CENSOR;
@@ -238,13 +242,18 @@ async function main() {
               concept: c.name, boundary: b + 1, jRank: jr, logitRank: lr,
             };
             slices.push(s);
-            if (!shallowest || b + 1 < shallowest.boundary) shallowest = s;
+            const prev = bestByConcept.get(c.name);
+            // best = lowest J-rank; tie-break = shallowest boundary (deterministic).
+            if (!prev || s.jRank < prev.jRank || (s.jRank === prev.jRank && s.boundary < prev.boundary)) {
+              bestByConcept.set(c.name, s);
+            }
           }
         }
       }
-      if (shallowest) {
-        const li = shallowest.boundary - 1;
-        evidence.push({ ...shallowest, jTopK: jTopKByBound[li], logitTopK: lTopKByBound[li] });
+      // Map insertion order = concept order = item.intermediates order (deterministic).
+      for (const s of bestByConcept.values()) {
+        const li = s.boundary - 1;
+        evidence.push({ ...s, jTopK: jTopKByBound[li], logitTopK: lTopKByBound[li] });
       }
     }
   }
@@ -260,7 +269,7 @@ async function main() {
   console.log(`curated set: ${nItems} items across ${SUITES.length} suites; ${nConceptsScored} scorable concepts (${nConceptsUnscorable} unscorable skipped).`);
   console.log(`\nJ-only-legible slices (J-rank ≤ ${TOPK_LEGIBLE} < logit-rank, fitted-J boundaries ℓ1..${HEADLINE_MAX_BOUND}):`);
   console.log(`  total slices = ${slices.length}  across ${distinctItems.size} distinct prompts, ${distinctConcepts.size} distinct concepts.`);
-  console.log(`\nper-item evidence (shallowest J-only-legible slice + top-${TOPK_DUMP} decoded tokens at that boundary):`);
+  console.log(`\nevidence — each concept's BEST-rank (deepest-legibility) J-only slice + top-${TOPK_DUMP} decoded tokens at that boundary:`);
   for (const e of evidence) {
     console.log(`\n  [${e.suite}/${e.item}] concept "${e.concept}" @ boundary ℓ${e.boundary}: J-rank=${e.jRank}  logit-rank=${e.logitRank > RANK_CENSOR - 1 ? '≥999' : e.logitRank}`);
     console.log(`    prompt : ${JSON.stringify(e.prompt.length > 90 ? e.prompt.slice(0, 90) + '…' : e.prompt)}`);

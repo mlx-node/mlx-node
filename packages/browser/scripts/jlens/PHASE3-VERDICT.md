@@ -45,31 +45,57 @@ supporting signal, never the GO criterion.
 `qualitative.mts` over a curated 14-item slice of the eval suites (paper story archetypes). A slice =
 concept with J-rank ≤ 10 **and** logit-rank > 10 at the same fitted-J boundary (ℓ1..23), min over single-token
 surface ids, apples-to-apples (only `useJacobian` differs). **56 J-only-legible slices across 5 prompts, 9
-concepts** — but the *quality* is uneven, and honesty about that shapes what we feature:
+concepts** — but the *quality* is uneven, and honesty about that shapes what we feature. Every top-10 dump
+below is quoted VERBATIM from the deterministic `qualitative-results.json` — its `evidence` array persists the
+top-10 at each concept's best-rank (deepest-legibility) boundary — with ranks as the artifact reports them
+(brackets = [J-rank @boundary, logit-rank]). The bracketed J-rank is the concept token's full-vocab pinned
+rank; on a near-tie it can differ by one position from the displayed argmax order (e.g. below, `season`'s
+pinned rank is 1 while the greedy top token prints as `best`).
 
 **CLEAN — headline demonstration (feature this).** French `"La saison après l'été est l'"` (answer:
-*l'automne*). The J-lens surfaces a coherent **season concept-cluster mid-stack** that logit never does:
+*l'automne*). At its best-rank boundary the J-lens surfaces a coherent season/temporal cluster the logit lens
+does not:
 
 ```
-ℓ17  J    : season · summer · winter · année · Season · phase …
-     logit: most · busiest · <CJK junk> · easiest …
-ℓ19  J    : season · summer · winter · year · month · autumn …
-     logit: 最佳的 · busiest · opport · autumn(buried) …
+season  [J-rank 1 @ℓ16, logit ≥999]
+  J    : best · season · summer · ____ · " season" · !' · ...' · ___ · winter · " ____"
+  logit: 也是最 · 佳 · ностью · 上一个 · 个字 · ündür · ... · 是一切 · most · 之一
+summer  [J-rank 2 @ℓ17, logit ≥999]
+  J    : season · summer · best · " season" · année · busiest · Season · winter · greatest · phase
+  logit: most · busiest · 也是最 · easiest · 的开始 · adir · endDate · hardest · 我最 · 上一个
 ```
 
-`season` reaches J-rank 1 and `summer` J-rank 2 across an ℓ15..23 band while logit ranks them ≥14 / ≥32.
-This is the paper's claim in miniature: the fitted Jacobian makes a mid-stack concept legible that the raw
-unembedding does not.
+The J-lens top-10 is a coherent seasonal/temporal field — season, summer, winter, année (year), Season — the
+English intermediate concepts for the French answer, while the logit lens shows superlatives + CJK fragments
+and ranks `season`/`summer` outside its top-10 (≥999) at these boundaries. This is the paper's claim in
+miniature: the fitted Jacobian makes a mid-stack concept legible that the raw unembedding does not. (Honest:
+the J top-10 also carries a few punctuation/underscore tokens alongside the concept cluster.)
 
-**VALID but subtle.** Spanish `"Lo opuesto de \"grande\" es \""` (answer: *pequeño*). J keeps English
-`small`/`tiny`/`micro` legible throughout; at ℓ20–22 logit *also* surfaces `small`, so the J-only slice is a
-single late boundary (ℓ23, J-rank 2 vs logit 75) where logit has committed to Spanish surface forms
-(`chico`/`pequeño`). Real, but not a clean mid-band story — feature only with that framing.
+**VALID but subtle.** Spanish `"Lo opuesto de \"grande\" es \""` (answer: *pequeño*). The J-only slice is a
+single late boundary where logit has committed to the Spanish answer while J keeps the English concept near-top:
 
-**WEAK / different phenomenon.** Arithmetic `"2 * (3 + 4) = "`. J's top-10 is a coherent **digit cluster**
-(`2 6 3 5 8 4 7` … all ten digits by ℓ22) while logit is pure garbage — J "knows a number goes here" — but it
-does not surface a crisp single intermediate concept (the operator `×` and results sit amid symbol soup).
-Interpretable as *number-slot*, not as a named concept. "Try it" tier, not a headline.
+```
+small  [J-rank 2 @ℓ23, logit-rank 75]
+  J    : pe · small · min · gran · micro · grande · se · sm · little · grand
+  logit: " chico" · pe · " peque" · " pequ" · " Petit" · Pe · " pequeño" · ...\" · " chicos" · " petit"
+```
+
+At ℓ20–22 the logit lens *also* surfaces `small` (so those boundaries are not J-only); the J-only effect
+appears only at ℓ23, where logit has switched to Spanish surface forms (`chico`/`pequeño`). Real, but a
+late-boundary effect, not a clean mid-band story — feature only with that framing.
+
+**WEAK / different phenomenon.** Arithmetic `"2 * (3 + 4) = "` and siblings. At its best-rank boundary the
+J-lens surfaces a **digit cluster** — the numeric answer-slot — while logit is garbage; but it does not
+surface a crisp single named concept:
+
+```
+7 (of "2*(3+4)") [J-rank 2 @ℓ18, logit ≥999]   J: 6 · 7 · 8 · 5 · 六是 · 9 · arach · 4 · six · linear
+multiplication   [J-rank 1 @ℓ11, logit ≥999]   J: × · = · .= · _____ · £ · ÷ · ……。 · ⭐ · � · =$
+```
+
+The digit concept surfaces amid a little noise; the operator concept is symbol-soup with `×` at top. Honest
+reading: J represents *"a number/operator goes here"*, not a crisp interpretable concept. "Try it" tier, not a
+headline.
 
 **ABSENT in the curated sample.** multihop (4 items), association (3), poetry (2) produced **zero**
 J-only-legible slices. On a 0.8B these tasks do not reliably show the phenomenon.
@@ -105,9 +131,9 @@ that actually reproduce.
 ## Reproduce
 
 ```
-env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/eval.mts
-env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/band-report.mts
-env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/qualitative.mts
+env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors JLENS_OUT=eval-results-v1.json oxnode packages/browser/scripts/jlens/eval.mts
+env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/band-report.mts       # writes band-report.json
+env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/qualitative.mts       # writes qualitative-results.json
 ```
 
 All three write deterministic, byte-identical-on-rerun JSON to `~/.cache/jlens/` (out of git).
