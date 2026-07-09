@@ -2666,6 +2666,13 @@ async function handleLensReadout(data: {
     const layers = Array.isArray(data.layers) ? data.layers : undefined;
     const pinnedIds = Array.isArray(data.pinnedIds) ? data.pinnedIds : undefined;
     const topK = data.topK;
+    // Every token id / topK is coerced to a Rust `u32` at the NAPI boundary
+    // (ECMAScript ToUint32: fractional truncates, out-of-range wraps mod 2^32),
+    // so a malformed id could silently read a DIFFERENT valid token than
+    // requested. Reject anything outside the exact u32 domain here so the RPC
+    // fails closed with a clear message instead of coercing.
+    const isU32 = (x: unknown): x is number =>
+      typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 && x <= 0xffffffff;
     // Mirror the backend's bounds up front so obviously-bad requests fail with a
     // clear message before crossing into wasm. The backend re-checks (plus
     // vocab-range checks we can't do here), clamps topK to min(requested, 32,
@@ -2687,11 +2694,20 @@ async function handleLensReadout(data: {
       });
       return;
     }
-    if (!Number.isInteger(topK) || topK < 1) {
+    const badPromptIdx = promptIds.findIndex((x) => !isU32(x));
+    if (badPromptIdx !== -1) {
       (self as any).postMessage({
         type: LENS_READOUT_ERROR_TYPE,
         id,
-        error: `lensReadout: topK must be an integer >= 1 (got ${String(topK)})`,
+        error: `lensReadout: every promptIds entry must be an integer in 0..=4294967295 (got ${String(promptIds[badPromptIdx])} at index ${badPromptIdx})`,
+      });
+      return;
+    }
+    if (!Number.isInteger(topK) || topK < 1 || topK > 0xffffffff) {
+      (self as any).postMessage({
+        type: LENS_READOUT_ERROR_TYPE,
+        id,
+        error: `lensReadout: topK must be an integer in 1..=4294967295 (got ${String(topK)})`,
       });
       return;
     }
@@ -2702,6 +2718,17 @@ async function handleLensReadout(data: {
         error: `lensReadout: pinnedIds length must be <= 8 (LENS_MAX_PINNED) (got ${pinnedIds.length})`,
       });
       return;
+    }
+    if (pinnedIds) {
+      const badPinnedIdx = pinnedIds.findIndex((x) => !isU32(x));
+      if (badPinnedIdx !== -1) {
+        (self as any).postMessage({
+          type: LENS_READOUT_ERROR_TYPE,
+          id,
+          error: `lensReadout: every pinnedIds entry must be an integer in 0..=4294967295 (got ${String(pinnedIds[badPinnedIdx])} at index ${badPinnedIdx})`,
+        });
+        return;
+      }
     }
     if (layers) {
       for (const layer of layers) {
