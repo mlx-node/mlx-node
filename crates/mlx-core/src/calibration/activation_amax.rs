@@ -184,7 +184,7 @@ pub(crate) fn is_activation_fp8_site(normalized_key: &str) -> bool {
 pub(crate) fn write_amax_into_config(
     config_path: &Path,
     amax: &HashMap<String, f32>,
-) -> Result<()> {
+) -> Result<usize> {
     let data = std::fs::read_to_string(config_path)
         .map_err(|e| Error::from_reason(format!("read {}: {e}", config_path.display())))?;
     let mut config: serde_json::Value = serde_json::from_str(&data)
@@ -195,10 +195,22 @@ pub(crate) fn write_amax_into_config(
     // `quantization_config` alias. Update EVERY present object-valued alias so
     // the two never drift out of sync — one alias with stale (uncalibrated)
     // amax would be an internally-inconsistent config for a consumer reading it.
+    // `matched` records the deduped SOURCE keys that actually homed into a
+    // per-layer override object (so the two aliases can't double-count, and the
+    // qkv/z fanout to one merged source counts once).
+    let mut matched: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in ["quantization", "quantization_config"] {
         if let Some(block) = config.get_mut(name).and_then(|v| v.as_object_mut()) {
-            apply_amax_to_block(block, amax);
+            apply_amax_to_block(block, amax, &mut matched);
         }
+    }
+
+    // Nothing was attached (e.g. a uniform `--q-mode mxfp8` checkpoint whose attn/GDN
+    // layers inherit the top-level mode and thus have no per-layer override object to
+    // hold `input_amax`). Do NOT rewrite/churn config.json, and report zero writes so
+    // the caller can fail loudly instead of claiming a phantom success.
+    if matched.is_empty() {
+        return Ok(0);
     }
 
     let out = serde_json::to_string_pretty(&config)
@@ -236,7 +248,7 @@ pub(crate) fn write_amax_into_config(
             config_path.display()
         ))
     })?;
-    Ok(())
+    Ok(matched.len())
 }
 
 /// Thread each collected per-tensor `input_amax` into a single quantization
@@ -248,9 +260,15 @@ pub(crate) fn write_amax_into_config(
 /// MERGED (`in_proj_qkvz`). Only per-layer OBJECT entries with a matching finite
 /// collected amax gain `"input_amax"`; top-level scalars and uncollected entries
 /// are left untouched.
+///
+/// Records each deduped SOURCE key that actually homed into an override object
+/// into `matched` (so the caller can tell whether ANY amax was persisted). The
+/// qkv/z fanout to one merged source counts that source once, and updating both
+/// config aliases with the same source counts it once.
 fn apply_amax_to_block(
     block: &mut serde_json::Map<String, serde_json::Value>,
     amax: &HashMap<String, f32>,
+    matched: &mut std::collections::HashSet<String>,
 ) {
     use crate::models::mtp_drafter::strip_wrapper_prefix;
 
@@ -276,6 +294,7 @@ fn apply_amax_to_block(
             // Skip non-finite maxima (NaN/inf would serialize as JSON null).
             if val.is_finite() {
                 entry.insert("input_amax".to_string(), serde_json::Value::from(val));
+                matched.insert(source.clone());
             }
         }
     }

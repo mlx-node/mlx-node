@@ -132,14 +132,34 @@ where
 /// NOT invoke [`write_amax_into_config`]: doing so would rewrite / pretty-print
 /// the file (churning its bytes and leaving any stale pre-existing `input_amax`
 /// in place) under a misleading success `0`. Skip the write and return `0`,
-/// leaving the file byte-untouched. A non-empty map is persisted atomically and
-/// its entry count returned.
+/// leaving the file byte-untouched.
+///
+/// A NON-empty map that nonetheless writes NOTHING is a distinct failure: the
+/// run DID exercise activation-fp8 sites, but the config has no per-layer mxfp8
+/// override object to attach `input_amax` to (a uniform `--q-mode mxfp8`
+/// checkpoint whose attn/GDN layers inherit the top-level mode). Reporting the
+/// collected `amax.len()` there would be a phantom success — the loader has
+/// nowhere to read the amax back. Fail LOUDLY instead (config.json is left
+/// byte-untouched by the zero-write guard in [`write_amax_into_config`]). Only a
+/// non-empty map that actually homed at least one `input_amax` returns its
+/// persisted-entry count.
 fn persist_amax_if_any(config_path: &Path, amax: &HashMap<String, f32>) -> Result<u32> {
     if amax.is_empty() {
         return Ok(0);
     }
-    write_amax_into_config(config_path, amax)?;
-    Ok(amax.len() as u32)
+    let written = write_amax_into_config(config_path, amax)?;
+    if written == 0 {
+        return Err(Error::from_reason(format!(
+            "calibration collected {} activation-amax value(s) but config.json has no per-layer \
+             mxfp8 override entries to attach them to — this is a uniform/non-nvidia checkpoint \
+             (its attention/GDN layers inherit a top-level quantization mode with no per-layer \
+             overrides, so there is nowhere for the loader to read `input_amax`); config.json left \
+             unchanged. Re-quantize with `--q-recipe nvidia` to get per-layer FP8-activation \
+             calibration.",
+            amax.len()
+        )));
+    }
+    Ok(written as u32)
 }
 
 /// Data-free static FP8 activation-amax calibration over RAW-text PREFILL
@@ -391,6 +411,55 @@ mod tests {
             4.0
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A NON-empty collected map whose sites have NO writable per-layer override
+    /// entry (a uniform `--q-mode mxfp8` checkpoint: top-level mode only, attn/GDN
+    /// inherit it) must FAIL LOUDLY rather than report a phantom success — and
+    /// leave config.json BYTE-IDENTICAL (no churn). The config includes a router-gate
+    /// affine override object that is NOT an activation-fp8 site, proving a
+    /// non-matching object entry does not count as a write.
+    #[test]
+    fn nonempty_amax_but_no_writable_entry_errors_and_leaves_config_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_nowrite_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // COMPACT single-line: any errant rewrite would pretty-print and change bytes.
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.mlp.gate": {"bits": 8, "group_size": 64, "mode": "affine"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        // An activation-fp8 site (q_proj) with NO per-layer object entry in config.
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("no per-layer mxfp8 override entries")
+                && err.reason.contains("left unchanged"),
+            "must fail loudly naming the uniform/non-nvidia case, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a non-writable calibration must leave config.json byte-identical (no churn)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
