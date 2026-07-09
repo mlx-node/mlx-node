@@ -192,32 +192,44 @@ pub(crate) fn write_amax_into_config(
 
     // The nvidia recipe writes the per-layer block under `quantization`; HF
     // exports (and our own converter) also mirror it into the
-    // `quantization_config` alias. Update EVERY present object-valued alias so
-    // the two never drift out of sync — one alias with stale (uncalibrated)
-    // amax would be an internally-inconsistent config for a consumer reading it.
-    // The loader reads the `quantization` block first, falling back to
-    // `quantization_config` (quant_dispatch.rs:292). Calibration only counts as
-    // REAL when that loader-preferred alias homes EVERY collected activation-fp8
-    // key: a uniform `--q-mode mxfp8` checkpoint (no per-layer objects), a
-    // partially drifted config, or one where only the fallback alias homes would
-    // otherwise imply a phantom success while leaving sites uncalibrated. We still
-    // apply to every present alias in place (keep them in sync), but gate the
-    // write on the loader-preferred alias's completeness. Each alias's `matched`
-    // dedups the SOURCE keys (the two aliases can't double-count; the qkv/z fanout
-    // to one merged source counts once). Non-finite collected maxima never home
-    // (skipped in `apply_amax_to_block`), so completeness is measured against the
-    // FINITE collected count.
+    // `quantization_config` alias. We update EVERY present object-valued alias so
+    // the two never drift out of sync, but the SUCCESS decision mirrors the loader
+    // exactly: calibration counts as REAL only when the loader-preferred alias
+    // materializes an `input_amax` for EVERY collected activation-fp8 key.
+    //
+    // Loader alias selection (`load_quant_settings_from_disk`, quant_dispatch.rs:291):
+    // it reads `quantization` whenever that KEY is present — even if the value is
+    // non-object, in which case it materializes NOTHING and does NOT fall back —
+    // and only uses `quantization_config` when `quantization` is absent. So
+    // completeness is judged on the loader-preferred alias by key PRESENCE (not
+    // object-ness): a uniform `--q-mode mxfp8` checkpoint (no per-layer objects), a
+    // partially drifted config, a present-but-non-object preferred alias, or one
+    // where only the fallback alias homes all resolve to `homed < expected` and
+    // fail loudly. `apply_amax_to_block` only homes entries the loader would
+    // materialize (a parseable `bits`, per `parse_quant_block`), and dedups the
+    // SOURCE keys (the qkv/z fanout to one merged source counts once). Non-finite
+    // collected maxima never home, so completeness is measured against the FINITE
+    // collected count.
     let expected = amax.values().filter(|v| v.is_finite()).count();
-    let mut preferred_homed: Option<usize> = None;
+    let preferred_name = if config.get("quantization").is_some() {
+        "quantization"
+    } else {
+        "quantization_config"
+    };
+    let mut preferred_homed = 0usize;
     for name in ["quantization", "quantization_config"] {
         if let Some(block) = config.get_mut(name).and_then(|v| v.as_object_mut()) {
             let mut matched: std::collections::HashSet<String> = std::collections::HashSet::new();
             apply_amax_to_block(block, amax, &mut matched);
-            // First present alias == the one the loader will read.
-            preferred_homed.get_or_insert(matched.len());
+            if name == preferred_name {
+                preferred_homed = matched.len();
+            }
         }
     }
-    let homed = preferred_homed.unwrap_or(0);
+    // A present-but-non-object preferred alias never entered the branch above, so
+    // `preferred_homed` stays 0 — matching the loader, which materializes nothing
+    // from it and does not fall back. Treated as incomplete below.
+    let homed = preferred_homed;
 
     // The loader-preferred alias did not home every finite collected key: zero for
     // a uniform-mxfp8 checkpoint (attn/GDN inherit the top-level mode with no
@@ -295,6 +307,18 @@ fn apply_amax_to_block(
         let Some(entry) = entry_val.as_object_mut() else {
             continue;
         };
+        // Mirror the loader's materialization gate (`parse_quant_block`,
+        // quant_dispatch.rs:242): it DROPS a per-layer entry unless it carries a
+        // parseable integer `bits`. An override object without `bits` is never
+        // read back, so writing `input_amax` there would be silently discarded on
+        // load — do not attach it and do not count it as homed.
+        if entry
+            .get("bits")
+            .and_then(serde_json::Value::as_i64)
+            .is_none()
+        {
+            continue;
+        }
         // Config keys are RAW/WRAPPED; collector keys are STRIPPED.
         let sck = strip_wrapper_prefix(ck);
         // Fan the MERGED GDN input-projection amax out to BOTH split config

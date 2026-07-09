@@ -572,6 +572,103 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The loader's `parse_quant_block` DROPS a per-layer entry that lacks a
+    /// parseable integer `bits` (quant_dispatch.rs:242). Calibration must mirror
+    /// that: an override object missing `bits` does NOT home (the loader would
+    /// discard any `input_amax` written into it), so this fails loudly and leaves
+    /// config.json byte-identical.
+    #[test]
+    fn override_without_bits_does_not_home_and_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_nobits_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // q_proj object is MALFORMED — no `bits` field — so the loader drops it.
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.self_attn.q_proj": {"mode": "mxfp8", "group_size": 32}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("per-layer mxfp8 override entries")
+                && err.reason.contains("left unchanged"),
+            "a bits-less override must not count as homed, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a bits-less-override calibration must leave config.json byte-identical (no churn)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The loader selects the alias by KEY PRESENCE: if `quantization` is present
+    /// but NON-OBJECT it materializes nothing and does NOT fall back to
+    /// `quantization_config` (quant_dispatch.rs:291 + parse_quant_block's
+    /// `as_object`). Calibration must mirror that — a present non-object
+    /// `quantization` yields zero homed even when a complete `quantization_config`
+    /// exists — so it fails loudly and leaves config.json byte-identical.
+    #[test]
+    fn non_object_preferred_alias_errors_even_with_complete_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx_calib_nonobjpref_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        // `quantization` is present but a STRING (non-object); the loader picks it,
+        // materializes nothing, and does NOT fall back to `quantization_config`.
+        let initial = serde_json::to_string(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "quantization": "mxfp8",
+            "quantization_config": {
+                "mode": "mxfp8", "bits": 8, "group_size": 32,
+                "layers.0.self_attn.q_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+            }
+        }))
+        .unwrap();
+        std::fs::write(&config_path, &initial).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+
+        let mut amax = HashMap::new();
+        amax.insert("layers.0.self_attn.q_proj".to_string(), 4.0f32);
+        let err = persist_amax_if_any(&config_path, &amax).unwrap_err();
+        assert!(
+            err.reason.contains("per-layer mxfp8 override entries")
+                && err.reason.contains("left unchanged"),
+            "a non-object preferred alias must yield zero homed, got: {}",
+            err.reason
+        );
+
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a non-object-preferred-alias calibration must leave config.json byte-identical"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A calibration that prefilled ZERO rows (empty dataset, or every row
     /// tokenized to nothing) must be an `Err` — NOT a silent `Ok(0)` — and must
     /// leave `config.json` UNTOUCHED. Drives `prefill_and_persist` with a fake
