@@ -1873,24 +1873,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     .to_string(),
             ));
         }
-        // The nvidia recipe is documented + validated only for qwen3_5 /
-        // qwen3_5_moe, and is a data-free port with a fixed format map: it
-        // reads no imatrix, ignores --q-mxfp (it emits mxfp4/mxfp8 directly),
-        // and pins bits=4/group_size=32 for its float tensors. Reject any other
-        // model type (or an omitted one) plus flags that would silently alter
-        // or contradict the map, but allow a bare `-q --q-recipe nvidia` (no
-        // explicit bits/group_size) to pass. Shared with the GGUF entry point
-        // (`convert_gguf_to_safetensors`).
-        if recipe == "nvidia" {
-            validate_nvidia_recipe_options(
-                model_type.as_deref(),
-                imatrix_path.as_deref(),
-                quant_mxfp,
-                options.quant_bits,
-                options.quant_group_size,
-            )
-            .map_err(Error::from_reason)?;
-        }
     }
 
     // Validate input directory
@@ -1942,6 +1924,28 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Load config to check for tied embeddings
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
+
+    // The nvidia recipe is documented + validated only for qwen3_5 / qwen3_5_moe.
+    // Gate on the INPUT config.json's own `model_type` (ground truth) — NOT the
+    // caller-supplied --model-type: the CLI forwards an explicit `-m` verbatim
+    // (skipping config auto-detect), so `-m qwen3_5` on a real gemma4/lfm2
+    // directory would otherwise reach Qwen sanitization + the generic nvidia
+    // predicate and emit an invalid checkpoint. It is a data-free fixed-format
+    // map: no imatrix, ignores --q-mxfp (emits mxfp4/mxfp8 directly), pins
+    // bits=4/group_size=32 for its float tensors — reject flags that would
+    // silently alter or contradict the map, but allow a bare `-q --q-recipe
+    // nvidia`. The GGUF entry point (`convert_gguf_to_safetensors`) has no
+    // config.json and rejects nvidia wholesale via a `None` model_type.
+    if quant_recipe.as_deref() == Some("nvidia") {
+        validate_nvidia_recipe_options(
+            config.get("model_type").and_then(|v| v.as_str()),
+            imatrix_path.as_deref(),
+            quant_mxfp,
+            options.quant_bits,
+            options.quant_group_size,
+        )
+        .map_err(Error::from_reason)?;
+    }
     let tie_word_embeddings = config["tie_word_embeddings"].as_bool().unwrap_or(false);
 
     if tie_word_embeddings && verbose {
@@ -11525,5 +11529,61 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
+        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real gemma4 directory
+        // past the nvidia gate. The gate reads the input config.json's actual
+        // model_type (gemma4), so the run is rejected even though --model-type
+        // claims qwen3_5. Only config.json is written — the gate must fire
+        // before weights load, so the error is the model-type reject, not a
+        // missing-safetensors error.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_realconfig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4",
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_5".to_string()), // caller's lie
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a real gemma4 config even with -m qwen3_5");
+        assert!(
+            err.reason
+                .contains("only supported for model types qwen3_5")
+                && err.reason.contains("gemma4"),
+            "expected the nvidia model-type reject naming the real config type gemma4, got: {}",
+            err.reason
+        );
     }
 }
