@@ -1883,24 +1883,11 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )));
     }
 
-    // Serialize all conversions process-wide before touching MLX's default
-    // device + stream — see `convert_mutex` and `CpuConvertGuard` docs for
-    // the race this avoids.
-    let _convert_lock = convert_mutex().lock().await;
-
-    // Route every MLX op in this conversion through the CPU device + stream.
-    //
-    // The conversion path is slice / reshape / dtype-cast only — no real math.
-    // On GPU, materializing a 1.6 GB sliced view of a fused expert tensor backed
-    // by a 250 GB mmap'd source can stall a Metal command buffer past the macOS
-    // GPU watchdog (~5 s), surfacing as
-    // `kIOGPUCommandBufferCallbackErrorTimeout` mid-shard for large MoE models
-    // (e.g. Qwen3.5 122B-A10B with 256 experts × 48 layers). CPU has direct
-    // access to the mmap'd pages and is immune to the watchdog. `_stream_guard`
-    // restores the prior default device + stream when convert_model returns.
-    let _stream_guard = CpuConvertGuard::enter_cpu();
-
-    // Check for required files
+    // Read + parse config.json up front (pure file I/O, no MLX) so the nvidia
+    // recipe can fail-closed BEFORE we acquire the convert mutex or switch
+    // MLX's default device: `CpuConvertGuard::enter_cpu` calls MLX FFI, which
+    // can abort in a headless/degraded MLX environment. The parsed config is
+    // reused for the conversion proper below.
     let config_path = input_dir.join("config.json");
     if !config_path.exists() {
         return Err(Error::from_reason(format!(
@@ -1908,20 +1895,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             input_dir.display()
         )));
     }
-
-    info!("Loading model from: {}", input_dir.display());
-    info!("Target dtype: {}", target_dtype);
-
-    // Create output directory
-    fs::create_dir_all(&output_dir).map_err(|e| {
-        Error::from_reason(format!(
-            "Failed to create output directory {}: {}",
-            output_dir.display(),
-            e
-        ))
-    })?;
-
-    // Load config to check for tied embeddings
     let config_data = fs::read_to_string(&config_path)?;
     let config: serde_json::Value = serde_json::from_str(&config_data)?;
 
@@ -1946,6 +1919,36 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         )
         .map_err(Error::from_reason)?;
     }
+
+    // Serialize all conversions process-wide before touching MLX's default
+    // device + stream — see `convert_mutex` and `CpuConvertGuard` docs for
+    // the race this avoids.
+    let _convert_lock = convert_mutex().lock().await;
+
+    // Route every MLX op in this conversion through the CPU device + stream.
+    //
+    // The conversion path is slice / reshape / dtype-cast only — no real math.
+    // On GPU, materializing a 1.6 GB sliced view of a fused expert tensor backed
+    // by a 250 GB mmap'd source can stall a Metal command buffer past the macOS
+    // GPU watchdog (~5 s), surfacing as
+    // `kIOGPUCommandBufferCallbackErrorTimeout` mid-shard for large MoE models
+    // (e.g. Qwen3.5 122B-A10B with 256 experts × 48 layers). CPU has direct
+    // access to the mmap'd pages and is immune to the watchdog. `_stream_guard`
+    // restores the prior default device + stream when convert_model returns.
+    let _stream_guard = CpuConvertGuard::enter_cpu();
+
+    info!("Loading model from: {}", input_dir.display());
+    info!("Target dtype: {}", target_dtype);
+
+    // Create output directory
+    fs::create_dir_all(&output_dir).map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to create output directory {}: {}",
+            output_dir.display(),
+            e
+        ))
+    })?;
+
     let tie_word_embeddings = config["tie_word_embeddings"].as_bool().unwrap_or(false);
 
     if tie_word_embeddings && verbose {
