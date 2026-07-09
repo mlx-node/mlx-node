@@ -3,7 +3,8 @@
 **Verdict: 🟢 GO** (all four criteria met). Model: Qwen3.5-0.8B (24 layers, d=1024, tied embeddings).
 Pack: `lens-pack-v1.safetensors` (F32, 96.5 MB, J.1..J.23, corpus-averaged over 100 windows × 128 tok).
 Date: 2026-07-10. Decided from three deterministic, byte-identical-on-rerun artifacts (all in
-`~/.cache/jlens/`, out of git): `eval-results-v1.json`, `band-report.json`, `qualitative-results.json`.
+the mlx-node repo cache `/Users/brooklyn/workspace/github/mlx-node/.cache/jlens/` (the scripts' hard-coded
+`OUT_DIR`; NOT `~/.cache`), out of git): `eval-results-v1.json`, `band-report.json`, `qualitative-results.json`.
 
 ## The four GO criteria (plan §T3.3)
 
@@ -46,11 +47,13 @@ supporting signal, never the GO criterion.
 concept with J-rank ≤ 10 **and** logit-rank > 10 at the same fitted-J boundary (ℓ1..23), min over single-token
 surface ids, apples-to-apples (only `useJacobian` differs). **56 J-only-legible slices across 5 prompts, 9
 concepts** — but the *quality* is uneven, and honesty about that shapes what we feature. Every top-10 dump
-below is quoted VERBATIM from the deterministic `qualitative-results.json` — its `evidence` array persists the
-top-10 at each concept's best-rank (deepest-legibility) boundary — with ranks as the artifact reports them
-(brackets = [J-rank @boundary, logit-rank]). The bracketed J-rank is the concept token's full-vocab pinned
-rank; on a near-tie it can differ by one position from the displayed argmax order (e.g. below, `season`'s
-pinned rank is 1 while the greedy top token prints as `best`).
+below is quoted verbatim from the deterministic `qualitative-results.json` — its `evidence` array persists the
+top-10 at each concept's best-rank (deepest-legibility) boundary. Tokens are shown in double quotes exactly as
+stored, **including the tokenizer's leading-space word-boundary markers** (e.g. `" season"`, `" most"`) — a
+leading space means the token begins a new word. Ranks are as the artifact reports (brackets =
+[J-rank @boundary, logit-rank]); the bracketed J-rank is the concept token's full-vocab pinned rank, which on
+a near-tie can differ by one position from the displayed argmax order (e.g. below, `season`'s pinned rank is 1
+while the greedy top token prints as `"best"`).
 
 **CLEAN — headline demonstration (feature this).** French `"La saison après l'été est l'"` (answer:
 *l'automne*). At its best-rank boundary the J-lens surfaces a coherent season/temporal cluster the logit lens
@@ -58,11 +61,11 @@ does not:
 
 ```
 season  [J-rank 1 @ℓ16, logit ≥999]
-  J    : best · season · summer · ____ · " season" · !' · ...' · ___ · winter · " ____"
-  logit: 也是最 · 佳 · ностью · 上一个 · 个字 · ündür · ... · 是一切 · most · 之一
+  J    : "best" "season" "summer" "____" " season" "!'" "...'" "___" "winter" " ____"
+  logit: "也是最" "佳" "ностью" "上一个" "个字" "ündür" "..." "是一切" " most" "之一"
 summer  [J-rank 2 @ℓ17, logit ≥999]
-  J    : season · summer · best · " season" · année · busiest · Season · winter · greatest · phase
-  logit: most · busiest · 也是最 · easiest · 的开始 · adir · endDate · hardest · 我最 · 上一个
+  J    : "season" "summer" "best" " season" "année" " busiest" "Season" "winter" " greatest" "phase"
+  logit: " most" " busiest" "也是最" " easiest" "的开始" "adir" "endDate" " hardest" "我最" "上一个"
 ```
 
 The J-lens top-10 is a coherent seasonal/temporal field — season, summer, winter, année (year), Season — the
@@ -76,8 +79,8 @@ single late boundary where logit has committed to the Spanish answer while J kee
 
 ```
 small  [J-rank 2 @ℓ23, logit-rank 75]
-  J    : pe · small · min · gran · micro · grande · se · sm · little · grand
-  logit: " chico" · pe · " peque" · " pequ" · " Petit" · Pe · " pequeño" · ...\" · " chicos" · " petit"
+  J    : "pe" "small" "min" "gran" "micro" "grande" "se" "sm" "little" "grand"
+  logit: " chico" "pe" " peque" " pequ" " Petit" "Pe" " pequeño" "...\"" " chicos" " petit"
 ```
 
 At ℓ20–22 the logit lens *also* surfaces `small` (so those boundaries are not J-only); the J-only effect
@@ -89,13 +92,15 @@ J-lens surfaces a **digit cluster** — the numeric answer-slot — while logit 
 surface a crisp single named concept:
 
 ```
-7 (of "2*(3+4)") [J-rank 2 @ℓ18, logit ≥999]   J: 6 · 7 · 8 · 5 · 六是 · 9 · arach · 4 · six · linear
-multiplication   [J-rank 1 @ℓ11, logit ≥999]   J: × · = · .= · _____ · £ · ÷ · ……。 · ⭐ · � · =$
+7 (of "2 * (3 + 4)")  [J-rank 2 @ℓ18, logit ≥999]
+  J: "6" "7" "8" "5" "六是" "9" "arach" "4" "six" "linear"
+multiplication        [J-rank 4 @ℓ11, logit ≥999]
+  J: "_____" ".=" "=" "×" "=$" "£" "÷" "……。" "✓" "________"
 ```
 
-The digit concept surfaces amid a little noise; the operator concept is symbol-soup with `×` at top. Honest
-reading: J represents *"a number/operator goes here"*, not a crisp interpretable concept. "Try it" tier, not a
-headline.
+The digit concept surfaces amid a little noise; the operator concept is symbol-soup (the `×` token is present
+but only rank 4, among `_____`/`.=`/`=`/`£`/`÷`). Honest reading: J represents *"a number/operator goes here"*,
+not a crisp interpretable concept. "Try it" tier, not a headline.
 
 **ABSENT in the curated sample.** multihop (4 items), association (3), poetry (2) produced **zero**
 J-only-legible slices. On a 0.8B these tasks do not reliably show the phenomenon.
@@ -136,4 +141,5 @@ env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode pa
 env PATH="/opt/homebrew/bin:$PATH" JLENS_PACK=lens-pack-v1.safetensors oxnode packages/browser/scripts/jlens/qualitative.mts       # writes qualitative-results.json
 ```
 
-All three write deterministic, byte-identical-on-rerun JSON to `~/.cache/jlens/` (out of git).
+All three write deterministic, byte-identical-on-rerun JSON to the scripts' hard-coded `OUT_DIR` =
+`/Users/brooklyn/workspace/github/mlx-node/.cache/jlens/` (out of git).
