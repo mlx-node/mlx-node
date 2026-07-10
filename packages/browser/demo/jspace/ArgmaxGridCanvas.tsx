@@ -32,6 +32,22 @@ export function offScaleLabel(rank: number): string | null {
   return rank >= RANK_CAP ? `≥${RANK_CAP}` : null;
 }
 
+/** A `selected` from stale state or an unclamped permalink may be out of range
+ *  for THIS slice. cellAt is `cells[layerIdx*promptLen+pos]`, so an unchecked
+ *  coord aliases a different cell or throws. Return null for anything not an
+ *  in-bounds integer cell. */
+export function normalizeSelected(
+  selected: CellRef | null,
+  slice: LensSliceData,
+): CellRef | null {
+  if (!selected) return null;
+  const { layerIdx, pos } = selected;
+  if (!Number.isInteger(layerIdx) || !Number.isInteger(pos)) return null;
+  if (layerIdx < 0 || layerIdx >= slice.layers.length) return null;
+  if (pos < 0 || pos >= slice.promptLen) return null;
+  return { layerIdx, pos };
+}
+
 const FONT = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
 const CELL_PAD = 6;
 
@@ -94,12 +110,35 @@ export function ArgmaxGridCanvas({
   const contentWidth = GUTTER_W + promptLen * CELL_W;
   const contentHeight = rowOrder.length * CELL_H;
 
+  // A `selected` from stale parent state (slice shrank under it) or an unclamped
+  // permalink may be out of range for THIS slice. Clamp ONCE and route every
+  // dereference through `sel` so nothing indexes cellAt with a bad coord.
+  // Memoized so it stays referentially stable for the draw effect's deps.
+  const sel = React.useMemo(() => normalizeSelected(selected, slice), [selected, slice]);
+
+  // Monotonic tick bumped whenever devicePixelRatio changes (browser zoom, or
+  // dragging the window to a different-DPR monitor) so the draw effect resamples
+  // the backing store even when the CSS width is unchanged. A same-value
+  // `setWidth` is discarded by React, so `width` alone cannot trigger a redraw
+  // on a pure DPR change — mirrors AttentionHeatmap.tsx's `resizeTick`.
+  const [resizeTick, setResizeTick] = React.useState(0);
+  const lastDprRef = React.useRef(0);
+
   // Measure the scroll container's visible width, and keep it in sync with
   // resizes / DPR changes. ResizeObserver preferred; window resize as fallback.
   React.useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const measure = () => setWidth(el.clientWidth);
+    const measure = () => {
+      setWidth(el.clientWidth);
+      // Zoom / monitor-move fires resize (and ResizeObserver) but may leave the
+      // CSS width identical; force a redraw by bumping the tick on DPR change.
+      const dpr = window.devicePixelRatio || 1;
+      if (dpr !== lastDprRef.current) {
+        lastDprRef.current = dpr;
+        setResizeTick((n) => n + 1);
+      }
+    };
     measure();
     let ro: ResizeObserver | undefined;
     if (typeof ResizeObserver !== 'undefined') {
@@ -115,17 +154,17 @@ export function ArgmaxGridCanvas({
 
   // Announce the keyboard-selected cell to assistive tech.
   React.useEffect(() => {
-    if (selected) {
-      const c = slice.cellAt(selected.layerIdx, selected.pos);
+    if (sel) {
+      const c = slice.cellAt(sel.layerIdx, sel.pos);
       setAnnounce(
-        `Layer ${slice.layers[selected.layerIdx]}, position ${selected.pos + 1} of ${promptLen}: ${c.topKTexts[0] ?? '∅'}`,
+        `Layer ${slice.layers[sel.layerIdx]}, position ${sel.pos + 1} of ${promptLen}: ${c.topKTexts[0] ?? '∅'}`,
       );
     }
-  }, [selected, slice, promptLen]);
+  }, [sel, slice, promptLen]);
 
-  const selectedDesc = selected
-    ? `Layer ${slice.layers[selected.layerIdx]}, position ${selected.pos + 1} of ${promptLen}: ${
-        slice.cellAt(selected.layerIdx, selected.pos).topKTexts[0] ?? '∅'
+  const selectedDesc = sel
+    ? `Layer ${slice.layers[sel.layerIdx]}, position ${sel.pos + 1} of ${promptLen}: ${
+        slice.cellAt(sel.layerIdx, sel.pos).topKTexts[0] ?? '∅'
       }`
     : '';
 
@@ -199,10 +238,10 @@ export function ArgmaxGridCanvas({
 
     // Selection ring (drawn before the gutter so a scrolled-under cell is
     // occluded by the sticky label column, matching the DOM twin).
-    if (selected) {
-      const r = rowOrder.indexOf(selected.layerIdx);
+    if (sel) {
+      const r = rowOrder.indexOf(sel.layerIdx);
       if (r >= 0) {
-        const sx = GUTTER_W + selected.pos * CELL_W - scrollLeft;
+        const sx = GUTTER_W + sel.pos * CELL_W - scrollLeft;
         const sy = r * CELL_H;
         ctx.strokeStyle = CANVAS.selectionRing;
         ctx.lineWidth = 2;
@@ -224,7 +263,7 @@ export function ArgmaxGridCanvas({
       const layerIdx = rowOrder[r]!;
       ctx.fillText(`ℓ${slice.layers[layerIdx]}`, CELL_PAD, r * CELL_H + CELL_H / 2);
     }
-  }, [slice, selected, colorByPinnedId, showWhitespace, scrollLeft, width]);
+  }, [slice, sel, colorByPinnedId, showWhitespace, scrollLeft, width, resizeTick]);
 
   function onScroll() {
     const el = scrollRef.current;
@@ -250,6 +289,11 @@ export function ArgmaxGridCanvas({
   }
 
   const lastHoverKey = React.useRef<string | null>(null);
+  // Track whether the PREVIOUS move was a Shift-scrub. A scrub clears the hover,
+  // so the first non-Shift move afterwards must re-emit the hover even when it
+  // lands on the same cell — the plain lastHoverKey short-circuit would strand
+  // the tooltip on null (or a stale cell). Tracked separately from lastHoverKey.
+  const wasScrubbing = React.useRef(false);
 
   function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
     const ref = locate(e);
@@ -258,14 +302,27 @@ export function ArgmaxGridCanvas({
         lastHoverKey.current = null;
         onHover(null);
       }
+      wasScrubbing.current = e.shiftKey;
       return;
     }
     const key = `${ref.layerIdx}:${ref.pos}`;
-    if (key === lastHoverKey.current && !e.shiftKey) return;
+    // Re-emit on the first non-Shift move after a scrub even on the same cell.
+    const scrubJustEnded = wasScrubbing.current && !e.shiftKey;
+    if (key === lastHoverKey.current && !e.shiftKey && !scrubJustEnded) {
+      wasScrubbing.current = false;
+      return;
+    }
     lastHoverKey.current = key;
-    // Shift held scrubs the selection instead of only hovering.
-    if (e.shiftKey) onSelect(ref);
-    else onHover(ref);
+    if (e.shiftKey) {
+      // Shift held scrubs the selection instead of only hovering. Clear the
+      // hover so a consumer rendering `hovered ?? selected` follows the scrubbed
+      // cell rather than showing the last hovered cell's tooltip.
+      onHover(null);
+      onSelect(ref);
+    } else {
+      onHover(ref);
+    }
+    wasScrubbing.current = e.shiftKey;
     const c = slice.cellAt(ref.layerIdx, ref.pos);
     setAnnounce(
       `Layer ${slice.layers[ref.layerIdx]}, position ${ref.pos + 1} of ${promptLen}: ${c.topKTexts[0] ?? '∅'}`,
@@ -274,6 +331,7 @@ export function ArgmaxGridCanvas({
 
   function onMouseLeave() {
     lastHoverKey.current = null;
+    wasScrubbing.current = false;
     onHover(null);
   }
 
@@ -296,7 +354,11 @@ export function ArgmaxGridCanvas({
   function onKeyDown(e: React.KeyboardEvent<HTMLCanvasElement>) {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
     e.preventDefault();
-    const cur = selected ?? { layerIdx: slice.layers.length - 1, pos: 0 };
+    // Empty axes: nothing to navigate, and `slice.layers.length - 1` would seed
+    // an out-of-range layerIdx of -1.
+    if (rowOrder.length === 0 || promptLen === 0) return;
+    // Seed from the clamped `sel`, never the raw (possibly stale) `selected`.
+    const cur = sel ?? { layerIdx: slice.layers.length - 1, pos: 0 };
     let layerIdx = cur.layerIdx;
     let pos = cur.pos;
     if (e.key === 'ArrowLeft') pos = Math.max(0, pos - 1);
@@ -316,12 +378,18 @@ export function ArgmaxGridCanvas({
           role="grid"
           aria-label={ariaLabel}
           tabIndex={0}
-          aria-activedescendant={selected ? activeId : undefined}
+          // A <canvas> cannot own DOM children, so the off-screen active gridcell
+          // is a SIBLING; aria-owns re-parents it logically so AT accepts the
+          // aria-activedescendant reference.
+          aria-owns={activeId}
+          aria-activedescendant={sel ? activeId : undefined}
           onMouseMove={onMouseMove}
           onMouseLeave={onMouseLeave}
           onClick={onClick}
           onKeyDown={onKeyDown}
-          style={{ position: 'sticky', left: 0, top: 0, display: 'block', outline: 'none' }}
+          // Keyboard focus stays visible via `.jspace-grid-scroll canvas:focus-visible`
+          // in styles.css — no bare `outline: none` here (it would win over that rule).
+          style={{ position: 'sticky', left: 0, top: 0, display: 'block' }}
         />
         {/* Off-screen gridcell that `aria-activedescendant` targets. */}
         <div id={activeId} role="gridcell" style={SR_ONLY}>

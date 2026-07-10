@@ -1054,6 +1054,17 @@
     box-shadow: 0 0 0 3px rgba(244, 200, 215, 0.25);
   }
 
+  /* /jspace canvas grid: visible keyboard focus (the canvas is tabIndex=0 with
+     no inline outline). Pink ring matches CANVAS.selectionRing (#ec4899); inset
+     so it reads inside the sticky canvas rather than being clipped. */
+  .jspace-grid-scroll canvas:focus-visible {
+    outline: 2px solid #ec4899;
+    outline-offset: -2px;
+  }
+  .jspace-grid-scroll canvas:focus:not(:focus-visible) {
+    outline: none;
+  }
+
   /* Inspector drawer (right-side slide-in over the chat) */
   .inspector-drawer-backdrop {
     position: absolute;

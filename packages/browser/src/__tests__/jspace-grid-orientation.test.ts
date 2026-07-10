@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vite-plus/test';
 import type { LensReadoutRun } from '../inspector-types';
 import { RANK_CAP } from '../../demo/jlens-core/colors';
 import { buildLensSlice } from '../../demo/jlens-core/types';
-import { displayRowOrder, offScaleLabel } from '../../demo/jspace/ArgmaxGridCanvas';
+import { displayRowOrder, normalizeSelected, offScaleLabel } from '../../demo/jspace/ArgmaxGridCanvas';
 
 /** layers ASCENDING; cells layer-major: cells[layerIdx * promptLen + pos]. */
 function fixture() {
@@ -47,5 +47,37 @@ describe('grid orientation', () => {
     expect(offScaleLabel(RANK_CAP)).toBe('≥999');
     expect(offScaleLabel(RANK_CAP + 1)).toBe('≥999');
     expect(offScaleLabel(998)).toBeNull();
+  });
+});
+
+describe('normalizeSelected', () => {
+  // fixture(): layers [6,12,24] (layerIdx 0..2), promptLen 2 (pos 0..1).
+  it('passes an in-bounds coord through unchanged', () => {
+    const slice = fixture();
+    expect(normalizeSelected({ layerIdx: 1, pos: 0 }, slice)).toEqual({ layerIdx: 1, pos: 0 });
+    expect(normalizeSelected({ layerIdx: 2, pos: 1 }, slice)).toEqual({ layerIdx: 2, pos: 1 });
+  });
+
+  it('rejects an out-of-range layerIdx (stale selection / unclamped permalink)', () => {
+    const slice = fixture();
+    expect(normalizeSelected({ layerIdx: 7, pos: 0 }, slice)).toBeNull();
+    expect(normalizeSelected({ layerIdx: -1, pos: 0 }, slice)).toBeNull();
+  });
+
+  it('rejects an out-of-range pos', () => {
+    const slice = fixture();
+    expect(normalizeSelected({ layerIdx: 0, pos: 9 }, slice)).toBeNull();
+    expect(normalizeSelected({ layerIdx: 0, pos: -1 }, slice)).toBeNull();
+  });
+
+  it('rejects a non-integer coord', () => {
+    const slice = fixture();
+    expect(normalizeSelected({ layerIdx: 1.5, pos: 0 }, slice)).toBeNull();
+    expect(normalizeSelected({ layerIdx: 0, pos: Number.NaN }, slice)).toBeNull();
+  });
+
+  it('returns null for a null selection', () => {
+    const slice = fixture();
+    expect(normalizeSelected(null, slice)).toBeNull();
   });
 });
