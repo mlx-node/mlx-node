@@ -353,6 +353,77 @@ function deepFind(node: unknown, predicate: (o: Record<string, unknown>) => bool
   return undefined;
 }
 
+/**
+ * One assistant message as observed in pi's `--mode json` stream.
+ *
+ * pi's agent loop (pi-agent-core agent-loop.ts, streamAssistantResponse)
+ * CONSUMES the provider's `start` and `done` events and re-emits them as
+ * `message_start` / `message_end`; only the in-between streaming events
+ * (`text_*` / `toolcall_*` / `thinking_*`) pass through verbatim as
+ * `message_update.assistantMessageEvent`. So the observable episode is:
+ *   message_start{role:'assistant'} -> inner event types in order ->
+ *   message_end{message.stopReason} (stopReason carries the done reason).
+ */
+interface AssistantEpisode {
+  /** `assistantMessageEvent.type` values in stream order. */
+  innerTypes: string[];
+  /** `text_delta` payloads in order. */
+  textDeltas: string[];
+  /** `toolcall_delta` payloads in order. */
+  toolcallDeltas: string[];
+  /** `toolCall` object from the `toolcall_end` inner event, if any. */
+  toolCallEnd: Record<string, unknown> | undefined;
+  /** Final message from `message_end` (undefined = episode never closed). */
+  endMessage: Record<string, unknown> | undefined;
+}
+
+function assistantEpisodes(events: unknown[]): AssistantEpisode[] {
+  const episodes: AssistantEpisode[] = [];
+  let current: AssistantEpisode | undefined;
+  for (const raw of events) {
+    if (raw === null || typeof raw !== 'object') continue;
+    const event = raw as Record<string, unknown>;
+    const message = event.message as Record<string, unknown> | undefined;
+    if (event.type === 'message_start' && message?.role === 'assistant') {
+      current = {
+        innerTypes: [],
+        textDeltas: [],
+        toolcallDeltas: [],
+        toolCallEnd: undefined,
+        endMessage: undefined,
+      };
+      episodes.push(current);
+    } else if (event.type === 'message_update' && current) {
+      const inner = event.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (!inner || typeof inner.type !== 'string') continue;
+      current.innerTypes.push(inner.type);
+      if (inner.type === 'text_delta' && typeof inner.delta === 'string') {
+        current.textDeltas.push(inner.delta);
+      }
+      if (inner.type === 'toolcall_delta' && typeof inner.delta === 'string') {
+        current.toolcallDeltas.push(inner.delta);
+      }
+      if (inner.type === 'toolcall_end') {
+        current.toolCallEnd = inner.toolCall as Record<string, unknown> | undefined;
+      }
+    } else if (event.type === 'message_end' && message?.role === 'assistant' && current) {
+      current.endMessage = message;
+      current = undefined;
+    }
+  }
+  return episodes;
+}
+
+/** innerTypes matches exactly: opener, >=1 of `delta`, closer. */
+function isBurstTrio(innerTypes: string[], kind: 'text' | 'toolcall'): boolean {
+  return (
+    innerTypes.length >= 3 &&
+    innerTypes[0] === `${kind}_start` &&
+    innerTypes[innerTypes.length - 1] === `${kind}_end` &&
+    innerTypes.slice(1, -1).every((t) => t === `${kind}_delta`)
+  );
+}
+
 interface Verdict {
   item: string;
   status: 'PROVEN' | 'FAILED' | 'SURPRISE';
@@ -396,19 +467,43 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
     `text scenario exit=${text.exitCode} timedOut=${text.timedOut}`,
   );
 
-  // 4. Text streaming through pi's output
-  const sawDelta = deepFind(text.events, (o) => o.type === 'message_update') !== undefined;
+  // 4. Text streaming through pi's output — assert the FULL observable
+  // sequence, in order. Provider `start`/`done` are re-emitted by pi's agent
+  // loop as message_start/message_end (done.reason -> message.stopReason);
+  // text_start/delta/end pass through as message_update.assistantMessageEvent.
+  const textEpisodes = assistantEpisodes(text.events);
+  const textEp = textEpisodes[0];
+  const textSeqOk = textEp !== undefined && isBurstTrio(textEp.innerTypes, 'text');
+  const textDeltasReassemble = textEp !== undefined && textEp.textDeltas.join('') === TEXT_REPLY;
+  const textStopOk = textEp?.endMessage?.stopReason === 'stop';
   const finalText = deepFind(
     text.events,
     (o) => typeof o.text === 'string' && (o.text as string).includes(TEXT_REPLY),
   );
   push(
     '4. Text streaming (start -> text_start/delta/end -> done{stop}) reaches pi output',
-    sawDelta && finalText !== undefined,
-    `message_update seen=${sawDelta}; final text found=${finalText !== undefined}`,
+    textEpisodes.length === 1 &&
+      textSeqOk &&
+      textDeltasReassemble &&
+      textStopOk &&
+      finalText !== undefined,
+    `assistantEpisodes=${textEpisodes.length} innerSeq=[${textEp?.innerTypes.join(',') ?? ''}] ` +
+      `trio(text_start,>=1 delta,text_end)=${textSeqOk} deltasJoin===TEXT_REPLY=${textDeltasReassemble} ` +
+      `message_end.stopReason=${String(textEp?.endMessage?.stopReason)} finalTextDelivered=${finalText !== undefined}`,
   );
 
-  // 5. Tool loop: toolcall -> pi executes read -> toolResult in second call context
+  // 5. Tool loop: first assistant episode must be the toolcall trio ending in
+  // stopReason 'toolUse'; then pi executes read, feeds the toolResult back,
+  // and the second episode is the text continuation ending in 'stop'.
+  const toolEpisodes = assistantEpisodes(tools.events);
+  const toolEp0 = toolEpisodes[0];
+  const toolEp1 = toolEpisodes[1];
+  const toolTrioOk = toolEp0 !== undefined && isBurstTrio(toolEp0.innerTypes, 'toolcall');
+  const toolCallEndOk =
+    toolEp0?.toolCallEnd?.name === 'read' && toolEp0?.toolCallEnd?.id === 'spike_call_0';
+  const toolStopOk = toolEp0?.endMessage?.stopReason === 'toolUse';
+  const contTrioOk = toolEp1 !== undefined && isBurstTrio(toolEp1.innerTypes, 'text');
+  const contStopOk = toolEp1?.endMessage?.stopReason === 'stop';
   const secondCallSawResult = tools.stderr.includes('SPIKE_TOOLRESULT_FOUND=true');
   const twoCalls = tools.stderr.includes('SPIKE_STREAM_CALL n=1');
   const resultHasContent = tools.stderr.includes('MLX_SPIKE_FILE_CONTENT_42');
@@ -418,23 +513,46 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   );
   push(
     '5. Tool loop (toolcall trio -> done{toolUse} -> pi runs read -> toolResult -> continuation)',
-    secondCallSawResult && twoCalls && resultHasContent && finalToolText !== undefined && tools.exitCode === 0,
-    `secondStreamCall=${twoCalls} toolResultInContext=${secondCallSawResult} ` +
+    toolEpisodes.length === 2 &&
+      toolTrioOk &&
+      toolCallEndOk &&
+      toolStopOk &&
+      contTrioOk &&
+      contStopOk &&
+      secondCallSawResult &&
+      twoCalls &&
+      resultHasContent &&
+      finalToolText !== undefined &&
+      tools.exitCode === 0,
+    `assistantEpisodes=${toolEpisodes.length} ` +
+      `ep0=[${toolEp0?.innerTypes.join(',') ?? ''}] trio=${toolTrioOk} toolcall_end{name,id}=${toolCallEndOk} ` +
+      `ep0.stopReason=${String(toolEp0?.endMessage?.stopReason)} ` +
+      `ep1=[${toolEp1?.innerTypes.join(',') ?? ''}] ep1.stopReason=${String(toolEp1?.endMessage?.stopReason)} ` +
+      `secondStreamCall=${twoCalls} toolResultInContext=${secondCallSawResult} ` +
       `fileContentInResult=${resultHasContent} finalTextDelivered=${finalToolText !== undefined} exit=${tools.exitCode}`,
   );
 
-  // 6. Usage plumbing
-  const usageEvent = deepFind(
-    text.events,
-    (o) =>
-      typeof o.usage === 'object' &&
-      o.usage !== null &&
-      (o.usage as Record<string, unknown>).totalTokens === 12,
-  );
+  // 6. Usage plumbing — assert EVERY field of the usage object the provider
+  // set, as propagated onto the final assistant message_end.
+  const endUsage = textEp?.endMessage?.usage as Record<string, unknown> | undefined;
+  const endCost = endUsage?.cost as Record<string, unknown> | undefined;
+  const usageFieldsOk =
+    endUsage !== undefined &&
+    endUsage.input === 7 &&
+    endUsage.output === 5 &&
+    endUsage.cacheRead === 0 &&
+    endUsage.cacheWrite === 0 &&
+    endUsage.totalTokens === 12;
+  const costFieldsOk =
+    endCost !== undefined &&
+    (['input', 'output', 'cacheRead', 'cacheWrite', 'total'] as const).every(
+      (k) => endCost[k] === 0,
+    );
   push(
     '6. Usage on final message (input=7 output=5 totalTokens=12, cost zeros) crashes nothing',
-    usageEvent !== undefined && text.exitCode === 0,
-    `usage(totalTokens=12) visible in session events=${usageEvent !== undefined}`,
+    usageFieldsOk && costFieldsOk && text.exitCode === 0,
+    `message_end.message.usage=${JSON.stringify(endUsage)} ` +
+      `fields(input=7,output=5,cacheRead=0,cacheWrite=0,totalTokens=12)=${usageFieldsOk} costAllZero=${costFieldsOk}`,
   );
 
   // 7. Malformed tool call -> error tool result fed back
