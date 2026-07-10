@@ -28,7 +28,13 @@ export interface AgentArgScan {
   passthrough: string[];
 }
 
-/** Leading positionals that route into pi's package manager and stay useful. */
+/**
+ * Leading positionals that route into pi's package manager and stay
+ * useful. pi's `parsePackageCommand` recognizes exactly
+ * `install | remove | uninstall | update | list` and ONLY at `args[0]`
+ * (`const [rawCommand] = args`), so these must reach pi verbatim —
+ * `update` (npm self-update) is the one member mlx blocks instead.
+ */
 const PI_PACKAGE_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove', 'uninstall', 'list']);
 
 /** Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}. */
@@ -63,11 +69,14 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     passthrough.push(arg);
   }
 
+  // Route on what pi will actually see at args[0] — the passthrough head —
+  // so a preceding (stripped) `--models-dir` pair cannot mask a package
+  // command or the blocked `update`.
   return {
     modelsDir,
     modelsDirMissingValue,
-    help: helpSeen && !PI_PACKAGE_COMMANDS.has(argv[0] ?? ''),
-    update: argv[0] === 'update',
+    help: helpSeen && !PI_PACKAGE_COMMANDS.has(passthrough[0] ?? ''),
+    update: passthrough[0] === 'update',
     passthrough,
   };
 }
@@ -131,7 +140,37 @@ Notes:
 pi options:`);
 }
 
-export async function run(argv: string[]): Promise<void> {
+/**
+ * Injectable seams for {@link run}'s argv-routing tests. Production
+ * leaves them unset and fills each via the deferred dynamic imports;
+ * types are `typeof import(...)` lookups (erased at compile time) so the
+ * module stays importable without the native addon.
+ */
+export interface AgentRunDeps {
+  resolveModelsDir?: (typeof import('../../config.js'))['resolveModelsDir'];
+  discoverMlxModels?: (typeof import('@mlx-node/agent'))['discoverMlxModels'];
+  runAgent?: (typeof import('@mlx-node/agent'))['runAgent'];
+  /** Whole first-run wizard step (imports + IO wiring included). */
+  wizard?: (modelsDir: string) => Promise<void>;
+}
+
+/** Production wizard step: interactive catalog pick + download. */
+async function runProductionWizard(modelsDir: string): Promise<void> {
+  const { runFirstRunWizard } = await import('./wizard.js');
+  const { select } = await import('@inquirer/prompts');
+  const { run: downloadModel } = await import('../download-model.js');
+  await runFirstRunWizard({
+    io: {
+      select: (opts) => select(opts),
+      isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+      log: (line) => console.log(line),
+    },
+    download: (downloadArgv) => downloadModel(downloadArgv),
+    modelsDir,
+  });
+}
+
+export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
   const scan = scanAgentArgs(argv);
 
   if (scan.update) {
@@ -148,8 +187,8 @@ export async function run(argv: string[]): Promise<void> {
 
   // Deferred imports: `@mlx-node/agent` loads the native addon and the
   // pure `scanAgentArgs` export above must stay importable without it.
-  const { resolveModelsDir } = await import('../../config.js');
-  const { discoverMlxModels, runAgent } = await import('@mlx-node/agent');
+  const resolveModelsDir = deps.resolveModelsDir ?? (await import('../../config.js')).resolveModelsDir;
+  const runAgent = deps.runAgent ?? (await import('@mlx-node/agent')).runAgent;
 
   const modelsDir = resolveModelsDir(scan.modelsDir);
 
@@ -160,22 +199,22 @@ export async function run(argv: string[]): Promise<void> {
     return;
   }
 
+  // Package commands (install/remove/uninstall/list) must reach pi with
+  // the command still at args[0] — pi's `parsePackageCommand` reads ONLY
+  // args[0], so a prepended `--model` would knock them into the agent
+  // prompt path. They need no model either: skip discovery, the
+  // first-run wizard and default-model injection, and forward verbatim.
+  if (PI_PACKAGE_COMMANDS.has(scan.passthrough[0] ?? '')) {
+    await runAgent({ modelsDir, models: [], argv: scan.passthrough });
+    return;
+  }
+
+  const discoverMlxModels = deps.discoverMlxModels ?? (await import('@mlx-node/agent')).discoverMlxModels;
   let models = await discoverMlxModels(modelsDir);
 
   if (models.length === 0) {
-    const { runFirstRunWizard } = await import('./wizard.js');
-    const { select } = await import('@inquirer/prompts');
-    const { run: downloadModel } = await import('../download-model.js');
     try {
-      await runFirstRunWizard({
-        io: {
-          select: (opts) => select(opts),
-          isTTY: Boolean(process.stdin.isTTY && process.stdout.isTTY),
-          log: (line) => console.log(line),
-        },
-        download: (downloadArgv) => downloadModel(downloadArgv),
-        modelsDir,
-      });
+      await (deps.wizard ?? runProductionWizard)(modelsDir);
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;

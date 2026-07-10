@@ -1,6 +1,12 @@
+import type { MlxModelInfo } from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { scanAgentArgs, withDefaultModel } from '../../packages/cli/src/commands/agent/index.js';
+import {
+  type AgentRunDeps,
+  run,
+  scanAgentArgs,
+  withDefaultModel,
+} from '../../packages/cli/src/commands/agent/index.js';
 
 describe('scanAgentArgs', () => {
   describe('--models-dir extraction', () => {
@@ -48,6 +54,12 @@ describe('scanAgentArgs', () => {
       expect(scan.update).toBe(false);
       expect(scan.passthrough).toEqual(['-p', 'update']);
     });
+
+    it('detects update behind a stripped --models-dir pair (pi would see it at args[0])', () => {
+      const scan = scanAgentArgs(['--models-dir', '/x', 'update']);
+      expect(scan.update).toBe(true);
+      expect(scan.passthrough).toEqual(['update']);
+    });
   });
 
   describe('help detection', () => {
@@ -63,6 +75,12 @@ describe('scanAgentArgs', () => {
         expect(scan.help).toBe(false);
         expect(scan.passthrough).toEqual([command, '--help']);
       }
+    });
+
+    it('suppresses mlx help for a package command behind --models-dir too', () => {
+      const scan = scanAgentArgs(['--models-dir', '/x', 'install', '--help']);
+      expect(scan.help).toBe(false);
+      expect(scan.passthrough).toEqual(['install', '--help']);
     });
 
     it('does not detect help when absent', () => {
@@ -125,5 +143,114 @@ describe('withDefaultModel', () => {
   it('does not treat prompt text as a flag', () => {
     const argv = ['-p', 'please run --continue for me'];
     expect(withDefaultModel(argv, 'm')).toEqual(['--model', 'mlx/m', '-p', 'please run --continue for me']);
+  });
+});
+
+/**
+ * End-to-end argv ROUTING through `run()`: pi's `parsePackageCommand`
+ * reads ONLY args[0], so package commands must reach `runAgent` verbatim
+ * — no `--model` injection ahead of them and no first-run wizard.
+ */
+describe('run() argv routing', () => {
+  function fakeModel(name: string): MlxModelInfo {
+    return { discovered: { name } } as unknown as MlxModelInfo;
+  }
+
+  /**
+   * Injected fakes for run(): `discoverBatches[i]` is the result of the
+   * i-th discovery call (last batch repeats). Records every call.
+   */
+  function makeDeps(discoverBatches: MlxModelInfo[][] = [[fakeModel('fake-model')]]) {
+    const calls = {
+      discover: [] as string[],
+      wizard: [] as string[],
+      runAgent: [] as Array<{ modelsDir: string; models: MlxModelInfo[]; argv: string[] }>,
+    };
+    const deps: AgentRunDeps = {
+      resolveModelsDir: (explicit) => explicit ?? '/fake/models',
+      discoverMlxModels: (modelsDir) => {
+        calls.discover.push(modelsDir);
+        return Promise.resolve(discoverBatches[Math.min(calls.discover.length - 1, discoverBatches.length - 1)]!);
+      },
+      runAgent: (opts) => {
+        calls.runAgent.push({ modelsDir: opts.modelsDir, models: opts.models, argv: opts.argv });
+        return Promise.resolve();
+      },
+      wizard: (modelsDir) => {
+        calls.wizard.push(modelsDir);
+        return Promise.resolve();
+      },
+    };
+    return { deps, calls };
+  }
+
+  it('hands each package command to pi verbatim at argv[0] — no --model, no discovery, no wizard', async () => {
+    for (const command of ['install', 'remove', 'uninstall', 'list']) {
+      const { deps, calls } = makeDeps();
+      await run([command, 'npm:some-extension'], deps);
+      expect(calls.runAgent).toHaveLength(1);
+      expect(calls.runAgent[0]!.argv).toEqual([command, 'npm:some-extension']);
+      expect(calls.runAgent[0]!.argv).not.toContain('--model');
+      expect(calls.runAgent[0]!.models).toEqual([]);
+      expect(calls.discover).toHaveLength(0);
+      expect(calls.wizard).toHaveLength(0);
+    }
+  });
+
+  it('routes a package command without any model present (empty dir, wizard stays out)', async () => {
+    const { deps, calls } = makeDeps([[]]);
+    await run(['list'], deps);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['list']);
+    expect(calls.wizard).toHaveLength(0);
+  });
+
+  it('routes a package command behind a stripped --models-dir pair', async () => {
+    const { deps, calls } = makeDeps();
+    await run(['--models-dir', '/x', 'install', 'npm:foo'], deps);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['install', 'npm:foo']);
+    expect(calls.runAgent[0]!.modelsDir).toBe('/x');
+    expect(calls.discover).toHaveLength(0);
+  });
+
+  it('still blocks update with exit code 1 before anything runs', async () => {
+    const { deps, calls } = makeDeps();
+    const prevExitCode = process.exitCode;
+    try {
+      await run(['update'], deps);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = prevExitCode;
+    }
+    expect(calls.runAgent).toHaveLength(0);
+    expect(calls.discover).toHaveLength(0);
+    expect(calls.wizard).toHaveLength(0);
+  });
+
+  it('still injects --model mlx/<id> on a fresh agent run', async () => {
+    const { deps, calls } = makeDeps();
+    await run(['-p', 'hi'], deps);
+    expect(calls.discover).toHaveLength(1);
+    expect(calls.wizard).toHaveLength(0);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/fake-model', '-p', 'hi']);
+    expect(calls.runAgent[0]!.models.map((m) => m.discovered.name)).toEqual(['fake-model']);
+  });
+
+  it('still skips injection when the run already carries --model', async () => {
+    const { deps, calls } = makeDeps();
+    await run(['--model', 'mlx/other', '-p', 'hi'], deps);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/other', '-p', 'hi']);
+  });
+
+  it('still runs the wizard for a fresh agent run with no models, then injects the downloaded one', async () => {
+    const { deps, calls } = makeDeps([[], [fakeModel('downloaded-model')]]);
+    await run(['-p', 'hi'], deps);
+    expect(calls.wizard).toHaveLength(1);
+    expect(calls.discover).toHaveLength(2);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '-p', 'hi']);
   });
 });
