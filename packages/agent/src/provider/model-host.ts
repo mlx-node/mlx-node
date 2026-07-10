@@ -45,6 +45,16 @@ export class MlxModelHost {
   }
 
   /**
+   * Read-only lookup of the discovery record behind `modelId` (name, path,
+   * `ModelType`). Pure map read — never touches the serialized chain or
+   * the resident. The stream adapter uses it to pick the launch preset
+   * for the model it is about to run.
+   */
+  modelInfo(modelId: string): DiscoveredModelLike | undefined {
+    return this.byName.get(modelId);
+  }
+
+  /**
    * Make `modelId` resident (loading or swapping on demand) and run `fn`
    * against its `ChatSession` — both inside one serialized closure, so no
    * other queued operation (in particular a swap to a different model)
