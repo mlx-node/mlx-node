@@ -97,6 +97,7 @@ export function ArgmaxGridCanvas({
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
   const activeId = React.useId();
+  const rowId = React.useId();
 
   // Viewport width (for column virtualization) and horizontal scroll offset.
   // Initialized to 0 so nothing touches `window` at module scope or in a
@@ -378,10 +379,11 @@ export function ArgmaxGridCanvas({
           role="grid"
           aria-label={ariaLabel}
           tabIndex={0}
-          // A <canvas> cannot own DOM children, so the off-screen active gridcell
-          // is a SIBLING; aria-owns re-parents it logically so AT accepts the
-          // aria-activedescendant reference.
-          aria-owns={activeId}
+          // A <canvas> cannot own DOM children, so the off-screen active cell is a
+          // SIBLING. A `grid` must own `row`s, and a `gridcell` requires a `row`
+          // parent, so aria-owns re-parents the off-screen ROW (which wraps the
+          // gridcell) — only while a selection exists, so an empty grid owns nothing.
+          aria-owns={sel ? rowId : undefined}
           aria-activedescendant={sel ? activeId : undefined}
           onMouseMove={onMouseMove}
           onMouseLeave={onMouseLeave}
@@ -391,9 +393,13 @@ export function ArgmaxGridCanvas({
           // in styles.css — no bare `outline: none` here (it would win over that rule).
           style={{ position: 'sticky', left: 0, top: 0, display: 'block' }}
         />
-        {/* Off-screen gridcell that `aria-activedescendant` targets. */}
-        <div id={activeId} role="gridcell" style={SR_ONLY}>
-          {selectedDesc}
+        {/* Off-screen row wrapping the gridcell that `aria-activedescendant`
+            targets — preserves the grid → row → gridcell ARIA hierarchy that a
+            bare canvas-owned gridcell would violate. */}
+        <div id={rowId} role="row" style={SR_ONLY}>
+          <div id={activeId} role="gridcell">
+            {selectedDesc}
+          </div>
         </div>
         {/* Screen-reader live region — mirrors AttentionHeatmap's announce region. */}
         <div aria-live="polite" aria-atomic="true" style={SR_ONLY}>
