@@ -17,9 +17,9 @@ export interface AgentArgScan {
   /** `--models-dir` was present without a value — usage error. */
   modelsDirMissingValue: boolean;
   /**
-   * `-h`/`--help` seen and this is NOT a pi package-manager invocation
-   * (`install`/`remove`/`uninstall`/`list` print their own per-command
-   * help inside pi, so those pass through untouched).
+   * `-h`/`--help` seen and this is NOT a pi pass-through invocation
+   * (`install`/`remove`/`uninstall`/`list`/`config` print their own
+   * per-command help inside pi, so those pass through untouched).
    */
   help: boolean;
   /** Leading `update` positional — pi's npm self-update, always blocked. */
@@ -29,13 +29,14 @@ export interface AgentArgScan {
 }
 
 /**
- * Leading positionals that route into pi's package manager and stay
- * useful. pi's `parsePackageCommand` recognizes exactly
- * `install | remove | uninstall | update | list` and ONLY at `args[0]`
- * (`const [rawCommand] = args`), so these must reach pi verbatim —
+ * Leading positionals that route into pi's own command handlers and stay
+ * useful. pi recognizes them ONLY at `args[0]`: `parsePackageCommand`
+ * matches exactly `install | remove | uninstall | update | list`
+ * (`const [rawCommand] = args`) and `handleConfigCommand` matches
+ * `config` (`const [command] = args`). So these must reach pi verbatim —
  * `update` (npm self-update) is the one member mlx blocks instead.
  */
-const PI_PACKAGE_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove', 'uninstall', 'list']);
+const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove', 'uninstall', 'list', 'config']);
 
 /** Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}. */
 export function scanAgentArgs(argv: string[]): AgentArgScan {
@@ -70,12 +71,12 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   }
 
   // Route on what pi will actually see at args[0] — the passthrough head —
-  // so a preceding (stripped) `--models-dir` pair cannot mask a package
+  // so a preceding (stripped) `--models-dir` pair cannot mask a pass-through
   // command or the blocked `update`.
   return {
     modelsDir,
     modelsDirMissingValue,
-    help: helpSeen && !PI_PACKAGE_COMMANDS.has(passthrough[0] ?? ''),
+    help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
     passthrough,
   };
@@ -135,7 +136,7 @@ Environment:
 Notes:
   'mlx agent update' is disabled — update @mlx-node/cli via your package
   manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
-  skills under the agent config home.
+  skills under the agent config home; 'config' edits which are enabled.
 
 pi options:`);
 }
@@ -199,12 +200,13 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
-  // Package commands (install/remove/uninstall/list) must reach pi with
-  // the command still at args[0] — pi's `parsePackageCommand` reads ONLY
+  // Pass-through commands (install/remove/uninstall/list/config) must
+  // reach pi with the command still at args[0] — pi's
+  // `parsePackageCommand` and `handleConfigCommand` both read ONLY
   // args[0], so a prepended `--model` would knock them into the agent
   // prompt path. They need no model either: skip discovery, the
   // first-run wizard and default-model injection, and forward verbatim.
-  if (PI_PACKAGE_COMMANDS.has(scan.passthrough[0] ?? '')) {
+  if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '')) {
     await runAgent({ modelsDir, models: [], argv: scan.passthrough });
     return;
   }

@@ -69,15 +69,15 @@ describe('scanAgentArgs', () => {
       expect(scanAgentArgs(['--mode', 'json', '--help']).help).toBe(true);
     });
 
-    it('leaves package-manager help to pi (install/remove/uninstall/list pass through)', () => {
-      for (const command of ['install', 'remove', 'uninstall', 'list']) {
+    it('leaves per-command help to pi (install/remove/uninstall/list/config pass through)', () => {
+      for (const command of ['install', 'remove', 'uninstall', 'list', 'config']) {
         const scan = scanAgentArgs([command, '--help']);
         expect(scan.help).toBe(false);
         expect(scan.passthrough).toEqual([command, '--help']);
       }
     });
 
-    it('suppresses mlx help for a package command behind --models-dir too', () => {
+    it('suppresses mlx help for a pass-through command behind --models-dir too', () => {
       const scan = scanAgentArgs(['--models-dir', '/x', 'install', '--help']);
       expect(scan.help).toBe(false);
       expect(scan.passthrough).toEqual(['install', '--help']);
@@ -148,8 +148,9 @@ describe('withDefaultModel', () => {
 
 /**
  * End-to-end argv ROUTING through `run()`: pi's `parsePackageCommand`
- * reads ONLY args[0], so package commands must reach `runAgent` verbatim
- * — no `--model` injection ahead of them and no first-run wizard.
+ * and `handleConfigCommand` read ONLY args[0], so package commands and
+ * `config` must reach `runAgent` verbatim — no `--model` injection
+ * ahead of them and no first-run wizard.
  */
 describe('run() argv routing', () => {
   function fakeModel(name: string): MlxModelInfo {
@@ -197,12 +198,25 @@ describe('run() argv routing', () => {
     }
   });
 
-  it('routes a package command without any model present (empty dir, wizard stays out)', async () => {
-    const { deps, calls } = makeDeps([[]]);
-    await run(['list'], deps);
+  it('hands config to pi verbatim at argv[0] — no --model, no discovery, no wizard', async () => {
+    const { deps, calls } = makeDeps();
+    await run(['config', '--local'], deps);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['list']);
+    expect(calls.runAgent[0]!.argv).toEqual(['config', '--local']);
+    expect(calls.runAgent[0]!.argv).not.toContain('--model');
+    expect(calls.runAgent[0]!.models).toEqual([]);
+    expect(calls.discover).toHaveLength(0);
     expect(calls.wizard).toHaveLength(0);
+  });
+
+  it('routes a pass-through command without any model present (empty dir, wizard stays out)', async () => {
+    for (const argv of [['list'], ['config']]) {
+      const { deps, calls } = makeDeps([[]]);
+      await run(argv, deps);
+      expect(calls.runAgent).toHaveLength(1);
+      expect(calls.runAgent[0]!.argv).toEqual(argv);
+      expect(calls.wizard).toHaveLength(0);
+    }
   });
 
   it('routes a package command behind a stripped --models-dir pair', async () => {
