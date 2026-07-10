@@ -514,10 +514,17 @@ async function main(): Promise<void> {
   {
     const failures: string[] = [];
     const evidence: string[] = [];
-    const thinkConfig: ChatConfig = { maxNewTokens: 128, temperature: 0 }; // default reasoning
+    // Default reasoning (no reasoningEffort:'none') so the turn REALLY thinks,
+    // plus an explicit thinkingTokenBudget: at temp=0 the 0.8b never emits
+    // </think> on its own (512/512 ramble observed, finish=length, no visible
+    // text), so the engine's budget-forced </think> is what guarantees the turn
+    // both thinks (reasoningTokens > 0) AND emits a visible answer. The prompt
+    // stays BARE: "think step by step" nudges make the ramble worse and leak
+    // pseudo-thinking into the visible text after the forced close.
+    const thinkConfig: ChatConfig = { maxNewTokens: 256, temperature: 0, thinkingTokenBudget: 64 };
     const h1: ChatMessage[] = [
       { role: 'system', content: SYSTEM },
-      { role: 'user', content: 'What is 17 + 25? Reply with just the number.' },
+      { role: 'user', content: 'What is 17 + 25?' },
     ];
     const r1 = await warmReplay(session, h1, thinkConfig);
     evidence.push(`thinking turn 1: ${finalStats(r1.final)}`);
@@ -527,33 +534,50 @@ async function main(): Promise<void> {
     );
     evidence.push(`turn 1 visible text: ${JSON.stringify(r1.final?.text ?? '')}`);
     if (!r1.final) failures.push('thinking turn 1 produced no final');
-    if ((r1.final?.reasoningTokens ?? 0) === 0) {
-      evidence.push('SURPRISE candidate: default-reasoning turn produced 0 reasoning tokens');
+    // Turn 1 MUST actually think — the item is meaningless without a real <think> block in the cache.
+    if (!((r1.final?.reasoningTokens ?? 0) > 0)) {
+      failures.push(`thinking turn 1 must produce reasoning tokens, got ${r1.final?.reasoningTokens}`);
+    }
+    if ((r1.final?.text ?? '').trim().length === 0) {
+      failures.push(`thinking turn 1 produced no visible text (finish=${r1.final?.finishReason}; budget too small?)`);
     }
 
     const h2: ChatMessage[] = [
       ...h1,
       { role: 'assistant', content: r1.final?.text ?? '' }, // visible text only — thinking is stripped on replay
-      { role: 'user', content: 'Now subtract 4 from that. Reply with just the number.' },
+      { role: 'user', content: 'Now subtract 4 from that.' },
     ];
     const r2 = await warmReplay(session, h2, thinkConfig);
     evidence.push(`thinking replay turn 2: ${finalStats(r2.final)}`);
     evidence.push(`turn 2 visible text: ${JSON.stringify(r2.final?.text ?? '')}`);
     if (!r2.final) failures.push('thinking replay turn 2 produced no final');
+    if ((r2.final?.text ?? '').trim().length === 0) failures.push('thinking replay turn 2 produced no visible text');
     const cached2 = r2.final?.cachedTokens;
     const prompt2 = r2.final?.promptTokens ?? 0;
-    // Design expectation (perf note, not a failure): the replay render strips
-    // the <think> block, so the KV prefix should invalidate at the thinking
-    // assistant turn — cachedTokens covers roughly [system, user1] only.
+    const prompt1 = r1.final?.promptTokens ?? 0;
     evidence.push(
       `prefix reuse across the thinking turn: cached=${cached2} of prompt=${prompt2} ` +
-        `(re-prefilled ${prompt2 - (cached2 ?? 0)}; design expects invalidation at the thinking turn)`,
+        `(re-prefilled ${prompt2 - (cached2 ?? 0)}; turn-1 prompt boundary=${prompt1})`,
     );
-    if (typeof cached2 !== 'number') failures.push(`turn 2 cachedTokens missing: ${cached2}`);
-    record('7. Thinking replay: cachedTokens behavior recorded', failures.length === 0 ? 'PROVEN' : 'FAILED', [
-      ...evidence,
-      ...failures,
-    ]);
+    // Invariant: the replay render strips <think>, so the KV cache diverges no later
+    // than assistant-1's generated tokens — 0 < cached2 < prompt2 AND cached2 <= turn 1's promptTokens.
+    if (!(typeof cached2 === 'number' && cached2 > 0)) {
+      failures.push(`turn 2 cachedTokens must be > 0, got ${cached2}`);
+    } else {
+      if (!(cached2 < prompt2)) {
+        failures.push(`turn 2 must re-prefill a suffix: cached=${cached2} !< prompt=${prompt2}`);
+      }
+      if (!(cached2 <= prompt1)) {
+        failures.push(
+          `cache must invalidate at the thinking assistant turn: cached=${cached2} > turn-1 prompt boundary=${prompt1}`,
+        );
+      }
+    }
+    record(
+      '7. Thinking replay: turn 1 thinks; turn 2 reuse stops at the thinking-turn boundary',
+      failures.length === 0 ? 'PROVEN' : 'FAILED',
+      [...evidence, ...failures],
+    );
   }
 
   // ---- Summary ----
