@@ -82,6 +82,12 @@ const PACK_ENV = process.env.JLENS_PACK;
 const PACK_PATH = PACK_ENV ? (PACK_ENV.includes('/') ? PACK_ENV : join(JLENS_CACHE_DIR, PACK_ENV)) : DEFAULT_PACK;
 const META_PATH = process.env.JLENS_META ?? DEFAULT_META;
 const OUT_DIR = process.env.JLENS_OUT_DIR ?? join(HERE, '../../demo/learn/widgets/jlens/baked');
+// The /jspace app also renders these frames as its model-free STARTER grid
+// (demo/jspace/starters/<slug>.json). Same envelope, same plain-number[] typed
+// arrays (Constraint 15) — so one bake run keeps the lesson and the /jspace
+// starters in lockstep. Override with JLENS_STARTER_DIR; set to '' to skip.
+const STARTER_DIR =
+  process.env.JLENS_STARTER_DIR ?? join(HERE, '../../demo/jspace/starters');
 
 const TOP_K = 10;
 const EXPECTED_JACOBIANS = 23; // J.1..J.23 in the v1 pack (eval.mts:179).
@@ -167,6 +173,7 @@ async function main() {
   console.log(`bakedDate=${bakedDate} (source: ${process.env.JLENS_BAKE_DATE ? 'JLENS_BAKE_DATE' : 'meta.fit_date'}); out=${OUT_DIR}\n`);
 
   mkdirSync(OUT_DIR, { recursive: true });
+  if (STARTER_DIR) mkdirSync(STARTER_DIR, { recursive: true });
 
   // `derivePins` needs {id,text}[]; the native model returns ids and texts from
   // two calls. Adapting here keeps ONE pin predicate across bake and the browsers.
@@ -237,11 +244,14 @@ async function main() {
       logit: serializeRun(logit),
       jacobian: serializeRun(jacobian),
     };
+    const serialized = JSON.stringify(envelope, null, 2) + '\n';
     const outPath = join(OUT_DIR, `${preset.slug}.json`);
-    writeAtomic(outPath, JSON.stringify(envelope, null, 2) + '\n');
+    writeAtomic(outPath, serialized);
+    // Mirror the SAME envelope into the /jspace starter dir (model-free grid).
+    if (STARTER_DIR) writeAtomic(join(STARTER_DIR, `${preset.slug}.json`), serialized);
     console.log(
       `[${preset.slug.padEnd(18)}] P=${String(promptIds.length).padStart(2)} pins=${pinnedIds.length} ` +
-        `cells=${logit.cells.length} → ${outPath}`,
+        `cells=${logit.cells.length} → ${outPath}${STARTER_DIR ? ` (+ starter)` : ''}`,
     );
   }
 
