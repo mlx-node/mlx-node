@@ -175,11 +175,6 @@ export class TurnEmitter {
    */
   onAborted(): void {
     if (this.finished) return;
-    try {
-      this.appendVisibleText(this.textBuffer.flush());
-    } catch {
-      // Preserving buffered residue is best-effort on the abort path.
-    }
     this.finishWithError('aborted', 'Request was aborted');
   }
 
@@ -188,9 +183,24 @@ export class TurnEmitter {
     this.finishWithError('error', err instanceof Error ? err.message : String(err));
   }
 
+  /**
+   * Shared terminal path for every non-`done` ending (abort, native
+   * finishReason=error, internal failure). Recovers any held-back buffer
+   * residue and closes the open text/thinking block BEFORE emitting the
+   * terminal event — a stream must never end `text_start/text_delta/error`
+   * with no `text_end` (pi's reference providers balance all blocks
+   * before terminals).
+   */
   private finishWithError(reason: 'aborted' | 'error', message: string): void {
     this.finished = true;
     try {
+      try {
+        this.appendVisibleText(this.textBuffer.flush());
+      } catch {
+        // Preserving buffered residue is best-effort; the block close and
+        // terminal event below must still go out.
+      }
+      this.closeOpenBlock();
       this.partial.stopReason = reason;
       this.partial.errorMessage = message;
       this.stream.push({ type: 'error', reason, error: this.partial });

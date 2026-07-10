@@ -324,27 +324,41 @@ describe('TurnEmitter', () => {
     expect(finalMessage(await collect(stream)).stopReason).toBe('stop');
   });
 
-  it('routes a finishReason=error final to error semantics', async () => {
+  it('routes a finishReason=error final to error semantics, closing the open block first', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onDelta(delta('so far'));
     emitter.onFinal(makeFinal({ finishReason: 'error' }));
 
     const events = await collect(stream);
+    // The open text block must be balanced (text_end) BEFORE the terminal.
+    expect(types(events)).toEqual(['start', 'text_start', 'text_delta', 'text_end', 'error']);
     const last = events[events.length - 1]!;
-    expect(last.type).toBe('error');
     expect(last.type === 'error' && last.reason).toBe('error');
     const message = finalMessage(events);
     expect(message.stopReason).toBe('error');
     expect(message.errorMessage).toMatch(/finishReason=error/);
+    expect(message.content).toEqual([{ type: 'text', text: 'so far' }]);
   });
 
-  it('synthesizes an aborted final preserving accumulated text and thinking', async () => {
+  it('recovers held-back buffer text on a finishReason=error final', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('result: <tool'));
+    emitter.onFinal(makeFinal({ finishReason: 'error' }));
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'text_start', 'text_delta', 'text_delta', 'text_end', 'error']);
+    expect(emittedText(events)).toBe('result: <tool');
+    expect(finalMessage(events).content).toEqual([{ type: 'text', text: 'result: <tool' }]);
+  });
+
+  it('synthesizes an aborted final with every open block closed before the terminal', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onDelta(delta('planning', true));
     emitter.onDelta(delta('partial answ'));
     emitter.onAborted();
 
     const events = await collect(stream);
+    // The open text block must be balanced (text_end) BEFORE the terminal.
     expect(types(events)).toEqual([
       'start',
       'thinking_start',
@@ -352,6 +366,7 @@ describe('TurnEmitter', () => {
       'thinking_end',
       'text_start',
       'text_delta',
+      'text_end',
       'error',
     ]);
     const last = events[events.length - 1]!;
@@ -366,14 +381,35 @@ describe('TurnEmitter', () => {
     expect(await stream.result()).toBe(message);
   });
 
-  it('emits an error event with stopReason error and errorMessage on onError', async () => {
+  it('closes an open thinking block before the abort terminal', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('mid-thought', true));
+    emitter.onAborted();
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'thinking_start', 'thinking_delta', 'thinking_end', 'error']);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'mid-thought' }]);
+  });
+
+  it('recovers held-back buffer text and closes the block before the abort terminal', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('partial <tool'));
+    emitter.onAborted();
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'text_start', 'text_delta', 'text_delta', 'text_end', 'error']);
+    expect(emittedText(events)).toBe('partial <tool');
+    expect(finalMessage(events).content).toEqual([{ type: 'text', text: 'partial <tool' }]);
+  });
+
+  it('emits an error event with stopReason error and errorMessage on onError, block closed first', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onDelta(delta('hi'));
     emitter.onError(new Error('boom'));
 
     const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'text_start', 'text_delta', 'text_end', 'error']);
     const last = events[events.length - 1]!;
-    expect(last.type).toBe('error');
     expect(last.type === 'error' && last.reason).toBe('error');
     const message = finalMessage(events);
     expect(message.stopReason).toBe('error');
