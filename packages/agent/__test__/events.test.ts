@@ -424,6 +424,25 @@ describe('TurnEmitter', () => {
     expect(message.errorMessage).toBe('string failure');
   });
 
+  it('contains a revoked Proxy error value: no throw, one error terminal, result() settles', async () => {
+    const { emitter, stream } = makeEmitter();
+    // On a revoked Proxy even `err instanceof Error` throws (the prototype
+    // walk hits the revoked trap), so onError must guard every read.
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+
+    expect(() => emitter.onError(proxy)).not.toThrow();
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'error']);
+    const last = events[events.length - 1]!;
+    expect(last.type === 'error' && last.reason).toBe('error');
+    const message = finalMessage(events);
+    expect(message.stopReason).toBe('error');
+    expect(message.errorMessage).toBe('unserializable error');
+    expect(await stream.result()).toBe(message);
+  });
+
   it('ignores events after the terminal event', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onFinal(makeFinal({ text: 'done' }));

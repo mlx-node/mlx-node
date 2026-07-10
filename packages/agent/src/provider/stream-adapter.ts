@@ -27,11 +27,13 @@
  *     spans the whole queued/running window so the stream terminates
  *     promptly even when `runWithResident` never yields.
  *   - Failures become stream events via `TurnEmitter` (`onError` /
- *     `onAborted`). If the emitter itself fails — a synchronous setup
- *     throw, or `onError` choking while coercing a hostile error value —
- *     a TurnEmitter-independent failsafe pushes a minimal terminal
- *     directly onto the stream. A push/end failure at that last layer is
- *     swallowed: there is no further recovery surface.
+ *     `onAborted`). Hostile error values are contained inside the emitter
+ *     itself (`onError` shares the hardened `coerceErrorMessage`), so the
+ *     TurnEmitter-independent failsafe below is defense in depth: if the
+ *     emitter still fails — a synchronous setup throw from a hostile
+ *     `Model` getter, or any residual defect — it pushes a minimal
+ *     terminal directly onto the stream. A push/end failure at that last
+ *     layer is swallowed: there is no further recovery surface.
  */
 
 import type {
@@ -48,6 +50,7 @@ import type { ChatSession } from '@mlx-node/lm';
 import type { DiscoveredModelLike } from '../types.js';
 import { buildChatConfig } from './chat-config.js';
 import { contextToChatMessages, toolsToDefinitions } from './convert-messages.js';
+import { coerceErrorMessage } from './error-coercion.js';
 import { emptyUsage, TurnEmitter } from './events.js';
 import { resetPreservingNativeCacheForWarmReuse } from './warm-reuse.js';
 
@@ -61,35 +64,6 @@ export interface StreamSimpleHost {
   modelInfo(modelId: string): DiscoveredModelLike | undefined;
   /** Atomic resident selection + serialized inference closure (see `MlxModelHost`). */
   runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T>;
-}
-
-/**
- * Coerce an arbitrary thrown value to a message string without trusting
- * it: an `Error` whose `message` getter throws, an object with a poisoned
- * `toString` / `Symbol.toPrimitive`, a null-prototype object (where
- * `String(err)` itself throws), and a revoked Proxy — where even
- * `err instanceof Error` throws, because `instanceof` walks the prototype
- * chain through the (revoked or throwing) `getPrototypeOf` trap — all
- * land on the constant fallback instead of escaping. Circular objects are
- * fine — `String` never serializes deeply.
- */
-export function coerceErrorMessage(err: unknown): string {
-  try {
-    // The `instanceof` check MUST live inside the guard: on a revoked
-    // Proxy (or any Proxy with a throwing `getPrototypeOf` trap) the
-    // check itself throws a TypeError before any property is read.
-    if (err instanceof Error) {
-      const { message } = err;
-      if (typeof message === 'string' && message.length > 0) return message;
-    }
-  } catch {
-    // hostile prototype walk or poisoned `message` getter — fall through
-  }
-  try {
-    return String(err);
-  } catch {
-    return 'unserializable error';
-  }
 }
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
@@ -157,8 +131,9 @@ export function makeMlxStreamSimple(
     /**
      * Idempotent terminal: the first caller wins, later callers no-op.
      * Routes through `TurnEmitter` when possible; falls back to the
-     * direct-push failsafe when the emitter is missing or throws (e.g.
-     * while coercing a hostile error value).
+     * direct-push failsafe when the emitter is missing or throws
+     * (defense in depth — `onError` shares the hardened coercion and is
+     * not expected to throw).
      */
     const terminalize = (kind: 'aborted' | 'error', err?: unknown): void => {
       if (terminated) return;

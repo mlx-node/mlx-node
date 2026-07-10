@@ -25,6 +25,7 @@ import type {
 } from '@earendil-works/pi-ai';
 import type { ChatStreamDelta, ChatStreamFinal, ToolCallResult } from '@mlx-node/lm';
 
+import { coerceErrorMessage } from './error-coercion.js';
 import { ToolCallTagBuffer } from './tool-call-buffer.js';
 
 /**
@@ -182,9 +183,14 @@ export class TurnEmitter {
     this.finishWithError('aborted', 'Request was aborted');
   }
 
+  /**
+   * Terminal for internal/adapter failures. `err` is untrusted: coercion
+   * is fully guarded (shared `coerceErrorMessage`), so even a revoked
+   * Proxy or a poisoned `message` getter cannot throw out of here.
+   */
   onError(err: unknown): void {
     if (this.finished) return;
-    this.finishWithError('error', err instanceof Error ? err.message : String(err));
+    this.finishWithError('error', coerceErrorMessage(err));
   }
 
   /**
