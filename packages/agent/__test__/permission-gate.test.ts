@@ -182,6 +182,103 @@ describe('createPermissionGateExtension', () => {
     expect(selectCalls[1]!.title).toContain('/repo/README.md');
   });
 
+  describe('prompt detail sanitization', () => {
+    it('strips ANSI escape sequences (CSI, incl. the bare C1 CSI byte) from the title', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo safe\u001b[2J\u001b[1;1H\u001b[31m && rm -rf /\u009b2J';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u001b');
+      expect(title).not.toContain('\u009b');
+      expect(title).toContain('echo safe');
+      expect(title).toContain('rm -rf /');
+    });
+
+    it('strips OSC sequences (terminal title / hyperlinks) including their payload', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'ls \u001b]0;spoofed-window-title\u0007-la';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u001b');
+      expect(title).not.toContain('spoofed-window-title');
+      expect(title).toContain('ls ');
+      expect(title).toContain('-la');
+    });
+
+    it('replaces non-ANSI control characters with a visible placeholder', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo a\u0007b\rc\u0000d';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u0007');
+      expect(title).not.toContain('\r');
+      expect(title).not.toContain('\u0000');
+      expect(title).toContain('echo a�b�c�d');
+    });
+
+    it('keeps newlines and tabs in a short multi-line command unchanged', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'for f in *.txt; do\n\techo "$f"\ndone';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain(command);
+      expect(title).not.toContain('[truncated]');
+    });
+
+    it('truncates an oversized command and marks the truncation', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = `echo start ${'x'.repeat(5000)} echo end`;
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('echo start');
+      expect(title).toContain('… [truncated]');
+      expect(title).not.toContain('echo end');
+      expect(title.length).toBeLessThan(600);
+    });
+
+    it('caps a many-line command at the line limit with a marker', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = Array.from({ length: 12 }, (_, i) => `step-${i}`).join('\n');
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('step-0');
+      expect(title).toContain('step-5');
+      expect(title).not.toContain('step-6');
+      expect(title).toContain('… [truncated]');
+    });
+
+    it('a command that is nothing but escape sequences shows a visible stand-in', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      await handler(toolCallEvent('bash', { command: '\u001b[2J\u001b[3J\u001b[H' }), ctx);
+      expect(selectCalls[0]!.title).toContain('(unprintable content)');
+    });
+
+    it('sanitizes the write/edit path detail too', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      await handler(toolCallEvent('write', { path: '/tmp/\u001b[31mevil\u001b[0m.txt', content: '' }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u001b');
+      expect(title).toContain('/tmp/evil.txt');
+    });
+
+    it('leaves a normal command and path untouched (no marker, no placeholder)', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      await handler(toolCallEvent('bash', { command: 'yarn build:native --verbose' }), ctx);
+      await handler(toolCallEvent('edit', { path: '/repo/src/index.ts', oldText: 'a', newText: 'b' }), ctx);
+      expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  yarn build:native --verbose');
+      expect(selectCalls[1]!.title).toBe('Allow edit?\n\n  /repo/src/index.ts');
+    });
+  });
+
   it('malformed event input still yields a decision without throwing', async () => {
     const handler = loadGateHandler();
     const malformedInputs: unknown[] = [undefined, null, 42, 'oops', {}, { command: 123 }, { path: { nested: true } }];
