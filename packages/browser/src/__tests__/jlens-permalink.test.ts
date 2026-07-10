@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { decodePermalink, encodePermalink, type JSpaceState } from '../../demo/jlens-core/permalink';
+import { LENS_MAX_PINNED } from '../inspector-types';
 
 const base: JSpaceState = {
   prompt: "La saison après l'été est l'",
@@ -23,17 +24,58 @@ describe('permalink codec', () => {
     expect(decodePermalink('#' + encodePermalink(base))).toEqual(base);
   });
 
-  it('clamps an over-long pin list to LENS_MAX_PINNED', () => {
-    const hash = 'p=hi&mode=j&pins=' + Array.from({ length: 12 }, (_, i) => i + 1).join('-');
-    expect(decodePermalink(hash).pins).toHaveLength(8);
+  it('clamps an over-long pin list to LENS_MAX_PINNED on decode', () => {
+    const over = Array.from({ length: LENS_MAX_PINNED + 4 }, (_, i) => i + 1);
+    const hash = 'p=hi&mode=j&pins=' + over.join('-');
+    // Assert the exact RETAINED ids, not just the length: a length-only check stays
+    // green even if the impl kept the LAST N instead of the first N.
+    expect(decodePermalink(hash).pins).toEqual(over.slice(0, LENS_MAX_PINNED));
+  });
+
+  it('clamps an over-long pin list to LENS_MAX_PINNED on encode', () => {
+    const over = Array.from({ length: LENS_MAX_PINNED + 4 }, (_, i) => i + 1);
+    // Inspect the WIRE string directly: routing through decode would clamp too and
+    // mask a missing encoder clamp.
+    const pinsPart = new URLSearchParams(encodePermalink({ ...base, pins: over })).get('pins');
+    expect(pinsPart).toBe(over.slice(0, LENS_MAX_PINNED).join('-'));
   });
 
   it('drops junk rather than throwing', () => {
     const r = decodePermalink('p=hi&mode=nonsense&pins=a-b-c&sel=zz');
     expect(r.prompt).toBe('hi');
+    // A junk `mode` decodes to ABSENT (not a present `undefined`); `toBeUndefined`
+    // alone can't tell the two apart, so assert absence explicitly.
+    expect(Object.hasOwn(r, 'mode')).toBe(false);
     expect(r.mode).toBeUndefined();
     expect(r.pins).toEqual([]);
     expect(r.sel).toBeNull();
+  });
+
+  it('drops junk pins instead of coercing prefixes', () => {
+    // `-1` and `7abc` must NOT survive as `1` / `7`: the field grammar rejects the
+    // whole value, so `pins` decodes to `[]`.
+    expect(decodePermalink('pins=-1').pins).toEqual([]);
+    expect(decodePermalink('pins=7abc').pins).toEqual([]);
+    // Digits-only but not a safe integer -> dropped.
+    expect(decodePermalink('pins=99999999999999999999').pins).toEqual([]);
+    // Empty value -> [] (grammar rejects the empty string).
+    expect(decodePermalink('pins=').pins).toEqual([]);
+  });
+
+  it('drops a junk or wrong-arity sel to null', () => {
+    expect(decodePermalink('sel=6abc,8xyz').sel).toBeNull(); // non-digit components
+    expect(decodePermalink('sel=1,2,3').sel).toBeNull(); // three coordinates
+    expect(decodePermalink('sel=5').sel).toBeNull(); // one coordinate
+  });
+
+  it('decodes the two golden mode values', () => {
+    expect(decodePermalink('mode=l').mode).toBe('logit');
+    expect(decodePermalink('mode=j').mode).toBe('jacobian');
+  });
+
+  it('emits no pins field when encoding a state whose pins contain a negative id', () => {
+    const encoded = encodePermalink({ ...base, pins: [-1] });
+    expect(new URLSearchParams(encoded).has('pins')).toBe(false);
   });
 
   it('returns an empty object for an empty hash', () => {

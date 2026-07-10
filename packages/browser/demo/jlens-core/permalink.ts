@@ -22,8 +22,19 @@ export type JSpaceState = {
 
 export function encodePermalink(s: JSpaceState): string {
   const parts = [`p=${encodeURIComponent(s.prompt)}`, `mode=${s.mode === 'jacobian' ? 'j' : 'l'}`];
-  if (s.pins.length > 0) parts.push(`pins=${s.pins.slice(0, LENS_MAX_PINNED).join('-')}`);
-  if (s.sel) parts.push(`sel=${s.sel.layerIdx},${s.sel.pos}`);
+  // Never emit a wire value that `decodePermalink` reads back as different, valid
+  // state: filter pins to non-negative safe ints BEFORE the cap, and omit `sel`
+  // unless both coordinates are non-negative safe ints.
+  const pins = s.pins.filter((n) => Number.isSafeInteger(n) && n >= 0).slice(0, LENS_MAX_PINNED);
+  if (pins.length > 0) parts.push(`pins=${pins.join('-')}`);
+  if (
+    s.sel &&
+    Number.isSafeInteger(s.sel.layerIdx) &&
+    s.sel.layerIdx >= 0 &&
+    Number.isSafeInteger(s.sel.pos) &&
+    s.sel.pos >= 0
+  )
+    parts.push(`sel=${s.sel.layerIdx},${s.sel.pos}`);
   return parts.join('&');
 }
 
@@ -43,20 +54,28 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
 
   const pins = params.get('pins');
   if (pins !== null) {
-    out.pins = pins
-      .split('-')
-      .map((x) => Number.parseInt(x, 10))
-      .filter((n) => Number.isInteger(n) && n >= 0)
-      .slice(0, LENS_MAX_PINNED);
+    // Validate the WHOLE field against a grammar before converting: a per-element
+    // predicate is useless here because `parseInt` is prefix-tolerant
+    // (`parseInt('7abc') === 7`) and `'-1'.split('-')` is `['', '1']`. Only after
+    // the grammar accepts do we map, drop unsafe ints (e.g. `99999999999999999999`),
+    // and cap. The grammar rejects `''`, so an empty `pins=` yields `[]`.
+    out.pins = /^\d+(-\d+)*$/.test(pins)
+      ? pins
+          .split('-')
+          .map((x) => Number.parseInt(x, 10))
+          .filter((n) => Number.isSafeInteger(n))
+          .slice(0, LENS_MAX_PINNED)
+      : [];
   }
 
   const sel = params.get('sel');
   if (sel !== null) {
-    const [a, b] = sel.split(',').map((x) => Number.parseInt(x, 10));
-    out.sel =
-      Number.isInteger(a) && Number.isInteger(b) && a! >= 0 && b! >= 0
-        ? { layerIdx: a!, pos: b! }
-        : null;
+    // Accept exactly two comma-separated non-negative integers, or reject to null.
+    // Decode CANNOT range-check layerIdx/pos: it does not know the grid dimensions
+    // (layers.length, promptLen). The consumer must clamp them against the actual
+    // grid before use.
+    const m = /^(\d+),(\d+)$/.exec(sel);
+    out.sel = m ? { layerIdx: Number.parseInt(m[1]!, 10), pos: Number.parseInt(m[2]!, 10) } : null;
   }
 
   return out;
