@@ -172,7 +172,7 @@ const weatherTool = createToolDefinition(
 // ---------------------------------------------------------------------------
 // Scenarios (strictly sequential)
 // ---------------------------------------------------------------------------
-async function main(): Promise<void> {
+async function main(): Promise<number> {
   console.log(`Spike B model: ${MODEL_PATH}`);
   const t0 = Date.now();
   const session = await loadSession(MODEL_PATH);
@@ -588,10 +588,33 @@ async function main(): Promise<void> {
     if (r.verdict === 'FAILED') failed++;
   }
   console.log(`Total: ${results.length} items, ${failed} FAILED, wall ${(Date.now() - t0) / 1000}s`);
-  if (failed > 0) process.exitCode = 1;
+  return failed;
 }
 
-main().catch((err) => {
-  console.error('SPIKE_FATAL', err);
-  process.exitCode = 2;
-});
+/**
+ * Hard-exit once stdout/stderr have drained. Setting `process.exitCode` alone
+ * is NOT reliable here: a run whose native model load crashed ("Rust cannot
+ * catch foreign exceptions" -> SPIKE_FATAL) was observed to still exit 0 under
+ * oxnode, so every terminal path must call process.exit() explicitly. The
+ * empty writes queue behind all prior output, so the callbacks fire only after
+ * everything already written has flushed.
+ */
+function exitAfterFlush(code: number): void {
+  let pending = 2;
+  const finish = (): void => {
+    pending -= 1;
+    if (pending === 0) process.exit(code);
+  };
+  process.stdout.write('', finish);
+  process.stderr.write('', finish);
+}
+
+main().then(
+  // Success path: exit 0 is only reachable here, after main() has printed the
+  // "N items, M FAILED" summary; any FAILED item exits 1.
+  (failed) => exitAfterFlush(failed > 0 ? 1 : 0),
+  (err) => {
+    console.error('SPIKE_FATAL', err);
+    exitAfterFlush(2);
+  },
+);
