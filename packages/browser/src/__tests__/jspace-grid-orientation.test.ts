@@ -1,0 +1,51 @@
+import { describe, expect, it } from 'vite-plus/test';
+
+import type { LensReadoutRun } from '../inspector-types';
+import { RANK_CAP } from '../../demo/jlens-core/colors';
+import { buildLensSlice } from '../../demo/jlens-core/types';
+import { displayRowOrder, offScaleLabel } from '../../demo/jspace/ArgmaxGridCanvas';
+
+/** layers ASCENDING; cells layer-major: cells[layerIdx * promptLen + pos]. */
+function fixture() {
+  const layers = [6, 12, 24];
+  const promptLen = 2;
+  const cells = layers.flatMap((layer, li) =>
+    Array.from({ length: promptLen }, (_, pos) => ({
+      layer,
+      position: pos,
+      argmaxId: li * 10 + pos,
+      topKIds: [li * 10 + pos],
+      topKLogits: Float32Array.from([1]),
+      topKProbs: Float32Array.from([1]),
+      topKTexts: [`L${layer}P${pos}`],
+    })),
+  );
+  const run: LensReadoutRun = {
+    promptLen, topK: 1, useJacobian: false, jacobianApplied: false, layers,
+    tokens: [{ id: 1, text: 'a' }, { id: 2, text: 'b' }],
+    cells,
+    pinned: [{ tokenId: 7, tokenText: 'x', ranks: Int32Array.from([1, 5, 50, 500, RANK_CAP, RANK_CAP]) }],
+  };
+  return buildLensSlice(run);
+}
+
+describe('grid orientation', () => {
+  it('renders the DEEPEST layer in the TOP row', () => {
+    const slice = fixture();
+    const rows = displayRowOrder(slice);           // indices into slice.layers
+    expect(slice.layers[rows[0]!]).toBe(24);        // deepest first
+    expect(slice.layers[rows[rows.length - 1]!]).toBe(6);
+  });
+
+  it('reads cells through cellAt, layer-major', () => {
+    const slice = fixture();
+    expect(slice.cellAt(2, 1).topKTexts[0]).toBe('L24P1');
+    expect(slice.cellAt(0, 0).topKTexts[0]).toBe('L6P0');
+  });
+
+  it('marks rank >= RANK_CAP as off-scale, never as a number', () => {
+    expect(offScaleLabel(RANK_CAP)).toBe('≥999');
+    expect(offScaleLabel(RANK_CAP + 1)).toBe('≥999');
+    expect(offScaleLabel(998)).toBeNull();
+  });
+});
