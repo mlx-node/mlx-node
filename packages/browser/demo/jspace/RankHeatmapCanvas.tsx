@@ -3,7 +3,9 @@ import * as React from 'react';
 import { RANK_CAP, rankToScore, viridis } from '../jlens-core/colors';
 import type { LensSliceData } from '../jlens-core/types';
 import { CANVAS, CELL_H, CELL_W, GUTTER_W } from './canvas-theme';
-import { type CellRef, displayRowOrder, normalizeSelected } from './ArgmaxGridCanvas';
+import { displayRowOrder, normalizeSelected } from './ArgmaxGridCanvas';
+import { SR_ONLY, type CellRef } from './grid-a11y-shared';
+import { useCanvasGridA11y } from './useCanvasGridA11y';
 
 /**
  * RankHeatmapCanvas — the position × layer rank field for ONE pinned token.
@@ -29,17 +31,6 @@ import { type CellRef, displayRowOrder, normalizeSelected } from './ArgmaxGridCa
 
 const FONT = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
 const CELL_PAD = 6;
-
-const SR_ONLY: React.CSSProperties = {
-  position: 'absolute',
-  width: 1,
-  height: 1,
-  overflow: 'hidden',
-  clip: 'rect(0,0,0,0)',
-  whiteSpace: 'nowrap',
-  left: 0,
-  top: 0,
-};
 
 export function RankHeatmapCanvas({
   slice,
@@ -68,6 +59,23 @@ export function RankHeatmapCanvas({
   // Clamp `selected` ONCE (it may be stale / out of range for THIS slice) and
   // route every dereference through `sel`, exactly as the canvas grid does.
   const sel = React.useMemo(() => normalizeSelected(selected, slice), [selected, slice]);
+
+  // SHARED grid → row → gridcell accessible model (identical to ArgmaxGridCanvas):
+  // this heatmap is a focusable, arrow-navigable control, so it must be a real
+  // `grid`, NOT `role="img"`. Only the per-cell description differs — here it is
+  // the token's rank at that (layer, position), read via `slice.rankAt`.
+  const pinText = slice.pinned[pinnedIdx]?.tokenText ?? '';
+  const { gridProps, proxyNode } = useCanvasGridA11y({
+    slice,
+    sel,
+    ariaLabel: `Rank of ${pinText || 'the pinned token'} by position and layer (deepest layer on top; brighter = higher rank)`,
+    describeCell: (ref) => {
+      const rankAt = slice.rankAt(pinnedIdx, ref.layerIdx, ref.pos);
+      return `Layer ${slice.layers[ref.layerIdx]}, position ${ref.pos + 1} of ${promptLen}: ${
+        rankAt >= RANK_CAP ? `off scale (≥${RANK_CAP})` : `rank ${rankAt}`
+      }`;
+    },
+  });
 
   // Monotonic tick bumped on devicePixelRatio change so the draw effect resamples
   // the backing store even when the CSS width is unchanged (mirrors ArgmaxGridCanvas).
@@ -258,21 +266,24 @@ export function RankHeatmapCanvas({
   }
 
   const hasCells = rowOrder.length > 0 && promptLen > 0;
-  const pinText = slice.pinned[pinnedIdx]?.tokenText ?? '';
 
   return (
     <div ref={scrollRef} onScroll={onScroll} className="jspace-grid-scroll" style={{ overflowX: 'auto' }}>
       <div style={{ position: 'relative', width: contentWidth, height: contentHeight }}>
         <canvas
           ref={canvasRef}
-          role="img"
-          aria-label={`Rank of ${pinText || 'the pinned token'} by position and layer (deepest layer on top; brighter = higher rank)`}
+          // This is a focusable, arrow-navigable control, so it is a real `grid`
+          // (role/label/counts/owns/activedescendant from the SHARED hook), NOT
+          // `role="img"`. A zero-axis slice yields no grid role/owns.
+          {...gridProps}
           tabIndex={hasCells ? 0 : undefined}
           onMouseMove={onMouseMove}
           onClick={onClick}
           onKeyDown={onKeyDown}
           style={{ position: 'sticky', left: 0, top: 0, display: 'block' }}
         />
+        {/* Off-screen grid → row → gridcell proxy owned by the canvas via aria-owns. */}
+        {proxyNode}
         <div aria-live="polite" aria-atomic="true" style={SR_ONLY}>
           {announce}
         </div>

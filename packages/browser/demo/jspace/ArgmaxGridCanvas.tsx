@@ -4,6 +4,8 @@ import { cleanupTokenText } from '../learn/inspector/TopKBars';
 import { RANK_CAP } from '../jlens-core/colors';
 import type { LensSliceData } from '../jlens-core/types';
 import { CANVAS, CELL_H, CELL_W, GUTTER_W } from './canvas-theme';
+import { SR_ONLY, type CellRef } from './grid-a11y-shared';
+import { useCanvasGridA11y } from './useCanvasGridA11y';
 
 /**
  * ArgmaxGridCanvas — the canvas twin of the lesson's DOM `ArgmaxGrid`.
@@ -20,7 +22,9 @@ import { CANVAS, CELL_H, CELL_W, GUTTER_W } from './canvas-theme';
  *   DEEPER (`layerIdx + 1`). Cells are always read through `slice.cellAt`.
  */
 
-export type CellRef = { layerIdx: number; pos: number };
+// `CellRef` lives in the neutral leaf module (so the shared a11y hook can import
+// it without a cycle); re-exported here for back-compat with existing imports.
+export type { CellRef };
 
 /** Deepest layer at the top. `slice.layers` is ASCENDING; display reverses it. */
 export function displayRowOrder(slice: LensSliceData): number[] {
@@ -50,17 +54,6 @@ export function normalizeSelected(
 
 const FONT = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
 const CELL_PAD = 6;
-
-const SR_ONLY: React.CSSProperties = {
-  position: 'absolute',
-  width: 1,
-  height: 1,
-  overflow: 'hidden',
-  clip: 'rect(0,0,0,0)',
-  whiteSpace: 'nowrap',
-  left: 0,
-  top: 0,
-};
 
 /** Longest prefix of `text` (plus an ellipsis) that fits within `maxWidth`. */
 function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
@@ -96,8 +89,6 @@ export function ArgmaxGridCanvas({
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
-  const activeId = React.useId();
-  const rowId = React.useId();
 
   // Viewport width (for column virtualization) and horizontal scroll offset.
   // Initialized to 0 so nothing touches `window` at module scope or in a
@@ -163,27 +154,18 @@ export function ArgmaxGridCanvas({
     }
   }, [sel, slice, promptLen]);
 
-  // The ONE grid cell represented in the DOM (the canvas paints the rest). Since
-  // the grid unconditionally owns this proxy row, it must ALWAYS be a real,
-  // indexed cell — never a blank unindexed placeholder. With no selection we
-  // anchor it to the grid-entry cell (deepest layer = display row 1, position 0 =
-  // column 1 — the SAME default onKeyDown seeds from), so AT reads a coherent
-  // row 1 / column 1 rather than inferring a blank one. `proxy` is null ONLY for
-  // a zero-axis (empty) slice, where the grid apparatus is dropped entirely.
-  const hasCells = slice.layers.length > 0 && promptLen > 0;
-  const proxy: CellRef | null = sel ?? (hasCells ? { layerIdx: slice.layers.length - 1, pos: 0 } : null);
-  const proxyDesc = proxy
-    ? `Layer ${slice.layers[proxy.layerIdx]}, position ${proxy.pos + 1} of ${promptLen}: ${
-        slice.cellAt(proxy.layerIdx, proxy.pos).topKTexts[0] ?? '∅'
-      }`
-    : '';
-  // The active-descendant IDREF must CHANGE VALUE on every cell move, or AT fires
-  // no gridcell-focus event (WAI-ARIA ties the focus event to an
-  // aria-activedescendant value change, not to mutating the referenced node's
-  // text). Derive the proxy cell id from its coordinates and `key` the node by the
-  // same coordinates so navigating A→B swaps the IDREF and recreates the cell.
-  const cellKey = proxy ? `${proxy.layerIdx}:${proxy.pos}` : '';
-  const cellId = proxy ? `${activeId}-${cellKey}` : undefined;
+  // The `grid → row → gridcell` accessible model (off-screen proxy row + the
+  // canvas's aria attributes) is SHARED with RankHeatmapCanvas; only the per-cell
+  // description differs, so we pass `describeCell`. See useCanvasGridA11y.
+  const { gridProps, proxyNode } = useCanvasGridA11y({
+    slice,
+    sel,
+    ariaLabel,
+    describeCell: (ref) =>
+      `Layer ${slice.layers[ref.layerIdx]}, position ${ref.pos + 1} of ${promptLen}: ${
+        slice.cellAt(ref.layerIdx, ref.pos).topKTexts[0] ?? '∅'
+      }`,
+  });
 
   // Single redraw pass. Keyed exactly on the brief's dependency list — no rAF
   // loop, this is not an animation.
@@ -392,27 +374,11 @@ export function ArgmaxGridCanvas({
       <div style={{ position: 'relative', width: contentWidth, height: contentHeight }}>
         <canvas
           ref={canvasRef}
-          // A zero-axis (empty) slice is not a grid: drop role/counts/owned proxy
-          // entirely rather than expose an empty grid with an unindexed row.
-          role={hasCells ? 'grid' : undefined}
-          aria-label={ariaLabel}
+          // role / aria-label / aria-rowcount / aria-colcount / aria-owns /
+          // aria-activedescendant come from the SHARED grid a11y hook (identical
+          // model to RankHeatmapCanvas). A zero-axis slice yields no grid role/owns.
+          {...gridProps}
           tabIndex={0}
-          // A <canvas> cannot own DOM children, so the off-screen active cell is a
-          // SIBLING. A `grid` must own `row`s, and a `gridcell` requires a `row`
-          // parent, so aria-owns UNCONDITIONALLY re-parents the off-screen ROW
-          // (which wraps the gridcell): the grid always owns >=1 row and the row is
-          // never orphaned, even with no selection. Only `aria-activedescendant` is
-          // gated on `sel` — with no selection there is simply no active cell (the
-          // proxy gridcell renders empty), which is absent, not a dangling ref.
-          aria-owns={proxy ? rowId : undefined}
-          aria-activedescendant={sel ? cellId : undefined}
-          // The full grid is painted on the canvas; only ONE proxy row/cell lives
-          // in the DOM. Publish the real dimensions so AT does not infer a 1×1
-          // grid: rows = residual boundaries, cols = prompt positions. The proxy
-          // row/cell carry their 1-based aria-rowindex / aria-colindex (below) so
-          // the represented cell's true coordinates are exposed despite the virtualization.
-          aria-rowcount={hasCells ? slice.layers.length : undefined}
-          aria-colcount={hasCells ? promptLen : undefined}
           onMouseMove={onMouseMove}
           onMouseLeave={onMouseLeave}
           onClick={onClick}
@@ -421,21 +387,9 @@ export function ArgmaxGridCanvas({
           // in styles.css — no bare `outline: none` here (it would win over that rule).
           style={{ position: 'sticky', left: 0, top: 0, display: 'block' }}
         />
-        {/* Off-screen row wrapping the gridcell that `aria-activedescendant`
-            targets — preserves the grid → row → gridcell ARIA hierarchy that a
-            bare canvas-owned gridcell would violate. The proxy ALWAYS carries its
-            true 1-based coordinates: rows render deepest-at-top (displayRowOrder is
-            reversed), so the display row index is `layers.length - layerIdx`; the
-            column index is `pos + 1`. Rendered only when a real cell exists (`proxy`
-            is null for an empty slice); `aria-activedescendant` above still gates on
-            an actual selection so no cell is announced "current" until one is chosen. */}
-        {proxy && (
-          <div id={rowId} role="row" aria-rowindex={slice.layers.length - proxy.layerIdx} style={SR_ONLY}>
-            <div key={cellKey} id={cellId} role="gridcell" aria-colindex={proxy.pos + 1}>
-              {proxyDesc}
-            </div>
-          </div>
-        )}
+        {/* Off-screen grid → row → gridcell proxy (the canvas cannot own DOM
+            children). Owned by the canvas via aria-owns; see useCanvasGridA11y. */}
+        {proxyNode}
         {/* Screen-reader live region — mirrors AttentionHeatmap's announce region. */}
         <div aria-live="polite" aria-atomic="true" style={SR_ONLY}>
           {announce}
