@@ -56,6 +56,8 @@
  *   JLENS_META       meta sidecar path    (default: lens-pack-v1.meta.json)
  *   JLENS_BAKE_DATE  override bakedDate    (default: meta.fit_date)
  *   JLENS_OUT_DIR    output dir           (default: demo/learn/widgets/jlens/baked)
+ *   JLENS_STARTER_DIR  /jspace starter dir  (default: demo/jspace/starters; auto-skips
+ *                       when JLENS_OUT_DIR is set; pass '' to force-skip)
  * DETERMINISM: this script NEVER calls Date.now()/new Date(); bakedDate comes from
  * JLENS_BAKE_DATE or the meta sidecar's fit_date, so a re-run is byte-identical.
  */
@@ -86,8 +88,15 @@ const OUT_DIR = process.env.JLENS_OUT_DIR ?? join(HERE, '../../demo/learn/widget
 // (demo/jspace/starters/<slug>.json). Same envelope, same plain-number[] typed
 // arrays (Constraint 15) — so one bake run keeps the lesson and the /jspace
 // starters in lockstep. Override with JLENS_STARTER_DIR; set to '' to skip.
+// CRITICAL: when JLENS_OUT_DIR redirects the lesson output (e.g. an isolation
+// check into /tmp), the starter mirror must NOT keep rewriting the committed
+// production starters — so it auto-skips unless the caller explicitly opts back
+// in with JLENS_STARTER_DIR. The canonical, non-redirected controller run is
+// unchanged (JLENS_OUT_DIR unset → mirror as before).
+const OUT_REDIRECTED = process.env.JLENS_OUT_DIR != null;
 const STARTER_DIR =
-  process.env.JLENS_STARTER_DIR ?? join(HERE, '../../demo/jspace/starters');
+  process.env.JLENS_STARTER_DIR ??
+  (OUT_REDIRECTED ? '' : join(HERE, '../../demo/jspace/starters'));
 
 const TOP_K = 10;
 const EXPECTED_JACOBIANS = 23; // J.1..J.23 in the v1 pack (eval.mts:179).
