@@ -1,7 +1,7 @@
 import * as React from 'react';
 
 import { TopKBars } from '../../inspector/TopKBars';
-import type { LensSliceData } from './types';
+import type { LensSliceData } from '../../../jlens-core/types';
 
 /**
  * LensTooltip — the per-cell detail panel. Given a selected (layerIdx, pos)

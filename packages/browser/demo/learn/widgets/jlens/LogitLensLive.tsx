@@ -12,11 +12,11 @@ import { renderTokenDisplay } from '../../inspector/TopKBars';
 import { RunButton } from '../../scaffolding/RunButton';
 import { SegmentedToggle } from '../../scaffolding/SegmentedToggle';
 import { ArgmaxGrid, type CellRef } from './ArgmaxGrid';
-import { pinColor } from './colors';
+import { pinColor } from '../../../jlens-core/colors';
 import { LensTooltip } from './LensTooltip';
 import { PinChips } from './PinChips';
 import { RankHeatmap } from './RankHeatmap';
-import { buildLensSlice, type LensSliceData } from './types';
+import { buildLensSlice, type LensSliceData } from '../../../jlens-core/types';
 
 /**
  * LogitLensLive — the interpretability chapter's LIVE demo: the LOGIT LENS on

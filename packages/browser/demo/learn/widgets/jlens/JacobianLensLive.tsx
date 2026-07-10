@@ -13,13 +13,13 @@ import { RunButton } from '../../scaffolding/RunButton';
 import { SegmentedToggle } from '../../scaffolding/SegmentedToggle';
 import { ArgmaxGrid, type CellRef } from './ArgmaxGrid';
 import { BAKED } from './baked';
-import { pinColor } from './colors';
-import { BAND, JACOBIAN_LAYERS, JACOBIAN_PRESETS, type JacobianPreset } from './jacobian-presets';
+import { pinColor } from '../../../jlens-core/colors';
+import { BAND, JACOBIAN_LAYERS, JACOBIAN_PRESETS, type JacobianPreset } from '../../../jlens-core/jacobian-presets';
 import { LensTooltip } from './LensTooltip';
 import { PinChips } from './PinChips';
 import { RankHeatmap } from './RankHeatmap';
-import { reviveRun } from './revive';
-import { buildLensSlice, type LensSliceData } from './types';
+import { reviveRun } from '../../../jlens-core/revive';
+import { buildLensSlice, type LensSliceData } from '../../../jlens-core/types';
 
 /**
  * JacobianLensLive — the fitted J-lens demo for the interpretability chapter.

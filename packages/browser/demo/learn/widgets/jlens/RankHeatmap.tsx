@@ -1,7 +1,7 @@
 import * as React from 'react';
 
-import { RANK_CAP, readableInk, rankToScore, viridis, VIRIDIS_LEGEND_STOPS } from './colors';
-import type { LensSliceData } from './types';
+import { RANK_CAP, readableInk, rankToScore, viridis, VIRIDIS_LEGEND_STOPS } from '../../../jlens-core/colors';
+import type { LensSliceData } from '../../../jlens-core/types';
 
 /**
  * RankHeatmap — the pinned-answer view. For each pinned answer token we track

@@ -1,7 +1,7 @@
 import * as React from 'react';
 
 import { renderTokenDisplay } from '../../inspector/TopKBars';
-import type { LensSliceData } from './types';
+import type { LensSliceData } from '../../../jlens-core/types';
 
 /**
  * ArgmaxGrid — the money shot. A CSS-grid table of the model's greedy top token

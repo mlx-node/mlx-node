@@ -1,5 +1,5 @@
 // Pure unit tests for the baked J-lens revive helper. These exercise the
-// React-free `reviveRun` in demo/learn/widgets/jlens/revive.ts and its handoff
+// React-free `reviveRun` in demo/jlens-core/revive.ts and its handoff
 // to `buildLensSlice` — no worker, no DOM, no React, no baked JSON on disk.
 //
 // The invariant under test (design decision D11): a serialized (baked) run
@@ -10,8 +10,8 @@
 
 import { describe, expect, test } from 'vitest';
 
-import { reviveRun, type SerializedRun } from '../../demo/learn/widgets/jlens/revive';
-import { buildLensSlice } from '../../demo/learn/widgets/jlens/types';
+import { reviveRun, type SerializedRun } from '../../demo/jlens-core/revive';
+import { buildLensSlice } from '../../demo/jlens-core/types';
 
 // A tiny 2-layer × 2-position run with one pinned token. Cells are stored
 // layer-major then position-minor: flat(layerIdx, pos) = layerIdx * promptLen + pos.

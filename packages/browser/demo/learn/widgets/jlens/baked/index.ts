@@ -15,7 +15,7 @@
 import arithmeticParensJson from './arithmetic-parens.json';
 import frenchSeasonJson from './french-season.json';
 import spanishOppositeJson from './spanish-opposite.json';
-import type { BakedFile } from '../revive';
+import type { BakedFile } from '../../../../jlens-core/revive';
 
 /** Baked frame per preset slug (keys === `JACOBIAN_PRESETS[].slug`). */
 export const BAKED: Record<string, BakedFile> = {

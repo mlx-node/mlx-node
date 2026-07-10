@@ -63,7 +63,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../../demo/learn/widgets/jlens/jacobian-presets.ts';
+import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../../demo/jlens-core/jacobian-presets.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 

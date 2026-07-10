@@ -1,8 +1,8 @@
 import * as React from 'react';
 
 import { renderTokenDisplay } from '../../inspector/TopKBars';
-import { RANK_CAP, SURFACE_RANK } from './colors';
-import type { LensSliceData } from './types';
+import { RANK_CAP, SURFACE_RANK } from '../../../jlens-core/colors';
+import type { LensSliceData } from '../../../jlens-core/types';
 
 /**
  * PinChips — one chip per pinned answer token, colour-matched to its RankHeatmap

@@ -13,7 +13,7 @@
 // The serialized shapes below MIRROR scripts/jlens/bake.mts:88-108 byte for byte
 // — keep them in sync if the bake schema ever changes.
 
-import type { LensCell, LensPinned, LensReadoutRun, TokenInfo } from '../../../../src/inspector-types';
+import type { LensCell, LensPinned, LensReadoutRun, TokenInfo } from '../../src/inspector-types';
 
 /** JSON-safe mirror of {@link LensCell}: the two Float32Arrays are `number[]`. */
 export type SerializedCell = {

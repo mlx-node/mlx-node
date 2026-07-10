@@ -10,7 +10,7 @@
 // is the shallowest boundary); the grid/heatmap render the rows reversed
 // themselves.
 
-import type { LensCell, LensPinned, LensReadoutRun, TokenInfo } from '../../../../src/inspector-types';
+import type { LensCell, LensPinned, LensReadoutRun, TokenInfo } from '../../src/inspector-types';
 import { RANK_CAP } from './colors';
 
 export type LensSliceData = {
