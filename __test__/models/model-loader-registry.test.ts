@@ -114,6 +114,34 @@ describe.sequential('declarative model loader registry', () => {
     await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "42" in ${tempDir}/config.json`);
   });
 
+  it.each([
+    ['null root', 'null'],
+    ['numeric root', '42'],
+  ] as const)('fails closed when the config.json root is not an object (%s)', async (_label, rawJson) => {
+    await writeFile(join(tempDir, 'config.json'), rawJson);
+    await expect(detectModelType(tempDir)).rejects.toThrow(
+      `Malformed config.json in ${tempDir}: root must be a JSON object`,
+    );
+  });
+
+  it.each([
+    ['numeric architectures', { architectures: 42 }],
+    ['object architectures', { architectures: {} }],
+  ] as const satisfies readonly (readonly [string, Readonly<Record<string, unknown>>])[])(
+    'fails closed for %s instead of coercing to the qwen3 default',
+    async (_label, config) => {
+      await writeConfig({ ...config });
+      await expect(detectModelType(tempDir)).rejects.toThrow(
+        `Malformed config.json in ${tempDir}: "architectures" must be an array or a string`,
+      );
+    },
+  );
+
+  it('keeps the blessed null architectures leniency after malformed-config validation', async () => {
+    await writeConfig({ model_type: 'lfm2', architectures: null });
+    await expect(detectModelType(tempDir)).resolves.toBe('lfm2');
+  });
+
   it.each(['internvl_chat', 'qianfan-ocr'] as const)(
     'preserves the %s loadSession rejection before loading native weights',
     async (modelType) => {

@@ -8,7 +8,9 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  Gemma4Model as NativeGemma4Model,
   HarrierModel,
+  Lfm2Model as NativeLfm2Model,
   QianfanOCRModel,
   Qwen3Model as NativeQwen3Model,
   Qwen35Model as NativeQwen35Model,
@@ -56,28 +58,28 @@ interface ModelConfigMatcher {
   readonly architectureProbe?: (config: ModelConfigMatchContext) => boolean;
 }
 
-interface ModelFamilyDescriptorBase {
+type NativeModelClass = abstract new (...args: never[]) => object;
+
+interface ModelFamilyDescriptor {
   readonly modelType: string;
+  readonly kind: ModelKind;
   readonly match: ModelConfigMatcher;
   readonly load: (modelPath: string, options?: LoadModelOptions) => Promise<unknown>;
+  /**
+   * Native `@mlx-node/core` class behind this family. The public
+   * `LoadableModel` / `TrainableModel` unions derive from these classes —
+   * NOT from the streaming-wrapper types the loaders return — so native
+   * instances stay assignable and trainers can pass them directly to the
+   * Rust engine factory methods without type conflicts. Loaded wrapper
+   * instances are runtime subclasses of their native class, so
+   * `instanceof` narrowing against these classes still works on
+   * `loadModel` results.
+   */
+  readonly nativeModelClass: NativeModelClass;
   readonly acceptsDraftModel?: true;
   /** Backward-compatible fallback when config.json omits model_type or sets it to null. */
   readonly defaultForNullishModelType?: true;
 }
-
-type NativeTrainerModelClass = abstract new (...args: never[]) => object;
-
-type ModelFamilyDescriptor = ModelFamilyDescriptorBase &
-  (
-    | {
-        readonly kind: 'trainable';
-        readonly nativeTrainerModelClass: NativeTrainerModelClass;
-      }
-    | {
-        readonly kind: Exclude<ModelKind, 'trainable'>;
-        readonly nativeTrainerModelClass?: never;
-      }
-  );
 
 /**
  * Ordered source of truth for every supported model family. Each entry owns
@@ -111,6 +113,7 @@ const MODEL_FAMILY_REGISTRY = [
         modelPath,
         options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
       ),
+    nativeModelClass: NativeGemma4Model,
     acceptsDraftModel: true,
   },
   {
@@ -122,13 +125,14 @@ const MODEL_FAMILY_REGISTRY = [
         modelType === 'qwen3' && architectures.has('Qwen3Model') && !architectures.has('Qwen3ForCausalLM'),
     },
     load: (modelPath: string) => HarrierModel.load(modelPath),
+    nativeModelClass: HarrierModel,
   },
   {
     modelType: 'qwen3',
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3'] },
     load: (modelPath: string) => Qwen3Model.load(modelPath),
-    nativeTrainerModelClass: NativeQwen3Model,
+    nativeModelClass: NativeQwen3Model,
     defaultForNullishModelType: true,
   },
   {
@@ -136,38 +140,42 @@ const MODEL_FAMILY_REGISTRY = [
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5'] },
     load: (modelPath: string) => Qwen35Model.load(modelPath),
-    nativeTrainerModelClass: NativeQwen35Model,
+    nativeModelClass: NativeQwen35Model,
   },
   {
     modelType: 'qwen3_5_moe',
     kind: 'trainable',
     match: { rawModelTypes: ['qwen3_5_moe'] },
     load: (modelPath: string) => Qwen35MoeModel.load(modelPath),
-    nativeTrainerModelClass: NativeQwen35MoeModel,
+    nativeModelClass: NativeQwen35MoeModel,
   },
   {
     modelType: 'lfm2',
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2'] },
     load: (modelPath: string) => Lfm2Model.load(modelPath),
+    nativeModelClass: NativeLfm2Model,
   },
   {
     modelType: 'lfm2_moe',
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2_moe'] },
     load: (modelPath: string) => Lfm2Model.load(modelPath),
+    nativeModelClass: NativeLfm2Model,
   },
   {
     modelType: 'internvl_chat',
     kind: 'vlm',
     match: { rawModelTypes: ['internvl_chat'] },
     load: (modelPath: string) => QianfanOCRModel.load(modelPath),
+    nativeModelClass: QianfanOCRModel,
   },
   {
     modelType: 'qianfan-ocr',
     kind: 'vlm',
     match: { rawModelTypes: ['qianfan-ocr'] },
     load: (modelPath: string) => QianfanOCRModel.load(modelPath),
+    nativeModelClass: QianfanOCRModel,
   },
 ] as const satisfies readonly ModelFamilyDescriptor[];
 
@@ -176,8 +184,15 @@ export type ModelType = (typeof MODEL_FAMILY_REGISTRY)[number]['modelType'];
 type RegisteredModelFamily = (typeof MODEL_FAMILY_REGISTRY)[number];
 type RegisteredTrainableFamily = Extract<RegisteredModelFamily, { readonly kind: 'trainable' }>;
 
-/** Union of the concrete model instances returned by the registered loaders. */
-export type LoadableModel = Awaited<ReturnType<RegisteredModelFamily['load']>>;
+/**
+ * Union of the native `@mlx-node/core` model classes across every registered
+ * family — the public contract of {@link loadModel}. At runtime the chat
+ * families resolve to streaming-wrapper subclasses of these classes
+ * (AsyncGenerator `chatStream*` overrides), but the public type names the
+ * native classes so downstream code can pass instances directly to Rust
+ * engine factory methods without type conflicts.
+ */
+export type LoadableModel = InstanceType<RegisteredModelFamily['nativeModelClass']>;
 
 /**
  * Union accepted by trainer APIs: registered wrapper results plus their native
@@ -185,26 +200,12 @@ export type LoadableModel = Awaited<ReturnType<RegisteredModelFamily['load']>>;
  */
 export type TrainableModel =
   | Awaited<ReturnType<RegisteredTrainableFamily['load']>>
-  | InstanceType<RegisteredTrainableFamily['nativeTrainerModelClass']>;
+  | InstanceType<RegisteredTrainableFamily['nativeModelClass']>;
 
 interface ModelFamilyIndex<Family extends ModelFamilyDescriptor> {
   readonly byModelType: ReadonlyMap<string, Family>;
   readonly byRawModelType: ReadonlyMap<string, Family>;
   readonly defaultForNullishModelType: Family;
-}
-
-function validateTrainerMetadata(
-  family: ModelFamilyDescriptorBase & {
-    readonly kind: ModelKind;
-    readonly nativeTrainerModelClass?: NativeTrainerModelClass;
-  },
-): void {
-  if (family.kind === 'trainable' && family.nativeTrainerModelClass === undefined) {
-    throw new Error(`Trainable model family "${family.modelType}" must declare native trainer metadata`);
-  }
-  if (family.kind !== 'trainable' && family.nativeTrainerModelClass !== undefined) {
-    throw new Error(`Non-trainable model family "${family.modelType}" cannot declare native trainer metadata`);
-  }
 }
 
 function buildModelFamilyIndex<const Family extends ModelFamilyDescriptor>(
@@ -215,8 +216,6 @@ function buildModelFamilyIndex<const Family extends ModelFamilyDescriptor>(
   let defaultForNullishModelType: Family | undefined;
 
   for (const family of registry) {
-    validateTrainerMetadata(family);
-
     const previousFamily = byModelType.get(family.modelType);
     if (previousFamily !== undefined) {
       throw new Error(`Duplicate canonical model type "${family.modelType}" in model family registry`);
@@ -263,15 +262,41 @@ function matchesArchitectureProbe(family: ModelFamilyDescriptor, config: ModelCo
   return family.match.architectureProbe?.(config) === true;
 }
 
-function normalizeConfig(config: unknown): NormalizedModelConfig {
-  const object: Record<string, unknown> =
-    typeof config === 'object' && config !== null && !Array.isArray(config) ? (config as Record<string, unknown>) : {};
+class MalformedModelConfigError extends Error {
+  constructor(modelPath: string, reason: string) {
+    super(`Malformed config.json in ${modelPath}: ${reason}`);
+    this.name = 'MalformedModelConfigError';
+  }
+}
+
+/**
+ * Fail-closed validation: a config.json whose root is not a plain object,
+ * or whose `architectures` is neither an array nor a string, is rejected
+ * instead of coerced (coercion would fall through to the qwen3
+ * nullish-model_type default and silently misroute the checkpoint).
+ * Blessed lenient shapes stay accepted: `{}` root (qwen3 default),
+ * missing/`null` `architectures` (empty set), bare-string `architectures`
+ * (single-element set), and non-string array entries (filtered out).
+ */
+function normalizeConfig(modelPath: string, config: unknown): NormalizedModelConfig {
+  if (typeof config !== 'object' || config === null || Array.isArray(config)) {
+    throw new MalformedModelConfigError(modelPath, 'root must be a JSON object');
+  }
+  const object = config as Record<string, unknown>;
   const hasModelType = Object.hasOwn(object, 'model_type');
   const rawModelTypeValue = hasModelType ? object.model_type : undefined;
   const usesDefaultModelType = !hasModelType || rawModelTypeValue === null;
   const rawModelType = typeof rawModelTypeValue === 'string' ? rawModelTypeValue : undefined;
   const rawModelTypeLabel = hasModelType ? String(rawModelTypeValue) : '<missing>';
   const rawArchitectures = 'architectures' in object ? object.architectures : undefined;
+  if (
+    rawArchitectures !== undefined &&
+    rawArchitectures !== null &&
+    !Array.isArray(rawArchitectures) &&
+    typeof rawArchitectures !== 'string'
+  ) {
+    throw new MalformedModelConfigError(modelPath, '"architectures" must be an array or a string');
+  }
   const architectures = Array.isArray(rawArchitectures)
     ? rawArchitectures.filter((architecture): architecture is string => typeof architecture === 'string')
     : typeof rawArchitectures === 'string'
@@ -367,7 +392,7 @@ export async function loadSession(
 export async function detectModelType(modelPath: string): Promise<ModelType> {
   try {
     const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
-    const config = normalizeConfig(JSON.parse(raw));
+    const config = normalizeConfig(modelPath, JSON.parse(raw));
     const baseFamily = config.usesDefaultModelType
       ? MODEL_FAMILY_INDEX.defaultForNullishModelType
       : config.rawModelType === undefined
@@ -379,7 +404,7 @@ export async function detectModelType(modelPath: string): Promise<ModelType> {
     if (family === undefined) throw new UnsupportedModelTypeError(modelPath, config.rawModelTypeLabel);
     return family.modelType;
   } catch (e) {
-    if (e instanceof UnsupportedModelTypeError) throw e;
+    if (e instanceof UnsupportedModelTypeError || e instanceof MalformedModelConfigError) throw e;
     throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
   }
 }
