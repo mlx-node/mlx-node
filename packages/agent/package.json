@@ -29,7 +29,8 @@
   "dependencies": {
     "@earendil-works/pi-ai": "0.80.6",
     "@earendil-works/pi-coding-agent": "0.80.6",
-    "@mlx-node/lm": "workspace:*"
+    "@mlx-node/lm": "workspace:*",
+    "@mlx-node/server": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.0.0"

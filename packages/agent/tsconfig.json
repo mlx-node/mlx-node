@@ -8,5 +8,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../lm" }]
+  "references": [{ "path": "../lm" }, { "path": "../server" }]
 }

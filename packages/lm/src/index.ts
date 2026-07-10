@@ -58,7 +58,7 @@ export { memoryStats } from '@mlx-node/core';
 export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';
 
 // Streaming chat API
-export type { ChatStreamFinal, ChatStreamEvent } from './stream.js';
+export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent } from './stream.js';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
 // Not part of the public API — may change without notice.
 // `_runChatStream` is the generic adapter used by every model wrapper
