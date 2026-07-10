@@ -45,6 +45,29 @@ export function encodePermalink(s: JSpaceState): string {
   return parts.join('&');
 }
 
+/**
+ * Decode a /jspace permalink hash into a SPARSE state patch.
+ *
+ * The result is a `Partial<JSpaceState>`: a KEY THAT IS ABSENT means "use the
+ * app default" — `pins` → `[]`, `sel` → `null`, `mode` → the app's default
+ * mode. The encoder deliberately OMITS empty/default fields from the wire
+ * (`{ pins: [], sel: null }` encodes to just `p=…&mode=…`), so the decoder
+ * reports those fields as absent own-properties, never as a present `undefined`.
+ *
+ * Consuming this correctly requires seeding a FULL default state and overlaying
+ * the decoded keys — e.g.
+ *
+ *     const state = { pins: [], sel: null, mode: DEFAULT_MODE, ...decodePermalink(hash) };
+ *
+ * or, equivalently and preferred, via {@link applyPermalink}. You MUST NOT patch
+ * the sparse result over live state (`Object.assign(live, decodePermalink(hash))`
+ * or a spread over the current session): an absent `pins` would leave the OLD
+ * pins in place instead of clearing them, so a shared permalink would leak the
+ * previous session's pins/selection — the opposite of full-state restoration.
+ *
+ * Never throws on malformed input: junk `mode`/`pins`/`sel` decode to
+ * absent/`[]`/`null` respectively rather than raising.
+ */
 export function decodePermalink(hash: string): Partial<JSpaceState> {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash;
   if (raw === '') return {};
@@ -98,4 +121,27 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
   }
 
   return out;
+}
+
+export type JSpaceDefaults = Pick<JSpaceState, 'mode' | 'pins' | 'sel'>;
+
+/**
+ * Overlay a decoded permalink patch onto a full default state. Absent keys fall
+ * back to `defaults`; this is the ONLY correct way to consume
+ * {@link decodePermalink} — never patch the sparse result over live state, or a
+ * shared permalink would leak the previous session's pins/selection.
+ *
+ * Pure: no globals, no I/O. `prompt` carries no per-app default, so an absent
+ * `p` yields `''`. Presence is tested with `Object.hasOwn`, not truthiness, so a
+ * decoded-but-`null` `sel` (junk on the wire) overrides `defaults.sel`, while a
+ * genuinely absent `sel` falls back to it.
+ */
+export function applyPermalink(defaults: JSpaceDefaults, hash: string): JSpaceState {
+  const patch = decodePermalink(hash);
+  return {
+    prompt: patch.prompt ?? '',
+    mode: Object.hasOwn(patch, 'mode') ? patch.mode! : defaults.mode,
+    pins: Object.hasOwn(patch, 'pins') ? patch.pins! : defaults.pins,
+    sel: Object.hasOwn(patch, 'sel') ? patch.sel! : defaults.sel,
+  };
 }

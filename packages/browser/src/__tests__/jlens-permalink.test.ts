@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { decodePermalink, encodePermalink, type JSpaceState } from '../../demo/jlens-core/permalink';
+import {
+  applyPermalink,
+  decodePermalink,
+  encodePermalink,
+  type JSpaceDefaults,
+  type JSpaceState,
+} from '../../demo/jlens-core/permalink';
 import { LENS_MAX_PINNED } from '../inspector-types';
 
 const base: JSpaceState = {
@@ -96,6 +102,30 @@ describe('permalink codec', () => {
     expect(decodePermalink('mode=j').mode).toBe('jacobian');
   });
 
+  it('ENCODES mode=l for a logit state and mode=j for a jacobian state', () => {
+    // Inspect the WIRE `mode` value directly: every existing round-trip test uses
+    // `jacobian`, so an encoder that hard-coded `mode=j` would leave them all green
+    // while silently restoring every `logit` link as `jacobian`.
+    expect(new URLSearchParams(encodePermalink({ ...base, mode: 'logit' })).get('mode')).toBe('l');
+    expect(new URLSearchParams(encodePermalink({ ...base, mode: 'jacobian' })).get('mode')).toBe('j');
+  });
+
+  it('round-trips every field of a LOGIT state (pins + sel present)', () => {
+    // Mirror the jacobian `round-trips every field` test with the other mode so the
+    // encoder's `logit` branch is proven end-to-end, not only through the decoder.
+    const s: JSpaceState = { ...base, mode: 'logit' };
+    expect(decodePermalink(encodePermalink(s))).toEqual(s);
+  });
+
+  it('encoder OMITS sel when a coordinate is negative or beyond MAX_SAFE_INTEGER', () => {
+    // Inspect the WIRE string: routing through decode would also drop these and mask
+    // a missing encoder guard.
+    const negLayer = encodePermalink({ ...base, sel: { layerIdx: -1, pos: 8 } });
+    expect(new URLSearchParams(negLayer).has('sel')).toBe(false);
+    const unsafeCoord = encodePermalink({ ...base, sel: { layerIdx: Number.MAX_SAFE_INTEGER + 1, pos: 8 } });
+    expect(new URLSearchParams(unsafeCoord).has('sel')).toBe(false);
+  });
+
   it('emits no pins field when encoding a state whose pins contain a negative id', () => {
     const encoded = encodePermalink({ ...base, pins: [-1] });
     expect(new URLSearchParams(encoded).has('pins')).toBe(false);
@@ -104,5 +134,38 @@ describe('permalink codec', () => {
   it('returns an empty object for an empty hash', () => {
     expect(decodePermalink('')).toEqual({});
     expect(decodePermalink('#')).toEqual({});
+  });
+});
+
+describe('applyPermalink overlay', () => {
+  // Non-default `pins`/`sel` and a `mode` that DIFFERS from the golden `mode=j` so
+  // the fallback cases actually prove the overlay rather than coincidentally
+  // matching `[]`/`null`/`jacobian`.
+  const defaults: JSpaceDefaults = {
+    mode: 'logit',
+    pins: [42],
+    sel: { layerIdx: 1, pos: 2 },
+  };
+
+  it('yields exactly the defaults for an empty hash', () => {
+    const s = applyPermalink(defaults, '');
+    expect(s.prompt).toBe('');
+    expect(s.mode).toBe(defaults.mode);
+    expect(s.pins).toEqual(defaults.pins);
+    expect(s.sel).toEqual(defaults.sel);
+  });
+
+  it('overlays mode but keeps default pins/sel for a mode-only hash', () => {
+    const s = applyPermalink(defaults, 'mode=j');
+    expect(s.mode).toBe('jacobian'); // overlaid, differs from defaults.mode ('logit')
+    expect(s.pins).toEqual(defaults.pins); // absent on the wire -> default kept
+    expect(s.sel).toEqual(defaults.sel); // absent on the wire -> default kept
+  });
+
+  it('overrides pins and sel from a hash that carries them', () => {
+    const s = applyPermalink(defaults, 'mode=j&pins=7-8&sel=3,4');
+    expect(s.mode).toBe('jacobian');
+    expect(s.pins).toEqual([7, 8]);
+    expect(s.sel).toEqual({ layerIdx: 3, pos: 4 });
   });
 });
