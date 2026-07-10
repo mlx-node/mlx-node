@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/lm" },
+    { "path": "./packages/agent" },
     { "path": "./packages/trl" },
     { "path": "./packages/vlm" },
     { "path": "./packages/cli" },

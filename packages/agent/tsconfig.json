@@ -5,15 +5,8 @@
     "outDir": "dist",
     "composite": true,
     "noEmit": false,
-    "resolveJsonModule": true,
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [
-    { "path": "../agent" },
-    { "path": "../core" },
-    { "path": "../lm" },
-    { "path": "../privacy" },
-    { "path": "../server" }
-  ]
+  "references": [{ "path": "../lm" }]
 }

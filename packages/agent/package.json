@@ -1,5 +1,5 @@
 {
-  "name": "@mlx-node/cli",
+  "name": "@mlx-node/agent",
   "version": "0.0.7",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
@@ -9,29 +9,32 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/mlx-node/mlx-node.git",
-    "directory": "packages/cli"
-  },
-  "bin": {
-    "mlx": "./dist/cli.js"
+    "directory": "packages/agent"
   },
   "files": [
     "dist"
   ],
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -b"
   },
   "dependencies": {
-    "@huggingface/hub": "^2.13.2",
-    "@inquirer/prompts": "^8.5.2",
-    "@mlx-node/agent": "workspace:*",
-    "@mlx-node/core": "workspace:*",
-    "@mlx-node/lm": "workspace:*",
-    "@mlx-node/privacy": "workspace:*",
-    "@mlx-node/server": "workspace:*",
-    "@napi-rs/keyring": "^1.3.0"
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@mlx-node/lm": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.0.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

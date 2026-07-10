@@ -65,6 +65,7 @@ export default defineConfig({
     alias: {
       '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
+      '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
       '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
