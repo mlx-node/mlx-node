@@ -13,6 +13,7 @@ import { RunButton } from '../../scaffolding/RunButton';
 import { SegmentedToggle } from '../../scaffolding/SegmentedToggle';
 import { ArgmaxGrid, type CellRef } from './ArgmaxGrid';
 import { pinColor } from '../../../jlens-core/colors';
+import { derivePins } from '../../../jlens-core/derive-pins';
 import { LensTooltip } from './LensTooltip';
 import { PinChips } from './PinChips';
 import { RankHeatmap } from './RankHeatmap';
@@ -263,16 +264,13 @@ export function LogitLensLive() {
       const promptIds = promptTokens.map((t) => t.id);
       if (promptIds.length === 0) throw new Error('prompt tokenized to zero tokens');
 
-      // Pin each concept by its first token (leading space → mid-sentence form).
-      const pinnedIds: number[] = [];
-      const partialFlags: boolean[] = [];
-      for (const concept of preset.concepts) {
-        const conceptTokens = await tokenize(worker, ` ${concept}`, { signal: ctrl.signal });
-        if (runGenRef.current !== myGen) return;
-        if (conceptTokens.length === 0) continue;
-        pinnedIds.push(conceptTokens[0]!.id);
-        partialFlags.push(conceptTokens.length > 1);
-      }
+      // One shared predicate — see demo/jlens-core/derive-pins.ts. The old
+      // per-iteration generation guards were an early-bail optimization, not a
+      // correctness requirement: every setState below is already gated.
+      const { pinnedIds, partialFlags } = await derivePins(preset.concepts, (text) =>
+        tokenize(worker, text, { signal: ctrl.signal }),
+      );
+      if (runGenRef.current !== myGen) return;
 
       const result = await lensReadout(
         worker,

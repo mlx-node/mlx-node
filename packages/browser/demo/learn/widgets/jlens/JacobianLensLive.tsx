@@ -14,6 +14,7 @@ import { SegmentedToggle } from '../../scaffolding/SegmentedToggle';
 import { ArgmaxGrid, type CellRef } from './ArgmaxGrid';
 import { BAKED } from './baked';
 import { pinColor } from '../../../jlens-core/colors';
+import { derivePins } from '../../../jlens-core/derive-pins';
 import { BAND, JACOBIAN_LAYERS, JACOBIAN_PRESETS, type JacobianPreset } from '../../../jlens-core/jacobian-presets';
 import { LensTooltip } from './LensTooltip';
 import { PinChips } from './PinChips';
@@ -372,23 +373,13 @@ export function JacobianLensLive() {
       const promptIds = promptTokens.map((t) => t.id);
       if (promptIds.length === 0) throw new Error('prompt tokenized to zero tokens');
 
-      // Pin each concept by its first token (leading space → mid-sentence form).
-      // Must match scripts/jlens/bake.mts, or a live run would disagree with the
-      // baked frame: when the leading space becomes its own token (` 7` → [' ', '7'])
-      // the pin would track bare whitespace, so fall back to the space-less form.
-      const pinnedIds: number[] = [];
-      const partialFlags: boolean[] = [];
-      for (const concept of preset.concepts) {
-        let conceptTokens = await tokenize(worker, ` ${concept}`, { signal: ctrl.signal });
-        if (runGenRef.current !== myGen) return;
-        if (conceptTokens.length > 0 && conceptTokens[0]!.text.trim() === '') {
-          conceptTokens = await tokenize(worker, concept, { signal: ctrl.signal });
-          if (runGenRef.current !== myGen) return;
-        }
-        if (conceptTokens.length === 0) continue;
-        pinnedIds.push(conceptTokens[0]!.id);
-        partialFlags.push(conceptTokens.length > 1);
-      }
+      // One shared predicate — see demo/jlens-core/derive-pins.ts. The old
+      // per-iteration generation guards were an early-bail optimization, not a
+      // correctness requirement: every setState below is already gated.
+      const { pinnedIds, partialFlags } = await derivePins(preset.concepts, (text) =>
+        tokenize(worker, text, { signal: ctrl.signal }),
+      );
+      if (runGenRef.current !== myGen) return;
 
       const result = await lensReadout(
         worker,

@@ -446,6 +446,14 @@ export const LENS_READOUT_REQUEST_TYPE = 'lensReadout' as const;
 export const LENS_READOUT_RESULT_TYPE = 'lensReadoutResult' as const;
 export const LENS_READOUT_ERROR_TYPE = 'lensReadoutError' as const;
 
+/**
+ * Cap on pinned ids. MUST equal `crates/mlx-core/src/inspector.rs`
+ * `LENS_MAX_PINNED`. The backend hard-ERRORS above this — it does not truncate
+ * (`model.rs:6250`, `mlx-worker.ts:2732`). The /jspace pin UI disables Add at
+ * this value so the 9th pin is refused before the worker can error.
+ */
+export const LENS_MAX_PINNED = 8;
+
 // -----------------------------------------------------------------------------
 // loadLensPack — one-shot request to fetch the shipped f16 J-lens pack, upload
 // its tensors to the GPU, and populate the model thread's `lens_pack` slot so

@@ -37,6 +37,7 @@ import {
   INSPECTOR_ERROR_TYPE,
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
+  LENS_MAX_PINNED,
   LENS_READOUT_ERROR_TYPE,
   LENS_READOUT_REQUEST_TYPE,
   LENS_READOUT_RESULT_TYPE,
@@ -2729,11 +2730,11 @@ async function handleLensReadout(data: {
       });
       return;
     }
-    if (pinnedIds && pinnedIds.length > 8) {
+    if (pinnedIds && pinnedIds.length > LENS_MAX_PINNED) {
       (self as any).postMessage({
         type: LENS_READOUT_ERROR_TYPE,
         id,
-        error: `lensReadout: pinnedIds length must be <= 8 (LENS_MAX_PINNED) (got ${pinnedIds.length})`,
+        error: `lensReadout: pinnedIds length must be <= ${LENS_MAX_PINNED} (LENS_MAX_PINNED) (got ${pinnedIds.length})`,
       });
       return;
     }
