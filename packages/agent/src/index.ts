@@ -1,5 +1,7 @@
 export type { DiscoveredModelLike } from './types.js';
 
+export { type CatalogEntry, MODEL_CATALOG, visibleCatalog } from './catalog.js';
+export { createPermissionGateExtension } from './extensions/permission-gate.js';
 export { buildChatConfig } from './provider/chat-config.js';
 export { contextToChatMessages, toolsToDefinitions } from './provider/convert-messages.js';
 export { TurnEmitter } from './provider/events.js';
