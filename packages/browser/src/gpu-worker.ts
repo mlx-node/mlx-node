@@ -1075,14 +1075,15 @@ self.onmessage = async (e: MessageEvent) => {
           unpackedBf16Names.push(tensor.name);
         }
       }
-      // Every 16-bit float must widen to f32 lanes. The backend's copy/astype
-      // kernels bind storage as `array<u32>` and index one element per 4-byte
-      // lane (webgpu/copy.cpp: "wgpu_itemsize is always 4 currently"), and no
-      // WebGPU kernel declares `enable f16`. `shader-f16` is a WGSL arithmetic
-      // feature this backend never uses and says nothing about storage, so
-      // gating f16 on it left native 2-byte buffers that astype() read two per
-      // lane, off the end of a half-length source. Only the explicit packed-bf16
-      // representation (2 per u32) may stay 16-bit.
+      // Every 16-bit float must widen to f32 lanes. WebGPU kernels bind storage
+      // as `array<u32>`, one element per 4-byte lane (webgpu/copy.cpp: "all types
+      // occupy one u32 slot"), yet wgpu_itemsize() widens bool/bf16/int64 to 4 and
+      // leaves float16 at its native 2 — the one dtype whose allocation contradicts
+      // that assumption. copy.cpp has no f16 conversion mode, so astype(f16→bf16)
+      // falls to mode 0, a raw u32-lane copy over a half-length source. `shader-f16`
+      // only enables the WGSL f16 scalar type for arithmetic (utils.h
+      // emit_f16_enable); it says nothing about storage, so gating the widen on it
+      // was wrong. Only the explicit packed-bf16 form (2 per u32) may stay 16-bit.
       const needsExpand = (isBf16 && !packedEligible) || isF16;
 
       let gpuByteSize: number;
