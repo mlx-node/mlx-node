@@ -4,6 +4,7 @@ import type { LensReadoutRun } from '../inspector-types';
 import { RANK_CAP } from '../../demo/jlens-core/colors';
 import { buildLensSlice } from '../../demo/jlens-core/types';
 import { displayRowOrder, normalizeSelected, offScaleLabel } from '../../demo/jspace/ArgmaxGridCanvas';
+import { rankToY } from '../../demo/jspace/RankChart';
 
 /** layers ASCENDING; cells layer-major: cells[layerIdx * promptLen + pos]. */
 function fixture() {
@@ -79,5 +80,18 @@ describe('normalizeSelected', () => {
   it('returns null for a null selection', () => {
     const slice = fixture();
     expect(normalizeSelected(null, slice)).toBeNull();
+  });
+});
+
+describe('rank axis', () => {
+  it('puts rank 1 at the TOP (bump-chart convention)', () => {
+    expect(rankToY(1, 100)).toBeLessThan(rankToY(10, 100));
+    expect(rankToY(10, 100)).toBeLessThan(rankToY(999, 100));
+  });
+
+  it('is logarithmic, not linear', () => {
+    const a = rankToY(1, 100) - rankToY(10, 100);
+    const b = rankToY(10, 100) - rankToY(100, 100);
+    expect(Math.abs(a - b)).toBeLessThan(1); // equal decades ⇒ equal pixels
   });
 });
