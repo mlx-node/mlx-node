@@ -76,6 +76,9 @@ export const BAND = {
 } as const;
 
 /** DEFAULT boundary subset baked/read for Jacobian mode: band onset (6) through
- *  the output boundary (24), evenly spaced. The early band (1..5) is intentionally
- *  excluded from the default view — T4.4 puts it behind a "show all layers" toggle. */
-export const JACOBIAN_LAYERS: number[] = [6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
+ *  the output boundary (24). Sampled every-other, but the legibility PEAK (17) is
+ *  included explicitly so the default view shows it (the French headline surfaces
+ *  'season' at 16 and 'summer' at 17; band-report legibility gap peaks at 17). The
+ *  early band (1..5) is intentionally excluded from the default view — T4.4 puts it
+ *  behind a "show all layers" toggle. */
+export const JACOBIAN_LAYERS: number[] = [6, 8, 10, 12, 14, 16, 17, 18, 20, 22, 24];
