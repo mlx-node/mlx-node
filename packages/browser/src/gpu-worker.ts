@@ -1075,8 +1075,15 @@ self.onmessage = async (e: MessageEvent) => {
           unpackedBf16Names.push(tensor.name);
         }
       }
-      // bf16 expands to f32 for legacy storage; f16 stays native when shader-f16 is available.
-      const needsExpand = (isBf16 && !packedEligible) || (isF16 && !hasShaderF16);
+      // Every 16-bit float must widen to f32 lanes. The backend's copy/astype
+      // kernels bind storage as `array<u32>` and index one element per 4-byte
+      // lane (webgpu/copy.cpp: "wgpu_itemsize is always 4 currently"), and no
+      // WebGPU kernel declares `enable f16`. `shader-f16` is a WGSL arithmetic
+      // feature this backend never uses and says nothing about storage, so
+      // gating f16 on it left native 2-byte buffers that astype() read two per
+      // lane, off the end of a half-length source. Only the explicit packed-bf16
+      // representation (2 per u32) may stay 16-bit.
+      const needsExpand = (isBf16 && !packedEligible) || isF16;
 
       let gpuByteSize: number;
       if (packedEligible) {

@@ -2882,8 +2882,9 @@ async function handleLoadLensPack(data: { id: string }) {
       cursor += tensor.byteSize;
     }
 
-    // 3. Upload to WebGPU. packBf16=false — lens matrices are plain f16, NOT
-    // 2-per-u32 packed bf16 (packing would make the Rust matmul read garbage).
+    // 3. Upload to WebGPU. packBf16=false — lens matrices are never 2-per-u32
+    // packed bf16 (packing would make the Rust matmul read garbage). The f16
+    // source is widened to f32 lanes by the uploader.
     const uploaded = await uploadWeightsToGpu(gpuWorker, packBuffer, 0, uploadTensors, undefined, false);
     if (uploaded.handles.length !== uploadTensors.length) {
       throw new Error(
@@ -2891,16 +2892,34 @@ async function handleLoadLensPack(data: { id: string }) {
       );
     }
 
-    // 4. Build the descriptors the NAPI loader consumes. dtypeCode routes
-    // through dtypeToCode (F16→2), matching Rust's persistence dtype_from_code.
-    const gpuTensors: GpuTensorDescriptor[] = uploadTensors.map((tensor, i) => ({
-      name: tensor.name,
-      handle: uploaded.handles[i]!,
-      dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
-      shape: tensor.shape,
-      byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
-      packedBf16: false,
-    }));
+    // 4. Build the descriptors the NAPI loader consumes. Only dtypes whose GPU
+    // itemsize is 4 bytes are readable: the backend's copy/astype kernels index
+    // storage as `array<u32>`, so a 16-bit lane decodes to garbage instead of
+    // failing. Assert rather than trust — this is exactly how a native f16 pack
+    // once loaded "successfully" and produced nonsense at every fitted layer.
+    const gpuTensors: GpuTensorDescriptor[] = uploadTensors.map((tensor, i) => {
+      const dtype = uploaded.uploadedDtypes[i];
+      if (dtype !== 'F32' && dtype !== 'BF16') {
+        throw new Error(
+          `loadLensPack: tensor '${tensor.name}' uploaded as ${dtype ?? 'unknown'}; ` +
+            `the WebGPU backend only reads 4-byte lanes (F32/BF16)`,
+        );
+      }
+      // Take the uploader's post-widening size, never the f16 source size — a
+      // widened dtype paired with the original byte count would read half the data.
+      const byteSize = uploaded.uploadedByteSizes[i];
+      if (typeof byteSize !== 'number') {
+        throw new Error(`loadLensPack: GPU upload reported no byte size for tensor '${tensor.name}'`);
+      }
+      return {
+        name: tensor.name,
+        handle: uploaded.handles[i]!,
+        dtypeCode: dtypeToCode(dtype),
+        shape: tensor.shape,
+        byteSize,
+        packedBf16: false,
+      };
+    });
 
     // 5. Populate lens_pack on the model thread (validates + casts to bf16).
     const loaded: number = await model.loadLensPackFromGpuBuffers(gpuTensors);
