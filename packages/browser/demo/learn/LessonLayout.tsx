@@ -98,10 +98,12 @@ export function LessonLayout({
           type="button"
           onClick={onBackToIndex}
           // Keep an accessible name at every width: the label is `sr-only` below
-          // `sm` (screen readers still announce it) and visible from `sm` up. The
-          // `py-1.5 -my-1.5` gives the icon-only mobile control a tap target on par
-          // with the neighboring size-sm Buttons without growing the header row.
-          className="inline-flex shrink-0 items-center gap-2 py-1.5 -my-1.5 text-sm text-muted-foreground hover:text-foreground"
+          // `sm` (screen readers still announce it) and visible from `sm` up. Below
+          // `sm` the label leaves flow, so the icon alone would give a tiny hit box;
+          // `h-8 px-2` floors it to a real ~32x32 target matching the neighboring
+          // `size="sm"` Buttons (also `h-8`), and `-mx-2` outsets that padding as
+          // pure hit area so the icon's position and the row height are unchanged.
+          className="-mx-2 inline-flex h-8 shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeftIcon className="size-4" />
           <span className="sr-only sm:not-sr-only">{ui.lessonLayout.allChapters}</span>
