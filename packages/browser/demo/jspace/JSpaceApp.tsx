@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import type { LensPinned, LensReadoutRun, TokenInfo } from '../../src/inspector-types';
+import type { LensPinned, TokenInfo } from '../../src/inspector-types';
 import { LENS_MAX_PINNED, LENS_MAX_POSITIONS } from '../../src/inspector-types';
 import { lensReadout, loadLensPack } from '../lib/lens-client';
 import { tokenize } from '../lib/tokenizer-client';
