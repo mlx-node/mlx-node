@@ -126,22 +126,39 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
 export type JSpaceDefaults = Pick<JSpaceState, 'mode' | 'pins' | 'sel'>;
 
 /**
- * Overlay a decoded permalink patch onto a full default state. Absent keys fall
- * back to `defaults`; this is the ONLY correct way to consume
- * {@link decodePermalink} — never patch the sparse result over live state, or a
- * shared permalink would leak the previous session's pins/selection.
+ * Resolve a /jspace hash into a FULL state, distinguishing two cases the encoder
+ * conflates on the wire:
  *
- * Pure: no globals, no I/O. `prompt` carries no per-app default, so an absent
- * `p` yields `''`. Presence is tested with `Object.hasOwn`, not truthiness, so a
- * decoded-but-`null` `sel` (junk on the wire) overrides `defaults.sel`, while a
- * genuinely absent `sel` falls back to it.
+ *   - EMPTY hash (`''` or bare `'#'`, a cold page load with no permalink): the
+ *     app's `defaults` verbatim, plus `prompt: ''`.
+ *   - NON-EMPTY hash (a real permalink): a COMPLETE state snapshot. The encoder
+ *     omits fields it left empty (`pins: []`) or null (`sel: null`), so those
+ *     keys are absent on the wire — but they restore to the CANONICAL EMPTIES
+ *     (`[]` / `null`), NEVER to `defaults`. Otherwise a shared "no pins / no
+ *     selection" link would silently inherit the recipient's pins and selection,
+ *     defeating the whole point of a full-state permalink. Only `mode` may fall
+ *     back to `defaults` (a hand-edited hash can drop it; a generated permalink
+ *     always carries it), and `prompt` falls back to `''`.
+ *
+ * This is the ONLY correct way to consume {@link decodePermalink} — never patch
+ * the sparse result over live state, or a shared permalink would leak the
+ * previous session's pins/selection.
+ *
+ * Pure: no globals, no I/O. The leading `#` is stripped here (as well as inside
+ * `decodePermalink`) so a bare `'#'` is treated as an empty hash.
  */
 export function applyPermalink(defaults: JSpaceDefaults, hash: string): JSpaceState {
-  const patch = decodePermalink(hash);
+  const raw = hash.startsWith('#') ? hash.slice(1) : hash;
+  // No permalink at all (bare page load): the app's cold-start defaults, verbatim.
+  if (raw === '') return { prompt: '', ...defaults };
+  // A non-empty hash IS a complete state snapshot. Fields the encoder omits
+  // because they were empty (`pins`) or null (`sel`) restore to those CANONICAL
+  // EMPTIES — never to `defaults`.
+  const patch = decodePermalink(raw);
   return {
     prompt: patch.prompt ?? '',
-    mode: Object.hasOwn(patch, 'mode') ? patch.mode! : defaults.mode,
-    pins: Object.hasOwn(patch, 'pins') ? patch.pins! : defaults.pins,
-    sel: Object.hasOwn(patch, 'sel') ? patch.sel! : defaults.sel,
+    mode: patch.mode ?? defaults.mode,
+    pins: patch.pins ?? [],
+    sel: patch.sel ?? null,
   };
 }

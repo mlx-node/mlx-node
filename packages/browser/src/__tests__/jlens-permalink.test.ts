@@ -155,11 +155,24 @@ describe('applyPermalink overlay', () => {
     expect(s.sel).toEqual(defaults.sel);
   });
 
-  it('overlays mode but keeps default pins/sel for a mode-only hash', () => {
+  it('treats a bare "#" hash like an empty hash and yields the defaults', () => {
+    // Proves the leading-`#` strip in applyPermalink feeds the empty-hash check:
+    // '#' -> '' -> full defaults, not a non-empty snapshot that would zero pins/sel.
+    const s = applyPermalink(defaults, '#');
+    expect(s.prompt).toBe('');
+    expect(s.mode).toBe(defaults.mode);
+    expect(s.pins).toEqual(defaults.pins);
+    expect(s.sel).toEqual(defaults.sel);
+  });
+
+  it('restores canonical empties (not defaults) for a non-empty mode-only hash', () => {
+    // A non-empty hash IS a complete snapshot: `pins`/`sel` absent on the wire mean
+    // the sender had none, so they must restore to []/null — NOT to the recipient's
+    // nonempty defaults, which would silently graft foreign pins onto a shared link.
     const s = applyPermalink(defaults, 'mode=j');
     expect(s.mode).toBe('jacobian'); // overlaid, differs from defaults.mode ('logit')
-    expect(s.pins).toEqual(defaults.pins); // absent on the wire -> default kept
-    expect(s.sel).toEqual(defaults.sel); // absent on the wire -> default kept
+    expect(s.pins).toEqual([]); // absent on the wire -> canonical empty, NOT defaults.pins
+    expect(s.sel).toBeNull(); // absent on the wire -> canonical null, NOT defaults.sel
   });
 
   it('overrides pins and sel from a hash that carries them', () => {
@@ -167,5 +180,12 @@ describe('applyPermalink overlay', () => {
     expect(s.mode).toBe('jacobian');
     expect(s.pins).toEqual([7, 8]);
     expect(s.sel).toEqual({ layerIdx: 3, pos: 4 });
+  });
+
+  it('restores an empty-pins/null-sel snapshot without inheriting nonempty defaults', () => {
+    const defaults = { mode: 'logit' as const, pins: [42], sel: { layerIdx: 1, pos: 2 } };
+    const wire = encodePermalink({ prompt: 'x', mode: 'jacobian', pins: [], sel: null });
+    const restored = applyPermalink(defaults, wire);
+    expect(restored).toEqual({ prompt: 'x', mode: 'jacobian', pins: [], sel: null });
   });
 });
