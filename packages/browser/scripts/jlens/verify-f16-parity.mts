@@ -181,7 +181,7 @@ async function main(): Promise<void> {
 
   // Discover the pinned id set = F32 J-lens top-K at the FINAL fitted layer (23),
   // last position. These fixed ids give the "pinned full-vocab ranks" both packs
-  // must agree on. (LENS_MAX_PINNED=8; TOP_K<=8, so no truncation.)
+  // must agree on. (pins ≤ LENS_MAX_PINNED (8); TOP_K ≤ 8, so no pin id is dropped.)
   const discover = await modelA.lensReadout(promptIds, { layers: [23], topK: TOP_K, useJacobian: true });
   const seedCell = discover.cells.find((c: Cell) => c.layer === 23 && c.position === P - 1);
   if (!seedCell) fail('no seed cell for pinned-id discovery at layer 23');

@@ -84,10 +84,13 @@ const EXPORT_HI = 23;
 // Smoke (caller contract: layers MUST be subset of 1..=24; the pack has no J.0).
 const SMOKE_LAYER = 5;
 const SMOKE_TOPK = 8;
-// lensReadout caps the prompt at LENS_MAX_POSITIONS=48 positions (inspector.rs:
-// LENS_MAX_POSITIONS — it bounds the transient [P, vocab] logits + layers×P host
-// crossing). The corpus sequences are 128 tok, so the smoke MUST slice to <=48.
-// 32 gives a real multi-token context while staying safely under the cap.
+// lensReadout caps the prompt at LENS_MAX_POSITIONS positions — 128 in the
+// shared contract (inspector.rs / src/inspector-types.ts); it bounds the
+// transient [P, vocab] logits + layers×P host crossing. NOTE: this branch does
+// NOT rebuild the native addon, so the on-disk .node still enforces the old 48
+// until `yarn build:native`; lens_readout ERRORS above whatever cap it holds
+// rather than dropping tokens. The corpus sequences are 128 tok; the smoke
+// slices to 32 — a real multi-token context that stays safely under even 48.
 const SMOKE_PROMPT_TOKENS = 32;
 
 const POLL_MS = 3000;
@@ -688,7 +691,8 @@ async function orchestrator(): Promise<void> {
   // smokeOk/smokeFailReason, the log is written unconditionally below, and the
   // process exits non-zero only at the very end (after the log is safely on disk).
   console.log(`\n[SMOKE] loadLensPackFromFile + lensReadout(useJacobian, layers=[${SMOKE_LAYER}])`);
-  // A held-out (UNfit) corpus sequence, sliced to <=LENS_MAX_POSITIONS (48).
+  // A held-out (UNfit) corpus sequence, sliced to SMOKE_PROMPT_TOKENS (32) —
+  // well under both the shared 128-position cap and the on-disk addon's old 48.
   const smokePrompt = corpus[N_FIT].slice(0, SMOKE_PROMPT_TOKENS);
   const smokeRun = await runWorker({
     kind: 'smoke',
@@ -1344,7 +1348,7 @@ async function worker(): Promise<void> {
       }
       const lIds: number[] = lCell.topKIds;
       // 2) J lens, PINNING the logit-lens top-K ids so we get their J-lens
-      //    full-vocab ranks (pinnedIds is capped at LENS_MAX_PINNED=8; topK<=8).
+      //    full-vocab ranks (pinnedIds holds ≤ LENS_MAX_PINNED (8) ids; topK ≤ 8).
       const pinnedIds = lIds.slice(0, 8);
       const jro = await model.lensReadout(job.promptIds, {
         layers: [job.layer],

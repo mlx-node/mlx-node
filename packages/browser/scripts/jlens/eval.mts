@@ -32,12 +32,13 @@
  * NAPI CONTRACT honored (crates/mlx-core/src/inspector.rs):
  *   - headline layer set = [1..=23] (the fitted-J domain); [1..=24] (24 = J=I)
  *     is a supplementary column only. Boundary 0 is unfitted and ERRORS.
- *   - pinnedIds capped at LENS_MAX_PINNED=8 (silently truncated past that) — we
- *     BATCH each item's surface-form ids into groups of ≤8 and merge ranks.
+ *   - pinnedIds capped at LENS_MAX_PINNED (8): the backend hard-ERRORS past that
+ *     (it rejects an oversized pin list rather than dropping ids) — we BATCH each
+ *     item's surface-form ids into groups of ≤8 and merge ranks.
  *   - ranks are display-capped at 999 (right-censored: 999 == "≥999", a miss).
  *     The log-k grid max is 377 < 999, so a censored rank is a miss at every k.
  *   - topK clamped to 32; we request topK=1 (irrelevant to the pinned metric).
- *   - LENS_MAX_POSITIONS=48; every eval prompt ≤ 41 tok (T1.3), asserted here.
+ *   - LENS_MAX_POSITIONS is 128; every eval prompt ≤ 41 tok (T1.3), asserted here.
  *
  * Run with: oxnode packages/browser/scripts/jlens/eval.mts
  *   (NOT tsx/ts-node — repo convention; needs env PATH="/opt/homebrew/bin:$PATH")
@@ -50,6 +51,15 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// The lens caps (LENS_MAX_POSITIONS / LENS_MAX_PINNED) have a single home in
+// src/inspector-types.ts, mirroring the Rust contract in inspector.rs. NOTE:
+// these scripts run against the on-disk native .node addon, which THIS branch
+// does not rebuild — the raised 128-position cap ships in wasm only. Until
+// `yarn build:native` re-bakes the addon, any prompt longer than the old 48
+// reaches lens_readout and comes back as a LOUD error, never a silent drop.
+// The `.ts` extension is required for oxnode's ESM resolution.
+import { LENS_MAX_PINNED, LENS_MAX_POSITIONS } from '../../src/inspector-types.ts';
 
 const MODEL_PATH = '/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16';
 const OUT_DIR = '/Users/brooklyn/workspace/github/mlx-node/.cache/jlens';
@@ -78,8 +88,6 @@ const K_GRID = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377];
 const LOGK = K_GRID.map((k) => Math.log(k));
 const LOGK_SPAN = LOGK[LOGK.length - 1] - LOGK[0]; // ln(377)
 
-const LENS_MAX_PINNED = 8;
-const LENS_MAX_POSITIONS = 48;
 const RANK_CENSOR = 999;
 
 type Suite = { slug: string; readout: 'preTarget' | 'lastNewline'; synonyms: boolean; expect: number };

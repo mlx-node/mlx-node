@@ -30,7 +30,8 @@ async function main() {
   const model = (await Qwen35Model.load(MODEL_PATH)) as any;
   console.log('Model loaded (no lens pack — logit lens).');
 
-  // Tokenize a ~32-token prompt, then clamp to <= 48 (LENS_MAX_POSITIONS).
+  // Tokenize the prompt, then clamp to 32 tokens — well under both the shared
+  // LENS_MAX_POSITIONS cap (128) and the on-disk native addon's old 48.
   const prompt =
     'The history of computing spans many centuries, from the earliest mechanical ' +
     'calculators through the vacuum tube era to the modern silicon microprocessors ' +

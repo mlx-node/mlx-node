@@ -56,6 +56,15 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// The lens caps (LENS_MAX_POSITIONS / LENS_MAX_PINNED) have a single home in
+// src/inspector-types.ts, mirroring the Rust contract in inspector.rs. NOTE:
+// these scripts run against the on-disk native .node addon, which THIS branch
+// does not rebuild — the raised 128-position cap ships in wasm only. Until
+// `yarn build:native` re-bakes the addon, any prompt longer than the old 48
+// reaches lens_readout and comes back as a LOUD error, never a silent drop.
+// The `.ts` extension is required for oxnode's ESM resolution.
+import { LENS_MAX_PINNED, LENS_MAX_POSITIONS } from '../../src/inspector-types.ts';
+
 const MODEL_PATH = '/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3.5-0.8b-mlx-bf16';
 const OUT_DIR = '/Users/brooklyn/workspace/github/mlx-node/.cache/jlens';
 // This is a v1 (full 100-prompt pack) deliverable → default to lens-pack-v1;
@@ -70,8 +79,6 @@ const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
 const REQUEST_LAYERS = Array.from({ length: 24 }, (_, i) => i + 1); // 1..24
 const N_BOUND = 24;
 const RANK_CENSOR = 999;
-const LENS_MAX_PINNED = 8;
-const LENS_MAX_POSITIONS = 48;
 const TOPK_LEGIBLE = 10; // detector 3: "entered the top-K" threshold (rank ≤ K)
 const RISE_THRESH = 1.25; // onset / band-structure multiplier over the early band
 const EARLY_BAND = 5; // early band = boundaries ℓ1..5
