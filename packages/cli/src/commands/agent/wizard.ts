@@ -36,6 +36,21 @@ function repoSlug(hfRepo: string): string {
 }
 
 /**
+ * argv for `mlx download model`, shared by the interactive download AND
+ * the non-TTY hint so both target the same destination: with a models
+ * dir in play the output is pinned to `<modelsDir>/<slug>` — otherwise a
+ * copy-pasted hint would download to the DEFAULT dir and a re-run under
+ * a custom `--models-dir` would still find nothing.
+ */
+function downloadModelArgv(hfRepo: string, modelsDir: string | undefined): string[] {
+  const argv = ['-m', hfRepo];
+  if (modelsDir) {
+    argv.push('-o', join(modelsDir, repoSlug(hfRepo)));
+  }
+  return argv;
+}
+
+/**
  * Offer the catalog (default entry first), download the chosen repo, and
  * return its HF slug. Non-TTY sessions cannot prompt: throws with the
  * manual `mlx download model` commands instead — the caller must not
@@ -45,7 +60,9 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
   const catalog = visibleCatalog();
 
   if (!deps.io.isTTY) {
-    const commands = catalog.map((entry) => `  mlx download model -m ${entry.hfRepo}`).join('\n');
+    const commands = catalog
+      .map((entry) => `  mlx download model ${downloadModelArgv(entry.hfRepo, deps.modelsDir).join(' ')}`)
+      .join('\n');
     throw new Error(
       `No local models found. Run in a terminal for the setup wizard, or download one directly:\n${commands}`,
     );
@@ -61,10 +78,6 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
     })),
   });
 
-  const argv = ['-m', chosen];
-  if (deps.modelsDir) {
-    argv.push('-o', join(deps.modelsDir, repoSlug(chosen)));
-  }
-  await deps.download(argv);
+  await deps.download(downloadModelArgv(chosen, deps.modelsDir));
   return chosen;
 }

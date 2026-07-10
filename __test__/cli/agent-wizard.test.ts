@@ -120,4 +120,21 @@ describe('runFirstRunWizard', () => {
     expect(selectCalls).toHaveLength(0);
     expect(calls).toHaveLength(0);
   });
+
+  it('pins the non-TTY hint commands to modelsDir exactly like the interactive download', async () => {
+    const { io } = makeIO({ isTTY: false });
+    const { download, calls } = makeDownload();
+
+    try {
+      await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
+      expect.unreachable('wizard must throw without a TTY');
+    } catch (error) {
+      const message = (error as Error).message;
+      for (const entry of visibleCatalog()) {
+        const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
+        expect(message).toContain(`mlx download model -m ${entry.hfRepo} -o ${join('/custom/models', slug)}`);
+      }
+    }
+    expect(calls).toHaveLength(0);
+  });
 });

@@ -11,6 +11,12 @@
  * the handoff and nothing here reads stdin.
  */
 
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+import type { MlxModelInfo } from '@mlx-node/agent';
+
 export interface AgentArgScan {
   /** Value of `--models-dir` (the flag pair is removed from `passthrough`). */
   modelsDir?: string;
@@ -48,10 +54,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === '--models-dir') {
-      if (i + 1 >= argv.length) {
+      const next = argv[i + 1];
+      // The SPACE-form value must be a real path token: absent, empty,
+      // or option-looking (`-…`) values are usage errors. Consuming an
+      // option here would swallow the next flag (`--models-dir --local`
+      // must not create ./--local and turn an install global). Dash-
+      // leading dirs must use the `--models-dir=<dir>` form.
+      if (next === undefined || next.startsWith('-')) {
         modelsDirMissingValue = true;
+      } else if (next.length === 0) {
+        modelsDirMissingValue = true;
+        i++; // the empty token was the (unusable) value — consume it
       } else {
-        modelsDir = argv[++i]!;
+        modelsDir = next;
+        i++;
       }
       continue;
     }
@@ -85,7 +101,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
 /**
  * Args that make pi resolve the model itself: an explicit choice
  * (`--model`/`--provider`) or a session reference whose saved model must
- * win (a CLI `--model` overrides session restore in pi).
+ * win (pi's `createAgentSession` restores the session's model ONLY when
+ * no CLI `--model` was given). `--fork` belongs here too: it copies the
+ * source session — messages and saved model included — into a new one.
  */
 const MODEL_CARRYING_ARGS: ReadonlySet<string> = new Set([
   '--model',
@@ -97,6 +115,7 @@ const MODEL_CARRYING_ARGS: ReadonlySet<string> = new Set([
   '--resume',
   '--session',
   '--session-id',
+  '--fork',
 ]);
 
 /**
@@ -113,6 +132,73 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
   return ['--model', `mlx/${defaultModelId}`, ...passthrough];
 }
 
+/** A `defaultProvider`/`defaultModel` pair persisted by pi's `/model`. */
+export interface PersistedPiDefault {
+  provider: string;
+  modelId: string;
+}
+
+/**
+ * Read pi's persisted `/model` default from the agent config home:
+ * `<agentDir>/settings.json`, fields `defaultProvider` + `defaultModel`
+ * (pi's `SettingsManager.setDefaultModelAndProvider` writes them to the
+ * GLOBAL-scope file, i.e. this one). The dir mirrors `runAgent`'s env
+ * seeding: an explicit `PI_CODING_AGENT_DIR` wins, else
+ * `~/.mlx-node/agent`. Absent or malformed settings mean "no persisted
+ * default", never an error.
+ */
+export function readPersistedDefaultModel(
+  agentDir: string = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.mlx-node', 'agent'),
+): PersistedPiDefault | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null) {
+      return undefined;
+    }
+    const { defaultProvider, defaultModel } = parsed as Record<string, unknown>;
+    if (typeof defaultProvider !== 'string' || defaultProvider.length === 0) {
+      return undefined;
+    }
+    if (typeof defaultModel !== 'string' || defaultModel.length === 0) {
+      return undefined;
+    }
+    return { provider: defaultProvider, modelId: defaultModel };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Pick the model id {@link withDefaultModel} injects on a fresh run. pi
+ * only consults its persisted default AFTER CLI args, and `mlx agent`
+ * always passes `--model` on fresh runs — so the injection itself must
+ * honor the user's persisted `/model` pick:
+ * - persisted `mlx/<id>` still discovered → inject that id;
+ * - persisted `mlx/<id>` no longer discovered → first discovered model;
+ * - persisted NON-mlx provider → deliberately overridden — this command
+ *   is local-first/offline — but announced via `notice` (stderr), never
+ *   silently.
+ */
+export function chooseDefaultModel(
+  models: readonly MlxModelInfo[],
+  persisted: PersistedPiDefault | undefined,
+): { modelId: string; notice?: string } {
+  const fallback = models[0]!.discovered.name;
+  if (persisted === undefined) {
+    return { modelId: fallback };
+  }
+  if (persisted.provider === 'mlx') {
+    const match = models.find((model) => model.discovered.name === persisted.modelId);
+    return { modelId: match ? match.discovered.name : fallback };
+  }
+  return {
+    modelId: fallback,
+    notice:
+      `mlx agent: persisted default ${persisted.provider}/${persisted.modelId} is not a local mlx model; ` +
+      `using mlx/${fallback} (this agent runs offline — pass --model to pick another local model)`,
+  };
+}
+
 /** mlx-side help; pi's full flag list is appended by forwarding `--help`. */
 function printAgentPreamble(): void {
   console.log(`
@@ -123,7 +209,8 @@ Usage:
 
 mlx options (handled before pi sees the args):
   --models-dir <dir>        Local models directory (default: ~/.mlx-node/models;
-                            also via MLX_MODELS_DIR or ~/.mlx-node/config.json)
+                            also via MLX_MODELS_DIR or ~/.mlx-node/config.json).
+                            Dash-leading paths need the --models-dir=<dir> form.
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
@@ -153,6 +240,8 @@ export interface AgentRunDeps {
   runAgent?: (typeof import('@mlx-node/agent'))['runAgent'];
   /** Whole first-run wizard step (imports + IO wiring included). */
   wizard?: (modelsDir: string) => Promise<void>;
+  /** Persisted-`/model` reader; production = {@link readPersistedDefaultModel}. */
+  readPersistedDefault?: typeof readPersistedDefaultModel;
 }
 
 /** Production wizard step: interactive catalog pick + download. */
@@ -181,7 +270,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   }
 
   if (scan.modelsDirMissingValue) {
-    console.error('Missing value for --models-dir');
+    console.error('Missing value for --models-dir (a dash-leading path needs the --models-dir=<dir> form)');
     process.exitCode = 1;
     return;
   }
@@ -233,9 +322,13 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     }
   }
 
-  await runAgent({
-    modelsDir,
-    models,
-    argv: withDefaultModel(scan.passthrough, models[0]!.discovered.name),
-  });
+  const { modelId, notice } = chooseDefaultModel(models, (deps.readPersistedDefault ?? readPersistedDefaultModel)());
+  const agentArgv = withDefaultModel(scan.passthrough, modelId);
+  // The identity return means no injection happened (session/--model run)
+  // — then nothing was overridden and the notice would be a lie.
+  if (notice !== undefined && agentArgv !== scan.passthrough) {
+    console.error(notice);
+  }
+
+  await runAgent({ modelsDir, models, argv: agentArgv });
 }
