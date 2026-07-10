@@ -163,9 +163,18 @@ export function ArgmaxGridCanvas({
     }
   }, [sel, slice, promptLen]);
 
-  const selectedDesc = sel
-    ? `Layer ${slice.layers[sel.layerIdx]}, position ${sel.pos + 1} of ${promptLen}: ${
-        slice.cellAt(sel.layerIdx, sel.pos).topKTexts[0] ?? '∅'
+  // The ONE grid cell represented in the DOM (the canvas paints the rest). Since
+  // the grid unconditionally owns this proxy row, it must ALWAYS be a real,
+  // indexed cell — never a blank unindexed placeholder. With no selection we
+  // anchor it to the grid-entry cell (deepest layer = display row 1, position 0 =
+  // column 1 — the SAME default onKeyDown seeds from), so AT reads a coherent
+  // row 1 / column 1 rather than inferring a blank one. `proxy` is null ONLY for
+  // a zero-axis (empty) slice, where the grid apparatus is dropped entirely.
+  const hasCells = slice.layers.length > 0 && promptLen > 0;
+  const proxy: CellRef | null = sel ?? (hasCells ? { layerIdx: slice.layers.length - 1, pos: 0 } : null);
+  const proxyDesc = proxy
+    ? `Layer ${slice.layers[proxy.layerIdx]}, position ${proxy.pos + 1} of ${promptLen}: ${
+        slice.cellAt(proxy.layerIdx, proxy.pos).topKTexts[0] ?? '∅'
       }`
     : '';
 
@@ -376,7 +385,9 @@ export function ArgmaxGridCanvas({
       <div style={{ position: 'relative', width: contentWidth, height: contentHeight }}>
         <canvas
           ref={canvasRef}
-          role="grid"
+          // A zero-axis (empty) slice is not a grid: drop role/counts/owned proxy
+          // entirely rather than expose an empty grid with an unindexed row.
+          role={hasCells ? 'grid' : undefined}
           aria-label={ariaLabel}
           tabIndex={0}
           // A <canvas> cannot own DOM children, so the off-screen active cell is a
@@ -386,15 +397,15 @@ export function ArgmaxGridCanvas({
           // never orphaned, even with no selection. Only `aria-activedescendant` is
           // gated on `sel` — with no selection there is simply no active cell (the
           // proxy gridcell renders empty), which is absent, not a dangling ref.
-          aria-owns={rowId}
+          aria-owns={proxy ? rowId : undefined}
           aria-activedescendant={sel ? activeId : undefined}
           // The full grid is painted on the canvas; only ONE proxy row/cell lives
           // in the DOM. Publish the real dimensions so AT does not infer a 1×1
           // grid: rows = residual boundaries, cols = prompt positions. The proxy
           // row/cell carry their 1-based aria-rowindex / aria-colindex (below) so
-          // the active cell's true coordinates are exposed despite the virtualization.
-          aria-rowcount={slice.layers.length}
-          aria-colcount={slice.promptLen}
+          // the represented cell's true coordinates are exposed despite the virtualization.
+          aria-rowcount={hasCells ? slice.layers.length : undefined}
+          aria-colcount={hasCells ? promptLen : undefined}
           onMouseMove={onMouseMove}
           onMouseLeave={onMouseLeave}
           onClick={onClick}
@@ -405,16 +416,19 @@ export function ArgmaxGridCanvas({
         />
         {/* Off-screen row wrapping the gridcell that `aria-activedescendant`
             targets — preserves the grid → row → gridcell ARIA hierarchy that a
-            bare canvas-owned gridcell would violate. When a cell is selected, the
-            proxy carries its true 1-based coordinates: rows render deepest-at-top
-            (displayRowOrder is reversed), so the display row index is
-            `layers.length - layerIdx`; the column index is `pos + 1`. With no
-            selection the proxy is an empty placeholder and carries no index. */}
-        <div id={rowId} role="row" aria-rowindex={sel ? slice.layers.length - sel.layerIdx : undefined} style={SR_ONLY}>
-          <div id={activeId} role="gridcell" aria-colindex={sel ? sel.pos + 1 : undefined}>
-            {selectedDesc}
+            bare canvas-owned gridcell would violate. The proxy ALWAYS carries its
+            true 1-based coordinates: rows render deepest-at-top (displayRowOrder is
+            reversed), so the display row index is `layers.length - layerIdx`; the
+            column index is `pos + 1`. Rendered only when a real cell exists (`proxy`
+            is null for an empty slice); `aria-activedescendant` above still gates on
+            an actual selection so no cell is announced "current" until one is chosen. */}
+        {proxy && (
+          <div id={rowId} role="row" aria-rowindex={slice.layers.length - proxy.layerIdx} style={SR_ONLY}>
+            <div id={activeId} role="gridcell" aria-colindex={proxy.pos + 1}>
+              {proxyDesc}
+            </div>
           </div>
-        </div>
+        )}
         {/* Screen-reader live region — mirrors AttentionHeatmap's announce region. */}
         <div aria-live="polite" aria-atomic="true" style={SR_ONLY}>
           {announce}

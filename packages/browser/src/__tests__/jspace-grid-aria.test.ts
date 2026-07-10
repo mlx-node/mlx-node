@@ -55,17 +55,29 @@ function makeRun(): LensReadoutRun {
 
 const slice = buildLensSlice(makeRun());
 
+// A zero-axis slice: no layers, no positions. The grid apparatus must be dropped.
+const emptySlice = buildLensSlice({
+  promptLen: 0,
+  topK: 1,
+  useJacobian: false,
+  jacobianApplied: false,
+  layers: [],
+  tokens: [],
+  cells: [],
+  pinned: [],
+});
+
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-function mount(selected: CellRef | null): HTMLCanvasElement {
+function mount(selected: CellRef | null, sliceArg: typeof slice = slice): HTMLCanvasElement {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
   flushSync(() => {
     root!.render(
       React.createElement(ArgmaxGridCanvas, {
-        slice,
+        slice: sliceArg,
         colorByPinnedId: new Map<number, string>(),
         selected,
         onHover: () => {},
@@ -86,7 +98,7 @@ afterEach(() => {
 });
 
 describe('ArgmaxGridCanvas ARIA row ownership', () => {
-  it('owns a role=row containing a role=gridcell even with NO selection', () => {
+  it('anchors the owned proxy to a real, indexed grid-entry cell with NO selection', () => {
     const canvas = mount(null);
     expect(canvas.getAttribute('role')).toBe('grid');
     // The full grid's dimensions are published even though only one proxy row
@@ -101,11 +113,13 @@ describe('ArgmaxGridCanvas ARIA row ownership', () => {
     const cell = row!.querySelector('[role="gridcell"]');
     expect(cell).not.toBeNull();
 
-    // No selection ⇒ no active cell: activedescendant AND the proxy coordinates
-    // are all ABSENT (an empty placeholder row/cell), not dangling.
+    // No selection ⇒ no ACTIVE cell (activedescendant absent), but the owned proxy
+    // is still a real, indexed cell anchored to the grid-entry cell: deepest layer
+    // (display row 1) / position 0 (column 1), with non-empty content.
     expect(canvas.getAttribute('aria-activedescendant')).toBeNull();
-    expect(row!.getAttribute('aria-rowindex')).toBeNull();
-    expect(cell!.getAttribute('aria-colindex')).toBeNull();
+    expect(row!.getAttribute('aria-rowindex')).toBe('1');
+    expect(cell!.getAttribute('aria-colindex')).toBe('1');
+    expect(cell!.textContent).not.toBe('');
   });
 
   it('exposes the reversed 1-based row index and column index of the selected cell', () => {
@@ -141,10 +155,22 @@ describe('ArgmaxGridCanvas ARIA row ownership', () => {
     // Row ownership and the grid dimensions are unconditional...
     expect(canvas.getAttribute('aria-owns')).toBeTruthy();
     expect(canvas.getAttribute('aria-rowcount')).toBe('2');
-    // ...but the stale/out-of-range selection clamps to null ⇒ no active descendant
-    // and no proxy coordinates.
+    // ...the stale/out-of-range selection clamps to null ⇒ no active descendant...
     expect(canvas.getAttribute('aria-activedescendant')).toBeNull();
+    // ...but the owned proxy still falls back to the indexed grid-entry cell.
     const row = document.getElementById(canvas.getAttribute('aria-owns')!)!;
-    expect(row.getAttribute('aria-rowindex')).toBeNull();
+    expect(row.getAttribute('aria-rowindex')).toBe('1');
+    expect(row.querySelector('[role="gridcell"]')!.getAttribute('aria-colindex')).toBe('1');
+  });
+
+  it('drops grid semantics entirely for a zero-axis (empty) slice', () => {
+    const canvas = mount(null, emptySlice);
+    // No grid, no counts, no owned proxy row — a blank canvas is not a 0×0 grid.
+    expect(canvas.getAttribute('role')).toBeNull();
+    expect(canvas.getAttribute('aria-owns')).toBeNull();
+    expect(canvas.getAttribute('aria-rowcount')).toBeNull();
+    expect(canvas.getAttribute('aria-colcount')).toBeNull();
+    expect(canvas.getAttribute('aria-activedescendant')).toBeNull();
+    expect(container!.querySelector('[role="row"]')).toBeNull();
   });
 });
