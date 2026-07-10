@@ -12,6 +12,7 @@ use crate::engine::backend::{
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{
     ThinkingPolicy, build_chatml_continue_delta_text, build_synthetic_user_message,
@@ -268,9 +269,9 @@ impl Lfm2Inner {
         // Block-paged KV adapter — default ON.
         //
         // Chat dispatch is wired through this adapter at every chat-entry
-        // site: the engine session core's `ChatBackend::paged_turn` probe
-        // hands whole (fresh) turns to the generic `run_paged_turn` driving
-        // `<Lfm2Inner as PagedBackend>` whenever the adapter is live.
+        // site: the execution plan hands eligible fresh turns to the generic
+        // `run_paged_turn` driving `<Lfm2Inner as PagedBackend>` whenever the
+        // adapter is live.
         //
         // KV-pool sizing: ONLY full_attention layers participate. LFM2's
         // hybrid layer mix is parsed from `config.layer_types`; conv
@@ -1084,18 +1085,27 @@ impl ChatBackend for Lfm2Inner {
     // promotion and the raw_text reasoning scrub) is what both the sync
     // and streaming paths need, so no per-family override.
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                // LFM2's live short-conv state is not represented by the
+                // paged attention adapter. Raw deltas must keep using the
+                // existing flat hybrid-cache path.
+                supports_delta: false,
+            }),
+            speculative: None,
+        }
     }
 
-    // `supports_images`: engine default `false` — LFM2 is text-only.
+    // `execution_plan().media`: `NONE` — LFM2 is text-only.
     // The NAPI entry points additionally carry their own "LFM2 is
     // text-only" pre-checks, which fire before any command is dispatched,
     // so the engine's typed pre-render rejection is a defense-in-depth
     // backstop.
     //
-    // `text_delta_image_guard`: engine default — `!supports_images() &&
-    // session_holds_images()` with the parametrized strings
+    // `text_delta_media_guard`: engine default — no declared media support
+    // plus `session_media()` with the parametrized strings
     // ("chat_tokens_delta_sync is text-only; session currently holds
     // image state" / the `chat_stream_tokens_delta` twin).
     //
@@ -1119,28 +1129,19 @@ impl ChatBackend for Lfm2Inner {
         // byte-stable.
     }
 
-    fn session_holds_images(&self) -> bool {
-        // Always `None` for text-only LFM2 in practice; feeds the
-        // DEFAULT `text_delta_image_guard` policy.
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // LFM2 has no path that can populate media state. Keep the advertised
+        // context truthful even though the legacy cache struct retains an
+        // always-None image-key slot for layout symmetry.
+        MediaCapabilities::NONE
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // CRITICAL (engine paged-probe contract — see the DELIBERATE FIX
-        // note at the probe): lfm2's delta paths NEVER touch the paged
-        // adapter. Decline delta turns so the generic flow (eager flat
-        // delta) runs the flat eager prefill+decode over `self.caches` even
-        // when `paged_adapter` is `Some`; fresh turns take the generic
-        // paged engine for both sync and streaming.
-        //
-        // ⚠ OPPOSITE of qwen3 (which runs the engine UNCONDITIONALLY for
-        // fresh + delta): lfm2 keeps its `is_delta` decline. Consequence:
-        // `is_delta` is ALWAYS false inside lfm2's `run_paged_turn`, so the
-        // engine's `reuse_cache = if is_delta {true} else {p.reuse_cache}`
-        // collapses to `p.reuse_cache`.
-        if args.is_delta {
-            return None;
-        }
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // `execution_plan` admits only fresh turns here. Delta turns keep
+        // using the generic flat hybrid-cache path even when an attention
+        // adapter is loaded; unlike Qwen3, LFM2's short-conv state cannot be
+        // continued through the paged adapter alone.
+        debug_assert!(!args.plan.is_delta);
         // The model-neutral `run_paged_turn` drives the whole fresh turn
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
         // begin_paged_decode → decode loop → save).
@@ -1155,7 +1156,7 @@ impl ChatBackend for Lfm2Inner {
         // and qwen3 — so flat and paged agree token-for-token under a
         // mid-`<think>` budget force. `lfm2_paged_vs_flat_greedy_token_parity`
         // (budget 32) holds because both paths share this loop.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Engine-owned DSpark (draft-model speculative decode) whole-turn loop —
 //! the DSpark analog of [`crate::engine::mtp_turn`]. Families opt in via
-//! [`crate::engine::backend::DsparkBackend`]; their `ChatBackend::mtp_turn`
+//! [`crate::engine::backend::DsparkBackend`]; their `ChatBackend::run_speculative_turn`
 //! override calls [`run_dspark_turn`].
 //!
 //! Structure mirrors [`crate::engine::mtp_turn::run_mtp_turn`] (the

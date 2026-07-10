@@ -2291,25 +2291,41 @@ export declare const enum BuiltinRewardType {
  * Data-free static FP8 activation-amax calibration over RAW-text PREFILL
  * (NVIDIA modelopt `MaxCalibrator` parity), end to end in native code.
  *
- * Reuses the SAME loader the inference session uses
+ * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
+ * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
+ * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
+ * clear error). Both loaders are the SAME ones the inference session uses
  * ([`persistence::load_with_thread`]) — the model is only usable on its
- * dedicated model thread — then:
- *   1. arms the process-global [`ActivationAmaxCollector`] (AFTER load, so no
- *      load-time eval is recorded);
- *   2. dispatches [`Qwen35Cmd::CalibratePrefillRaw`], which on the model thread
- *      tokenizes each `text` WITHOUT the chat template, truncates to
- *      `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
- *      mxfp8 attn/GDN projection's activation tap fires over realistic
- *      raw-text activations, resetting caches between rows;
- *   3. disarms the collector, then — ONLY if the full loop succeeded — drains
- *      the per-tensor amax and ATOMICALLY writes it into
- *      `<model_path>/config.json` (temp file + `rename`).
+ * dedicated model thread. Then:
+ *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
+ *      model thread SELF-ARMS that thread's thread-local
+ *      [`ActivationAmaxCollector`] flag (RAII, AFTER load so no load-time eval
+ *      is recorded), tokenizes each `text` WITHOUT the chat template, truncates
+ *      to `calib_seq` tokens, and runs PREFILL ONLY (no generation) so every
+ *      mxfp8 attn/GDN projection's activation tap fires over realistic raw-text
+ *      activations, resetting caches between rows, then disarms on exit;
+ *   2. ONLY if the full loop succeeded — drains the per-tensor amax and
+ *      ATOMICALLY writes it into `<model_path>/config.json` (temp file +
+ *      `rename`).
+ *
+ * CONCURRENCY: the whole clear→prefill→take→write section is serialized by
+ * [`calib_guard`] (a process-wide `try_lock`); a second concurrent calibration
+ * fails fast with "another calibration is in progress". The arm flag is
+ * thread-local (so a concurrent inference model can't contaminate the run), but
+ * the running-max MAP is process-global, so serializing RUNS keeps two
+ * calibrations from interleaving `record`/`take` on it. The map is CLEARED at
+ * the very start so stale amax from a prior PANICKED run cannot leak into this
+ * write.
  *
  * On ANY error before the final write, the partial amax is discarded and
  * `config.json` is left UNTOUCHED (a failed calibration must not mutate the
- * live model in place). Returns the number of projections calibrated (the
- * count of collected amax entries); 0 means the model exercised no
- * activation-fp8 sites (not an nvidia-recipe checkpoint).
+ * live model in place). A run that prefilled ZERO rows (empty dataset, or every
+ * row tokenized to nothing) is likewise an ERROR that leaves `config.json`
+ * untouched — a no-op calibration must not report a silent success. Returns the
+ * number of projections calibrated (the count of collected amax entries); 0
+ * means a real prefill ran but the model exercised no activation-fp8 sites (not
+ * an nvidia-recipe checkpoint), and in that case `config.json` is left
+ * UNCHANGED (no rewrite).
  */
 export declare function calibrateActivationAmaxRaw(
   modelPath: string,

@@ -56,10 +56,9 @@ describe.sequential('Gemma4 unified model detection', () => {
   });
 
   it('routes architecture-only unified checkpoints (no model_type) to gemma4', async () => {
-    // Arch-only unified checkpoint: `model_type` is absent, so `rawModelType`
-    // defaults to `qwen3`. Detection must still route to `gemma4` off the
-    // `Gemma4UnifiedForConditionalGeneration` architecture, matching the native
-    // loader (gemma4/persistence.rs is_unified), instead of misrouting to Qwen3.
+    // Detection first selects the declarative nullish-model_type => qwen3 base,
+    // then the recognized architecture refines it to `gemma4`. This mirrors
+    // gemma4/persistence.rs is_unified in the native loader.
     await writeFile(
       join(tempDir, 'config.json'),
       JSON.stringify({

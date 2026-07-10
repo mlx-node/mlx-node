@@ -45,7 +45,7 @@ describe.sequential('Harrier Model Detection', () => {
     expect(modelType).toBe('qwen3');
   });
 
-  it('should default to qwen3 when architectures is absent', async () => {
+  it('should detect an explicit qwen3 when architectures is absent', async () => {
     await writeFile(
       join(tempDir, 'config.json'),
       JSON.stringify({

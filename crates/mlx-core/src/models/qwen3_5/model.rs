@@ -18,6 +18,10 @@ use crate::engine::backend::{
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::plan::{
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    SpeculativePlan,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -320,6 +324,56 @@ pub(crate) struct Qwen35Inner {
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
     /// hooks and the raw `generate` loop.
     gen_defaults: crate::engine::ModelGenerationDefaults,
+}
+
+/// Build the dense media admission contract from the components wired into
+/// one loaded Qwen3.5 instance.
+///
+/// Image execution needs all three pieces. Missing combinations remain
+/// backend-validated so the family core preserves its established diagnostic
+/// instead of the engine replacing it with a generic unsupported-media error.
+const fn qwen35_dense_media_plan(
+    has_vision_encoder: bool,
+    has_image_processor: bool,
+    has_paged_adapter: bool,
+) -> MediaPlan {
+    let images_available = has_vision_encoder && has_image_processor && has_paged_adapter;
+    MediaPlan::with_backend_validation(
+        MediaCapabilities {
+            images: images_available,
+            audio: false,
+        },
+        MediaCapabilities::IMAGES,
+    )
+}
+
+/// Media represented by the live dense session state.
+///
+/// The content hash identifies a freshly saved image turn. Generic paged
+/// continuations intentionally clear that key, but retain the M-RoPE delta
+/// while they keep extending the same live image-derived KV prefix. Treat
+/// either signal as image context so request planning stays truthful across
+/// every successive text continuation.
+const fn qwen35_dense_session_media(
+    has_cached_image_key: bool,
+    has_cached_rope_delta: bool,
+) -> MediaCapabilities {
+    if has_cached_image_key || has_cached_rope_delta {
+        MediaCapabilities::IMAGES
+    } else {
+        MediaCapabilities::NONE
+    }
+}
+
+/// Make the resolved decoder authoritative for legacy Qwen3.5 whole-turn
+/// cores, which still derive their local `ChatParams` from a `ChatConfig`.
+fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderPlan) -> bool {
+    let planned_mtp = matches!(
+        decoder,
+        DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+    );
+    config.enable_mtp = Some(planned_mtp);
+    planned_mtp
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
@@ -1364,15 +1418,10 @@ impl Qwen35Inner {
 
     /// Set the vision encoder.
     ///
-    /// Permits loading the vision encoder even when `paged_adapter` is
-    /// active so VLM checkpoints can run text-only inference through
-    /// the paged dispatch. The actual incompatibility is the
-    /// M-RoPE / vision-feature plumbing on the paged forward path,
-    /// which only fires when an input message carries images. The
-    /// chat-entry sites (`vision_mtp_whole_turn_core`, `chat_stream_sync_inner`,
-    /// and the MoE counterparts) reject `has_images && paged_adapter`
-    /// before dispatching, so text-only paged turns proceed normally
-    /// while image turns surface a clear runtime error.
+    /// Paged VLM checkpoints wire this alongside the image processor and
+    /// adapter. Image-bearing turns then route through the dedicated paged
+    /// vision prefill/decode cores; incomplete stacks stay backend-validated
+    /// so those cores can report the precise missing component.
     ///
     /// For text-only inputs M-RoPE collapses to standard scalar-offset
     /// RoPE — `Qwen3_5Attention::forward` uses `self.rope` whenever
@@ -7098,8 +7147,8 @@ impl PagedBackend for Qwen35Inner {
 }
 
 impl Qwen35Inner {
-    /// Whole-turn dense dispatch behind the engine's `vision_turn` and
-    /// `mtp_turn` probes.
+    /// Whole-turn dense dispatch behind the engine's multimodal and
+    /// speculative handlers.
     ///
     /// Routes the four turn shapes onto the whole-turn cores:
     /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
@@ -7108,9 +7157,9 @@ impl Qwen35Inner {
     /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
     /// every dense-path subtlety the generic flow does not model: VLM
     /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back to
-    /// AR when ineligible), the MTP-on-paged `mtp_takes_dense_path`
-    /// release/rebuild dance, and the paged-text-only rejection for
-    /// image turns.
+    /// AR when ineligible), the legacy defensive paged-to-flat cache rebuild,
+    /// and requires-paged image routing (including the missing-adapter
+    /// diagnostic).
     ///
     /// Delta turns recover the raw delta from the engine-composed
     /// `args.tokens` (`cached_history + delta` by construction — the
@@ -7123,11 +7172,17 @@ impl Qwen35Inner {
         // checkpoint ships no defaults (`gen_defaults` all-None).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
+        // The engine resolved MTP admission once, before any cache mutation.
+        // These legacy whole-turn cores still extract their own `ChatParams`,
+        // so project the selected decoder back into their config instead of
+        // letting the raw request independently re-open the MTP gate.
+        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        debug_assert!(!planned_mtp || self.has_mtp_weights());
         let thinking = args.thinking;
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {
                 let cb = StreamSender(sink);
-                if args.is_delta {
+                if args.plan.is_delta {
                     let delta_start = self.cached_token_history.len().min(args.tokens.len());
                     let delta_tokens = args.tokens[delta_start..].to_vec();
                     self.chat_stream_tokens_delta_sync_inner(
@@ -7140,7 +7195,7 @@ impl Qwen35Inner {
                 } else {
                     self.chat_stream_sync_inner(
                         args.tokens.to_vec(),
-                        args.images,
+                        args.media.images,
                         config,
                         args.eos_id,
                         &cb,
@@ -7151,14 +7206,14 @@ impl Qwen35Inner {
                 Ok(TurnOutput::Streamed)
             }
             _ => {
-                let result = if args.is_delta {
+                let result = if args.plan.is_delta {
                     let delta_start = self.cached_token_history.len().min(args.tokens.len());
                     let delta_tokens = args.tokens[delta_start..].to_vec();
                     self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
                 } else {
                     self.vision_mtp_whole_turn_core(
                         args.tokens.to_vec(),
-                        args.images,
+                        args.media.images,
                         config,
                         args.eos_id,
                         thinking,
@@ -7169,18 +7224,13 @@ impl Qwen35Inner {
         }
     }
 
-    /// Whole-turn block-paged dispatch behind [`ChatBackend::paged_turn`].
+    /// Whole-turn block-paged dispatch behind [`ChatBackend::run_paged_turn`].
     ///
     /// Conditional router (dense differs from MoE here — `run_decode_loop` has
-    /// NO MTP gate, so MTP turns must NOT route through it):
-    ///   * MTP turns (`enable_mtp && has_mtp_weights`) take the native
-    ///     paged-MTP path. The streaming-MTP probe declined earlier
-    ///     (routed to `mtp_turn` → `dense_whole_turn`), so only SYNC reaches
-    ///     here with MTP on; `paged_turn_sync_core` self-handles the MTP
-    ///     gate (the eager paged MTP arm, with AR fallback). The
-    ///     `(sink, cancelled)` match is preserved so any future MTP-stream
-    ///     entry still finds its dispatch target.
-    ///   * NON-MTP turns (sync or stream) → the new generic AR+paged path via
+    /// no MTP gate, so planned MTP must use the native paged-MTP cores):
+    ///   * planned MTP turns (sync or stream) use the matching eager paged-MTP
+    ///     core, including text deltas over an image-derived live session;
+    ///   * autoregressive turns (sync or stream) use the generic paged path via
     ///     `engine::paged_turn::run_paged_turn`, which drives the adapter
     ///     lifecycle through [`PagedBackend`] and reuses `run_decode_loop`.
     fn paged_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -7190,9 +7240,11 @@ impl Qwen35Inner {
         // honors them too (no-op when the checkpoint ships none).
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
+        let planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        debug_assert!(!planned_mtp || self.has_mtp_weights());
         let mut p = extract_chat_params(&config);
         p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
-        if p.enable_mtp && self.has_mtp_weights() {
+        if planned_mtp {
             let report_perf = args.config.report_performance.unwrap_or(false);
             let tokenizer = args.tokenizer.clone();
             let thinking = args.thinking;
@@ -8190,17 +8242,29 @@ impl ChatBackend for Qwen35Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
-    }
-
-    fn supports_images(&self) -> bool {
-        // Unconditionally true: the vision probe owns ALL image-bearing
-        // fresh turns; a checkpoint loaded without the vision
-        // encoder/processor surfaces the "VLM prefill requested but vision
-        // encoder/processor not loaded" / paged-text-only errors from inside
-        // the whole-turn cores.
-        true
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            media: qwen35_dense_media_plan(
+                self.vision_encoder.is_some(),
+                self.image_processor.is_some(),
+                self.paged_adapter.is_some(),
+            ),
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: self.has_mtp_weights().then_some(SpeculativePlan {
+                kind: SpeculativeKind::NativeMtp,
+                supported_input_media: MediaCapabilities::NONE,
+                // A text delta can continue an image-derived live session
+                // with native MTP. The current turn carries no image bytes;
+                // the eager paged-MTP core verifies against the target's
+                // existing paged KV context. This is the same route the old
+                // session dispatcher selected: its paged probe ran before the
+                // MTP probe and dense `paged_turn` handled MTP directly.
+                supported_context_media: MediaCapabilities::IMAGES,
+                supports_paged_attention: true,
+            }),
+        }
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
@@ -8212,9 +8276,9 @@ impl ChatBackend for Qwen35Inner {
         // Record the turn's streaming-ness for `begin_decode`'s relabel
         // (`TurnSetup` does not carry it). The session core calls this
         // hook exactly once per generic-flow turn, before
-        // `begin_decode`; whole-turn override paths return from the
-        // probes earlier and never consult either hook. The labels are
-        // the engine defaults.
+        // `begin_decode`; specialized whole-turn paths return from their
+        // planned executor earlier and never consult either hook. The labels
+        // are the engine defaults.
         self.turn_is_streaming.set(is_streaming);
         match (is_streaming, is_delta) {
             (false, false) => "chat",
@@ -8230,35 +8294,39 @@ impl ChatBackend for Qwen35Inner {
         self.caches.is_some()
     }
 
-    fn session_holds_images(&self) -> bool {
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        qwen35_dense_session_media(
+            self.cached_image_key.is_some(),
+            self.cached_rope_deltas.is_some(),
+        )
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Both SYNC and STREAMING turns take the paged core. The paged
         // cores self-handle MTP via the `eager_mtp_paged` arm
         // (`paged_turn_sync_core_inner` / `paged_turn_stream_core_inner`),
         // the streaming eager-MTP path.
-        Some(self.paged_whole_turn(args))
+        debug_assert!(args.plan.use_paged_attention);
+        debug_assert!(self.paged_adapter.is_some());
+        self.paged_whole_turn(args)
     }
 
-    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // `p.enable_mtp && has_mtp_weights` turns run the dense cores whose
-        // internal MTP gate drives the eager MTP turn
-        // (`engine::mtp_turn::run_mtp_turn`) and falls back to plain AR
-        // decode when MTP is ineligible for the turn shape.
-        // Everything beyond this entry condition stays inside those cores.
-        if !(args.params.enable_mtp && self.has_mtp_weights()) {
-            return None;
-        }
-        Some(self.dense_whole_turn(args))
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The execution plan has already established request opt-in, loaded
+        // MTP weights, flat-cache admission, and text-only input. The dense
+        // core retains the algorithm-specific MTP gate and AR fallback.
+        debug_assert!(args.media.is_empty());
+        debug_assert!(matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        ));
+        self.dense_whole_turn(args)
     }
 
-    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // The probe is gated on `!images.is_empty()`; the dense cores own
-        // the full image pipeline (VLM prefill, M-RoPE deltas,
-        // paged-text-only rejection, missing-encoder error).
-        Some(self.dense_whole_turn(args))
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The dense cores own the full image pipeline (VLM prefill, M-RoPE
+        // deltas, paged-backend validation, missing-encoder error).
+        self.dense_whole_turn(args)
     }
 }
 
@@ -10482,6 +10550,65 @@ mod paged_construction_tests {
         assert_eq!(cfg.full_attention_layer_count(), 2);
     }
 
+    #[test]
+    fn test_qwen35_media_plan_requires_complete_paged_vision_stack() {
+        for has_encoder in [false, true] {
+            for has_processor in [false, true] {
+                for has_paged in [false, true] {
+                    let plan = qwen35_dense_media_plan(has_encoder, has_processor, has_paged);
+                    let available = has_encoder && has_processor && has_paged;
+                    assert_eq!(plan.available.images, available);
+                    assert!(!plan.available.audio);
+                    assert_eq!(plan.backend_validated.images, !available);
+                    assert!(!plan.backend_validated.audio);
+                    assert!(plan.admitted().images);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_qwen35_session_media_survives_paged_image_key_clear() {
+        assert_eq!(
+            qwen35_dense_session_media(true, false),
+            MediaCapabilities::IMAGES
+        );
+        assert_eq!(
+            qwen35_dense_session_media(false, true),
+            MediaCapabilities::IMAGES,
+            "a retained M-RoPE delta proves successive paged text turns still extend image KV"
+        );
+        assert_eq!(
+            qwen35_dense_session_media(false, false),
+            MediaCapabilities::NONE
+        );
+    }
+
+    #[test]
+    fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
+        let mut config = ChatConfig {
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        };
+        assert!(!apply_qwen35_dense_planned_decoder(
+            &mut config,
+            DecoderPlan::Autoregressive
+        ));
+        assert_eq!(config.enable_mtp, Some(false));
+
+        assert!(apply_qwen35_dense_planned_decoder(
+            &mut config,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        ));
+        assert_eq!(config.enable_mtp, Some(true));
+
+        assert!(!apply_qwen35_dense_planned_decoder(
+            &mut config,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ));
+        assert_eq!(config.enable_mtp, Some(false));
+    }
+
     /// When `use_block_paged_cache` is `None`, `paged_adapter` is None.
     #[test]
     fn test_inner_no_paged_adapter_when_flag_is_none() {
@@ -10714,10 +10841,9 @@ mod paged_construction_tests {
         );
     }
 
-    /// VLM checkpoints are accepted under paged dispatch: the vision
-    /// encoder loads even with `paged_adapter` on. Text-only chat
-    /// entry points reject image-bearing turns at runtime; this test
-    /// verifies only the load-time wiring.
+    /// VLM checkpoints are accepted under paged dispatch. The media plan is
+    /// not executable with only an encoder; it becomes available only after
+    /// the processor completes the paged vision stack.
     #[test]
     #[ignore = "Allocates Metal LayerKVPool; gate on MLX_TEST_PAGED=1"]
     fn test_vlm_loads_when_paged_enabled() {
@@ -10745,12 +10871,20 @@ mod paged_construction_tests {
         assert!(
             result.is_ok(),
             "set_vision_encoder must succeed when paged_adapter is Some so VLM \
-             checkpoints can run text-only paged inference; got {result:?}"
+             checkpoints can complete their paged media stack; got {result:?}"
         );
         assert!(
             inner.vision_encoder.is_some(),
             "vision_encoder field must be populated after a successful set"
         );
+        let incomplete = inner.execution_plan().media;
+        assert_eq!(incomplete.available, MediaCapabilities::NONE);
+        assert_eq!(incomplete.backend_validated, MediaCapabilities::IMAGES);
+
+        inner.set_image_processor(Qwen35VLImageProcessor::new(None));
+        let complete = inner.execution_plan().media;
+        assert_eq!(complete.available, MediaCapabilities::IMAGES);
+        assert_eq!(complete.backend_validated, MediaCapabilities::NONE);
     }
 
     /// Dense Qwen3.5 paged-prefill chunking state test. This drives the

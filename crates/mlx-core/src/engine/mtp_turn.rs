@@ -1,7 +1,7 @@
 //! Engine-owned MTP (Multi-Token Prediction) propose/verify whole-turn
 //! path — the MTP analog of [`crate::engine::paged_turn`]. Families opt in
 //! via [`crate::engine::backend::MtpBackend`]; their
-//! `ChatBackend::mtp_turn` body becomes `Some(run_mtp_turn(self, args))`.
+//! `ChatBackend::run_speculative_turn` delegates to `run_mtp_turn`.
 //!
 //! SCAFFOLD STEP: the relocated `decode_loop_mtp!` outer body
 //! (`run_mtp_turn`) and the relocated `run_mtp_cycle_inner` (`run_mtp_cycle`)

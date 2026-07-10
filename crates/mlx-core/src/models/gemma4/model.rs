@@ -14,6 +14,10 @@ use crate::engine::backend::{
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
+use crate::engine::plan::{
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    SpeculativePlan,
+};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -383,14 +387,16 @@ pub(crate) struct Gemma4Inner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Content hash of the image set associated with the live cache. Used
     /// in Step 5c to detect mid-session image changes (which require a
-    /// full session restart). `None` when no session is active or the
-    /// session is text-only.
+    /// full session restart). Cleared after a successful warm text save; use
+    /// `media_session_context` for the media kinds still represented by live
+    /// KV across subsequent continuations.
     pub(crate) cached_image_key: Option<u64>,
     /// Content hash of the audio set associated with the live cache. Audio
     /// counterpart of `cached_image_key`: set after an audio prefill so a
     /// follow-up text delta is rejected (the continue path is text-only) and
-    /// a follow-up audio turn cold-restarts. `None` for text-only / image-only
-    /// sessions.
+    /// a follow-up audio turn cold-restarts. Like the image key, this is
+    /// cleared after a warm text save even though the live media KV remains;
+    /// `media_session_context` is the persistent source of truth.
     pub(crate) cached_audio_key: Option<u64>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
     ///
@@ -429,6 +435,17 @@ pub(crate) struct Gemma4Inner {
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
+    /// Media kinds causally represented by the current session's live/persisted
+    /// prefix. Unlike the content-hash keys, this survives every successful
+    /// warm text continuation because those turns extend — rather than replace
+    /// — the media-derived KV. Cleared only when that session is reset or a
+    /// successful text-only turn replaces it.
+    media_session_context: MediaCapabilities,
+    /// Context handed to the currently executing generic paged text turn.
+    /// `run_paged_turn` snapshots `TurnPlan::context_media` here so
+    /// `save_paged_history` can distinguish a warm media continuation from a
+    /// fresh text replacement without widening the model-neutral trait.
+    paged_text_turn_context: MediaCapabilities,
     /// True only while a media (audio / non-unified image) turn left its
     /// global paged KV live AND a sliding history checkpoint remembered at the
     /// full kept-live prefix, so a follow-up text delta can warm-continue on
@@ -436,9 +453,37 @@ pub(crate) struct Gemma4Inner {
     /// `finalize_vision_turn_media_state` on the continuable branch; reset to
     /// `false` at every non-continuable point (`clear_reuse_state`, both vision
     /// prefill-start blocks, the non-continuable finalize). When `false`, the
-    /// `text_delta_image_guard` rejects a media-session delta as today.
+    /// `text_delta_media_guard` rejects a media-session delta as today.
     media_session_continuable: bool,
     pub(crate) model_id: u64,
+}
+
+/// Describe Gemma's actually wired media paths separately from inputs that
+/// must enter the family backend only to preserve a specific compatibility
+/// error.
+const fn gemma4_media_plan(
+    image_components_loaded: bool,
+    audio_embedder_loaded: bool,
+    paged_adapter_loaded: bool,
+) -> MediaPlan {
+    let images_available = image_components_loaded && paged_adapter_loaded;
+    let audio_available = audio_embedder_loaded && paged_adapter_loaded;
+    MediaPlan::with_backend_validation(
+        MediaCapabilities {
+            images: images_available,
+            audio: audio_available,
+        },
+        MediaCapabilities {
+            // Image input was historically admitted unconditionally so the
+            // Gemma core could distinguish missing vision from missing paged
+            // execution. Keep that family-owned diagnostic.
+            images: true,
+            // Audio was historically admitted only when its embedder existed.
+            // With no paged adapter, the family core owns the compatibility
+            // error; with no embedder, the engine rejects it before render.
+            audio: audio_embedder_loaded,
+        },
+    )
 }
 
 /// Draft-model variant loaded alongside the target for speculative decoding
@@ -1098,6 +1143,8 @@ impl Gemma4Inner {
             sliding_prefix_checkpoints: VecDeque::new(),
             sliding_prompt_boundary_checkpoint: None,
             sliding_last_history_checkpoint: None,
+            media_session_context: MediaCapabilities::NONE,
+            paged_text_turn_context: MediaCapabilities::NONE,
             media_session_continuable: false,
             model_id,
         })
@@ -1182,18 +1229,35 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    /// Clear cached token history and image key. Called from both
+    /// Clear cached token history and media identity/context. Called from both
     /// `init_caches_sync` and `reset_caches_sync`.
     fn clear_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
         self.sliding_prompt_boundary_checkpoint = None;
         self.sliding_last_history_checkpoint = None;
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
         self.media_session_continuable = false;
+    }
+
+    /// Publish the raw media identity and the persistent causal context for a
+    /// successfully finalized multimodal turn.
+    fn publish_media_session_context(
+        &mut self,
+        new_image_key: Option<u64>,
+        new_audio_key: Option<u64>,
+    ) {
+        self.cached_image_key = new_image_key;
+        self.cached_audio_key = new_audio_key;
+        self.media_session_context = MediaCapabilities {
+            images: new_image_key.is_some(),
+            audio: new_audio_key.is_some(),
+        };
     }
 
     fn find_gemma4_sliding_history_checkpoint(
@@ -1781,7 +1845,7 @@ impl Gemma4Inner {
     ///
     /// The engine session core owns message-side image extraction
     /// (`engine::session::extract_images_from_messages`) and prompt
-    /// rendering; the raw bytes arrive via [`WholeTurnArgs::images`].
+    /// rendering; the raw bytes arrive via [`WholeTurnArgs::media`].
     /// The "no vision support" rejection surfaces from INSIDE the vision
     /// turn (after render).
     fn prepare_vision_tokens(
@@ -2060,7 +2124,7 @@ impl Gemma4Inner {
     ///   sliding-history checkpoint actually `stored`, AND the adapter is
     ///   `live_for_continue`): the global paged KV is kept live (full blocks
     ///   registered for content-addressed reuse) and the marker is set so
-    ///   `text_delta_image_guard` lets the next text delta through. On that delta
+    ///   `text_delta_media_guard` lets the next text delta through. On that delta
     ///   the global prefix is reused IN-PLACE (`continue_turn` keeps the block
     ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
     ///   re-walked) and the sliding caches resolve to `state="live"`
@@ -2156,8 +2220,7 @@ impl Gemma4Inner {
                 // Publish history FIRST: the checkpoint reads its length, and
                 // the next delta's prefix restore matches against it.
                 self.cached_token_history = full_history;
-                self.cached_image_key = new_image_key;
-                self.cached_audio_key = new_audio_key;
+                self.publish_media_session_context(new_image_key, new_audio_key);
                 let history_for_ckpt = self.cached_token_history.clone();
                 let stored = self
                     .remember_gemma4_sliding_history_checkpoint(&history_for_ckpt)
@@ -2196,14 +2259,13 @@ impl Gemma4Inner {
         }
 
         // Non-continuable: release the global KV but keep history + media keys so
-        // a follow-up text delta reaches `text_delta_image_guard`, which rejects
+        // a follow-up text delta reaches `text_delta_media_guard`, which rejects
         // it (marker is false). Matches the vision core's prior behavior.
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
         self.cached_token_history = full_history;
-        self.cached_image_key = new_image_key;
-        self.cached_audio_key = new_audio_key;
+        self.publish_media_session_context(new_image_key, new_audio_key);
         self.media_session_continuable = false;
         Ok(())
     }
@@ -2285,6 +2347,8 @@ impl Gemma4Inner {
         // any prior kept-live request and can then fail (block exhaustion) via
         // `?` — a stale `true` would wrongly admit a later text delta.
         self.media_session_continuable = false;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_sync_core: paged_adapter is None")
@@ -2517,6 +2581,8 @@ impl Gemma4Inner {
         // any prior kept-live request and can then fail (block exhaustion) via
         // `?` — a stale `true` would wrongly admit a later text delta.
         self.media_session_continuable = false;
+        self.media_session_context = MediaCapabilities::NONE;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
         {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("vision_paged_turn_stream_core: paged_adapter is None")
@@ -4583,10 +4649,10 @@ impl Gemma4Inner {
         Ok(ids[0])
     }
 
-    /// Vision whole-turn dispatch for the engine's
-    /// [`ChatBackend::vision_turn`] probe. Only fresh turns carry
-    /// images (the engine's delta inputs are text-only by construction
-    /// and the delta image guard rejects image-holding sessions), so
+    /// Multimodal whole-turn dispatch for the engine's
+    /// [`ChatBackend::run_multimodal_turn`] handler. Only fresh turns carry
+    /// media (the engine's delta inputs are text-only by construction
+    /// and the delta media guard rejects media-holding sessions), so
     /// the paged cores cold-start unconditionally —
     /// `verify_cache_prefix(.., has_images = true)` forces a miss.
     ///
@@ -4594,7 +4660,7 @@ impl Gemma4Inner {
     /// no paged adapter (explicit `use_block_paged_cache: false`, a
     /// non-Metal build, or paged init failure) has no vision path and
     /// returns an error instead of silently falling back.
-    fn vision_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    fn multimodal_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if self.paged_adapter.is_none() {
             return Err(Error::from_reason(
                 "gemma4 image turns require the block-paged KV backend; the model was loaded \
@@ -4607,8 +4673,8 @@ impl Gemma4Inner {
             (Some(sink), Some(cancelled)) => {
                 self.vision_paged_turn_stream_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4620,8 +4686,8 @@ impl Gemma4Inner {
             _ => {
                 let result = self.vision_paged_turn_sync_core(
                     args.tokens,
-                    args.images,
-                    args.audio,
+                    args.media.images,
+                    args.media.audio,
                     &tokenizer,
                     args.config,
                     args.eos_id,
@@ -4909,6 +4975,10 @@ impl PagedBackend for Gemma4Inner {
         keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        // `run_paged_turn` snapshots the request planner's context here for
+        // the duration of the executor. Empty means this text turn is a fresh
+        // replacement; non-empty means it extended a media-derived session.
+        let continued_media_context = self.paged_text_turn_context;
         // Save token history ONLY — the adapter's pool owns the K/V.
         // `keep_all` is the flat rule (engine: `finish_reason ==
         // "length"`); when it is false the terminal stop token is dropped
@@ -4925,12 +4995,23 @@ impl PagedBackend for Gemma4Inner {
             };
             full_history.extend_from_slice(history_tokens);
             self.cached_token_history = full_history;
-            // A text save is text-only, so drop any stale media key — mirrors
-            // the flat `save_cache_state` fresh-turn clear. On a warm reuse the
-            // delta image guard already kept these `None`, so this is a no-op;
-            // on a fresh start it clears a key a prior media turn left behind.
+            // A text save carries no new raw media identity, so drop the hash
+            // keys. A warm continuation retains its causal media kinds in
+            // `media_session_context`; a fresh start clears that context below.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            if continued_media_context.is_empty() {
+                // A successful fresh text turn replaced any previous media
+                // session. Its saved/live KV is now genuinely text-only.
+                self.media_session_context = MediaCapabilities::NONE;
+                self.media_session_continuable = false;
+            } else {
+                // A warm text delta extended the same live media prefix. The
+                // raw hash keys are turn-local and intentionally cleared, but
+                // the causal media context must survive every continuation.
+                debug_assert!(self.media_session_continuable);
+                self.media_session_context = continued_media_context;
+            }
             // Sliding-window warm-continue checkpoint keyed on the freshly
             // set history (post-reconcile `request_tokens()` == the trimmed
             // history). Fallible: a checkpoint/eval error aborts the turn so
@@ -4950,6 +5031,8 @@ impl PagedBackend for Gemma4Inner {
             // force an "audio state" restart on the text-only session.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
         Ok(())
     }
@@ -5209,9 +5292,9 @@ impl ChatBackend for Gemma4Inner {
         Ok(())
     }
 
-    /// Prefix-reuse check. The engine routes every image-bearing turn
-    /// through `vision_turn` BEFORE this check, so only the session-side
-    /// image gate (`cached_image_key.is_some()` → miss) is needed here;
+    /// Prefix-reuse check. The engine routes every media-bearing turn
+    /// through the multimodal executor BEFORE this check, so only the
+    /// session-side image gate (`cached_image_key.is_some()` → miss) is needed here;
     /// there is no `has_images` parameter.
     ///
     /// All-or-nothing: returns `0` or `cached.len()` (exact-match falls
@@ -5279,6 +5362,8 @@ impl ChatBackend for Gemma4Inner {
             // structurally `None`.
             self.cached_image_key = None;
             self.cached_audio_key = None;
+            self.media_session_context = MediaCapabilities::NONE;
+            self.media_session_continuable = false;
         }
     }
 
@@ -5406,31 +5491,29 @@ impl ChatBackend for Gemma4Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
-    }
-
-    /// UNCONDITIONALLY `true` — even for checkpoints without a vision
-    /// tower. Image-bearing messages are accepted on every entry point and
-    /// surface the exact "Images provided but model has no vision support
-    /// (no vision_config in config.json)" error from INSIDE the turn (after
-    /// template rendering); returning `false` here would replace that with
-    /// the engine's typed pre-render restart-prefix error. The error
-    /// surfaces from inside `vision_turn` instead (see
-    /// `prepare_vision_tokens`).
-    fn supports_images(&self) -> bool {
-        true
-    }
-
-    /// Audio support is gated on the unified `embed_audio` projection being
-    /// built at load time (`config.has_audio`). Unlike `supports_images`
-    /// (which is unconditionally `true` so the "no vision support" error
-    /// surfaces from inside the turn), audio is rejected at the pre-render
-    /// guard for non-audio checkpoints: there is no audio entry inside the
-    /// turn to surface a clearer message, and the engine's typed restart
-    /// prefix is the correct contract.
-    fn supports_audio(&self) -> bool {
-        self.embed_audio.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        let paged_available = self.paged_adapter.is_some();
+        let image_components_loaded = (self.vision_tower.is_some()
+            || self.unified_vision_embedder.is_some())
+            && self.embed_vision.is_some()
+            && self.image_processor.is_some();
+        let audio_embedder_loaded = self.embed_audio.is_some();
+        ExecutionPlan {
+            media: gemma4_media_plan(
+                image_components_loaded,
+                audio_embedder_loaded,
+                paged_available,
+            ),
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: self.has_draft().then_some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: false,
+            }),
+        }
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
@@ -5458,14 +5541,14 @@ impl ChatBackend for Gemma4Inner {
         Box::new(Gemma4Emitter::new())
     }
 
-    /// REJECT text deltas on image-holding sessions despite
-    /// `supports_images() == true`: gemma4's prefix reuse is text-only, so
+    /// REJECT text deltas on media-holding sessions despite the declared
+    /// image capability: gemma4's prefix reuse is text-only, so
     /// a delta on top of an image session would prefill on caches whose
     /// positions include expanded image tokens the history bookkeeping
     /// does not model. The message has NO space after the prefix:
     /// `"{PREFIX}{entry_fn} is text-only; session currently holds image
     /// state"`.
-    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
+    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
         // Warm-continue: a continuable media turn (audio / non-unified image)
         // kept its global paged KV live + a sliding history checkpoint at the
         // full prefix, so a text delta restores causally on the live media KV.
@@ -5492,10 +5575,11 @@ impl ChatBackend for Gemma4Inner {
         // must cold-restart, not warm-continue against a released request.
         // A warm text delta clears `cached_image_key` but leaves the marker
         // armed, so the key checks below would silently fall through to `None`;
-        // gate on the marker (the true media-held signal) and emit the audio /
-        // image restart message that matches whichever media key still remains.
+        // gate on the marker (the true media-held signal) and use the persistent
+        // media context to preserve the correct image/audio diagnostic across
+        // repeated continuations.
         if self.media_session_continuable {
-            let media_state = if self.cached_audio_key.is_some() {
+            let media_state = if self.session_media().audio {
                 "audio"
             } else {
                 "image"
@@ -5532,39 +5616,45 @@ impl ChatBackend for Gemma4Inner {
         !self.cached_token_history.is_empty() && self.caches.is_some()
     }
 
-    fn session_holds_images(&self) -> bool {
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // Keys cover a just-finalized media turn and direct/transitional test
+        // states. `media_session_context` remains authoritative after warm
+        // text saves clear those keys while preserving the same live media KV.
+        self.media_session_context.union(MediaCapabilities {
+            images: self.cached_image_key.is_some(),
+            audio: self.cached_audio_key.is_some(),
+        })
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // Gated on `has_paged_adapter()`; with the adapter live EVERY
-        // text turn (fresh + delta, sync + streaming) takes the generic
-        // paged engine, which drives the adapter lifecycle via
-        // [`PagedBackend`] and reuses the shared `run_decode_loop`.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // The execution plan admits every text turn shape (fresh + delta,
+        // sync + streaming) when the adapter is loaded. The generic paged
+        // engine drives the lifecycle via [`PagedBackend`].
+        debug_assert!(args.plan.use_paged_attention);
+        debug_assert!(self.paged_adapter.is_some());
+        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
+        debug_assert!(self.paged_text_turn_context.is_empty());
+        self.paged_text_turn_context = args.plan.context_media;
+        let result = crate::engine::paged_turn::run_paged_turn(self, args);
+        self.paged_text_turn_context = MediaCapabilities::NONE;
+        result
     }
 
     /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
-    /// variant). Dispatches only when the request opted in (`enableMtp`), a
-    /// draft model is loaded, the flat KV path is active (no paged adapter
-    /// — enforced at load, re-checked here defensively), and the turn is
-    /// text-only (image/audio turns were already routed to `vision_turn`
-    /// by the session core; re-checked defensively). Everything else falls
-    /// through to the generic AR flow.
-    fn mtp_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        if !(args.params.enable_mtp
-            && self.has_draft()
-            && self.paged_adapter.is_none()
-            && args.images.is_empty()
-            && args.audio.is_empty())
-        {
-            return None;
-        }
-        Some(self.draft_chat_turn(args))
+    /// variant). The execution plan admits this handler only after request
+    /// opt-in, with a loaded draft, flat KV, and text-only input.
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(args.media.is_empty());
+        debug_assert!(matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ));
+        self.draft_chat_turn(args)
     }
 
-    fn vision_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        Some(self.vision_chat_turn(args))
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(!args.media.is_empty());
+        self.multimodal_chat_turn(args)
     }
 }
 
@@ -7320,6 +7410,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn gemma4_media_plan_separates_availability_from_backend_validation() {
+        let text_only_flat = gemma4_media_plan(false, false, false);
+        assert_eq!(text_only_flat.available, MediaCapabilities::NONE);
+        assert_eq!(text_only_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let image_flat = gemma4_media_plan(true, false, false);
+        assert_eq!(image_flat.available, MediaCapabilities::NONE);
+        assert_eq!(image_flat.backend_validated, MediaCapabilities::IMAGES);
+
+        let audio_flat = gemma4_media_plan(false, true, false);
+        assert_eq!(audio_flat.available, MediaCapabilities::NONE);
+        assert_eq!(
+            audio_flat.backend_validated,
+            MediaCapabilities::IMAGES_AND_AUDIO
+        );
+
+        let media_paged = gemma4_media_plan(true, true, true);
+        assert_eq!(media_paged.available, MediaCapabilities::IMAGES_AND_AUDIO);
+        assert_eq!(media_paged.backend_validated, MediaCapabilities::NONE);
+
+        let missing_image_components_paged = gemma4_media_plan(false, true, true);
+        assert_eq!(
+            missing_image_components_paged.available,
+            MediaCapabilities {
+                images: false,
+                audio: true,
+            }
+        );
+        assert_eq!(
+            missing_image_components_paged.backend_validated,
+            MediaCapabilities::IMAGES
+        );
+    }
+
     /// Pins the composition order `prepare_multimodal_tokens` relies on: on the
     /// manual no-placeholder fallback (tokenizer without a chat template),
     /// audio expansion runs FIRST and image expansion runs LAST, so the image
@@ -8194,7 +8319,7 @@ mod tests {
         inner.media_session_continuable = false;
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "clean session must not reject a text delta"
         );
@@ -8205,7 +8330,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = false;
         let image_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable image turn must reject");
         assert!(
             image_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -8222,7 +8347,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = false;
         let audio_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("text delta after non-continuable audio turn must reject");
         assert!(
             audio_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -8241,7 +8366,7 @@ mod tests {
         inner.cached_audio_key = Some(7);
         inner.media_session_continuable = true;
         let audio_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable audio session with no live request must REJECT");
         assert!(
             audio_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -8259,7 +8384,7 @@ mod tests {
         inner.cached_audio_key = None;
         inner.media_session_continuable = true;
         let image_not_live_reject = inner
-            .text_delta_image_guard("chat_session_continue")
+            .text_delta_media_guard("chat_session_continue")
             .expect("continuable image session with no live request must REJECT");
         assert!(
             image_not_live_reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
@@ -8277,7 +8402,7 @@ mod tests {
     /// must clear `cached_audio_key`, exactly as the flat `save_cache_state`
     /// does on a fresh turn. Without that clear, a text-only paged start over a
     /// reused model whose prior turn was audio would leave `cached_audio_key`
-    /// stale, and the next text delta's `text_delta_image_guard` would wrongly
+    /// stale, and the next text delta's `text_delta_media_guard` would wrongly
     /// force an "audio state" restart on the text-only session. This pins the
     /// fix: pre-fix the post-save key would stay `Some` and the guard would
     /// return the audio-state restart string, failing both asserts below.
@@ -8322,10 +8447,107 @@ mod tests {
         // session. Pre-fix this would be `Some("…holds audio state")`.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "after a text-only paged save the guard must not force an audio restart"
         );
+    }
+
+    /// A warm text save clears the raw image/audio hash keys, but it extends
+    /// the same live media-derived KV. The exact media kinds therefore remain
+    /// visible to the next delta planner across any number of continuations.
+    /// This exercises image-only, audio-only, and combined contexts without a
+    /// real paged adapter; the no-adapter guard also proves the preserved
+    /// context retains the existing modality-specific restart wording.
+    #[test]
+    fn test_media_context_survives_repeated_warm_text_saves() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        let cases = [
+            (MediaCapabilities::IMAGES, Some(11), None, "image state"),
+            (MediaCapabilities::AUDIO, None, Some(22), "audio state"),
+            (
+                MediaCapabilities::IMAGES_AND_AUDIO,
+                Some(33),
+                Some(44),
+                "audio state",
+            ),
+        ];
+
+        for (context, image_key, audio_key, expected_state) in cases {
+            inner.clear_reuse_state();
+            inner.publish_media_session_context(image_key, audio_key);
+            inner.media_session_continuable = true;
+            assert_eq!(inner.session_media(), context);
+
+            for turn in 0..2u32 {
+                // Mirrors `run_paged_turn` handing the planner's prior context
+                // to `save_paged_history` for a successful warm text delta.
+                inner.paged_text_turn_context = inner.session_media();
+                inner
+                    .save_paged_history(&[10, 11, turn], &[20, 21], false, true)
+                    .expect("warm text paged save must succeed");
+
+                assert!(inner.cached_image_key.is_none());
+                assert!(inner.cached_audio_key.is_none());
+                assert_eq!(
+                    inner.session_media(),
+                    context,
+                    "turn {turn} must preserve the media-derived context"
+                );
+                assert!(inner.media_session_continuable);
+
+                // This fixture has no adapter, so the guard must reject. Its
+                // unchanged error format should still name the true context
+                // after the raw keys have been cleared.
+                let reject = inner
+                    .text_delta_media_guard("chat_session_continue")
+                    .expect("not-live media context must request a restart");
+                assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
+                assert!(reject.contains(expected_state), "got: {reject}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fresh_text_save_replaces_persistent_media_context() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = match super::Gemma4Inner::new(cfg) {
+            Ok(i) => i,
+            Err(err) => {
+                let msg = err.reason.to_string();
+                if msg.contains("No Metal device found") {
+                    eprintln!("skipping (no Metal device): {msg}");
+                    return;
+                }
+                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            }
+        };
+
+        inner.publish_media_session_context(Some(11), Some(22));
+        inner.media_session_continuable = true;
+        // Fresh plans carry no prior context. A successful text save therefore
+        // replaces, rather than extends, the old media session.
+        inner.paged_text_turn_context = MediaCapabilities::NONE;
+        inner
+            .save_paged_history(&[1, 2, 3], &[4, 5], false, true)
+            .expect("fresh text paged save must succeed");
+
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert!(!inner.media_session_continuable);
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
     }
 
     /// Image/audio symmetry in `verify_cache_prefix`: a non-continuable session
@@ -8419,18 +8641,28 @@ mod tests {
             "marker must default to false on construction"
         );
 
-        // clear_reuse_state resets the marker.
+        // clear_reuse_state resets the marker and both persistent/transient
+        // media context sources.
+        inner.publish_media_session_context(Some(7), Some(8));
+        inner.paged_text_turn_context = MediaCapabilities::IMAGES_AND_AUDIO;
         inner.media_session_continuable = true;
         inner.clear_reuse_state();
         assert!(
             !inner.media_session_continuable,
             "clear_reuse_state must reset the continuable marker"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert_eq!(
+            inner.paged_text_turn_context,
+            MediaCapabilities::NONE,
+            "clear_reuse_state must clear transient turn context"
+        );
 
         // reset_caches_sync (which calls clear_reuse_state) resets the marker
         // AND nulls caches → has_live_session() false → a delta cannot continue.
+        inner.publish_media_session_context(None, Some(9));
+        inner.paged_text_turn_context = MediaCapabilities::AUDIO;
         inner.media_session_continuable = true;
-        inner.cached_audio_key = Some(9);
         inner
             .reset_caches_sync()
             .expect("reset_caches_sync must succeed");
@@ -8442,11 +8674,12 @@ mod tests {
             inner.cached_audio_key.is_none(),
             "reset_caches_sync must clear the media key"
         );
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
         // After reset, even toggling the marker can't allow a delta: the
         // session is dead (no live caches), and the reset already cleared it.
         assert!(
             inner
-                .text_delta_image_guard("chat_session_continue")
+                .text_delta_media_guard("chat_session_continue")
                 .is_none(),
             "post-reset session holds no media key → guard returns None (no media to reject)"
         );

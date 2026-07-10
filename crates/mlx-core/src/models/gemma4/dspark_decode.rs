@@ -2,7 +2,7 @@
 //! [`DsparkStepper`]/[`DsparkBackend`] implementation the engine-owned
 //! [`crate::engine::dspark_turn::run_dspark_turn`] loop drives, plus the
 //! variant-generic whole-turn core (`draft_chat_turn`) behind gemma4's
-//! `ChatBackend::mtp_turn` override.
+//! `ChatBackend::run_speculative_turn` executor.
 //!
 //! Split of responsibilities:
 //!   * the DSpark DRAFT model (5-layer cross-attending transformer, markov
@@ -390,7 +390,7 @@ impl DsparkBackend for Gemma4Inner {
 
 impl Gemma4Inner {
     /// Draft whole-turn core (both [`Gemma4Draft`] variants) behind
-    /// gemma4's `ChatBackend::mtp_turn` override — the draft analog of the
+    /// gemma4's `ChatBackend::run_speculative_turn` executor — the draft analog of the
     /// engine's generic `chat_turn_core` tail, sync AND streaming through
     /// the same body (`args.sink` presence selects the mode, mirroring
     /// `vision_chat_turn` / the MTP whole-turn cores).
@@ -411,7 +411,7 @@ impl Gemma4Inner {
         let tokenizer = args.tokenizer.clone();
         let eos_id = args.eos_id;
         let thinking = args.thinking;
-        let is_delta = args.is_delta;
+        let is_delta = args.plan.is_delta;
         let tokens: Vec<u32> = args.tokens.to_vec();
         let is_streaming = args.sink.is_some();
 
@@ -929,6 +929,9 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+    };
     use crate::engine::types::ChatConfig;
     use crate::models::gemma4::assistant::{AssistantConfig, AssistantDraftModel};
     use crate::models::gemma4::config::Gemma4Config;
@@ -1315,11 +1318,19 @@ pub(crate) mod tests {
             config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
             sink: None,
             cancelled: None,
-            images: &[],
-            audio: &[],
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
         };
         match inner.draft_chat_turn(&mut args)? {
             TurnOutput::Complete(r) => Ok(*r),
@@ -1484,11 +1495,19 @@ pub(crate) mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
             sink: Some(&sink),
             cancelled: Some(&cancelled),
-            images: &[],
-            audio: &[],
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
         };
         let out = inner
             .draft_chat_turn(&mut args)

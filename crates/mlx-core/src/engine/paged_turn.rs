@@ -1,8 +1,7 @@
 //! Generic PAGED whole-turn engine — the paged analog of the FLAT tail
 //! in [`crate::engine::session`] `chat_turn_core`. Families opt in via
 //! [`crate::engine::backend::PagedBackend`]; their
-//! `ChatBackend::paged_turn` body becomes
-//! `Some(run_paged_turn(self, args))`.
+//! `ChatBackend::run_paged_turn` delegates here.
 
 use std::time::Instant;
 
@@ -19,8 +18,8 @@ use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{DeviceType, Stream};
 
 /// Drive one PAGED whole turn through the generic engine. Returns the
-/// same `Result<TurnOutput>` shape the `ChatBackend::paged_turn` probe
-/// expects; honors the streaming Complete-vs-Streamed contract
+/// same `Result<TurnOutput>` shape the `ChatBackend::run_paged_turn`
+/// executor expects; honors the streaming Complete-vs-Streamed contract
 /// ([`crate::engine::backend::TurnOutput`]).
 ///
 /// MIRRORS the FLAT `chat_turn_core` tail (prefill → first-token sample
@@ -37,7 +36,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let report_perf = p.report_performance;
     let max_new_tokens = p.max_new_tokens;
     let thinking = args.thinking;
-    let is_delta = args.is_delta;
+    let is_delta = args.plan.is_delta;
     let is_streaming = args.sink.is_some();
     let think_end_id = tokenizer.think_end_id();
     let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
@@ -451,10 +450,28 @@ mod tests {
         ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix,
         PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TurnSetup, WholeTurnArgs,
     };
+    use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::profiling::PerformanceMetrics;
     use crate::stream::Stream;
     use crate::tokenizer::Qwen3Tokenizer;
+
+    fn paged_test_plan() -> TurnPlan {
+        TurnPlan {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            use_paged_attention: true,
+            decoder: DecoderPlan::Autoregressive,
+        }
+    }
+
+    fn no_media() -> MediaInputs<'static> {
+        MediaInputs {
+            images: &[],
+            audio: &[],
+        }
+    }
 
     /// Ordered call-sequence ledger, shared between the backend and its
     /// stepper via `Arc`. Each entry is a static label; the test asserts
@@ -930,11 +947,10 @@ mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: paged_test_plan(),
             sink: None,
             cancelled: None,
-            images: &[],
-            audio: &[],
+            media: no_media(),
         };
 
         let out = run_paged_turn(&mut backend, &mut args)
@@ -1081,11 +1097,10 @@ mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: paged_test_plan(),
             sink: Some(&sink),
             cancelled: Some(&cancelled),
-            images: &[],
-            audio: &[],
+            media: no_media(),
         };
 
         let out = run_paged_turn(&mut backend, &mut args)
@@ -1213,11 +1228,10 @@ mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: paged_test_plan(),
             sink: None,
             cancelled: None,
-            images: &[],
-            audio: &[],
+            media: no_media(),
         };
 
         let out = run_paged_turn(&mut backend, &mut args);
@@ -1477,11 +1491,10 @@ mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: paged_test_plan(),
             sink: None,
             cancelled: None,
-            images: &[],
-            audio: &[],
+            media: no_media(),
         };
 
         let out = run_paged_turn(&mut backend, &mut args)

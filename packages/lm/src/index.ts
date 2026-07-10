@@ -68,7 +68,7 @@ export type { ChatStreamFinal, ChatStreamEvent } from './stream.js';
 // subclass from its native class; the VLM package reuses it to build
 // `QianfanOCRModel`.
 export { _runChatStream, makeStreamingModel } from './stream.js';
-export type { StreamingModel } from './stream.js';
+export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance, StreamingModel } from './stream.js';
 // Cross-model chat session wrapper (see chat-session.ts for design notes).
 // `SessionCapableModel` is the structural interface matched by every
 // generative model wrapper and used as the upper-bound for
@@ -91,12 +91,11 @@ export {
   loadModel,
   loadSession,
   detectModelType,
+  type LoadableModel,
+  type TrainableModel,
   type ModelType,
   type LoadModelOptions,
 } from './models/model-loader.js';
-
-// Interfaces
-export type { TrainableModel, LoadableModel } from './interfaces.js';
 
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 

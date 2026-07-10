@@ -297,8 +297,11 @@ export async function* _runChatStream(
  * instance type so `InstanceType<NativeStreamingCtor>` resolves to the
  * full native instance surface (`generate`, `saveModel`,
  * `numParameters`, `hasMtpWeights`, …) — see {@link NativeStreamingCtor}.
+ *
+ * @internal Native callback streaming surface consumed by
+ * {@link makeStreamingModel}.
  */
-interface NativeStreamingInstance {
+export interface NativeStreamingInstance {
   chatStreamSessionStart: (...args: never[]) => Promise<ChatStreamHandle>;
   chatStreamSessionContinue: (...args: never[]) => Promise<ChatStreamHandle>;
   chatStreamSessionContinueTool: (...args: never[]) => Promise<ChatStreamHandle>;
@@ -342,9 +345,9 @@ interface StreamingModelOptions {
   /**
    * Whether to attach an `applyChatTemplate` method. Defaults to
    * `recordModelPath` because the method can only work when a path was
-   * recorded. Qwen3 (first-gen) records its path but exposes no
-   * `applyChatTemplate`; pass `applyTemplate: false` to suppress the
-   * method while still recording the path.
+   * recorded. Qwen3 (first-gen) records its path but keeps its native
+   * tokenizer-backed implementation; pass `applyTemplate: false` to suppress
+   * only the factory's path-backed replacement.
    */
   applyTemplate?: boolean;
 }
@@ -370,18 +373,30 @@ type ResolvedApplyTemplate<O extends StreamingModelOptions> = O extends {
   ? O['applyTemplate']
   : O['recordModelPath'];
 
+/** @internal Method names whose callback ABI is replaced by the generator wrapper. */
+export type NativeStreamingMethod = keyof NativeStreamingInstance;
+
+type StreamingReplacementMethod<O extends StreamingModelOptions> =
+  | NativeStreamingMethod
+  | (ResolvedApplyTemplate<O> extends true ? 'applyChatTemplate' : never);
+
 /**
- * Instance surface of a generated streaming wrapper: the native instance (minus
- * its native callback chat methods) plus the `SessionCapableModel` generator
- * overrides. When the wrapper installs `applyChatTemplate` (the templating
- * variants — `applyTemplate` resolves truthy), it is re-added as a REQUIRED
- * member instead of the optional one `SessionCapableModel` declares, so
- * `model.applyChatTemplate(...)` is not a possibly-undefined call after
- * `load()` in strict TS.
+ * Instance surface of a generated streaming wrapper. Only methods replaced at
+ * runtime are removed from the native instance: the three callback streaming
+ * methods, plus `applyChatTemplate` when the wrapper installs its path-backed
+ * implementation. Intersecting the remaining native surface with
+ * `SessionCapableModel` preserves required native capabilities such as
+ * `hasBlockPagedCache()` while exposing the generator streaming signatures.
+ *
+ * When `applyTemplate` resolves false, an existing native implementation stays
+ * intact (notably Qwen3's required tokenizer-backed method), while models that
+ * never had one (QianfanOCR) retain the optional structural contract.
+ *
+ * @internal Concrete instance type returned by {@link makeStreamingModel}.
  */
-type StreamingInstance<C extends NativeStreamingCtor, O extends StreamingModelOptions> = Omit<
+export type StreamingInstance<C extends NativeStreamingCtor, O extends StreamingModelOptions> = Omit<
   InstanceType<C>,
-  keyof SessionCapableModel
+  StreamingReplacementMethod<O>
 > &
   SessionCapableModel &
   (ResolvedApplyTemplate<O> extends true ? Required<Pick<SessionCapableModel, 'applyChatTemplate'>> : object);
@@ -397,8 +412,8 @@ type StreamingInstance<C extends NativeStreamingCtor, O extends StreamingModelOp
  *     `config ?? null`, `images`, `isError ?? null`, and the `signal`),
  *   - overrides `static load` to re-prototype the native instance onto
  *     the concrete subclass (`this`) and optionally record the path,
- *   - exposes `applyChatTemplate` when `opts.applyTemplate` (defaulting
- *     to `opts.recordModelPath`).
+ *   - installs a path-backed `applyChatTemplate` when `opts.applyTemplate`
+ *     (defaulting to `opts.recordModelPath`).
  *
  * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) builds its
  * `QianfanOCRModel` from the same factory. Not part of the public API.
@@ -408,13 +423,10 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
   opts: O,
 ): {
   // Preserve the native instance surface (`generate`, `batchGenerate`,
-  // `saveModel`, `numParameters`, `hasMtpWeights`, …) by re-deriving it
-  // from `InstanceType<C>`, while letting the `SessionCapableModel`
-  // streaming overrides (AsyncGenerator chat methods + `resetCaches`,
-  // etc.) win. `Omit<…, keyof SessionCapableModel>` drops the native
-  // callback-style chat methods so the re-added `SessionCapableModel`
-  // generator signatures take precedence. `applyChatTemplate` is required on
-  // templating variants (see `StreamingInstance`).
+  // `saveModel`, `numParameters`, required cache-capability getters, …) while
+  // replacing only the three callback streaming methods with AsyncGenerators.
+  // A path-backed `applyChatTemplate` is also replaced/re-required only on
+  // variants that install it (see `StreamingInstance`).
   //
   // `ConstructorParameters<C>` (not `never[]`) keeps each native config
   // constructor — e.g. `new Gemma4Model(config)` / `new QianfanOCRModel(config)`
@@ -560,8 +572,8 @@ export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, { recordM
  * Qwen3 (first-gen, text-only) model.
  *
  * Records its model path (so prototype-set + path-recording match the
- * other families) but exposes NO `applyChatTemplate` —
- * `applyTemplate: false` suppresses that method.
+ * other families) but does not install the factory's path-backed
+ * `applyChatTemplate`; it retains the native tokenizer-backed method.
  */
 export class Qwen3Model extends makeStreamingModel(Qwen3ModelNative, {
   recordModelPath: true,
@@ -590,3 +602,20 @@ function _assertSessionCapable(): void {
   void _qwen3;
 }
 void _assertSessionCapable;
+
+type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<InstanceType<C>, NativeStreamingMethod>;
+
+/** Compile-time guard that the factory preserves every non-streaming native member. */
+function _assertPreservedNativeSurfaces(): void {
+  const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> = null as unknown as Qwen3Model;
+  const _qwen35: PreservedNativeSurface<typeof Qwen35ModelNative> = null as unknown as Qwen35Model;
+  const _moe: PreservedNativeSurface<typeof Qwen35MoeModelNative> = null as unknown as Qwen35MoeModel;
+  const _lfm2: PreservedNativeSurface<typeof Lfm2ModelNative> = null as unknown as Lfm2Model;
+  const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> = null as unknown as Gemma4Model;
+  void _qwen3;
+  void _qwen35;
+  void _moe;
+  void _lfm2;
+  void _gemma4;
+}
+void _assertPreservedNativeSurfaces;

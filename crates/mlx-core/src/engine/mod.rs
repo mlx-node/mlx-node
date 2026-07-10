@@ -19,6 +19,7 @@ pub(crate) mod paged_turn;
 pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;
+pub(crate) mod plan;
 pub(crate) mod session;
 pub mod types;
 pub(crate) mod vision;

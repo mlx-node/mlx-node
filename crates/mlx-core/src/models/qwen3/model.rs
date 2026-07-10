@@ -20,6 +20,7 @@ use crate::engine::backend::{
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
@@ -3301,8 +3302,14 @@ impl ChatBackend for Qwen3Inner {
         })
     }
 
-    fn has_paged_adapter(&self) -> bool {
-        self.paged_adapter.is_some()
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: None,
+        }
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
@@ -3316,8 +3323,8 @@ impl ChatBackend for Qwen3Inner {
         // Record the turn's streaming-ness for `begin_decode`'s relabel
         // (`TurnSetup` does not carry it). The session core calls this
         // hook exactly once per generic-flow turn, before
-        // `begin_decode`; paged turns return from the probe earlier and
-        // never consult either hook.
+        // `begin_decode`; paged turns return from the planned executor
+        // earlier and never consult either hook.
         self.turn_is_streaming.set(is_streaming);
         match (is_streaming, is_delta) {
             (true, false) => "qwen3_chat_stream",
@@ -3329,21 +3336,19 @@ impl ChatBackend for Qwen3Inner {
         }
     }
 
-    fn session_holds_images(&self) -> bool {
-        // Structurally always `None` for text-only qwen3; checked anyway
-        // so the default `text_delta_image_guard` keeps its defensive
-        // behavior.
-        self.cached_image_key.is_some()
+    fn session_media(&self) -> MediaCapabilities {
+        // Qwen3 has no path that can populate media state. Keep the model's
+        // media contract truthful even though the legacy cache struct retains
+        // an always-None image-key slot for layout symmetry.
+        MediaCapabilities::NONE
     }
 
-    fn paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        // The probe is gated on `has_paged_adapter()`; with the adapter
-        // configured EVERY turn (fresh + delta, sync + streaming) takes
-        // the generic paged engine. `run_paged_turn` drives the adapter
-        // lifecycle via [`PagedBackend`], reusing the shared
-        // `run_decode_loop`. The probe runs for delta streaming turns too,
-        // routed by the engine's session-core dispatch.
-        Some(crate::engine::paged_turn::run_paged_turn(self, args))
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        // `execution_plan` admits paged attention for every turn shape
+        // (fresh + delta, sync + streaming). The generic paged engine drives
+        // the adapter lifecycle via [`PagedBackend`] and reuses the shared
+        // `run_decode_loop`.
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 }
 

@@ -13,6 +13,7 @@ There are already some wild used inference implementations for your reference:
 ## Topic guides
 
 - [docs/architecture.md](docs/architecture.md) — Workspace layout, packages, dependency chain, build flow, adding native ops / TS utilities
+- [docs/inference-architecture.md](docs/inference-architecture.md) — Model registry, per-turn execution planning, media/paged/speculative composition, adding a model
 - [docs/models.md](docs/models.md) — Model implementations, ChatSession API, streaming, VLM, document pipelines
 - [docs/privacy-filter.md](docs/privacy-filter.md) — PII detection & redaction (openai/privacy-filter port)
 - [docs/training.md](docs/training.md) — GRPO, SFT, autograd, optimizers, `mlx-train` TUI, persistence

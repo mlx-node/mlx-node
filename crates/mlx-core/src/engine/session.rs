@@ -6,7 +6,7 @@
 //! ```text
 //! reuse_cache guard → tokenizer → resolve_params
 //!   → pre-render image guard → render_prompt
-//!   → vision_turn probe → paged_turn probe → mtp_turn probe
+//!   → resolve TurnPlan → optional multimodal/paged/speculative executor
 //!   → verify_cache_prefix → reset-or-delta split → prefill
 //!   → first-token sample (apply_all_penalties + sampling::sample)
 //!   → eval_caches → begin_decode → run_decode_loop → end_decode
@@ -33,6 +33,7 @@ use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::plan::{MediaCapabilities, MediaInputs, TurnPath, TurnPlan, TurnRequest};
 use crate::engine::types::{ChatConfig, ChatResult};
 use crate::stream::{DeviceType, Stream};
 use crate::tokenizer::ChatMessage;
@@ -370,29 +371,29 @@ fn delta_guards<B: ChatBackend>(
     // design (qwen3.5's sticky image-key contract — see
     // `save_cache_state_after_delta`). Gemma4 overrides to REJECT with
     // the typed restart prefix despite being image-capable.
-    if let Some(message) = backend.text_delta_image_guard(entry.fn_name()) {
+    if let Some(message) = backend.text_delta_media_guard(entry.fn_name()) {
         return Err(Error::from_reason(message));
     }
     Ok(())
 }
 
 /// Unwrap the core's sync-path result. `Ok(None)` means a whole-turn
-/// override returned [`TurnOutput::Streamed`] with no sink attached —
+/// executor returned [`TurnOutput::Streamed`] with no sink attached —
 /// a family-impl contract violation, surfaced as an error rather than
 /// a panic.
 fn expect_sync_result(out: Result<Option<ChatResult>>) -> Result<ChatResult> {
     out?.ok_or_else(|| {
         Error::from_reason(
-            "whole-turn override returned TurnOutput::Streamed on the sync (sink-less) path",
+            "specialized executor returned TurnOutput::Streamed on the sync (sink-less) path",
         )
     })
 }
 
-/// Map a whole-turn override's outcome into the core's return shape.
+/// Map a specialized executor's outcome into the core's return shape.
 ///
 /// `is_streaming` is the turn's sink presence. The streaming contract
-/// (documented on [`TurnOutput`] and the three whole-turn probes): a
-/// probe running with a sink attached MUST deliver every chunk —
+/// (documented on [`TurnOutput`] and the specialized executors): an
+/// executor running with a sink attached MUST deliver every chunk —
 /// including the terminal done-chunk — through the sink and return
 /// [`TurnOutput::Streamed`]. A `Complete` outcome under streaming would
 /// otherwise pass through silently and close the stream with NO chunks,
@@ -408,8 +409,8 @@ fn whole_turn_outcome(out: Result<TurnOutput>, is_streaming: bool) -> Result<Opt
         TurnOutput::Complete(result) => {
             if is_streaming {
                 return Err(Error::from_reason(
-                    "whole-turn override returned TurnOutput::Complete on a streaming \
-                     (sink-bearing) turn; streaming probes must deliver all output \
+                    "specialized executor returned TurnOutput::Complete on a streaming \
+                     (sink-bearing) turn; streaming executors must deliver all output \
                      (including the terminal done-chunk) through the sink and return \
                      TurnOutput::Streamed",
                 ));
@@ -456,7 +457,7 @@ fn extract_audio_from_messages(messages: &[ChatMessage]) -> Vec<Vec<u8>> {
 /// Returns `Ok(Some(result))` for sync callers; `Ok(None)` when the
 /// turn's output was fully delivered through the streaming sink (the
 /// generic streaming flow emits the terminal chunk itself and still
-/// returns `Ok(None)`; whole-turn overrides signal the same via
+/// returns `Ok(None)`; specialized executors signal the same via
 /// [`TurnOutput::Streamed`]).
 fn chat_turn_core<B: ChatBackend>(
     backend: &mut B,
@@ -480,6 +481,13 @@ fn chat_turn_core<B: ChatBackend>(
     let report_perf = p.report_performance;
     let max_new_tokens = p.max_new_tokens;
     let thinking = backend.thinking_setup(&config);
+    // Immutable load-time capabilities, read once for this turn. The hot
+    // decode loop consumes the resolved `TurnPlan` and never probes them.
+    let execution = backend.execution_plan();
+    // `backend_validated` does not claim an encoder exists. It only admits
+    // the request through this generic boundary so the family's multimodal
+    // handler can retain its more precise validation/error contract.
+    let admitted_media = execution.media.admitted();
 
     // --- template/render: full prompt tokens for this turn ---
     // Fresh: family render hook (default = the jinja chat-template path,
@@ -497,25 +505,24 @@ fn chat_turn_core<B: ChatBackend>(
             // content as an array, so a text-only family's chat
             // template could otherwise fail with an UNTYPED template
             // error first, breaking the prefix routing. Vision-capable
-            // backends (`supports_images() == true` — including
+            // backends with image capability — including
             // gemma4's unconditional policy, whose "no vision support"
-            // error surfaces from inside `vision_turn`) skip the
+            // error surfaces from inside the multimodal executor) skip the
             // rejection, render normally, and route through the
-            // `vision_turn` probe below with these exact extracted
+            // multimodal executor below with these exact extracted
             // images (single extraction — no drift).
             let images = extract_images_from_messages(messages);
-            if !images.is_empty() && !backend.supports_images() {
+            if !images.is_empty() && !admitted_media.images {
                 return Err(Error::from_reason(format!(
                     "{IMAGE_CHANGE_RESTART_PREFIX} this model is text-only; image messages are not supported",
                 )));
             }
             // Audio mirrors the image guard: a fresh audio-bearing turn against
             // a model with no audio support is rejected with the typed
-            // restart prefix before `render_prompt`. `supports_audio()`
-            // defaults to `false`, so every non-audio family rejects here and
-            // image-only / text-only flows stay byte-identical.
+            // restart prefix before `render_prompt`. Every non-audio family
+            // rejects here and image-only / text-only flows stay byte-identical.
             let audio = extract_audio_from_messages(messages);
-            if !audio.is_empty() && !backend.supports_audio() {
+            if !audio.is_empty() && !admitted_media.audio {
                 return Err(Error::from_reason(format!(
                     "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
                 )));
@@ -531,7 +538,31 @@ fn chat_turn_core<B: ChatBackend>(
         }
     };
 
-    // --- whole-turn overrides: vision → paged → mtp ---
+    let media = MediaInputs {
+        images: &images,
+        audio: &audio,
+    };
+    let input_media = media.capabilities();
+    // A fresh request fully describes its own context; stale state from a
+    // previous session must not constrain the new plan. A delta has no raw
+    // media input but may continue over media already encoded in live KV, so
+    // ask the backend for the exact media kinds represented there.
+    let context_media = if is_delta {
+        backend.session_media()
+    } else {
+        MediaCapabilities::NONE
+    };
+    let turn_plan = TurnPlan::resolve(
+        execution,
+        TurnRequest {
+            is_delta,
+            input_media,
+            context_media,
+            speculative_requested: p.enable_mtp,
+        },
+    );
+
+    // --- specialized whole-turn execution ---
     {
         let mut wt_args = WholeTurnArgs {
             tokens: &tokens,
@@ -540,54 +571,25 @@ fn chat_turn_core<B: ChatBackend>(
             config: &config,
             params: &p,
             thinking,
-            is_delta,
+            plan: turn_plan,
             sink: streaming.as_ref().map(|s| s.sink),
             cancelled: streaming.as_ref().map(|s| s.cancelled),
-            images: &images,
-            audio: &audio,
+            media,
         };
 
-        // Vision probe. Text-only families were already rejected by the
-        // PRE-RENDER image guard above (typed restart prefix, before
-        // `render_prompt` could fail with an untyped template error) —
-        // only `supports_images() == true` backends reach this probe,
-        // and they MUST take the override (the generic flow below is
-        // text-only, so silently falling through would drop the
-        // images).
-        if !images.is_empty() || !audio.is_empty() {
-            return match backend.vision_turn(&mut wt_args) {
-                Some(out) => whole_turn_outcome(out, streaming.is_some()),
-                None => Err(Error::from_reason(
-                    "model reports supports_images()/supports_audio() but provided no vision_turn override",
-                )),
-            };
-        }
-
-        // Paged probe — dispatches when the backend has a paged adapter.
-        // A family whose MTP takes precedence over paged (qwen3.5's
-        // `mtp_takes_dense_path`) returns `None` here for those turns
-        // so the `mtp_turn` probe below picks them up.
-        //
-        // The probe runs for Delta turns on BOTH the sync and STREAMING
-        // paths. With qwen3's paged adapter ON (its DEFAULT), a flat
-        // streaming-delta path would clone the never-populated flat KV
-        // vecs and `forward_fused` would read `num_layers` KV pointers
-        // from a ZERO-length vec: latent out-of-bounds UB. Routing
-        // streaming deltas through the same paged probe as sync deltas
-        // avoids that by construction; qwen3's `paged_turn` therefore
-        // handles `is_delta` streaming turns instead of returning `None`
-        // for them. lfm2 is the opposite: its delta paths NEVER touch
-        // the paged adapter, so ITS `paged_turn` returns `None` when
-        // `args.is_delta`.
-        if backend.has_paged_adapter()
-            && let Some(out) = backend.paged_turn(&mut wt_args)
-        {
-            return whole_turn_outcome(out, streaming.is_some());
-        }
-
-        // MTP probe — dispatches on the qwen3.5 dense/MoE
-        // `p.enable_mtp && has_mtp_weights` condition.
-        if let Some(out) = backend.mtp_turn(&mut wt_args) {
+        // `TurnPlan` keeps current input media, live-context media,
+        // paged-attention eligibility, and decoder strategy as independent
+        // data. The outer multimodal path depends only on current input; the
+        // path is derived only here so a
+        // supported combination such as dense Qwen3.5 paged+MTP reaches the
+        // paged executor with its speculative decoder choice intact.
+        let specialized = match turn_plan.path() {
+            TurnPath::Multimodal => Some(backend.run_multimodal_turn(&mut wt_args)),
+            TurnPath::Paged => Some(backend.run_paged_turn(&mut wt_args)),
+            TurnPath::Speculative => Some(backend.run_speculative_turn(&mut wt_args)),
+            TurnPath::Generic => None,
+        };
+        if let Some(out) = specialized {
             return whole_turn_outcome(out, streaming.is_some());
         }
     }
@@ -727,7 +729,7 @@ fn chat_turn_core<B: ChatBackend>(
             params: &p,
             is_delta,
             // The generic flow is text-only; image turns routed through
-            // `vision_turn` above.
+            // the multimodal executor above.
             has_images: false,
             total_seq_len: tokens.len(),
         };

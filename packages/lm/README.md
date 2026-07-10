@@ -153,10 +153,10 @@ Or set `MLX_PROFILE_DECODE=1` to auto-enable and write a report on exit.
 | `loadModel()`    | Auto-detect and load any supported model from disk                                |
 | `loadSession()`  | `loadModel()` + `new ChatSession(model)` in one step                              |
 | `ChatSession<M>` | Multi-turn chat wrapper — `send()`, `sendStream()`, `sendToolResult()`, `reset()` |
-| `Qwen3Model`     | Qwen3 inference — `generate()`, paged attention, speculative decoding             |
-| `Qwen35Model`    | Qwen3.5 Dense — `generate()` with compiled C++ forward                            |
-| `Qwen35MoeModel` | Qwen3.5 MoE — `generate()` with compiled C++ forward and expert routing           |
-| `Gemma4Model`    | Gemma4 inference — `generate()`                                                   |
+| `Qwen3Model`     | Qwen3 inference — `generate()` and paged attention                                |
+| `Qwen35Model`    | Qwen3.5 Dense — compiled forward, VLM, paged attention, native MTP                |
+| `Qwen35MoeModel` | Qwen3.5 MoE — compiled forward, expert routing, paged attention, native MTP       |
+| `Gemma4Model`    | Gemma4 inference — multimodal generation and optional external-draft speculation  |
 | `Lfm2Model`      | LFM2.5 hybrid conv+attention inference — `generate()`                             |
 
 ### Streaming Types
@@ -218,13 +218,13 @@ function createToolDefinition(
 
 Every generative model wrapper exposes the same `ChatSession<M>` surface — `send()`, `sendStream()`, and `sendToolResult()` all work against any of the models below.
 
-| Model         | `generate()` | `ChatSession` | Training | Notes                                 |
-| ------------- | :----------: | :-----------: | :------: | ------------------------------------- |
-| Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention, speculative decoding |
-| Qwen3.5 Dense |     Yes      |      Yes      | GRPO/SFT | Compiled C++ forward, VLM variant     |
-| Qwen3.5 MoE   |     Yes      |      Yes      | GRPO/SFT | Compiled C++ forward, expert routing  |
-| Gemma4        |     Yes      |      Yes      |    No    | Streaming chat via session            |
-| LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture  |
+| Model         | `generate()` | `ChatSession` | Training | Notes                                |
+| ------------- | :----------: | :-----------: | :------: | ------------------------------------ |
+| Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention                      |
+| Qwen3.5 Dense |     Yes      |      Yes      | GRPO/SFT | Compiled forward, VLM, native MTP    |
+| Qwen3.5 MoE   |     Yes      |      Yes      | GRPO/SFT | Expert routing, paged cache, MTP     |
+| Gemma4        |     Yes      |      Yes      |    No    | Multimodal, optional external draft  |
+| LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture |
 
 ## Performance
 

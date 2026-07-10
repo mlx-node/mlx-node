@@ -1,5 +1,8 @@
 # Architecture
 
+For the model-extension boundary and composable media, paged-attention, and
+speculative-decoding plan, see [inference-architecture.md](inference-architecture.md).
+
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  TypeScript layer — 6 packages                           │

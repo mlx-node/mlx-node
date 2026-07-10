@@ -24,6 +24,7 @@ use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
     extract_chat_params, resolve_enable_thinking,
 };
+use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::profiling::PerformanceMetrics;
@@ -524,8 +525,10 @@ pub(crate) trait PagedPrefix {
     fn suffix_len(&self) -> usize;
 }
 
-/// Outcome of a whole-turn override ([`ChatBackend::paged_turn`] /
-/// [`ChatBackend::mtp_turn`] / [`ChatBackend::vision_turn`]).
+/// Outcome of a specialized whole-turn executor
+/// ([`ChatBackend::run_paged_turn`] /
+/// [`ChatBackend::run_speculative_turn`] /
+/// [`ChatBackend::run_multimodal_turn`]).
 ///
 /// Mirrors the two return shapes of the real per-family whole-turn
 /// functions: the sync cores return `Result<ChatResult>`
@@ -537,7 +540,7 @@ pub(crate) trait PagedPrefix {
 ///
 /// The variant MUST match the turn's sink presence
 /// ([`WholeTurnArgs::sink`]):
-///   * sink `Some` (streaming turn) → the probe must deliver every
+///   * sink `Some` (streaming turn) → the executor must deliver every
 ///     chunk INCLUDING the terminal done-chunk through the sink and
 ///     return [`TurnOutput::Streamed`]. `Complete` here is a
 ///     family-impl contract violation: the session core rejects it
@@ -560,7 +563,7 @@ pub(crate) enum TurnOutput {
     Streamed,
 }
 
-/// Inputs to the whole-turn overrides.
+/// Inputs to the specialized whole-turn executors.
 ///
 /// Field set derived from the real call-site signatures
 /// (`Qwen35Inner::paged_turn_sync_core(tokens, tokenizer, eos_token_id,
@@ -576,23 +579,23 @@ pub(crate) struct WholeTurnArgs<'a> {
     pub params: &'a ChatParams,
     /// Turn's resolved thinking-mode state:
     /// `backend.thinking_setup(&config)` computed ONCE at turn entry. The
-    /// whole-turn overrides (paged/mtp/vision) build their
+    /// specialized executors (paged/speculative/multimodal) build their
     /// `ReasoningTracker` from this via `ReasoningTracker::from_setup`
     /// instead of recomputing `resolve_enable_thinking` inline.
     pub thinking: ThinkingSetup,
-    /// Whether this is a session-delta continuation (text appended on
-    /// top of live caches) rather than a fresh prefill.
-    pub is_delta: bool,
+    /// Request-time feature plan resolved once from the model's immutable
+    /// [`ExecutionPlan`]. Specialized handlers consume this instead of
+    /// re-probing paged/speculative/media capabilities.
+    pub plan: TurnPlan,
     /// Streaming sink; `None` on the sync core (`cb` at the
     /// `paged_turn_stream_core` call sites).
     pub sink: Option<&'a dyn ChunkSink>,
     /// Cooperative-cancel flag; `None` on the sync core.
     pub cancelled: Option<&'a AtomicBool>,
-    /// Raw image bytes for `vision_turn`; empty for text-only turns.
-    pub images: &'a [Vec<u8>],
-    /// Raw (encoded) audio bytes for the multimodal `vision_turn`; empty for
-    /// turns with no audio. Only the unified Gemma 4 audio path consumes this.
-    pub audio: &'a [Vec<u8>],
+    /// Raw media for the model's multimodal preparation layer. Image and
+    /// audio are independent, composable inputs; adding another modality
+    /// should extend this boundary rather than the decode loop.
+    pub media: MediaInputs<'a>,
 }
 
 /// Per-family backend the session cores drive.
@@ -622,15 +625,15 @@ pub(crate) struct WholeTurnArgs<'a> {
 /// qwen3_5/ChatML reference):
 ///   - render/finalize: `render_prompt`, `resolve_params`,
 ///     `finalize_turn`
-///   - capability probes: `has_paged_adapter`, `supports_images`,
-///     `has_live_session`, `session_holds_images`
+///   - execution capabilities: `execution_plan`, `has_live_session`,
+///     `session_media`
 ///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,
 ///     `wired_limit_bytes`
 ///   - streaming: `stream_skip_special_tokens`, `stream_emitter`,
-///     `stream_delta_prompt_tokens`, `text_delta_image_guard`
+///     `stream_delta_prompt_tokens`, `text_delta_media_guard`
 ///   - profiling/perf: `profiler_label`, `augment_performance`
-///   - whole-turn overrides (return `None` = run generic flow):
-///     `paged_turn`, `mtp_turn`, `vision_turn`
+///   - specialized executors selected by the resolved plan:
+///     `run_paged_turn`, `run_speculative_turn`, `run_multimodal_turn`
 ///
 /// (The per-step `DecodeStep` seam — `forward`/`eval_step` required,
 /// `trace_offset`/`trace_name`/`profiler_relabel`/`end_decode`
@@ -969,36 +972,16 @@ pub(crate) trait ChatBackend {
         )
     }
 
-    // ---- optional capability probes ----
+    // ---- immutable execution capabilities ----
 
-    /// Whether a block-paged KV adapter is active (routes the turn to
-    /// `paged_turn`). == the `self.paged_adapter.is_some()` checks.
-    fn has_paged_adapter(&self) -> bool {
-        false
-    }
-
-    /// Whether the family can consume image inputs (routes image-bearing
-    /// turns to `vision_turn`). Text-only families reject images with
-    /// the `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` error instead — the
-    /// session core fires that rejection BEFORE
-    /// [`ChatBackend::render_prompt`] (TS `ChatSession` restart-routing
-    /// contract: the typed prefix must win over any template error the
-    /// image-bearing message array could trigger; see the fresh-turn
-    /// image guard in `chat_turn_core`).
-    fn supports_images(&self) -> bool {
-        false
-    }
-
-    /// Whether the family can consume audio inputs (routes audio-bearing
-    /// turns to `vision_turn`, the shared multimodal entry). Audio mirrors
-    /// the image guard: an audio-bearing fresh turn against a family that
-    /// returns `false` is rejected with the typed
-    /// `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix BEFORE
-    /// `render_prompt`. Default `false` keeps every non-audio family — and
-    /// every image-only / text-only flow — byte-identical; only the unified
-    /// Gemma 4 (`has_audio`) checkpoint overrides to `true`.
-    fn supports_audio(&self) -> bool {
-        false
+    /// Features wired into this model instance at load time.
+    ///
+    /// The default is a flat, autoregressive, text-only target. Families opt
+    /// into media, paged attention, and speculation declaratively. The
+    /// session resolves this description into one request-time `TurnPlan`
+    /// before any cache mutation; no capability probe runs in the token loop.
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan::TEXT_ONLY
     }
 
     /// Additional stop-token ids honored ALONGSIDE the session EOS id.
@@ -1050,21 +1033,28 @@ pub(crate) trait ChatBackend {
     /// `"chat_tokens_delta_sync"` on the sync twin,
     /// `"chat_stream_tokens_delta"` on the streaming twin.
     ///
-    /// Default is the lfm2-style text-only defensive guard: reject only
-    /// when the family does NOT support images but the session somehow
-    /// holds image state. Image-capable families that accept text deltas
-    /// on image sessions (qwen3.5's sticky-image-key contract) keep the
-    /// default and return `None` via `supports_images() == true`.
+    /// Default is a per-kind defensive guard: reject when the live session
+    /// holds any media kind the target does not actually have available.
+    /// Media-capable families that accept text deltas (qwen3.5's
+    /// sticky-image-key contract) keep the default.
     ///
-    /// Gemma4's override REJECTS despite `supports_images() == true`
+    /// Gemma4's override REJECTS despite declaring image capability
     /// whenever `cached_image_key.is_some()`, with the typed prefix the
     /// TS `ChatSession` restart routing matches on:
     /// `format!("{IMAGE_CHANGE_RESTART_PREFIX}{entry_fn} is text-only;
     /// session currently holds image state")`.
-    fn text_delta_image_guard(&self, entry_fn: &'static str) -> Option<String> {
-        if !self.supports_images() && self.session_holds_images() {
+    fn text_delta_media_guard(&self, entry_fn: &'static str) -> Option<String> {
+        let session_media = self.session_media();
+        let unsupported = session_media.difference(self.execution_plan().media.available);
+        if !unsupported.is_empty() {
+            let media_state = match (unsupported.images, unsupported.audio) {
+                (true, true) => "image/audio",
+                (true, false) => "image",
+                (false, true) => "audio",
+                (false, false) => unreachable!("guarded by !unsupported.is_empty()"),
+            };
             Some(format!(
-                "{entry_fn} is text-only; session currently holds image state"
+                "{entry_fn} is text-only; session currently holds {media_state} state"
             ))
         } else {
             None
@@ -1183,60 +1173,50 @@ pub(crate) trait ChatBackend {
         !self.cached_token_history().is_empty()
     }
 
-    /// Whether the live session currently holds image state
-    /// (`cached_image_key.is_some()` on the families that track it).
+    /// Media kinds currently represented by the live session's cache state.
     ///
-    /// Feeds the DEFAULT [`ChatBackend::text_delta_image_guard`] policy
-    /// (reject text deltas on image-holding sessions only for text-only
-    /// families). Families that need a different policy override the
-    /// guard hook itself, not this probe. Default covers families that
-    /// never track image state.
-    fn session_holds_images(&self) -> bool {
-        false
+    /// Feeds the default [`ChatBackend::text_delta_media_guard`] policy
+    /// and the request planner's `context_media` fact on delta turns. Returning
+    /// the specific kinds instead of a boolean prevents speculation from
+    /// mistaking an empty current-turn input for a text-only live context.
+    /// Families that need a different delta policy override the guard hook
+    /// itself. Default covers families that never track media state.
+    fn session_media(&self) -> MediaCapabilities {
+        MediaCapabilities::NONE
     }
 
-    // ---- whole-turn overrides ----
+    // ---- specialized whole-turn executors ----
     //
-    // Consulted by the session cores BEFORE the generic
-    // verify-prefix/prefill/decode flow. `None` means "no override —
-    // run the generic flow"; `Some(result)` is the turn's outcome.
-    //
-    // Streaming contract (see [`TurnOutput`]): when `args.sink` is
-    // `Some`, an override MUST deliver all output (including the
-    // terminal done-chunk) through the sink and return
-    // `TurnOutput::Streamed`; `Complete` under streaming is rejected
-    // loudly by the session core.
+    // The session calls exactly one executor selected by `TurnPlan::path`.
+    // A model that declares a capability but omits its executor fails loudly;
+    // there is no `Option` fall-through that can silently discard media or
+    // disable an optimization. Streaming executors retain the `TurnOutput`
+    // contract documented above.
 
-    /// Block-paged whole-turn path. == `paged_turn_sync_core` /
-    /// `paged_turn_stream_core` on Qwen3.5 dense/MoE.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Execute a turn whose eligible attention layers use the paged adapter.
+    /// The plan may also select speculative decoding; dense Qwen3.5 handles
+    /// that supported composition inside this executor.
+    fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected paged attention but the backend has no paged executor",
+            self.family_name(),
+        )))
     }
 
-    /// MTP speculative-decode whole-turn path. == the
-    /// `p.enable_mtp && has_mtp_weights` branch in
-    /// `models/qwen3_5/model.rs` / `models/qwen3_5_moe/model.rs`, now
-    /// driving the engine-owned `run_mtp_turn`.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn mtp_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Execute a flat speculative turn (native MTP or an external draft).
+    fn run_speculative_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected speculative decoding but the backend has no speculative executor",
+            self.family_name(),
+        )))
     }
 
-    /// Vision (VLM) whole-turn path. == the image-bearing prefill
-    /// branches (`args.images` non-empty) on the VLM-capable families.
-    ///
-    /// Streaming contract: see [`TurnOutput`] — with `args.sink`
-    /// attached, stream everything through the sink and return
-    /// [`TurnOutput::Streamed`], never `Complete`.
-    fn vision_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Option<Result<TurnOutput>> {
-        None
+    /// Prepare and execute a turn carrying one or more media inputs.
+    fn run_multimodal_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        Err(Error::from_reason(format!(
+            "{} execution plan selected multimodal input but the backend has no multimodal executor",
+            self.family_name(),
+        )))
     }
 }
 
@@ -1249,8 +1229,8 @@ pub(crate) trait ChatBackend {
 /// (`type PagedDecode<'a>`) and the [`Self::PrefixState`] assoc type
 /// have no stable trait-level default, so folding them into the base
 /// trait would force every family to implement them. A family opts in by
-/// implementing this trait and setting its `ChatBackend::paged_turn`
-/// body to `Some(run_paged_turn(self, args))`; families with a forked
+/// implementing this trait and delegating `ChatBackend::run_paged_turn`
+/// to `run_paged_turn(self, args)`; families with a forked
 /// per-family paged core do not implement it.
 ///
 /// `run_paged_turn` MIRRORS the FLAT engine tail
@@ -1536,8 +1516,8 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
 /// folding it into the base trait would force every family to implement
 /// it. A family opts in by implementing this trait (+ [`MtpStepper`] for
-/// its stepper) and setting its `ChatBackend::mtp_turn` body to
-/// `Some(run_mtp_turn(self, args))`; MTP-less families do not implement
+/// its stepper) and delegating `ChatBackend::run_speculative_turn` to
+/// `run_mtp_turn(self, args)`; MTP-less families do not implement
 /// it.
 ///
 /// The engine-owned loop (`run_mtp_turn`) is the relocated
@@ -1785,7 +1765,7 @@ pub(crate) struct DsparkTurnSetup<'a> {
 /// Split out of [`ChatBackend`] for the SAME reason as [`MtpBackend`]: the
 /// GAT (`type DsparkDecode<'a>`) has no stable trait-level default. A family
 /// opts in by implementing this trait (+ [`DsparkStepper`] for its stepper)
-/// and overriding `ChatBackend::mtp_turn` to call `run_dspark_turn`;
+/// and overriding `ChatBackend::run_speculative_turn` to call `run_dspark_turn`;
 /// DSpark-less families do not implement it. Production implementation:
 /// gemma4 (`models::gemma4::dspark_decode`).
 pub(crate) trait DsparkBackend: ChatBackend {

@@ -457,6 +457,9 @@ mod tests {
     use crate::engine::backend::{
         ChatBackend, DsparkBackend, DsparkTurnSetup, TurnOutput, WholeTurnArgs,
     };
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+    };
     use crate::engine::types::ChatConfig;
     use crate::models::gemma4::assistant::AssistantDraftModel;
     use crate::models::gemma4::dspark::DsparkContextCache;
@@ -895,11 +898,19 @@ mod tests {
             config: &config,
             params: &p,
             thinking,
-            is_delta: false,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: false,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            },
             sink: Some(&sink),
             cancelled: Some(&cancelled),
-            images: &[],
-            audio: &[],
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
         };
         let out = inner
             .draft_chat_turn(&mut args)
