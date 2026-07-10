@@ -143,6 +143,15 @@ adopts the widget's broader `text.trim() === ''` predicate (it catches `"\n"` an
 `"  "`, which the bake's id-equality does not), and deletes all three call-site
 loops. Cap at 8 — the backend errors above that.
 
+`bake.mts` injects an adapter over `encodeTokens` (ids only) + `decodeTokens`;
+the browsers inject the worker `tokenize`, which already returns `{id, text}[]`.
+
+**`derivePins` maps concepts → pins. `/jspace` has no concepts.** Its pins are
+single token ids the user clicks. `derivePins` is therefore used by the two lesson
+widgets, by `bake.mts`, and by `/jspace` **only inside the self-test oracle**,
+which replays the baked frame's four committed concepts. It must not appear
+anywhere in the live user-prompt path.
+
 ---
 
 ## 4. The correctness oracle
@@ -235,6 +244,22 @@ pinned `greater` + `sum([-1])`. Position-separable, verified line by line.
 ```
 
 `P=33 → 17,16`  ·  `P=128 → 32,32,32,32`  ·  `P=9 → 9`  ·  `P=1 → 1`
+
+**`eval_arrays` and `to_vec` must move inside the tile loop.** Slicing alone
+changes nothing: MLX is lazy, so if the single `eval` stays at the layer level
+the whole `[P, vocab]` graph still materializes at once and peak memory still
+tracks `P`. Evaluating and reading back per tile is what makes the peak track the
+*tile*, not the prompt. This is the acceptance criterion, not the slicing.
+
+**`nTiles == 1` must take an un-sliced `h_l.clone()` branch**, not an identity
+`slice_axis(1, 0, P)`. That explicit branch is what makes "lesson presets are
+never tiled" an assertable invariant rather than a hope about graph equivalence.
+
+**Push order is load-bearing.** `types.ts:39` indexes both `cells[]` and every
+`pinned[pi].ranks[]` by `flat = layerIdx * promptLen + pos`. Cells must be pushed
+at the **global** position `tile_start + local`, and pinned ranks appended with
+`pi` outer / local position inner, per tile. Getting the pinned nesting wrong
+compiles, passes every shape check, and silently scrambles the rank tracks.
 
 A size-1 tile is the one thing that must never happen: `M == 1` routes to the
 split-K GEMV, whose different `K`-summation order can flip an exact tie in the
@@ -409,10 +434,19 @@ Value-based, not "review the code".
    divergence. Assert **both** directions — a test that only ever passes proves
    nothing: the real pack passes, and a deliberately corrupted pack (e.g. one
    `J` tensor's bytes shifted by two, reproducing the f16 laning fault) fails.
-2. **Tiling parity.** Tiled vs untiled `lensReadout` on WebGPU over prompts
-   engineered to induce top-k near-ties: **bit-identical** top-k ids and pinned
-   ranks. Explicitly test `P = 33` (proving the rebalance to 17+16 emits no
-   size-1 tile) and `P = 1`.
+2. **Tiling parity — on WebGPU, not Metal.** A `cargo test` runs the Metal
+   backend, whose kernels are not the ones that ship; a Metal pass is ~no evidence
+   about WebGPU. So tiling is toggled by a **diagnostic `noTile` request flag**
+   threaded through `LensReadoutOptions` — *not* an env var, which does not reach
+   the wasm worker — and the harness runs the *same binary* both ways **through
+   the browser worker**: bit-identical top-k ids and pinned ranks at `P = 33`
+   (proving the rebalance to 17+16 emits no size-1 tile) and `P = 1`.
+   Plus a `P = 128` WebGPU smoke: the grid renders, the worker does not OOM.
+
+   Note that the native `.node` addon is **not** rebuilt on this branch, so the
+   offline bake keeps running the pre-tiling code. That is fine — lesson presets
+   are `P ≤ 9` and never tile — but it means the re-bake gate exercises
+   `derivePins`, not tiling. Only the browser harness tests the tiling.
 3. **Lesson frames unchanged.** The three committed baked JSONs are byte-identical
    after the extraction *and* after the tiling change. Prerendered
    `/chapters/lm-head/jacobian-lens` still contains its baked token with zero
