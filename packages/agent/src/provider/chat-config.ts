@@ -3,8 +3,9 @@
  *
  * Base sampling + output budget come from `@mlx-node/server`'s
  * `LAUNCH_PRESETS` (the ONLY allowed server import in this package —
- * presets/preset types, nothing else), then pi's per-call
- * `SimpleStreamOptions` overlay on top.
+ * presets/preset types, nothing else) extended by the agent-local
+ * {@link AGENT_LAUNCH_PRESETS}, then pi's per-call `SimpleStreamOptions`
+ * overlay on top.
  */
 
 import type { SimpleStreamOptions, ThinkingLevel } from '@earendil-works/pi-ai';
@@ -12,28 +13,38 @@ import type { ChatConfig, ModelType, ToolDefinition } from '@mlx-node/lm';
 import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
 
 /**
- * Family variants that share the base family's `LAUNCH_PRESETS` entry.
- * `lfm2_moe` checkpoints load through the same LFM2.5 family as `lfm2`
- * (`Lfm2Model.load` serves both model-loader registry rows) and LiquidAI
- * publishes one set of sampling recommendations for the family, so the
- * MoE variant maps onto the `lfm2` preset here instead of forking
- * `packages/server`.
+ * Agent-local launch presets for model types `LAUNCH_PRESETS` does not
+ * cover (kept here — this package must not fork `packages/server`).
+ *
+ * `lfm2_moe` (LFM2.5-8B-A1B): LiquidAI's HF model card for the MoE
+ * checkpoint recommends temperature 0.2 / top_k 80 — deliberately NOT
+ * the dense `lfm2` preset (LFM2.5-1.2B guidance: temperature 0.05 /
+ * top_k 50). repetitionPenalty 1.05 and the 8192-token output budget
+ * match the dense family entry.
  */
-const PRESET_FAMILY_ALIASES: Partial<Record<ModelType, string>> = {
-  lfm2_moe: 'lfm2',
+const AGENT_LAUNCH_PRESETS: Partial<Record<ModelType, LaunchPreset>> = {
+  lfm2_moe: {
+    sampling: {
+      temperature: 0.2,
+      topP: 1.0,
+      topK: 80,
+      minP: 0.0,
+      presencePenalty: 0.0,
+      repetitionPenalty: 1.05,
+    },
+    maxOutputTokens: 8192,
+  },
 };
 
 /**
- * `LAUNCH_PRESETS` lookup with {@link PRESET_FAMILY_ALIASES} applied —
- * the ONE preset resolution shared by discovery (`models.ts`) and
- * per-call config assembly, so a model can never be discovered without
- * also being streamable (and vice versa).
+ * Preset lookup — agent-local entries win over `LAUNCH_PRESETS` (they
+ * exist precisely because the server table has no correct entry for the
+ * type). This is the ONE preset resolution shared by discovery
+ * (`models.ts`) and per-call config assembly, so a model can never be
+ * discovered without also being streamable (and vice versa).
  */
 export function launchPresetFor(modelType: ModelType): LaunchPreset | undefined {
-  const direct = LAUNCH_PRESETS[modelType];
-  if (direct) return direct;
-  const alias = PRESET_FAMILY_ALIASES[modelType];
-  return alias === undefined ? undefined : LAUNCH_PRESETS[alias];
+  return AGENT_LAUNCH_PRESETS[modelType] ?? LAUNCH_PRESETS[modelType];
 }
 
 /**
@@ -57,7 +68,7 @@ export function buildChatConfig(
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
-    const known = [...Object.keys(LAUNCH_PRESETS), ...Object.keys(PRESET_FAMILY_ALIASES)].join(', ');
+    const known = [...new Set([...Object.keys(LAUNCH_PRESETS), ...Object.keys(AGENT_LAUNCH_PRESETS)])].join(', ');
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);
   }
 

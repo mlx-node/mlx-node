@@ -432,6 +432,45 @@ describe('makeMlxStreamSimple', () => {
     expect(await stream.result()).toBe(message);
   });
 
+  it('terminalizes a revoked-Proxy rejection (instanceof itself throws) with no unhandled rejection', async () => {
+    // Reviewer repro: `err instanceof Error` throws on a revoked Proxy
+    // (`TypeError: Cannot perform 'getPrototypeOf' on a proxy that has
+    // been revoked`). With the check outside the guard, the coercion
+    // helper itself threw → detached catch rejected → the stream stayed
+    // start-only AND an unhandled rejection escaped.
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      runWithResident: () => Promise.reject(proxy),
+    };
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const stream = makeMlxStreamSimple(host)(MODEL, CONTEXT);
+      const events = await collect(stream);
+      // Exactly one terminal: 'start' then a single 'error' event.
+      expect(types(events)).toEqual(['start', 'error']);
+      const last = events[events.length - 1]!;
+      expect(last.type === 'error' && last.reason).toBe('error');
+      const message = finalMessage(events);
+      expect(message.stopReason).toBe('error');
+      // String(revokedProxy) also throws → constant fallback.
+      expect(message.errorMessage).toBe('unserializable error');
+      // result() settles on the terminal message.
+      expect(await stream.result()).toBe(message);
+      // Give any detached rejection a chance to surface before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('falls back to the failsafe terminal for an Error whose message getter throws', async () => {
     class PoisonError extends Error {
       constructor() {

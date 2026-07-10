@@ -66,19 +66,24 @@ export interface StreamSimpleHost {
 /**
  * Coerce an arbitrary thrown value to a message string without trusting
  * it: an `Error` whose `message` getter throws, an object with a poisoned
- * `toString` / `Symbol.toPrimitive`, and a null-prototype object (where
- * `String(err)` itself throws) all land on the constant fallback instead
- * of escaping. Circular objects are fine — `String` never serializes
- * deeply.
+ * `toString` / `Symbol.toPrimitive`, a null-prototype object (where
+ * `String(err)` itself throws), and a revoked Proxy — where even
+ * `err instanceof Error` throws, because `instanceof` walks the prototype
+ * chain through the (revoked or throwing) `getPrototypeOf` trap — all
+ * land on the constant fallback instead of escaping. Circular objects are
+ * fine — `String` never serializes deeply.
  */
 export function coerceErrorMessage(err: unknown): string {
-  if (err instanceof Error) {
-    try {
+  try {
+    // The `instanceof` check MUST live inside the guard: on a revoked
+    // Proxy (or any Proxy with a throwing `getPrototypeOf` trap) the
+    // check itself throws a TypeError before any property is read.
+    if (err instanceof Error) {
       const { message } = err;
       if (typeof message === 'string' && message.length > 0) return message;
-    } catch {
-      // poisoned `message` getter — fall through to String(err)
     }
+  } catch {
+    // hostile prototype walk or poisoned `message` getter — fall through
   }
   try {
     return String(err);

@@ -32,8 +32,8 @@ beforeAll(async () => {
   });
   // No max_position_embeddings anywhere → documented family fallback.
   await writeModelDir('gamma-fallback', { model_type: 'qwen3_5' });
-  // lfm2_moe is loadable and maps onto the lfm2 launch preset (same
-  // LFM2.5 family) — it MUST be discovered, not skipped.
+  // lfm2_moe is loadable via the agent-local MoE launch preset
+  // (LFM2.5-8B-A1B) — it MUST be discovered, not skipped.
   await writeModelDir('lfm-moe', { model_type: 'lfm2_moe' });
 
   // All of the below must be skipped silently:
@@ -80,7 +80,7 @@ describe('discoverMlxModels', () => {
     expect(moe!.piModel.reasoning).toBe(true);
   });
 
-  it('discovers lfm2_moe with lfm2-family traits and the aliased lfm2 preset', () => {
+  it('discovers lfm2_moe with lfm2-family traits and the first-class MoE preset', () => {
     const moe = infos[3]!;
     expect(moe.discovered).toEqual({
       name: 'lfm-moe',
@@ -89,7 +89,7 @@ describe('discoverMlxModels', () => {
     });
     expect(moe.piModel.reasoning).toBe(true);
     expect(moe.piModel.contextWindow).toBe(128000); // LFM2.5 family fallback window
-    expect(moe.piModel.maxTokens).toBe(8192); // LAUNCH_PRESETS.lfm2.maxOutputTokens via the lfm2_moe alias
+    expect(moe.piModel.maxTokens).toBe(8192); // agent-local lfm2_moe preset maxOutputTokens
   });
 
   it('reads contextWindow from text_config.max_position_embeddings (qwen3_5 nesting)', () => {

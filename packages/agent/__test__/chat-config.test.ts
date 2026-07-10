@@ -63,11 +63,17 @@ describe('buildChatConfig', () => {
     expect('reuseCache' in config).toBe(false);
   });
 
-  it('resolves lfm2_moe through the lfm2 preset alias (same LFM2.5 family)', () => {
+  it('gives lfm2_moe the first-class MoE sampler (LFM2.5-8B-A1B card), NOT the dense lfm2 preset', () => {
     const config = buildChatConfig('lfm2_moe', undefined, undefined);
-    expect(config.maxNewTokens).toBe(LAUNCH_PRESETS['lfm2']!.maxOutputTokens);
-    expect(config.temperature).toBe(LAUNCH_PRESETS['lfm2']!.sampling.temperature);
-    expect(config.repetitionPenalty).toBe(LAUNCH_PRESETS['lfm2']!.sampling.repetitionPenalty);
+    // Concrete card values — deliberately not compared against
+    // LAUNCH_PRESETS['lfm2'] (the dense 1.2B guidance: temp 0.05, topK 50).
+    expect(config.temperature).toBe(0.2);
+    expect(config.topK).toBe(80);
+    expect(config.repetitionPenalty).toBe(1.05);
+    expect(config.maxNewTokens).toBe(8192);
+    // Guard against silently re-aliasing onto the dense preset.
+    expect(config.temperature).not.toBe(LAUNCH_PRESETS['lfm2']!.sampling.temperature);
+    expect(config.topK).not.toBe(LAUNCH_PRESETS['lfm2']!.sampling.topK);
   });
 
   it('throws a clear error for a model type with no launch preset', () => {

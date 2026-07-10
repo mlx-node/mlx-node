@@ -54,9 +54,9 @@ interface FamilyTraits {
 
 /**
  * Keyed by `ModelType`: a chat-capable family must have BOTH an entry
- * here and a launch preset via `launchPresetFor` (which folds `lfm2_moe`
- * onto the `lfm2` preset) to be served — missing either side is skipped,
- * never guessed.
+ * here and a launch preset via `launchPresetFor` (which serves `lfm2_moe`
+ * from the agent-local MoE preset) to be served — missing either side is
+ * skipped, never guessed.
  */
 const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   qwen3: { reasoning: true, fallbackContextWindow: 40960 },
