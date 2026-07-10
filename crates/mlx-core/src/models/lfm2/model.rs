@@ -1089,10 +1089,21 @@ impl ChatBackend for Lfm2Inner {
         ExecutionPlan {
             media: MediaPlan::NONE,
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
-                // LFM2's live short-conv state is not represented by the
-                // paged attention adapter. Raw deltas must keep using the
-                // existing flat hybrid-cache path.
-                supports_delta: false,
+                // Delta turns stay PAGED. The session core rebuilds the full
+                // token stream (`cached_token_history ++ delta`) before the
+                // plan resolves, so a delta reaches `run_paged_turn` as the
+                // same strict extension a resent growing conversation
+                // produces: the adapter warm-continues the live request and
+                // conv Pass-1 (`run_conv_only_prefill`) rebuilds short-conv
+                // state over the cached prefix. The short-conv state itself
+                // is still never represented by the adapter — it is
+                // reconstructed from tokens every paged turn. Declaring
+                // `supports_delta: false` would route deltas to the flat
+                // tail, which tail-prefills onto EMPTY flat attention KV
+                // (paged turns never fill it) while conv state sits at the
+                // prior position — a corrupt, input-independent
+                // continuation.
+                supports_delta: true,
             }),
             speculative: None,
         }
@@ -1137,12 +1148,16 @@ impl ChatBackend for Lfm2Inner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // `execution_plan` admits only fresh turns here. Delta turns keep
-        // using the generic flat hybrid-cache path even when an attention
-        // adapter is loaded; unlike Qwen3, LFM2's short-conv state cannot be
-        // continued through the paged adapter alone.
-        debug_assert!(!args.plan.is_delta);
-        // The model-neutral `run_paged_turn` drives the whole fresh turn
+        // Fresh AND delta turns land here (`supports_delta: true`). For a
+        // delta, `args.tokens` is already the full stream
+        // (`cached_token_history ++ delta`, rebuilt by the session core
+        // before plan resolution) and the engine forces `reuse_cache = true`,
+        // so `prime_prefix_state` sees the exact strict-extension shape a
+        // resent growing conversation produces — the adapter warm-continues
+        // the live request and `run_paged_prefill_chunk` Pass-1 rebuilds
+        // conv state over the cached prefix.
+        //
+        // The model-neutral `run_paged_turn` drives the whole turn
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
         // begin_paged_decode → decode loop → save).
         //

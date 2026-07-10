@@ -294,8 +294,8 @@ async fn lfm2_paged_vs_flat_greedy_token_parity() {
 // Test (a2 / G1): forced-LENGTH-exit parity.
 //
 // Tests (a) and (c) above NEVER drive a LENGTH exit through the paged path —
-// (a) prompts all early-stop under max_new=32, and (c)'s turn-2 is a delta
-// (`is_delta` → lfm2 `paged_turn` returns None → eager-flat). That leaves the
+// (a) prompts all early-stop under max_new=32, and (c)'s turn-2 delta
+// early-stops the same way. That leaves the
 // migrated lfm2 paged `save_paged_history` DROP-ON-LENGTH branch (Case A of
 // the token-accounting proof) UNTESTED. A FRESH turn-1 with a small `max_new`
 // on a verbose prompt GUARANTEES a length exit with NO EOS — lfm2 always emits
@@ -717,6 +717,208 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 }
 
 // ---------------------------------------------------------------------------
+// Test (d): PAGED-DELTA memory-probe parity + content correctness.
+//
+// THE BUG THIS PINS (pre-existing; the planner refactor briefly ratified it):
+// with the paged adapter live, a FRESH turn writes attention K/V ONLY into the
+// paged pool — the flat `Lfm2LayerCache::Attention` slots stay EMPTY — while
+// conv state lands in the flat slots and `save_paged_history` persists only
+// `cached_token_history`. When `supports_delta` was `false`, a
+// `chat_session_continue` delta planned FLAT (`TurnPath::Generic`) and
+// tail-prefilled ONLY the delta onto those empty attention caches: attention
+// attended over nothing at offset 0 while conv state sat at position ~N.
+// Output degenerated into input-INDEPENDENT garbage (e.g. 30 repeated
+// `<think>` tokens). The old test (c) above could not catch this: its
+// context-insensitive follow-up ("And in another word?") under a 32-token
+// budget cut mid-`<think>`, so garbage matched garbage.
+//
+// THE ORACLE: a memory-probe conversation whose turn-2/turn-3 answers are
+// derivable ONLY from turn-1/turn-2 context. Turn 1 plants named values
+// (amber=7, cobalt=11); turn 2 (delta) asks for their sum (18); turn 3
+// (delta) adds jade=13 and asks the new total (31). BOTH the paged session
+// (the repro path) and the forced-flat control (whose delta path carries
+// live flat conv+attention caches — the hole-free reference) must produce
+// the correct sums: CONTENT assertions, so a regression that corrupts both
+// paths identically still fails loudly, and the two paths must agree on the
+// ANSWERS.
+//
+// Deliberately NOT asserted: byte-equality of the answer texts. Producing an
+// actual arithmetic answer on this checkpoint needs hundreds of greedy
+// tokens (think + answer), and at that length the accepted ~1-ULP
+// paged-vs-flat numerical class flips a near-tie argmax mid-`<think>`
+// (observed at token ~93 of turn 1 — a FRESH turn, before any delta ran), so
+// the two transcripts legitimately drift while both remain correct. See the
+// bridge-probe comment above for the same accepted class. Byte-level
+// paged-vs-flat parity — including a short delta turn — is pinned by tests
+// (a)/(a2)/(b2)/(c) at lengths where greedy stays tie-free.
+//
+// Reachability: `cached_tokens` must be >0 and strictly growing on the paged
+// session's delta turns — proof the deltas took the paged warm-continue
+// (`ContinuedLivePrefix`) and did not silently re-prefill from scratch.
+// ---------------------------------------------------------------------------
+
+/// Memory-probe config: budget 128 force-closes a looping `<think>`
+/// deterministically; max_new 512 leaves the post-`</think>` span free to
+/// state the actual number (every probe turn ends `finish=stop` well below
+/// the cap on this checkpoint).
+fn memory_probe_chat_config() -> ChatConfig {
+    ChatConfig {
+        thinking_token_budget: Some(128),
+        ..parity_chat_config(512)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real LFM2 checkpoint"]
+async fn lfm2_paged_delta_memory_probe_parity() {
+    let Some(src) = resolve_source_model() else {
+        return;
+    };
+
+    let flat_dir = match clone_model_dir(&src, "lfm2-flat-memprobe", false) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for flat path: {e}"),
+    };
+    let paged_dir = match clone_model_dir(&src, "lfm2-paged-memprobe", true) {
+        Ok(p) => p,
+        Err(e) => panic!("failed to clone model dir for paged path: {e}"),
+    };
+
+    let flat_model = Lfm2Model::load_from_dir(&flat_dir.to_string_lossy())
+        .await
+        .expect("failed to load flat-path LFM2 model");
+    let paged_model = Lfm2Model::load_from_dir(&paged_dir.to_string_lossy())
+        .await
+        .expect("failed to load paged-path LFM2 model");
+
+    // ---- Turn 1: plant the values (fresh start on both paths) ----
+    // A trivial recall question rather than a "reply OK" instruction: this
+    // checkpoint over-thinks meta-instructions and drags them into later
+    // turns, poisoning the arithmetic probes.
+    let prompt1 = "Here are values to remember: amber = 7 and cobalt = 11. What is amber?";
+    let r1_flat = flat_model
+        .chat_session_start(
+            vec![user_message(prompt1)],
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 1 flat chat_session_start failed");
+    let r1_paged = paged_model
+        .chat_session_start(
+            vec![user_message(prompt1)],
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 1 paged chat_session_start failed");
+    eprintln!(
+        "[mem-probe] turn1: flat cached={} text={:?} | paged cached={} text={:?}",
+        r1_flat.cached_tokens, r1_flat.text, r1_paged.cached_tokens, r1_paged.text,
+    );
+    assert!(
+        r1_paged.text.contains('7'),
+        "paged turn 1 could not even recall the just-planted value: {:?}",
+        r1_paged.text,
+    );
+
+    // ---- Turn 2 (DELTA): sum of the planted values ----
+    let user2 = "Add amber and cobalt together. What is the sum?";
+    let r2_flat = flat_model
+        .chat_session_continue(
+            user2.to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 2 flat chat_session_continue failed");
+    let r2_paged = paged_model
+        .chat_session_continue(
+            user2.to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 2 paged chat_session_continue failed");
+    eprintln!(
+        "[mem-probe] turn2: flat cached={} text={:?} | paged cached={} text={:?}",
+        r2_flat.cached_tokens, r2_flat.text, r2_paged.cached_tokens, r2_paged.text,
+    );
+
+    // Reachability: the paged delta must have warm-continued the live paged
+    // request (a 0 here would mean a silent from-scratch re-prefill that
+    // could mask the corruption this test exists to catch).
+    assert!(
+        r2_paged.cached_tokens > 0,
+        "paged delta turn 2 reused nothing (cached_tokens=0) — the delta did not take the \
+         paged warm-continue path",
+    );
+    // Content: the answer is derivable ONLY from turn-1 context. The
+    // pre-fix corrupted continuation (empty flat attention KV) cannot
+    // produce it.
+    assert!(
+        r2_paged.text.contains("18"),
+        "paged delta turn 2 lost the turn-1 context: expected the sum 18 in {:?}",
+        r2_paged.text,
+    );
+    // Answer-level parity with the forced-flat control (byte parity is
+    // pinned at short lengths by tests (a)/(c) — see the header).
+    assert!(
+        r2_flat.text.contains("18"),
+        "flat control turn 2 disagrees with the paged answer (expected 18): {:?}",
+        r2_flat.text,
+    );
+
+    // ---- Turn 3 (DELTA): extend the context and re-derive ----
+    let user3 = "One more value: jade = 13. What is amber + cobalt + jade in total?";
+    let r3_flat = flat_model
+        .chat_session_continue(
+            user3.to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 3 flat chat_session_continue failed");
+    let r3_paged = paged_model
+        .chat_session_continue(
+            user3.to_string(),
+            None,
+            None,
+            Some(memory_probe_chat_config()),
+        )
+        .await
+        .expect("turn 3 paged chat_session_continue failed");
+    eprintln!(
+        "[mem-probe] turn3: flat cached={} text={:?} | paged cached={} text={:?}",
+        r3_flat.cached_tokens, r3_flat.text, r3_paged.cached_tokens, r3_paged.text,
+    );
+
+    assert!(
+        r3_paged.cached_tokens > r2_paged.cached_tokens,
+        "paged delta turn 3 did not grow its reused prefix ({} -> {})",
+        r2_paged.cached_tokens,
+        r3_paged.cached_tokens,
+    );
+    assert!(
+        r3_paged.text.contains("31"),
+        "paged delta turn 3 lost accumulated context: expected the sum 31 in {:?}",
+        r3_paged.text,
+    );
+    assert!(
+        r3_flat.text.contains("31"),
+        "flat control turn 3 disagrees with the paged answer (expected 31): {:?}",
+        r3_flat.text,
+    );
+
+    eprintln!(
+        "[PASS] lfm2 paged-delta memory probe: paged answers correct (18, 31), flat control \
+         agrees; paged cached {} -> {}",
+        r2_paged.cached_tokens, r3_paged.cached_tokens,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry regression: LFM2 paged prefillTokensPerSecond must be full-prompt
 // scale, not attention-suffix scale, on a warm cross-request prefix-cache hit.
 //
@@ -768,9 +970,9 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
     // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
     // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
     // This exercises the fresh-turn paged START path (`run_paged_turn` →
-    // `paged_prefill`) that the telemetry fix touches, NOT the
-    // `chat_session_continue` delta path (which legitimately forwards only the
-    // delta via the eager-flat path and is left unchanged).
+    // `paged_prefill`) that the telemetry fix touches. (The
+    // `chat_session_continue` delta path now ALSO runs paged — see the
+    // memory-probe test below — and shares the same telemetry hook.)
     let r2 = paged_model
         .chat_session_start(vec![user_message(prompt1)], Some(perf_chat_config(32)))
         .await
@@ -856,11 +1058,12 @@ async fn lfm2_paged_prefill_bridge_cache_hit_ab_probe() {
         r1.num_tokens, r1.finish_reason, r1.raw_text
     );
 
-    // Turn 2: a FRESH chat_session_start (NOT chat_session_continue -- LFM2
-    // declines the delta path, see model.rs ~1041) re-submitting the growing
-    // history. The content-addressed prefix cache hits (cached_tokens>0),
-    // driving run_paged_prefill_chunk's Pass 2 through forward_paged with
-    // cached_prefix_len>0 -- the EXACT branch this fix changes.
+    // Turn 2: a FRESH chat_session_start re-submitting the growing history
+    // (a delta would also run paged now, but the fresh restart keeps this
+    // probe's shape stable). The content-addressed prefix cache hits
+    // (cached_tokens>0), driving run_paged_prefill_chunk's Pass 2 through
+    // forward_paged with cached_prefix_len>0 -- the EXACT branch this fix
+    // changes.
     let user2 = "Which of those is the closest to the sun?";
     let r2 = model
         .chat_session_start(
