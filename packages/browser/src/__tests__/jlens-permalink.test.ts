@@ -68,6 +68,29 @@ describe('permalink codec', () => {
     expect(decodePermalink('sel=5').sel).toBeNull(); // one coordinate
   });
 
+  it('rejects a sel whose coord is a digit run beyond Number.MAX_SAFE_INTEGER', () => {
+    // The regex passes (all digits, one comma) but parseInt rounds/overflows.
+    // Encode never emits such a sel, so decode must not accept it.
+    expect(decodePermalink('sel=9007199254740993,1').sel).toBeNull(); // rounds to 9007199254740992
+    expect(decodePermalink('sel=' + '9'.repeat(400) + ',1').sel).toBeNull(); // overflows to Infinity
+    // Guard the SECOND capture too: a fix that only checks layerIdx would pass the
+    // first two but leak here.
+    expect(decodePermalink('sel=1,9007199254740993').sel).toBeNull();
+  });
+
+  it('sanitizes a lone surrogate instead of throwing, at the cost of that one char', () => {
+    const encoded = encodePermalink({ prompt: '\uD800', mode: 'logit', pins: [], sel: null });
+    // The lone surrogate becomes U+FFFD (the replacement char), not a URIError.
+    expect(decodePermalink(encoded).prompt).toBe('�');
+  });
+
+  it('round-trips a valid astral character byte-for-byte (toWellFormed left it intact)', () => {
+    // A valid surrogate PAIR must survive untouched — proves the sanitizer only
+    // rewrites LONE surrogates and does not damage well-formed input.
+    const s: JSpaceState = { ...base, prompt: '😀' };
+    expect(decodePermalink(encodePermalink(s)).prompt).toBe('😀');
+  });
+
   it('decodes the two golden mode values', () => {
     expect(decodePermalink('mode=l').mode).toBe('logit');
     expect(decodePermalink('mode=j').mode).toBe('jacobian');

@@ -21,7 +21,14 @@ export type JSpaceState = {
 };
 
 export function encodePermalink(s: JSpaceState): string {
-  const parts = [`p=${encodeURIComponent(s.prompt)}`, `mode=${s.mode === 'jacobian' ? 'j' : 'l'}`];
+  // `encodeURIComponent` THROWS `URIError` on a lone surrogate (e.g. '\uD800'), so
+  // a type-valid state would crash permalink creation. `toWellFormed()` replaces
+  // any unpaired surrogate with U+FFFD first. This is the codec's ONLY lossy path:
+  // for a malformed-UTF-16 prompt `decode(encode(s)).prompt !== s.prompt`. That is
+  // the right call — such a prompt cannot be tokenized anyway, so a non-throwing
+  // lossy permalink beats a crash. Well-formed input (incl. astral pairs) is
+  // untouched and round-trips byte-for-byte.
+  const parts = [`p=${encodeURIComponent(s.prompt.toWellFormed())}`, `mode=${s.mode === 'jacobian' ? 'j' : 'l'}`];
   // Never emit a wire value that `decodePermalink` reads back as different, valid
   // state: filter pins to non-negative safe ints BEFORE the cap, and omit `sel`
   // unless both coordinates are non-negative safe ints.
@@ -74,8 +81,20 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
     // Decode CANNOT range-check layerIdx/pos: it does not know the grid dimensions
     // (layers.length, promptLen). The consumer must clamp them against the actual
     // grid before use.
+    // The regex constrains only the CHARACTER SET, not numeric representability:
+    // `parseInt` silently rounds `9007199254740993` and overflows a 400-digit run
+    // to `Infinity`, which `encodePermalink` would never emit (it omits `sel` for
+    // an unsafe coord). Range-check BOTH captures so decode rejects exactly what
+    // encode refuses to produce. The regex forbids `-`, so a >= 0 check is
+    // redundant and omitted.
     const m = /^(\d+),(\d+)$/.exec(sel);
-    out.sel = m ? { layerIdx: Number.parseInt(m[1]!, 10), pos: Number.parseInt(m[2]!, 10) } : null;
+    if (m) {
+      const layerIdx = Number.parseInt(m[1]!, 10);
+      const pos = Number.parseInt(m[2]!, 10);
+      out.sel = Number.isSafeInteger(layerIdx) && Number.isSafeInteger(pos) ? { layerIdx, pos } : null;
+    } else {
+      out.sel = null;
+    }
   }
 
   return out;
