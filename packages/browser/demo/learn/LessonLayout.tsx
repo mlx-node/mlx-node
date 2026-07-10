@@ -97,10 +97,14 @@ export function LessonLayout({
         <button
           type="button"
           onClick={onBackToIndex}
-          className="inline-flex shrink-0 items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+          // Keep an accessible name at every width: the label is `sr-only` below
+          // `sm` (screen readers still announce it) and visible from `sm` up. The
+          // `py-1.5 -my-1.5` gives the icon-only mobile control a tap target on par
+          // with the neighboring size-sm Buttons without growing the header row.
+          className="inline-flex shrink-0 items-center gap-2 py-1.5 -my-1.5 text-sm text-muted-foreground hover:text-foreground"
         >
           <ArrowLeftIcon className="size-4" />
-          <span className="hidden sm:inline">{ui.lessonLayout.allChapters}</span>
+          <span className="sr-only sm:not-sr-only">{ui.lessonLayout.allChapters}</span>
         </button>
         <div className="min-w-0 flex-1 truncate text-center font-mono text-[0.65rem] uppercase tracking-[0.1em] text-muted-foreground sm:text-xs sm:tracking-[0.15em]">
           {ui.lessonLayout.breadcrumb(current.number, current.title)}
@@ -112,12 +116,12 @@ export function LessonLayout({
           {onLoadModel && !modelReady ? (
             <Button variant="outline" size="sm" onClick={onLoadModel} className="gap-2">
               <DownloadIcon className="size-4" />
-              <span className="hidden sm:inline">{ui.lessonLayout.loadModel}</span>
+              <span className="sr-only sm:not-sr-only">{ui.lessonLayout.loadModel}</span>
             </Button>
           ) : null}
           <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
             <MessageSquareIcon className="size-4" />
-            <span className="hidden sm:inline">{ui.lessonLayout.freeChat}</span>
+            <span className="sr-only sm:not-sr-only">{ui.lessonLayout.freeChat}</span>
           </Button>
           <LanguageSwitcher />
         </div>
