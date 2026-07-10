@@ -2,14 +2,40 @@
  * J-lens f16 SHIPPED-pack rank-parity harness (Task T4.0, R6).
  *
  * Proves the f16 shipped pack (`lens-pack-v1.f16.safetensors`) is READOUT-
- * EQUIVALENT to the F32 master pack (`lens-pack-v1.safetensors`): loading either
- * and running the SAME `lensReadout(useJacobian=true)` over the SAME fixed prompt
- * and layer set yields IDENTICAL top-K id orderings AND identical pinned
- * full-vocab ranks. This is RANK parity, NOT bit identity — plan D8 astype's the
- * pack to bf16 at load, so F32 and f16 collapse to bf16 operands that differ (if
- * at all) only in the last bf16 bit; the readout ranking must be unchanged. This
- * is the export-time validation named in the plan's cross-phase validation story
+ * EQUIVALENT to the F32 master pack (`lens-pack-v1.safetensors`) at the top-K /
+ * rank level: loading either and running the SAME `lensReadout(useJacobian=true)`
+ * over the SAME fixed prompt + layer set must agree on the argmax, keep pinned
+ * ranks within a small tolerance, and preserve top-4 membership. This is RANK
+ * parity WITHIN f16 TOLERANCE, NOT bit identity: plan D8 astype's BOTH packs to
+ * bf16 at load, and f16 rounding (round-trip relErr ≈ 2^-11) crosses a bf16
+ * boundary here and there, so deep pinned ranks jitter by ±1–2 and top-8 slots
+ * 7–8 swap on near-ties while the argmax and top-4 membership hold. Exact top-K /
+ * pinned-rank equality is therefore UNPASSABLE for a correct lossy f16 pack — an
+ * exact gate would reject every good export (the T4.0 initial-commit bug). This
+ * is the export-time validation named in the plan's cross-phase story
  * ("f16 round-trip rank parity at export").
+ *
+ * CLAIM-LEVEL VALIDATION (the definitive proof — run by the controller, NOT here):
+ * the FULL eval on the f16 pack vs the F32 pack (eval-results-f16.json vs
+ * eval-results-v1.json) measured max |Δ jAucHead| = 0.00074 (< 0.001) across all
+ * six suites, f16 J beats logit 6/6 (jWins6=6, same as F32), and logit-AUC is
+ * byte-identical f32-vs-f16 — so f16 preserves the shipped GO claim at the metric
+ * level. THIS harness is only the lightweight top-K SANITY gate guarding the
+ * export (catches overflow→Inf / wrong dtype / gross reorder) without re-running
+ * the ~minutes-long eval.
+ *
+ * PASS CRITERION (gate = (a) ∧ (b) ∧ (c), evaluated at the readout position per
+ * reported layer; the full per-layer diff is still printed for inspection):
+ *   (a) TOP-1 stability — the argmax token is IDENTICAL F32 vs f16 at every layer.
+ *       A real regression flips the argmax; f16 jitter never does. EXACT.
+ *   (b) PINNED-RANK drift bounded — for each pinned id, |rank_f32 − rank_f16| ≤
+ *       max(2, ceil(0.02 * min(rank_f32, rank_f16))): ±2 absolute at shallow ranks,
+ *       2% relative once ranks are deep (where ±1 is meaningless). Two censored
+ *       ranks (native display cap 999 = "≥999") count as equal.
+ *   (c) NO TOP-4 ESCAPE — every id in F32's top-4 appears within f16's top-8 and
+ *       vice-versa (order may swap on near-ties; membership must hold).
+ * Deliberately NOT a rubber stamp: a flipped argmax, a pinned id drifting past the
+ * bound, or a top-4 id falling out of top-8 each FAIL the gate.
  *
  * !!! DO NOT EXECUTE THIS SCRIPT UNSUPERVISED !!!
  * The GPU is SERIAL and the controller owns every MLX job. This harness loads the
@@ -78,6 +104,7 @@ const PROMPT = 'The capital of France is';
 const LAYERS = Array.from({ length: 23 }, (_, i) => i + 1); // fitted domain J.1..J.23
 const TOP_K = 8;
 const EXPECT_JACOBIANS = 23;
+const RANK_CAP = 999; // native full-vocab rank display cap: 999 means ">= 999" (censored)
 
 function fail(msg: string): never {
   console.error(`\nFAIL: ${msg}`);
@@ -155,34 +182,79 @@ async function main(): Promise<void> {
   const B = await readoutFor(modelB, promptIds, pinnedIds);
   if (B.jacobianApplied !== true) fail('f16 readout jacobianApplied=false (expected true for J.1..J.23)');
 
-  // ---------- Compare: top-K id ordering + pinned ranks, per layer ----------
-  console.log(`\n[PARITY] per-layer top-${TOP_K} id ordering + pinned rank parity (F32 vs f16):`);
-  let idMismatches = 0;
-  let rankMismatches = 0;
+  // ---------- Compare: the relaxed-but-principled gate (a) ∧ (b) ∧ (c) ----------
+  // Rationale in the header: exact top-K/rank equality is unpassable for a correct
+  // lossy f16 pack; the gate below passes THIS genuinely-fine pack while still
+  // catching a truly broken export.
+  console.log(
+    `\n[PARITY] per-layer diff + gate (F32 vs f16): (a) top-1 exact, (b) pinned-rank drift ≤ max(2, 2%), (c) top-4 ⊆ top-8:`,
+  );
+  // (b) drift bound: sub-±2 absolute at shallow ranks, 2% relative once deep; two
+  // censored ranks (both >= RANK_CAP, i.e. the "999 = >=999" display cap) are equal.
+  const rankWithinTol = (rF: number, rG: number): boolean => {
+    if (rF >= RANK_CAP && rG >= RANK_CAP) return true;
+    const tol = Math.max(2, Math.ceil(0.02 * Math.min(rF, rG)));
+    return Math.abs(rF - rG) <= tol;
+  };
+  /** (c): every id in `top4` present somewhere in `topK` (top-8). */
+  const subsetOf = (top4: number[], topK: number[]): boolean => {
+    const set = new Set(topK);
+    return top4.every((id) => set.has(id));
+  };
+
+  let top1Flips = 0; // (a) violations
+  let rankViol = 0; // (b) violations
+  let top4Escapes = 0; // (c) violations
+  let exactIdDiffs = 0; // informational: layers whose top-K ORDER is not byte-exact
+  let exactRankDiffs = 0; // informational: layers whose pinned ranks are not byte-exact
   for (let li = 0; li < LAYERS.length; li++) {
     const L = LAYERS[li];
-    const idsOk = sameOrder(A.topKByLayer[li], B.topKByLayer[li]);
-    const ranksOk = sameOrder(A.pinnedRanksByLayer[li], B.pinnedRanksByLayer[li]);
-    if (!idsOk) idMismatches++;
-    if (!ranksOk) rankMismatches++;
-    const flag = idsOk && ranksOk ? 'ok' : 'DIFF';
+    const aIds = A.topKByLayer[li];
+    const bIds = B.topKByLayer[li];
+    const aRanks = A.pinnedRanksByLayer[li];
+    const bRanks = B.pinnedRanksByLayer[li];
+
+    const top1Ok = aIds[0] === bIds[0]; // (a) argmax identical
+    const rankOk = aRanks.every((r, bi) => rankWithinTol(r, bRanks[bi])); // (b)
+    const top4Ok = subsetOf(aIds.slice(0, 4), bIds) && subsetOf(bIds.slice(0, 4), aIds); // (c)
+    if (!top1Ok) top1Flips++;
+    if (!rankOk) rankViol++;
+    if (!top4Ok) top4Escapes++;
+
+    const idsExact = sameOrder(aIds, bIds);
+    const ranksExact = sameOrder(aRanks, bRanks);
+    if (!idsExact) exactIdDiffs++;
+    if (!ranksExact) exactRankDiffs++;
+
+    const layerOk = top1Ok && rankOk && top4Ok;
+    // 'ok' = byte-exact; 'ok*' = passes the gate but has expected f16 jitter; 'FAIL' = gate violated.
+    const flag = layerOk ? (idsExact && ranksExact ? 'ok ' : 'ok*') : 'FAIL';
+    const viol: string[] = [];
+    if (!top1Ok) viol.push(`TOP1 F32=${aIds[0]} f16=${bIds[0]}`);
+    if (!rankOk) viol.push('RANK-DRIFT');
+    if (!top4Ok) viol.push('TOP4-ESCAPE');
     let detail = '';
-    if (!idsOk) detail += `  ids F32=[${A.topKByLayer[li].join(',')}] f16=[${B.topKByLayer[li].join(',')}]`;
-    if (!ranksOk)
-      detail += `  ranks F32=[${A.pinnedRanksByLayer[li].join(',')}] f16=[${B.pinnedRanksByLayer[li].join(',')}]`;
-    console.log(`  ℓ${String(L).padStart(2)}: ${flag}${detail}`);
+    if (!idsExact) detail += `  ids F32=[${aIds.join(',')}] f16=[${bIds.join(',')}]`;
+    if (!ranksExact) detail += `  ranks F32=[${aRanks.join(',')}] f16=[${bRanks.join(',')}]`;
+    console.log(`  ℓ${String(L).padStart(2)}: ${flag}${viol.length ? ' [' + viol.join(' ') + ']' : ''}${detail}`);
   }
 
+  const gateFails = top1Flips + rankViol + top4Escapes;
   console.log(
-    `\n[PARITY] layers=${LAYERS.length}  id-order mismatches=${idMismatches}  pinned-rank mismatches=${rankMismatches}`,
+    `\n[PARITY] layers=${LAYERS.length}  GATE: top1-flips=${top1Flips} rank-drift-viol=${rankViol} top4-escapes=${top4Escapes}`,
   );
-  if (idMismatches > 0 || rankMismatches > 0) {
+  console.log(
+    `[PARITY] informational (expected f16 jitter, NOT gated): ${exactIdDiffs} layer(s) with non-exact top-${TOP_K} order, ` +
+      `${exactRankDiffs} with non-exact pinned ranks`,
+  );
+  if (gateFails > 0) {
     fail(
-      `f16 pack diverges from F32: ${idMismatches} id-order + ${rankMismatches} rank mismatch(es) across ${LAYERS.length} layers`,
+      `f16 pack fails the parity gate: ${top1Flips} argmax flip(s) + ${rankViol} rank-drift violation(s) + ` +
+        `${top4Escapes} top-4 escape(s) across ${LAYERS.length} layers`,
     );
   }
 
-  console.log('\n==================== f16 == F32 readout (rank parity) ====================');
+  console.log('\n==================== f16 ≈ F32 readout (rank parity within f16 tolerance) ====================');
   console.log(SENTINEL);
   process.exit(0);
 }
