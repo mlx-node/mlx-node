@@ -49,6 +49,21 @@ const Y_TICKS: Array<{ rank: number; label: string }> = [
 
 type Point = { x: number; rank: number };
 
+/**
+ * CSS-pixel height the chart renders at for a container of `containerWidth` px.
+ *
+ * BOTH renderers share this ONE responsive aspect ratio (`HEIGHT / SVG_WIDTH`):
+ *   - the SVG path has `viewBox="0 0 560 240"` + `h-auto w-full`, so the browser
+ *     lays it out at exactly `containerWidth * 240/560`.
+ *   - the canvas path sets `style.height` to this value and scales ALL drawing
+ *     coordinates by `k = containerWidth / SVG_WIDTH` (see RankChartCanvas).
+ * That keeps the picture geometrically CONTINUOUS across the 200→201-sample
+ * SVG→canvas switch, instead of jumping from ~171px (scaled SVG) to a fixed 240px.
+ */
+export function chartHeightFor(containerWidth: number): number {
+  return containerWidth * (HEIGHT / SVG_WIDTH);
+}
+
 /** Drawing geometry for a given total drawing width `w` (SVG units or CSS px). */
 function scales(w: number, xMin: number, xMax: number) {
   const innerW = Math.max(1, w - PAD_LEFT - PAD_RIGHT);
@@ -287,15 +302,20 @@ function RankChartCanvas({
 
     const dpr = window.devicePixelRatio || 1;
     const cssW = width > 0 ? width : SVG_WIDTH;
-    const cssH = HEIGHT;
+    const k = cssW / SVG_WIDTH; // uniform responsive scale — matches the SVG viewBox
+    const cssH = chartHeightFor(cssW); // == k * HEIGHT: same aspect ratio as the SVG path
     canvas.width = Math.max(1, Math.round(cssW * dpr));
     canvas.height = Math.max(1, Math.round(cssH * dpr));
     canvas.style.width = `${cssW}px`;
     canvas.style.height = `${cssH}px`;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, cssW, cssH);
+    // Draw in the SAME logical 560×240 space as the SVG path; fold the responsive
+    // scale `k` and the backing-store `dpr` into ONE transform so every coordinate
+    // (and the padding) scales identically — the two renderers stay geometrically
+    // continuous across the CANVAS_THRESHOLD sample-count switch.
+    ctx.setTransform(k * dpr, 0, 0, k * dpr, 0, 0);
+    ctx.clearRect(0, 0, SVG_WIDTH, HEIGHT);
 
-    const { xFor, yFor, innerH } = scales(cssW, xMin, xMax);
+    const { xFor, yFor, innerH } = scales(SVG_WIDTH, xMin, xMax);
 
     // Gridlines + y tick labels.
     ctx.font = FONT;
@@ -306,8 +326,8 @@ function RankChartCanvas({
       ctx.strokeStyle = 'rgba(232, 228, 236, 0.08)';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(PAD_LEFT, y + 0.5);
-      ctx.lineTo(cssW - PAD_RIGHT, y + 0.5);
+      ctx.moveTo(PAD_LEFT, y);
+      ctx.lineTo(SVG_WIDTH - PAD_RIGHT, y);
       ctx.stroke();
       ctx.fillStyle = CANVAS.inkMuted;
       ctx.fillText(t.label, PAD_LEFT - 6, y);
@@ -358,10 +378,10 @@ function RankChartCanvas({
       }
     });
 
-    // x-axis label.
+    // x-axis label — logical coords, matching the SVG path's placement exactly.
     ctx.fillStyle = CANVAS.inkMuted;
     ctx.textAlign = 'center';
-    ctx.fillText(xLabel, PAD_LEFT + (cssW - PAD_LEFT - PAD_RIGHT) / 2, cssH - 8);
+    ctx.fillText(xLabel, PAD_LEFT + (SVG_WIDTH - PAD_LEFT - PAD_RIGHT) / 2, HEIGHT - 6);
   }, [points, colors, xLabel, selectedX, xMin, xMax, width, resizeTick]);
 
   return (

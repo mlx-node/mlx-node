@@ -94,4 +94,16 @@ describe('rank axis', () => {
     const b = rankToY(10, 100) - rankToY(100, 100);
     expect(Math.abs(a - b)).toBeLessThan(1); // equal decades ⇒ equal pixels
   });
+
+  it('pins the endpoints and clamps out-of-range ranks', () => {
+    const h = 100;
+    // The equal-decade property alone would still pass a shifted formula like
+    // `10 + log10(rank)`; pin the actual endpoints so the axis cannot drift.
+    expect(rankToY(1, h)).toBe(0); // rank 1 sits exactly at the top
+    expect(rankToY(RANK_CAP, h)).toBe(h); // the cap sits exactly at the bottom
+    // Below-cap clamp: rank 0 (impossible, but a stale/garbage value) → rank 1 → top.
+    expect(rankToY(0, h)).toBe(0);
+    // Above-cap clamp: any rank past the cap pins to the bottom band, never beyond.
+    expect(rankToY(RANK_CAP * 5, h)).toBe(h);
+  });
 });
