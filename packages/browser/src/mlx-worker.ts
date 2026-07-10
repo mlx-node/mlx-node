@@ -38,6 +38,7 @@ import {
   INSPECTOR_REQUEST_TYPE,
   INSPECTOR_RESULT_TYPE,
   LENS_MAX_PINNED,
+  LENS_MAX_POSITIONS,
   LENS_READOUT_ERROR_TYPE,
   LENS_READOUT_REQUEST_TYPE,
   LENS_READOUT_RESULT_TYPE,
@@ -2694,9 +2695,10 @@ async function handleLensReadout(data: {
       typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 && x <= 0xffffffff;
     // Mirror the backend's bounds up front so obviously-bad requests fail with a
     // clear message before crossing into wasm. The backend re-checks (plus
-    // vocab-range checks we can't do here), clamps topK to min(requested, 32,
-    // vocab), and truncates pinnedIds past the cap. Constants:
-    // LENS_MAX_POSITIONS=48, LENS_MAX_PINNED=8, boundaries 0..=24.
+    // vocab-range checks we can't do here).
+    // The backend clamps topK to min(requested, 32, vocab) and hard-ERRORS on a
+    // pinnedIds list longer than LENS_MAX_PINNED — it does not truncate.
+    // Boundaries are 0..=24; layer 0 has no Jacobian and errors under useJacobian.
     if (promptIds.length === 0) {
       (self as any).postMessage({
         type: LENS_READOUT_ERROR_TYPE,
@@ -2705,11 +2707,11 @@ async function handleLensReadout(data: {
       });
       return;
     }
-    if (promptIds.length > 48) {
+    if (promptIds.length > LENS_MAX_POSITIONS) {
       (self as any).postMessage({
         type: LENS_READOUT_ERROR_TYPE,
         id,
-        error: `lensReadout: promptIds length must be <= 48 (LENS_MAX_POSITIONS) (got ${promptIds.length})`,
+        error: `lensReadout: promptIds length must be <= ${LENS_MAX_POSITIONS} (LENS_MAX_POSITIONS) (got ${promptIds.length})`,
       });
       return;
     }
@@ -2767,6 +2769,7 @@ async function handleLensReadout(data: {
       topK,
       pinnedIds,
       useJacobian: data.useJacobian,
+      noTile: data.noTile,
     });
 
     // Float32Array/Int32Array buffers are transferable for zero-copy

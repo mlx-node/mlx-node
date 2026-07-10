@@ -142,6 +142,7 @@ export function lensReadout(
       topK: req.topK,
       pinnedIds: req.pinnedIds,
       useJacobian: req.useJacobian,
+      noTile: req.noTile,
     };
 
     try {

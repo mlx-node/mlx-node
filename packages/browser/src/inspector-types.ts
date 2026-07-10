@@ -366,8 +366,7 @@ export type LensReadoutRequest = {
   type: 'lensReadout';
   /** Caller-supplied correlation id. The worker echoes this in the response. */
   id: string;
-  /** Prompt token ids to read. Must be non-empty; length 1..48
-   *  (LENS_MAX_POSITIONS). */
+  /** Prompt token ids to read. Must be non-empty; length 1..LENS_MAX_POSITIONS. */
   promptIds: number[];
   /** Residual-stream boundaries to read, each `0..=24` (`h_0` = embedding
    *  output … `h_24` = pre-final-norm). Empty/undefined = all 25. */
@@ -382,6 +381,12 @@ export type LensReadoutRequest = {
    *  the plain logit lens (the browser has no pack). Forwarded faithfully — a
    *  `true` with a non-final layer and no pack errors in the backend. */
   useJacobian: boolean;
+  /**
+   * Diagnostic: force a single untiled position tile. Used only by the
+   * tiling-parity harness to run tiled vs untiled on the SAME backend and the
+   * SAME binary. Never set by application code.
+   */
+  noTile?: boolean;
 };
 
 /** Per-(layer, position) readout cell. Sibling of `ScorePosition`: same top-K
@@ -453,6 +458,13 @@ export const LENS_READOUT_ERROR_TYPE = 'lensReadoutError' as const;
  * this value so the 9th pin is refused before the worker can error.
  */
 export const LENS_MAX_PINNED = 8;
+
+/**
+ * Cap on `lensReadout` prompt length. MUST equal
+ * `crates/mlx-core/src/inspector.rs` `LENS_MAX_POSITIONS`. The worker guard and
+ * the /jspace client cap both read this — no bare literal anywhere.
+ */
+export const LENS_MAX_POSITIONS = 128;
 
 // -----------------------------------------------------------------------------
 // loadLensPack — one-shot request to fetch the shipped f16 J-lens pack, upload

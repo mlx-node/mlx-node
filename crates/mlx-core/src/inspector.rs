@@ -914,6 +914,10 @@ pub struct LensReadoutOptions {
     /// boundary (`ℓ==24`) is `J=I` by definition and needs no pack, so a
     /// final-boundary-only request is always allowed even with no pack loaded.
     pub use_jacobian: bool,
+    /// Diagnostic: force a single untiled position tile, reproducing the
+    /// pre-tiling code path. Used by the tiling-parity harness to run tiled and
+    /// untiled from ONE binary on the SAME backend. Not part of the public API.
+    pub no_tile: Option<bool>,
 }
 
 /// Per-(layer, position) readout cell. Sibling of [`ScorePositionNapi`]: same
@@ -1097,10 +1101,26 @@ pub const LENS_TOP_K_CAP: u32 = 32;
 /// plus one `Int32Array` of length `cells` in the result.
 pub const LENS_MAX_PINNED: usize = 8;
 
-/// Cap on the prompt length (`P`, positions) accepted by `lensReadout`. Bounds
-/// the transient per-layer `[P, vocab]` logits materialized on device and the
-/// number of cells (`layers × P`) crossed to host.
-pub const LENS_MAX_POSITIONS: usize = 48;
+/// Cap on the prompt length (`P`, positions) accepted by `lensReadout`.
+///
+/// 128 matches the context length the Jacobian was fitted at (100 prompts ×
+/// 128 tokens). This is a PURE bound — nothing is array-sized by it. What used
+/// to make it load-bearing was the per-layer `[P, vocab]` transient; that is now
+/// bounded by `LENS_POSITION_TILE` instead, so peak memory tracks the tile.
+pub const LENS_MAX_POSITIONS: usize = 128;
+
+/// Positions per tile in the per-layer unembed.
+///
+/// Tiles are BALANCED, never `step_by`: `n = ceil(P/32)`, and every tile is
+/// `floor(P/n)` or `floor(P/n)+1`. A size-1 tile must never occur — `M == 1`
+/// routes the unembed matmul to the split-K GEMV (`webgpu/matmul.cpp:995`),
+/// whose different K-summation order can flip an exact tie in the downstream
+/// EXACT `argpartition`. Balanced tiling emits a size-1 tile only at `P == 1`,
+/// which is a single untiled tile and therefore identical to the old path.
+///
+/// 32 also keeps every lesson preset (`P <= 9`) at `n == 1`, so the committed
+/// baked frames can never change.
+pub const LENS_POSITION_TILE: usize = 32;
 
 /// The number of residual-stream boundaries the J-lens can read: `h_0`
 /// (embedding output) through `h_24` (pre-final-norm hidden state, = the

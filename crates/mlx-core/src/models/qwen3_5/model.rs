@@ -12,8 +12,9 @@ use crate::array::MxArray;
 use crate::chat_stream::{ChatStreamSink, MIN_SAB_LEN, SabSink};
 use crate::inspector::{
     AttentionLayerNapi, AttentionRunNapi, INSPECTOR_MAX_NEW_TOKENS_CAP, InspectorRecorder,
-    InspectorRunOptions, LENS_MAX_PINNED, LENS_MAX_POSITIONS, LENS_NUM_BOUNDARIES, LENS_TOP_K_CAP,
-    LensCellNapi, LensPinnedNapi, LensReadoutOptions, LensReadoutResult, LogitsStepNapi,
+    InspectorRunOptions, LENS_MAX_PINNED, LENS_MAX_POSITIONS, LENS_NUM_BOUNDARIES,
+    LENS_POSITION_TILE, LENS_TOP_K_CAP, LensCellNapi, LensPinnedNapi, LensReadoutOptions,
+    LensReadoutResult, LogitsStepNapi,
     ModelMetaNapi, SCORE_TOKENS_MAX_DRAFT, SCORE_TOKENS_TOP_K_CAP, ScorePositionNapi,
     ScoreTokensResult, TokenInfoNapi, top_k_rows, verify_logit_row_bounds,
 };
@@ -6348,6 +6349,8 @@ impl Qwen35Inner {
             let mut cell_data: Vec<CellRaw> = Vec::with_capacity(layers.len() * p);
             let mut pinned_ranks: Vec<Vec<i32>> = vec![Vec::with_capacity(layers.len() * p); pinned_ids.len()];
 
+            let no_tile = opts.no_tile.unwrap_or(false);
+
             for &l in &layers {
                 let h_l = boundaries[l].as_ref().ok_or_else(|| {
                     Error::from_reason(format!(
@@ -6357,12 +6360,10 @@ impl Qwen35Inner {
                 })?;
 
                 // Apply J_ℓ per position if a pack Jacobian exists for this
-                // boundary; otherwise identity (plain logit lens). `x = h · Jᵀ`
-                // realizes the per-position `J·h`. The final boundary (ℓ==24) is
-                // `J=I` by definition and is ALWAYS identity — never apply a
-                // `J.24` even if one were somehow present in the pack
-                // (design-freeze D6). Non-final requested layers are guaranteed
-                // to carry a real `J` by the up-front validation above.
+                // boundary; otherwise identity (plain logit lens). The final
+                // boundary is `J=I` by definition (design-freeze D6). This
+                // matmul stays FULL-P: it is `[P,1024]·[1024,1024]`, ~0.5 MB,
+                // and tiling it would change M and thus the accumulation order.
                 let is_final = l == max_boundary as usize;
                 let x = match (
                     use_jacobian && !is_final,
@@ -6375,73 +6376,97 @@ impl Qwen35Inner {
                     _ => h_l.clone(),
                 };
 
-                let normed = self.final_norm.forward(&x)?;
-                let logits3d = normed.matmul(&embedding_weight_t)?;
-                // Reshape `[1, P, vocab]` → `[P, vocab]` and promote to f32 so
-                // logsumexp / probs / ranks are numerically safe.
-                let logits = logits3d
-                    .reshape(&[p as i64, vocab as i64])?
-                    .astype(crate::array::DType::Float32)?;
+                // Balanced position tiles: n = ceil(P/C), sizes floor(P/n) or +1.
+                // Never `step_by` — that leaves a size-1 remainder at P=33.
+                let n_tiles = if no_tile { 1 } else { p.div_ceil(LENS_POSITION_TILE) };
+                let base = p / n_tiles;
+                let extra = p % n_tiles; // the first `extra` tiles get one more
 
-                // Device top-K (argpartition → slice → gather → tiny argsort),
-                // the exact recipe from `sparse_distributions_from_logits`.
-                let neg_logits = logits.mul_scalar(-1.0)?;
-                let partitioned = neg_logits.argpartition((top_k as i32) - 1, Some(-1))?;
-                let top_idx = partitioned.slice(&[0, 0], &[p as i64, top_k as i64])?;
-                let top_vals = logits.take_along_axis(&top_idx, -1)?;
-                let sort_order = top_vals.mul_scalar(-1.0)?.argsort(Some(-1))?;
-                let top_idx = top_idx.take_along_axis(&sort_order, -1)?;
-                let top_vals = top_vals.take_along_axis(&sort_order, -1)?;
+                let mut tile_start = 0usize;
+                for t in 0..n_tiles {
+                    let tile_len = base + usize::from(t < extra);
 
-                // Full-vocab-normalized probabilities for the retained K (an
-                // honest probability via a logsumexp over the whole row).
-                let log_total = logits.logsumexp(Some(&[-1]), Some(true))?;
-                let probs = top_vals
-                    .sub(&log_total)?
-                    .exp()?
-                    .astype(crate::array::DType::Float32)?;
+                    // n_tiles == 1 must NOT slice. An identity slice is a
+                    // different graph node; the un-sliced clone is what makes
+                    // "P <= 9 is byte-identical to the old path" assertable.
+                    let x_tile = if n_tiles == 1 {
+                        x.clone()
+                    } else {
+                        x.slice_axis(1, tile_start as i64, (tile_start + tile_len) as i64)?
+                    };
 
-                // Pinned-token ranks: `rank = (#tokens with strictly greater
-                // logit) + 1`, via gt-count — never a sort (design-freeze D7).
-                let mut pinned_counts: Vec<MxArray> = Vec::with_capacity(pinned_ids.len());
-                for &pid in &pinned_ids {
-                    let col = MxArray::from_int32(&vec![pid as i32; p], &[p as i64, 1])?;
-                    let pinned_logit = logits.take_along_axis(&col, -1)?; // [P,1]
-                    let gt = logits.greater(&pinned_logit)?; // [P, vocab]
-                    let count = gt
-                        .astype(crate::array::DType::Float32)?
-                        .sum(Some(&[-1]), Some(false))?; // [P]
-                    pinned_counts.push(count);
-                }
+                    let normed = self.final_norm.forward(&x_tile)?;
+                    let logits3d = normed.matmul(&embedding_weight_t)?;
+                    let logits = logits3d
+                        .reshape(&[tile_len as i64, vocab as i64])?
+                        .astype(crate::array::DType::Float32)?;
 
-                // Materialize only the small results.
-                let mut to_eval: Vec<&MxArray> = vec![&top_idx, &top_vals, &probs];
-                for c in &pinned_counts {
-                    to_eval.push(c);
-                }
-                MxArray::eval_arrays(&to_eval)?;
+                    let neg_logits = logits.mul_scalar(-1.0)?;
+                    let partitioned = neg_logits.argpartition((top_k as i32) - 1, Some(-1))?;
+                    let top_idx = partitioned.slice(&[0, 0], &[tile_len as i64, top_k as i64])?;
+                    let top_vals = logits.take_along_axis(&top_idx, -1)?;
+                    let sort_order = top_vals.mul_scalar(-1.0)?.argsort(Some(-1))?;
+                    let top_idx = top_idx.take_along_axis(&sort_order, -1)?;
+                    let top_vals = top_vals.take_along_axis(&sort_order, -1)?;
 
-                let ids: Vec<i32> = top_idx.to_int32()?.to_vec();
-                let vals: Vec<f32> = top_vals.to_float32()?.to_vec();
-                let prob_v: Vec<f32> = probs.to_float32()?.to_vec();
+                    let log_total = logits.logsumexp(Some(&[-1]), Some(true))?;
+                    let probs = top_vals
+                        .sub(&log_total)?
+                        .exp()?
+                        .astype(crate::array::DType::Float32)?;
 
-                for pos in 0..p {
-                    let base = pos * top_k;
-                    cell_data.push((
-                        l,
-                        pos,
-                        ids[base..base + top_k].to_vec(),
-                        vals[base..base + top_k].to_vec(),
-                        prob_v[base..base + top_k].to_vec(),
-                    ));
-                }
-
-                for (pi, count_arr) in pinned_counts.iter().enumerate() {
-                    let counts: Vec<f32> = count_arr.to_float32()?.to_vec(); // len P
-                    for &c in counts.iter().take(p) {
-                        let rank = (c.round() as i64) + 1;
-                        pinned_ranks[pi].push(rank.min(999) as i32);
+                    let mut pinned_counts: Vec<MxArray> = Vec::with_capacity(pinned_ids.len());
+                    for &pid in &pinned_ids {
+                        let col = MxArray::from_int32(&vec![pid as i32; tile_len], &[tile_len as i64, 1])?;
+                        let pinned_logit = logits.take_along_axis(&col, -1)?; // [C,1]
+                        let gt = logits.greater(&pinned_logit)?; // [C, vocab]
+                        let count = gt
+                            .astype(crate::array::DType::Float32)?
+                            .sum(Some(&[-1]), Some(false))?; // [C]
+                        pinned_counts.push(count);
                     }
+
+                    // Per-TILE eval + readback. This — not the slicing — is what
+                    // keeps peak memory tracking the tile instead of P: MLX is
+                    // lazy, so a layer-level eval would still materialize the
+                    // whole [P, vocab] graph at once.
+                    let mut to_eval: Vec<&MxArray> = vec![&top_idx, &top_vals, &probs];
+                    for c in &pinned_counts {
+                        to_eval.push(c);
+                    }
+                    MxArray::eval_arrays(&to_eval)?;
+
+                    let ids: Vec<i32> = top_idx.to_int32()?.to_vec();
+                    let vals: Vec<f32> = top_vals.to_float32()?.to_vec();
+                    let prob_v: Vec<f32> = probs.to_float32()?.to_vec();
+
+                    // GLOBAL position, not the tile-local index: buildLensSlice
+                    // reads cells[layerIdx * promptLen + pos] (jlens-core/types.ts:39).
+                    for local in 0..tile_len {
+                        let base_i = local * top_k;
+                        cell_data.push((
+                            l,
+                            tile_start + local,
+                            ids[base_i..base_i + top_k].to_vec(),
+                            vals[base_i..base_i + top_k].to_vec(),
+                            prob_v[base_i..base_i + top_k].to_vec(),
+                        ));
+                    }
+
+                    // pi OUTER, tile-local position INNER, tiles appended in
+                    // order — so each pinned_ranks[pi] stays layer-major /
+                    // position-minor, matching the same flat index. Getting this
+                    // nesting wrong compiles, passes every shape check, and
+                    // silently scrambles the rank tracks.
+                    for (pi, count_arr) in pinned_counts.iter().enumerate() {
+                        let counts: Vec<f32> = count_arr.to_float32()?.to_vec(); // len tile_len
+                        for &c in counts.iter().take(tile_len) {
+                            let rank = (c.round() as i64) + 1;
+                            pinned_ranks[pi].push(rank.min(999) as i32);
+                        }
+                    }
+
+                    tile_start += tile_len;
                 }
             }
 
