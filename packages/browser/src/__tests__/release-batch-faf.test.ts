@@ -86,21 +86,33 @@ describe('BUFFER_RELEASE_BATCH fire-and-forget (Task B)', () => {
     expect(stats.rpcCount).toBe(1);
   });
 
-  it('does not block on Atomics.wait (returns within 5 ms)', () => {
+  it('never calls Atomics.wait during the auto-flush', () => {
     const { stub } = makeBridgeHarness();
     const release = stub.imports.wgpuBufferRelease as (h: number) => void;
 
-    // If the implementation regressed and Atomics.wait were somehow invoked
-    // on the main thread, it would either throw (TypeError in browsers) OR
-    // block until timeout. Measure wall clock of the auto-flush to catch
-    // either failure mode. 5 ms is generous — the fire-and-forget path is
-    // a handful of stores.
-    const t0 = performance.now();
-    for (let i = 0; i < MAX_RELEASE_BATCH; i++) {
-      release(2000 + i);
+    // Observe the property directly instead of timing it. A regression that
+    // reintroduced a blocking round-trip must call Atomics.wait, so a spy is an
+    // exact detector; on the main thread that call also throws TypeError, which
+    // the not.toThrow() below catches. A wall-clock budget could only ever have
+    // been a proxy for machine load.
+    const realWait = Atomics.wait;
+    let waitCalls = 0;
+    Atomics.wait = ((...args: Parameters<typeof Atomics.wait>) => {
+      waitCalls += 1;
+      return realWait.apply(Atomics, args);
+    }) as typeof Atomics.wait;
+
+    try {
+      expect(() => {
+        for (let i = 0; i < MAX_RELEASE_BATCH; i++) {
+          release(2000 + i);
+        }
+      }).not.toThrow();
+    } finally {
+      Atomics.wait = realWait;
     }
-    const elapsed = performance.now() - t0;
-    expect(elapsed).toBeLessThan(5);
+
+    expect(waitCalls).toBe(0);
   });
 
   it('leaves STATUS=IDLE when there are zero pending releases', () => {
