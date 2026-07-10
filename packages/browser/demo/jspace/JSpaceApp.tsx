@@ -23,6 +23,7 @@ import { cleanupTokenText, renderTokenDisplay } from '../learn/inspector/TopKBar
 import { SegmentedToggle } from '../learn/scaffolding/SegmentedToggle';
 import { ArgmaxGridCanvas, normalizeSelected, type CellRef } from './ArgmaxGridCanvas';
 import { ByLayerStrip } from './ByLayerStrip';
+import { isColdPrompt } from './cold-prompt';
 import { ByPosStrip } from './ByPosStrip';
 import { PinManager } from './PinManager';
 import { PromptTokens } from './PromptTokens';
@@ -75,6 +76,11 @@ export default function JSpaceApp() {
   const [tokenCount, setTokenCount] = React.useState<number | null>(null);
   const [runError, setRunError] = React.useState<string | null>(null);
   const [jac, setJac] = React.useState<JacState>({ status: 'idle' });
+  // True from `handleRun` entry until the dispatched run fully settles — covers the
+  // pre-dispatch `await tokenize(...)` window where neither `running` nor `activating`
+  // is set yet, so the mode toggle can't change out from under an in-flight run and a
+  // second Enter/Run can't start a duplicate (F1).
+  const [preparing, setPreparing] = React.useState(false);
 
   // ---- refs (async-closure-safe mirrors + one-shot guards) ----------------
   const pinsRef = React.useRef(pins);
@@ -82,6 +88,10 @@ export default function JSpaceApp() {
   const committedPromptIdsRef = React.useRef<number[] | null>(null);
   const packLoadedRef = React.useRef(false);
   const jacActivatedRef = React.useRef(false);
+  // Single-flight promise for `ensureJacobianReady`: all entry points (Enter, mode
+  // toggle, addPin/removePin → runReadout) coalesce onto ONE 46 MB download + ONE
+  // self-test instead of racing concurrent activations (F2).
+  const jacActivationRef = React.useRef<Promise<'ok' | 'failed' | 'unavailable'> | null>(null);
   const hashAppliedRef = React.useRef(false);
   const lastWrittenHashRef = React.useRef<string | null>(null);
 
@@ -92,6 +102,7 @@ export default function JSpaceApp() {
   React.useEffect(() => {
     packLoadedRef.current = false;
     jacActivatedRef.current = false;
+    jacActivationRef.current = null;
     setJac({ status: 'idle' });
   }, [loadKickoff]);
 
@@ -150,28 +161,37 @@ export default function JSpaceApp() {
     const worker = mlxWorkerRef.current;
     if (!worker) return 'unavailable';
     if (jacActivatedRef.current) return jac.status === 'failed' ? 'failed' : 'ok';
-    setJac({ status: 'activating' });
-    try {
-      // Idempotent 46 MB fetch + GPU upload; trust the worker's returned
-      // already-loaded flag over packLoadedRef (which a model reload invalidates).
-      await loadLensPack(worker, { signal: inspectorAbortRef.current?.signal ?? undefined });
-      packLoadedRef.current = true;
-      const verdict = await runSelfTest(worker);
-      jacActivatedRef.current = true;
-      if (verdict.ok) {
-        setJac({ status: 'ok', verdict });
-        return 'ok';
-      }
-      // The self-test caught garbage — refuse the "verified" badge, warn loudly.
-      setJac({ status: 'failed', verdict });
-      return 'failed';
-    } catch (err) {
-      if (isAbortError(err)) {
-        setJac({ status: 'idle' });
+    if (jacActivationRef.current) return jacActivationRef.current; // coalesce concurrent callers
+    const p = (async (): Promise<'ok' | 'failed' | 'unavailable'> => {
+      setJac({ status: 'activating' });
+      try {
+        // Idempotent 46 MB fetch + GPU upload; trust the worker's returned
+        // already-loaded flag over packLoadedRef (which a model reload invalidates).
+        await loadLensPack(worker, { signal: inspectorAbortRef.current?.signal ?? undefined });
+        packLoadedRef.current = true;
+        const verdict = await runSelfTest(worker);
+        jacActivatedRef.current = true;
+        if (verdict.ok) {
+          setJac({ status: 'ok', verdict });
+          return 'ok';
+        }
+        // The self-test caught garbage — refuse the "verified" badge, warn loudly.
+        setJac({ status: 'failed', verdict });
+        return 'failed';
+      } catch (err) {
+        if (isAbortError(err)) {
+          setJac({ status: 'idle' });
+          return 'unavailable';
+        }
+        setJac({ status: 'error', message: err instanceof Error ? err.message : String(err) });
         return 'unavailable';
       }
-      setJac({ status: 'error', message: err instanceof Error ? err.message : String(err) });
-      return 'unavailable';
+    })();
+    jacActivationRef.current = p;
+    try {
+      return await p;
+    } finally {
+      jacActivationRef.current = null;
     }
   }
 
@@ -195,37 +215,44 @@ export default function JSpaceApp() {
 
   async function handleRun(): Promise<void> {
     setRunError(null);
-    if (modelStatus !== 'ready') {
-      kickoffLoad();
-      return;
-    }
-    const worker = mlxWorkerRef.current;
-    if (!worker) {
-      setRunError('MLX worker is not available.');
-      return;
-    }
-    let toks: TokenInfo[];
+    // `preparing` guards the whole run — including the pre-dispatch `await tokenize`
+    // window — so the mode toggle and a second run stay disabled until this settles.
+    setPreparing(true);
     try {
-      toks = await tokenize(worker, prompt);
-    } catch (err) {
-      if (isAbortError(err)) return;
-      setRunError(err instanceof Error ? err.message : String(err));
-      return;
+      if (modelStatus !== 'ready') {
+        kickoffLoad();
+        return;
+      }
+      const worker = mlxWorkerRef.current;
+      if (!worker) {
+        setRunError('MLX worker is not available.');
+        return;
+      }
+      let toks: TokenInfo[];
+      try {
+        toks = await tokenize(worker, prompt);
+      } catch (err) {
+        if (isAbortError(err)) return;
+        setRunError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+      const promptIds = toks.map((t) => t.id);
+      setTokenCount(promptIds.length); // live token counter reflects this submit
+      if (promptIds.length === 0) {
+        setRunError('Prompt tokenized to zero tokens.');
+        return;
+      }
+      // CLIENT CAP: refuse to dispatch beyond LENS_MAX_POSITIONS (never a bare 128).
+      if (promptIds.length > LENS_MAX_POSITIONS) {
+        setRunError(`Prompt is ${promptIds.length} tokens; the maximum is ${LENS_MAX_POSITIONS}. Trim it to run.`);
+        return;
+      }
+      setSelected(null);
+      setHovered(null);
+      await runReadout(promptIds, pinsRef.current, mode);
+    } finally {
+      setPreparing(false);
     }
-    const promptIds = toks.map((t) => t.id);
-    setTokenCount(promptIds.length); // live token counter reflects this submit
-    if (promptIds.length === 0) {
-      setRunError('Prompt tokenized to zero tokens.');
-      return;
-    }
-    // CLIENT CAP: refuse to dispatch beyond LENS_MAX_POSITIONS (never a bare 128).
-    if (promptIds.length > LENS_MAX_POSITIONS) {
-      setRunError(`Prompt is ${promptIds.length} tokens; the maximum is ${LENS_MAX_POSITIONS}. Trim it to run.`);
-      return;
-    }
-    setSelected(null);
-    setHovered(null);
-    await runReadout(promptIds, pinsRef.current, mode);
   }
 
   function handleModeChange(next: LensMode): void {
@@ -292,7 +319,7 @@ export default function JSpaceApp() {
     if (typeof window === 'undefined') return;
     const encoded = encodePermalink({ prompt, mode, pins, sel: selected });
     if (encoded === lastWrittenHashRef.current) return;
-    const isColdDefault = prompt === '' && pins.length === 0 && selected === null && mode === DEFAULTS.mode;
+    const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null && mode === DEFAULTS.mode;
     if (isColdDefault && (lastWrittenHashRef.current === null || lastWrittenHashRef.current === '')) return;
     lastWrittenHashRef.current = encoded;
     const url = `${window.location.pathname}${window.location.search}#${encoded}`;
@@ -313,7 +340,7 @@ export default function JSpaceApp() {
       const slice = buildLensSlice(liveResult);
       return { kind: 'live', slice, pinned: liveResult.pinned };
     }
-    if (prompt.trim() === '') {
+    if (isColdPrompt(prompt)) {
       const frame = (STARTERS[starterSlug] ?? STARTERS['french-season']) as BakedFile;
       const run = mode === 'jacobian' ? frame.jacobian : frame.logit;
       const slice = buildLensSlice(reviveRun(run));
@@ -416,6 +443,7 @@ export default function JSpaceApp() {
             // never on every keystroke.
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
+              if (running || activating || preparing) return;
               void handleRun();
             }
           }}
@@ -427,7 +455,7 @@ export default function JSpaceApp() {
           <button
             type="button"
             onClick={() => void handleRun()}
-            disabled={running || activating}
+            disabled={running || activating || preparing}
             className="rounded-md border border-primary/50 bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
             {!modelReady ? 'Download & run' : running ? 'Reading layers…' : 'Run'}
@@ -437,7 +465,7 @@ export default function JSpaceApp() {
             value={mode}
             onChange={handleModeChange}
             ariaLabel="Lens mode"
-            disabled={running || activating}
+            disabled={running || activating || preparing}
             options={[
               { value: 'logit' as LensMode, label: 'Logit' },
               { value: 'jacobian' as LensMode, label: 'Jacobian' },
@@ -484,6 +512,10 @@ export default function JSpaceApp() {
         ) : jac.status === 'error' ? (
           <p className="text-[12px] text-destructive" role="alert">
             <strong>Jacobian lens unavailable.</strong> {jac.message}
+          </p>
+        ) : jac.status === 'idle' && modelReady ? (
+          <p className="text-[12px] text-muted-foreground">
+            Switching to the Jacobian lens downloads a ~46 MB fitted-lens pack (once).
           </p>
         ) : null}
 
