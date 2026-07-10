@@ -63,7 +63,9 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { derivePins, type Encode } from '../../demo/jlens-core/derive-pins.ts';
 import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../../demo/jlens-core/jacobian-presets.ts';
+import { LENS_MAX_PINNED } from '../../src/inspector-types.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -82,7 +84,6 @@ const META_PATH = process.env.JLENS_META ?? DEFAULT_META;
 const OUT_DIR = process.env.JLENS_OUT_DIR ?? join(HERE, '../../demo/learn/widgets/jlens/baked');
 
 const TOP_K = 10;
-const LENS_MAX_PINNED = 8; // crates/mlx-core NAPI contract cap.
 const EXPECTED_JACOBIANS = 23; // J.1..J.23 in the v1 pack (eval.mts:179).
 
 // ---- serialized (JSON-safe) mirror of LensReadoutRun -----------------------
@@ -167,11 +168,13 @@ async function main() {
 
   mkdirSync(OUT_DIR, { recursive: true });
 
-  // Qwen emits a standalone space token before a digit, so ` 7` tokenizes to
-  // [' ', '7']. Pinning the first token would then track bare whitespace. Learn
-  // the standalone-space id once so the pin loop can detect that case.
-  const spaceEnc: number[] = await model.encodeTokens(' ');
-  const standaloneSpaceId: number | null = spaceEnc.length === 1 ? spaceEnc[0]! : null;
+  // `derivePins` needs {id,text}[]; the native model returns ids and texts from
+  // two calls. Adapting here keeps ONE pin predicate across bake and the browsers.
+  const encodeWithText: Encode = async (text) => {
+    const ids: number[] = await model.encodeTokens(text);
+    const texts: string[] = await model.decodeTokens(ids);
+    return ids.map((id, i) => ({ id, text: texts[i] ?? '' }));
+  };
 
   for (const preset of JACOBIAN_PRESETS) {
     // 1. tokenize the RAW prompt (no chat template — D9).
@@ -182,17 +185,7 @@ async function main() {
     //    FIRST token id, flag multi-token concepts. When that first token is the
     //    standalone space (` 7`), fall back to the space-less form — a whitespace
     //    pin's rank track says nothing about the concept it claims to follow.
-    const pinnedIds: number[] = [];
-    const partialFlags: boolean[] = [];
-    for (const concept of preset.concepts) {
-      let enc: number[] = await model.encodeTokens(` ${concept}`);
-      if (enc.length > 0 && standaloneSpaceId !== null && enc[0] === standaloneSpaceId) {
-        enc = await model.encodeTokens(concept);
-      }
-      if (enc.length === 0) continue; // mirror the widget's skip-empty behavior
-      pinnedIds.push(enc[0]);
-      partialFlags.push(enc.length > 1);
-    }
+    const { pinnedIds, partialFlags } = await derivePins(preset.concepts, encodeWithText);
     // Keep concepts index-aligned with pins so T4.4 can zip them 1:1. None of the
     // curated concepts tokenize to zero tokens; fail loud if that ever changes.
     if (pinnedIds.length !== preset.concepts.length) {
