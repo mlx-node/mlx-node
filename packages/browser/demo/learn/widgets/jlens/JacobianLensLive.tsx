@@ -373,11 +373,18 @@ export function JacobianLensLive() {
       if (promptIds.length === 0) throw new Error('prompt tokenized to zero tokens');
 
       // Pin each concept by its first token (leading space → mid-sentence form).
+      // Must match scripts/jlens/bake.mts, or a live run would disagree with the
+      // baked frame: when the leading space becomes its own token (` 7` → [' ', '7'])
+      // the pin would track bare whitespace, so fall back to the space-less form.
       const pinnedIds: number[] = [];
       const partialFlags: boolean[] = [];
       for (const concept of preset.concepts) {
-        const conceptTokens = await tokenize(worker, ` ${concept}`, { signal: ctrl.signal });
+        let conceptTokens = await tokenize(worker, ` ${concept}`, { signal: ctrl.signal });
         if (runGenRef.current !== myGen) return;
+        if (conceptTokens.length > 0 && conceptTokens[0]!.text.trim() === '') {
+          conceptTokens = await tokenize(worker, concept, { signal: ctrl.signal });
+          if (runGenRef.current !== myGen) return;
+        }
         if (conceptTokens.length === 0) continue;
         pinnedIds.push(conceptTokens[0]!.id);
         partialFlags.push(conceptTokens.length > 1);

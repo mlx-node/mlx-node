@@ -167,17 +167,28 @@ async function main() {
 
   mkdirSync(OUT_DIR, { recursive: true });
 
+  // Qwen emits a standalone space token before a digit, so ` 7` tokenizes to
+  // [' ', '7']. Pinning the first token would then track bare whitespace. Learn
+  // the standalone-space id once so the pin loop can detect that case.
+  const spaceEnc: number[] = await model.encodeTokens(' ');
+  const standaloneSpaceId: number | null = spaceEnc.length === 1 ? spaceEnc[0]! : null;
+
   for (const preset of JACOBIAN_PRESETS) {
     // 1. tokenize the RAW prompt (no chat template — D9).
     const promptIds: number[] = await model.encodeTokens(preset.prompt);
     if (promptIds.length === 0) throw new Error(`${preset.slug}: prompt tokenized to zero tokens`);
 
-    // 2. derive pins exactly as the widget does (LogitLensLive.tsx:269-274):
-    //    tokenize ` ${concept}`, pin the FIRST token id, flag multi-token concepts.
+    // 2. derive pins exactly as the widget does: tokenize ` ${concept}`, pin the
+    //    FIRST token id, flag multi-token concepts. When that first token is the
+    //    standalone space (` 7`), fall back to the space-less form — a whitespace
+    //    pin's rank track says nothing about the concept it claims to follow.
     const pinnedIds: number[] = [];
     const partialFlags: boolean[] = [];
     for (const concept of preset.concepts) {
-      const enc: number[] = await model.encodeTokens(` ${concept}`);
+      let enc: number[] = await model.encodeTokens(` ${concept}`);
+      if (enc.length > 0 && standaloneSpaceId !== null && enc[0] === standaloneSpaceId) {
+        enc = await model.encodeTokens(concept);
+      }
       if (enc.length === 0) continue; // mirror the widget's skip-empty behavior
       pinnedIds.push(enc[0]);
       partialFlags.push(enc.length > 1);
@@ -211,6 +222,15 @@ async function main() {
     // Keep the eval.mts guard: a `true` request that silently downgraded is a bug.
     if (jacobian.jacobianApplied !== true) {
       throw new Error(`${preset.slug}: jacobianApplied=false (expected a real Jacobian on the non-final boundaries)`);
+    }
+    // A pin the reader sees as a concept track must be a real token, not a space.
+    for (const pin of jacobian.pinned) {
+      if (pin.tokenText.trim() === '') {
+        throw new Error(
+          `${preset.slug}: pinned token ${pin.tokenId} is whitespace-only (${JSON.stringify(pin.tokenText)}) — ` +
+            `its rank track would say nothing about the concept it is labeled with`,
+        );
+      }
     }
 
     // 4. serialize (typed arrays -> number[]) and write atomically.
