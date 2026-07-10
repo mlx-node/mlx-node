@@ -70,12 +70,9 @@ const emptySlice = buildLensSlice({
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-function mount(selected: CellRef | null, sliceArg: typeof slice = slice): HTMLCanvasElement {
-  container = document.createElement('div');
-  document.body.appendChild(container);
-  root = createRoot(container);
+function renderSel(r: Root, selected: CellRef | null, sliceArg: typeof slice): void {
   flushSync(() => {
-    root!.render(
+    r.render(
       React.createElement(ArgmaxGridCanvas, {
         slice: sliceArg,
         colorByPinnedId: new Map<number, string>(),
@@ -87,7 +84,20 @@ function mount(selected: CellRef | null, sliceArg: typeof slice = slice): HTMLCa
       }),
     );
   });
+}
+
+function mount(selected: CellRef | null, sliceArg: typeof slice = slice): HTMLCanvasElement {
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+  renderSel(root, selected, sliceArg);
   return container.querySelector('canvas')!;
+}
+
+// Re-render the SAME root (no remount) — simulates in-place keyboard navigation.
+function rerender(selected: CellRef | null): HTMLCanvasElement {
+  renderSel(root!, selected, slice);
+  return container!.querySelector('canvas')!;
 }
 
 afterEach(() => {
@@ -161,6 +171,24 @@ describe('ArgmaxGridCanvas ARIA row ownership', () => {
     const row = document.getElementById(canvas.getAttribute('aria-owns')!)!;
     expect(row.getAttribute('aria-rowindex')).toBe('1');
     expect(row.querySelector('[role="gridcell"]')!.getAttribute('aria-colindex')).toBe('1');
+  });
+
+  it('swaps the active-descendant IDREF when navigating cell A → cell B on the SAME root', () => {
+    // The active-descendant focus event fires on an IDREF VALUE change, not on the
+    // referenced node's text mutating. Navigate without remounting and assert the
+    // id actually changes and the old node is gone (recreated, not mutated).
+    const canvas = mount({ layerIdx: 1, pos: 0 }); // cell A
+    const idA = canvas.getAttribute('aria-activedescendant');
+    expect(idA).toBeTruthy();
+    expect(document.getElementById(idA!)?.getAttribute('role')).toBe('gridcell');
+
+    rerender({ layerIdx: 0, pos: 1 }); // navigate to cell B, same root
+    const idB = canvas.getAttribute('aria-activedescendant');
+    expect(idB).toBeTruthy();
+    expect(idB).not.toBe(idA); // IDREF changed ⇒ AT receives a gridcell-focus event
+    expect(document.getElementById(idB!)?.getAttribute('role')).toBe('gridcell');
+    // Old cell id is gone (keyed node recreated) — the reference is never stale.
+    expect(document.getElementById(idA!)).toBeNull();
   });
 
   it('drops grid semantics entirely for a zero-axis (empty) slice', () => {

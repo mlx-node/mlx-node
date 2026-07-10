@@ -177,6 +177,13 @@ export function ArgmaxGridCanvas({
         slice.cellAt(proxy.layerIdx, proxy.pos).topKTexts[0] ?? '∅'
       }`
     : '';
+  // The active-descendant IDREF must CHANGE VALUE on every cell move, or AT fires
+  // no gridcell-focus event (WAI-ARIA ties the focus event to an
+  // aria-activedescendant value change, not to mutating the referenced node's
+  // text). Derive the proxy cell id from its coordinates and `key` the node by the
+  // same coordinates so navigating A→B swaps the IDREF and recreates the cell.
+  const cellKey = proxy ? `${proxy.layerIdx}:${proxy.pos}` : '';
+  const cellId = proxy ? `${activeId}-${cellKey}` : undefined;
 
   // Single redraw pass. Keyed exactly on the brief's dependency list — no rAF
   // loop, this is not an animation.
@@ -398,7 +405,7 @@ export function ArgmaxGridCanvas({
           // gated on `sel` — with no selection there is simply no active cell (the
           // proxy gridcell renders empty), which is absent, not a dangling ref.
           aria-owns={proxy ? rowId : undefined}
-          aria-activedescendant={sel ? activeId : undefined}
+          aria-activedescendant={sel ? cellId : undefined}
           // The full grid is painted on the canvas; only ONE proxy row/cell lives
           // in the DOM. Publish the real dimensions so AT does not infer a 1×1
           // grid: rows = residual boundaries, cols = prompt positions. The proxy
@@ -424,7 +431,7 @@ export function ArgmaxGridCanvas({
             an actual selection so no cell is announced "current" until one is chosen. */}
         {proxy && (
           <div id={rowId} role="row" aria-rowindex={slice.layers.length - proxy.layerIdx} style={SR_ONLY}>
-            <div id={activeId} role="gridcell" aria-colindex={proxy.pos + 1}>
+            <div key={cellKey} id={cellId} role="gridcell" aria-colindex={proxy.pos + 1}>
               {proxyDesc}
             </div>
           </div>
