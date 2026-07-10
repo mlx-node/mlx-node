@@ -7,7 +7,7 @@
  * Behavior (settled design):
  * - Interactive (`ctx.hasUI`): prompt via `ctx.ui.select` with the
  *   command (bash) or file path (write/edit) as the detail line, passed
- *   through `sanitizeDetail` (escape/control stripping + length cap).
+ *   through `sanitizeDetail` (control-byte encoding + length cap).
  *   "Always (this session)" allow-lists the tool name in memory for the
  *   lifetime of this extension instance.
  * - Non-interactive: allow only when `MLX_AGENT_AUTO_APPROVE=1`,
@@ -33,23 +33,24 @@ const DETAIL_MAX_LINES = 6;
 const TRUNCATION_MARKER = '… [truncated]';
 
 /**
- * ANSI/VT escape sequences, stripped wholesale: CSI (`ESC [` or the bare
- * C1 CSI byte U+009B) with parameter/intermediate bytes and a final byte,
- * OSC (`ESC ]` … terminated by BEL or ST), and remaining two-byte
- * `ESC <Fe>` sequences. Anything malformed that this misses degrades to a
- * lone control character and is caught by CONTROL_CHAR_RE below.
- */
-const ANSI_ESCAPE_RE =
-  // eslint-disable-next-line no-control-regex
-  /(?:\u001b\[|\u009b)[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b[@-Z\\-_]?/g;
-
-/**
- * C0 controls (except `\t` and `\n`), DEL, and C1 controls. These are
- * collapsed to a visible U+FFFD placeholder rather than removed, so the
- * user can see that the tool call contained something unprintable.
+ * Every character that must be rendered visibly instead of reaching the
+ * terminal: C0 controls except `\n` and `\t`, DEL, and the C1 range
+ * U+0080–U+009F (which contains the raw CSI/OSC/ST bytes U+009B, U+009D
+ * and U+009C). Matched one character at a time — deliberately NOT as
+ * multi-character escape "sequences": CSI parameters/finals and OSC
+ * payloads are ordinary printable bytes that bash still parses and
+ * executes, so any sequence-level deletion makes real shell syntax
+ * invisible while it still runs (and CSI/OSC/ST termination is ambiguous
+ * to parse in the first place — e.g. an unterminated OSC has no defined
+ * end).
  */
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
+
+/** Render one control character as visible `\xNN` text (e.g. ESC → `\x1b`). */
+function encodeControlChar(ch: string): string {
+  return `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
+}
 
 /**
  * Sanitize model-controlled text before it is embedded in the approval
@@ -59,14 +60,24 @@ const CONTROL_CHAR_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
  * could otherwise move the cursor, erase lines, or restyle the prompt to
  * disguise what is being approved.
  *
- * - ANSI escape sequences are stripped entirely.
- * - Other control characters (C0 except `\n`/`\t`, DEL, C1) become `�`.
- * - Output is capped at DETAIL_MAX_LINES lines and DETAIL_MAX_CHARS chars
- *   with a visible truncation marker, so a huge command cannot flood the
- *   prompt off the screen.
+ * Encode, never delete. An earlier deletion-based version stripped whole
+ * "escape sequences", but the bytes inside a CSI/OSC-shaped span are
+ * still shell syntax that bash executes — a command could display as a
+ * safe-looking prefix while a pipe or a second command hid inside what
+ * the sanitizer parsed as an escape payload. Instead:
+ *
+ * - Every printable character is preserved verbatim — nothing bash could
+ *   interpret (letters, digits, shell metacharacters, spaces) is removed
+ *   or altered.
+ * - Every control character (C0 except `\n`/`\t`, DEL, C1) is rendered
+ *   as visible `\xNN` text, so no byte that could drive the terminal
+ *   survives, and no shell text can hide behind one.
+ * - Output is capped at DETAIL_MAX_LINES lines and DETAIL_MAX_CHARS
+ *   chars (counted after encoding) with a visible truncation marker, so
+ *   a huge command cannot flood the prompt off the screen.
  */
 function sanitizeDetail(text: string): string {
-  let out = text.replace(ANSI_ESCAPE_RE, '').replace(CONTROL_CHAR_RE, '�');
+  let out = text.replace(CONTROL_CHAR_RE, encodeControlChar);
   let truncated = false;
 
   const lines = out.split('\n');
@@ -87,8 +98,9 @@ function sanitizeDetail(text: string): string {
     out += ` ${TRUNCATION_MARKER}`;
   }
   if (out.trim().length === 0 && text.length > 0) {
-    // The input was entirely escape sequences / control characters; show
-    // something rather than an approvable-looking blank line.
+    // Control characters always encode to visible text, so this only
+    // fires for whitespace-only input; show something rather than an
+    // approvable-looking blank line.
     return '(unprintable content)';
   }
   return out;

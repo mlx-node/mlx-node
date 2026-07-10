@@ -65,6 +65,30 @@ function toolCallEvent(toolName: string, input: unknown): ToolCallEvent {
   return { type: 'tool_call', toolCallId: 'call-1', toolName, input } as ToolCallEvent;
 }
 
+/**
+ * Property-style guard for the sanitizer's core invariant: encode, never
+ * delete. Every printable-ASCII character of the input (anything bash
+ * could interpret — letters, digits, shell metacharacters, spaces) must
+ * appear in the sanitized title in the original order. Encoding may
+ * insert visible `\xNN` text, but it must never remove or reorder a
+ * shell-significant byte.
+ */
+function expectPreservesPrintables(input: string, title: string): void {
+  let pos = 0;
+  for (const ch of input) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code > 0x7e) {
+      continue;
+    }
+    const found = title.indexOf(ch, pos);
+    expect(
+      found,
+      `printable char ${JSON.stringify(ch)} of the input was lost after offset ${pos}`,
+    ).toBeGreaterThanOrEqual(0);
+    pos = found + 1;
+  }
+}
+
 const savedAutoApprove = process.env['MLX_AGENT_AUTO_APPROVE'];
 
 afterEach(() => {
@@ -182,8 +206,8 @@ describe('createPermissionGateExtension', () => {
     expect(selectCalls[1]!.title).toContain('/repo/README.md');
   });
 
-  describe('prompt detail sanitization', () => {
-    it('strips ANSI escape sequences (CSI, incl. the bare C1 CSI byte) from the title', async () => {
+  describe('prompt detail sanitization (encode, never delete)', () => {
+    it('encodes CSI escape bytes visibly while keeping every printable byte', async () => {
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
       const command = 'echo safe\u001b[2J\u001b[1;1H\u001b[31m && rm -rf /\u009b2J';
@@ -191,23 +215,28 @@ describe('createPermissionGateExtension', () => {
       const title = selectCalls[0]!.title;
       expect(title).not.toContain('\u001b');
       expect(title).not.toContain('\u009b');
-      expect(title).toContain('echo safe');
-      expect(title).toContain('rm -rf /');
+      // The escape bytes are rendered as text; the CSI parameter/final
+      // bytes (which bash would still parse) stay verbatim and in place.
+      expect(title).toContain('echo safe\\x1b[2J\\x1b[1;1H\\x1b[31m && rm -rf /\\x9b2J');
+      expectPreservesPrintables(command, title);
     });
 
-    it('strips OSC sequences (terminal title / hyperlinks) including their payload', async () => {
+    it('encodes the OSC introducer and terminator; the payload text stays visible', async () => {
+      // The OSC "payload" is ordinary printable text. Under the old
+      // deletion regime it vanished from the prompt even though bash
+      // still parses those bytes — it must be shown.
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
       const command = 'ls \u001b]0;spoofed-window-title\u0007-la';
       await handler(toolCallEvent('bash', { command }), ctx);
       const title = selectCalls[0]!.title;
       expect(title).not.toContain('\u001b');
-      expect(title).not.toContain('spoofed-window-title');
-      expect(title).toContain('ls ');
-      expect(title).toContain('-la');
+      expect(title).not.toContain('\u0007');
+      expect(title).toContain('ls \\x1b]0;spoofed-window-title\\x07-la');
+      expectPreservesPrintables(command, title);
     });
 
-    it('replaces non-ANSI control characters with a visible placeholder', async () => {
+    it('renders non-escape control characters (BEL, CR, NUL) as \\xNN text', async () => {
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
       const command = 'echo a\u0007b\rc\u0000d';
@@ -216,7 +245,87 @@ describe('createPermissionGateExtension', () => {
       expect(title).not.toContain('\u0007');
       expect(title).not.toContain('\r');
       expect(title).not.toContain('\u0000');
-      expect(title).toContain('echo a�b�c�d');
+      expect(title).toContain('echo a\\x07b\\x0dc\\x00d');
+      expectPreservesPrintables(command, title);
+    });
+
+    it('renders DEL as \\x7f text', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo x\u007fy';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u007f');
+      expect(title).toContain('echo x\\x7fy');
+    });
+
+    it('regression: an OSC-shaped span cannot hide an executed command', async () => {
+      // Reviewer demonstration against pi's real bash backend: bash
+      // executes `printf DANGEROUS` between the ESC] and BEL, but the
+      // old sanitizer deleted the whole span as an "OSC payload" and the
+      // prompt showed only `printf SAFE; : `.
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'printf SAFE; : \u001b]0; printf DANGEROUS; : \u0007';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('printf SAFE');
+      expect(title).toContain('printf DANGEROUS');
+      expect(title).toContain('\\x1b]0;');
+      expect(title).toContain('\\x07');
+      expect(title).not.toContain('\u001b');
+      expect(title).not.toContain('\u0007');
+      expectPreservesPrintables(command, title);
+    });
+
+    it('regression: a CSI-shaped prefix cannot hide a real pipe', async () => {
+      // Reviewer demonstration: `|` is a valid CSI final byte, so the
+      // old sanitizer deleted `ESC[|` wholesale and the pipe disappeared
+      // from the prompt while bash still piped into `printf HIDDEN_PIPE`.
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = ': \u001b[| printf HIDDEN_PIPE';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('\\x1b[| printf HIDDEN_PIPE');
+      expect(title).not.toContain('\u001b');
+      expectPreservesPrintables(command, title);
+    });
+
+    it('regression: ESC-backslash (two-byte ST) is encoded, not swallowed', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo first\u001b\\echo second';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('echo first\\x1b\\echo second');
+      expect(title).not.toContain('\u001b');
+      expectPreservesPrintables(command, title);
+    });
+
+    it('regression: the C1 ST byte U+009C is encoded visibly', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo a\u009cecho b';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('echo a\\x9cecho b');
+      expect(title).not.toContain('\u009c');
+      expectPreservesPrintables(command, title);
+    });
+
+    it('regression: an unterminated OSC prefix cannot swallow the following line', async () => {
+      // The old OSC regex made the terminator optional, so an ESC] with
+      // no BEL/ST consumed everything after it — including the next
+      // executable line.
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      const command = 'echo first \u001b]0;no-terminator\necho second';
+      await handler(toolCallEvent('bash', { command }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).toContain('echo first \\x1b]0;no-terminator\necho second');
+      expect(title).not.toContain('\u001b');
+      expectPreservesPrintables(command, title);
     });
 
     it('keeps newlines and tabs in a short multi-line command unchanged', async () => {
@@ -253,23 +362,35 @@ describe('createPermissionGateExtension', () => {
       expect(title).toContain('… [truncated]');
     });
 
-    it('a command that is nothing but escape sequences shows a visible stand-in', async () => {
+    it('a command that is nothing but escape bytes is shown fully encoded', async () => {
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
       await handler(toolCallEvent('bash', { command: '\u001b[2J\u001b[3J\u001b[H' }), ctx);
+      const title = selectCalls[0]!.title;
+      expect(title).not.toContain('\u001b');
+      expect(title).toContain('\\x1b[2J\\x1b[3J\\x1b[H');
+      expect(title).not.toContain('(unprintable content)');
+    });
+
+    it('a whitespace-only command shows a visible stand-in', async () => {
+      const handler = loadGateHandler();
+      const { ctx, selectCalls } = makeCtx(true, 'Yes');
+      await handler(toolCallEvent('bash', { command: '  \n \t ' }), ctx);
       expect(selectCalls[0]!.title).toContain('(unprintable content)');
     });
 
-    it('sanitizes the write/edit path detail too', async () => {
+    it('encodes control bytes in the write/edit path detail too', async () => {
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
-      await handler(toolCallEvent('write', { path: '/tmp/\u001b[31mevil\u001b[0m.txt', content: '' }), ctx);
+      const path = '/tmp/\u001b[31mevil\u001b[0m.txt';
+      await handler(toolCallEvent('write', { path, content: '' }), ctx);
       const title = selectCalls[0]!.title;
       expect(title).not.toContain('\u001b');
-      expect(title).toContain('/tmp/evil.txt');
+      expect(title).toContain('/tmp/\\x1b[31mevil\\x1b[0m.txt');
+      expectPreservesPrintables(path, title);
     });
 
-    it('leaves a normal command and path untouched (no marker, no placeholder)', async () => {
+    it('leaves a normal command and path untouched (no marker, no encoding)', async () => {
       const handler = loadGateHandler();
       const { ctx, selectCalls } = makeCtx(true, 'Yes');
       await handler(toolCallEvent('bash', { command: 'yarn build:native --verbose' }), ctx);
