@@ -188,4 +188,25 @@ describe('applyPermalink overlay', () => {
     const restored = applyPermalink(defaults, wire);
     expect(restored).toEqual({ prompt: 'x', mode: 'jacobian', pins: [], sel: null });
   });
+
+  // A full JSpaceState is STRUCTURALLY assignable to JSpaceDefaults (which is a
+  // Pick, not an exact type), so the consumer may pass its live state object as
+  // `defaults`. A `{ prompt:'', ...defaults }` spread would then leak that
+  // object's `prompt` over the blank; an empty hash must always cold-start with
+  // an empty prompt. Assert the exact four-key shape for both empty forms.
+  it('blanks the prompt on an empty hash even when defaults carries a stale prompt', () => {
+    const stateful = { prompt: 'stale', mode: 'logit' as const, pins: [42], sel: { layerIdx: 1, pos: 2 } };
+    expect(applyPermalink(stateful, '')).toEqual({
+      prompt: '',
+      mode: 'logit',
+      pins: [42],
+      sel: { layerIdx: 1, pos: 2 },
+    });
+    expect(applyPermalink(stateful, '#')).toEqual({
+      prompt: '',
+      mode: 'logit',
+      pins: [42],
+      sel: { layerIdx: 1, pos: 2 },
+    });
+  });
 });

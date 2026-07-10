@@ -149,8 +149,14 @@ export type JSpaceDefaults = Pick<JSpaceState, 'mode' | 'pins' | 'sel'>;
  */
 export function applyPermalink(defaults: JSpaceDefaults, hash: string): JSpaceState {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash;
-  // No permalink at all (bare page load): the app's cold-start defaults, verbatim.
-  if (raw === '') return { prompt: '', ...defaults };
+  // No permalink at all (bare page load): the app's cold-start defaults, with a
+  // blank prompt. Project the three fields EXPLICITLY, never `...defaults`:
+  // `JSpaceDefaults` is a structural `Pick`, so a full `JSpaceState` is an
+  // accepted argument, and a spread would copy its `prompt` over the `''` (and
+  // could drop keys if `defaults` were getter-backed).
+  if (raw === '') {
+    return { prompt: '', mode: defaults.mode, pins: defaults.pins, sel: defaults.sel };
+  }
   // A non-empty hash IS a complete state snapshot. Fields the encoder omits
   // because they were empty (`pins`) or null (`sel`) restore to those CANONICAL
   // EMPTIES — never to `defaults`.
