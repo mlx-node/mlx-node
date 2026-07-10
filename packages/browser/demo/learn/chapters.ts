@@ -125,6 +125,11 @@ export const CHAPTERS: ChapterMeta[] = [
         title: 'The logit lens',
         blurb: 'Point the LM head at a middle layer instead of the last one: read the vocabulary out of every depth and watch the answer emerge — the logit lens, live on your in-browser Qwen3.5.',
       },
+      {
+        id: 'jacobian-lens',
+        title: 'The Jacobian lens',
+        blurb: 'A fitted per-layer Jacobian sharpens the blurry middle layers the logit lens cannot read — run our own fit, live on your in-browser Qwen3.5.',
+      },
     ],
   },
   {

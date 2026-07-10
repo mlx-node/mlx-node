@@ -79,6 +79,10 @@ export const ZH_CHAPTER_META: Record<string, ChapterMetaOverlay> = {
         title: 'Logit lens',
         blurb: '把 LM head 对准中间层，而不只是最后一层：从每个深度读出词表，看答案如何逐层浮现——logit lens，在你浏览器里的 Qwen3.5 上实时运行。',
       },
+      'jacobian-lens': {
+        title: 'Jacobian lens',
+        blurb: '一个拟合的逐层 Jacobian，锐化 logit lens 读不动的那些模糊中间层——跑我们自己的 fit，在你浏览器里的 Qwen3.5 上实时运行。',
+      },
     },
   },
   sampling: {

@@ -25,7 +25,7 @@ import {
   KvCachePrefixCachingSection,
   KvCacheQuantizationSection,
 } from './sections/kv-cache';
-import { LmHeadLogitLensSection } from './sections/lm-head';
+import { LmHeadJacobianLensSection, LmHeadLogitLensSection } from './sections/lm-head';
 import { PostTrainingDistillationSection } from './sections/post-training';
 import {
   SamplingMtpSection,
@@ -47,6 +47,7 @@ export const SECTION_BODIES: Record<string, React.ComponentType> = {
   'kv-cache/quantization': KvCacheQuantizationSection,
   'kv-cache/number-formats': KvCacheNumberFormatsSection,
   'lm-head/logit-lens': LmHeadLogitLensSection,
+  'lm-head/jacobian-lens': LmHeadJacobianLensSection,
   'training/data-curation': TrainingDataCurationSection,
   'scaling/scaling-laws': ScalingLawsSection,
   'post-training/distillation': PostTrainingDistillationSection,
