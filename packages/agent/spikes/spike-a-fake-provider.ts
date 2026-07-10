@@ -189,11 +189,12 @@ async function runChild(scenario: Scenario): Promise<void> {
         totalTokens: 12,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       };
-      stream.push({
-        type: 'done',
-        reason: output.stopReason as 'stop' | 'toolUse',
-        message: output,
-      });
+      // pi's loop consumes `done` via response.result() (= done.message) and
+      // never reads `done.reason` — so the emitted reason is only checkable
+      // out-of-band. Capture it as a stderr marker for the judge.
+      const doneReason = output.stopReason as 'stop' | 'toolUse';
+      mark(`SPIKE_DONE_REASON n=${call} reason=${doneReason}`);
+      stream.push({ type: 'done', reason: doneReason, message: output });
       stream.end();
     })().catch((error: unknown) => {
       pushStreamError(stream, model, error);
@@ -360,9 +361,14 @@ function deepFind(node: unknown, predicate: (o: Record<string, unknown>) => bool
  * CONSUMES the provider's `start` and `done` events and re-emits them as
  * `message_start` / `message_end`; only the in-between streaming events
  * (`text_*` / `toolcall_*` / `thinking_*`) pass through verbatim as
- * `message_update.assistantMessageEvent`. So the observable episode is:
+ * `message_update.assistantMessageEvent`. On `done` the loop calls
+ * `response.result()` — which resolves to `done.message` — and emits THAT
+ * AssistantMessage as `message_end.message`; `done.reason` is never read.
+ * So the observable episode is:
  *   message_start{role:'assistant'} -> inner event types in order ->
- *   message_end{message.stopReason} (stopReason carries the done reason).
+ *   message_end{message.stopReason} (stopReason = the AssistantMessage's own
+ *   field; the provider-level `done.reason` is judged separately via the
+ *   SPIKE_DONE_REASON stderr markers).
  */
 interface AssistantEpisode {
   /** `assistantMessageEvent.type` values in stream order. */
@@ -412,6 +418,22 @@ function assistantEpisodes(events: unknown[]): AssistantEpisode[] {
     }
   }
   return episodes;
+}
+
+/**
+ * Provider-level `done.reason` values captured out-of-band via the child's
+ * SPIKE_DONE_REASON stderr markers, ordered by stream-call index. This is the
+ * ONLY way to judge `done.reason`: pi's loop discards it (message_end carries
+ * the AssistantMessage from response.result(), whose own stopReason is what
+ * surfaces in the JSON stream).
+ */
+function capturedDoneReasons(stderr: string): string[] {
+  return stderr
+    .split('\n')
+    .map((line) => /^SPIKE_DONE_REASON n=(\d+) reason=(\S+)$/.exec(line))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .sort((a, b) => Number(a[1]) - Number(b[1]))
+    .map((m) => m[2]);
 }
 
 /** innerTypes matches exactly: opener, >=1 of `delta`, closer. */
@@ -468,14 +490,18 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   );
 
   // 4. Text streaming through pi's output — assert the FULL observable
-  // sequence, in order. Provider `start`/`done` are re-emitted by pi's agent
-  // loop as message_start/message_end (done.reason -> message.stopReason);
+  // sequence, in order. Provider `start` is re-emitted as message_start;
+  // on `done` the loop emits message_end with the AssistantMessage from
+  // response.result() (done.reason is discarded by pi — asserted instead via
+  // the provider-side SPIKE_DONE_REASON capture);
   // text_start/delta/end pass through as message_update.assistantMessageEvent.
   const textEpisodes = assistantEpisodes(text.events);
   const textEp = textEpisodes[0];
   const textSeqOk = textEp !== undefined && isBurstTrio(textEp.innerTypes, 'text');
   const textDeltasReassemble = textEp !== undefined && textEp.textDeltas.join('') === TEXT_REPLY;
   const textStopOk = textEp?.endMessage?.stopReason === 'stop';
+  const textDoneReasons = capturedDoneReasons(text.stderr);
+  const textProviderDoneOk = textDoneReasons.join(',') === 'stop';
   const finalText = deepFind(
     text.events,
     (o) => typeof o.text === 'string' && (o.text as string).includes(TEXT_REPLY),
@@ -486,10 +512,12 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
       textSeqOk &&
       textDeltasReassemble &&
       textStopOk &&
+      textProviderDoneOk &&
       finalText !== undefined,
     `assistantEpisodes=${textEpisodes.length} innerSeq=[${textEp?.innerTypes.join(',') ?? ''}] ` +
       `trio(text_start,>=1 delta,text_end)=${textSeqOk} deltasJoin===TEXT_REPLY=${textDeltasReassemble} ` +
-      `message_end.stopReason=${String(textEp?.endMessage?.stopReason)} finalTextDelivered=${finalText !== undefined}`,
+      `message_end.stopReason=${String(textEp?.endMessage?.stopReason)} ` +
+      `providerDoneReasons=[${textDoneReasons.join(',')}](want [stop]) finalTextDelivered=${finalText !== undefined}`,
   );
 
   // 5. Tool loop: first assistant episode must be the toolcall trio ending in
@@ -504,6 +532,8 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   const toolStopOk = toolEp0?.endMessage?.stopReason === 'toolUse';
   const contTrioOk = toolEp1 !== undefined && isBurstTrio(toolEp1.innerTypes, 'text');
   const contStopOk = toolEp1?.endMessage?.stopReason === 'stop';
+  const toolDoneReasons = capturedDoneReasons(tools.stderr);
+  const toolProviderDoneOk = toolDoneReasons.join(',') === 'toolUse,stop';
   const secondCallSawResult = tools.stderr.includes('SPIKE_TOOLRESULT_FOUND=true');
   const twoCalls = tools.stderr.includes('SPIKE_STREAM_CALL n=1');
   const resultHasContent = tools.stderr.includes('MLX_SPIKE_FILE_CONTENT_42');
@@ -519,6 +549,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
       toolStopOk &&
       contTrioOk &&
       contStopOk &&
+      toolProviderDoneOk &&
       secondCallSawResult &&
       twoCalls &&
       resultHasContent &&
@@ -528,6 +559,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
       `ep0=[${toolEp0?.innerTypes.join(',') ?? ''}] trio=${toolTrioOk} toolcall_end{name,id}=${toolCallEndOk} ` +
       `ep0.stopReason=${String(toolEp0?.endMessage?.stopReason)} ` +
       `ep1=[${toolEp1?.innerTypes.join(',') ?? ''}] ep1.stopReason=${String(toolEp1?.endMessage?.stopReason)} ` +
+      `providerDoneReasons=[${toolDoneReasons.join(',')}](want [toolUse,stop]) ` +
       `secondStreamCall=${twoCalls} toolResultInContext=${secondCallSawResult} ` +
       `fileContentInResult=${resultHasContent} finalTextDelivered=${finalToolText !== undefined} exit=${tools.exitCode}`,
   );
