@@ -14,6 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
 
@@ -139,19 +140,45 @@ export interface PersistedPiDefault {
 }
 
 /**
+ * Expand a `PI_CODING_AGENT_DIR` value exactly like pi 0.80.6 does
+ * (`getAgentDir` → `expandTildePath` → `normalizePath` with default
+ * options): a lone `~` or a leading `~/` (`~\` on Windows) becomes the
+ * home directory, a `file://` URL becomes its path, and everything
+ * else — including `~user` — passes through verbatim (no trim). Looser
+ * or tighter rules would desync this reader from the settings.json pi
+ * actually opens. `home` is a test seam (pi's `homeDir` option).
+ */
+export function expandPiAgentDir(dir: string, home: string = homedir()): string {
+  if (dir === '~') {
+    return home;
+  }
+  if (dir.startsWith('~/') || (process.platform === 'win32' && dir.startsWith('~\\'))) {
+    return join(home, dir.slice(2));
+  }
+  // pi tests /^file:\/\//; startsWith is the identical predicate.
+  if (dir.startsWith('file://')) {
+    return fileURLToPath(dir);
+  }
+  return dir;
+}
+
+/**
  * Read pi's persisted `/model` default from the agent config home:
  * `<agentDir>/settings.json`, fields `defaultProvider` + `defaultModel`
  * (pi's `SettingsManager.setDefaultModelAndProvider` writes them to the
- * GLOBAL-scope file, i.e. this one). The dir mirrors `runAgent`'s env
- * seeding: an explicit `PI_CODING_AGENT_DIR` wins, else
- * `~/.mlx-node/agent`. Absent or malformed settings mean "no persisted
- * default", never an error.
+ * GLOBAL-scope file, i.e. this one). The dir mirrors what pi itself
+ * will resolve after `runAgent`'s env seeding: an explicit
+ * `PI_CODING_AGENT_DIR` wins — run through {@link expandPiAgentDir},
+ * matching pi's own tilde/file-URL expansion — else `~/.mlx-node/agent`
+ * (the value `runAgent` seeds). An explicitly passed `agentDir` (test
+ * seam) is used verbatim. Absent, malformed, or unresolvable settings
+ * mean "no persisted default", never an error.
  */
-export function readPersistedDefaultModel(
-  agentDir: string = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.mlx-node', 'agent'),
-): PersistedPiDefault | undefined {
+export function readPersistedDefaultModel(agentDir?: string): PersistedPiDefault | undefined {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
+    const envDir = process.env.PI_CODING_AGENT_DIR;
+    const dir = agentDir ?? (envDir ? expandPiAgentDir(envDir) : join(homedir(), '.mlx-node', 'agent'));
+    const parsed: unknown = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'));
     if (typeof parsed !== 'object' || parsed === null) {
       return undefined;
     }

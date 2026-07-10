@@ -1,9 +1,23 @@
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 import { MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { runFirstRunWizard, type WizardIO } from '../../packages/cli/src/commands/agent/wizard.js';
+
+/**
+ * Parse a rendered command's argument string with a REAL POSIX shell and
+ * return the words it would hand the program (NUL-delimited so embedded
+ * newlines can't confuse the split). This is the ground truth for "does
+ * the copy-pasteable hint reconstruct the intended argv".
+ */
+function shellSplit(renderedArgs: string): string[] {
+  const out = execFileSync('/bin/sh', ['-c', `printf '%s\\0' ${renderedArgs}`]);
+  const words = out.toString('utf8').split('\0');
+  words.pop(); // printf leaves a trailing NUL → one empty tail element
+  return words;
+}
 
 interface SelectCall {
   message: string;
@@ -136,5 +150,57 @@ describe('runFirstRunWizard', () => {
       }
     }
     expect(calls).toHaveLength(0);
+  });
+
+  it('shell-quotes hint elements so a models dir with spaces and metacharacters survives copy-paste', async () => {
+    // Space, single quote, `$`, `;` and `&` in one path. Deliberately
+    // harmless commands after the metacharacters: if quoting regresses,
+    // the real /bin/sh below would EXECUTE them.
+    const modelsDir = `/tmp/My Models/it's;echo x&$HOME`;
+    const { io } = makeIO({ isTTY: false });
+    const { download, calls } = makeDownload();
+
+    let message = '';
+    try {
+      await runFirstRunWizard({ io, download, modelsDir });
+      expect.unreachable('wizard must throw without a TTY');
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    for (const entry of visibleCatalog()) {
+      const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
+      const line = message.split('\n').find((l) => l.includes(entry.hfRepo));
+      expect(line).toBeDefined();
+      const renderedArgs = line!.trim().replace(/^mlx download model /, '');
+      // Round-trip: a real POSIX shell parses the displayed command back
+      // into EXACTLY the argv the interactive path would pass — one `-o`
+      // word, `$HOME` unexpanded, `;`/`&` inert.
+      expect(shellSplit(renderedArgs)).toEqual(['-m', entry.hfRepo, '-o', join(modelsDir, slug)]);
+      // Known-correct quoted form: safe words bare, unsafe -o value
+      // single-quoted with the embedded quote escaped as '\''.
+      expect(line).toContain(`-o '/tmp/My Models/it'\\''s;echo x&$HOME/${slug}'`);
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('renders plain safe paths unquoted (round-trips too)', async () => {
+    const { io } = makeIO({ isTTY: false });
+    const { download } = makeDownload();
+
+    try {
+      await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
+      expect.unreachable('wizard must throw without a TTY');
+    } catch (error) {
+      const message = (error as Error).message;
+      const entry = visibleCatalog()[0]!;
+      const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
+      // Unchanged readable form for the common case...
+      expect(message).toContain(`mlx download model -m ${entry.hfRepo} -o /custom/models/${slug}`);
+      // ...and it still parses back to the intended argv.
+      const line = message.split('\n').find((l) => l.includes(entry.hfRepo))!;
+      const renderedArgs = line.trim().replace(/^mlx download model /, '');
+      expect(shellSplit(renderedArgs)).toEqual(['-m', entry.hfRepo, '-o', `/custom/models/${slug}`]);
+    }
   });
 });

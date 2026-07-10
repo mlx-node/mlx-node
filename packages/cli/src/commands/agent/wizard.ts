@@ -51,6 +51,21 @@ function downloadModelArgv(hfRepo: string, modelsDir: string | undefined): strin
 }
 
 /**
+ * Quote ONE argv element for copy-paste into a POSIX shell. Elements of
+ * only safe characters pass through untouched (keeps the common hint
+ * readable); anything else is single-quoted, with embedded single
+ * quotes escaped as `'\''` (close quote, literal `'`, reopen). Only the
+ * DISPLAYED hint needs this — the interactive path hands `download`
+ * real argv elements, no shell in between.
+ */
+function shellQuote(arg: string): string {
+  if (/^[A-Za-z0-9@%+=:,./_-]+$/.test(arg)) {
+    return arg;
+  }
+  return `'${arg.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+/**
  * Offer the catalog (default entry first), download the chosen repo, and
  * return its HF slug. Non-TTY sessions cannot prompt: throws with the
  * manual `mlx download model` commands instead — the caller must not
@@ -61,7 +76,9 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
 
   if (!deps.io.isTTY) {
     const commands = catalog
-      .map((entry) => `  mlx download model ${downloadModelArgv(entry.hfRepo, deps.modelsDir).join(' ')}`)
+      .map(
+        (entry) => `  mlx download model ${downloadModelArgv(entry.hfRepo, deps.modelsDir).map(shellQuote).join(' ')}`,
+      )
       .join('\n');
     throw new Error(
       `No local models found. Run in a terminal for the setup wizard, or download one directly:\n${commands}`,

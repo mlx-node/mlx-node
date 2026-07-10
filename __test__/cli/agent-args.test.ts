@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import {
   type AgentRunDeps,
   chooseDefaultModel,
+  expandPiAgentDir,
   readPersistedDefaultModel,
   run,
   scanAgentArgs,
@@ -186,6 +187,32 @@ describe('withDefaultModel', () => {
   it('does not treat prompt text as a flag', () => {
     const argv = ['-p', 'please run --continue for me'];
     expect(withDefaultModel(argv, 'm')).toEqual(['--model', 'mlx/m', '-p', 'please run --continue for me']);
+  });
+});
+
+/**
+ * Mirror of pi 0.80.6 `getAgentDir` → `normalizePath` (default options)
+ * on the `PI_CODING_AGENT_DIR` value: lone `~` and leading `~/` expand,
+ * `file://` URLs resolve, `~user` and everything else pass verbatim.
+ */
+describe('expandPiAgentDir', () => {
+  it('expands a lone ~ and a leading ~/ against the home dir', () => {
+    expect(expandPiAgentDir('~', '/home/u')).toBe('/home/u');
+    expect(expandPiAgentDir('~/tilde-agent', '/home/u')).toBe(join('/home/u', 'tilde-agent'));
+    expect(expandPiAgentDir('~/a b/agent', '/home/u')).toBe(join('/home/u', 'a b/agent'));
+  });
+
+  it('does NOT expand ~user (pi does not either) and passes other values verbatim', () => {
+    expect(expandPiAgentDir('~user/agent', '/home/u')).toBe('~user/agent');
+    expect(expandPiAgentDir('/abs/agent', '/home/u')).toBe('/abs/agent');
+    expect(expandPiAgentDir('relative/agent', '/home/u')).toBe('relative/agent');
+    // No trim: pi's normalizePath default options leave whitespace alone,
+    // so a padded value stays a literal (weird) path — parity over polish.
+    expect(expandPiAgentDir(' ~/padded', '/home/u')).toBe(' ~/padded');
+  });
+
+  it('resolves file:// URLs like pi', () => {
+    expect(expandPiAgentDir('file:///abs/agent', '/home/u')).toBe('/abs/agent');
   });
 });
 
@@ -451,6 +478,46 @@ describe('run() argv routing', () => {
           }
         }
       });
+    });
+
+    it('tilde-expands PI_CODING_AGENT_DIR exactly like pi before reading settings.json', async () => {
+      // pi expands a leading ~/ in PI_CODING_AGENT_DIR (getAgentDir →
+      // normalizePath), so the reader must open settings.json under the
+      // REAL home dir — a literal ./~/... would silently miss the user's
+      // saved default. Throwaway dir directly under $HOME, no mocks.
+      const realHomeDir = await mkdtemp(join(homedir(), '.mlx-agent-tilde-test-'));
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      try {
+        await writeFile(
+          join(realHomeDir, 'settings.json'),
+          JSON.stringify({ defaultProvider: 'mlx', defaultModel: 'tilde-model' }),
+        );
+        process.env.PI_CODING_AGENT_DIR = `~/${basename(realHomeDir)}`;
+        expect(readPersistedDefaultModel()).toEqual({ provider: 'mlx', modelId: 'tilde-model' });
+      } finally {
+        if (prev === undefined) {
+          delete process.env.PI_CODING_AGENT_DIR;
+        } else {
+          process.env.PI_CODING_AGENT_DIR = prev;
+        }
+        await rm(realHomeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('never throws on an unresolvable PI_CODING_AGENT_DIR (expansion failure = no default)', () => {
+      // fileURLToPath rejects a non-localhost host; pi itself would crash
+      // on this value, but the reader must stay failure-tolerant.
+      const prev = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = 'file://not-localhost/agent';
+      try {
+        expect(readPersistedDefaultModel()).toBeUndefined();
+      } finally {
+        if (prev === undefined) {
+          delete process.env.PI_CODING_AGENT_DIR;
+        } else {
+          process.env.PI_CODING_AGENT_DIR = prev;
+        }
+      }
     });
 
     it('chooseDefaultModel is pure over the three policy branches', () => {
