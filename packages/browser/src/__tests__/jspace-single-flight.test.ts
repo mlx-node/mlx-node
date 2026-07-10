@@ -51,4 +51,37 @@ describe('single-flight run queue', () => {
     await flush();
     expect(q.inFlight()).toBe(false);
   });
+
+  // The recovery guarantee the /jspace worker-generation fix relies on: when an
+  // in-flight dispatch REJECTS (e.g. its worker was torn down and the readout
+  // aborted), the queue must drain and promote the PENDING run immediately — not
+  // strand it behind the dead dispatch until the client timeout.
+  it('a rejected in-flight dispatch drains and dispatches the pending run', async () => {
+    const dispatched: string[] = [];
+    const resolves: ((v: string) => void)[] = [];
+    const rejects: ((e: unknown) => void)[] = [];
+    const q = createRunQueue<string, string>((req) => {
+      dispatched.push(req);
+      return new Promise<string>((res, rej) => {
+        resolves.push(res);
+        rejects.push(rej);
+      });
+    });
+
+    const pA = q.run('A'); // in flight
+    const pB = q.run('B'); // pending behind A
+    expect(dispatched).toEqual(['A']);
+    // Swallow A's rejection so the test failure surface stays clean.
+    pA.catch(() => {});
+
+    rejects[0]!(new Error('worker torn down')); // A's worker died mid-dispatch
+    await expect(pA).rejects.toThrow('worker torn down');
+    await flush();
+
+    expect(dispatched).toEqual(['A', 'B']); // B promoted the instant A settled
+    resolves[1]!('rB');
+    await expect(pB).resolves.toBe('rB');
+    await flush();
+    expect(q.inFlight()).toBe(false);
+  });
 });

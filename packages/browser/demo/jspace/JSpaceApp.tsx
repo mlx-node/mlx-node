@@ -23,6 +23,7 @@ import { cleanupTokenText, renderTokenDisplay } from '../learn/inspector/TopKBar
 import { SegmentedToggle } from '../learn/scaffolding/SegmentedToggle';
 import { ArgmaxGridCanvas, normalizeSelected, type CellRef } from './ArgmaxGridCanvas';
 import { ByLayerStrip } from './ByLayerStrip';
+import { composeAbort } from './compose-abort';
 import { isColdPrompt } from './cold-prompt';
 import { ByPosStrip } from './ByPosStrip';
 import { PinManager } from './PinManager';
@@ -95,17 +96,6 @@ export default function JSpaceApp() {
   const hashAppliedRef = React.useRef(false);
   const lastWrittenHashRef = React.useRef<string | null>(null);
 
-  // A fresh model load resets the worker-global `lensPackLoaded` (mlx-worker.ts),
-  // so our belief that the pack is resident + the self-test verdict must reset
-  // too — we then re-consult the worker (loadLensPack returns `alreadyLoaded`)
-  // rather than trusting a stale ref.
-  React.useEffect(() => {
-    packLoadedRef.current = false;
-    jacActivatedRef.current = false;
-    jacActivationRef.current = null;
-    setJac({ status: 'idle' });
-  }, [loadKickoff]);
-
   // -------------------------------------------------------------------------
   // Execution: single-flight lensReadout with the hard jacobianApplied guard.
   // -------------------------------------------------------------------------
@@ -121,7 +111,12 @@ export default function JSpaceApp() {
         pinnedIds: args.pinnedIds,
         useJacobian: args.useJacobian,
       },
-      { signal },
+      // Cancel on EITHER the component lifetime (useLensRun's own signal) OR the
+      // worker generation serving this readout: a post-ready worker/GPU error →
+      // retry terminates + replaces the worker (app.tsx aborts inspectorAbortRef
+      // on teardown), which rejects this readout promptly so the queue drains
+      // instead of stranding the next run behind a hung dispatch for 60 s.
+      { signal: composeAbort(signal, inspectorAbortRef.current?.signal) },
     );
     // HARD invariant (kept from the bake + lesson): a useJacobian:true request
     // that silently downgraded is a BUG — never relabel a logit frame Jacobian.
@@ -130,6 +125,23 @@ export default function JSpaceApp() {
     }
     return result;
   });
+  const { reset: resetRun } = lensRun;
+
+  // A fresh model load (loadKickoff bump — cold load OR a retry that terminates +
+  // replaces the worker) resets the worker-global `lensPackLoaded` (mlx-worker.ts),
+  // so our belief that the pack is resident + the self-test verdict must reset too
+  // (we then re-consult the worker; loadLensPack returns `alreadyLoaded`). It also
+  // starts a NEW worker generation, so the committed prompt + any displayed frame
+  // computed on the previous worker are stale — drop them so recovery shows the
+  // model-free view until the reader re-runs, never a dead-worker frame.
+  React.useEffect(() => {
+    packLoadedRef.current = false;
+    jacActivatedRef.current = false;
+    jacActivationRef.current = null;
+    committedPromptIdsRef.current = null;
+    resetRun();
+    setJac({ status: 'idle' });
+  }, [loadKickoff, resetRun]);
 
   // -------------------------------------------------------------------------
   // Jacobian activation: 46 MB pack + one-time silent self-test.
@@ -230,7 +242,9 @@ export default function JSpaceApp() {
       }
       let toks: TokenInfo[];
       try {
-        toks = await tokenize(worker, prompt);
+        // Bind tokenization to the worker generation too, so a worker teardown
+        // (retry/replacement) rejects it promptly instead of hanging to timeout.
+        toks = await tokenize(worker, prompt, { signal: inspectorAbortRef.current?.signal ?? undefined });
       } catch (err) {
         if (isAbortError(err)) return;
         setRunError(err instanceof Error ? err.message : String(err));
