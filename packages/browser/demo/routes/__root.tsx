@@ -32,6 +32,7 @@ import {
   getChapterSeo,
   getChaptersHubSeo,
   getChatSeo,
+  getJspaceSeo,
   getLandingSeo,
   getSectionSeo,
   sectionJsonLd,
@@ -124,6 +125,12 @@ function RootComponent() {
     // falls through to the locale-level landing identity below.
     if (path === '/chat' && locale === 'en') {
       applySeoHead(getChatSeo(), null);
+      return;
+    }
+    // /jspace is English-only (the Jacobian-lens app) — same fall-through rules
+    // as /chat: any /zh/jspace lands on the locale-level landing identity below.
+    if (path === '/jspace' && locale === 'en') {
+      applySeoHead(getJspaceSeo(), null);
       return;
     }
     // Unknown path — fall back to the site-level landing identity (same locale).

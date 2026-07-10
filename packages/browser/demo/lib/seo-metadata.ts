@@ -139,6 +139,20 @@ export function getChatSeo(): PageSeo {
   };
 }
 
+export function getJspaceSeo(): PageSeo {
+  return {
+    title: `J-Space · ${SITE_NAME}`,
+    description:
+      'Type any prompt and watch a language model make up its mind, layer by layer. A Jacobian lens that runs entirely in your browser on WebGPU.',
+    canonical: `${SITE_ORIGIN}/jspace`,
+    ogType: 'website',
+    image: OG_IMAGE,
+    // /jspace is English-only (there is no /zh/jspace) — no hreflang alternates.
+    locale: 'en',
+    alternates: [],
+  };
+}
+
 export function getChaptersHubSeo(locale: Locale = DEFAULT_LOCALE): PageSeo {
   return {
     title: CHAPTERS_HUB_TITLES[locale],
