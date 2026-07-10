@@ -381,9 +381,12 @@ export function ArgmaxGridCanvas({
           tabIndex={0}
           // A <canvas> cannot own DOM children, so the off-screen active cell is a
           // SIBLING. A `grid` must own `row`s, and a `gridcell` requires a `row`
-          // parent, so aria-owns re-parents the off-screen ROW (which wraps the
-          // gridcell) — only while a selection exists, so an empty grid owns nothing.
-          aria-owns={sel ? rowId : undefined}
+          // parent, so aria-owns UNCONDITIONALLY re-parents the off-screen ROW
+          // (which wraps the gridcell): the grid always owns >=1 row and the row is
+          // never orphaned, even with no selection. Only `aria-activedescendant` is
+          // gated on `sel` — with no selection there is simply no active cell (the
+          // proxy gridcell renders empty), which is absent, not a dangling ref.
+          aria-owns={rowId}
           aria-activedescendant={sel ? activeId : undefined}
           onMouseMove={onMouseMove}
           onMouseLeave={onMouseLeave}
