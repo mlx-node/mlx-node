@@ -20,6 +20,7 @@ Commands:
   calibrate          Calibrate FP8 activation amax for --q-recipe nvidia models
   redact             Redact PII from text using a privacy-filter model
   launch claude      Start a local server and spawn Claude Code pointed at it
+  agent              Start the local coding agent (pi-based, fully offline)
 
 Options:
   -h, --help         Show this help message
@@ -32,6 +33,8 @@ Examples:
   mlx calibrate -i ./qwen3.6-27b-nvidia-mxfp4-mlx --dataset ~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl
   mlx redact -m .cache/models/privacy-filter -i input.txt -o redacted.txt
   mlx launch claude
+  mlx agent
+  mlx agent -c
 `);
 }
 
@@ -74,6 +77,12 @@ async function main() {
       const rest = args.slice(1);
       const { run } = await import('./commands/redact.js');
       await run(rest);
+      break;
+    }
+
+    case 'agent': {
+      const { run } = await import('./commands/agent/index.js');
+      await run(args.slice(1));
       break;
     }
 

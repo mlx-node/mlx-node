@@ -8,4 +8,5 @@ export { TurnEmitter } from './provider/events.js';
 export { createMlxProviderExtension } from './provider/index.js';
 export { MlxModelHost, type MlxModelHostOptions } from './provider/model-host.js';
 export { discoverMlxModels, type MlxModelInfo } from './provider/models.js';
+export { runAgent, type RunAgentMain, type RunAgentOptions } from './run-agent.js';
 export { makeMlxStreamSimple, type StreamSimpleHost } from './provider/stream-adapter.js';
