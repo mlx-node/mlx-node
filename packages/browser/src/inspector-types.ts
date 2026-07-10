@@ -447,6 +447,29 @@ export const LENS_READOUT_RESULT_TYPE = 'lensReadoutResult' as const;
 export const LENS_READOUT_ERROR_TYPE = 'lensReadoutError' as const;
 
 // -----------------------------------------------------------------------------
+// loadLensPack — one-shot request to fetch the shipped f16 J-lens pack, upload
+// its tensors to the GPU, and populate the model thread's `lens_pack` slot so
+// `lensReadout({ useJacobian: true })` stops erroring. Plumbing only — the
+// widget toggle / consent UI is a later task. The request carries no payload
+// beyond the correlation id; the pack filename and model base live in the
+// worker. The response reports how many Jacobians were loaded and whether the
+// pack was already resident (idempotent load-once → a second call is a no-op
+// success with `alreadyLoaded: true`).
+export type LoadLensPackRequest = {
+  type: 'loadLensPack';
+  /** Caller-supplied correlation id. The worker echoes this in the response. */
+  id: string;
+};
+
+export type LoadLensPackResponse =
+  | { type: 'loadLensPackResult'; id: string; loaded: number; alreadyLoaded: boolean }
+  | { type: 'loadLensPackError'; id: string; error: string };
+
+export const LOAD_LENS_PACK_REQUEST_TYPE = 'loadLensPack' as const;
+export const LOAD_LENS_PACK_RESULT_TYPE = 'loadLensPackResult' as const;
+export const LOAD_LENS_PACK_ERROR_TYPE = 'loadLensPackError' as const;
+
+// -----------------------------------------------------------------------------
 // Notes for the backend implementer (crates/mlx-core, Rust).
 // -----------------------------------------------------------------------------
 //

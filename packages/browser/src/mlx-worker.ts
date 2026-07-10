@@ -40,6 +40,9 @@ import {
   LENS_READOUT_ERROR_TYPE,
   LENS_READOUT_REQUEST_TYPE,
   LENS_READOUT_RESULT_TYPE,
+  LOAD_LENS_PACK_ERROR_TYPE,
+  LOAD_LENS_PACK_REQUEST_TYPE,
+  LOAD_LENS_PACK_RESULT_TYPE,
   SCORE_TOKENS_ERROR_TYPE,
   SCORE_TOKENS_REQUEST_TYPE,
   SCORE_TOKENS_RESULT_TYPE,
@@ -91,6 +94,14 @@ let wasmMemory: WebAssembly.Memory | null = null;
 let wasmMalloc: ((size: number) => number) | null = null;
 let wasmFree: ((ptr: number) => void) | null = null;
 let modelSupportsImages = false;
+// Retained from the active model load so the (later, on-demand) J-lens pack
+// loader can fetch the pack from the SAME model base and upload it through the
+// SAME GPU worker the weights used. Reset on every fresh load. `lensPackLoaded`
+// makes the load idempotent (load-once): a second `loadLensPack` is a no-op
+// success rather than a re-upload.
+let currentModelSource: ModelSource | null = null;
+let currentGpuWorker: Worker | null = null;
+let lensPackLoaded = false;
 let bridgeOptimizationControl: Int32Array | null = null;
 let configuredFusionEnabled = true;
 let configuredDispatchBatchEnabled = false;
@@ -1514,6 +1525,11 @@ async function handleInit(data: {
     const gpuWorker = new Worker(workerAssetUrl(gpuWorkerUrl), {
       type: 'module',
     });
+    // Fresh load: retain this GPU worker for a later on-demand lens-pack upload
+    // and reset the load-once state (any prior pack died with the old worker).
+    currentGpuWorker = gpuWorker;
+    currentModelSource = null;
+    lensPackLoaded = false;
 
     // Wait for gpu-worker to create GPUDevice and be ready
     const gpuReady = await new Promise<any>((resolve, reject) => {
@@ -1801,6 +1817,8 @@ async function handleInit(data: {
     // one shard at a time so large local checkpoints never need one giant JS
     // ArrayBuffer.
     const modelSource = createModelSource(data.modelUrl, data.modelFiles, data.hfModel, data.modelLabel);
+    // Retain for the on-demand J-lens pack fetch (same model base as weights).
+    currentModelSource = modelSource;
     post({
       type: 'progress',
       step: 'model',
@@ -2802,6 +2820,107 @@ async function handleLensReadout(data: {
   }
 }
 
+// Versioned f16 J-lens pack shipped alongside the model weights (T4.0). Fetched
+// by EXPLICIT filename from the same model base as the weights (never via
+// discoverWeightFiles). Versioned so the immutable edge cache never serves a
+// stale pack (Plan D6).
+const LENS_PACK_FILENAME = 'lens-pack-v1.f16.safetensors';
+
+// Fetch the shipped f16 J-lens pack, upload its `J.{layer}` tensors to WebGPU,
+// and populate the model thread's `lens_pack` so `lensReadout({useJacobian:
+// true})` stops erroring. Plumbing for a later toggle (T4.4) — nothing calls
+// this yet. Mirrors handleLensReadout's error convention and the model-weight
+// GPU-buffer upload path (readSafeTensorsHeader → per-tensor byte copy →
+// uploadWeightsToGpu(..., packBf16=false) → build descriptors → NAPI). Fetch is
+// source-agnostic (readSafeTensorsHeader/readSourceSlice work for local, remote
+// and HF sources) so it also works against the local dev model symlink, not
+// just the deployed /api/model/* route. Idempotent load-once: a second call
+// after a successful load is a no-op success.
+async function handleLoadLensPack(data: { id: string }) {
+  const id = data.id;
+  try {
+    if (!model || typeof model.loadLensPackFromGpuBuffers !== 'function') {
+      throw new Error('loadLensPack: model not loaded (or this WASM build has no loadLensPackFromGpuBuffers)');
+    }
+    if (lensPackLoaded) {
+      // Load-once: the pack is already resident on the model thread.
+      (self as any).postMessage({
+        type: LOAD_LENS_PACK_RESULT_TYPE,
+        id,
+        loaded: 0,
+        alreadyLoaded: true,
+      });
+      return;
+    }
+    const source = currentModelSource;
+    const gpuWorker = currentGpuWorker;
+    if (!source || !gpuWorker) {
+      throw new Error('loadLensPack: model source / GPU worker unavailable (load a model first)');
+    }
+
+    // 1. Parse the pack header from the same model base as the weights.
+    const { tensors, dataOffset } = await readSafeTensorsHeader(source, LENS_PACK_FILENAME);
+    if (tensors.length === 0) {
+      throw new Error(`loadLensPack: ${LENS_PACK_FILENAME} contains no tensors`);
+    }
+
+    // 2. Pack every tensor's bytes contiguously into one upload buffer, byte
+    // offsets relative to the buffer start (dataOffset=0 for uploadWeightsToGpu),
+    // mirroring uploadPreparedWeightItems' single-batch path. ~46 MiB for the
+    // 23-Jacobian pack — one buffer, one upload.
+    let totalBytes = 0;
+    for (const tensor of tensors) totalBytes += tensor.byteSize;
+    const packBuffer = new ArrayBuffer(totalBytes);
+    const packView = new Uint8Array(packBuffer);
+    const uploadTensors: UploadTensorInfo[] = [];
+    let cursor = 0;
+    for (const tensor of tensors) {
+      // copyTensorBytesInto reads from the file at (dataOffset + tensor.byteOffset)
+      // using the ORIGINAL descriptor, so copy BEFORE recording the new offset.
+      await copyTensorBytesInto(source, LENS_PACK_FILENAME, dataOffset, tensor, packView, cursor);
+      uploadTensors.push({ ...tensor, byteOffset: cursor });
+      cursor += tensor.byteSize;
+    }
+
+    // 3. Upload to WebGPU. packBf16=false — lens matrices are plain f16, NOT
+    // 2-per-u32 packed bf16 (packing would make the Rust matmul read garbage).
+    const uploaded = await uploadWeightsToGpu(gpuWorker, packBuffer, 0, uploadTensors, undefined, false);
+    if (uploaded.handles.length !== uploadTensors.length) {
+      throw new Error(
+        `loadLensPack: GPU upload returned ${uploaded.handles.length} handles for ${uploadTensors.length} tensors`,
+      );
+    }
+
+    // 4. Build the descriptors the NAPI loader consumes. dtypeCode routes
+    // through dtypeToCode (F16→2), matching Rust's persistence dtype_from_code.
+    const gpuTensors: GpuTensorDescriptor[] = uploadTensors.map((tensor, i) => ({
+      name: tensor.name,
+      handle: uploaded.handles[i]!,
+      dtypeCode: dtypeToCode(uploaded.uploadedDtypes[i] ?? tensor.dtype),
+      shape: tensor.shape,
+      byteSize: uploaded.uploadedByteSizes[i] ?? tensor.byteSize,
+      packedBf16: false,
+    }));
+
+    // 5. Populate lens_pack on the model thread (validates + casts to bf16).
+    const loaded: number = await model.loadLensPackFromGpuBuffers(gpuTensors);
+    lensPackLoaded = true;
+    (self as any).postMessage({
+      type: LOAD_LENS_PACK_RESULT_TYPE,
+      id,
+      loaded,
+      alreadyLoaded: false,
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    (self as any).postMessage({
+      type: LOAD_LENS_PACK_ERROR_TYPE,
+      id,
+      error: message,
+    });
+  }
+}
+
 // Training chapter playground hooks (chapter 13 — Training). Each drives the
 // worker-scoped `trainer` (a `TinyTrainer` NAPI instance) and replies with a
 // {type:'train*Result'|'train*Error', id, ...} message correlated by the
@@ -2957,6 +3076,9 @@ self.onmessage = (e: MessageEvent) => {
       break;
     case LENS_READOUT_REQUEST_TYPE:
       void handleLensReadout(e.data);
+      break;
+    case LOAD_LENS_PACK_REQUEST_TYPE:
+      void handleLoadLensPack(e.data);
       break;
     case TRAIN_INIT_REQUEST_TYPE:
       handleTrainInit(e.data);

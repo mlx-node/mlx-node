@@ -1417,7 +1417,7 @@ pub(crate) fn load_vision_weights(
 /// JS codes match the Rust DType discriminant order:
 ///   0=f32, 1=i32, 2=f16, 3=bf16, 4=u32, 5=u8
 #[cfg(target_family = "wasm")]
-fn dtype_from_code(code: i32) -> Result<DType> {
+pub(crate) fn dtype_from_code(code: i32) -> Result<DType> {
     match code {
         0 => Ok(DType::Float32),
         1 => Ok(DType::Int32),

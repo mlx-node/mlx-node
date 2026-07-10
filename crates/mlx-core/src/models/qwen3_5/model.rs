@@ -456,6 +456,16 @@ pub(crate) enum Qwen35Cmd {
         path: String,
         reply: ResponseTx<u32>,
     },
+    /// Browser/WASM counterpart of [`Self::LoadLensPack`]: load a fitted J-lens
+    /// pack from GPU buffers the JS side already uploaded (there is no
+    /// filesystem in wasm). Each descriptor names one `J.{layer}` tensor's GPU
+    /// handle, dtype, and shape. See
+    /// [`Qwen35Inner::load_lens_pack_from_gpu_buffers_sync`].
+    #[cfg(target_family = "wasm")]
+    LoadLensPackFromGpuBuffers {
+        gpu_tensors: Vec<super::persistence::GpuTensorInfo>,
+        reply: ResponseTx<u32>,
+    },
     /// Offline J-lens fit (T1.2): fit the per-boundary Jacobians `J_l` over the
     /// given pre-tokenized prompts, accumulate into a resumable fp32 checkpoint,
     /// and optionally export a `J.{layer}` pack. Native offline eval only —
@@ -751,6 +761,10 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         #[cfg(feature = "full")]
         Qwen35Cmd::LoadLensPack { path, reply } => {
             let _ = reply.send(inner.load_lens_pack_from_file_sync(path));
+        }
+        #[cfg(target_family = "wasm")]
+        Qwen35Cmd::LoadLensPackFromGpuBuffers { gpu_tensors, reply } => {
+            let _ = reply.send(inner.load_lens_pack_from_gpu_buffers_sync(gpu_tensors));
         }
         #[cfg(feature = "full")]
         Qwen35Cmd::FitJacobianLens { opts, reply } => {
@@ -6607,6 +6621,136 @@ impl Qwen35Inner {
         Ok(loaded)
     }
 
+    /// Browser/WASM counterpart of [`Self::load_lens_pack_from_file_sync`]:
+    /// load a fitted J-lens pack from GPU buffers the JS side already uploaded
+    /// to WebGPU (there is no filesystem in wasm). This is the ONLY loader that
+    /// ships in the browser build, so it is gated on `target_family = "wasm"`
+    /// (NOT `feature = "full"`, which would strip it from wasm).
+    ///
+    /// Mirrors the file loader's validation exactly (25-slot vec, `J.` prefix,
+    /// integer layer suffix, reject `J.24` and out-of-range/duplicate layers,
+    /// require rank-2 `[hidden, hidden]`). It differs only in how each tensor is
+    /// materialized: instead of the SafeTensors disk reader it wraps the
+    /// pre-uploaded WGPU buffer via
+    /// [`crate::utils::safetensors::array_from_gpu_buffer`], routing the JS
+    /// dtype code through [`super::persistence::dtype_from_code`] — the SAME
+    /// mapping the model-weight GPU load uses (the local table in
+    /// `array_from_gpu_buffer` orders codes differently). Lens matrices are
+    /// plain f16/bf16, never 2-per-u32 packed, so the packed-bf16 mark is
+    /// deliberately never applied. Each wrapped tensor is cast to the model's
+    /// `h` dtype with `astype(bf16).eval()` so the f16 upload becomes bf16 once.
+    /// Populates `self.lens_pack`; returns how many Jacobians were loaded.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn load_lens_pack_from_gpu_buffers_sync(
+        &mut self,
+        gpu_tensors: Vec<super::persistence::GpuTensorInfo>,
+    ) -> Result<u32> {
+        let max_boundary = LENS_NUM_BOUNDARIES - 1; // 24
+
+        // Defensive: pack boundaries assume exactly 24 decoder layers (see the
+        // same check in `lens_readout_sync` / the file loader). A pack fitted
+        // for a different layer count must not silently load into wrong slots.
+        if self.layers.len() != LENS_NUM_BOUNDARIES - 1 {
+            return Err(Error::from_reason(format!(
+                "load_lens_pack: model has {} decoder layers but LENS_NUM_BOUNDARIES={} \
+                 assumes {}; pack boundary indexing is invalid for this model",
+                self.layers.len(),
+                LENS_NUM_BOUNDARIES,
+                LENS_NUM_BOUNDARIES - 1
+            )));
+        }
+        if self.config.hidden_size <= 0 {
+            return Err(Error::from_reason(format!(
+                "load_lens_pack: invalid hidden_size {} in model config",
+                self.config.hidden_size
+            )));
+        }
+        let hidden = self.config.hidden_size as i64;
+
+        let mut pack: Vec<Option<MxArray>> = (0..LENS_NUM_BOUNDARIES).map(|_| None).collect();
+        let mut loaded = 0u32;
+        for tensor in &gpu_tensors {
+            let name = &tensor.name;
+            let Some(layer_str) = name.strip_prefix("J.") else {
+                continue;
+            };
+            let Ok(layer) = layer_str.parse::<usize>() else {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' has a non-integer layer suffix",
+                    name
+                )));
+            };
+            if layer > max_boundary {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' layer {} out of range (0..={})",
+                    name, layer, max_boundary
+                )));
+            }
+            // The final boundary is `J=I` by definition — a pack must NOT carry
+            // a `J.24`. Reject it explicitly so a mislabeled/over-complete pack
+            // fails loudly instead of shipping a tensor the readout ignores.
+            if layer == max_boundary {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' targets the final boundary {} which is identity \
+                     by definition; a pack must not carry a J.{}",
+                    name, max_boundary, max_boundary
+                )));
+            }
+            // Reject duplicate entries for the same layer.
+            if pack[layer].is_some() {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: duplicate tensor for layer {} ('{}')",
+                    layer, name
+                )));
+            }
+
+            // Wrap the pre-uploaded WGPU buffer (zero-copy). Route the JS dtype
+            // code through persistence's `dtype_from_code` (the model-weight GPU
+            // path convention), NOT the local reverse table. `packed_bf16` is
+            // intentionally ignored — lens matrices are plain f16/bf16.
+            let dtype = super::persistence::dtype_from_code(tensor.dtype_code)?;
+            let shape_i64: Vec<i64> = tensor.shape.iter().map(|&d| d as i64).collect();
+            let arr = crate::utils::safetensors::array_from_gpu_buffer(
+                tensor.handle,
+                tensor.byte_size as usize,
+                &shape_i64,
+                dtype,
+            )?;
+
+            // Validate shape on the wrapped array: a per-layer Jacobian must be
+            // a square `[hidden, hidden]` matrix (`x = h · Jᵀ`). Shape/rank are
+            // metadata, available without evaluating the lazy array.
+            let ndim = arr.ndim()?;
+            if ndim != 2 {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' must be rank-2 [hidden, hidden], got rank {}",
+                    name, ndim
+                )));
+            }
+            let d0 = arr.shape_at(0)?;
+            let d1 = arr.shape_at(1)?;
+            if d0 != hidden || d1 != hidden {
+                return Err(Error::from_reason(format!(
+                    "load_lens_pack: tensor '{}' must be [{}, {}] (hidden_size²), got [{}, {}]",
+                    name, hidden, hidden, d0, d1
+                )));
+            }
+            let arr_bf16 = arr.astype(crate::array::DType::BFloat16)?;
+            arr_bf16.eval();
+            pack[layer] = Some(arr_bf16);
+            loaded += 1;
+        }
+
+        if loaded == 0 {
+            return Err(Error::from_reason(
+                "load_lens_pack: no `J.{layer}` tensors found in the uploaded pack".to_string(),
+            ));
+        }
+
+        self.lens_pack = pack;
+        Ok(loaded)
+    }
+
     /// Offline J-lens fit (T1.2). Loads the frozen bf16 model weights via
     /// [`Self::get_parameters_sync`] and drives
     /// [`crate::models::qwen3_5::jlens_fit::fit_jacobian_lens`] over the prompts
@@ -8994,6 +9138,30 @@ impl Qwen3_5Model {
                 _cache_limit_guard: crate::cache_limit::coordinator().register(0),
             })
         })
+    }
+
+    /// Load a fitted J-lens pack from GPU buffers (browser/WebGPU path).
+    ///
+    /// Browser counterpart of the native `load_lens_pack_from_file`: the JS
+    /// side uploads the versioned f16 pack tensors (`J.{layer}`) to WebGPU and
+    /// passes descriptors; the model thread wraps them, validates
+    /// (`[hidden, hidden]`, `J.0..=23`), casts each to bf16 once, and populates
+    /// its `lens_pack` slot so `lensReadout({ useJacobian: true })` stops
+    /// erroring. Returns the number of Jacobians loaded. Kept in this
+    /// `target_family = "wasm"`-gated `#[napi] impl` block (alongside
+    /// `load_from_gpu_buffers`) because it takes the wasm-only
+    /// `GpuTensorInfo` — gating the whole block keeps napi's generated
+    /// registration callbacks in lock-step with the method (a per-method cfg in
+    /// the shared block would leave a dangling `_c_callback`).
+    #[napi]
+    pub async fn load_lens_pack_from_gpu_buffers(
+        &self,
+        gpu_tensors: Vec<persistence::GpuTensorInfo>,
+    ) -> Result<u32> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::LoadLensPackFromGpuBuffers { gpu_tensors, reply }
+        })
+        .await
     }
 
     /// Store config/tokenizer strings before per-tensor CPU accumulation starts.
