@@ -27,7 +27,11 @@ import type { ChatStreamDelta, ChatStreamFinal, ToolCallResult } from '@mlx-node
 
 import { ToolCallTagBuffer } from './tool-call-buffer.js';
 
-function emptyUsage(): Usage {
+/**
+ * All-zero usage. Shared with the stream adapter's TurnEmitter-independent
+ * failsafe terminal, so it must stay trivially non-throwing.
+ */
+export function emptyUsage(): Usage {
   return {
     input: 0,
     output: 0,

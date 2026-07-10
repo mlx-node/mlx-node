@@ -63,6 +63,13 @@ describe('buildChatConfig', () => {
     expect('reuseCache' in config).toBe(false);
   });
 
+  it('resolves lfm2_moe through the lfm2 preset alias (same LFM2.5 family)', () => {
+    const config = buildChatConfig('lfm2_moe', undefined, undefined);
+    expect(config.maxNewTokens).toBe(LAUNCH_PRESETS['lfm2']!.maxOutputTokens);
+    expect(config.temperature).toBe(LAUNCH_PRESETS['lfm2']!.sampling.temperature);
+    expect(config.repetitionPenalty).toBe(LAUNCH_PRESETS['lfm2']!.sampling.repetitionPenalty);
+  });
+
   it('throws a clear error for a model type with no launch preset', () => {
     expect(() => buildChatConfig('harrier', undefined, undefined)).toThrow(/no launch preset .*harrier/i);
   });

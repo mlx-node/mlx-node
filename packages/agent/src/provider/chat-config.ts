@@ -9,7 +9,32 @@
 
 import type { SimpleStreamOptions, ThinkingLevel } from '@earendil-works/pi-ai';
 import type { ChatConfig, ModelType, ToolDefinition } from '@mlx-node/lm';
-import { LAUNCH_PRESETS } from '@mlx-node/server';
+import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
+
+/**
+ * Family variants that share the base family's `LAUNCH_PRESETS` entry.
+ * `lfm2_moe` checkpoints load through the same LFM2.5 family as `lfm2`
+ * (`Lfm2Model.load` serves both model-loader registry rows) and LiquidAI
+ * publishes one set of sampling recommendations for the family, so the
+ * MoE variant maps onto the `lfm2` preset here instead of forking
+ * `packages/server`.
+ */
+const PRESET_FAMILY_ALIASES: Partial<Record<ModelType, string>> = {
+  lfm2_moe: 'lfm2',
+};
+
+/**
+ * `LAUNCH_PRESETS` lookup with {@link PRESET_FAMILY_ALIASES} applied —
+ * the ONE preset resolution shared by discovery (`models.ts`) and
+ * per-call config assembly, so a model can never be discovered without
+ * also being streamable (and vice versa).
+ */
+export function launchPresetFor(modelType: ModelType): LaunchPreset | undefined {
+  const direct = LAUNCH_PRESETS[modelType];
+  if (direct) return direct;
+  const alias = PRESET_FAMILY_ALIASES[modelType];
+  return alias === undefined ? undefined : LAUNCH_PRESETS[alias];
+}
 
 /**
  * pi thinking level → native `reasoningEffort`. pi never delivers 'off'
@@ -30,9 +55,9 @@ export function buildChatConfig(
   options: SimpleStreamOptions | undefined,
   tools: ToolDefinition[] | undefined,
 ): ChatConfig {
-  const preset = LAUNCH_PRESETS[modelType];
+  const preset = launchPresetFor(modelType);
   if (!preset) {
-    const known = Object.keys(LAUNCH_PRESETS).join(', ');
+    const known = [...Object.keys(LAUNCH_PRESETS), ...Object.keys(PRESET_FAMILY_ALIASES)].join(', ');
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);
   }
 

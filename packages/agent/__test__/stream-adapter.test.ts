@@ -322,6 +322,172 @@ describe('makeMlxStreamSimple', () => {
     expect(session.log).toEqual(['fn1-start:not-discovered', 'fn1-end:not-discovered']);
   });
 
+  it('terminates promptly with aborted when the signal fires while QUEUED, then skips all session work', async () => {
+    // Reviewer repro: a request parked behind stalled prior inference or
+    // loading must not stay start-only forever when its signal aborts.
+    const session = new FakeChatSession([]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let closureRan = false;
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      async runWithResident<T>(_modelId: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+        await gate; // prior work that never yields until released
+        closureRan = true;
+        return fn(session.asChatSession());
+      },
+    };
+    const controller = new AbortController();
+    const streamSimple = makeMlxStreamSimple(host);
+
+    const stream = streamSimple(MODEL, CONTEXT, { signal: controller.signal });
+    controller.abort(); // abort while queued — the resident closure has not run
+
+    // The stream must terminate WITHOUT the gate ever being released.
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'error']);
+    const last = events[events.length - 1]!;
+    expect(last.type === 'error' && last.reason).toBe('aborted');
+    const message = finalMessage(events);
+    expect(message.stopReason).toBe('aborted');
+    expect(await stream.result()).toBe(message);
+
+    // Release the stalled work: the closure runs but must skip ALL session
+    // work (no warm-reset side effects, no prime, no stream) and emit
+    // nothing further.
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(closureRan).toBe(true);
+    expect(session.log).toEqual([]);
+    expect(session.primedWith).toBeNull();
+    expect(session.stateAtPrime).toBeNull();
+    expect(await collect(stream)).toEqual([]); // no events after the terminal
+    expect(await stream.result()).toBe(message);
+  });
+
+  it('pre-checks the signal: an already-aborted call terminates without engaging the host', async () => {
+    let hostCalls = 0;
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      runWithResident: () => {
+        hostCalls += 1;
+        return Promise.reject(new Error('must not run'));
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const streamSimple = makeMlxStreamSimple(host);
+
+    const events = await collect(streamSimple(MODEL, CONTEXT, { signal: controller.signal }));
+    expect(types(events)).toEqual(['start', 'error']);
+    const last = events[events.length - 1]!;
+    expect(last.type === 'error' && last.reason).toBe('aborted');
+    expect(finalMessage(events).stopReason).toBe('aborted');
+    expect(hostCalls).toBe(0);
+  });
+
+  it('contains a synchronous setup failure (poisoned Model getter) inside the stream', async () => {
+    const session = new FakeChatSession([]);
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session));
+    const evilModel = Object.defineProperty({ ...MODEL }, 'api', {
+      get(): string {
+        throw new Error('poisoned model.api');
+      },
+    }) as Model<Api>;
+
+    let stream!: AssistantMessageEventStream;
+    expect(() => {
+      stream = streamSimple(evilModel, CONTEXT);
+    }).not.toThrow();
+
+    // The TurnEmitter died before it could push 'start'; the failsafe
+    // still delivers exactly one terminal so result() settles.
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['error']);
+    const message = finalMessage(events);
+    expect(message.stopReason).toBe('error');
+    expect(message.errorMessage).toBe('poisoned model.api');
+    expect(message.api).toBe('unknown'); // hostile field reads fall back safely
+    expect(await stream.result()).toBe(message);
+    expect(session.log).toEqual([]); // the host was never engaged
+  });
+
+  it('falls back to a TurnEmitter-independent terminal when the error defeats coercion (null-prototype)', async () => {
+    // String(err) throws for a null-prototype object, which blows up
+    // TurnEmitter.onError itself — the failsafe must still terminalize.
+    const evil: unknown = Object.create(null);
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      runWithResident: () => Promise.reject(evil),
+    };
+    const stream = makeMlxStreamSimple(host)(MODEL, CONTEXT);
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'error']);
+    const message = finalMessage(events);
+    expect(message.stopReason).toBe('error');
+    expect(message.errorMessage).toBe('unserializable error');
+    expect(await stream.result()).toBe(message);
+  });
+
+  it('falls back to the failsafe terminal for an Error whose message getter throws', async () => {
+    class PoisonError extends Error {
+      constructor() {
+        super(); // no message argument → the prototype getter stays active
+      }
+      override get message(): string {
+        throw new Error('message getter exploded');
+      }
+    }
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      runWithResident: () => Promise.reject(new PoisonError()),
+    };
+    const stream = makeMlxStreamSimple(host)(MODEL, CONTEXT);
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual(['start', 'error']);
+    const message = finalMessage(events);
+    expect(message.stopReason).toBe('error');
+    // Both err.message and String(err) throw → constant fallback.
+    expect(message.errorMessage).toBe('unserializable error');
+    expect(await stream.result()).toBe(message);
+  });
+
+  it('swallows a terminal-push failure instead of cascading into pi', async () => {
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      runWithResident: () => Promise.reject(new Error('load failed')),
+    };
+    const streamSimple = makeMlxStreamSimple(host);
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const stream = streamSimple(MODEL, CONTEXT);
+      // Sabotage the terminal surface AFTER setup pushed 'start' but
+      // BEFORE the detached rejection path fires (microtask ordering).
+      let pushAttempts = 0;
+      stream.push = () => {
+        pushAttempts += 1;
+        throw new Error('stream.push exploded');
+      };
+      stream.end = () => {
+        throw new Error('stream.end exploded');
+      };
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(pushAttempts).toBeGreaterThan(0); // the terminal WAS attempted
+      expect(unhandled).toEqual([]); // and its failure never escaped
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('runs two concurrent calls strictly sequentially, streaming INSIDE each closure', async () => {
     const session = new FakeChatSession([
       async function* () {

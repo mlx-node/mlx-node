@@ -21,9 +21,9 @@ import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
 import { detectModelType, type ModelType } from '@mlx-node/lm';
-import { LAUNCH_PRESETS } from '@mlx-node/server';
 
 import type { DiscoveredModelLike } from '../types.js';
+import { launchPresetFor } from './chat-config.js';
 
 /** A discovered local checkpoint paired with its pi provider model entry. */
 export interface MlxModelInfo {
@@ -38,22 +38,25 @@ const NON_GENERATIVE: ReadonlySet<ModelType> = new Set<ModelType>(['harrier', 'q
 interface FamilyTraits {
   /**
    * Whether the family emits `<think>` reasoning (drives pi's thinking
-   * levels): true for qwen3 / qwen3_5 / qwen3_5_moe / lfm2, false for the
-   * instruct-only gemma4.
+   * levels): true for qwen3 / qwen3_5 / qwen3_5_moe / lfm2 / lfm2_moe,
+   * false for the instruct-only gemma4.
    */
   reasoning: boolean;
   /**
    * Context-window fallback when `config.json` carries no
    * `max_position_embeddings` at either nesting level. Values are the
    * trained windows of the reference checkpoints: Qwen3 40960,
-   * Qwen3.5 (+MoE) 262144, Gemma4 131072, LFM2.5 128000.
+   * Qwen3.5 (+MoE) 262144, Gemma4 131072, LFM2.5 (dense + MoE) 128000
+   * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`).
    */
   fallbackContextWindow: number;
 }
 
 /**
- * Keyed like `LAUNCH_PRESETS`: a chat-capable family must appear in BOTH
- * maps to be served (a preset without traits is skipped, never guessed).
+ * Keyed by `ModelType`: a chat-capable family must have BOTH an entry
+ * here and a launch preset via `launchPresetFor` (which folds `lfm2_moe`
+ * onto the `lfm2` preset) to be served — missing either side is skipped,
+ * never guessed.
  */
 const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   qwen3: { reasoning: true, fallbackContextWindow: 40960 },
@@ -61,6 +64,7 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   qwen3_5_moe: { reasoning: true, fallbackContextWindow: 262144 },
   gemma4: { reasoning: false, fallbackContextWindow: 131072 },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
+  lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
 };
 
 function positiveInteger(value: unknown): number | undefined {
@@ -126,9 +130,9 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
 
     if (NON_GENERATIVE.has(modelType)) continue;
 
-    const preset = LAUNCH_PRESETS[modelType];
+    const preset = launchPresetFor(modelType);
     if (!preset) {
-      if (debug) console.warn(`[mlx] skip ${full}: no LAUNCH_PRESETS entry for ${modelType}`);
+      if (debug) console.warn(`[mlx] skip ${full}: no launch preset for ${modelType}`);
       continue;
     }
     const traits = FAMILY_TRAITS[modelType];
