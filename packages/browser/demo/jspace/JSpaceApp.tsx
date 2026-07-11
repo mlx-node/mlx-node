@@ -95,6 +95,11 @@ export default function JSpaceApp() {
   const jacActivationRef = React.useRef<Promise<'ok' | 'failed' | 'unavailable'> | null>(null);
   const hashAppliedRef = React.useRef(false);
   const lastWrittenHashRef = React.useRef<string | null>(null);
+  // A selection restored from a permalink onto a CUSTOM prompt can't render until
+  // the reader runs (skeleton until then) and `handleRun` clears `selected` before
+  // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
+  // clamped to that slice. Consumed once; later runs never re-apply it.
+  const pendingSelRef = React.useRef<CellRef | null>(null);
 
   // -------------------------------------------------------------------------
   // Execution: single-flight lensReadout with the hard jacobianApplied guard.
@@ -161,7 +166,9 @@ export default function JSpaceApp() {
       { promptIds, layers: JACOBIAN_LAYERS, topK: TOP_K, pinnedIds, useJacobian: true },
       { signal },
     );
-    if (live.useJacobian && live.jacobianApplied !== true) {
+    // We REQUESTED useJacobian:true, so the response MUST report jacobianApplied:true —
+    // check unconditionally (a downgraded useJacobian:false response must not slip past).
+    if (live.jacobianApplied !== true) {
       throw new Error('self-test: Jacobian readout downgraded (jacobianApplied=false)');
     }
     const baked = reviveRun((STARTERS['french-season'] as unknown as BakedFile).jacobian);
@@ -320,10 +327,21 @@ export default function JSpaceApp() {
     setPrompt(restored.prompt);
     setMode(restored.mode);
     setPins(restored.pins);
-    setSelected(restored.sel);
+    setSelected(restored.sel); // renders immediately for a STARTER permalink (grid is present)
+    pendingSelRef.current = restored.sel; // …and survives the first Run for a CUSTOM permalink
     setActivePinIdx(restored.pins.length > 0 ? 0 : null);
     lastWrittenHashRef.current = hash.startsWith('#') ? hash.slice(1) : hash;
   }, []);
+
+  // Re-apply a permalink-restored selection ONCE after the first live slice: the
+  // custom-prompt path starts as a skeleton and `handleRun` clears `selected`, so
+  // without this the shared cell would be lost. Clamp to the real slice and consume.
+  React.useEffect(() => {
+    if (lensRun.state.status !== 'done' || pendingSelRef.current === null) return;
+    const slice = buildLensSlice(lensRun.state.result);
+    setSelected(normalizeSelected(pendingSelRef.current, slice));
+    pendingSelRef.current = null;
+  }, [lensRun.state]);
 
   // Write the permalink to the HASH with replaceState — NEVER navigate (the root
   // route's searchSchema would strip it). Skips redundant writes + the cold
@@ -368,6 +386,16 @@ export default function JSpaceApp() {
   const pinnedForView = view.pinned;
   const effectiveActiveIdx =
     pinnedForView.length === 0 ? null : Math.min(Math.max(activePinIdx ?? 0, 0), pinnedForView.length - 1);
+
+  // A deliberate selection (keyboard nav or click) wins over a stale hover: clear
+  // `hovered` so `activeCellRef` (= hovered ?? selected) follows the selection.
+  // Otherwise the canvas ring + aria-activedescendant (which track `selected`)
+  // diverge from the tooltip / charts / cross-sections / Pin target (which track
+  // activeCellRef), and Pin could pin the hovered cell while another is selected.
+  const selectCell = React.useCallback((ref: CellRef | null) => {
+    setHovered(null);
+    setSelected(ref);
+  }, []);
 
   const activeCellRef = slice ? normalizeSelected(hovered ?? selected, slice) : null;
   const colorByPinnedId = React.useMemo(() => {
@@ -587,9 +615,10 @@ export default function JSpaceApp() {
             tokens={slice.tokens}
             selectedPos={activeCellRef?.pos ?? null}
             showWhitespace={showWhitespace}
-            onSelectPos={(pos) =>
-              setSelected((prev) => ({ layerIdx: prev?.layerIdx ?? slice.layers.length - 1, pos }))
-            }
+            onSelectPos={(pos) => {
+              setHovered(null); // a deliberate position pick wins over a stale hover
+              setSelected((prev) => ({ layerIdx: prev?.layerIdx ?? slice.layers.length - 1, pos }));
+            }}
           />
 
           {/* Argmax grid */}
@@ -603,7 +632,7 @@ export default function JSpaceApp() {
               colorByPinnedId={colorByPinnedId}
               selected={selected}
               onHover={setHovered}
-              onSelect={setSelected}
+              onSelect={selectCell}
               showWhitespace={showWhitespace}
               ariaLabel={`Argmax grid: ${slice.layers.length} residual boundaries as rows (deepest on top) by ${slice.promptLen} prompt positions as columns.`}
             />
@@ -646,7 +675,7 @@ export default function JSpaceApp() {
                     slice={slice}
                     pinnedIdx={effectiveActiveIdx}
                     selected={selected}
-                    onSelect={setSelected}
+                    onSelect={selectCell}
                   />
                 </div>
                 <div className="min-w-0 flex-1 space-y-1">
@@ -667,8 +696,8 @@ export default function JSpaceApp() {
           {/* Cross-sections at the selected cell */}
           {activeCellRef ? (
             <div className="grid gap-4 lg:grid-cols-2">
-              <ByLayerStrip slice={slice} pos={activeCellRef.pos} selected={selected} onSelect={setSelected} />
-              <ByPosStrip slice={slice} layerIdx={activeCellRef.layerIdx} selected={selected} onSelect={setSelected} />
+              <ByLayerStrip slice={slice} pos={activeCellRef.pos} selected={selected} onSelect={selectCell} />
+              <ByPosStrip slice={slice} layerIdx={activeCellRef.layerIdx} selected={selected} onSelect={selectCell} />
             </div>
           ) : null}
         </section>
