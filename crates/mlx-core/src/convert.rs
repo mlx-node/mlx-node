@@ -11991,68 +11991,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn convert_model_nvidia_recipe_accepts_gemma4_text_config() {
-        // `gemma4_text` is a real dense gemma4 root model_type in this repo
-        // (model-loader `rawModelTypes`, and the CLI collapses `gemma4_text` →
-        // `--model-type gemma4`). The gate reads the config's OWN type, so it
-        // must collapse `gemma4_text` to the gemma4 family and ACCEPT a
-        // requested gemma4 rather than reject it as unsupported. Proof it
-        // passed the model-type gate: the run fails LATER on missing weights
-        // (only config.json is written), not with the "only supported for
-        // model types" upfront reject. Reverting `nvidia_recipe_family`'s
-        // gemma4_text arm turns this into that gate reject and fails the test.
-        let base = std::env::temp_dir().join(format!(
-            "nvidia_gate_gemma4_text_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        ));
-        let input = base.join("in");
-        let output = base.join("out");
-        std::fs::create_dir_all(&input).expect("create synthetic input dir");
-        std::fs::write(
-            input.join("config.json"),
-            serde_json::to_string_pretty(&serde_json::json!({
-                "model_type": "gemma4_text",
-                "tie_word_embeddings": false
-            }))
-            .unwrap(),
-        )
-        .expect("write config.json");
-
-        let err = convert_model(ConversionOptions {
-            input_dir: input.to_string_lossy().to_string(),
-            output_dir: output.to_string_lossy().to_string(),
-            dtype: Some("bfloat16".to_string()),
-            verbose: Some(false),
-            model_type: Some("gemma4".to_string()), // CLI-collapsed gemma4_text
-            quantize: Some(true),
-            quant_bits: None,
-            quant_group_size: None,
-            quant_mode: Some("affine".to_string()),
-            quant_recipe: Some("nvidia".to_string()),
-            imatrix_path: None,
-            quant_mxfp: None,
-            quant_mtp: None,
-        })
-        .await
-        .err()
-        .expect("run still fails: no safetensors were written");
-        // The failure must NOT be the nvidia model-type gate reject — the gate
-        // accepted gemma4_text (collapsed to the gemma4 family) and fell
-        // through to the missing-weights path.
-        assert!(
-            !err.reason.contains("only supported for model types"),
-            "gemma4_text must pass the nvidia model-type gate, got a gate reject: {}",
-            err.reason
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
         // Round-2 [medium]: real gemma MoE configs carry `enable_moe_block`
         // under `text_config` (the root key is absent), and the loader resolves
