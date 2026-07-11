@@ -4251,10 +4251,17 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
 /// it.
 ///
 /// The nvidia recipe is a data-free port of NVIDIA modelopt's Qwen3.5/3.6
-/// *hybrid* recipe and is documented + validated ONLY for `qwen3_5` /
-/// `qwen3_5_moe`. Its per-layer map (`build_nvidia_recipe`) is a pure
+/// *hybrid* recipe. The SAME fixed mxfp4/mxfp8 class-map is now also applied to
+/// dense `gemma4` / `gemma4_unified`, whose standard attention + MLP key names
+/// fall out of the same predicate: attention `self_attn.{q,k,v,o}_proj` →
+/// mxfp8, MLP `.mlp.{gate,up,down}_proj` → mxfp4, and norms / `embed_tokens` /
+/// `vision_embedder.*` (plus the tied gemma4 head) stay bf16. This is the same
+/// data-free format map generalized to gemma4's standard attention — NOT a port
+/// of an official NVIDIA *gemma* recipe. The recipe is documented + validated
+/// for these four model types (`qwen3_5` / `qwen3_5_moe` / `gemma4` /
+/// `gemma4_unified`). Its per-layer map (`build_nvidia_recipe`) is a pure
 /// key-pattern predicate with no model-family awareness, so applying it to any
-/// other family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
+/// OTHER family (or to a `None`/omitted model type) would emit mxfp4/mxfp8
 /// per-layer metadata on generic substrings (`lm_head`, `self_attn`, `.mlp.*`)
 /// that those loaders were never designed for — producing an unloadable or
 /// numerically invalid checkpoint instead of failing upfront. Reject any
@@ -4286,11 +4293,15 @@ pub(crate) fn validate_nvidia_recipe_options(
     quant_bits: Option<i32>,
     quant_group_size: Option<i32>,
 ) -> std::result::Result<(), String> {
-    if !matches!(model_type, Some("qwen3_5") | Some("qwen3_5_moe")) {
+    if !matches!(
+        model_type,
+        Some("qwen3_5") | Some("qwen3_5_moe") | Some("gemma4") | Some("gemma4_unified")
+    ) {
         return Err(format!(
-            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe \
-             (got {}). It ports the Qwen3.5/3.6 hybrid modelopt recipe; other families \
-             (e.g. gemma4) need their own recipe.",
+            "--q-recipe nvidia is only supported for model types qwen3_5 / qwen3_5_moe / \
+             gemma4 / gemma4_unified (got {}). It applies a fixed data-free mxfp4/mxfp8 \
+             class-map (attention → mxfp8, MLP → mxfp4, norms/embeds/vision → bf16); other \
+             families need their own recipe.",
             match model_type {
                 Some(mt) => format!("'{mt}'"),
                 None => "none".to_string(),
@@ -7420,26 +7431,32 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_recipe_options_accepts_qwen3_5_and_moe() {
-        // The recipe is documented + validated for exactly these two families.
-        // A bare invocation (no aux flags) on either must pass.
+    fn nvidia_recipe_options_accepts_supported_families() {
+        // The recipe is documented + validated for exactly these four families
+        // (qwen3_5 / qwen3_5_moe + dense gemma4 / gemma4_unified, whose standard
+        // attention + MLP keys fall out of the same data-free class-map). A bare
+        // invocation (no aux flags) on any of them must pass.
         validate_nvidia_recipe_options(Some("qwen3_5"), None, false, None, None)
             .expect("qwen3_5 must be accepted");
         validate_nvidia_recipe_options(Some("qwen3_5_moe"), None, false, None, None)
             .expect("qwen3_5_moe must be accepted");
+        validate_nvidia_recipe_options(Some("gemma4"), None, false, None, None)
+            .expect("gemma4 must be accepted");
+        validate_nvidia_recipe_options(Some("gemma4_unified"), None, false, None, None)
+            .expect("gemma4_unified must be accepted");
     }
 
     #[test]
-    fn nvidia_recipe_options_rejects_non_qwen_model_types() {
+    fn nvidia_recipe_options_rejects_unsupported_model_types() {
         // Other families' loaders were never designed for the nvidia recipe's
-        // mxfp4/mxfp8 per-layer map — reject upfront. The model-type gate fires
-        // before the aux-flag checks, so it holds even with otherwise-valid
-        // (bare) flags.
-        for mt in ["gemma4", "lfm2", "lfm2_moe", "qwen3"] {
+        // mxfp4/mxfp8 per-layer map — reject upfront. `qwen3` != `qwen3_5`, so it
+        // stays unsupported. The model-type gate fires before the aux-flag
+        // checks, so it holds even with otherwise-valid (bare) flags.
+        for mt in ["lfm2", "lfm2_moe", "qwen3"] {
             let err = validate_nvidia_recipe_options(Some(mt), None, false, None, None)
-                .expect_err("nvidia recipe must reject a non-qwen3_5 model type");
+                .expect_err("nvidia recipe must reject an unsupported model type");
             assert!(
-                err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+                err.contains("only supported for model types"),
                 "error must name the supported model types, got: {err}"
             );
             assert!(
@@ -7457,7 +7474,7 @@ mod tests {
         let err = validate_nvidia_recipe_options(None, None, false, None, None)
             .expect_err("nvidia recipe must reject an omitted model type");
         assert!(
-            err.contains("only supported for model types qwen3_5 / qwen3_5_moe"),
+            err.contains("only supported for model types"),
             "error must name the supported model types, got: {err}"
         );
         assert!(
@@ -11536,11 +11553,12 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
-        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real gemma4 directory
-        // past the nvidia gate. The gate reads the input config.json's actual
-        // model_type (gemma4), so the run is rejected even though --model-type
-        // claims qwen3_5. Only config.json is written — the gate must fire
-        // before weights load, so the error is the model-type reject, not a
+        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
+        // directory past the nvidia gate. The gate reads the input config.json's
+        // actual model_type (lfm2 — still unsupported now that gemma4 is
+        // allowed), so the run is rejected even though --model-type claims
+        // qwen3_5. Only config.json is written — the gate must fire before
+        // weights load, so the error is the model-type reject, not a
         // missing-safetensors error.
         let base = std::env::temp_dir().join(format!(
             "nvidia_gate_realconfig_{}_{}",
@@ -11556,7 +11574,7 @@ mod tests {
         std::fs::write(
             input.join("config.json"),
             serde_json::to_string_pretty(&serde_json::json!({
-                "model_type": "gemma4",
+                "model_type": "lfm2",
                 "tie_word_embeddings": false
             }))
             .unwrap(),
@@ -11580,12 +11598,10 @@ mod tests {
         })
         .await
         .err()
-        .expect("nvidia recipe must reject a real gemma4 config even with -m qwen3_5");
+        .expect("nvidia recipe must reject a real lfm2 config even with -m qwen3_5");
         assert!(
-            err.reason
-                .contains("only supported for model types qwen3_5")
-                && err.reason.contains("gemma4"),
-            "expected the nvidia model-type reject naming the real config type gemma4, got: {}",
+            err.reason.contains("only supported for model types") && err.reason.contains("lfm2"),
+            "expected the nvidia model-type reject naming the real config type lfm2, got: {}",
             err.reason
         );
     }

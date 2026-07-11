@@ -89,8 +89,14 @@ Quantization Arguments:
                         =mxfp8 8/32, in_proj_a/b + router gates=8b affine,
                         everything else bf16. Fixed map (ignores --q-bits/
                         --q-group-size); runs under --q-mode affine; no imatrix.
+                        Also supported for dense gemma4 / gemma4_unified: the
+                        same class-map applies to standard attention (q/k/v/o
+                        =mxfp8) and MLP (gate/up/down=mxfp4), with head/embeds/
+                        vision_embedder staying bf16 (tied gemma4 head is bf16).
                         Example: mlx convert -m qwen3_5 -q --q-recipe nvidia \
                           -i ./qwen3.6-27b -o ./qwen3.6-27b-nvidia-mxfp4-mlx
+                        Example: mlx convert -m gemma4 -q --q-recipe nvidia \
+                          -i ./gemma-4-12b -o ./gemma-4-12b-nvidia-mxfp4-mlx
   --q-mtp <string>      Qwen MTP quantization policy: off (default), cyankiwi,
                         all, or split (alias drafter).
                         cyankiwi/all quantize MTP linears as 4-bit affine
