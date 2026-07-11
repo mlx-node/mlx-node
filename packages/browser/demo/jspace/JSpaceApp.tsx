@@ -434,7 +434,16 @@ export default function JSpaceApp() {
 
   // ---- render -------------------------------------------------------------
   return (
-    <main className="mx-auto max-w-[110rem] space-y-5 px-4 py-6">
+    // /jspace is a standalone route rendered directly inside `.app-root`
+    // (position: relative; h-dvh; overflow-hidden — demo/styles.css), whose body is
+    // `overflow: hidden`, so the document never scrolls. Like LessonLayout and the
+    // chat layer, /jspace must OWN its scroll surface. `absolute inset-0` pins this
+    // <main> to all four edges of the shell — fixing its height to the viewport so
+    // `overflow-y-auto` scrolls internally instead of clipping; `max-w-[110rem]
+    // mx-auto` still centers the body (auto margins on an inset-0 box). Without this
+    // the live view (grid + heatmap + charts + cross-sections) is unreachable below
+    // the fold.
+    <main className="absolute inset-0 mx-auto max-w-[110rem] space-y-5 overflow-y-auto px-4 py-6">
       <header className="space-y-1">
         <h1 className="text-xl font-semibold">J-Space</h1>
         <p className="text-sm text-muted-foreground">
