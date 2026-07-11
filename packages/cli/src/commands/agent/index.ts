@@ -11,7 +11,7 @@
  * the handoff and nothing here reads stdin.
  */
 
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,11 +100,24 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
 }
 
 /**
- * Args that make pi resolve the model itself: an explicit choice
- * (`--model`/`--provider`) or a session reference whose saved model must
- * win (pi's `createAgentSession` restores the session's model ONLY when
- * no CLI `--model` was given). `--fork` belongs here too: it copies the
- * source session — messages and saved model included — into a new one.
+ * Args that make pi resolve the model itself, so `--model mlx/<default>`
+ * injection must be SUPPRESSED: an explicit choice (`--model`/`--provider`)
+ * or a session reference whose saved model must win (pi's
+ * `createAgentSession` restores the session's model ONLY when no CLI
+ * `--model` was given). `--fork` belongs here too: it copies the source
+ * session — messages and saved model included — into a new one.
+ *
+ * `--provider` stays a suppressor DELIBERATELY. Provider-only
+ * (`mlx agent --provider groq`, no `--model`) never selects a model in pi
+ * (`resolveCliModel` needs a `cliModel`), so it falls through to
+ * `findInitialModel`, where the write-once persisted mlx default
+ * ({@link writePersistedDefaultModel}, step 3) now keeps it on-machine —
+ * that is the fix for the provider-only leak. Removing `--provider` here
+ * (so injection fires) would be WORSE: pi resolves the injected
+ * `--model mlx/<default>` against the user's `--provider groq` via
+ * `buildFallbackModel`, minting a bogus CLOUD `groq/mlx/<default>` custom
+ * model — the exact off-machine routing this guards against. Verified
+ * against pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
  */
 const MODEL_CARRYING_ARGS: ReadonlySet<string> = new Set([
   '--model',
@@ -163,21 +176,31 @@ export function expandPiAgentDir(dir: string, home: string = homedir()): string 
 }
 
 /**
+ * Resolve pi's agent config home the way `runAgent`'s env seeding will:
+ * an explicit `PI_CODING_AGENT_DIR` wins — run through {@link expandPiAgentDir}
+ * to match pi's own tilde/file-URL expansion — else `~/.mlx-node/agent`
+ * (the value `runAgent` seeds). An explicitly passed `agentDir` (test seam)
+ * is used verbatim. May throw only via `expandPiAgentDir` (e.g. a malformed
+ * `file://` URL); callers wrap this in their own try/catch. Shared by the
+ * persisted-default reader and writer so both open the SAME settings.json.
+ */
+function resolvePiAgentDir(agentDir?: string): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR;
+  return agentDir ?? (envDir ? expandPiAgentDir(envDir) : join(homedir(), '.mlx-node', 'agent'));
+}
+
+/**
  * Read pi's persisted `/model` default from the agent config home:
  * `<agentDir>/settings.json`, fields `defaultProvider` + `defaultModel`
  * (pi's `SettingsManager.setDefaultModelAndProvider` writes them to the
  * GLOBAL-scope file, i.e. this one). The dir mirrors what pi itself
- * will resolve after `runAgent`'s env seeding: an explicit
- * `PI_CODING_AGENT_DIR` wins — run through {@link expandPiAgentDir},
- * matching pi's own tilde/file-URL expansion — else `~/.mlx-node/agent`
- * (the value `runAgent` seeds). An explicitly passed `agentDir` (test
- * seam) is used verbatim. Absent, malformed, or unresolvable settings
- * mean "no persisted default", never an error.
+ * will resolve after `runAgent`'s env seeding (see {@link resolvePiAgentDir}).
+ * Absent, malformed, or unresolvable settings mean "no persisted default",
+ * never an error.
  */
 export function readPersistedDefaultModel(agentDir?: string): PersistedPiDefault | undefined {
   try {
-    const envDir = process.env.PI_CODING_AGENT_DIR;
-    const dir = agentDir ?? (envDir ? expandPiAgentDir(envDir) : join(homedir(), '.mlx-node', 'agent'));
+    const dir = resolvePiAgentDir(agentDir);
     const parsed: unknown = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'));
     if (typeof parsed !== 'object' || parsed === null) {
       return undefined;
@@ -192,6 +215,47 @@ export function readPersistedDefaultModel(agentDir?: string): PersistedPiDefault
     return { provider: defaultProvider, modelId: defaultModel };
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Persist an mlx `/model` default into `<agentDir>/settings.json`
+ * (`defaultProvider` + `defaultModel`), PRESERVING every existing field.
+ *
+ * This is the belt half of the local-first guarantee for pi's session /
+ * provider paths, which suppress the `--model` injection: pi's
+ * `findInitialModel` consults this persisted default (step 3) ABOVE its
+ * "first available cloud model" fallback (step 4) and BELOW a restored
+ * session's own model, so seeding an mlx default keeps a `-c`/`--session`/
+ * provider-only launch on-machine instead of silently picking a cloud
+ * model that an ambient API key made available.
+ *
+ * Callers gate this to WRITE-ONCE (only when no default is persisted) so a
+ * later user `/model` pick is never overwritten. Best-effort by contract:
+ * ANY I/O failure is swallowed — a settings write must never crash the
+ * launch (the `--model` injection on plain fresh runs remains the fallback).
+ * The dir resolves IDENTICALLY to {@link readPersistedDefaultModel}.
+ */
+export function writePersistedDefaultModel(provider: string, modelId: string, agentDir?: string): void {
+  try {
+    const dir = resolvePiAgentDir(agentDir);
+    const path = join(dir, 'settings.json');
+    let settings: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (typeof parsed === 'object' && parsed !== null) {
+        settings = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // No existing settings.json (or unreadable/malformed) — start empty and
+      // write a fresh, valid file with just the two default fields.
+    }
+    settings['defaultProvider'] = provider;
+    settings['defaultModel'] = modelId;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+  } catch {
+    // Settings I/O failure must not abort the launch.
   }
 }
 
@@ -269,6 +333,8 @@ export interface AgentRunDeps {
   wizard?: (modelsDir: string) => Promise<void>;
   /** Persisted-`/model` reader; production = {@link readPersistedDefaultModel}. */
   readPersistedDefault?: typeof readPersistedDefaultModel;
+  /** Persisted-`/model` writer; production = {@link writePersistedDefaultModel}. */
+  writePersistedDefault?: (provider: string, modelId: string) => void;
 }
 
 /** Production wizard step: interactive catalog pick + download. */
@@ -349,7 +415,17 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     }
   }
 
-  const { modelId, notice } = chooseDefaultModel(models, (deps.readPersistedDefault ?? readPersistedDefaultModel)());
+  const persisted = (deps.readPersistedDefault ?? readPersistedDefaultModel)();
+  const { modelId, notice } = chooseDefaultModel(models, persisted);
+  // Write-once: seed an mlx default into pi's settings.json when none is
+  // persisted yet, so the session / provider-only launch paths (where the
+  // `--model` injection is suppressed) still resolve to a local model via
+  // pi's `findInitialModel` step-3 instead of an ambient cloud provider.
+  // Only when unset, so a later user `/model` pick is never overwritten; the
+  // writer swallows I/O failures, so a bad settings file can't crash launch.
+  if (persisted === undefined) {
+    (deps.writePersistedDefault ?? writePersistedDefaultModel)('mlx', modelId);
+  }
   const agentArgv = withDefaultModel(scan.passthrough, modelId);
   // The identity return means no injection happened (session/--model run)
   // — then nothing was overridden and the notice would be a lie.

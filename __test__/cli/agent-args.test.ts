@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -13,6 +14,7 @@ import {
   run,
   scanAgentArgs,
   withDefaultModel,
+  writePersistedDefaultModel,
 } from '../../packages/cli/src/commands/agent/index.js';
 
 describe('scanAgentArgs', () => {
@@ -165,6 +167,16 @@ describe('withDefaultModel', () => {
     expect(withDefaultModel(withProvider, 'default-model')).toBe(withProvider);
   });
 
+  it('keeps --provider a suppressor even without --model (injection would mint a bogus cloud model)', () => {
+    // Injecting `--model mlx/<default>` next to a user `--provider groq` makes
+    // pi resolve a bogus CLOUD `groq/mlx/<default>` custom model
+    // (buildFallbackModel), the exact off-machine route the local-first policy
+    // fights. Provider-only stays on-machine via the persisted mlx default
+    // (findInitialModel step-3), NOT injection — so this must NOT rewrite argv.
+    const providerOnly = ['--provider', 'groq'];
+    expect(withDefaultModel(providerOnly, 'default-model')).toBe(providerOnly);
+  });
+
   it('never overrides a session-carrying run (saved model must win)', () => {
     for (const args of [
       ['-c'],
@@ -236,6 +248,7 @@ describe('run() argv routing', () => {
       discover: [] as string[],
       wizard: [] as string[],
       runAgent: [] as Array<{ modelsDir: string; models: MlxModelInfo[]; argv: string[] }>,
+      writes: [] as Array<{ provider: string; modelId: string }>,
     };
     const deps: AgentRunDeps = {
       resolveModelsDir: (explicit) => explicit ?? '/fake/models',
@@ -251,8 +264,11 @@ describe('run() argv routing', () => {
         calls.wizard.push(modelsDir);
         return Promise.resolve();
       },
-      // Hermetic default: never read the developer's real settings.json.
+      // Hermetic defaults: never read/write the developer's real settings.json.
       readPersistedDefault: () => undefined,
+      writePersistedDefault: (provider, modelId) => {
+        calls.writes.push({ provider, modelId });
+      },
     };
     return { deps, calls };
   }
@@ -518,6 +534,67 @@ describe('run() argv routing', () => {
           process.env.PI_CODING_AGENT_DIR = prev;
         }
       }
+    });
+
+    /**
+     * FIX-A (write-once persisted mlx default): the session / provider-only
+     * launch paths suppress the `--model` injection, so pi's findInitialModel
+     * step-3 default is the only slot that keeps them on-machine. `run()` must
+     * seed `defaultProvider: mlx` + the mlx default into settings.json when
+     * none is persisted — and only then (never over a user `/model` pick).
+     */
+    it('seeds an mlx default into settings.json on a suppressed session/provider launch', async () => {
+      for (const argv of [['-c'], ['--provider', 'groq'], ['--session-id', 'unknown-xyz']]) {
+        await withTempSettings(undefined, async (agentDir) => {
+          const { deps, calls } = makeDeps(twoModels());
+          deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
+          deps.writePersistedDefault = (provider, modelId) => writePersistedDefaultModel(provider, modelId, agentDir);
+          await run(argv, deps);
+          // The suppressed path was NOT rewritten with --model…
+          expect(calls.runAgent[0]!.argv).toEqual(argv);
+          // …but settings.json now carries the local default (step-3 slot).
+          expect(readPersistedDefaultModel(agentDir)).toEqual({ provider: 'mlx', modelId: 'model-a' });
+        });
+      }
+    });
+
+    it('write-once: never overwrites an already-persisted default (or its sibling fields)', async () => {
+      await withTempSettings({ defaultProvider: 'mlx', defaultModel: 'model-b', theme: 'dark' }, async (agentDir) => {
+        const { deps, calls } = makeDeps(twoModels());
+        deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
+        // Recording writer (not the real one) makes any stray write observable.
+        await run(['-c'], deps);
+        expect(calls.writes).toHaveLength(0);
+        const raw: unknown = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
+        expect(raw).toEqual({ defaultProvider: 'mlx', defaultModel: 'model-b', theme: 'dark' });
+      });
+    });
+
+    it('preserves unrelated settings fields when seeding the default', async () => {
+      await withTempSettings({ theme: 'dark', quietStartup: true }, async (agentDir) => {
+        const { deps } = makeDeps(twoModels());
+        deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
+        deps.writePersistedDefault = (provider, modelId) => writePersistedDefaultModel(provider, modelId, agentDir);
+        await run(['-c'], deps);
+        const raw: unknown = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
+        expect(raw).toEqual({ theme: 'dark', quietStartup: true, defaultProvider: 'mlx', defaultModel: 'model-a' });
+      });
+    });
+
+    it('does not crash the launch when settings.json is unwritable', async () => {
+      await withTempSettings(undefined, async (agentDir) => {
+        // Make `<agentDir>/not-a-dir` a FILE, then point the writer under it so
+        // mkdirSync/writeFileSync fail with ENOTDIR — the writer must swallow it.
+        await writeFile(join(agentDir, 'not-a-dir'), 'x');
+        const unwritable = join(agentDir, 'not-a-dir', 'deeper');
+        const { deps, calls } = makeDeps();
+        deps.readPersistedDefault = () => undefined;
+        deps.writePersistedDefault = (provider, modelId) => writePersistedDefaultModel(provider, modelId, unwritable);
+        await run(['-p', 'hi'], deps);
+        // Launch proceeded despite the write failure (belt: --model injected).
+        expect(calls.runAgent).toHaveLength(1);
+        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/fake-model', '-p', 'hi']);
+      });
     });
 
     it('chooseDefaultModel is pure over the three policy branches', () => {
