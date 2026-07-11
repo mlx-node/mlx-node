@@ -1301,7 +1301,9 @@ pub async fn convert_gguf_to_safetensors(
     // was never a supported path.
     if options.quant_recipe.as_deref() == Some("nvidia") {
         crate::convert::validate_nvidia_recipe_options(
-            None,
+            None,  // config_family: no HF model_type in GGUF scope → rejected
+            None,  // requested_model_type: CLI never forwards --model-type here
+            false, // is_moe: unused once config_family None rejects upfront
             options.imatrix_path.as_deref(),
             options.quant_mxfp.unwrap_or(false),
             options.quant_bits,
