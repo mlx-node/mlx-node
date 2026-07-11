@@ -750,5 +750,107 @@ describe('makeMlxStreamSimple', () => {
       expect(finalMessage(events2).stopReason).toBe('error');
       expect(host.invalidatedIds).toContain(MODEL.id);
     });
+
+    it('marks the resident dirty synchronously before the callback rejects (queued turn full-resets)', async () => {
+      // Reviewer race: the dirty mark must land on the SAME synchronous stack as
+      // the callback's rejection — before runSerialized releases the chain — or
+      // a queued turn's consumeResidentDirty() sees false and warm-reuses onto
+      // the KV advanced by the failed decode. This host captures the dirty state
+      // at the exact instant fn1 rejects; the detached `.catch` (terminalize)
+      // has not run yet, so ONLY a synchronous in-callback mark shows up here.
+      const session = new FakeChatSession([
+        // Turn 1: native decode fault throws out of the stream loop.
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('par');
+          throw new Error('native decode fault');
+        },
+        // Turn 2: normal completion — the QUEUED turn.
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('ok');
+          yield finalEvent({ text: 'ok' });
+        },
+      ]);
+      const dirty = new Set<string>();
+      let dirtyAtReject: boolean | undefined;
+      let chain: Promise<unknown> = Promise.resolve();
+      const host: StreamSimpleHost = {
+        modelInfo: () => DISCOVERED,
+        markResidentDirty: (id) => {
+          dirty.add(id);
+        },
+        consumeResidentDirty: (id) => {
+          const was = dirty.has(id);
+          dirty.delete(id);
+          return was;
+        },
+        invalidateResident: () => undefined,
+        runWithResident<T>(id: string, fn: (s: ChatSession) => Promise<T>): Promise<T> {
+          const run = async (): Promise<T> => {
+            try {
+              return await fn(session.asChatSession());
+            } catch (err) {
+              // At fn's rejection: with the fix, dirty is already set
+              // (synchronous, in the callback). Reverting leaves this false.
+              if (dirtyAtReject === undefined) dirtyAtReject = dirty.has(id);
+              throw err;
+            }
+          };
+          const result = chain.then(run);
+          chain = result.then(
+            () => undefined,
+            () => undefined,
+          );
+          return result;
+        },
+      };
+      const streamSimple = makeMlxStreamSimple(host);
+
+      const events1 = await collect(streamSimple(MODEL, CONTEXT));
+      expect(finalMessage(events1).stopReason).toBe('error');
+      // The mark landed on the same synchronous stack as the callback rejection.
+      expect(dirtyAtReject).toBe(true);
+
+      const events2 = await collect(streamSimple(MODEL, CONTEXT));
+      expect(finalMessage(events2).stopReason).toBe('stop');
+      // The queued turn observed dirty=true → FULL reset (cold prefill).
+      expect(session.resetCalls).toBe(1);
+      expect(session.log).toContain('reset');
+    });
+
+    it('marks the resident dirty on an in-band finishReason=error terminal (next turn full-resets)', async () => {
+      const session = new FakeChatSession([
+        // Turn 1: an in-band error terminal — a `done` event with finishReason
+        // 'error', NO throw and NO abort (chat-session yields this without
+        // committing a final).
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('par');
+          yield finalEvent({ finishReason: 'error' });
+        },
+        // Turn 2: normal completion.
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield delta('ok');
+          yield finalEvent({ text: 'ok' });
+        },
+      ]);
+      const host = makeFakeHost(session);
+      const streamSimple = makeMlxStreamSimple(host);
+
+      const events1 = await collect(streamSimple(MODEL, CONTEXT));
+      // Routed to onError (stopReason 'error'), NOT treated as a success final.
+      expect(finalMessage(events1).stopReason).toBe('error');
+      // The in-band error flagged the resident dirty (no throw, no abort).
+      expect(host.isDirty(MODEL.id)).toBe(true);
+      expect(session.resetCalls).toBe(0);
+
+      const events2 = await collect(streamSimple(MODEL, CONTEXT));
+      expect(finalMessage(events2).stopReason).toBe('stop');
+      // Turn 2 saw dirty=true → FULL reset (cold prefill) instead of warm reuse.
+      expect(session.resetCalls).toBe(1);
+      expect(session.log).toContain('reset');
+    });
   });
 });

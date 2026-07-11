@@ -233,24 +233,68 @@ export function makeMlxStreamSimple(
           await resetPreservingNativeCacheForWarmReuse(session);
         }
         if (terminated) return;
-        session.primeHistory(contextToChatMessages(context));
-        const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
-        for await (const event of session.startFromHistoryStream(config, signal)) {
-          if (event.done) {
-            sawNativeFinal = true;
-            if (!terminated) {
-              terminated = true;
-              detachAbort?.();
-              detachAbort = undefined;
-              try {
-                turn.onFinal(event);
-              } catch (err) {
-                pushFailsafeTerminal('error', coerceErrorMessage(err));
+        try {
+          session.primeHistory(contextToChatMessages(context));
+          const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
+          for await (const event of session.startFromHistoryStream(config, signal)) {
+            if (event.done) {
+              if (event.finishReason === 'error') {
+                // In-band native error terminal: chat-session yields a `done`
+                // event with `finishReason: 'error'` WITHOUT committing a final
+                // (no `sawFinal`), so the physical KV may be ahead of the
+                // committed history. Mark the resident dirty (synchronously,
+                // inside the callback, so a queued turn observes it) and route
+                // to onError — sending it to onFinal treats it as success and
+                // skips the dirty flag.
+                if (!terminated) {
+                  terminated = true;
+                  detachAbort?.();
+                  detachAbort = undefined;
+                  try {
+                    host.markResidentDirty(model.id);
+                  } catch {
+                    // Nothing to mark — fail safe.
+                  }
+                  try {
+                    turn.onError(new Error('native stream reported finishReason=error'));
+                  } catch (err) {
+                    pushFailsafeTerminal('error', coerceErrorMessage(err));
+                  }
+                }
+              } else {
+                sawNativeFinal = true;
+                if (!terminated) {
+                  terminated = true;
+                  detachAbort?.();
+                  detachAbort = undefined;
+                  try {
+                    turn.onFinal(event);
+                  } catch (err) {
+                    pushFailsafeTerminal('error', coerceErrorMessage(err));
+                  }
+                }
               }
+            } else if (!terminated) {
+              turn.onDelta(event);
             }
-          } else if (!terminated) {
-            turn.onDelta(event);
           }
+        } catch (err) {
+          // A native decode fault thrown mid-stream can leave the physical KV
+          // ahead of the committed history. Flag the resident dirty so the NEXT
+          // turn full-resets — SYNCHRONOUSLY here, before this callback rejects
+          // and `runSerialized` releases the chain, so a queued turn observes
+          // dirty === true (the detached `.catch` terminalize runs too late for
+          // that). Abort is excluded: a clean cancel realigns the cache (warm
+          // reuse stays valid) and its terminal has already fired. Re-throw so
+          // the detached `.catch` still terminalizes the stream.
+          if (!signal?.aborted) {
+            try {
+              host.markResidentDirty(model.id);
+            } catch {
+              // Nothing to mark — fail safe.
+            }
+          }
+          throw err;
         }
       });
       if (!terminated && !sawNativeFinal) {
