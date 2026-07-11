@@ -7,12 +7,12 @@
  */
 export const CANVAS = {
   bg: '#0f0d11',
-  ink: '#e8e4ec',
-  inkMuted: '#8b8494',
-  grid: 'rgba(232, 228, 236, 0.07)',
-  selectionRing: '#ec4899',
+  ink: '#ece4da', // = --text (warm cream); the grids read as recessed screens in their panels
+  inkMuted: '#9e928a', // = --text-dim; warms the ℓ-gutter labels + RankChart y-ticks/axis
+  grid: 'rgba(236, 228, 218, 0.07)', // warm, faint hairlines
+  selectionRing: '#ec4899', // MUST match .jspace-grid-scroll canvas:focus-visible + RankChart selected-x
   rankSuperscript: '#b91c1c',
-  unranked: '#241f29',
+  unranked: '#201b26', // grey-out aligned to the warmed surface family
 } as const;
 
 export const CELL_W = 68;

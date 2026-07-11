@@ -69,7 +69,7 @@ export function PinManager({
     <section aria-label="Pinned tokens" className="space-y-2">
       <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Pinned token series">
         {pins.length === 0 ? (
-          <span className="text-[12px] text-muted-foreground">
+          <span className="text-[12px] leading-relaxed text-[color:var(--text-dim)]">
             No pins yet — click a cell, then add its top token to track its rank.
           </span>
         ) : (
@@ -80,7 +80,7 @@ export function PinManager({
             return (
               <span
                 key={`${id}-${i}`}
-                className="inline-flex items-center overflow-hidden rounded-md border font-mono text-[12px]"
+                className="inline-flex items-center overflow-hidden rounded-lg border font-mono text-[12px]"
                 style={{ borderColor: color, background: active ? `${color}26` : `${color}14` }}
               >
                 {/* SELECT the active series. Sibling of the remove button — never
@@ -118,17 +118,17 @@ export function PinManager({
             type="button"
             disabled={!canAdd}
             onClick={handleAdd}
-            className="rounded-md border border-border bg-background px-2.5 py-1 text-[12px] font-medium transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="rounded-lg border border-border bg-background/60 px-3 py-1.5 text-[12px] font-medium text-foreground transition-colors hover:border-primary/40 hover:bg-muted disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
             {addCandidate !== null && canAdd
               ? `+ Pin “${renderTokenDisplay(addCandidate.text)}”`
               : '+ Pin selected token'}
           </button>
-          <span className="text-[11px] text-muted-foreground">
+          <span className="text-[11px] text-[color:var(--text-dim)]">
             {pins.length} / {maxPins} pins
           </span>
           {!canAdd && addReason !== '' ? (
-            <span className="text-[11px] text-muted-foreground" aria-live="polite">
+            <span className="text-[11px] text-[color:var(--text-dim)]" aria-live="polite">
               {addReason}
             </span>
           ) : null}

@@ -34,12 +34,15 @@ import { STARTERS, STARTER_SLUGS } from './starters';
 import { useLensRun } from './useLensRun';
 
 // ---------------------------------------------------------------------------
-// Read settings. The Jacobian pack only carries fitted Jacobians for
-// JACOBIAN_LAYERS, so jacobian mode is limited to those 11 boundaries; the plain
-// logit lens can read every boundary, so it shows the full 24-row stack. topK
-// matches the offline bake so the self-test compares like against like.
+// Read settings. BOTH lenses read every residual boundary 1..24 so the LOGIT ↔
+// JACOBIAN toggle is directly comparable and never shrinks the grid: the shipped
+// fitted-Jacobian pack carries a fitted J for every boundary 1..23 (24 is J=I,
+// the plain unembedding), so Jacobian mode is NOT limited to a subset. The
+// 11-boundary JACOBIAN_LAYERS sample is used ONLY by the self-test oracle below
+// to replay the committed 11-layer baked reference frame. topK matches the
+// offline bake so the self-test compares like against like.
 // ---------------------------------------------------------------------------
-const LOGIT_LAYERS: number[] = Array.from({ length: 24 }, (_, i) => i + 1); // 1..24
+const ALL_LAYERS: number[] = Array.from({ length: 24 }, (_, i) => i + 1); // 1..24
 const TOP_K = 10;
 
 const DEFAULTS: JSpaceDefaults = { mode: 'logit', pins: [], sel: null };
@@ -48,8 +51,12 @@ function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
 }
 
-function layersFor(mode: LensMode): number[] {
-  return mode === 'jacobian' ? JACOBIAN_LAYERS : LOGIT_LAYERS;
+/** Both lenses read the full boundary stack 1..24 (see {@link ALL_LAYERS}), so a
+ *  mode toggle never shrinks the grid. `mode` is accepted to keep the call sites
+ *  uniform and to document that the two modes stay aligned. Exported for the
+ *  layer-parity unit test. */
+export function layersFor(mode: LensMode): number[] {
+  return mode === 'jacobian' ? ALL_LAYERS : ALL_LAYERS;
 }
 
 /** Jacobian activation lifecycle: one-time pack load + silent self-test. */
@@ -281,6 +288,9 @@ export default function JSpaceApp() {
     setMode(next);
     setSelected(null);
     setHovered(null);
+    // User diverged from any permalink-restored state — cancel the one-shot
+    // restore so a later run does not resurrect a stale selection (F3).
+    pendingSelRef.current = null;
     const hasLiveRun = committedPromptIdsRef.current !== null;
     if (next === 'jacobian' && modelStatus === 'ready') {
       void (async () => {
@@ -395,6 +405,9 @@ export default function JSpaceApp() {
   const selectCell = React.useCallback((ref: CellRef | null) => {
     setHovered(null);
     setSelected(ref);
+    // A deliberate selection is a user divergence — drop any pending permalink
+    // restore so it can't overwrite this selection after the next run (F3).
+    pendingSelRef.current = null;
   }, []);
 
   const activeCellRef = slice ? normalizeSelected(hovered ?? selected, slice) : null;
@@ -419,7 +432,7 @@ export default function JSpaceApp() {
         }
       : null;
 
-  // RankChart: each pin's rank vs depth at the selected (or final) position.
+  // RankChart 1: each pin's rank vs DEPTH at the selected (or final) position.
   const chartPos = slice ? Math.min(activeCellRef?.pos ?? slice.promptLen - 1, slice.promptLen - 1) : 0;
   const chartPoints = slice
     ? pinnedForView.map((_p, pi) =>
@@ -428,6 +441,16 @@ export default function JSpaceApp() {
     : [];
   const chartColors = pinnedForView.map((_p, i) => pinColor(i));
   const selectedLayerNum = slice && activeCellRef ? slice.layers[activeCellRef.layerIdx] ?? null : null;
+
+  // RankChart 2: each pin's rank vs POSITION at the selected (or deepest) layer.
+  const chartLayerIdx = slice ? (activeCellRef?.layerIdx ?? slice.layers.length - 1) : 0;
+  const posChartPoints = slice
+    ? pinnedForView.map((_p, pi) =>
+        Array.from({ length: slice.promptLen }, (_, pos) => ({ x: pos + 1, rank: slice.rankAt(pi, chartLayerIdx, pos) })),
+      )
+    : [];
+  // The layer actually charted, so the header is honest even with no selection.
+  const posChartLayerNum = slice ? slice.layers[chartLayerIdx] ?? null : null;
 
   const running = lensRun.state.status === 'running';
   const activating = jac.status === 'activating';
@@ -443,36 +466,47 @@ export default function JSpaceApp() {
     // mx-auto` still centers the body (auto margins on an inset-0 box). Without this
     // the live view (grid + heatmap + charts + cross-sections) is unreachable below
     // the fold.
-    <main className="absolute inset-0 mx-auto max-w-[110rem] space-y-5 overflow-y-auto px-4 py-6">
-      <header className="space-y-1">
-        <h1 className="text-xl font-semibold">J-Space</h1>
-        <p className="text-sm text-muted-foreground">
+    <main className="absolute inset-0 mx-auto max-w-[82rem] space-y-8 overflow-y-auto px-6 py-10 md:px-10 md:py-14">
+      <header className="space-y-3 border-b border-border/60 pb-8">
+        <span className="inline-flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
+          <span
+            aria-hidden
+            className="h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_var(--book-pink)]"
+          />
+          Jacobian lens · on-device
+        </span>
+        <h1 className="font-display text-4xl font-normal leading-[1.05] tracking-tight text-foreground md:text-5xl">
+          J-<span className="italic text-primary">Space</span>
+        </h1>
+        <p className="max-w-[48ch] text-sm leading-relaxed text-[color:var(--text-dim)]">
           Every layer’s guess, at every position — computed on your device.
         </p>
       </header>
 
       {!modelReady ? (
-        <section
-          aria-labelledby="jspace-consent"
-          className="space-y-2 rounded-md border border-border bg-muted/20 p-3"
-        >
-          <h2 id="jspace-consent" className="text-sm font-semibold">
+        <section aria-labelledby="jspace-consent" className="jspace-panel space-y-3 p-5">
+          <h2 id="jspace-consent" className="font-display text-lg font-normal tracking-tight text-foreground">
             Run the model on your device
           </h2>
-          <p className="text-[13px] text-muted-foreground">
-            Reading your own prompt downloads about <strong>1.6 GB</strong> of model weights, and a further{' '}
-            <strong>46 MB</strong> the first time you switch to the Jacobian lens. Nothing is downloaded
-            until you press Run. The starter grid below needs no model.
+          <p className="text-[13px] leading-relaxed text-[color:var(--text-dim)]">
+            Reading your own prompt downloads about <strong className="font-medium text-foreground">1.6 GB</strong>{' '}
+            of model weights, and a further{' '}
+            <strong className="font-medium text-foreground">46 MB</strong> the first time you switch to the
+            Jacobian lens. Nothing is downloaded until you press Run. The starter grid below needs no model.
           </p>
           {modelStatus === 'loading' ? (
-            <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
+            <p
+              className="font-mono text-[11px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]"
+              role="status"
+              aria-live="polite"
+            >
               {loadingText || 'Loading Qwen3.5-0.8B…'}
             </p>
           ) : (
             <button
               type="button"
               onClick={() => kickoffLoad()}
-              className="rounded-lg border border-primary/50 bg-primary/10 px-4 py-2 text-sm font-medium text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              className="inline-flex items-center gap-2 rounded-lg border border-primary/40 bg-primary/10 px-4 py-2 text-sm font-medium text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition-colors hover:border-primary/60 hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-50"
             >
               Download and run (~1.6 GB)
             </button>
@@ -481,14 +515,22 @@ export default function JSpaceApp() {
       ) : null}
 
       {/* Prompt editor + controls */}
-      <section className="space-y-2">
-        <label htmlFor="jspace-prompt" className="text-[11px] uppercase tracking-wider text-muted-foreground">
+      <section className="jspace-panel space-y-4 p-5">
+        <label
+          htmlFor="jspace-prompt"
+          className="block font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]"
+        >
           Prompt (raw text — no chat template)
         </label>
         <textarea
           id="jspace-prompt"
           value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
+          onChange={(e) => {
+            setPrompt(e.target.value);
+            // Editing the prompt is a user divergence — cancel any pending
+            // permalink-restored selection so a later run can't resurrect it (F3).
+            pendingSelRef.current = null;
+          }}
           onKeyDown={(e) => {
             // Enter runs; Shift+Enter inserts a newline. Runs fire on Enter,
             // never on every keystroke.
@@ -500,14 +542,14 @@ export default function JSpaceApp() {
           }}
           rows={2}
           placeholder="Type a prompt, then press Enter to read every layer…"
-          className="w-full resize-y rounded-md border border-border bg-background p-2 font-mono text-[13px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+          className="w-full resize-y rounded-lg border border-border bg-background/50 p-3.5 font-mono text-[13px] leading-relaxed text-foreground placeholder:text-[color:var(--text-muted)] shadow-inner transition-colors focus-visible:border-primary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         />
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <button
             type="button"
             onClick={() => void handleRun()}
             disabled={running || activating || preparing}
-            className="rounded-md border border-primary/50 bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex items-center gap-2 rounded-lg border border-primary/40 bg-primary/10 px-4 py-2 text-sm font-medium text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] transition-colors hover:border-primary/60 hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-50"
           >
             {!modelReady ? 'Download & run' : running ? 'Reading layers…' : 'Run'}
           </button>
@@ -535,7 +577,7 @@ export default function JSpaceApp() {
 
           {/* Live token counter — char count is live, token count reflects the
               last submit. Turns red past the cap. Never a bare 128. */}
-          <span className="text-[11px] text-muted-foreground">
+          <span className="ml-auto font-mono text-[11px] tabular-nums text-[color:var(--text-dim)]">
             {prompt.length} chars ·{' '}
             <span className={tokenCount !== null && tokenCount > LENS_MAX_POSITIONS ? 'font-semibold text-destructive' : ''}>
               {tokenCount ?? '—'} / {LENS_MAX_POSITIONS} tokens
@@ -545,37 +587,41 @@ export default function JSpaceApp() {
 
         {/* Jacobian activation status / self-test verdict */}
         {activating ? (
-          <p className="text-[12px] text-muted-foreground" role="status" aria-live="polite">
+          <p
+            className="font-mono text-[11px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]"
+            role="status"
+            aria-live="polite"
+          >
             Loading the fitted-Jacobian lens pack (~46 MB) and self-testing against the baked reference…
           </p>
         ) : jac.status === 'ok' ? (
-          <span className="inline-flex items-center gap-1.5 rounded border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-[color:var(--qwen)]/45 bg-[color:var(--qwen)]/12 px-2.5 py-1 font-mono text-[11px] text-[color:var(--qwen-light)]">
             fitted Jacobian · self-test passed (agreement {jac.verdict.topOneAgreement.toFixed(2)}, best-rank Δ{' '}
             {jac.verdict.worstPinDelta})
           </span>
         ) : jac.status === 'failed' ? (
-          <p className="text-[12px] text-destructive" role="alert">
+          <p className="text-[12px] leading-relaxed text-destructive" role="alert">
             <strong>Jacobian self-test failed.</strong> The browser could not reproduce the baked reference
             (top-1 agreement {jac.verdict.topOneAgreement.toFixed(4)}, worst pinned best-rank delta{' '}
             {jac.verdict.worstPinDelta}). The fitted-Jacobian badge is withheld — treat any Jacobian readout
             with suspicion.
           </p>
         ) : jac.status === 'error' ? (
-          <p className="text-[12px] text-destructive" role="alert">
+          <p className="text-[12px] leading-relaxed text-destructive" role="alert">
             <strong>Jacobian lens unavailable.</strong> {jac.message}
           </p>
         ) : jac.status === 'idle' && modelReady ? (
-          <p className="text-[12px] text-muted-foreground">
+          <p className="text-[12px] leading-relaxed text-[color:var(--text-dim)]">
             Switching to the Jacobian lens downloads a ~46 MB fitted-lens pack (once).
           </p>
         ) : null}
 
         {runError ? (
-          <p className="text-[12px] text-destructive" role="alert">
+          <p className="text-[12px] leading-relaxed text-destructive" role="alert">
             <strong>Lens read failed.</strong> {runError}
           </p>
         ) : lensRun.state.status === 'error' ? (
-          <p className="text-[12px] text-destructive" role="alert">
+          <p className="text-[12px] leading-relaxed text-destructive" role="alert">
             <strong>Lens read failed.</strong> {lensRun.state.message}
           </p>
         ) : null}
@@ -583,9 +629,9 @@ export default function JSpaceApp() {
 
       {/* Starter chips — only under the model-free starter grid. */}
       {view.kind === 'starter' ? (
-        <section className="space-y-1">
-          <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
-            Starter (no model needed)
+        <section className="space-y-2">
+          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
+            Starter · no model needed
           </span>
           <div className="flex flex-wrap items-center gap-2">
             <SegmentedToggle
@@ -604,65 +650,105 @@ export default function JSpaceApp() {
 
       {/* The main grid + panels */}
       {view.kind === 'skeleton' || !slice ? (
-        <section className="space-y-2">
-          <div className="rounded-md border border-border bg-background p-3 font-mono text-[13px]" style={{ whiteSpace: 'pre-wrap' }}>
+        <section className="space-y-4">
+          <div
+            className="jspace-panel p-4 font-mono text-[13px] leading-relaxed text-foreground"
+            style={{ whiteSpace: 'pre-wrap' }}
+          >
             {prompt}
           </div>
           {pins.length > 0 ? (
-            <p className="text-[12px] text-muted-foreground">
+            <p className="text-[12px] leading-relaxed text-[color:var(--text-dim)]">
               Restored pins: {pins.map((id) => `#${id}`).join(', ')} — run to see their rank tracks.
             </p>
           ) : null}
-          <div className="flex min-h-[8rem] items-center justify-center rounded-md border border-dashed border-border bg-muted/10 text-sm text-muted-foreground">
-            Run to compute — press Run to read every layer for this prompt.
+          <div className="flex min-h-[10rem] flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border/70 bg-card/30 p-10 text-center">
+            <p className="font-display text-lg font-normal tracking-tight text-foreground">Run to compute</p>
+            <p className="text-[13px] text-[color:var(--text-dim)]">
+              Press Run to read every layer for this prompt.
+            </p>
           </div>
         </section>
       ) : (
-        <section className="space-y-4">
+        <section className="space-y-6">
           {/* Prompt tokens = position axis */}
-          <PromptTokens
-            tokens={slice.tokens}
-            selectedPos={activeCellRef?.pos ?? null}
-            showWhitespace={showWhitespace}
-            onSelectPos={(pos) => {
-              setHovered(null); // a deliberate position pick wins over a stale hover
-              setSelected((prev) => ({ layerIdx: prev?.layerIdx ?? slice.layers.length - 1, pos }));
-            }}
-          />
-
-          {/* Argmax grid */}
-          <div className="space-y-1.5">
-            <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-              Per-layer top token (deepest at the top)
-              {view.kind === 'starter' ? ' · baked starter (no model)' : slice.jacobianApplied ? ' · fitted Jacobian' : ' · logit lens'}
-            </div>
-            <ArgmaxGridCanvas
-              slice={slice}
-              colorByPinnedId={colorByPinnedId}
-              selected={selected}
-              onHover={setHovered}
-              onSelect={selectCell}
+          <div className="space-y-2">
+            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
+              Prompt · position axis
+            </span>
+            <PromptTokens
+              tokens={slice.tokens}
+              selectedPos={activeCellRef?.pos ?? null}
               showWhitespace={showWhitespace}
-              ariaLabel={`Argmax grid: ${slice.layers.length} residual boundaries as rows (deepest on top) by ${slice.promptLen} prompt positions as columns.`}
+              onSelectPos={(pos) => {
+                setHovered(null); // a deliberate position pick wins over a stale hover
+                setSelected((prev) => ({ layerIdx: prev?.layerIdx ?? slice.layers.length - 1, pos }));
+                // A deliberate position pick is a user divergence — drop any
+                // pending permalink-restored selection (F3).
+                pendingSelRef.current = null;
+              }}
             />
           </div>
 
-          {/* Per-cell tooltip */}
-          {activeCellRef ? (
-            <LensTooltip
-              slice={slice}
-              layerIdx={activeCellRef.layerIdx}
-              pos={activeCellRef.pos}
-              runKey={lensRun.runKey}
-              header={`ℓ${slice.layers[activeCellRef.layerIdx]} · position ${activeCellRef.pos + 1} · after "${renderTokenDisplay(slice.tokens[activeCellRef.pos]?.text ?? '')}"`}
-              probLabel="full-vocab probability"
-            />
-          ) : (
-            <p className="text-[11px] text-muted-foreground">Hover or tap any cell to see that layer’s top-K read.</p>
-          )}
+          {/* Argmax grid (instrument) docked beside the per-cell readout on lg.
+              SOURCE ORDER stays grid-then-detail so selectCell / aria-activedescendant
+              / the permalink one-shot restore are unaffected; mobile stacks. */}
+          <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_19rem] lg:gap-6 lg:items-start">
+            {/* LEFT — the argmax grid panel. min-w-0 keeps the inner
+                .jspace-grid-scroll horizontally scrollable instead of blowing out. */}
+            <div className="jspace-panel min-w-0 space-y-3 p-4 lg:p-5">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
+                  Per-layer top token · deepest at top
+                </span>
+                {view.kind === 'starter' ? (
+                  <span className="rounded-full border border-border/70 bg-muted/40 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]">
+                    baked starter
+                  </span>
+                ) : slice.jacobianApplied ? (
+                  <span className="rounded-full border border-[color:var(--qwen)]/45 bg-[color:var(--qwen)]/12 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-[color:var(--qwen-light)]">
+                    fitted Jacobian
+                  </span>
+                ) : (
+                  <span className="rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-primary">
+                    logit lens
+                  </span>
+                )}
+              </div>
+              <div className="overflow-hidden rounded-lg border border-border/60">
+                <ArgmaxGridCanvas
+                  slice={slice}
+                  colorByPinnedId={colorByPinnedId}
+                  selected={selected}
+                  onHover={setHovered}
+                  onSelect={selectCell}
+                  showWhitespace={showWhitespace}
+                  ariaLabel={`Argmax grid: ${slice.layers.length} residual boundaries as rows (deepest on top) by ${slice.promptLen} prompt positions as columns.`}
+                />
+              </div>
+            </div>
 
-          {/* Pins + rank field + rank-by-depth chart */}
-          <div className="space-y-3">
+            {/* RIGHT — the per-cell readout, sticky within the page scroller on lg. */}
+            <div className="mt-4 lg:mt-0 lg:sticky lg:top-6">
+              {activeCellRef ? (
+                <LensTooltip
+                  slice={slice}
+                  layerIdx={activeCellRef.layerIdx}
+                  pos={activeCellRef.pos}
+                  runKey={lensRun.runKey}
+                  header={`ℓ${slice.layers[activeCellRef.layerIdx]} · position ${activeCellRef.pos + 1} · after "${renderTokenDisplay(slice.tokens[activeCellRef.pos]?.text ?? '')}"`}
+                  probLabel="full-vocab probability"
+                />
+              ) : (
+                <p className="flex min-h-[6rem] items-center justify-center rounded-lg border border-dashed border-border/60 bg-card/30 p-4 text-center font-mono text-[11px] leading-relaxed text-[color:var(--text-dim)]">
+                  Hover or tap any cell to see that layer’s top-K read.
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Pins + rank field + rank charts */}
+          <div className="space-y-4">
             <PinManager
               pins={pinnedForView.map((p) => p.tokenId)}
               labelOf={pinLabel}
@@ -675,28 +761,46 @@ export default function JSpaceApp() {
             />
 
             {pinnedForView.length > 0 && effectiveActiveIdx !== null ? (
-              <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
-                <div className="space-y-1">
-                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                    Rank of “{cleanupTokenText(pinnedForView[effectiveActiveIdx]?.tokenText ?? '')}” by position × layer
+              <div className="space-y-5">
+                {/* Rank heatmap — full-width panel; the flex item carries min-w-0
+                    flex-1 so the intrinsic 8750px canvas stays inside its own
+                    .jspace-grid-scroll scroller instead of overflowing the page (F6). */}
+                <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
+                  <div className="jspace-panel min-w-0 flex-1 space-y-2 p-4">
+                    <div className="jspace-eyebrow">
+                      Rank of “{cleanupTokenText(pinnedForView[effectiveActiveIdx]?.tokenText ?? '')}” by position × layer
+                    </div>
+                    <RankHeatmapCanvas
+                      slice={slice}
+                      pinnedIdx={effectiveActiveIdx}
+                      selected={selected}
+                      onSelect={selectCell}
+                    />
                   </div>
-                  <RankHeatmapCanvas
-                    slice={slice}
-                    pinnedIdx={effectiveActiveIdx}
-                    selected={selected}
-                    onSelect={selectCell}
-                  />
                 </div>
-                <div className="min-w-0 flex-1 space-y-1">
-                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                    Pinned-token rank by depth (position {chartPos + 1})
+
+                {/* Rank-vs-depth and rank-vs-position, a matched pair below (F5). */}
+                <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
+                  <div className="jspace-panel min-w-0 flex-1 space-y-2 p-4">
+                    <div className="jspace-eyebrow">Pinned-token rank by depth (position {chartPos + 1})</div>
+                    <RankChart
+                      points={chartPoints}
+                      colors={chartColors}
+                      xLabel="residual boundary ℓ"
+                      selectedX={selectedLayerNum}
+                    />
                   </div>
-                  <RankChart
-                    points={chartPoints}
-                    colors={chartColors}
-                    xLabel="residual boundary ℓ"
-                    selectedX={selectedLayerNum}
-                  />
+                  <div className="jspace-panel min-w-0 flex-1 space-y-2 p-4">
+                    <div className="jspace-eyebrow">
+                      Pinned-token rank across positions (ℓ{selectedLayerNum ?? posChartLayerNum})
+                    </div>
+                    <RankChart
+                      points={posChartPoints}
+                      colors={chartColors}
+                      xLabel="prompt position"
+                      selectedX={(activeCellRef?.pos ?? 0) + 1}
+                    />
+                  </div>
                 </div>
               </div>
             ) : null}
@@ -704,7 +808,7 @@ export default function JSpaceApp() {
 
           {/* Cross-sections at the selected cell */}
           {activeCellRef ? (
-            <div className="grid gap-4 lg:grid-cols-2">
+            <div className="grid gap-5 lg:grid-cols-2">
               <ByLayerStrip slice={slice} pos={activeCellRef.pos} selected={selected} onSelect={selectCell} />
               <ByPosStrip slice={slice} layerIdx={activeCellRef.layerIdx} selected={selected} onSelect={selectCell} />
             </div>

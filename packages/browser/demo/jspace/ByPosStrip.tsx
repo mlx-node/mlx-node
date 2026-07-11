@@ -24,11 +24,11 @@ export function ByPosStrip({
   onSelect: (ref: CellRef) => void;
 }) {
   return (
-    <section aria-label={`By position at layer ${slice.layers[layerIdx]}`} className="space-y-1">
-      <h3 className="font-mono text-[12px] font-semibold text-foreground/80">
+    <section aria-label={`By position at layer ${slice.layers[layerIdx]}`} className="jspace-panel space-y-2 p-4">
+      <h3 className="font-mono text-[10px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]">
         By Pos (Layer={slice.layers[layerIdx]})
       </h3>
-      <div className="space-y-0.5 rounded-md border border-border bg-background p-2">
+      <div className="space-y-0.5 rounded-lg bg-background/40 p-2">
         {Array.from({ length: slice.promptLen }, (_, pos) => {
           const cell = slice.cellAt(layerIdx, pos);
           const isSelected = selected?.layerIdx === layerIdx && selected?.pos === pos;

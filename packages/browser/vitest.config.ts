@@ -11,6 +11,9 @@ export default defineConfig({
   resolve: {
     alias: {
       '@mlx-node/lm/tools': resolve(__dirname, '../lm/src/tools/index.ts'),
+      // Mirror vite.config.ts + tsconfig `@/*` → demo/*, so tests that mount full
+      // demo components (which import shared modules via `@/…`) resolve them.
+      '@': resolve(__dirname, 'demo'),
     },
   },
   test: {

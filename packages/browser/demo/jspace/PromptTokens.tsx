@@ -25,7 +25,7 @@ export function PromptTokens({
 }) {
   return (
     <div
-      className="rounded-md border border-border bg-background p-3 font-mono text-[13px] leading-relaxed"
+      className="rounded-lg border border-border bg-background/50 p-3 font-mono text-[13px] leading-relaxed"
       style={{ whiteSpace: 'pre-wrap' }}
     >
       {tokens.map((token, pos) => (

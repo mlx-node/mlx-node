@@ -13,9 +13,10 @@
 import * as React from 'react';
 import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { ArgmaxGridCanvas, type CellRef } from '../../demo/jspace/ArgmaxGridCanvas';
+import { CELL_H, CELL_W, GUTTER_W } from '../../demo/jspace/canvas-theme';
 import { buildLensSlice } from '../../demo/jlens-core/types';
 import type { LensCell, LensReadoutRun } from '../inspector-types';
 
@@ -200,5 +201,53 @@ describe('ArgmaxGridCanvas ARIA row ownership', () => {
     expect(canvas.getAttribute('aria-colcount')).toBeNull();
     expect(canvas.getAttribute('aria-activedescendant')).toBeNull();
     expect(container!.querySelector('[role="row"]')).toBeNull();
+  });
+});
+
+// F2: a keyboard/programmatic selection to a DIFFERENT cell than the one under
+// the pointer strands the same-cell hover cache — the next intra-cell pointer
+// move is short-circuited and the tooltip/charts keep showing the selected cell.
+// The fix invalidates lastHoverKey on any `selected` change so hover re-emits.
+describe('ArgmaxGridCanvas hover cache invalidation on selection (F2)', () => {
+  it('re-emits onHover on the same cell after a keyboard/programmatic select', async () => {
+    const onHover = vi.fn();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const el = (selected: CellRef | null) =>
+      React.createElement(ArgmaxGridCanvas, {
+        slice,
+        colorByPinnedId: new Map<number, string>(),
+        selected,
+        onHover,
+        onSelect: () => {},
+        showWhitespace: false,
+        ariaLabel: 'test grid',
+      });
+
+    flushSync(() => root!.render(el(null)));
+    await new Promise((r) => setTimeout(r, 0)); // let measure/draw effects settle
+    const canvas = container.querySelector('canvas')!;
+    // Cell A = deepest display row (layerIdx 1 for layers [2,4]), position 0.
+    const rect = canvas.getBoundingClientRect();
+    const ax = rect.left + GUTTER_W + CELL_W / 2;
+    const ay = rect.top + CELL_H / 2;
+    const moveOverA = () =>
+      canvas.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: ax, clientY: ay }));
+
+    // (1) first move over A emits onHover(A).
+    moveOverA();
+    expect(onHover).toHaveBeenCalledWith({ layerIdx: 1, pos: 0 });
+
+    // (2) keyboard nav selects a DIFFERENT cell B on the SAME root (pointer never
+    // moves). The parent's activeCellRef is now B while the cursor is still over A.
+    flushSync(() => root!.render(el({ layerIdx: 0, pos: 1 })));
+    await new Promise((r) => setTimeout(r, 0)); // let the [selected] effect reset lastHoverKey
+
+    // (3) a second intra-A move must RE-EMIT onHover(A) — pre-fix it was suppressed
+    // by the stale same-cell cache; post-fix the [selected] effect cleared it.
+    onHover.mockClear();
+    moveOverA();
+    expect(onHover).toHaveBeenCalledWith({ layerIdx: 1, pos: 0 });
   });
 });

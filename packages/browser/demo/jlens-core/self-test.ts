@@ -85,8 +85,17 @@ function structuralMismatch(live: LensReadoutRun, baked: LensReadoutRun): string
     }
   }
   for (let i = 0; i < baked.cells.length; i++) {
-    if (live.cells[i]!.topKIds.length !== baked.cells[i]!.topKIds.length) {
-      return `cell[${i}] topK width ${live.cells[i]!.topKIds.length} != baked ${baked.cells[i]!.topKIds.length}`;
+    const lc = live.cells[i]!;
+    const bc = baked.cells[i]!;
+    // Cell identity: both sides are produced layer-major/position-minor by the
+    // SAME deterministic backend, so (layer, position) must match index-for-index.
+    // A spatial permutation that leaves counts/pins/layers aligned still scores
+    // ~0.98 top-1 agreement, so it would otherwise slip past the fuzzy metric.
+    if (lc.layer !== bc.layer || lc.position !== bc.position) {
+      return `cell[${i}] identity (${lc.layer},${lc.position}) != baked (${bc.layer},${bc.position})`;
+    }
+    if (lc.topKIds.length !== bc.topKIds.length) {
+      return `cell[${i}] topK width ${lc.topKIds.length} != baked ${bc.topKIds.length}`;
     }
   }
   return null;

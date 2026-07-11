@@ -31,11 +31,11 @@ export function ByLayerStrip({
   const promptToken = cleanupTokenText(slice.tokens[pos]?.text ?? '');
 
   return (
-    <section aria-label={`By layer at position ${pos + 1}`} className="space-y-1">
-      <h3 className="font-mono text-[12px] font-semibold text-foreground/80">
+    <section aria-label={`By layer at position ${pos + 1}`} className="jspace-panel space-y-2 p-4">
+      <h3 className="font-mono text-[10px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]">
         By Layer (Pos={pos + 1} {promptToken})
       </h3>
-      <div className="space-y-0.5 rounded-md border border-border bg-background p-2">
+      <div className="space-y-0.5 rounded-lg bg-background/40 p-2">
         {rowOrder.map((layerIdx) => {
           const cell = slice.cellAt(layerIdx, pos);
           const isSelected = selected?.pos === pos && selected?.layerIdx === layerIdx;

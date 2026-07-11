@@ -323,7 +323,7 @@ function RankChartCanvas({
     ctx.textAlign = 'right';
     for (const t of Y_TICKS) {
       const y = yFor(t.rank);
-      ctx.strokeStyle = 'rgba(232, 228, 236, 0.08)';
+      ctx.strokeStyle = 'rgba(236, 228, 218, 0.07)'; // warm hairline — matches CANVAS.grid
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(PAD_LEFT, y);

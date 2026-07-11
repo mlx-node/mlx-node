@@ -99,4 +99,16 @@ describe('self-test structural gate', () => {
     live.pinned = live.pinned.slice(0, live.pinned.length - 1);
     expect(compareToBakedFrame(live, frame()).ok).toBe(false);
   });
+
+  // A within-layer cell permutation keeps counts, pins, layers, promptLen and
+  // topK aligned, so the fuzzy top-1 metric still scores ~0.98 — only the per-cell
+  // (layer, position) identity check catches it. reviveRun makes fresh cell
+  // objects, so swapping live array elements does not alias the baked side (F1b).
+  it('FAILS when two cells are spatially swapped (would otherwise score ~0.98)', () => {
+    const live = frame();
+    [live.cells[0], live.cells[1]] = [live.cells[1]!, live.cells[0]!];
+    const v = compareToBakedFrame(live, frame());
+    expect(v.ok).toBe(false);
+    expect(v.reason).toContain('structural mismatch');
+  });
 });

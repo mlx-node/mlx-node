@@ -293,6 +293,14 @@ export function ArgmaxGridCanvas({
   // lands on the same cell — the plain lastHoverKey short-circuit would strand
   // the tooltip on null (or a stale cell). Tracked separately from lastHoverKey.
   const wasScrubbing = React.useRef(false);
+  // A keyboard/programmatic selection to a DIFFERENT cell than the one under the
+  // pointer moves the parent's activeCellRef to the selected cell while the
+  // cursor is still over the previously hovered cell. Invalidate the same-cell
+  // hover cache on any `selected` change (mirroring the wasScrubbing guard) so the
+  // next intra-cell pointer move re-emits onHover and re-syncs the tooltip/charts.
+  React.useEffect(() => {
+    lastHoverKey.current = null;
+  }, [selected]);
 
   function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
     const ref = locate(e);
