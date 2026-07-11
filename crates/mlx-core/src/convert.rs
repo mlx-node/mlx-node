@@ -1910,8 +1910,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     //     `architectures: ["Gemma4Unified*"]`), which the CLI canonicalizes;
     //   - requested_model_type: the --model-type the sanitizer will dispatch on
     //     (moved into `model_type` above) — must agree with config_family;
-    //   - is_moe: `enable_moe_block` (top-level or nested under text_config, as
-    //     the gemma4 loader reads it) — gemma4 nvidia is dense-only.
+    //   - is_moe: `enable_moe_block` resolved via the loader's own
+    //     `get_config_bool` (nested `text_config` first, then root) — gemma4
+    //     nvidia is dense-only.
     // It is also a data-free fixed-format map: no imatrix, ignores --q-mxfp
     // (emits mxfp4/mxfp8 directly), pins bits=4/group_size=32 for its float
     // tensors — reject flags that would silently alter or contradict the map,
@@ -1935,15 +1936,16 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     })
                     .map(|_| "gemma4_unified")
             });
-        let is_moe = config
-            .get("enable_moe_block")
-            .or_else(|| {
-                config
-                    .get("text_config")
-                    .and_then(|tc| tc.get("enable_moe_block"))
-            })
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Resolve `enable_moe_block` EXACTLY as the gemma4 loader does
+        // (`get_config_bool`: nested `text_config` first, then root) so the
+        // gate's dense/MoE view can never disagree with how the model loads —
+        // real gemma configs carry the flag under `text_config`, not the root.
+        let is_moe = crate::engine::persistence::get_config_bool(
+            &config,
+            config.get("text_config"),
+            &["enable_moe_block"],
+            false,
+        );
         validate_nvidia_recipe_options(
             config_family,
             model_type.as_deref(),
@@ -1996,7 +1998,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
     // than re-quantizing. Detected from the config; the runtime never reads
     // Google's native quant metadata.
-    let is_gemma_prequantized = model_type.as_deref() == Some("gemma4")
+    // Key on the gemma FAMILY (gemma4 or the gemma4_unified alias), not the
+    // exact string: an aliased `-m gemma4_unified` on a gemma-QAT source must
+    // not slip this rejection into the generic quantizer. Kept keyed on the
+    // resolved `model_type` (real QAT configs may omit `model_type` and rely on
+    // `-m gemma4`), just alias-robust.
+    let is_gemma_prequantized = nvidia_recipe_family(model_type.as_deref()) == Some("gemma4")
         && config
             .get("quantization_config")
             .and_then(|qc| qc.get("quant_method"))
@@ -11908,6 +11915,125 @@ mod tests {
             err.reason
                 .contains("different model family than the input config"),
             "expected the nvidia family-mismatch reject for gemma4 config + qwen3_5 override, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
+        // Round-2 [medium]: real gemma MoE configs carry `enable_moe_block`
+        // under `text_config` (the root key is absent), and the loader resolves
+        // it nested-first (`get_config_bool`). The gate must mirror that: a
+        // gemma4 config whose enable_moe_block lives in text_config=true is MoE
+        // and must be rejected (its `experts.switch_glu.*` keys would fall
+        // through to bf16). Belt-and-braces: set the root key to false to prove
+        // nested wins. Only config.json is written — the gate fires before
+        // weights load.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_moe_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "tie_word_embeddings": false,
+                "enable_moe_block": false, // root says dense…
+                "text_config": { "enable_moe_block": true } // …nested (loader-canonical) says MoE
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("nvidia recipe must reject a gemma4 MoE config (enable_moe_block in text_config)");
+        assert!(
+            err.reason.contains("only dense gemma4"),
+            "expected the nvidia dense-only reject for a text_config MoE gemma4, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
+        // Round-2 [high]: a gemma-QAT source (`quant_method: "gemma"`) with an
+        // aliased `-m gemma4_unified` must NOT slip the already-quantized
+        // rejection into the generic quantizer. `is_gemma_prequantized` now
+        // matches the gemma FAMILY (gemma4/gemma4_unified), so the alias is
+        // caught. The config declares model_type gemma4, so the nvidia
+        // family-agreement check passes (both collapse to gemma) — the QAT gate
+        // is what must reject. Only config.json is written.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4",
+                "tie_word_embeddings": false,
+                "quantization_config": { "quant_method": "gemma" }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()), // aliased override
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("gemma-QAT source with aliased -m gemma4_unified must be rejected");
+        assert!(
+            err.reason
+                .contains("gemma-QAT checkpoints are already quantized"),
+            "expected the gemma-QAT already-quantized reject, got: {}",
             err.reason
         );
 
