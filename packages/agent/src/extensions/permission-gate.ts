@@ -107,18 +107,6 @@ function sanitizeDetail(text: string): string {
 }
 
 /**
- * Memoized `shellCommandPrefix` per `<cwd>\0<trusted>` key. pi bakes the
- * effective prefix once (at `_buildRuntime`), so resolving it once here
- * matches pi's own behavior, avoids repeated settings-file I/O, and
- * sidesteps constructing `SettingsManager` more than once. Keying on trust
- * too (not just cwd) keeps the displayed command a SUPERSET of what pi
- * executes even if project trust flips mid-session — a strictly safer memo
- * than cwd-only. The cached promise never rejects: {@link loadShellCommandPrefix}
- * swallows all failures to `''`.
- */
-const shellPrefixCache = new Map<string, Promise<string>>();
-
-/**
  * Load pi's effective bash `shellCommandPrefix` for one (cwd, trusted)
  * pair, EXACTLY as pi will bake it: `SettingsManager.create` merges
  * `~/.mlx-node/agent/settings.json` (global) with `<cwd>/.pi/settings.json`
@@ -140,22 +128,21 @@ async function loadShellCommandPrefix(cwd: string, trusted: boolean): Promise<st
 }
 
 /**
- * Resolve (and memoize) the effective bash prefix for the handler's
- * context. Fail-safe by construction: any failure — including a hostile
- * `ctx` getter — resolves to `''`, so the gate falls back to displaying the
- * command as-is and NEVER throws.
+ * Resolve the effective bash prefix for the handler's context, freshly on
+ * every call (deliberately NOT memoized). Per-call resolution mirrors pi's
+ * own `/reload` semantics: a settings change rebuilds BashTool with the NEW
+ * `shellCommandPrefix` while cwd + trust stay the same, so a module-global
+ * cache keyed on (cwd, trusted) would surface the STALE prefix while BashTool
+ * executes the new one — reopening the disclosure gap. Construction is
+ * read-only (see {@link loadShellCommandPrefix}) and the dynamic import is
+ * ESM-loader-cached, so resolving each time costs ≤2 small JSON reads and the
+ * bash approval already blocks on human input. Fail-safe by construction: any
+ * failure — including a hostile `ctx` getter — resolves to `''`, so the gate
+ * falls back to displaying the command as-is and NEVER throws.
  */
 async function resolveShellCommandPrefix(ctx: ExtensionContext): Promise<string> {
   try {
-    const trusted = ctx.isProjectTrusted();
-    const cwd = ctx.cwd;
-    const key = `${cwd}\x00${trusted ? '1' : '0'}`;
-    let cached = shellPrefixCache.get(key);
-    if (cached === undefined) {
-      cached = loadShellCommandPrefix(cwd, trusted);
-      shellPrefixCache.set(key, cached);
-    }
-    return await cached;
+    return await loadShellCommandPrefix(ctx.cwd, ctx.isProjectTrusted());
   } catch {
     return '';
   }

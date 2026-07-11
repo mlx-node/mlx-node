@@ -437,7 +437,7 @@ describe('createPermissionGateExtension', () => {
       }
     }
 
-    /** Fresh, unique project cwd so the (cwd, trusted) prefix memo never aliases across tests. */
+    /** Fresh, unique project cwd so each test resolves against its own isolated settings. */
     function freshProject(): Promise<string> {
       return mkdtemp(join(tmpdir(), 'mlx-gate-project-'));
     }
@@ -543,6 +543,44 @@ describe('createPermissionGateExtension', () => {
           await rm(cwd, { recursive: true, force: true });
         }
       });
+    });
+
+    it('re-reads shellCommandPrefix per call so a settings change is reflected (no stale memo)', async () => {
+      // pi's /reload rebuilds BashTool with the new shellCommandPrefix while
+      // cwd + trust are unchanged. A module-global (cwd, trusted) memo would
+      // return the STALE prefix on the second call — the prompt would show the
+      // old program while BashTool executes the new one, reopening the gap.
+      // Per-call resolution reflects the rewritten settings.json exactly.
+      const agentDir = await mkdtemp(join(tmpdir(), 'mlx-gate-reload-'));
+      const cwd = await freshProject();
+      const settingsPath = join(agentDir, 'settings.json');
+      const prev = process.env['PI_CODING_AGENT_DIR'];
+      try {
+        process.env['PI_CODING_AGENT_DIR'] = agentDir;
+
+        await writeFile(settingsPath, JSON.stringify({ shellCommandPrefix: 'PREFIX_A' }));
+        const first = loadGateHandler();
+        const a = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+        await first(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+        expect(a.selectCalls[0]!.title).toContain('PREFIX_A');
+
+        // Settings change + /reload: same cwd + trust, new prefix. The gate must
+        // now surface PREFIX_B, never the memoized PREFIX_A.
+        await writeFile(settingsPath, JSON.stringify({ shellCommandPrefix: 'PREFIX_B' }));
+        const second = loadGateHandler();
+        const b = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+        await second(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+        expect(b.selectCalls[0]!.title).toContain('PREFIX_B');
+        expect(b.selectCalls[0]!.title).not.toContain('PREFIX_A');
+      } finally {
+        if (prev === undefined) {
+          delete process.env['PI_CODING_AGENT_DIR'];
+        } else {
+          process.env['PI_CODING_AGENT_DIR'] = prev;
+        }
+        await rm(agentDir, { recursive: true, force: true });
+        await rm(cwd, { recursive: true, force: true });
+      }
     });
   });
 
