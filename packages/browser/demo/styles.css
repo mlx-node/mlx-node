@@ -93,7 +93,7 @@
     background:
       radial-gradient(1200px 600px at 80% -10%, rgba(244, 200, 215, 0.08) 0%, transparent 60%),
       radial-gradient(900px 500px at 10% 110%, rgba(97, 92, 237, 0.1) 0%, transparent 65%),
-      radial-gradient(207% 123% at 50% 0%, #2a2530 0%, #0f0d11 100%) fixed;
+      radial-gradient(207% 123% at 50% 0%, #2a2530 0%, #0f0d11 100%);
     color: var(--text);
     overflow: hidden;
   }
@@ -111,10 +111,13 @@
     @apply relative h-dvh min-h-dvh w-full overflow-hidden;
   }
 
-  /* /jspace editorial panel — a soft surface that floats on the fixed page
-     gradient (semi-transparent so the warm pink/indigo glows bleed through). */
+  /* /jspace editorial panel — a soft surface that floats on the page gradient
+     (semi-transparent so the warm pink/indigo glows bleed through). No
+     backdrop-filter: over 7 large panels it forces a full-viewport re-raster on
+     every hover repaint (whole-screen blink in Chrome); the backdrop is a smooth
+     gradient, so blur is invisible anyway — a touch more opacity replaces it. */
   .jspace-panel {
-    @apply rounded-xl border border-border/70 bg-card/55 backdrop-blur-sm;
+    @apply rounded-xl border border-border/70 bg-card/75;
     box-shadow:
       inset 0 1px 0 rgba(236, 228, 218, 0.05),
       0 1px 2px rgba(0, 0, 0, 0.25),
