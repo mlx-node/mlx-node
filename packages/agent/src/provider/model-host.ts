@@ -27,6 +27,16 @@ interface ResidentModel {
   session: ChatSession;
   /** Kept solely so a swap can explicitly drop the native ref before loading. */
   model: object;
+  /**
+   * Set when the previous turn on this resident ended in a native ERROR
+   * terminal. A native error mid-decode can leave the physical KV cache
+   * advanced past the committed `cached_token_history`, so the next warm
+   * reuse would replay pi's history onto a misaligned prefix (garbled
+   * continuation). While dirty, the next turn does a FULL `session.reset()`
+   * (cold prefill) instead of the warm-reuse wipe. Cleared on consume; NOT
+   * set on abort / stop / length (those leave the cache consistent).
+   */
+  dirty: boolean;
 }
 
 export class MlxModelHost {
@@ -82,10 +92,48 @@ export class MlxModelHost {
         this.resident = null;
         const model = await this.loadModelFn(entry.path);
         session = new ChatSession(model as unknown as SessionCapableModel);
-        this.resident = { id: modelId, session, model };
+        this.resident = { id: modelId, session, model, dirty: false };
       }
       return await fn(session);
     });
+  }
+
+  /**
+   * Flag the current resident as post-error so the next turn does a full
+   * reset instead of a warm reuse. No-op unless `modelId` is the live
+   * resident (a load failure or a swap already dropped/replaced it, and a
+   * reloaded model starts with a clean cache).
+   */
+  markResidentDirty(modelId: string): void {
+    if (this.resident?.id === modelId) {
+      this.resident.dirty = true;
+    }
+  }
+
+  /**
+   * Read-and-clear the resident's post-error `dirty` flag. Returns `true`
+   * only when `modelId` is the live resident AND it was dirty — the signal
+   * for the caller to run a full `session.reset()` this turn instead of the
+   * warm-reuse wipe.
+   */
+  consumeResidentDirty(modelId: string): boolean {
+    if (this.resident?.id !== modelId) {
+      return false;
+    }
+    const wasDirty = this.resident.dirty;
+    this.resident.dirty = false;
+    return wasDirty;
+  }
+
+  /**
+   * Drop the current resident so the next `runWithResident` reloads it from
+   * scratch. Used when a post-error full reset itself fails and the session
+   * can no longer be trusted. No-op unless `modelId` is the live resident.
+   */
+  invalidateResident(modelId: string): void {
+    if (this.resident?.id === modelId) {
+      this.resident = null;
+    }
   }
 
   /**

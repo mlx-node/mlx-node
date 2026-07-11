@@ -192,6 +192,50 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('gemma-mid');
   });
 
+  it('tracks the post-error dirty flag: mark then consume-and-clear', async () => {
+    const host = new MlxModelHost(MODELS, { loadModelFn: makeLoader() });
+    await getSession(host, 'qwen-small');
+
+    // Clean by default.
+    expect(host.consumeResidentDirty('qwen-small')).toBe(false);
+
+    host.markResidentDirty('qwen-small');
+    // First consume sees it dirty…
+    expect(host.consumeResidentDirty('qwen-small')).toBe(true);
+    // …and clears it (read-and-clear).
+    expect(host.consumeResidentDirty('qwen-small')).toBe(false);
+  });
+
+  it('markResidentDirty / consumeResidentDirty are no-ops for a non-resident model', async () => {
+    const host = new MlxModelHost(MODELS, { loadModelFn: makeLoader() });
+    await getSession(host, 'qwen-small');
+
+    // A different model is not resident: marking it does nothing…
+    host.markResidentDirty('gemma-mid');
+    expect(host.consumeResidentDirty('gemma-mid')).toBe(false);
+    // …and the actual resident stays clean.
+    expect(host.consumeResidentDirty('qwen-small')).toBe(false);
+  });
+
+  it('invalidateResident drops the resident so the next call reloads', async () => {
+    const loader = makeLoader();
+    const host = new MlxModelHost(MODELS, { loadModelFn: loader });
+    const first = await getSession(host, 'qwen-small');
+    expect(loader).toHaveBeenCalledTimes(1);
+
+    host.invalidateResident('qwen-small');
+    expect(host.residentId).toBeNull();
+
+    const reloaded = await getSession(host, 'qwen-small');
+    expect(loader).toHaveBeenCalledTimes(2);
+    expect(reloaded).not.toBe(first);
+    expect(host.residentId).toBe('qwen-small');
+
+    // Invalidating a non-resident model is a no-op.
+    host.invalidateResident('gemma-mid');
+    expect(host.residentId).toBe('qwen-small');
+  });
+
   it('leaves no resident on load failure and allows a retry', async () => {
     const loader = makeLoader();
     const host = new MlxModelHost(MODELS, { loadModelFn: loader });

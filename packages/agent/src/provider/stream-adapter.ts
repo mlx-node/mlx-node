@@ -64,6 +64,12 @@ export interface StreamSimpleHost {
   modelInfo(modelId: string): DiscoveredModelLike | undefined;
   /** Atomic resident selection + serialized inference closure (see `MlxModelHost`). */
   runWithResident<T>(modelId: string, fn: (session: ChatSession) => Promise<T>): Promise<T>;
+  /** Flag the resident as post-error so the next turn does a full reset (see `MlxModelHost`). */
+  markResidentDirty(modelId: string): void;
+  /** Read-and-clear the resident's post-error flag; `true` ⇒ full-reset this turn. */
+  consumeResidentDirty(modelId: string): boolean;
+  /** Drop the resident so the next turn reloads it (post-error reset failure). */
+  invalidateResident(modelId: string): void;
 }
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
@@ -140,6 +146,19 @@ export function makeMlxStreamSimple(
       terminated = true;
       detachAbort?.();
       detachAbort = undefined;
+      if (kind === 'error') {
+        // A native error mid-decode can leave the physical KV ahead of the
+        // committed history; flag the resident so the NEXT turn does a full
+        // reset (cold prefill) instead of a misaligned warm reuse. Only the
+        // error terminal marks dirty — abort / stop / length keep the cache
+        // consistent and preserve warm reuse. Guarded: a hostile `model.id`
+        // getter must not derail the terminal.
+        try {
+          host.markResidentDirty(model.id);
+        } catch {
+          // Nothing to mark — fail safe.
+        }
+      }
       if (emitter) {
         try {
           if (kind === 'aborted') {
@@ -198,7 +217,21 @@ export function makeMlxStreamSimple(
         if (!discovered) {
           throw new Error(`mlx streamSimple: no discovery record for model "${model.id}"`);
         }
-        await resetPreservingNativeCacheForWarmReuse(session);
+        if (host.consumeResidentDirty(model.id)) {
+          // Previous turn errored mid-decode: the physical KV may be ahead of
+          // the committed history, so a warm reuse would misalign this
+          // replay's prefix. Full-reset (clears native caches + history →
+          // hit=0 → cold prefill). If the reset itself fails the session is
+          // untrustworthy — drop the resident so the next call reloads it.
+          try {
+            await session.reset();
+          } catch (err) {
+            host.invalidateResident(model.id);
+            throw err;
+          }
+        } else {
+          await resetPreservingNativeCacheForWarmReuse(session);
+        }
         if (terminated) return;
         session.primeHistory(contextToChatMessages(context));
         const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
