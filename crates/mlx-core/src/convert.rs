@@ -4294,17 +4294,20 @@ pub(crate) fn validate_nvfp4_recipe(recipe: &str) -> std::result::Result<(), Str
 /// coarse *family* (the unit `recipe_for` actually dispatches on), or `None`
 /// when the type is unsupported by this recipe.
 ///
-/// `gemma4` and `gemma4_unified` both map to the single `"gemma4"` family
-/// because `recipe_for` resolves both to the same `Gemma4Recipe` — so a config
-/// declaring one and a `--model-type` declaring the other AGREE. `gemma4_text`
-/// is intentionally absent (it is not in `recipe_for`, i.e. unconvertible via
-/// this path), as are `lfm2` / `qwen3` / `None`.
+/// `gemma4`, `gemma4_unified`, and `gemma4_text` all map to the single
+/// `"gemma4"` family. `recipe_for` resolves `gemma4` / `gemma4_unified` to the
+/// same `Gemma4Recipe`, and `gemma4_text` is the text-only dense alias for that
+/// same family: the loader recognizes `gemma4_text` as a plain dense gemma4 root
+/// `model_type`, and the CLI collapses a `gemma4_text` config to `--model-type
+/// gemma4` before it reaches the sanitizer. A config declaring any of the three
+/// and a `--model-type` declaring another therefore AGREE. `lfm2` / `qwen3` /
+/// `None` remain unsupported by this recipe.
 fn nvidia_recipe_family(model_type: Option<&str>) -> Option<&'static str> {
     match model_type {
         Some("qwen3_5") => Some("qwen3_5"),
         Some("qwen3_5_moe") => Some("qwen3_5_moe"),
-        Some("gemma4") | Some("gemma4_unified") => Some("gemma4"),
-        _ => None, // incl. gemma4_text (unconvertible), lfm2, qwen3, None, etc.
+        Some("gemma4") | Some("gemma4_unified") | Some("gemma4_text") => Some("gemma4"),
+        _ => None, // incl. lfm2, qwen3, None, etc.
     }
 }
 
@@ -7640,6 +7643,72 @@ mod tests {
             None,
         )
         .expect("gemma4_unified config + gemma4 --model-type must agree (same family)");
+    }
+
+    #[test]
+    fn nvidia_recipe_options_accepts_gemma4_text_alias() {
+        // `gemma4_text` is the text-only dense alias of the gemma4 family: the
+        // loader recognizes it as a plain dense gemma4 root model_type and the
+        // CLI collapses a `gemma4_text` config to `--model-type gemma4` before
+        // the sanitizer runs. The gate reads the config's OWN type
+        // (gemma4_text) while the sanitizer dispatches on the collapsed
+        // `gemma4`, so a gemma4_text config with a requested gemma4 (or
+        // gemma4_unified) must be ACCEPTED, not rejected as unsupported.
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4 --model-type must be accepted (same family)");
+        validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4_unified"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("gemma4_text config + gemma4_unified --model-type must agree (same family)");
+
+        // The dense-only guard still holds: a gemma4_text config with
+        // enable_moe_block is MoE and must be rejected (its experts sanitize to
+        // `experts.switch_glu.*` keys that fall through to bf16).
+        let moe_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("gemma4"),
+            true,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("a gemma4_text MoE checkpoint must still be rejected");
+        assert!(
+            moe_err.contains("only dense gemma4"),
+            "error must mention the dense-only gemma4 limit, got: {moe_err}"
+        );
+
+        // Family-agreement still holds: gemma4_text config + qwen3_5
+        // --model-type names a different family and must be rejected.
+        let mismatch_err = validate_nvidia_recipe_options(
+            Some("gemma4_text"),
+            Some("qwen3_5"),
+            false,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect_err("gemma4_text config + qwen3_5 --model-type must be rejected");
+        assert!(
+            mismatch_err.contains("different model family than the input config"),
+            "error must mention the family mismatch, got: {mismatch_err}"
+        );
     }
 
     #[test]
@@ -11915,6 +11984,68 @@ mod tests {
             err.reason
                 .contains("different model family than the input config"),
             "expected the nvidia family-mismatch reject for gemma4 config + qwen3_5 override, got: {}",
+            err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_nvidia_recipe_accepts_gemma4_text_config() {
+        // `gemma4_text` is a real dense gemma4 root model_type in this repo
+        // (model-loader `rawModelTypes`, and the CLI collapses `gemma4_text` →
+        // `--model-type gemma4`). The gate reads the config's OWN type, so it
+        // must collapse `gemma4_text` to the gemma4 family and ACCEPT a
+        // requested gemma4 rather than reject it as unsupported. Proof it
+        // passed the model-type gate: the run fails LATER on missing weights
+        // (only config.json is written), not with the "only supported for
+        // model types" upfront reject. Reverting `nvidia_recipe_family`'s
+        // gemma4_text arm turns this into that gate reject and fails the test.
+        let base = std::env::temp_dir().join(format!(
+            "nvidia_gate_gemma4_text_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_text",
+                "tie_word_embeddings": false
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4".to_string()), // CLI-collapsed gemma4_text
+            quantize: Some(true),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: Some("affine".to_string()),
+            quant_recipe: Some("nvidia".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("run still fails: no safetensors were written");
+        // The failure must NOT be the nvidia model-type gate reject — the gate
+        // accepted gemma4_text (collapsed to the gemma4 family) and fell
+        // through to the missing-weights path.
+        assert!(
+            !err.reason.contains("only supported for model types"),
+            "gemma4_text must pass the nvidia model-type gate, got a gate reject: {}",
             err.reason
         );
 
