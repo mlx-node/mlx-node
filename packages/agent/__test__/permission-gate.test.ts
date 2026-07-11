@@ -59,6 +59,35 @@ function loadGate(): { toolCall: ToolCallHandler; sessionStart: SessionStartHand
   return { toolCall: toolCall as ToolCallHandler, sessionStart: sessionStart as SessionStartHandler };
 }
 
+/** The real named InlineExtension, for tests that must re-invoke `factory`. */
+function loadGateExtension(): { name: string; factory: (pi: ExtensionAPI) => void | Promise<void> } {
+  const extension = createPermissionGateExtension();
+  if (typeof extension === 'function') {
+    throw new Error('expected the named InlineExtension form');
+  }
+  expect(extension.name).toBe('mlx-permission-gate');
+  return extension;
+}
+
+/** Invoke an extension's factory once (fresh fake pi), capturing its handlers. */
+function invokeFactory(extension: { factory: (pi: ExtensionAPI) => void | Promise<void> }): {
+  toolCall: ToolCallHandler;
+  sessionStart: SessionStartHandler;
+} {
+  const handlers = new Map<string, unknown>();
+  const fakePi = {
+    on(event: string, handler: unknown): void {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  void extension.factory(fakePi);
+  const toolCall = handlers.get('tool_call');
+  const sessionStart = handlers.get('session_start');
+  expect(toolCall, 'factory must register a tool_call handler').toBeTypeOf('function');
+  expect(sessionStart, 'factory must register a session_start handler').toBeTypeOf('function');
+  return { toolCall: toolCall as ToolCallHandler, sessionStart: sessionStart as SessionStartHandler };
+}
+
 /** A minimal pi `session_start` event (boot). */
 function sessionStartEvent(): SessionStartEvent {
   return { type: 'session_start', reason: 'startup' };
@@ -613,6 +642,95 @@ describe('createPermissionGateExtension', () => {
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), c.ctx);
           expect(c.selectCalls[0]!.title).toContain('GLOBAL_PFX');
           expect(c.selectCalls[0]!.title).not.toContain('PROJECT_PFX');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('FACTORY REINVOCATION: the snapshot survives pi re-invoking factory on /reload and retains on a failed reload', async () => {
+      // pi re-invokes the inline extension FACTORY on every /reload BEFORE
+      // emitting the reload session_start. If the snapshot lived inside factory
+      // it would reset to undefined on that reinvocation, so a failed reload
+      // (malformed file) would retain against undefined → empty, dropping pi's
+      // still-baked PFX_A. The snapshot lives in the OUTER per-extension closure
+      // and persists. Mutation guard: moving `layers`/`snapshotted` back into
+      // factory makes the second factory reset state → this shows empty → fails.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+        const cwd = await freshProject();
+        try {
+          const extension = loadGateExtension();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          // Boot: first factory invocation + session_start snapshots PFX_A.
+          const boot = invokeFactory(extension);
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await boot.sessionStart(sessionStartEvent(), a.ctx);
+          await boot.toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+          // /reload: pi RE-INVOKES the SAME extension's factory (fresh handlers)
+          // BEFORE the reload session_start, with the file now malformed.
+          await writeFile(join(agentDir, 'settings.json'), '{ this is not valid json');
+          const reloaded = invokeFactory(extension);
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await reloaded.sessionStart(sessionStartEvent(), b.ctx);
+          await reloaded.toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toContain('PFX_A');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('ZERO-BYTE CLEAR: a truncated (empty) global settings.json on reload clears the prefix (matches pi)', async () => {
+      // pi's loadFromStorage short-circuits `if (!content) return {}` (no error)
+      // for a zero-byte file → the layer is CLEARED, unlike a malformed file
+      // (which throws → retain). Mutation guard: treating empty as retain (drop
+      // the `!content` early return) shows PFX_A here and fails.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+          await writeFile(join(agentDir, 'settings.json'), ''); // truncate to zero bytes
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), b.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('ZERO-BYTE CLEAR (project layer): truncating the project settings falls through to the global prefix', async () => {
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'GLOBAL_PFX' }), async () => {
+        const cwd = await freshProject();
+        const projectSettings = join(cwd, '.pi', 'settings.json');
+        try {
+          await mkdir(join(cwd, '.pi'), { recursive: true });
+          await writeFile(projectSettings, JSON.stringify({ shellCommandPrefix: 'PROJECT_PFX' }));
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PROJECT_PFX');
+
+          // Truncate PROJECT to zero bytes → project layer cleared → falls to global.
+          await writeFile(projectSettings, '');
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), b.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toContain('GLOBAL_PFX');
+          expect(b.selectCalls[0]!.title).not.toContain('PROJECT_PFX');
         } finally {
           await rm(cwd, { recursive: true, force: true });
         }

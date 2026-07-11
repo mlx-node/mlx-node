@@ -150,7 +150,16 @@ function resolveLayerPrefix(prior: string | undefined, path: string, active: boo
     return undefined; // absent → pi clears the layer
   }
   try {
-    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    const content = readFileSync(path, 'utf-8');
+    if (!content) {
+      // Zero-byte file → pi's `loadFromStorage` short-circuits (`if (!content)
+      // return {}`, no error) → the layer is CLEARED (not retained). `!content`
+      // matches pi's exact truthiness, so whitespace-only (`" "`) is NOT empty:
+      // it reaches JSON.parse, throws, and falls to the retain branch below —
+      // exactly as pi errors and retains for it.
+      return undefined;
+    }
+    const parsed: unknown = JSON.parse(content);
     if (typeof parsed !== 'object' || parsed === null) {
       // pi's migrateSettings throws on a non-object → reload retains the prior.
       return prior;
@@ -220,28 +229,35 @@ function describeToolCall(toolName: string, event: ToolCallEvent): string {
 }
 
 /**
- * Build the `mlx-permission-gate` inline extension. The per-session
- * allow list lives in the factory closure, so every extension load
- * (session start or `/reload`) starts with a clean slate.
+ * Build the `mlx-permission-gate` inline extension. The per-session allow list
+ * lives in the `factory` closure, so every extension load (session start or
+ * `/reload`) starts with a clean slate. The bash-prefix snapshot, by contrast,
+ * lives in THIS outer closure so it PERSISTS across factory reinvocations.
  */
 export function createPermissionGateExtension(): InlineExtension {
+  // Per-layer snapshot of pi's bash `shellCommandPrefix`, recomputed at each
+  // `session_start` — which fires at boot AFTER pi bakes the prefix into
+  // BashTool and again on `/reload` AFTER the rebuild, i.e. the SAME lifecycle
+  // instant pi bakes it. Kept per-layer (not pre-merged) so each reload applies
+  // pi's exact RETENTION rule: a failed layer reload keeps baking the prior
+  // value, so we keep showing it. `snapshotted` tells a real empty snapshot
+  // apart from "no session_start yet" (which falls back to a one-shot on-demand
+  // read). Snapshot-primary is FAITHFUL: it shows exactly what pi baked, even
+  // after an edit-without-reload where an on-demand re-read would drift.
+  //
+  // MUST live here, not in `factory`: pi re-invokes the inline extension factory
+  // on every `/reload` (resource-loader `loadExtensionFactories`) BEFORE
+  // emitting the reload `session_start`. If this state were reset per factory
+  // run, a failed reload (malformed/unreadable file) would `retain` against a
+  // freshly-reset `undefined` and drop pi's still-baked prefix — the exact
+  // under-disclosure the retain rule exists to prevent.
+  let layers: ShellPrefixLayers = { global: undefined, project: undefined };
+  let snapshotted = false;
+
   return {
     name: 'mlx-permission-gate',
     factory: (pi: ExtensionAPI) => {
       const sessionAllowed = new Set<string>();
-
-      // Per-layer snapshot of pi's bash `shellCommandPrefix`, recomputed at each
-      // `session_start` — which fires at boot AFTER pi bakes the prefix into
-      // BashTool and again on `/reload` AFTER the rebuild, i.e. the SAME
-      // lifecycle instant pi bakes it. Kept per-layer (not pre-merged) so each
-      // reload applies pi's exact RETENTION rule: a failed layer reload keeps
-      // baking the prior value, so we keep showing it. `snapshotted` tells a
-      // real empty snapshot apart from "no session_start yet" (which falls back
-      // to a one-shot on-demand read). Snapshot-primary is FAITHFUL: it shows
-      // exactly what pi baked, even after an edit-without-reload where an
-      // on-demand re-read would drift from the executed value.
-      let layers: ShellPrefixLayers = { global: undefined, project: undefined };
-      let snapshotted = false;
 
       pi.on('session_start', async (_event, ctx) => {
         layers = await resolveShellPrefixLayers(layers, ctx);
