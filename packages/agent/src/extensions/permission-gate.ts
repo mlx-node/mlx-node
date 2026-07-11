@@ -20,7 +20,7 @@
  * narrowed defensively by hand instead of via `isToolCallEventType`.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolCallEvent } from '@earendil-works/pi-coding-agent';
@@ -110,67 +110,93 @@ function sanitizeDetail(text: string): string {
 }
 
 /**
- * Read pi's effective bash `shellCommandPrefix` for one (cwd, trusted) pair
- * with a DIRECT, lock-free file read — deliberately NOT via pi's
- * `SettingsManager`, whose load takes a proper-lockfile lock (creating and
- * removing `<file>.lock`, so it is not read-only) and, under lock contention
- * or a non-writable dir, catches the failure in `tryLoadFromStorage` and
- * returns `{}` → an EMPTY prefix. pi bakes the REAL prefix into BashTool once
- * at boot and again on `/reload`; a later locked read that degraded to `{}`
- * would make the gate display an empty prefix while pi executes a non-empty
- * one (a security fail-open / under-disclosure). This reader has strictly
- * fewer failure modes than pi's locked read: it never takes a lock (no
- * contention failure, no `.lock` side effect) and treats every absent,
- * unreadable, or malformed file as `{}` — exactly as pi's own
- * `tryLoadFromStorage` does — so it can never show empty where pi baked
- * non-empty.
- *
- * The merge mirrors pi's `deepMergeSettings(global, project)` +
- * `getShellCommandPrefix()`: the project layer (`<cwd>/.pi/settings.json`) is
- * consulted ONLY when the project is trusted, and a project string overrides
- * the global one; otherwise the global (`<agentDir>/settings.json`) value is
- * used, else `''`. Verified against pi 0.80.6: no settings migration renames
- * `shellCommandPrefix`, so a direct read is complete.
- *
- * `getAgentDir`/`CONFIG_DIR_NAME` are imported at call time (deferred), so
- * this module keeps its "no pi runtime import before env seeding" discipline;
- * both are pure (the env is read lazily inside `getAgentDir`). NEVER throws
- * for a settings-file problem — each read is caught. May reject only if the
- * deferred pi import itself fails (post-boot it never does); callers wrap it.
+ * Per-layer snapshot of pi's `shellCommandPrefix`: the value contributed by the
+ * global (`<agentDir>/settings.json`) and project (`<cwd>/.pi/settings.json`)
+ * settings layers, each a `string` or `undefined` (that layer sets no prefix).
+ * Kept per-layer — not pre-merged — so a `/reload` can update each layer with
+ * pi's exact per-layer RETENTION semantics before re-merging.
  */
-async function readShellPrefixNoLock(cwd: string, trusted: boolean): Promise<string> {
-  const { getAgentDir, CONFIG_DIR_NAME } = await import('@earendil-works/pi-coding-agent');
-  const readSettings = (path: string): Record<string, unknown> => {
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
-      return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
-    } catch {
-      // Absent, unreadable, or malformed — pi treats this identically to `{}`.
-      return {};
-    }
-  };
-  const pick = (settings: Record<string, unknown>): string | undefined =>
-    typeof settings['shellCommandPrefix'] === 'string' ? (settings['shellCommandPrefix'] as string) : undefined;
-
-  const globalSettings = readSettings(join(getAgentDir(), 'settings.json'));
-  const projectSettings = trusted ? readSettings(join(cwd, CONFIG_DIR_NAME, 'settings.json')) : {};
-  return pick(projectSettings) ?? pick(globalSettings) ?? '';
+interface ShellPrefixLayers {
+  global: string | undefined;
+  project: string | undefined;
 }
 
 /**
- * Resolve the effective bash prefix for one context without ever throwing.
- * Wraps {@link readShellPrefixNoLock} plus the `ctx` getters (a hostile or
- * missing `ctx.isProjectTrusted` must not crash the gate) → `''` on any
- * failure. Used to snapshot at `session_start`, and only as a fallback for
- * the structurally-rare case that a bash approval precedes the first
- * `session_start`.
+ * Recompute ONE settings layer's `shellCommandPrefix` the way pi's
+ * `SettingsManager.reload()` does (`tryLoadFromStorage` → `loadFromStorage` +
+ * `withLock`, `dist/core/settings-manager.js`), given the layer's PRIOR value:
+ * - `!active` (untrusted project) → `undefined` (pi's `loadFromStorage` returns
+ *   `{}` for an untrusted project, no error → the layer is CLEARED).
+ * - file ABSENT → `undefined` (`withLock` yields `current=undefined` → `{}`, no
+ *   error → CLEARED).
+ * - file present + parseable object → its `shellCommandPrefix` if a string, else
+ *   `undefined` (REPLACE with the new value).
+ * - file present but malformed / unreadable / a non-object (pi's
+ *   `migrateSettings` does `"key" in settings`, which throws for a non-object) →
+ *   `tryLoadFromStorage` returns an error → reload RETAINS the prior value.
+ *
+ * The retention branch is what closes the reload under-disclosure: on a FAILED
+ * reload pi keeps baking the prior prefix into BashTool, so the gate must keep
+ * showing it rather than degrade to empty. At the FIRST snapshot (boot) the
+ * prior value is `undefined`, so a `retain` there yields empty — which matches
+ * pi baking `{}` for a malformed-at-boot file. Same logic is correct at boot
+ * and reload, so no boot/reload branching is needed.
  */
-async function resolveBashPrefix(ctx: ExtensionContext): Promise<string> {
-  try {
-    return await readShellPrefixNoLock(ctx.cwd, ctx.isProjectTrusted());
-  } catch {
-    return '';
+function resolveLayerPrefix(prior: string | undefined, path: string, active: boolean): string | undefined {
+  if (!active) {
+    return undefined; // untrusted project layer → dropped
   }
+  if (!existsSync(path)) {
+    return undefined; // absent → pi clears the layer
+  }
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    if (typeof parsed !== 'object' || parsed === null) {
+      // pi's migrateSettings throws on a non-object → reload retains the prior.
+      return prior;
+    }
+    const value = (parsed as Record<string, unknown>)['shellCommandPrefix'];
+    return typeof value === 'string' ? value : undefined;
+  } catch {
+    // Malformed JSON / unreadable (EACCES) → pi retains the prior layer value.
+    return prior;
+  }
+}
+
+/**
+ * Recompute both settings layers for one context, applying {@link
+ * resolveLayerPrefix} per layer with a DIRECT, lock-free read — deliberately
+ * NOT via pi's `SettingsManager`, whose load takes a proper-lockfile lock
+ * (creating/removing `<file>.lock`) and, under contention or a non-writable
+ * dir, degrades to `{}`. This reader never takes a lock and MIRRORS pi's reload
+ * retention, so it can never show empty where pi is still baking a non-empty
+ * prefix. `prior` carries the last snapshot so the retain branch is faithful.
+ *
+ * `getAgentDir`/`CONFIG_DIR_NAME` are imported at call time (deferred), so this
+ * module keeps its "no pi runtime import before env seeding" discipline; both
+ * are pure (env read lazily inside `getAgentDir`). NEVER throws: a hostile
+ * `ctx.isProjectTrusted` getter or a failed deferred import retains `prior`.
+ */
+async function resolveShellPrefixLayers(prior: ShellPrefixLayers, ctx: ExtensionContext): Promise<ShellPrefixLayers> {
+  try {
+    const { getAgentDir, CONFIG_DIR_NAME } = await import('@earendil-works/pi-coding-agent');
+    const trusted = ctx.isProjectTrusted();
+    return {
+      global: resolveLayerPrefix(prior.global, join(getAgentDir(), 'settings.json'), true),
+      project: resolveLayerPrefix(prior.project, join(ctx.cwd, CONFIG_DIR_NAME, 'settings.json'), trusted),
+    };
+  } catch {
+    return prior;
+  }
+}
+
+/**
+ * Merge the two layers exactly as pi's `deepMergeSettings(global, project)` +
+ * `getShellCommandPrefix()` do: a project string overrides the global one,
+ * otherwise the global value is used, else `''`.
+ */
+function effectiveShellPrefix(layers: ShellPrefixLayers): string {
+  return layers.project ?? layers.global ?? '';
 }
 
 /**
@@ -204,18 +230,22 @@ export function createPermissionGateExtension(): InlineExtension {
     factory: (pi: ExtensionAPI) => {
       const sessionAllowed = new Set<string>();
 
-      // Snapshot of pi's effective bash `shellCommandPrefix`, captured at each
+      // Per-layer snapshot of pi's bash `shellCommandPrefix`, recomputed at each
       // `session_start` — which fires at boot AFTER pi bakes the prefix into
       // BashTool and again on `/reload` AFTER the rebuild, i.e. the SAME
-      // lifecycle instant pi bakes it. `undefined` means "not yet snapshotted"
-      // (kept distinct from a snapshotted empty prefix), so the bash branch can
-      // tell a real empty prefix apart from a missing snapshot. Snapshot-primary
-      // is FAITHFUL: it shows exactly what pi baked, even after an edit-without-
-      // reload where an on-demand re-read would drift from the executed value.
-      let bashPrefix: string | undefined;
+      // lifecycle instant pi bakes it. Kept per-layer (not pre-merged) so each
+      // reload applies pi's exact RETENTION rule: a failed layer reload keeps
+      // baking the prior value, so we keep showing it. `snapshotted` tells a
+      // real empty snapshot apart from "no session_start yet" (which falls back
+      // to a one-shot on-demand read). Snapshot-primary is FAITHFUL: it shows
+      // exactly what pi baked, even after an edit-without-reload where an
+      // on-demand re-read would drift from the executed value.
+      let layers: ShellPrefixLayers = { global: undefined, project: undefined };
+      let snapshotted = false;
 
       pi.on('session_start', async (_event, ctx) => {
-        bashPrefix = await resolveBashPrefix(ctx);
+        layers = await resolveShellPrefixLayers(layers, ctx);
+        snapshotted = true;
       });
 
       pi.on('tool_call', async (event, ctx) => {
@@ -244,12 +274,15 @@ export function createPermissionGateExtension(): InlineExtension {
         const command = describeToolCall(toolName, event);
         let detailSource = command;
         if (toolName === 'bash') {
-          // Snapshot is primary (faithful to pi's baked value). Only if a bash
-          // approval somehow precedes the first session_start do we fall back
-          // to a one-shot on-demand read (lock-free, never throws). `??` keeps
-          // a snapshotted empty prefix (`''`) authoritative — it is not treated
-          // as "missing" — so we never re-read over a deliberate empty bake.
-          const prefix = bashPrefix ?? (await resolveBashPrefix(ctx));
+          // Snapshot is primary (faithful to pi's baked value, incl. reload
+          // retention). Only if a bash approval somehow precedes the first
+          // session_start do we fall back to a one-shot on-demand read from a
+          // clean baseline (lock-free, never throws). A snapshotted empty prefix
+          // is authoritative — it is NOT treated as "missing" — so we never
+          // re-read over a deliberate empty bake.
+          const prefix = snapshotted
+            ? effectiveShellPrefix(layers)
+            : effectiveShellPrefix(await resolveShellPrefixLayers({ global: undefined, project: undefined }, ctx));
           detailSource = prefix ? `${prefix}\n${command}` : command;
         }
         const detail = sanitizeDetail(detailSource);

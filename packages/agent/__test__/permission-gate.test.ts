@@ -521,6 +521,104 @@ describe('createPermissionGateExtension', () => {
       });
     });
 
+    it('RELOAD RETENTION: a corrupt global settings.json on reload keeps the prior baked prefix (matches pi)', async () => {
+      // pi's SettingsManager.reload() RETAINS a layer's prior value when that
+      // layer fails to reload (malformed/unreadable) — it keeps baking PFX_A
+      // into BashTool. A reader that mapped malformed → {} would drop to empty
+      // and under-disclose while pi still executes PFX_A. Mutation guard:
+      // mapping malformed → empty (drop retention) makes the reload assertion
+      // show the bare command and this test fail.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+          // Corrupt the file, then /reload: pi retains + bakes PFX_A.
+          await writeFile(join(agentDir, 'settings.json'), '{ this is not valid json');
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), b.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toContain('PFX_A');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('RELOAD CLEAR: a deleted global settings.json on reload clears the prefix (absent → empty, matches pi)', async () => {
+      // pi's reload maps an ABSENT layer to {} (no error) → the layer is
+      // CLEARED and BashTool bakes an empty prefix. So a deletion (unlike a
+      // corrupt file) must drop to the bare command.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+          await rm(join(agentDir, 'settings.json'), { force: true });
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), b.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('PER-LAYER RETENTION: reload retains a corrupt project layer, then clears it on delete → falls to global', async () => {
+      // Layers are tracked independently: corrupting the PROJECT file retains
+      // the project prefix (project still overrides global), while DELETING it
+      // clears the project layer so the global prefix takes over. Mutation
+      // guard: merging into one layer (or dropping per-layer retention) breaks
+      // the middle assertion.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'GLOBAL_PFX' }), async () => {
+        const cwd = await freshProject();
+        const projectSettings = join(cwd, '.pi', 'settings.json');
+        try {
+          await mkdir(join(cwd, '.pi'), { recursive: true });
+          await writeFile(projectSettings, JSON.stringify({ shellCommandPrefix: 'PROJECT_PFX' }));
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PROJECT_PFX');
+          expect(a.selectCalls[0]!.title).not.toContain('GLOBAL_PFX');
+
+          // Corrupt PROJECT, reload → project layer retained (still overrides global).
+          await writeFile(projectSettings, '{ broken');
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), b.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toContain('PROJECT_PFX');
+          expect(b.selectCalls[0]!.title).not.toContain('GLOBAL_PFX');
+
+          // Delete PROJECT, reload → project cleared, falls through to global.
+          await rm(projectSettings, { force: true });
+          const c = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), c.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), c.ctx);
+          expect(c.selectCalls[0]!.title).toContain('GLOBAL_PFX');
+          expect(c.selectCalls[0]!.title).not.toContain('PROJECT_PFX');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
     it('shows a TRUSTED project .pi/settings.json prefix but HIDES an untrusted one (matches pi)', async () => {
       await withGlobalAgentSettings(undefined, async () => {
         // Trusted project → pi loads `<cwd>/.pi/settings.json` → prefix shown.
