@@ -141,6 +141,48 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Options that UNCONDITIONALLY consume the FOLLOWING token as their value —
+ * mirrors pi 0.80.6 `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
+ * re-verify on a pi bump (same bounded coupling as the {@link expandPiAgentDir}
+ * / {@link readPersistedDefaultModel} shims). {@link withDefaultModel} skips the
+ * token after any of these so its VALUE is never mistaken for an option name:
+ * `--system-prompt --model` sets systemPrompt="--model" in pi and leaves
+ * `parsed.model` UNSET, so a naive membership scan that saw `--model` would
+ * wrongly suppress injection → pi resolves a cloud default (the leak this fix
+ * closes). Deliberately EXCLUDES the conditional consumers `-p`/`--print` and
+ * `--list-models` (pi only consumes a NON-dash next token for those, so a
+ * `--`-leading sentinel is never swallowed) and the flag-only carriers
+ * `-c`/`--continue`/`-r`/`--resume` (no value). The inline `--opt=value` form is
+ * not modeled either — pi's exact-match parser does not accept it.
+ */
+const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
+  '--mode',
+  '--provider',
+  '--model',
+  '--api-key',
+  '--system-prompt',
+  '--append-system-prompt',
+  '--name',
+  '-n',
+  '--session',
+  '--session-id',
+  '--fork',
+  '--session-dir',
+  '--models',
+  '--tools',
+  '-t',
+  '--exclude-tools',
+  '-xt',
+  '--thinking',
+  '--export',
+  '--extension',
+  '-e',
+  '--skill',
+  '--prompt-template',
+  '--theme',
+]);
+
+/**
  * Keep a launch on-machine at the AUTHORITATIVE CLI-arg layer (above settings
  * and above pi's cloud fallback). Without this, ambient provider credentials
  * (e.g. a `GROQ_API_KEY` in the shell) make pi's "first available model"
@@ -154,10 +196,29 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
  * Pure function, exported for tests.
  */
 export function withDefaultModel(passthrough: string[], defaultModelId: string): string[] {
-  if (passthrough.some((arg) => FULL_SUPPRESS_ARGS.has(arg))) {
+  // Classify over OPTION NAMES, not raw tokens: a value token that merely looks
+  // like an option (`--system-prompt --model` → "--model" is systemPrompt's
+  // VALUE, not an option) must not drive the decision. Walk left→right and, just
+  // like pi's parser (`args[++i]`), skip the token after any unconditional
+  // value-consumer so only real option names remain. A sentinel that is itself
+  // a consumer both classifies AND skips its own following value in this one
+  // pass; a sentinel consumed as some earlier option's value is skipped here and
+  // never classifies.
+  const optionNames = new Set<string>();
+  for (let i = 0; i < passthrough.length; i++) {
+    const token = passthrough[i]!;
+    optionNames.add(token);
+    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < passthrough.length) {
+      i++; // the next token is this option's value, never an option name
+    }
+  }
+
+  // Fail-closed default is to inject a LOCAL model; suppress only on a real
+  // explicit model/scope/fork, and scope (not bare --model) for a real carrier.
+  if (Array.from(FULL_SUPPRESS_ARGS).some((arg) => optionNames.has(arg))) {
     return passthrough;
   }
-  if (passthrough.some((arg) => SESSION_PROVIDER_CARRIER_ARGS.has(arg))) {
+  if (Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))) {
     return ['--models', 'mlx/*', ...passthrough];
   }
   return ['--model', `mlx/${defaultModelId}`, ...passthrough];

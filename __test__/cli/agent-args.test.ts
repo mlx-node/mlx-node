@@ -201,6 +201,49 @@ describe('withDefaultModel', () => {
     const argv = ['-p', 'please run --continue for me'];
     expect(withDefaultModel(argv, 'm')).toEqual(['--model', 'mlx/m', '-p', 'please run --continue for me']);
   });
+
+  describe('value-aware scan: a sentinel consumed as a VALUE must not suppress injection', () => {
+    it('injects a local model when --model is the VALUE of --system-prompt (the leak this fix closes)', () => {
+      // pi sets systemPrompt="--model" and leaves parsed.model UNSET, so without
+      // a local injection pi resolves a cloud default. A raw membership scan that
+      // saw the `--model` token would wrongly forward this unchanged. The value-
+      // aware scan skips `--model` (it is --system-prompt's value) → injects.
+      // Mutation guard: reverting to `passthrough.some(FULL_SUPPRESS_ARGS.has)`
+      // makes this expect the unchanged argv and the test fails.
+      expect(withDefaultModel(['--system-prompt', '--model', '-p', 'hi'], 'd')).toEqual([
+        '--model',
+        'mlx/d',
+        '--system-prompt',
+        '--model',
+        '-p',
+        'hi',
+      ]);
+    });
+
+    it('injects a local model when --provider is the VALUE of --append-system-prompt', () => {
+      expect(withDefaultModel(['--append-system-prompt', '--provider'], 'd')).toEqual([
+        '--model',
+        'mlx/d',
+        '--append-system-prompt',
+        '--provider',
+      ]);
+    });
+
+    it('injects a local model when a carrier (-c) is consumed as the VALUE of --name', () => {
+      // --name consumes `-c` as its value (pi: args[++i]); the benign reverse
+      // direction — the leftover run is a plain fresh run → concrete --model.
+      expect(withDefaultModel(['--name', '-c'], 'd')).toEqual(['--model', 'mlx/d', '--name', '-c']);
+    });
+
+    it('still classifies a REAL option name after its consumer sentinel skips its own value', () => {
+      // A real `--session-id foo` (consumer + carrier) still scopes to mlx/*, and
+      // a real explicit `--model x` (consumer + full-suppress) still forwards
+      // unchanged — the sentinel classifies AND skips its value in one pass.
+      expect(withDefaultModel(['--session-id', 'foo'], 'd')).toEqual(['--models', 'mlx/*', '--session-id', 'foo']);
+      const explicit = ['--model', 'x', '-p', 'hi'];
+      expect(withDefaultModel(explicit, 'd')).toBe(explicit);
+    });
+  });
 });
 
 /**
