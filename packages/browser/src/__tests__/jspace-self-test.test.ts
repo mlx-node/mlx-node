@@ -64,3 +64,39 @@ describe('self-test oracle', () => {
     expect(compareToBakedFrame(live, frame()).ok).toBe(false);
   });
 });
+
+// A trust gate must reject a MIS-SHAPED envelope outright — the fuzzy metrics
+// assume index alignment, so a truncated frame still scores ~0.99 and swapped
+// pins can slip past min-over-ranks. The structural gate closes that.
+describe('self-test structural gate', () => {
+  it('FAILS a frame truncated by one cell (would otherwise score ~0.99)', () => {
+    const live = frame();
+    live.cells = live.cells.slice(0, live.cells.length - 1);
+    const v = compareToBakedFrame(live, frame());
+    expect(v.ok).toBe(false);
+    expect(v.reason).toContain('structural mismatch');
+  });
+
+  it('FAILS when pin identities/order differ (swapped tracks)', () => {
+    const live = frame();
+    [live.pinned[0], live.pinned[1]] = [live.pinned[1]!, live.pinned[0]!];
+    const v = compareToBakedFrame(live, frame());
+    expect(v.ok).toBe(false);
+    expect(v.reason).toContain('structural mismatch');
+  });
+
+  it('FAILS when promptLen or topK disagree', () => {
+    const a = frame();
+    a.promptLen -= 1;
+    expect(compareToBakedFrame(a, frame()).ok).toBe(false);
+    const b = frame();
+    b.topK += 1;
+    expect(compareToBakedFrame(b, frame()).ok).toBe(false);
+  });
+
+  it('FAILS when the pin count differs', () => {
+    const live = frame();
+    live.pinned = live.pinned.slice(0, live.pinned.length - 1);
+    expect(compareToBakedFrame(live, frame()).ok).toBe(false);
+  });
+});

@@ -50,6 +50,49 @@ function minRank(ranks: ArrayLike<number>): number {
 }
 
 /**
+ * The fuzzy metrics below ASSUME the live frame is shape-aligned with the baked
+ * frame (same cell count, pin identities/order, layers, topK, promptLen). A trust
+ * gate must not infer that from a mis-shaped envelope: a frame truncated by one
+ * cell still scores ~0.99 top-1 agreement, and reordered/renamed pins can slip
+ * past the min-over-ranks metric. So reject any structural mismatch OUTRIGHT,
+ * before the fuzzy comparison. Returns a human-readable reason, or null if aligned.
+ */
+function structuralMismatch(live: LensReadoutRun, baked: LensReadoutRun): string | null {
+  if (live.cells.length !== baked.cells.length) {
+    return `cell count ${live.cells.length} != baked ${baked.cells.length}`;
+  }
+  if (live.pinned.length !== baked.pinned.length) {
+    return `pin count ${live.pinned.length} != baked ${baked.pinned.length}`;
+  }
+  if (live.promptLen !== baked.promptLen) {
+    return `promptLen ${live.promptLen} != baked ${baked.promptLen}`;
+  }
+  if (live.topK !== baked.topK) {
+    return `topK ${live.topK} != baked ${baked.topK}`;
+  }
+  if (live.layers.length !== baked.layers.length) {
+    return `layer count ${live.layers.length} != baked ${baked.layers.length}`;
+  }
+  for (let i = 0; i < baked.layers.length; i++) {
+    if (live.layers[i] !== baked.layers[i]) return `layer[${i}] ${live.layers[i]} != baked ${baked.layers[i]}`;
+  }
+  for (let i = 0; i < baked.pinned.length; i++) {
+    if (live.pinned[i]!.tokenId !== baked.pinned[i]!.tokenId) {
+      return `pin[${i}] id ${live.pinned[i]!.tokenId} != baked ${baked.pinned[i]!.tokenId} (identity/order)`;
+    }
+    if (live.pinned[i]!.ranks.length !== baked.pinned[i]!.ranks.length) {
+      return `pin[${i}] rank length ${live.pinned[i]!.ranks.length} != baked ${baked.pinned[i]!.ranks.length}`;
+    }
+  }
+  for (let i = 0; i < baked.cells.length; i++) {
+    if (live.cells[i]!.topKIds.length !== baked.cells[i]!.topKIds.length) {
+      return `cell[${i}] topK width ${live.cells[i]!.topKIds.length} != baked ${baked.cells[i]!.topKIds.length}`;
+    }
+  }
+  return null;
+}
+
+/**
  * Compare a LIVE readout against the baked oracle frame. Both must have been
  * produced at the SAME settings (same layers, topK, pins, prompt), so `cells`
  * and `pinned` are index-aligned and layer-major on both sides.
@@ -60,6 +103,12 @@ function minRank(ranks: ArrayLike<number>): number {
  *   - `ok`               = `topOneAgreement >= 0.9 && worstPinDelta <= 3`.
  */
 export function compareToBakedFrame(live: LensReadoutRun, baked: LensReadoutRun): SelfTestVerdict {
+  // --- structural gate: a mis-shaped envelope is garbage, not a near miss ---
+  const shape = structuralMismatch(live, baked);
+  if (shape !== null) {
+    return { ok: false, topOneAgreement: 0, worstPinDelta: Infinity, reason: `structural mismatch: ${shape}` };
+  }
+
   // --- top-1 agreement over cells -----------------------------------------
   const nCells = baked.cells.length;
   let matches = 0;
