@@ -100,28 +100,37 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
 }
 
 /**
- * Args that make pi resolve the model itself, so `--model mlx/<default>`
- * injection must be SUPPRESSED: an explicit choice (`--model`/`--provider`)
- * or a session reference whose saved model must win (pi's
- * `createAgentSession` restores the session's model ONLY when no CLI
- * `--model` was given). `--fork` belongs here too: it copies the source
- * session — messages and saved model included — into a new one.
- *
- * `--provider` stays a suppressor DELIBERATELY. Provider-only
- * (`mlx agent --provider groq`, no `--model`) never selects a model in pi
- * (`resolveCliModel` needs a `cliModel`), so it falls through to
- * `findInitialModel`, where the write-once persisted mlx default
- * ({@link writePersistedDefaultModel}, step 3) now keeps it on-machine —
- * that is the fix for the provider-only leak. Removing `--provider` here
- * (so injection fires) would be WORSE: pi resolves the injected
- * `--model mlx/<default>` against the user's `--provider groq` via
- * `buildFallbackModel`, minting a bogus CLOUD `groq/mlx/<default>` custom
- * model — the exact off-machine routing this guards against. Verified
- * against pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
+ * Args carrying an EXPLICIT model choice or a concrete session copy: ALL
+ * default injection is suppressed and the argv is forwarded verbatim.
+ * - `--model` / `--models` — the user already named a model or a scope; pi
+ *   resolves it directly.
+ * - `--fork` — copies the source session (messages + saved model) into a new
+ *   one; injecting anything would fight the restore.
  */
-const MODEL_CARRYING_ARGS: ReadonlySet<string> = new Set([
-  '--model',
-  '--models',
+const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--model', '--models', '--fork']);
+
+/**
+ * Session / provider carriers where a bare `--model mlx/<id>` injection is
+ * WRONG but a local-only SCOPE is right: {@link withDefaultModel} prepends
+ * `--models mlx/*` for these instead of a concrete `--model`.
+ *
+ * - session refs (`-c`/`--continue`/`-r`/`--resume`/`--session`/`--session-id`):
+ *   a real existing session must restore its OWN saved model. `--models` is a
+ *   scope, not a model — pi leaves `options.model` undefined for an existing
+ *   session (saved model wins) and only picks `scopedModels[0]` (an mlx model)
+ *   for a NEW / unknown / empty session, never a cloud default.
+ * - `--provider <p>` (no `--model`): provider-only never selects a model in pi
+ *   (`resolveCliModel` needs a `cliModel`), so it would fall through to
+ *   `findInitialModel` and an ambient cloud default. `--models mlx/*` forces an
+ *   mlx model at the CLI-arg layer, ABOVE settings (global + project) and above
+ *   the cloud fallback — immune to a write-once seed failure, a project
+ *   `.pi/settings.json` override, or ambient API keys. Injecting a bare
+ *   `--model mlx/<id>` here would be WORSE: pi resolves it against `--provider
+ *   <p>` via `buildFallbackModel`, minting a bogus CLOUD `<p>/mlx/<id>` custom
+ *   model; a `--models` scope carries no provider and cannot. Verified against
+ *   pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
+ */
+const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--provider',
   '-c',
   '--continue',
@@ -129,19 +138,27 @@ const MODEL_CARRYING_ARGS: ReadonlySet<string> = new Set([
   '--resume',
   '--session',
   '--session-id',
-  '--fork',
 ]);
 
 /**
- * Default fresh runs to the first discovered local model. Without this,
- * ambient provider credentials (e.g. a `GROQ_API_KEY` in the shell) make
- * pi's "first available model" fallback pick a CLOUD model over the
- * local ones — the opposite of what `mlx agent` promises. Pure function,
- * exported for tests.
+ * Keep a launch on-machine at the AUTHORITATIVE CLI-arg layer (above settings
+ * and above pi's cloud fallback). Without this, ambient provider credentials
+ * (e.g. a `GROQ_API_KEY` in the shell) make pi's "first available model"
+ * fallback pick a CLOUD model over the local ones — the opposite of what
+ * `mlx agent` promises. Three cases:
+ * - explicit model / scope / fork ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
+ * - session / provider carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
+ *   prepend `--models mlx/*` (a local-only scope that preserves session restore
+ *   yet blocks a cloud default for a new / unknown / empty session);
+ * - plain fresh run → prepend `--model mlx/<default>`.
+ * Pure function, exported for tests.
  */
 export function withDefaultModel(passthrough: string[], defaultModelId: string): string[] {
-  if (passthrough.some((arg) => MODEL_CARRYING_ARGS.has(arg))) {
+  if (passthrough.some((arg) => FULL_SUPPRESS_ARGS.has(arg))) {
     return passthrough;
+  }
+  if (passthrough.some((arg) => SESSION_PROVIDER_CARRIER_ARGS.has(arg))) {
+    return ['--models', 'mlx/*', ...passthrough];
   }
   return ['--model', `mlx/${defaultModelId}`, ...passthrough];
 }
@@ -417,18 +434,23 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
 
   const persisted = (deps.readPersistedDefault ?? readPersistedDefaultModel)();
   const { modelId, notice } = chooseDefaultModel(models, persisted);
-  // Write-once: seed an mlx default into pi's settings.json when none is
-  // persisted yet, so the session / provider-only launch paths (where the
-  // `--model` injection is suppressed) still resolve to a local model via
-  // pi's `findInitialModel` step-3 instead of an ambient cloud provider.
-  // Only when unset, so a later user `/model` pick is never overwritten; the
-  // writer swallows I/O failures, so a bad settings file can't crash launch.
+  // Write-once belt: seed an mlx default into pi's settings.json when none is
+  // persisted yet. The AUTHORITATIVE guard for the session / provider carrier
+  // paths is the `--models mlx/*` scope injected by withDefaultModel (CLI-arg
+  // layer, above settings) — this seed is belt-and-suspenders: it gives pi's
+  // `/model` a starting default and keeps `findInitialModel` step-3 on-machine
+  // if the scope is ever bypassed. Only when unset, so a later user `/model`
+  // pick is never overwritten; the writer swallows I/O failures, so a bad
+  // settings file can't crash launch.
   if (persisted === undefined) {
     (deps.writePersistedDefault ?? writePersistedDefaultModel)('mlx', modelId);
   }
   const agentArgv = withDefaultModel(scan.passthrough, modelId);
-  // The identity return means no injection happened (session/--model run)
-  // — then nothing was overridden and the notice would be a lie.
+  // A notice only makes sense when injection actually overrode a non-mlx
+  // persisted default. An identity return (FULL_SUPPRESS: --model/--models/
+  // --fork) overrode nothing, so the notice would be a lie; both the
+  // `--models mlx/*` scope and the fresh-run `--model` injection return a new
+  // array, so `agentArgv !== scan.passthrough` marks a real override.
   if (notice !== undefined && agentArgv !== scan.passthrough) {
     console.error(notice);
   }
