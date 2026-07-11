@@ -1958,6 +1958,44 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         .map_err(Error::from_reason)?;
     }
 
+    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
+    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
+    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
+    // than re-quantizing. Detected from the config; the runtime never reads
+    // Google's native quant metadata.
+    // Key on the gemma FAMILY (gemma4 or the gemma4_unified alias), not the
+    // exact string: an aliased `-m gemma4_unified` on a gemma-QAT source must
+    // not slip this rejection into the generic quantizer. Kept keyed on the
+    // resolved `model_type` (real QAT configs may omit `model_type` and rely on
+    // `-m gemma4`), just alias-robust.
+    // These guards are pure config reads (no MLX ops), evaluated BEFORE the
+    // convert mutex + `CpuConvertGuard::enter_cpu()` below, so an invalid
+    // already-quantized or non-E2B gemma-QAT source is rejected without
+    // acquiring the process-wide lock or touching MLX — keeping the rejection
+    // hermetic in headless/degraded environments (no SIGABRT from MLX init).
+    let is_gemma_prequantized = nvidia_recipe_family(model_type.as_deref()) == Some("gemma4")
+        && config
+            .get("quantization_config")
+            .and_then(|qc| qc.get("quant_method"))
+            .and_then(|m| m.as_str())
+            == Some("gemma");
+    if is_gemma_prequantized
+        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
+    {
+        return Err(Error::from_reason(
+            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
+             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
+             to MLX affine)"
+                .to_string(),
+        ));
+    }
+    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
+    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
+    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
+    if is_gemma_prequantized {
+        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
+    }
+
     // Serialize all conversions process-wide before touching MLX's default
     // device + stream — see `convert_mutex` and `CpuConvertGuard` docs for
     // the race this avoids.
@@ -1991,39 +2029,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     if tie_word_embeddings && verbose {
         info!("Model uses tied embeddings - will skip lm_head.weight");
-    }
-
-    // Google gemma-QAT ("wNa8o8") prequantized source: weights are already
-    // per-output-channel symmetric 2/4/8-bit (quant_method == "gemma"). We repack
-    // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
-    // than re-quantizing. Detected from the config; the runtime never reads
-    // Google's native quant metadata.
-    // Key on the gemma FAMILY (gemma4 or the gemma4_unified alias), not the
-    // exact string: an aliased `-m gemma4_unified` on a gemma-QAT source must
-    // not slip this rejection into the generic quantizer. Kept keyed on the
-    // resolved `model_type` (real QAT configs may omit `model_type` and rely on
-    // `-m gemma4`), just alias-robust.
-    let is_gemma_prequantized = nvidia_recipe_family(model_type.as_deref()) == Some("gemma4")
-        && config
-            .get("quantization_config")
-            .and_then(|qc| qc.get("quant_method"))
-            .and_then(|m| m.as_str())
-            == Some("gemma");
-    if is_gemma_prequantized
-        && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
-    {
-        return Err(Error::from_reason(
-            "gemma-QAT checkpoints are already quantized; convert without --quantize, \
-             --q-recipe, --imatrix-path, or --q-mtp (the source is repacked losslessly \
-             to MLX affine)"
-                .to_string(),
-        ));
-    }
-    // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
-    // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
-    // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
-    if is_gemma_prequantized {
-        crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
     }
 
     // Load tensors - handle both single file and sharded models
