@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -44,10 +48,16 @@ interface SelectCall {
 }
 
 /** Fake ExtensionContext recording ui.select calls and answering with `choice`. */
-function makeCtx(hasUI: boolean, choice?: string): { ctx: ExtensionContext; selectCalls: SelectCall[] } {
+function makeCtx(
+  hasUI: boolean,
+  choice?: string,
+  extra?: { cwd?: string; isProjectTrusted?: () => boolean },
+): { ctx: ExtensionContext; selectCalls: SelectCall[] } {
   const selectCalls: SelectCall[] = [];
   const ctx = {
     hasUI,
+    cwd: extra?.cwd,
+    isProjectTrusted: extra?.isProjectTrusted,
     ui: {
       select: (title: string, options: string[]): Promise<string | undefined> => {
         if (!hasUI) {
@@ -90,12 +100,18 @@ function expectPreservesPrintables(input: string, title: string): void {
 }
 
 const savedAutoApprove = process.env['MLX_AGENT_AUTO_APPROVE'];
+const savedAgentDir = process.env['PI_CODING_AGENT_DIR'];
 
 afterEach(() => {
   if (savedAutoApprove === undefined) {
     delete process.env['MLX_AGENT_AUTO_APPROVE'];
   } else {
     process.env['MLX_AGENT_AUTO_APPROVE'] = savedAutoApprove;
+  }
+  if (savedAgentDir === undefined) {
+    delete process.env['PI_CODING_AGENT_DIR'];
+  } else {
+    process.env['PI_CODING_AGENT_DIR'] = savedAgentDir;
   }
 });
 
@@ -397,6 +413,136 @@ describe('createPermissionGateExtension', () => {
       await handler(toolCallEvent('edit', { path: '/repo/src/index.ts', oldText: 'a', newText: 'b' }), ctx);
       expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  yarn build:native --verbose');
       expect(selectCalls[1]!.title).toBe('Allow edit?\n\n  /repo/src/index.ts');
+    });
+  });
+
+  describe('pi shellCommandPrefix is surfaced in the bash prompt', () => {
+    // pi's BashTool runs `${shellCommandPrefix}\n${command}`, so a non-empty
+    // prefix executes shell bytes the model never named. The gate must show
+    // the effective prefix (displayed == executed). Resolution is fail-safe:
+    // any failure falls back to the bare command and never throws.
+    async function withGlobalAgentSettings(
+      settings: string | undefined,
+      fn: (agentDir: string) => Promise<void>,
+    ): Promise<void> {
+      const agentDir = await mkdtemp(join(tmpdir(), 'mlx-gate-agent-'));
+      try {
+        if (settings !== undefined) {
+          await writeFile(join(agentDir, 'settings.json'), settings);
+        }
+        process.env['PI_CODING_AGENT_DIR'] = agentDir;
+        await fn(agentDir);
+      } finally {
+        await rm(agentDir, { recursive: true, force: true });
+      }
+    }
+
+    /** Fresh, unique project cwd so the (cwd, trusted) prefix memo never aliases across tests. */
+    function freshProject(): Promise<string> {
+      return mkdtemp(join(tmpdir(), 'mlx-gate-project-'));
+    }
+
+    it('prepends a GLOBAL settings.json shellCommandPrefix to the bash approval title', async () => {
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'sudo -k --' }), async () => {
+        const cwd = await freshProject();
+        try {
+          const handler = loadGateHandler();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+          await handler(toolCallEvent('bash', { command: 'rm -rf /tmp/scratch' }), ctx);
+          expect(selectCalls).toHaveLength(1);
+          // Displayed == executed: the hidden prefix and the command both show.
+          expect(selectCalls[0]!.title).toContain('sudo -k --');
+          expect(selectCalls[0]!.title).toContain('rm -rf /tmp/scratch');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('shows a TRUSTED project .pi/settings.json prefix but HIDES an untrusted one (matches pi)', async () => {
+      await withGlobalAgentSettings(undefined, async () => {
+        // Trusted project → pi loads `<cwd>/.pi/settings.json` → prefix shown.
+        const trustedCwd = await freshProject();
+        try {
+          await mkdir(join(trustedCwd, '.pi'), { recursive: true });
+          await writeFile(
+            join(trustedCwd, '.pi', 'settings.json'),
+            JSON.stringify({ shellCommandPrefix: 'PROJECT_PREFIX' }),
+          );
+          const handler = loadGateHandler();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: trustedCwd, isProjectTrusted: () => true });
+          await handler(toolCallEvent('bash', { command: 'make build' }), ctx);
+          expect(selectCalls[0]!.title).toContain('PROJECT_PREFIX');
+        } finally {
+          await rm(trustedCwd, { recursive: true, force: true });
+        }
+
+        // Untrusted project → pi drops the project layer → prefix NOT shown.
+        const untrustedCwd = await freshProject();
+        try {
+          await mkdir(join(untrustedCwd, '.pi'), { recursive: true });
+          await writeFile(
+            join(untrustedCwd, '.pi', 'settings.json'),
+            JSON.stringify({ shellCommandPrefix: 'PROJECT_PREFIX' }),
+          );
+          const handler = loadGateHandler();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: untrustedCwd, isProjectTrusted: () => false });
+          await handler(toolCallEvent('bash', { command: 'make build' }), ctx);
+          expect(selectCalls[0]!.title).not.toContain('PROJECT_PREFIX');
+          expect(selectCalls[0]!.title).toContain('make build');
+        } finally {
+          await rm(untrustedCwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('leaves the title as the bare command when no prefix is configured', async () => {
+      await withGlobalAgentSettings(JSON.stringify({ theme: 'dark' }), async () => {
+        const cwd = await freshProject();
+        try {
+          const handler = loadGateHandler();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+          await handler(toolCallEvent('bash', { command: 'yarn build' }), ctx);
+          expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  yarn build');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('never crashes and shows the bare command when prefix resolution throws', async () => {
+      const cwd = await freshProject();
+      try {
+        const handler = loadGateHandler();
+        const { ctx, selectCalls } = makeCtx(true, 'No', {
+          cwd,
+          isProjectTrusted: () => {
+            throw new Error('trust check exploded');
+          },
+        });
+        const result = await handler(toolCallEvent('bash', { command: 'echo hi' }), ctx);
+        // The gate still prompted (bare command) and returned a decision.
+        expect(selectCalls).toHaveLength(1);
+        expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
+        expect(result).toEqual({ block: true, reason: 'Blocked by user' });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('does not consult a shell prefix for non-bash tools', async () => {
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'SHOULD_NOT_APPEAR' }), async () => {
+        const cwd = await freshProject();
+        try {
+          const handler = loadGateHandler();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+          await handler(toolCallEvent('write', { path: '/tmp/out.txt', content: 'x' }), ctx);
+          expect(selectCalls[0]!.title).not.toContain('SHOULD_NOT_APPEAR');
+          expect(selectCalls[0]!.title).toContain('/tmp/out.txt');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
     });
   });
 
