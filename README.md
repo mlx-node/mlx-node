@@ -31,15 +31,16 @@ MLX-Node brings Apple's [MLX](https://github.com/ml-explore/mlx) framework to Ja
 
 ## Why MLX-Node?
 
-|     | Feature                       | Description                                                                                |
-| :-: | :---------------------------- | :----------------------------------------------------------------------------------------- |
-| ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion         |
-| 🧪  | **Experimental CUDA**         | NVIDIA GPU inference via MLX's CUDA backend — Qwen3.6 on GB10 / DGX Spark (preview, eager) |
-| 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO)  |
-| 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling           |
-| 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                        |
-| 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                           |
-| 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                  |
+|     | Feature                       | Description                                                                                      |
+| :-: | :---------------------------- | :----------------------------------------------------------------------------------------------- |
+| ⚡  | **Metal GPU Acceleration**    | Native Apple Silicon performance via MLX with lazy evaluation and operation fusion               |
+| 🧪  | **Experimental CUDA**         | NVIDIA GPU inference via MLX's CUDA backend — Qwen3.6 on GB10 / DGX Spark (preview, eager)       |
+| 🎯  | **GRPO Training**             | Complete reinforcement learning pipeline with 4 loss variants (GRPO, DAPO, Dr.GRPO, BNPO)        |
+| 🤖  | **Qwen Models**               | Support for 0.6B, 1.7B, 4B, 8B, 14B, 32B parameter models with advanced sampling                 |
+| 🧑‍💻  | **Local Coding Agent**        | `mlx agent` — the first all-in-one local coding agent: pi-based, fully offline, permission-gated |
+| 🔄  | **Automatic Differentiation** | Compute gradients through entire models via functional forward pass                              |
+| 🚫  | **Zero Python Dependency**    | Pure Rust/TypeScript implementation — no Python runtime required                                 |
+| 📊  | **TypedArray-First API**      | Zero-copy operations using native JavaScript typed arrays                                        |
 
 ---
 
@@ -417,13 +418,13 @@ MLX-Node uses a clean two-layer architecture: **Rust for compute**, **TypeScript
 
 ### Package Overview
 
-| Package                             | Purpose                    | Use For                                          |
-| :---------------------------------- | :------------------------- | :----------------------------------------------- |
-| [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs   |
-| [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers        |
-| [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl) |
-| [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights                |
-| [`@mlx-node/vlm`](./packages/vlm)   | Vision-language models     | PaddleOCR-VL, document processing                |
+| Package                             | Purpose                    | Use For                                            |
+| :---------------------------------- | :------------------------- | :------------------------------------------------- |
+| [`@mlx-node/lm`](./packages/lm)     | Model loading & inference  | Loading models, generating text, model configs     |
+| [`@mlx-node/trl`](./packages/trl)   | Training & optimization    | GRPO training, custom rewards, optimizers          |
+| [`@mlx-node/core`](./packages/core) | Native bindings (internal) | Low-level operations (usually import via lm/trl)   |
+| [`@mlx-node/cli`](./packages/cli)   | CLI                        | Download models, quantize weights, run `mlx agent` |
+| [`@mlx-node/vlm`](./packages/vlm)   | Vision-language models     | PaddleOCR-VL, document processing                  |
 
 ### Optimizations
 
