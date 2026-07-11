@@ -43,12 +43,14 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'MoE, fast decode',
   },
   {
-    // Repo publishes after Task 9's local convert + validation; the slug
-    // is the intended name and may be corrected in Task 9.
+    // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via
+    // `mlx convert --q-recipe nvidia` on gemma-4-12b-it (coherent + tool
+    // calling through `mlx agent`). Provisional slug — the user finalizes it
+    // on HF upload; entry stays hidden until the repo exists.
     label: 'Gemma-4-12B',
-    hfRepo: 'Brooooooklyn/Gemma-4-12B-IT-q4-mlx',
-    sizeGb: 8.4,
-    description: 'Compact, fits smaller machines',
+    hfRepo: 'Brooooooklyn/Gemma-4-12B-IT-mxfp-mlx',
+    sizeGb: 8.6,
+    description: 'Compact (mxfp4 MLP + mxfp8 attention), fits smaller machines',
     hidden: true,
   },
 ];
