@@ -1963,23 +1963,34 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // losslessly to MLX affine (2/4-bit) + dequant the I8 modules to float, rather
     // than re-quantizing. Detected from the config; the runtime never reads
     // Google's native quant metadata.
-    // Key on the gemma FAMILY (gemma4 or the gemma4_unified alias), not the
-    // exact string: an aliased `-m gemma4_unified` on a gemma-QAT source must
-    // not slip this rejection into the generic quantizer. Kept keyed on the
-    // resolved `model_type` (real QAT configs may omit `model_type` and rely on
-    // `-m gemma4`), just alias-robust.
+    //
+    // Split the detection by ROLE (WB-2) — a single alias-robust predicate would
+    // let a gemma4_unified QAT reach the E2B importer, which DROPS AUDIO:
+    //   - is_gemma_qat_family: the gemma FAMILY (gemma4 / gemma4_text /
+    //     gemma4_unified all collapse via `nvidia_recipe_family`). Used ONLY for
+    //     the pre-import already-quantized REJECT, so an aliased
+    //     `-m gemma4_unified` on a gemma-QAT source can't slip past that reject
+    //     into the generic quantizer.
+    //   - is_gemma_e2b_import: EXACT `model_type == "gemma4"`. The importer
+    //     hardcodes E2B's language schedule and DROPS AUDIO, so it must never run
+    //     for the unified alias (which carries audio). Honors the documented CLI
+    //     contract in packages/cli/src/commands/convert.ts (the exact-"gemma4"
+    //     gate must NOT match unified). Real E2B is model_type "gemma4",
+    //     unaffected.
     // These guards are pure config reads (no MLX ops), evaluated BEFORE the
     // convert mutex + `CpuConvertGuard::enter_cpu()` below, so an invalid
-    // already-quantized or non-E2B gemma-QAT source is rejected without
+    // already-quantized, unified, or non-E2B gemma-QAT source is rejected without
     // acquiring the process-wide lock or touching MLX — keeping the rejection
     // hermetic in headless/degraded environments (no SIGABRT from MLX init).
-    let is_gemma_prequantized = nvidia_recipe_family(model_type.as_deref()) == Some("gemma4")
-        && config
-            .get("quantization_config")
-            .and_then(|qc| qc.get("quant_method"))
-            .and_then(|m| m.as_str())
-            == Some("gemma");
-    if is_gemma_prequantized
+    let is_gemma_qat_source = config
+        .get("quantization_config")
+        .and_then(|qc| qc.get("quant_method"))
+        .and_then(|m| m.as_str())
+        == Some("gemma");
+    let is_gemma_qat_family =
+        nvidia_recipe_family(model_type.as_deref()) == Some("gemma4") && is_gemma_qat_source;
+    let is_gemma_e2b_import = model_type.as_deref() == Some("gemma4") && is_gemma_qat_source;
+    if is_gemma_qat_family
         && (do_quantize || quant_recipe.is_some() || imatrix_path.is_some() || quant_mtp != "off")
     {
         return Err(Error::from_reason(
@@ -1989,10 +2000,36 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 .to_string(),
         ));
     }
+    // A positively-unified gemma-QAT is unsupported by the E2B importer (which is
+    // EXACT-"gemma4" only, drops audio, and pins E2B's language schedule). With no
+    // quant flags it escapes the already-quantized family reject above AND misses
+    // `is_gemma_e2b_import` (exact match), so without this it would fall through to
+    // the generic quantizer and silently mis-repack the already-quantized weights.
+    // Reject it explicitly (still hermetic — pure config read). `is_unified` is
+    // computed from the config exactly as `models/gemma4/persistence.rs`
+    // (model_type == "gemma4_unified" || architectures[0] == unified arch).
+    if is_gemma_qat_source {
+        let is_unified = config.get("model_type").and_then(|v| v.as_str())
+            == Some("gemma4_unified")
+            || config
+                .get("architectures")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                == Some("Gemma4UnifiedForConditionalGeneration");
+        if is_unified {
+            return Err(Error::from_reason(
+                "unified gemma QAT is not supported by the E2B prequantized importer \
+                 (it drops audio and hardcodes E2B's language schedule); convert the \
+                 E2B gemma-QAT checkpoint instead"
+                    .to_string(),
+            ));
+        }
+    }
     // The detection gate above (model_type=gemma4 + quant_method=gemma) also matches
     // other gemma4 QAT variants, but the importer hardcodes E2B's bit schedule.
     // Reject a non-E2B schedule with a clear error rather than mis-repacking it.
-    if is_gemma_prequantized {
+    if is_gemma_e2b_import {
         crate::convert_gemma_import::validate_e2b_qat_schedule(&config)?;
     }
 
@@ -2216,7 +2253,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     }
 
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
-    let converted_tensors = if is_gemma_prequantized {
+    let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
             "float32" | "f32" => DType::Float32,
             "float16" | "f16" => DType::Float16,
@@ -2375,7 +2412,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             },
             None => converted_tensors,
         }
-    }; // end is_gemma_prequantized else branch
+    }; // end is_gemma_e2b_import else branch
 
     // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
@@ -2408,7 +2445,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // loaders that trust the top-level default for tensors without a
     // per-layer override would mis-dequantize, so derive the top-level block
     // from the importer's own override map instead.
-    if is_gemma_prequantized {
+    if is_gemma_e2b_import {
         let (bits, group_size, mode) =
             crate::convert_gemma_import::top_level_quant_metadata(&per_layer_overrides)?;
         quant_bits_effective = bits;
@@ -2750,7 +2787,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     let mut output_config = config.clone();
 
     // Inject quantization metadata if quantized
-    if do_quantize || is_gemma_prequantized {
+    if do_quantize || is_gemma_e2b_import {
         // sym8 has NO quant group (one f32 scale per output channel), so the
         // top-level group_size is written as `null` — the loader must dispatch
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
@@ -12059,11 +12096,12 @@ mod tests {
     async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
         // Round-2 [high]: a gemma-QAT source (`quant_method: "gemma"`) with an
         // aliased `-m gemma4_unified` must NOT slip the already-quantized
-        // rejection into the generic quantizer. `is_gemma_prequantized` now
-        // matches the gemma FAMILY (gemma4/gemma4_unified), so the alias is
-        // caught. The config declares model_type gemma4, so the nvidia
-        // family-agreement check passes (both collapse to gemma) — the QAT gate
-        // is what must reject. Only config.json is written.
+        // rejection into the generic quantizer. The FAMILY predicate
+        // `is_gemma_qat_family` (gemma4/gemma4_unified collapse via
+        // nvidia_recipe_family) still catches the alias for the reject. The
+        // config declares model_type gemma4, so the nvidia family-agreement check
+        // passes (both collapse to gemma) — the QAT gate is what must reject.
+        // Only config.json is written.
         let base = std::env::temp_dir().join(format!(
             "nvidia_gate_gemma_qat_{}_{}",
             std::process::id(),
@@ -12109,6 +12147,87 @@ mod tests {
                 .contains("gemma-QAT checkpoints are already quantized"),
             "expected the gemma-QAT already-quantized reject, got: {}",
             err.reason
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn convert_model_rejects_unified_gemma_qat_before_e2b_importer() {
+        // WB-2 [high]: a gemma4_unified QAT (audio-carrying) must NOT reach the
+        // E2B prequantized importer, which is EXACT-"gemma4" only and DROPS
+        // AUDIO. This config uses the EXACT E2B language schedule, so under the
+        // pre-fix single family predicate it would PASS validate_e2b_qat_schedule
+        // and enter the importer (dropping audio). With the role split, the
+        // unified marker (model_type gemma4_unified / unified architecture) trips
+        // the explicit unified-QAT reject FIRST — hermetically, before the
+        // convert mutex + enter_cpu, so no output directory is even created.
+        let base = std::env::temp_dir().join(format!(
+            "unified_gemma_qat_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model_type": "gemma4_unified",
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "tie_word_embeddings": false,
+                // A real (non-null) audio_config: the unified checkpoint carries
+                // audio the E2B importer would silently drop.
+                "audio_config": { "input_feat_size": 128 },
+                "quantization_config": {
+                    "quant_method": "gemma",
+                    // EXACT E2B schedule — so the pre-fix path would validate + import.
+                    "module_quant_configs": {
+                        "^lm_head$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens$": { "num_bits": 2 },
+                        "language_model\\.embed_tokens_per_layer$": { "num_bits": 4 },
+                        "language_model\\.layers\\.(\\d|1[0-4])\\.mlp\\.": { "num_bits": 4 },
+                        "language_model\\.layers\\.\\d+\\.mlp\\.": { "num_bits": 2 },
+                        "language_model\\.layers\\.\\d+\\.self_attn\\.": { "num_bits": 4 }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .expect("write config.json");
+
+        let err = convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("gemma4_unified".to_string()),
+            quantize: None, // NO quant flags: escapes the already-quantized family reject
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .err()
+        .expect("unified gemma-QAT must be rejected before the E2B importer");
+        assert!(
+            err.reason.contains("unified gemma QAT is not supported"),
+            "expected the unified gemma-QAT reject, got: {}",
+            err.reason
+        );
+        // Hermetic: the reject fires before create_dir_all(&output_dir), so no
+        // audio-dropped E2B output is ever produced. Under the pre-fix single
+        // predicate the output dir WOULD have been created — this discriminates.
+        assert!(
+            !output.exists(),
+            "no output directory should be created for a rejected unified gemma-QAT"
         );
 
         let _ = std::fs::remove_dir_all(&base);
