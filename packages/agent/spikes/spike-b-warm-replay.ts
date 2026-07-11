@@ -23,6 +23,7 @@
  */
 import { join } from 'node:path';
 
+import { createBashToolDefinition, createEditToolDefinition } from '@earendil-works/pi-coding-agent';
 import { Qwen3Tokenizer } from '@mlx-node/core';
 import {
   type ChatConfig,
@@ -35,7 +36,6 @@ import {
   type ToolCallResult,
   type ToolDefinition,
 } from '@mlx-node/lm';
-import { createBashToolDefinition, createEditToolDefinition } from '@earendil-works/pi-coding-agent';
 
 const MODEL_PATH = process.env.SPIKE_MODEL ?? '/Users/brooklyn/.mlx-node/models/qwen3.5-0.8b-mlx-bf16';
 
@@ -240,11 +240,10 @@ async function main(): Promise<number> {
     if (!(reprefill3 < prompts[2] / 2)) {
       failures.push(`call 3 re-prefilled ${reprefill3} of ${prompts[2]} prompt tokens (>= half; reuse not effective)`);
     }
-    record(
-      '1. Warm replay x3: cachedTokens > 0 on calls 2 and 3',
-      failures.length === 0 ? 'PROVEN' : 'FAILED',
-      [...evidence, ...failures],
-    );
+    record('1. Warm replay x3: cachedTokens > 0 on calls 2 and 3', failures.length === 0 ? 'PROVEN' : 'FAILED', [
+      ...evidence,
+      ...failures,
+    ]);
 
     const sane = texts.every((t) => t.trim().length > 0);
     record(
@@ -252,7 +251,12 @@ async function main(): Promise<number> {
       sane ? 'PROVEN' : 'FAILED',
       sane
         ? [`all 3 finals non-empty; eyeball texts above (Paris / Tokyo expected)`]
-        : [`empty final text in turns: ${texts.map((t, i) => (t.trim() ? '' : i + 1)).filter(Boolean).join(',')}`],
+        : [
+            `empty final text in turns: ${texts
+              .map((t, i) => (t.trim() ? '' : i + 1))
+              .filter(Boolean)
+              .join(',')}`,
+          ],
     );
   }
 
@@ -311,7 +315,9 @@ async function main(): Promise<number> {
         `pendingUnresolvedToolCallCount after resolved prime: ${session.pendingUnresolvedToolCallCount} (null = gate disarmed)`,
       );
       if (session.pendingUnresolvedToolCallCount !== null) {
-        failures.push(`resolved fan-out must derive null unresolved count, got ${session.pendingUnresolvedToolCallCount}`);
+        failures.push(
+          `resolved fan-out must derive null unresolved count, got ${session.pendingUnresolvedToolCallCount}`,
+        );
       }
       let final: ChatStreamFinal | null = null;
       for await (const event of session.startFromHistoryStream({ ...BASE_CONFIG, tools: [weatherTool] })) {

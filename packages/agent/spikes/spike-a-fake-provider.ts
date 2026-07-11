@@ -84,11 +84,7 @@ async function runChild(scenario: Scenario): Promise<void> {
 
   let callIndex = 0;
 
-  const pushStreamError = (
-    stream: AssistantMessageEventStream,
-    model: Model<string>,
-    error: unknown,
-  ): void => {
+  const pushStreamError = (stream: AssistantMessageEventStream, model: Model<string>, error: unknown): void => {
     const message: AssistantMessage = {
       role: 'assistant',
       content: [],
@@ -335,7 +331,10 @@ function runScenario(scenario: Scenario, root: string): Promise<ChildResult> {
 }
 
 /** Depth-first search for any node matching the predicate in parsed JSON. */
-function deepFind(node: unknown, predicate: (o: Record<string, unknown>) => boolean): Record<string, unknown> | undefined {
+function deepFind(
+  node: unknown,
+  predicate: (o: Record<string, unknown>) => boolean,
+): Record<string, unknown> | undefined {
   if (Array.isArray(node)) {
     for (const item of node) {
       const hit = deepFind(item, predicate);
@@ -472,9 +471,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
 
   // 2. Provider registration + model resolution, no auth prompt
   const registered = SCENARIOS.every((s) => results[s].stderr.includes('SPIKE_REGISTER_OK'));
-  const noAuthPrompt = SCENARIOS.every(
-    (s) => !/\/login|No models available|not logged in/i.test(results[s].stderr),
-  );
+  const noAuthPrompt = SCENARIOS.every((s) => !/\/login|No models available|not logged in/i.test(results[s].stderr));
   const modelResolved = deepFind(text.events, (o) => o.model === 'fake-model' && o.provider === 'mlx') !== undefined;
   push(
     '2. registerProvider("mlx", {...streamSimple}) resolves --model mlx/fake-model without auth',
@@ -502,10 +499,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   const textStopOk = textEp?.endMessage?.stopReason === 'stop';
   const textDoneReasons = capturedDoneReasons(text.stderr);
   const textProviderDoneOk = textDoneReasons.join(',') === 'stop';
-  const finalText = deepFind(
-    text.events,
-    (o) => typeof o.text === 'string' && (o.text as string).includes(TEXT_REPLY),
-  );
+  const finalText = deepFind(text.events, (o) => typeof o.text === 'string' && (o.text as string).includes(TEXT_REPLY));
   push(
     '4. Text streaming (start -> text_start/delta/end -> done{stop}) reaches pi output',
     textEpisodes.length === 1 &&
@@ -527,8 +521,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   const toolEp0 = toolEpisodes[0];
   const toolEp1 = toolEpisodes[1];
   const toolTrioOk = toolEp0 !== undefined && isBurstTrio(toolEp0.innerTypes, 'toolcall');
-  const toolCallEndOk =
-    toolEp0?.toolCallEnd?.name === 'read' && toolEp0?.toolCallEnd?.id === 'spike_call_0';
+  const toolCallEndOk = toolEp0?.toolCallEnd?.name === 'read' && toolEp0?.toolCallEnd?.id === 'spike_call_0';
   const toolStopOk = toolEp0?.endMessage?.stopReason === 'toolUse';
   const contTrioOk = toolEp1 !== undefined && isBurstTrio(toolEp1.innerTypes, 'text');
   const contStopOk = toolEp1?.endMessage?.stopReason === 'stop';
@@ -577,9 +570,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
     endUsage.totalTokens === 12;
   const costFieldsOk =
     endCost !== undefined &&
-    (['input', 'output', 'cacheRead', 'cacheWrite', 'total'] as const).every(
-      (k) => endCost[k] === 0,
-    );
+    (['input', 'output', 'cacheRead', 'cacheWrite', 'total'] as const).every((k) => endCost[k] === 0);
   push(
     '6. Usage on final message (input=7 output=5 totalTokens=12, cost zeros) crashes nothing',
     usageFieldsOk && costFieldsOk && text.exitCode === 0,
@@ -588,9 +579,7 @@ function judge(results: Record<Scenario, ChildResult>): Verdict[] {
   );
 
   // 7. Malformed tool call -> error tool result fed back
-  const errorResultLine = malformed.stderr
-    .split('\n')
-    .find((l) => l.startsWith('SPIKE_TOOLRESULT_JSON='));
+  const errorResultLine = malformed.stderr.split('\n').find((l) => l.startsWith('SPIKE_TOOLRESULT_JSON='));
   let errorResultIsError = false;
   if (errorResultLine) {
     try {
