@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionStartEvent,
   ToolCallEvent,
   ToolCallEventResult,
 } from '@earendil-works/pi-coding-agent';
@@ -17,11 +18,13 @@ type ToolCallHandler = (
   ctx: ExtensionContext,
 ) => Promise<ToolCallEventResult | undefined | void> | ToolCallEventResult | undefined | void;
 
+type SessionStartHandler = (event: SessionStartEvent, ctx: ExtensionContext) => Promise<void> | void;
+
 /**
- * Run the real factory against a hand-rolled fake ExtensionAPI and capture
- * the registered `tool_call` handler.
+ * Run the real factory against a hand-rolled fake ExtensionAPI and return
+ * every registered handler by event name.
  */
-function loadGateHandler(): ToolCallHandler {
+function buildGateHandlers(): Map<string, unknown> {
   const handlers = new Map<string, unknown>();
   const fakePi = {
     on(event: string, handler: unknown): void {
@@ -36,10 +39,29 @@ function loadGateHandler(): ToolCallHandler {
   }
   expect(extension.name).toBe('mlx-permission-gate');
   void extension.factory(fakePi);
+  return handlers;
+}
 
-  const handler = handlers.get('tool_call');
+/** Capture just the `tool_call` handler (the bash prefix falls back to on-demand). */
+function loadGateHandler(): ToolCallHandler {
+  const handler = buildGateHandlers().get('tool_call');
   expect(handler, 'factory must register a tool_call handler').toBeTypeOf('function');
   return handler as ToolCallHandler;
+}
+
+/** Capture both the `tool_call` and `session_start` handlers (snapshot path). */
+function loadGate(): { toolCall: ToolCallHandler; sessionStart: SessionStartHandler } {
+  const handlers = buildGateHandlers();
+  const toolCall = handlers.get('tool_call');
+  const sessionStart = handlers.get('session_start');
+  expect(toolCall, 'factory must register a tool_call handler').toBeTypeOf('function');
+  expect(sessionStart, 'factory must register a session_start handler').toBeTypeOf('function');
+  return { toolCall: toolCall as ToolCallHandler, sessionStart: sessionStart as SessionStartHandler };
+}
+
+/** A minimal pi `session_start` event (boot). */
+function sessionStartEvent(): SessionStartEvent {
+  return { type: 'session_start', reason: 'startup' };
 }
 
 interface SelectCall {
@@ -418,9 +440,11 @@ describe('createPermissionGateExtension', () => {
 
   describe('pi shellCommandPrefix is surfaced in the bash prompt', () => {
     // pi's BashTool runs `${shellCommandPrefix}\n${command}`, so a non-empty
-    // prefix executes shell bytes the model never named. The gate must show
-    // the effective prefix (displayed == executed). Resolution is fail-safe:
-    // any failure falls back to the bare command and never throws.
+    // prefix executes shell bytes the model never named. The gate snapshots the
+    // effective prefix at `session_start` (the same instant pi bakes it into
+    // BashTool) via a DIRECT, lock-free read, then shows it (displayed ==
+    // executed). Resolution is fail-safe: any failure resolves to the bare
+    // command and never throws.
     async function withGlobalAgentSettings(
       settings: string | undefined,
       fn: (agentDir: string) => Promise<void>,
@@ -442,17 +466,55 @@ describe('createPermissionGateExtension', () => {
       return mkdtemp(join(tmpdir(), 'mlx-gate-project-'));
     }
 
-    it('prepends a GLOBAL settings.json shellCommandPrefix to the bash approval title', async () => {
+    it('snapshots a GLOBAL settings.json shellCommandPrefix at session_start and shows it', async () => {
       await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'sudo -k --' }), async () => {
         const cwd = await freshProject();
         try {
-          const handler = loadGateHandler();
+          const { toolCall, sessionStart } = loadGate();
           const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
-          await handler(toolCallEvent('bash', { command: 'rm -rf /tmp/scratch' }), ctx);
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('bash', { command: 'rm -rf /tmp/scratch' }), ctx);
           expect(selectCalls).toHaveLength(1);
           // Displayed == executed: the hidden prefix and the command both show.
           expect(selectCalls[0]!.title).toContain('sudo -k --');
           expect(selectCalls[0]!.title).toContain('rm -rf /tmp/scratch');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('FAITHFULNESS: keeps the session_start snapshot even after settings.json changes without a reload', async () => {
+      // pi bakes the prefix into BashTool at session_start; if the file is then
+      // edited WITHOUT a /reload, BashTool still runs the BAKED (snapshotted)
+      // value. The gate must show that same baked value — an on-demand re-read
+      // would drift to the new file contents and misrepresent what executes.
+      // This is the mutation guard: reverting to a per-call / on-demand-primary
+      // read makes the second assertion show PFX_B and this test fail.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+          const a = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), a.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+          expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+          // Edit the file with NO further session_start.
+          await writeFile(join(agentDir, 'settings.json'), JSON.stringify({ shellCommandPrefix: 'PFX_B' }));
+          const b = makeCtx(true, 'Yes', ctxTrusted);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+          expect(b.selectCalls[0]!.title).toContain('PFX_A');
+          expect(b.selectCalls[0]!.title).not.toContain('PFX_B');
+
+          // A fresh session_start (simulated /reload) re-snapshots → now PFX_B.
+          const c = makeCtx(true, 'Yes', ctxTrusted);
+          await sessionStart(sessionStartEvent(), c.ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), c.ctx);
+          expect(c.selectCalls[0]!.title).toContain('PFX_B');
+          expect(c.selectCalls[0]!.title).not.toContain('PFX_A');
         } finally {
           await rm(cwd, { recursive: true, force: true });
         }
@@ -469,9 +531,10 @@ describe('createPermissionGateExtension', () => {
             join(trustedCwd, '.pi', 'settings.json'),
             JSON.stringify({ shellCommandPrefix: 'PROJECT_PREFIX' }),
           );
-          const handler = loadGateHandler();
+          const { toolCall, sessionStart } = loadGate();
           const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: trustedCwd, isProjectTrusted: () => true });
-          await handler(toolCallEvent('bash', { command: 'make build' }), ctx);
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('bash', { command: 'make build' }), ctx);
           expect(selectCalls[0]!.title).toContain('PROJECT_PREFIX');
         } finally {
           await rm(trustedCwd, { recursive: true, force: true });
@@ -485,9 +548,10 @@ describe('createPermissionGateExtension', () => {
             join(untrustedCwd, '.pi', 'settings.json'),
             JSON.stringify({ shellCommandPrefix: 'PROJECT_PREFIX' }),
           );
-          const handler = loadGateHandler();
+          const { toolCall, sessionStart } = loadGate();
           const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd: untrustedCwd, isProjectTrusted: () => false });
-          await handler(toolCallEvent('bash', { command: 'make build' }), ctx);
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('bash', { command: 'make build' }), ctx);
           expect(selectCalls[0]!.title).not.toContain('PROJECT_PREFIX');
           expect(selectCalls[0]!.title).toContain('make build');
         } finally {
@@ -496,13 +560,14 @@ describe('createPermissionGateExtension', () => {
       });
     });
 
-    it('leaves the title as the bare command when no prefix is configured', async () => {
+    it('snapshots the bare command when no prefix is configured', async () => {
       await withGlobalAgentSettings(JSON.stringify({ theme: 'dark' }), async () => {
         const cwd = await freshProject();
         try {
-          const handler = loadGateHandler();
+          const { toolCall, sessionStart } = loadGate();
           const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
-          await handler(toolCallEvent('bash', { command: 'yarn build' }), ctx);
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('bash', { command: 'yarn build' }), ctx);
           expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  yarn build');
         } finally {
           await rm(cwd, { recursive: true, force: true });
@@ -510,7 +575,29 @@ describe('createPermissionGateExtension', () => {
       });
     });
 
-    it('never crashes and shows the bare command when prefix resolution throws', async () => {
+    it('a malformed/absent settings.json at session_start snapshots the bare command and does not crash', async () => {
+      // pi's own load treats a malformed/absent settings file as `{}` and bakes
+      // an empty prefix; the direct reader mirrors that, so the snapshot is `''`
+      // and the prompt shows the bare command. The empty snapshot is authoritative
+      // — it must NOT trigger an on-demand re-read.
+      await withGlobalAgentSettings('{ this is not valid json', async () => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), ctx);
+          expect(selectCalls).toHaveLength(1);
+          expect(selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      });
+    });
+
+    it('never crashes and shows the bare command when the ctx trust getter throws', async () => {
+      // No session_start fired → the bash branch falls back to a one-shot
+      // on-demand read, which must swallow a hostile `ctx.isProjectTrusted`.
       const cwd = await freshProject();
       try {
         const handler = loadGateHandler();
@@ -530,57 +617,37 @@ describe('createPermissionGateExtension', () => {
       }
     });
 
-    it('does not consult a shell prefix for non-bash tools', async () => {
-      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'SHOULD_NOT_APPEAR' }), async () => {
+    it('falls back to an on-demand read when a bash approval precedes session_start', async () => {
+      // Structurally rare, but the snapshot may not exist yet. The bash branch
+      // then reads on demand (lock-free, never throws) rather than showing empty.
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'FALLBACK_PFX' }), async () => {
         const cwd = await freshProject();
         try {
-          const handler = loadGateHandler();
+          const { toolCall } = loadGate();
           const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
-          await handler(toolCallEvent('write', { path: '/tmp/out.txt', content: 'x' }), ctx);
-          expect(selectCalls[0]!.title).not.toContain('SHOULD_NOT_APPEAR');
-          expect(selectCalls[0]!.title).toContain('/tmp/out.txt');
+          // Note: no sessionStart() call here.
+          await toolCall(toolCallEvent('bash', { command: 'echo hi' }), ctx);
+          expect(selectCalls[0]!.title).toContain('FALLBACK_PFX');
         } finally {
           await rm(cwd, { recursive: true, force: true });
         }
       });
     });
 
-    it('re-reads shellCommandPrefix per call so a settings change is reflected (no stale memo)', async () => {
-      // pi's /reload rebuilds BashTool with the new shellCommandPrefix while
-      // cwd + trust are unchanged. A module-global (cwd, trusted) memo would
-      // return the STALE prefix on the second call — the prompt would show the
-      // old program while BashTool executes the new one, reopening the gap.
-      // Per-call resolution reflects the rewritten settings.json exactly.
-      const agentDir = await mkdtemp(join(tmpdir(), 'mlx-gate-reload-'));
-      const cwd = await freshProject();
-      const settingsPath = join(agentDir, 'settings.json');
-      const prev = process.env['PI_CODING_AGENT_DIR'];
-      try {
-        process.env['PI_CODING_AGENT_DIR'] = agentDir;
-
-        await writeFile(settingsPath, JSON.stringify({ shellCommandPrefix: 'PREFIX_A' }));
-        const first = loadGateHandler();
-        const a = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
-        await first(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
-        expect(a.selectCalls[0]!.title).toContain('PREFIX_A');
-
-        // Settings change + /reload: same cwd + trust, new prefix. The gate must
-        // now surface PREFIX_B, never the memoized PREFIX_A.
-        await writeFile(settingsPath, JSON.stringify({ shellCommandPrefix: 'PREFIX_B' }));
-        const second = loadGateHandler();
-        const b = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
-        await second(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
-        expect(b.selectCalls[0]!.title).toContain('PREFIX_B');
-        expect(b.selectCalls[0]!.title).not.toContain('PREFIX_A');
-      } finally {
-        if (prev === undefined) {
-          delete process.env['PI_CODING_AGENT_DIR'];
-        } else {
-          process.env['PI_CODING_AGENT_DIR'] = prev;
+    it('does not consult a shell prefix for non-bash tools', async () => {
+      await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'SHOULD_NOT_APPEAR' }), async () => {
+        const cwd = await freshProject();
+        try {
+          const { toolCall, sessionStart } = loadGate();
+          const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+          await sessionStart(sessionStartEvent(), ctx);
+          await toolCall(toolCallEvent('write', { path: '/tmp/out.txt', content: 'x' }), ctx);
+          expect(selectCalls[0]!.title).not.toContain('SHOULD_NOT_APPEAR');
+          expect(selectCalls[0]!.title).toContain('/tmp/out.txt');
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
         }
-        await rm(agentDir, { recursive: true, force: true });
-        await rm(cwd, { recursive: true, force: true });
-      }
+      });
     });
   });
 
