@@ -145,6 +145,38 @@ describe('scanAgentArgs', () => {
       expect(scan.update).toBe(false);
     });
   });
+
+  describe('value-aware walk shares VALUE_CONSUMING_ARGS (WB-5, sibling of R3-2)', () => {
+    // The scan must NOT hijack a token that sits in a pi value-consumer's value
+    // slot. Mutation guard: reverting scanAgentArgs to the raw exact-token scan
+    // strips the systemPrompt value + interprets a value `--help`, failing these.
+    it('does not strip a --models-dir that is the VALUE of --system-prompt', () => {
+      const scan = scanAgentArgs(['--system-prompt', '--models-dir', 'x']);
+      expect(scan.modelsDir).toBeUndefined();
+      expect(scan.modelsDirMissingValue).toBe(false);
+      expect(scan.passthrough).toEqual(['--system-prompt', '--models-dir', 'x']);
+    });
+
+    it('does not route to help for a --help that is the VALUE of --system-prompt', () => {
+      const scan = scanAgentArgs(['--system-prompt', '--help', '-p', 'hi']);
+      expect(scan.help).toBe(false);
+      expect(scan.passthrough).toEqual(['--system-prompt', '--help', '-p', 'hi']);
+    });
+
+    it('does not treat update as the blocked positional when it is a consumed VALUE', () => {
+      const scan = scanAgentArgs(['--system-prompt', 'update']);
+      expect(scan.update).toBe(false);
+      expect(scan.passthrough).toEqual(['--system-prompt', 'update']);
+    });
+
+    it('still recognizes a REAL --models-dir / --help / leading update in option-name position', () => {
+      const withDir = scanAgentArgs(['--models-dir', 'x']);
+      expect(withDir.modelsDir).toBe('x');
+      expect(withDir.passthrough).toEqual([]);
+      expect(scanAgentArgs(['--help']).help).toBe(true);
+      expect(scanAgentArgs(['update']).update).toBe(true);
+    });
+  });
 });
 
 describe('withDefaultModel', () => {
@@ -663,6 +695,67 @@ describe('run() argv routing', () => {
       const overridden = chooseDefaultModel(models, { provider: 'groq', modelId: 'llama' });
       expect(overridden.modelId).toBe('model-a');
       expect(overridden.notice).toContain('groq/llama');
+    });
+  });
+});
+
+/**
+ * WB-3: the write-once seed must never clobber a present-but-recoverable
+ * settings.json. It writes ONLY when the file is genuinely absent (ENOENT) or
+ * already a valid settings object; a malformed / unreadable / non-object file is
+ * left byte-for-byte untouched (pi treats those as load errors, not "start
+ * empty"). readPersistedDefaultModel returns undefined for a malformed file, so
+ * run() auto-seeds — which is exactly why the writer itself must refuse.
+ */
+describe('writePersistedDefaultModel (WB-3: never clobber a recoverable settings.json)', () => {
+  async function withDir(fn: (dir: string) => Promise<void> | void): Promise<void> {
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-agent-write-'));
+    try {
+      await fn(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('SKIPS a present-but-malformed settings.json, leaving its bytes untouched', async () => {
+    await withDir(async (dir) => {
+      const path = join(dir, 'settings.json');
+      await writeFile(path, '{ oops');
+      // Mutation guard: reverting WB-3 rewrites this to {defaultProvider,defaultModel}.
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        writePersistedDefaultModel('mlx', 'model-x', dir);
+      } finally {
+        errorSpy.mockRestore();
+      }
+      expect(readFileSync(path, 'utf8')).toBe('{ oops');
+    });
+  });
+
+  it('SKIPS a valid-JSON non-object (array) settings.json, leaving it untouched', async () => {
+    await withDir(async (dir) => {
+      const path = join(dir, 'settings.json');
+      await writeFile(path, '[]');
+      writePersistedDefaultModel('mlx', 'model-x', dir);
+      expect(readFileSync(path, 'utf8')).toBe('[]');
+    });
+  });
+
+  it('creates a fresh file with exactly the two fields when settings.json is absent', async () => {
+    await withDir((dir) => {
+      writePersistedDefaultModel('mlx', 'model-x', dir);
+      const raw: unknown = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'));
+      expect(raw).toEqual({ defaultProvider: 'mlx', defaultModel: 'model-x' });
+    });
+  });
+
+  it('merges the two fields into a valid settings object, preserving existing keys', async () => {
+    await withDir(async (dir) => {
+      const path = join(dir, 'settings.json');
+      await writeFile(path, JSON.stringify({ theme: 'dark' }));
+      writePersistedDefaultModel('mlx', 'model-x', dir);
+      const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      expect(raw).toEqual({ theme: 'dark', defaultProvider: 'mlx', defaultModel: 'model-x' });
     });
   });
 });

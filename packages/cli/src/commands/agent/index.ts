@@ -45,7 +45,62 @@ export interface AgentArgScan {
  */
 const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove', 'uninstall', 'list', 'config']);
 
-/** Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}. */
+/**
+ * Options that UNCONDITIONALLY consume the FOLLOWING token as their value —
+ * mirrors pi 0.80.6 `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
+ * re-verify on a pi bump (same bounded coupling as the {@link expandPiAgentDir}
+ * / {@link readPersistedDefaultModel} shims). Shared by BOTH argv walks — the
+ * {@link scanAgentArgs} option-name lift and the {@link withDefaultModel} model
+ * scan — so they classify identically and a value token after a pi
+ * value-consumer is never re-interpreted: `--system-prompt --models-dir` sets
+ * systemPrompt="--models-dir" in pi, so mlx must forward that value verbatim,
+ * not strip it as its own flag (the R3-2 / WB-5 sibling leaks). Both walks skip
+ * the token after any of these. Deliberately EXCLUDES the conditional consumers
+ * `-p`/`--print` and `--list-models` (pi only consumes a NON-dash next token for
+ * those, so a `--`-leading sentinel is never swallowed) and the flag-only
+ * carriers `-c`/`--continue`/`-r`/`--resume` (no value). The inline
+ * `--opt=value` form is not modeled either — pi's exact-match parser does not
+ * accept it.
+ */
+const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
+  '--mode',
+  '--provider',
+  '--model',
+  '--api-key',
+  '--system-prompt',
+  '--append-system-prompt',
+  '--name',
+  '-n',
+  '--session',
+  '--session-id',
+  '--fork',
+  '--session-dir',
+  '--models',
+  '--tools',
+  '-t',
+  '--exclude-tools',
+  '-xt',
+  '--thinking',
+  '--export',
+  '--extension',
+  '-e',
+  '--skill',
+  '--prompt-template',
+  '--theme',
+]);
+
+/**
+ * Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}.
+ *
+ * ONE pi-parity, value-aware walk (sibling of {@link withDefaultModel}'s model
+ * scan, sharing {@link VALUE_CONSUMING_ARGS}): mlx's own options
+ * (`--models-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
+ * position. A token sitting in a pi value-consumer's value slot
+ * (`--system-prompt --models-dir` → "--models-dir" is systemPrompt's value) is
+ * forwarded verbatim, never hijacked as mlx's flag. Routing (`help`/`update`)
+ * reads the value-aware passthrough head, so a stripped `--models-dir` pair
+ * cannot mask what pi will see at args[0].
+ */
 export function scanAgentArgs(argv: string[]): AgentArgScan {
   const passthrough: string[] = [];
   let modelsDir: string | undefined;
@@ -54,6 +109,19 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
+
+    // pi value-consumer in an option-NAME position: the following token is its
+    // VALUE (pi does `args[++i]`), never an option name. Forward BOTH verbatim
+    // and skip the value so it is never interpreted as mlx's --models-dir/help.
+    // This is checked FIRST, so a `--models-dir` (or `--help`) sitting in a
+    // pi-consumer's value slot passes through untouched.
+    if (VALUE_CONSUMING_ARGS.has(arg) && i + 1 < argv.length) {
+      passthrough.push(arg, argv[i + 1]!);
+      i++;
+      continue;
+    }
+
+    // mlx-only options, recognized ONLY here (an option-NAME position).
     if (arg === '--models-dir') {
       const next = argv[i + 1];
       // The SPACE-form value must be a real path token: absent, empty,
@@ -87,9 +155,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     passthrough.push(arg);
   }
 
-  // Route on what pi will actually see at args[0] — the passthrough head —
-  // so a preceding (stripped) `--models-dir` pair cannot mask a pass-through
-  // command or the blocked `update`.
+  // Route on what pi will actually see at args[0] — the value-aware passthrough
+  // head — so a preceding (stripped) `--models-dir` pair or a consumed value
+  // cannot mask a pass-through command or the blocked `update`.
   return {
     modelsDir,
     modelsDirMissingValue,
@@ -138,48 +206,6 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--resume',
   '--session',
   '--session-id',
-]);
-
-/**
- * Options that UNCONDITIONALLY consume the FOLLOWING token as their value —
- * mirrors pi 0.80.6 `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
- * re-verify on a pi bump (same bounded coupling as the {@link expandPiAgentDir}
- * / {@link readPersistedDefaultModel} shims). {@link withDefaultModel} skips the
- * token after any of these so its VALUE is never mistaken for an option name:
- * `--system-prompt --model` sets systemPrompt="--model" in pi and leaves
- * `parsed.model` UNSET, so a naive membership scan that saw `--model` would
- * wrongly suppress injection → pi resolves a cloud default (the leak this fix
- * closes). Deliberately EXCLUDES the conditional consumers `-p`/`--print` and
- * `--list-models` (pi only consumes a NON-dash next token for those, so a
- * `--`-leading sentinel is never swallowed) and the flag-only carriers
- * `-c`/`--continue`/`-r`/`--resume` (no value). The inline `--opt=value` form is
- * not modeled either — pi's exact-match parser does not accept it.
- */
-const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
-  '--mode',
-  '--provider',
-  '--model',
-  '--api-key',
-  '--system-prompt',
-  '--append-system-prompt',
-  '--name',
-  '-n',
-  '--session',
-  '--session-id',
-  '--fork',
-  '--session-dir',
-  '--models',
-  '--tools',
-  '-t',
-  '--exclude-tools',
-  '-xt',
-  '--thinking',
-  '--export',
-  '--extension',
-  '-e',
-  '--skill',
-  '--prompt-template',
-  '--theme',
 ]);
 
 /**
@@ -318,16 +344,41 @@ export function writePersistedDefaultModel(provider: string, modelId: string, ag
   try {
     const dir = resolvePiAgentDir(agentDir);
     const path = join(dir, 'settings.json');
-    let settings: Record<string, unknown> = {};
+
+    // Never CLOBBER a present-but-recoverable settings.json: pi treats a
+    // malformed/unreadable file as a LOAD ERROR and refuses to overwrite it, so
+    // the seed only fires on a genuinely-absent file or a valid settings object.
+    // Split the read by failure reason:
+    let existing: string;
     try {
-      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
-      if (typeof parsed === 'object' && parsed !== null) {
-        settings = parsed as Record<string, unknown>;
+      existing = readFileSync(path, 'utf8');
+    } catch (readError) {
+      // ENOENT = the file genuinely does not exist → seed a fresh, minimal file.
+      // Any OTHER read error (EACCES/EISDIR/ENOTDIR/…) → a present file we cannot
+      // read: leave it untouched rather than risk clobbering recoverable settings.
+      if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
+        mkdirSync(dir, { recursive: true });
+        const fresh = { defaultProvider: provider, defaultModel: modelId };
+        writeFileSync(path, `${JSON.stringify(fresh, null, 2)}\n`, 'utf8');
       }
-    } catch {
-      // No existing settings.json (or unreadable/malformed) — start empty and
-      // write a fresh, valid file with just the two default fields.
+      return;
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(existing);
+    } catch {
+      // Present but not valid JSON → recoverable by the user; do NOT overwrite.
+      console.error(`mlx agent: ${path} is not valid JSON; leaving it untouched (no default seeded)`);
+      return;
+    }
+    // Valid JSON but not a plain settings object (array / string / number /
+    // null) → treat as malformed and SKIP; only a real object is safe to merge.
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return;
+    }
+
+    const settings = parsed as Record<string, unknown>;
     settings['defaultProvider'] = provider;
     settings['defaultModel'] = modelId;
     mkdirSync(dir, { recursive: true });
