@@ -293,14 +293,21 @@ export function ArgmaxGridCanvas({
   // lands on the same cell — the plain lastHoverKey short-circuit would strand
   // the tooltip on null (or a stale cell). Tracked separately from lastHoverKey.
   const wasScrubbing = React.useRef(false);
-  // A keyboard/programmatic selection to a DIFFERENT cell than the one under the
-  // pointer moves the parent's activeCellRef to the selected cell while the
-  // cursor is still over the previously hovered cell. Invalidate the same-cell
-  // hover cache on any `selected` change (mirroring the wasScrubbing guard) so the
+  // Invalidate the same-cell hover cache (mirroring the wasScrubbing guard) so the
   // next intra-cell pointer move re-emits onHover and re-syncs the tooltip/charts.
+  // Two triggers, both of which leave the cursor parked on a cell whose key still
+  // matches lastHoverKey while the underlying state moved out from under it:
+  //   (a) a keyboard/programmatic selection to a DIFFERENT cell than the one under
+  //       the pointer — the parent's activeCellRef jumps to the selected cell while
+  //       the cursor is still over the previously hovered cell; and
+  //   (b) a `slice` identity change with the selection unchanged — a Logit/Jacobian
+  //       mode toggle or a new run swaps the slice without remounting the canvas, so
+  //       the stale same-cell cache must be dropped or the next intra-cell move is
+  //       stranded (`slice` is a stable useMemo ref, so this fires only on real data
+  //       swaps, never on ordinary re-renders).
   React.useEffect(() => {
     lastHoverKey.current = null;
-  }, [selected]);
+  }, [selected, slice]);
 
   function onMouseMove(e: React.MouseEvent<HTMLCanvasElement>) {
     const ref = locate(e);

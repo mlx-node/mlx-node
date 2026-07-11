@@ -250,4 +250,55 @@ describe('ArgmaxGridCanvas hover cache invalidation on selection (F2)', () => {
     moveOverA();
     expect(onHover).toHaveBeenCalledWith({ layerIdx: 1, pos: 0 });
   });
+
+  it('re-emits onHover after a slice change even when selection is unchanged (mode toggle)', async () => {
+    const onHover = vi.fn();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+    root = createRoot(container);
+    const el = (sliceArg: typeof slice, selected: CellRef | null) =>
+      React.createElement(ArgmaxGridCanvas, {
+        slice: sliceArg,
+        colorByPinnedId: new Map<number, string>(),
+        selected,
+        onHover,
+        onSelect: () => {},
+        showWhitespace: false,
+        ariaLabel: 'test grid',
+      });
+
+    // Two DISTINCT slice references, both with a cell at A (layerIdx 1, pos 0) so
+    // `locate` returns the same key across the swap. S2 mirrors a Logit/Jacobian
+    // mode toggle: `view.slice` swaps identity while `selected` stays null.
+    const s1 = slice;
+    const s2 = buildLensSlice(makeRun());
+    expect(s2).not.toBe(s1); // distinct reference — the trigger under test
+
+    flushSync(() => root!.render(el(s1, null)));
+    await new Promise((r) => setTimeout(r, 0)); // let measure/draw effects settle
+    const canvas = container.querySelector('canvas')!;
+    // Cell A = deepest display row (layerIdx 1 for layers [2,4]), position 0.
+    const rect = canvas.getBoundingClientRect();
+    const ax = rect.left + GUTTER_W + CELL_W / 2;
+    const ay = rect.top + CELL_H / 2;
+    const moveOverA = () =>
+      canvas.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: ax, clientY: ay }));
+
+    // (1) first move over A emits onHover(A).
+    moveOverA();
+    expect(onHover).toHaveBeenCalledWith({ layerIdx: 1, pos: 0 });
+
+    // (2) the slice swaps to S2 (mode toggle) on the SAME root; `selected` stays
+    // null, so the [selected]-only effect would NOT reset the cache. The canvas
+    // has no `key`, so it does not remount and lastHoverKey persists on A's key.
+    onHover.mockClear();
+    flushSync(() => root!.render(el(s2, null)));
+    await new Promise((r) => setTimeout(r, 0)); // let the [selected, slice] effect reset lastHoverKey
+
+    // (3) a second intra-A move must RE-EMIT onHover(A) — pre-fix (deps [selected])
+    // the stale same-cell cache strands it; post-fix (deps [selected, slice]) the
+    // slice change cleared the cache so hover re-fires.
+    moveOverA();
+    expect(onHover).toHaveBeenCalledWith({ layerIdx: 1, pos: 0 });
+  });
 });
