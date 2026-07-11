@@ -903,6 +903,70 @@ describe('createPermissionGateExtension', () => {
         }
       });
     });
+
+    describe('non-string / falsy / mis-merged prefixes (pi does NO type validation)', () => {
+      // pi's getShellCommandPrefix returns the RAW merged value and bash.js:213
+      // bakes `commandPrefix ? `${commandPrefix}\n${command}` : command`, so ANY
+      // truthy value executes as `String(value)\n<cmd>` and any falsy value runs
+      // the bare command. The gate must disclose exactly that. Mutation guard:
+      // reverting resolveLayerPrefix to the string-only filter
+      // (`typeof value === 'string' ? value : undefined`) shows the bare command
+      // for every non-string case, and reverting the merge to `??` lets a present
+      // falsy/null project layer fall through to the global — both fail here.
+
+      /** Fire a fresh session_start over the given global (+ optional trusted project) settings and return the bash prompt title. */
+      async function bashDetail(globalSettings: string, projectSettings?: string): Promise<string> {
+        let title = '';
+        await withGlobalAgentSettings(globalSettings, async () => {
+          const cwd = await freshProject();
+          try {
+            if (projectSettings !== undefined) {
+              await mkdir(join(cwd, '.pi'), { recursive: true });
+              await writeFile(join(cwd, '.pi', 'settings.json'), projectSettings);
+            }
+            const { toolCall, sessionStart } = loadGate();
+            const { ctx, selectCalls } = makeCtx(true, 'Yes', { cwd, isProjectTrusted: () => true });
+            await sessionStart(sessionStartEvent(), ctx);
+            await toolCall(toolCallEvent('bash', { command: 'echo hi' }), ctx);
+            title = selectCalls[0]!.title;
+          } finally {
+            await rm(cwd, { recursive: true, force: true });
+          }
+        });
+        return title;
+      }
+
+      it('coerces a truthy non-string GLOBAL prefix exactly like pi (String(value))', async () => {
+        expect(await bashDetail('{"shellCommandPrefix":123}')).toContain('123\necho hi');
+        expect(await bashDetail('{"shellCommandPrefix":true}')).toContain('true\necho hi');
+        expect(await bashDetail('{"shellCommandPrefix":{"x":1}}')).toContain('[object Object]\necho hi');
+        expect(await bashDetail('{"shellCommandPrefix":["a","b"]}')).toContain('a,b\necho hi');
+      });
+
+      it('runs the bare command for a falsy single-layer prefix (0/false/""/null)', async () => {
+        for (const value of ['0', 'false', '""', 'null']) {
+          expect(await bashDetail(`{"shellCommandPrefix":${value}}`), value).toBe('Allow bash?\n\n  echo hi');
+        }
+      });
+
+      it('a present falsy/null PROJECT prefix overrides a truthy global (key-presence merge, not ??)', async () => {
+        for (const value of ['""', '0', 'false', 'null']) {
+          const title = await bashDetail('{"shellCommandPrefix":"evil"}', `{"shellCommandPrefix":${value}}`);
+          expect(title, value).toBe('Allow bash?\n\n  echo hi');
+          expect(title, value).not.toContain('evil');
+        }
+      });
+
+      it('a present truthy non-string PROJECT prefix overrides the global string', async () => {
+        expect(await bashDetail('{"shellCommandPrefix":"a"}', '{"shellCommandPrefix":123}')).toContain('123\necho hi');
+      });
+
+      it('regression: a numeric global prefix with no project layer still shows String(value)', async () => {
+        const title = await bashDetail('{"shellCommandPrefix":123}');
+        expect(title).toContain('123\necho hi');
+        expect(title).not.toBe('Allow bash?\n\n  echo hi');
+      });
+    });
   });
 
   it('malformed event input still yields a decision without throwing', async () => {

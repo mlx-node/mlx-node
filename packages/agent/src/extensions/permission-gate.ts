@@ -110,15 +110,22 @@ function sanitizeDetail(text: string): string {
 }
 
 /**
- * Per-layer snapshot of pi's `shellCommandPrefix`: the value contributed by the
- * global (`<agentDir>/settings.json`) and project (`<cwd>/.pi/settings.json`)
- * settings layers, each a `string` or `undefined` (that layer sets no prefix).
- * Kept per-layer — not pre-merged — so a `/reload` can update each layer with
- * pi's exact per-layer RETENTION semantics before re-merging.
+ * Per-layer snapshot of pi's `shellCommandPrefix`: the RAW value contributed by
+ * the global (`<agentDir>/settings.json`) and project (`<cwd>/.pi/settings.json`)
+ * settings layers. pi does NO type validation — `getShellCommandPrefix()` just
+ * returns the merged `settings.shellCommandPrefix` verbatim and `bash.js:213`
+ * bakes `commandPrefix ? \`${commandPrefix}\n${command}\` : command` — so the
+ * value can be ANY JSON type (`123`, `true`, `{…}`, `["a","b"]`, `""`, `null`).
+ * Each field is the layer's raw value, or `undefined` when that layer sets no
+ * prefix (absent key / cleared / dropped). `undefined` can only mean "layer
+ * absent" — a JSON value is never `undefined` — which is exactly what the
+ * presence-based merge below keys on. Kept per-layer (not pre-merged) so a
+ * `/reload` can update each layer with pi's exact per-layer RETENTION semantics
+ * before re-merging.
  */
 interface ShellPrefixLayers {
-  global: string | undefined;
-  project: string | undefined;
+  global: unknown;
+  project: unknown;
 }
 
 /**
@@ -129,8 +136,10 @@ interface ShellPrefixLayers {
  *   `{}` for an untrusted project, no error → the layer is CLEARED).
  * - file ABSENT → `undefined` (`withLock` yields `current=undefined` → `{}`, no
  *   error → CLEARED).
- * - file present + parseable object → its `shellCommandPrefix` if a string, else
- *   `undefined` (REPLACE with the new value).
+ * - file present + parseable object → its RAW `shellCommandPrefix` value if the
+ *   key is present (ANY JSON type — pi does no validation), else `undefined`
+ *   (REPLACE with the new value). Presence, not string-ness, decides: pi's
+ *   merge keys on key-presence, and pi bakes any truthy value's `String(...)`.
  * - file present but malformed / unreadable / a non-object (pi's
  *   `migrateSettings` does `"key" in settings`, which throws for a non-object) →
  *   `tryLoadFromStorage` returns an error → reload RETAINS the prior value.
@@ -143,7 +152,7 @@ interface ShellPrefixLayers {
  * retain) is decided by the CALLER (the `session_start` handler, on `reason`);
  * this per-layer rule is identical either way.
  */
-function resolveLayerPrefix(prior: string | undefined, path: string, active: boolean): string | undefined {
+function resolveLayerPrefix(prior: unknown, path: string, active: boolean): unknown {
   if (!active) {
     return undefined; // untrusted project layer → dropped
   }
@@ -165,8 +174,11 @@ function resolveLayerPrefix(prior: string | undefined, path: string, active: boo
       // pi's migrateSettings throws on a non-object → reload retains the prior.
       return prior;
     }
-    const value = (parsed as Record<string, unknown>)['shellCommandPrefix'];
-    return typeof value === 'string' ? value : undefined;
+    // Presence, NOT string-ness, decides — pi does no type validation and its
+    // key-presence merge treats a present non-string / falsy value as "set".
+    // Return the RAW value (any JSON type) when the key is present, else
+    // `undefined` so the presence-based merge sees this layer as unset.
+    return 'shellCommandPrefix' in parsed ? (parsed as Record<string, unknown>)['shellCommandPrefix'] : undefined;
   } catch {
     // Malformed JSON / unreadable (EACCES) → pi retains the prior layer value.
     return prior;
@@ -211,11 +223,18 @@ async function resolveShellPrefixLayers(prior: ShellPrefixLayers, ctx: Extension
 
 /**
  * Merge the two layers exactly as pi's `deepMergeSettings(global, project)` +
- * `getShellCommandPrefix()` do: a project string overrides the global one,
- * otherwise the global value is used, else `''`.
+ * `getShellCommandPrefix()` do, returning the RAW merged value (any JSON type or
+ * `undefined`). pi's `deepMergeSettings` overrides on KEY-PRESENCE: it iterates
+ * `Object.keys(project)` and, for any `shellCommandPrefix` whose value is not
+ * `undefined`, the project value wins — so a present project `""` / `0` /
+ * `false` / `null` overrides the global one, and only an ABSENT project key
+ * (our `undefined`) falls through to global. A `??` merge would be WRONG here:
+ * it would let a present project `null` / `""` / `0` / `false` fall through to
+ * global, disagreeing with pi. Coercion to a string (and the `''` empty default)
+ * happens once at the call site, mirroring `bash.js:213`.
  */
-function effectiveShellPrefix(layers: ShellPrefixLayers): string {
-  return layers.project ?? layers.global ?? '';
+function mergedPrefixRaw(layers: ShellPrefixLayers): unknown {
+  return layers.project !== undefined ? layers.project : layers.global;
 }
 
 /**
@@ -327,10 +346,22 @@ export function createPermissionGateExtension(): InlineExtension {
           // clean baseline (lock-free, never throws). A snapshotted empty prefix
           // is authoritative — it is NOT treated as "missing" — so we never
           // re-read over a deliberate empty bake.
-          const prefix = snapshotted
-            ? effectiveShellPrefix(layers)
-            : effectiveShellPrefix(await resolveShellPrefixLayers({ global: undefined, project: undefined }, ctx));
-          detailSource = prefix ? `${prefix}\n${command}` : command;
+          //
+          // Coerce ONCE here, byte-identical to pi's `bash.js:213`
+          // (`commandPrefix ? \`${commandPrefix}\n${command}\` : command`): the
+          // `raw ?` truthiness gate mirrors pi (falsy `0`/`""`/`false`/`null`/
+          // absent → bare command), and `String(raw)` mirrors the template
+          // coercion pi applies to any truthy value (`123`→`123`, `true`→`true`,
+          // `{…}`→`[object Object]`, `["a","b"]`→`a,b`). Using `String(raw)`
+          // rather than a bare `${raw}` keeps this well-typed on `unknown`.
+          const raw = snapshotted
+            ? mergedPrefixRaw(layers)
+            : mergedPrefixRaw(await resolveShellPrefixLayers({ global: undefined, project: undefined }, ctx));
+          // The `[object Object]` / `a,b` default stringification is DELIBERATE
+          // here — it is exactly what pi's `${commandPrefix}` template bakes for a
+          // non-string prefix, and disclosing pi's actual bytes is the whole point.
+          // eslint-disable-next-line @typescript-eslint/no-base-to-string
+          detailSource = raw ? `${String(raw)}\n${command}` : command;
         }
         const detail = sanitizeDetail(detailSource);
         const choice = await ctx.ui.select(`Allow ${toolName}?\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No']);
