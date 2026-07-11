@@ -146,16 +146,69 @@ describe('contextToChatMessages', () => {
     ]);
   });
 
-  it('keeps aborted assistant messages that carry text or toolCalls', () => {
+  it('DROPS error/aborted assistant messages even when they carry partial text (mirrors pi transformMessages)', () => {
+    // The core WB-4 regression: an aborted/errored turn with PARTIAL content is
+    // an incomplete turn pi never replays. Priming it into the reset session
+    // garbles the continuation. Mutation guard: reverting to the empty-husk-only
+    // check keeps these partial turns and this test fails.
     const converted = contextToChatMessages({
       messages: [
+        userMsg('q1'),
         assistantMsg([{ type: 'text', text: 'partial ans' }], 'aborted'),
-        assistantMsg([{ type: 'toolCall', id: 'call_7', name: 'ls', arguments: {} }], 'error'),
+        assistantMsg([{ type: 'text', text: 'half an error' }], 'error'),
+        userMsg('q2'),
       ],
     });
     expect(converted).toEqual([
-      { role: 'assistant', content: 'partial ans' },
-      { role: 'assistant', content: '', toolCalls: [{ id: 'call_7', name: 'ls', arguments: '{}' }] },
+      { role: 'user', content: 'q1' },
+      { role: 'user', content: 'q2' },
+    ]);
+  });
+
+  it('DROPS an error/aborted assistant that carries a tool call, leaving no dangling toolCalls', () => {
+    const converted = contextToChatMessages({
+      messages: [
+        userMsg('q1'),
+        assistantMsg([{ type: 'toolCall', id: 'call_7', name: 'ls', arguments: {} }], 'error'),
+        userMsg('q2'),
+      ],
+    });
+    // The dropped turn's tool call is NOT tracked, so no synthetic tool result
+    // is emitted for it either — it vanishes entirely.
+    expect(converted).toEqual([
+      { role: 'user', content: 'q1' },
+      { role: 'user', content: 'q2' },
+    ]);
+    expect(converted.some((m) => m.role === 'tool')).toBe(false);
+  });
+
+  it('synthesizes a No-result tool message for a RETAINED assistant tool call with no following result', () => {
+    // pi's insertSyntheticToolResults: a completed turn whose tool call is never
+    // answered gets a synthetic error result before the next user/assistant, so
+    // no tool call is left unresolved in the primed history. Mutation guard:
+    // dropping the orphan-repair pass omits the synthetic tool message → fails.
+    const converted = contextToChatMessages({
+      messages: [
+        userMsg('do it'),
+        assistantMsg([{ type: 'toolCall', id: 'call_9', name: 'ls', arguments: {} }], 'toolUse'),
+        userMsg('never mind'),
+      ],
+    });
+    expect(converted).toEqual([
+      { role: 'user', content: 'do it' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call_9', name: 'ls', arguments: '{}' }] },
+      { role: 'tool', content: 'No result provided', toolCallId: 'call_9', isError: true },
+      { role: 'user', content: 'never mind' },
+    ]);
+  });
+
+  it('synthesizes a No-result tool message for a trailing unresolved tool call at end of history', () => {
+    const converted = contextToChatMessages({
+      messages: [assistantMsg([{ type: 'toolCall', id: 'call_end', name: 'ls', arguments: {} }], 'toolUse')],
+    });
+    expect(converted).toEqual([
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call_end', name: 'ls', arguments: '{}' }] },
+      { role: 'tool', content: 'No result provided', toolCallId: 'call_end', isError: true },
     ]);
   });
 

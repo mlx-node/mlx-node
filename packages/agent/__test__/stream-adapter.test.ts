@@ -255,6 +255,57 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.tools).toBeUndefined();
   });
 
+  it('does not prime a prior error/aborted partial assistant turn into the reset session (WB-4)', async () => {
+    // Integration guard for WB-4: pi's history can carry a turn that errored (or
+    // was aborted) mid-decode with PARTIAL content. contextToChatMessages must
+    // drop it, so what reaches primeHistory is the clean history without the
+    // invalid partial turn. Mutation guard: reverting WB-4 (keep partial
+    // error/aborted turns) primes 'half a broken answer' here → this fails.
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield delta('ok');
+        yield finalEvent({ text: 'ok' });
+      },
+    ]);
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session));
+
+    const brokenTurn: AssistantMessage = {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'half a broken answer' }],
+      api: 'mlx',
+      provider: 'mlx',
+      model: 'qwen-small',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'error',
+      timestamp: 2,
+    };
+    const ctxWithBrokenTurn: Context = {
+      systemPrompt: 'Be terse.',
+      messages: [
+        { role: 'user', content: 'Q1', timestamp: 1 },
+        brokenTurn,
+        { role: 'user', content: 'Q2', timestamp: 3 },
+      ],
+    };
+
+    await collect(streamSimple(MODEL, ctxWithBrokenTurn));
+    expect(session.primedWith).toEqual([
+      { role: 'system', content: 'Be terse.' },
+      { role: 'user', content: 'Q1' },
+      { role: 'user', content: 'Q2' },
+    ]);
+    // No trace of the dropped partial turn survives into the primed history.
+    expect(session.primedWith?.some((m) => m.content === 'half a broken answer')).toBe(false);
+  });
+
   it('emits the toolcall trio and finishes with toolUse on a tool-call turn', async () => {
     const session = new FakeChatSession([
       // eslint-disable-next-line @typescript-eslint/require-await
