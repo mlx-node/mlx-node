@@ -88,9 +88,9 @@ function invokeFactory(extension: { factory: (pi: ExtensionAPI) => void | Promis
   return { toolCall: toolCall as ToolCallHandler, sessionStart: sessionStart as SessionStartHandler };
 }
 
-/** A minimal pi `session_start` event (boot). */
-function sessionStartEvent(): SessionStartEvent {
-  return { type: 'session_start', reason: 'startup' };
+/** A minimal pi `session_start` event; defaults to the boot (`startup`) reason. */
+function sessionStartEvent(reason: SessionStartEvent['reason'] = 'startup'): SessionStartEvent {
+  return { type: 'session_start', reason };
 }
 
 interface SelectCall {
@@ -540,7 +540,7 @@ describe('createPermissionGateExtension', () => {
 
           // A fresh session_start (simulated /reload) re-snapshots → now PFX_B.
           const c = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), c.ctx);
+          await sessionStart(sessionStartEvent('reload'), c.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), c.ctx);
           expect(c.selectCalls[0]!.title).toContain('PFX_B');
           expect(c.selectCalls[0]!.title).not.toContain('PFX_A');
@@ -571,7 +571,7 @@ describe('createPermissionGateExtension', () => {
           // Corrupt the file, then /reload: pi retains + bakes PFX_A.
           await writeFile(join(agentDir, 'settings.json'), '{ this is not valid json');
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), b.ctx);
+          await sessionStart(sessionStartEvent('reload'), b.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toContain('PFX_A');
         } finally {
@@ -597,7 +597,7 @@ describe('createPermissionGateExtension', () => {
 
           await rm(join(agentDir, 'settings.json'), { force: true });
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), b.ctx);
+          await sessionStart(sessionStartEvent('reload'), b.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
         } finally {
@@ -630,7 +630,7 @@ describe('createPermissionGateExtension', () => {
           // Corrupt PROJECT, reload → project layer retained (still overrides global).
           await writeFile(projectSettings, '{ broken');
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), b.ctx);
+          await sessionStart(sessionStartEvent('reload'), b.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toContain('PROJECT_PFX');
           expect(b.selectCalls[0]!.title).not.toContain('GLOBAL_PFX');
@@ -638,7 +638,7 @@ describe('createPermissionGateExtension', () => {
           // Delete PROJECT, reload → project cleared, falls through to global.
           await rm(projectSettings, { force: true });
           const c = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), c.ctx);
+          await sessionStart(sessionStartEvent('reload'), c.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), c.ctx);
           expect(c.selectCalls[0]!.title).toContain('GLOBAL_PFX');
           expect(c.selectCalls[0]!.title).not.toContain('PROJECT_PFX');
@@ -650,11 +650,12 @@ describe('createPermissionGateExtension', () => {
 
     it('FACTORY REINVOCATION: the snapshot survives pi re-invoking factory on /reload and retains on a failed reload', async () => {
       // pi re-invokes the inline extension FACTORY on every /reload BEFORE
-      // emitting the reload session_start. If the snapshot lived inside factory
-      // it would reset to undefined on that reinvocation, so a failed reload
-      // (malformed file) would retain against undefined → empty, dropping pi's
-      // still-baked PFX_A. The snapshot lives in the OUTER per-extension closure
-      // and persists. Mutation guard: moving `layers`/`snapshotted` back into
+      // emitting the reload session_start (reason 'reload' — pi's sole
+      // retain-on-error path). If the snapshot lived inside factory it would
+      // reset to undefined on that reinvocation, so a failed reload (malformed
+      // file) would retain against undefined → empty, dropping pi's still-baked
+      // PFX_A. The snapshot lives in the OUTER per-extension closure and
+      // persists. Mutation guard: moving `layers`/`snapshotted` back into
       // factory makes the second factory reset state → this shows empty → fails.
       await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
         const cwd = await freshProject();
@@ -674,13 +675,50 @@ describe('createPermissionGateExtension', () => {
           await writeFile(join(agentDir, 'settings.json'), '{ this is not valid json');
           const reloaded = invokeFactory(extension);
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await reloaded.sessionStart(sessionStartEvent(), b.ctx);
+          await reloaded.sessionStart(sessionStartEvent('reload'), b.ctx);
           await reloaded.toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toContain('PFX_A');
         } finally {
           await rm(cwd, { recursive: true, force: true });
         }
       });
+    });
+
+    it('NEW-SESSION RESET: a fresh lifecycle (new/resume/fork) restarts from a blank baseline, not the prior snapshot', async () => {
+      // pi rebuilds a FRESH SettingsManager for new/resume/fork (boot semantics:
+      // bad file → empty, NO retain), unlike /reload (its sole retain-on-error
+      // path). So after a session snapshotted PFX_A, a fresh lifecycle whose
+      // settings file is now malformed must NOT keep showing PFX_A — pi bakes
+      // empty there, and retaining it would over-disclose a prefix pi won't run.
+      // Mutation guard: dropping the reason gate (retain for every reason) makes
+      // these show PFX_A and fail.
+      for (const reason of ['new', 'resume', 'fork'] as const) {
+        await withGlobalAgentSettings(JSON.stringify({ shellCommandPrefix: 'PFX_A' }), async (agentDir) => {
+          const cwd = await freshProject();
+          try {
+            const extension = loadGateExtension();
+            const ctxTrusted = { cwd, isProjectTrusted: () => true };
+
+            // Prior session: snapshot PFX_A.
+            const first = invokeFactory(extension);
+            const a = makeCtx(true, 'Yes', ctxTrusted);
+            await first.sessionStart(sessionStartEvent('startup'), a.ctx);
+            await first.toolCall(toolCallEvent('bash', { command: 'echo hi' }), a.ctx);
+            expect(a.selectCalls[0]!.title).toContain('PFX_A');
+
+            // Fresh lifecycle with the file now malformed → blank baseline → empty.
+            await writeFile(join(agentDir, 'settings.json'), '{ this is not valid json');
+            const fresh = invokeFactory(extension);
+            const b = makeCtx(true, 'Yes', ctxTrusted);
+            await fresh.sessionStart(sessionStartEvent(reason), b.ctx);
+            await fresh.toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
+            expect(b.selectCalls[0]!.title, `reason=${reason}`).toBe('Allow bash?\n\n  echo hi');
+            expect(b.selectCalls[0]!.title, `reason=${reason}`).not.toContain('PFX_A');
+          } finally {
+            await rm(cwd, { recursive: true, force: true });
+          }
+        });
+      }
     });
 
     it('ZERO-BYTE CLEAR: a truncated (empty) global settings.json on reload clears the prefix (matches pi)', async () => {
@@ -700,7 +738,7 @@ describe('createPermissionGateExtension', () => {
 
           await writeFile(join(agentDir, 'settings.json'), ''); // truncate to zero bytes
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), b.ctx);
+          await sessionStart(sessionStartEvent('reload'), b.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toBe('Allow bash?\n\n  echo hi');
         } finally {
@@ -727,7 +765,7 @@ describe('createPermissionGateExtension', () => {
           // Truncate PROJECT to zero bytes → project layer cleared → falls to global.
           await writeFile(projectSettings, '');
           const b = makeCtx(true, 'Yes', ctxTrusted);
-          await sessionStart(sessionStartEvent(), b.ctx);
+          await sessionStart(sessionStartEvent('reload'), b.ctx);
           await toolCall(toolCallEvent('bash', { command: 'echo hi' }), b.ctx);
           expect(b.selectCalls[0]!.title).toContain('GLOBAL_PFX');
           expect(b.selectCalls[0]!.title).not.toContain('PROJECT_PFX');

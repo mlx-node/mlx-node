@@ -137,10 +137,11 @@ interface ShellPrefixLayers {
  *
  * The retention branch is what closes the reload under-disclosure: on a FAILED
  * reload pi keeps baking the prior prefix into BashTool, so the gate must keep
- * showing it rather than degrade to empty. At the FIRST snapshot (boot) the
- * prior value is `undefined`, so a `retain` there yields empty — which matches
- * pi baking `{}` for a malformed-at-boot file. Same logic is correct at boot
- * and reload, so no boot/reload branching is needed.
+ * showing it rather than degrade to empty. Whether `prior` is a real prior
+ * snapshot (reload) or a blank `undefined` baseline (a fresh lifecycle, which
+ * builds a NEW `SettingsManager` with boot semantics — bad file → empty, no
+ * retain) is decided by the CALLER (the `session_start` handler, on `reason`);
+ * this per-layer rule is identical either way.
  */
 function resolveLayerPrefix(prior: string | undefined, path: string, active: boolean): string | undefined {
   if (!active) {
@@ -185,6 +186,15 @@ function resolveLayerPrefix(prior: string | undefined, path: string, active: boo
  * module keeps its "no pi runtime import before env seeding" discipline; both
  * are pure (env read lazily inside `getAgentDir`). NEVER throws: a hostile
  * `ctx.isProjectTrusted` getter or a failed deferred import retains `prior`.
+ *
+ * ACCEPTED RESIDUAL (do NOT try to fix): pi's LOCKED read also retains on lock
+ * CONTENTION, which this lock-free reader cannot detect. So a `/reload` that
+ * simultaneously (i) contends pi's settings lock and (ii) sees the file
+ * concurrently reduced to empty could make pi retain a non-empty prefix while
+ * this reader observes empty and under-discloses. That needs a concurrent
+ * lock-holder emptying the file at the reload instant — an actor with settings
+ * write access who could instead just inject a (disclosed) prefix directly, so
+ * it grants no escalation. Left as an extreme-adversarial residual.
  */
 async function resolveShellPrefixLayers(prior: ShellPrefixLayers, ctx: ExtensionContext): Promise<ShellPrefixLayers> {
   try {
@@ -207,6 +217,18 @@ async function resolveShellPrefixLayers(prior: ShellPrefixLayers, ctx: Extension
 function effectiveShellPrefix(layers: ShellPrefixLayers): string {
   return layers.project ?? layers.global ?? '';
 }
+
+/**
+ * `session_start` reasons that build a FRESH `SettingsManager` (boot semantics:
+ * a bad/malformed file → empty, NEVER a retain). pi's `SettingsManager.reload()`
+ * — reason `'reload'` — is its ONLY retain-on-error path, so ONLY a reload may
+ * inherit the prior snapshot; these fresh lifecycles must restart from a blank
+ * baseline or the gate would show a prior session's prefix that pi won't
+ * execute (over-disclosure). Any unknown/missing reason falls OUTSIDE this set
+ * and therefore retains — over-disclosing a stale prefix is safe; under-
+ * disclosing an executed one is not. Verified against pi 0.80.6 `SessionStartEvent`.
+ */
+const FRESH_SESSION_REASONS: ReadonlySet<string> = new Set(['startup', 'new', 'resume', 'fork']);
 
 /**
  * Derive the human-readable detail line for the approval prompt.
@@ -259,8 +281,17 @@ export function createPermissionGateExtension(): InlineExtension {
     factory: (pi: ExtensionAPI) => {
       const sessionAllowed = new Set<string>();
 
-      pi.on('session_start', async (_event, ctx) => {
-        layers = await resolveShellPrefixLayers(layers, ctx);
+      pi.on('session_start', async (event, ctx) => {
+        // Only a /reload (pi's sole retain-on-error path) may inherit the prior
+        // snapshot. A fresh lifecycle (startup/new/resume/fork) builds a NEW
+        // SettingsManager with boot semantics (bad file → empty), so it must
+        // start from a blank baseline or we'd retain a prefix pi won't execute.
+        // Unknown/missing reason → retain (over-disclose is safe; under-disclose
+        // is not); read defensively since a hostile event need not be well-typed.
+        const reason: unknown = (event as { reason?: unknown }).reason;
+        const fresh = typeof reason === 'string' && FRESH_SESSION_REASONS.has(reason);
+        const prior: ShellPrefixLayers = fresh ? { global: undefined, project: undefined } : layers;
+        layers = await resolveShellPrefixLayers(prior, ctx);
         snapshotted = true;
       });
 
