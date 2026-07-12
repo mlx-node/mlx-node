@@ -203,6 +203,16 @@ describe('scanAgentArgs', () => {
       expect(scan.passthrough).toEqual(['--export']);
     });
 
+    it('does not treat an empty --export value as a one-shot (pi stores "" but skips the export path)', () => {
+      // pi consumes '' as the value (args.js: `result.export = args[++i]`),
+      // then `if (parsed.export)` at main.js:408 is FALSY for '' — no
+      // export-and-exit, pi falls into normal session startup. Bypassing the
+      // wizard here would hand pi zero models and end in a silent no-op.
+      const scan = scanAgentArgs(['--export', '']);
+      expect(scan.piOneShot).toBe(false);
+      expect(scan.passthrough).toEqual(['--export', '']);
+    });
+
     it('does not trip on a --version consumed as the VALUE of --system-prompt', () => {
       const scan = scanAgentArgs(['--system-prompt', '--version']);
       expect(scan.piOneShot).toBe(false);
@@ -537,6 +547,14 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(1);
     expect(calls.runAgent).toHaveLength(1);
     expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--list-models']);
+  });
+
+  it('keeps an empty --export value on the wizard path with zero models (pi would silently no-op)', async () => {
+    const { deps, calls } = makeDeps([[], [fakeModel('downloaded-model')]]);
+    await run(['--export', ''], deps);
+    expect(calls.wizard).toHaveLength(1);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--export', '']);
   });
 
   /**

@@ -38,7 +38,10 @@ export interface AgentArgScan {
    * of session creation — so they need no local model: forward verbatim,
    * skipping discovery, the first-run wizard and default-model injection.
    * A bare trailing `--export` does NOT count: pi only consumes a following
-   * value (`i + 1 < len`), otherwise it is an unknown flag.
+   * value (`i + 1 < len`), otherwise it is an unknown flag. Neither does an
+   * EMPTY value (`--export ''`): pi stores '' but its truthiness gate
+   * (`if (parsed.export)`) skips the export path, so pi would fall into
+   * normal session startup — that run must stay on the discovery path.
    */
   piOneShot: boolean;
   /** Args forwarded to pi in their original order. */
@@ -127,7 +130,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     // This is checked FIRST, so a `--models-dir` (or `--help`) sitting in a
     // pi-consumer's value slot passes through untouched.
     if (VALUE_CONSUMING_ARGS.has(arg) && i + 1 < argv.length) {
-      if (arg === '--export') {
+      if (arg === '--export' && argv[i + 1]!.length > 0) {
         piOneShot = true;
       }
       passthrough.push(arg, argv[i + 1]!);
