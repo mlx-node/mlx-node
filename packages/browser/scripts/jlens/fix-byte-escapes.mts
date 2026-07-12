@@ -57,8 +57,12 @@ function findTokenizer(): string {
 
 type Envelope = { logit: SerializedRun; jacobian: SerializedRun; [k: string]: unknown };
 
-/** Rewrite every `�`-bearing string in a run (cells[].topKTexts aligned with
- *  topKIds, tokens[].text aligned with tokens[].id). Returns #strings changed. */
+/** Rewrite every `�`-bearing string in a run: cells[].topKTexts (aligned with
+ *  topKIds), tokens[].text (aligned with tokens[].id), and pinned[].tokenText
+ *  (aligned with pinned[].tokenId). Covering pinned keeps the migration in
+ *  lockstep with the live worker + bake, so a future re-bake stays byte-identical
+ *  to the committed data even if a concept ever pins a fragment token. Returns
+ *  #strings changed. */
 function fixRun(run: SerializedRun, idToBytes: (id: number) => Uint8Array | null): number {
   let changed = 0;
   for (const cell of run.cells) {
@@ -75,6 +79,13 @@ function fixRun(run: SerializedRun, idToBytes: (id: number) => Uint8Array | null
     const escaped = escapeByteFragments(token.text, token.id, idToBytes);
     if (escaped !== token.text) {
       token.text = escaped;
+      changed += 1;
+    }
+  }
+  for (const pin of run.pinned) {
+    const escaped = escapeByteFragments(pin.tokenText, pin.tokenId, idToBytes);
+    if (escaped !== pin.tokenText) {
+      pin.tokenText = escaped;
       changed += 1;
     }
   }

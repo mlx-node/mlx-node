@@ -154,7 +154,7 @@ function serializeRun(ro: any, idToBytes: (id: number) => Uint8Array | null): Se
     })),
     pinned: (ro.pinned as any[]).map((p) => ({
       tokenId: p.tokenId,
-      tokenText: p.tokenText,
+      tokenText: escapeByteFragments(p.tokenText, p.tokenId, idToBytes),
       ranks: Array.from(p.ranks as ArrayLike<number>),
     })),
   };

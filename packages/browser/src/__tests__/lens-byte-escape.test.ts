@@ -120,4 +120,16 @@ describe('escapeByteFragments (real Qwen3.5 vocab piece strings)', () => {
     expect(idToBytes(999999)).toBeNull();
     expect(escapeByteFragments('�', 999999, idToBytes)).toBe('�');
   });
+
+  it('escapes a PINNED fragment token the same way as cells/tokens (id 133 → "‹C9›")', () => {
+    // The worker, bake.mts and the migration all run pinned `tokenText` through
+    // the SAME `escapeByteFragments(text, id, idToBytes)`. A pinned fragment is
+    // therefore escaped identically to a cell/token fragment — this pins that
+    // contract so the three paths can never drift on the pinned case.
+    const pin = { tokenId: 133, tokenText: '�' };
+    expect(escapeByteFragments(pin.tokenText, pin.tokenId, idToBytes)).toBe('‹C9›');
+    // …and a genuine U+FFFD pinned token is preserved, not escaped.
+    const genuine = { tokenId: 49247, tokenText: '�s' };
+    expect(escapeByteFragments(genuine.tokenText, genuine.tokenId, idToBytes)).toBe('�s');
+  });
 });

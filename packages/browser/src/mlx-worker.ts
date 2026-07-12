@@ -2775,6 +2775,11 @@ async function handleLensReadout(data: {
       }
     }
 
+    // Snapshot the byte-escape resolver BEFORE the await. A model switch that
+    // lands while this readout is in flight resets/rebuilds `lensIdToBytes` for
+    // the NEW model; applying that to THIS result's ids would mis-decode them.
+    // The pre-await snapshot matches the model that produces `result`.
+    const idToBytes = lensIdToBytes;
     const result = await model.lensReadout(promptIds, {
       layers,
       topK,
@@ -2810,10 +2815,10 @@ async function handleLensReadout(data: {
     // STANDALONE, so a fragment of a multi-byte UTF-8 char collapsed to `�`.
     // Rebuild the raw bytes from the id and emit a faithful `‹E5›` escape,
     // keeping any still-valid characters (src/lens-byte-escape.ts). Gated by
-    // `lensIdToBytes` (built at model load) and, per string, the cheap `�` check
-    // inside `escapeByteFragments`. Mutates the fresh NAPI arrays in place.
+    // `idToBytes` (the pre-await snapshot above, built at model load) and, per
+    // string, the cheap `�` check inside `escapeByteFragments`. Mutates the fresh
+    // NAPI arrays in place.
     const tokens = Array.isArray(result?.tokens) ? result.tokens : [];
-    const idToBytes = lensIdToBytes;
     if (idToBytes) {
       for (const cell of cells) {
         const texts = cell?.topKTexts;
