@@ -3997,7 +3997,7 @@ export interface Qwen35Config {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
@@ -4105,7 +4105,7 @@ export interface Qwen35MoeConfig {
   /**
    * GPU memory budget for paged KV cache in megabytes.
    * Only used when `use_block_paged_cache` is true.
-   * Default: 2048 (2GB).
+   * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
   /**

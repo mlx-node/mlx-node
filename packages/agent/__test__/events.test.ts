@@ -152,6 +152,111 @@ describe('TurnEmitter', () => {
     ]);
   });
 
+  it('strips Qwen thinking markup split across reasoning deltas', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('<thi', true));
+    emitter.onDelta(delta('nk>Plan the change.', true));
+    emitter.onDelta(delta('</thi', true));
+    emitter.onDelta(delta('nk>', true));
+    emitter.onDelta(delta('Apply it.'));
+    emitter.onFinal(makeFinal({ text: 'Apply it.', thinking: 'Plan the change.', reasoningTokens: 4 }));
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual([
+      'start',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_end',
+      'text_start',
+      'text_delta',
+      'text_end',
+      'done',
+    ]);
+    expect(finalMessage(events).content).toEqual([
+      { type: 'thinking', thinking: 'Plan the change.' },
+      { type: 'text', text: 'Apply it.' },
+    ]);
+  });
+
+  it('strips LongCat thinking markup while preserving surrounding ordinary text', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('prefix <longcat_', true));
+    emitter.onDelta(delta('think>middle</longcat_', true));
+    emitter.onDelta(delta('think> suffix', true));
+    emitter.onFinal(makeFinal({ thinking: 'prefix middle suffix', reasoningTokens: 3 }));
+
+    const events = await collect(stream);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'prefix middle suffix' }]);
+    const thinkingDeltas = events
+      .filter((event): event is Extract<AssistantMessageEvent, { type: 'thinking_delta' }> => {
+        return event.type === 'thinking_delta';
+      })
+      .map((event) => event.delta)
+      .join('');
+    expect(thinkingDeltas).toBe('prefix middle suffix');
+  });
+
+  it('recovers an incomplete reasoning-tag prefix when the stream is aborted', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('ordinary </thi', true));
+    emitter.onAborted();
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual([
+      'start',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_delta',
+      'thinking_end',
+      'error',
+    ]);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'ordinary </thi' }]);
+  });
+
+  it('recovers an incomplete reasoning-tag prefix on a successful final', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('ordinary <longcat_thi', true));
+    emitter.onFinal(makeFinal({ thinking: 'ordinary <longcat_thi', reasoningTokens: 2 }));
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual([
+      'start',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_delta',
+      'thinking_end',
+      'done',
+    ]);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'ordinary <longcat_thi' }]);
+  });
+
+  it('recovers an incomplete reasoning-tag prefix on an error final', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('ordinary <thi', true));
+    emitter.onFinal(makeFinal({ finishReason: 'error' }));
+
+    const events = await collect(stream);
+    expect(types(events)).toEqual([
+      'start',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_delta',
+      'thinking_end',
+      'error',
+    ]);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'ordinary <thi' }]);
+  });
+
+  it('releases a false-alarm reasoning-tag prefix without losing ordinary text', async () => {
+    const { emitter, stream } = makeEmitter();
+    emitter.onDelta(delta('reasoning <thi', true));
+    emitter.onDelta(delta('ng aloud', true));
+    emitter.onFinal(makeFinal({ thinking: 'reasoning <thing aloud', reasoningTokens: 2 }));
+
+    const events = await collect(stream);
+    expect(finalMessage(events).content).toEqual([{ type: 'thinking', thinking: 'reasoning <thing aloud' }]);
+  });
+
   it('suppresses <tool_call> markup split across text deltas', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onDelta(delta('Checking now.'));

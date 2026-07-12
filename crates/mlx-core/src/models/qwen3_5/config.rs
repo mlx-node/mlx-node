@@ -1,5 +1,52 @@
 use napi_derive::napi;
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB: u32 = 256;
+
+/// Derive the default paged-KV budget from the model's advertised context.
+///
+/// Qwen3.5 checkpoints commonly advertise 262,144 tokens. The former fixed
+/// 2 GiB default only held 104,848 tokens for the 35B-A3B layout (10 full
+/// attention layers, 2 KV heads, head size 256), so a valid long conversation
+/// could exhaust the allocator even though it was still well inside the model
+/// context window. Keep explicit `paged_cache_memory_mb` overrides intact, but
+/// size the implicit default for exactly one full-context sequence.
+pub(crate) fn qwen35_default_paged_cache_memory_mb(
+    max_seq_len: u32,
+    block_size: u32,
+    head_size: u32,
+    num_kv_heads: u32,
+    num_layers: u32,
+) -> u32 {
+    if max_seq_len == 0 || block_size == 0 || head_size == 0 || num_kv_heads == 0 || num_layers == 0
+    {
+        return QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB;
+    }
+
+    let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
+    let bytes_per_block = 2u64
+        .saturating_mul(u64::from(num_kv_heads))
+        .saturating_mul(u64::from(head_size))
+        .saturating_mul(u64::from(block_size))
+        .saturating_mul(2)
+        .saturating_mul(u64::from(num_layers));
+    let required_mb = bytes_per_block
+        .saturating_mul(max_blocks)
+        .div_ceil(BYTES_PER_MIB)
+        .max(u64::from(QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB));
+    u32::try_from(required_mb).unwrap_or(u32::MAX)
+}
+
+pub(crate) fn qwen35_resolve_paged_cache_memory_mb(
+    configured_memory_mb: Option<u32>,
+    default_memory_mb: u32,
+) -> (u32, &'static str) {
+    match configured_memory_mb {
+        Some(memory_mb) => (memory_mb, "config"),
+        None => (default_memory_mb, "auto_full_context"),
+    }
+}
+
 /// Qwen3.5 model configuration (dense variant).
 ///
 /// For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
@@ -44,7 +91,7 @@ pub struct Qwen3_5Config {
     // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
-    /// Default: 2048 (2GB).
+    /// Default: automatically sized for one full-context sequence.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
@@ -184,5 +231,68 @@ impl Qwen3_5Config {
 
         // 2 bytes per param (bf16)
         total_params * 2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb};
+    use mlx_paged_attn::PagedAttentionConfig;
+
+    fn paged_config(
+        gpu_memory_mb: u32,
+        head_size: u32,
+        num_kv_heads: u32,
+        num_layers: u32,
+    ) -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb,
+            head_size,
+            num_kv_heads,
+            num_layers,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(262_144),
+            max_batch_size: Some(32),
+        }
+    }
+
+    #[test]
+    fn paged_cache_default_covers_agents_a1_full_context() {
+        // agents-a1 / Qwen3.5-35B-A3B: 40 layers at interval 4 gives
+        // 10 physical full-attention layers, with 2 KV heads of width 256.
+        let memory_mb = qwen35_default_paged_cache_memory_mb(262_144, 16, 256, 2, 10);
+        assert_eq!(memory_mb, 5_120);
+
+        let config = paged_config(memory_mb, 256, 2, 10);
+        assert_eq!(config.calculate_num_blocks(), 16_384);
+        assert_eq!(config.max_cached_tokens(), 262_144);
+    }
+
+    #[test]
+    fn paged_cache_default_covers_qwen36_27b_full_context() {
+        // Qwen3.6-27B: 64 layers at interval 4 gives 16 physical
+        // full-attention layers, with 4 KV heads of width 256.
+        let memory_mb = qwen35_default_paged_cache_memory_mb(262_144, 16, 256, 4, 16);
+        assert_eq!(memory_mb, 16_384);
+
+        let config = paged_config(memory_mb, 256, 4, 16);
+        assert_eq!(config.calculate_num_blocks(), 16_384);
+        assert_eq!(config.max_cached_tokens(), 262_144);
+    }
+
+    #[test]
+    fn explicit_2048_mb_override_preserves_the_observed_small_pool() {
+        let automatic = qwen35_default_paged_cache_memory_mb(262_144, 16, 256, 2, 10);
+        let (memory_mb, source) = qwen35_resolve_paged_cache_memory_mb(Some(2_048), automatic);
+        assert_eq!(memory_mb, 2_048);
+        assert_eq!(source, "config");
+
+        let config = paged_config(memory_mb, 256, 2, 10);
+        assert_eq!(config.calculate_num_blocks(), 6_553);
+        assert_eq!(config.max_cached_tokens(), 104_848);
+        // The failing Image-agent turn was already beyond this physical
+        // capacity while pi still correctly reported 40.4% of 262k.
+        assert!(106_240 > config.max_cached_tokens());
     }
 }

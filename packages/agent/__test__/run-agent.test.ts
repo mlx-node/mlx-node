@@ -1,7 +1,7 @@
 /**
  * `runAgent` boot-shell contract, via the `mainImpl` seam (pi itself is
  * never imported here): env seeding with `??=` semantics, the exact
- * extension pair, and verbatim argv forwarding.
+ * extension set, and verbatim argv forwarding.
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -77,20 +77,20 @@ describe('runAgent', () => {
     expect(env.MLX_PAGED_PREFILL_CHUNK_SIZE).toBe('512');
   });
 
-  it('passes exactly the provider and permission-gate extensions, in order', async () => {
+  it('passes exactly the built-in mlx extensions, in order', async () => {
     const { main, calls } = makeSeam();
     await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
 
     const factories = calls[0]!.extensionFactories;
     const names = factories.map((entry) => {
-      // Both mlx extensions use the named `{ name, factory }` form, never
+      // All mlx extensions use the named `{ name, factory }` form, never
       // the bare-function InlineExtension variant.
       expect(typeof entry).toBe('object');
       const named = entry as Extract<InlineExtension, { name: string; factory: unknown }>;
       expect(typeof named.factory).toBe('function');
       return named.name;
     });
-    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate']);
+    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-terminal-title']);
   });
 
   it('forwards argv verbatim', async () => {

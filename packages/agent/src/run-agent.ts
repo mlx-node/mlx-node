@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
+import { createTerminalTitleExtension } from './extensions/terminal-title.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import type { MlxModelInfo } from './provider/models.js';
 
@@ -54,6 +55,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // with `mainImpl` injected, pi is never imported at all.
   const main: RunAgentMain = opts.mainImpl ?? (await import('@earendil-works/pi-coding-agent')).main;
   await main(opts.argv, {
-    extensionFactories: [createMlxProviderExtension(opts.models), createPermissionGateExtension()],
+    extensionFactories: [
+      createMlxProviderExtension(opts.models),
+      createPermissionGateExtension(),
+      createTerminalTitleExtension(),
+    ],
   });
 }

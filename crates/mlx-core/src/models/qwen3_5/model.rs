@@ -714,9 +714,21 @@ impl Qwen35Inner {
             }
 
             let block_size = config.paged_block_size.unwrap_or(16);
-            let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
             let head_size = config.head_dim as u32;
             let num_kv_heads = config.num_kv_heads as u32;
+            let max_seq_len = config.max_position_embeddings as u32;
+            let default_gpu_memory_mb = super::config::qwen35_default_paged_cache_memory_mb(
+                max_seq_len,
+                block_size,
+                head_size,
+                num_kv_heads,
+                attn_layer_count,
+            );
+            let (gpu_memory_mb, paged_cache_memory_source) =
+                super::config::qwen35_resolve_paged_cache_memory_mb(
+                    config.paged_cache_memory_mb,
+                    default_gpu_memory_mb,
+                );
 
             let pa_config = mlx_paged_attn::PagedAttentionConfig {
                 block_size,
@@ -728,7 +740,7 @@ impl Qwen35Inner {
                 // `Qwen3_5LayerCache::Linear`.
                 num_layers: attn_layer_count,
                 use_fp8_cache: Some(false),
-                max_seq_len: Some(config.max_position_embeddings as u32),
+                max_seq_len: Some(max_seq_len),
                 max_batch_size: Some(32),
             };
 
@@ -762,8 +774,9 @@ impl Qwen35Inner {
 
             info!(
                 "Qwen3.5 block-paged adapter enabled: num_blocks={}, block_size={}, \
-                 gpu_memory_mb={}, num_attn_layers={}, cache_dtype=BFloat16",
-                num_blocks, block_size, gpu_memory_mb, attn_layer_count
+                 gpu_memory_mb={}, paged_cache_memory_source={}, num_attn_layers={}, \
+                 cache_dtype=BFloat16",
+                num_blocks, block_size, gpu_memory_mb, paged_cache_memory_source, attn_layer_count
             );
             Some(adapter)
         } else {

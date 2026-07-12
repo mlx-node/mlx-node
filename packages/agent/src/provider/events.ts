@@ -26,6 +26,7 @@ import type {
 import type { ChatStreamDelta, ChatStreamFinal, ToolCallResult } from '@mlx-node/lm';
 
 import { coerceErrorMessage } from './error-coercion.js';
+import { ReasoningTagBuffer } from './reasoning-tag-buffer.js';
 import { ToolCallTagBuffer } from './tool-call-buffer.js';
 
 /**
@@ -88,6 +89,7 @@ export class TurnEmitter {
   private readonly stream: AssistantMessageEventStream;
   private readonly partial: AssistantMessage;
   private readonly textBuffer = new ToolCallTagBuffer();
+  private readonly thinkingBuffer = new ReasoningTagBuffer();
   /**
    * Leading whitespace-only text parked before any text block exists, so
    * a `"\n\n"` emitted right before `<tool_call>` markup never ratifies a
@@ -117,8 +119,11 @@ export class TurnEmitter {
     if (this.finished) return;
     try {
       if (delta.isReasoning === true) {
-        this.appendThinking(delta.text);
+        this.appendThinking(this.thinkingBuffer.push(delta.text));
       } else {
+        // A reasoning suffix that only resembled a partial protocol tag is
+        // ordinary text. Release it before opening the visible-text block.
+        this.appendThinking(this.thinkingBuffer.flush());
         // Text routes through the tag buffer: partial structural markup
         // (`<tool_call>` etc.) must never leak into pi-visible text.
         const { safeText, tagFound, cleanPrefix } = this.textBuffer.push(delta.text);
@@ -142,7 +147,9 @@ export class TurnEmitter {
         return;
       }
 
-      // Release any held-back non-tag suffix, then close the open block.
+      // Release held-back suffixes from both structural-tag buffers, then
+      // close the open block.
+      this.appendThinking(this.thinkingBuffer.flush());
       this.appendVisibleText(this.textBuffer.flush());
       this.closeOpenBlock();
 
@@ -205,6 +212,7 @@ export class TurnEmitter {
     this.finished = true;
     try {
       try {
+        this.appendThinking(this.thinkingBuffer.flush());
         this.appendVisibleText(this.textBuffer.flush());
       } catch {
         // Preserving buffered residue is best-effort; the block close and
@@ -222,6 +230,7 @@ export class TurnEmitter {
   }
 
   private appendThinking(text: string): void {
+    if (!text) return;
     let block = this.openBlock;
     if (block?.type !== 'thinking') {
       this.closeOpenBlock();
