@@ -37,7 +37,7 @@
     "octokit": "^5.0.5",
     "oxc-parser": "^0.137.0",
     "prettier": "^3.8.4",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "vite-plus": "0.1.24",
     "vitest": "^4.1.9"
   },
@@ -45,5 +45,5 @@
     "vite": "npm:@voidzero-dev/vite-plus-core@0.1.24",
     "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.24"
   },
-  "packageManager": "yarn@4.17.0"
+  "packageManager": "yarn@4.17.1"
 }
