@@ -177,6 +177,44 @@ describe('scanAgentArgs', () => {
       expect(scanAgentArgs(['update']).update).toBe(true);
     });
   });
+
+  describe('pi one-shot detection (--version / -v / --export)', () => {
+    // pi answers these before any model resolution (main.js:404-407 prints
+    // VERSION, :408-421 exports, both process.exit before session creation),
+    // so they must bypass discovery + the first-run wizard.
+    it('detects --version and -v in option-name position, forwarding them verbatim', () => {
+      for (const flag of ['--version', '-v']) {
+        const scan = scanAgentArgs([flag]);
+        expect(scan.piOneShot).toBe(true);
+        expect(scan.passthrough).toEqual([flag]);
+      }
+      expect(scanAgentArgs(['--mode', 'json', '--version']).piOneShot).toBe(true);
+    });
+
+    it('detects --export only when it consumed a value', () => {
+      const scan = scanAgentArgs(['--export', 'session.jsonl']);
+      expect(scan.piOneShot).toBe(true);
+      expect(scan.passthrough).toEqual(['--export', 'session.jsonl']);
+    });
+
+    it('does not treat a trailing bare --export as a one-shot (pi sees an unknown flag)', () => {
+      const scan = scanAgentArgs(['--export']);
+      expect(scan.piOneShot).toBe(false);
+      expect(scan.passthrough).toEqual(['--export']);
+    });
+
+    it('does not trip on a --version consumed as the VALUE of --system-prompt', () => {
+      const scan = scanAgentArgs(['--system-prompt', '--version']);
+      expect(scan.piOneShot).toBe(false);
+      expect(scan.passthrough).toEqual(['--system-prompt', '--version']);
+    });
+
+    it('leaves --list-models undetected — it stays on the wizard path', () => {
+      const scan = scanAgentArgs(['--list-models']);
+      expect(scan.piOneShot).toBe(false);
+      expect(scan.passthrough).toEqual(['--list-models']);
+    });
+  });
 });
 
 describe('withDefaultModel', () => {
@@ -464,6 +502,41 @@ describe('run() argv routing', () => {
     expect(calls.runAgent).toHaveLength(1);
     expect(calls.runAgent[0]!.argv).toEqual(['--fork', 'abc123', '-p', 'hi']);
     expect(calls.runAgent[0]!.argv).not.toContain('--model');
+  });
+
+  it('forwards pi one-shots (--version / -v / --export) verbatim — no discovery, no wizard, no injection', async () => {
+    // pi prints VERSION (main.js:404-407) or exports (main.js:408-421) and
+    // exits BEFORE model resolution, so a fresh install with zero models must
+    // not fall into the first-run wizard ahead of them.
+    for (const argv of [['--version'], ['-v'], ['--export', 'session.jsonl']]) {
+      const { deps, calls } = makeDeps([[]]);
+      await run(argv, deps);
+      expect(calls.runAgent).toHaveLength(1);
+      expect(calls.runAgent[0]!.argv).toEqual(argv);
+      expect(calls.runAgent[0]!.models).toEqual([]);
+      expect(calls.discover).toHaveLength(0);
+      expect(calls.wizard).toHaveLength(0);
+    }
+  });
+
+  it('still blocks update even when --version rides along', async () => {
+    const { deps, calls } = makeDeps();
+    const prevExitCode = process.exitCode;
+    try {
+      await run(['update', '--version'], deps);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = prevExitCode;
+    }
+    expect(calls.runAgent).toHaveLength(0);
+  });
+
+  it('keeps --list-models on the wizard path with zero models (pi would print a dead-end /login hint)', async () => {
+    const { deps, calls } = makeDeps([[], [fakeModel('downloaded-model')]]);
+    await run(['--list-models'], deps);
+    expect(calls.wizard).toHaveLength(1);
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--list-models']);
   });
 
   /**

@@ -31,6 +31,16 @@ export interface AgentArgScan {
   help: boolean;
   /** Leading `update` positional — pi's npm self-update, always blocked. */
   update: boolean;
+  /**
+   * pi one-shot metadata argv: `--version`/`-v` in an option-NAME position,
+   * or `--export` that consumed a value. pi answers these BEFORE model
+   * resolution — `main()` prints VERSION / exports and `process.exit`s ahead
+   * of session creation — so they need no local model: forward verbatim,
+   * skipping discovery, the first-run wizard and default-model injection.
+   * A bare trailing `--export` does NOT count: pi only consumes a following
+   * value (`i + 1 < len`), otherwise it is an unknown flag.
+   */
+  piOneShot: boolean;
   /** Args forwarded to pi in their original order. */
   passthrough: string[];
 }
@@ -106,6 +116,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let modelsDir: string | undefined;
   let modelsDirMissingValue = false;
   let helpSeen = false;
+  let piOneShot = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -116,6 +127,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     // This is checked FIRST, so a `--models-dir` (or `--help`) sitting in a
     // pi-consumer's value slot passes through untouched.
     if (VALUE_CONSUMING_ARGS.has(arg) && i + 1 < argv.length) {
+      if (arg === '--export') {
+        piOneShot = true;
+      }
       passthrough.push(arg, argv[i + 1]!);
       i++;
       continue;
@@ -152,6 +166,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     if (arg === '-h' || arg === '--help') {
       helpSeen = true;
     }
+    if (arg === '--version' || arg === '-v') {
+      piOneShot = true;
+    }
     passthrough.push(arg);
   }
 
@@ -163,6 +180,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     modelsDirMissingValue,
     help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
+    piOneShot,
     passthrough,
   };
 }
@@ -515,9 +533,15 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   // reach pi with the command still at args[0] — pi's
   // `parsePackageCommand` and `handleConfigCommand` both read ONLY
   // args[0], so a prepended `--model` would knock them into the agent
-  // prompt path. They need no model either: skip discovery, the
-  // first-run wizard and default-model injection, and forward verbatim.
-  if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '')) {
+  // prompt path. pi one-shots (`--version`/`-v`, `--export <file>`) exit
+  // inside pi before any model resolution. Neither needs a model: skip
+  // discovery, the first-run wizard and default-model injection, and
+  // forward verbatim. `--list-models` is deliberately NOT routed here:
+  // with zero models pi prints a dead-end "/login" hint (this agent is
+  // offline-only, /login cannot produce a local model), while the wizard
+  // path downloads a model in a TTY — then actually lists it — or prints
+  // the exact `mlx download model` commands headless.
+  if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '') || scan.piOneShot) {
     await runAgent({ modelsDir, models: [], argv: scan.passthrough });
     return;
   }
