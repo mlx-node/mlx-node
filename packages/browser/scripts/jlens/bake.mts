@@ -68,6 +68,7 @@ import { fileURLToPath } from 'node:url';
 import { derivePins, type Encode } from '../../demo/jlens-core/derive-pins.ts';
 import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../../demo/jlens-core/jacobian-presets.ts';
 import { LENS_MAX_PINNED } from '../../src/inspector-types.ts';
+import { buildIdToBytes, escapeByteFragments } from '../../src/lens-byte-escape.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -124,15 +125,22 @@ type SerializedRun = {
 };
 
 /** Convert a native LensReadoutRun into a JSON-safe SerializedRun: every typed
- *  array (topKLogits/topKProbs Float32Array, ranks Int32Array) becomes number[]. */
-function serializeRun(ro: any): SerializedRun {
+ *  array (topKLogits/topKProbs Float32Array, ranks Int32Array) becomes number[].
+ *  Byte-level-BPE fragment tokens whose standalone HF decode collapsed to `�`
+ *  are re-rendered as faithful hex escapes (`‹E5›`) via `escapeByteFragments`,
+ *  keeping the bake in lockstep with the committed data + the live worker fix
+ *  (see src/lens-byte-escape.ts + scripts/jlens/fix-byte-escapes.mts). */
+function serializeRun(ro: any, idToBytes: (id: number) => Uint8Array | null): SerializedRun {
   return {
     promptLen: ro.promptLen,
     topK: ro.topK,
     useJacobian: ro.useJacobian,
     jacobianApplied: ro.jacobianApplied,
     layers: Array.from(ro.layers as ArrayLike<number>),
-    tokens: (ro.tokens as { id: number; text: string }[]).map((t) => ({ id: t.id, text: t.text })),
+    tokens: (ro.tokens as { id: number; text: string }[]).map((t) => ({
+      id: t.id,
+      text: escapeByteFragments(t.text, t.id, idToBytes),
+    })),
     cells: (ro.cells as any[]).map((c) => ({
       layer: c.layer,
       position: c.position,
@@ -140,7 +148,9 @@ function serializeRun(ro: any): SerializedRun {
       topKIds: Array.from(c.topKIds as ArrayLike<number>),
       topKLogits: Array.from(c.topKLogits as ArrayLike<number>),
       topKProbs: Array.from(c.topKProbs as ArrayLike<number>),
-      topKTexts: (c.topKTexts as string[]).slice(),
+      topKTexts: (c.topKTexts as string[]).map((text, i) =>
+        escapeByteFragments(text, (c.topKIds as ArrayLike<number>)[i]!, idToBytes),
+      ),
     })),
     pinned: (ro.pinned as any[]).map((p) => ({
       tokenId: p.tokenId,
@@ -161,6 +171,9 @@ async function main() {
   const { Qwen35Model } = await import('@mlx-node/lm');
   console.log(`Loading model from ${MODEL_PATH} ...`);
   const model = (await Qwen35Model.load(MODEL_PATH)) as any;
+  // Byte-level vocab resolver so fragment tokens (`�`) bake as faithful hex
+  // escapes instead of the lossy replacement char. Same util as the live worker.
+  const idToBytes = buildIdToBytes(readFileSync(join(MODEL_PATH, 'tokenizer.json'), 'utf8'));
   console.log(`Loading lens pack from ${PACK_PATH} ...`);
   const loaded = await model.loadLensPackFromFile(PACK_PATH);
   if (loaded !== EXPECTED_JACOBIANS) {
@@ -250,8 +263,8 @@ async function main() {
       partialFlags,
       layers: Array.from(JACOBIAN_LAYERS),
       meta: bakeMeta,
-      logit: serializeRun(logit),
-      jacobian: serializeRun(jacobian),
+      logit: serializeRun(logit, idToBytes),
+      jacobian: serializeRun(jacobian, idToBytes),
     };
     const serialized = JSON.stringify(envelope, null, 2) + '\n';
     const outPath = join(OUT_DIR, `${preset.slug}.json`);

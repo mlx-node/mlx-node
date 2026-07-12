@@ -52,6 +52,7 @@ import {
   TOKENIZE_REQUEST_TYPE,
   TOKENIZE_RESULT_TYPE,
 } from './inspector-types.js';
+import { buildIdToBytes, escapeByteFragments } from './lens-byte-escape.js';
 import { CMD_OFFSET, READBACK_BUFFER_SIZE, DISPATCH_BATCH_BUFFER_SIZE, STATS_BUFFER_SIZE } from './rpc-protocol.js';
 import { parseSafeTensorsHeaderBytes, dtypeToCode, type TensorInfo } from './safetensors.js';
 import {
@@ -104,6 +105,12 @@ let modelSupportsImages = false;
 let currentModelSource: ModelSource | null = null;
 let currentGpuWorker: Worker | null = null;
 let lensPackLoaded = false;
+// Byte-level-BPE vocab resolver, built from the active model's tokenizer.json at
+// load. Lets the lens re-render fragment tokens (whose standalone HF decode
+// collapsed to `�` inside the WASM) as faithful hex escapes like `‹E5›`
+// (src/lens-byte-escape.ts). Reset on every fresh load; `null` until ready, in
+// which case the lens transform is skipped and texts pass through unchanged.
+let lensIdToBytes: ((id: number) => Uint8Array | null) | null = null;
 let bridgeOptimizationControl: Int32Array | null = null;
 let configuredFusionEnabled = true;
 let configuredDispatchBatchEnabled = false;
@@ -1532,6 +1539,7 @@ async function handleInit(data: {
     currentGpuWorker = gpuWorker;
     currentModelSource = null;
     lensPackLoaded = false;
+    lensIdToBytes = null;
 
     // Wait for gpu-worker to create GPUDevice and be ready
     const gpuReady = await new Promise<any>((resolve, reject) => {
@@ -1838,6 +1846,9 @@ async function handleInit(data: {
     post({ type: 'progress', step: 'model', message: 'Loading tokenizer...' });
     const tokenizerJson = await readSourceText(modelSource, 'tokenizer.json');
     if (!tokenizerJson) throw new Error('tokenizer.json is empty');
+    // Build the byte-level-BPE resolver for the lens (memoized; the heavy vocab
+    // inversion is lazy on first use). Ready before any lensReadout response.
+    lensIdToBytes = buildIdToBytes(tokenizerJson);
     const tokenizerConfigJson = await readSourceText(modelSource, 'tokenizer_config.json', true);
     const generationConfigJson = await readSourceText(modelSource, 'generation_config.json', true);
     modelGenerationDefaults = generationConfigJson ? normalizeGenerationConfig(JSON.parse(generationConfigJson)) : {};
@@ -2795,6 +2806,31 @@ async function handleLensReadout(data: {
     for (const p of pinned) {
       pushBuf(p?.ranks);
     }
+    // Re-render byte-level-BPE fragment tokens. The WASM decoded each id
+    // STANDALONE, so a fragment of a multi-byte UTF-8 char collapsed to `�`.
+    // Rebuild the raw bytes from the id and emit a faithful `‹E5›` escape,
+    // keeping any still-valid characters (src/lens-byte-escape.ts). Gated by
+    // `lensIdToBytes` (built at model load) and, per string, the cheap `�` check
+    // inside `escapeByteFragments`. Mutates the fresh NAPI arrays in place.
+    const tokens = Array.isArray(result?.tokens) ? result.tokens : [];
+    const idToBytes = lensIdToBytes;
+    if (idToBytes) {
+      for (const cell of cells) {
+        const texts = cell?.topKTexts;
+        const ids = cell?.topKIds;
+        if (Array.isArray(texts) && ids != null) {
+          for (let i = 0; i < texts.length; i++) {
+            texts[i] = escapeByteFragments(texts[i], ids[i], idToBytes);
+          }
+        }
+      }
+      for (const t of tokens) {
+        if (t) t.text = escapeByteFragments(t.text, t.id, idToBytes);
+      }
+      for (const p of pinned) {
+        if (p) p.tokenText = escapeByteFragments(p.tokenText, p.tokenId, idToBytes);
+      }
+    }
     (self as any).postMessage(
       {
         type: LENS_READOUT_RESULT_TYPE,
@@ -2807,7 +2843,7 @@ async function handleLensReadout(data: {
           useJacobian: result?.useJacobian ?? data.useJacobian,
           jacobianApplied: result?.jacobianApplied ?? false,
           layers: result?.layers ?? [],
-          tokens: result?.tokens ?? [],
+          tokens,
           cells,
           pinned,
         },
