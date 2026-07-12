@@ -47,6 +47,31 @@ mlx convert --input ./model --output ./model-bf16 --dtype bf16
 mlx convert --input ./model --output ./model-q --quantize --q-recipe mixed_4_6
 ```
 
+### Official Unsloth MXFP and DGX recipes for Qwen3.5
+
+For verified dense and MoE Qwen3.5/Qwen3.6-family checkpoints, the fixed
+[official Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) is
+available in two forms. Both keep FP8-class weights as MXFP8 and use the same
+AWQ imatrix pre-scaling:
+
+```bash
+# Apple MXFP variant: replace NVFP4 with MXFP4
+mlx convert -m qwen3_5_moe -q --q-recipe unsloth --q-mxfp \
+  --imatrix-path ./imatrix_unsloth.gguf_file \
+  -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-mxfp4-mlx
+
+# Official DGX variant: retain NVFP4
+mlx convert -m qwen3_5_moe -q --q-mode nvfp4 --q-recipe unsloth \
+  --imatrix-path ./imatrix_unsloth.gguf_file \
+  -i ./qwen3.5-35b-a3b -o ./qwen3.5-35b-a3b-unsloth-nvfp4-mlx
+```
+
+Early FFNs use MXFP4 4/32 with `--q-mxfp`, or NVFP4 4/16 with
+`--q-mode nvfp4`. The final eight FFNs, attention q/k/v/o, GDN qkv/z/out, and
+`lm_head` use MXFP8 8/32 in both. Embeddings, routers, GDN a/b, vision, MTP,
+norms, and recurrent parameters remain BF16. Plain affine Unsloth alone keeps
+the legacy Dynamic 2.0 recipe.
+
 ### NVIDIA modelopt recipe (data-free MXFP4 port)
 
 `--q-recipe nvidia` ports NVIDIA modelopt's `w4a16_nvfp4-fp8_attn-kv_fp8_cast`
@@ -104,7 +129,8 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 | `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                          |
 | `-q`, `--quantize` | Enable quantization                                                                       |
 | `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia` |
-| `--q-mode`         | `affine` (default) or `mxfp8`                                                             |
+| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                  |
+| `--q-mxfp`         | Select Unsloth's fixed MXFP map, or upgrade eligible decisions for other recipes          |
 | `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)             |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                  |
 | `--mmproj`         | Vision-encoder conversion path                                                            |

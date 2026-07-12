@@ -417,7 +417,9 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 | Scheme       | How it's invoked                                                                                                                                         |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 4-bit affine | `mlx_quantized_matmul` (mode `affine`, configurable group size and bits)                                                                                 |
+| MXFP4        | `--q-mode mxfp4`, or the early-FFN class in `--q-recipe unsloth --q-mxfp`; 4-bit microscaling with group size 32                                         |
 | MXFP8        | `mlx_gather_qmm` with `mode="mxfp8"` (used for MoE expert routing); returns `[quantized, scales]`                                                        |
+| NVFP4        | `--q-recipe unsloth --q-mode nvfp4`; early FFNs use NVFP4 4/16 in the official DGX class map                                                             |
 | FP8 E4M3     | `mlx_dequantize` — dequant **before** expert stacking; no re-quantization after stacking                                                                 |
 | FP8 KV cache | Paged-adapter only — `KVCacheDType::Fp8` with per-layer scale management via `KvScaleManager`. FP8 KV is intentionally rejected by the flat-path attach. |
 
@@ -427,7 +429,10 @@ The Qwen3.5 GDN recurrence uses the **per-step** kernel by default on **every** 
 
 - mlx-lm-style mixed-bit: `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`
 - `qwen3_5` — Qwen3.5-tuned recipe
-- `unsloth` — requires imatrix calibration
+- `unsloth` — requires imatrix calibration. `--q-mxfp` selects the official map
+  translated from NVFP4/FP8 to MXFP4/MXFP8; `--q-mode nvfp4` selects the
+  official DGX map with NVFP4/MXFP8. Both use the final-eight FFN split and the
+  same BF16 exclusions. Plain affine alone keeps the legacy Dynamic 2.0 map.
 
 AWQ-style imatrix pre-scaling is supported for improved low-bit quality.
 

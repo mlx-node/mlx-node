@@ -108,6 +108,10 @@ mlx convert --input ./model.gguf --output ./model-vlm --mmproj ./mmproj.gguf
 # imatrix AWQ pre-scaling with unsloth dynamic quantization
 mlx convert --input ./model --output ./model-unsloth --quantize --q-recipe unsloth --imatrix-path ./imatrix.gguf
 
+# Qwen3.5 family: official Unsloth map translated to MXFP4/MXFP8
+mlx convert --input ./model --output ./model-unsloth-mxfp4 --quantize \
+  --q-recipe unsloth --q-mxfp --imatrix-path ./imatrix.gguf
+
 # Qwen3.6 with MTPLX-style MTP sidecar
 mlx convert \
   --input .cache/models/qwen3.6-27b \
@@ -151,14 +155,14 @@ Auto-detected from `config.json` when not specified:
 
 #### Quantization Recipes
 
-| Recipe      | Description                                     |
-| ----------- | ----------------------------------------------- |
-| `mixed_2_6` | 2-bit base, 6-bit sensitive layers              |
-| `mixed_3_4` | 3-bit base, 4-bit sensitive layers              |
-| `mixed_3_6` | 3-bit base, 6-bit sensitive layers              |
-| `mixed_4_6` | 4-bit base, 6-bit sensitive layers              |
-| `qwen3_5`   | Optimized for Qwen3.5 hybrid architecture       |
-| `unsloth`   | Unsloth Dynamic 2.0 (requires `--imatrix-path`) |
+| Recipe      | Description                                                            |
+| ----------- | ---------------------------------------------------------------------- |
+| `mixed_2_6` | 2-bit base, 6-bit sensitive layers                                     |
+| `mixed_3_4` | 3-bit base, 4-bit sensitive layers                                     |
+| `mixed_3_6` | 3-bit base, 6-bit sensitive layers                                     |
+| `mixed_4_6` | 4-bit base, 6-bit sensitive layers                                     |
+| `qwen3_5`   | Optimized for Qwen3.5 hybrid architecture                              |
+| `unsloth`   | Legacy affine, official MXFP/DGX maps with `--q-mxfp`/`--q-mode nvfp4` |
 
 #### Unsloth Recipe
 
@@ -172,21 +176,43 @@ mlx convert -i ./model -o ./model-q3 -q --q-bits 3 --q-recipe unsloth --imatrix-
 mlx convert -i ./model -o ./model-q4 -q --q-bits 4 --q-recipe unsloth --imatrix-path ./imatrix.gguf
 ```
 
+For verified Qwen3.5/Qwen3.6-family checkpoints, select the fixed [official
+Unsloth class map](https://unsloth.ai/docs/models/qwen3.6#nvfp4) with either
+`--q-mxfp` (NVFP4 → MXFP4, FP8 → MXFP8) or `--q-mode nvfp4` (the official DGX
+map, retaining NVFP4 and using MXFP8 for FP8 classes). AWQ imatrix pre-scaling
+is the same for both. Plain affine Unsloth alone keeps legacy Dynamic 2.0.
+
+```bash
+mlx convert -i ./model -o ./model-unsloth-mxfp4 -q \
+  --q-recipe unsloth --q-mxfp --imatrix-path ./imatrix.gguf
+
+mlx convert -i ./model -o ./model-unsloth-nvfp4 -q \
+  --q-recipe unsloth --q-mode nvfp4 --imatrix-path ./imatrix.gguf
+```
+
+The two official maps share the high-precision and BF16 classes:
+
+| Weight class                                                                     | `--q-mxfp` | `--q-mode nvfp4` |
+| -------------------------------------------------------------------------------- | ---------- | ---------------- |
+| FFN `gate_proj` / `up_proj` / `down_proj`, except the final 8 transformer layers | MXFP4 4/32 | NVFP4 4/16       |
+| Final 8 FFNs; attention q/k/v/o; GDN qkv/z/out; `lm_head`                        | MXFP8 8/32 | MXFP8 8/32       |
+| Embeddings; routers; GDN a/b; vision; MTP; norms; recurrent parameters           | BF16       | BF16             |
+
 Per-tensor bit assignments (N = `--q-bits`):
 
-| Weight                      | Bits | Rationale                                         |
-| --------------------------- | ---- | ------------------------------------------------- |
-| `gate_proj`, `up_proj`      | N    | Bulk of MoE expert params, safe at low bits       |
-| `down_proj`                 | N+1  | Slightly more sensitive than other FFN weights    |
-| `embed_tokens`              | N+2  | Very low KLD sensitivity (~0.15)                  |
-| `self_attn.q/k/v_proj`      | N+2  | AWQ-correctable via input_layernorm               |
-| `linear_attn.in_proj_qkv/z` | N+2  | AWQ-correctable via input_layernorm               |
-| `lm_head`                   | N+3  | Safest tensor (KLD ~0.05)                         |
-| Router gates                | 8    | Standard for MoE routing accuracy                 |
+| Weight                      | Bits     | Rationale                                                  |
+| --------------------------- | -------- | ---------------------------------------------------------- |
+| `gate_proj`, `up_proj`      | N        | Bulk of MoE expert params, safe at low bits                |
+| `down_proj`                 | N+1      | Slightly more sensitive than other FFN weights             |
+| `embed_tokens`              | N+2      | Very low KLD sensitivity (~0.15)                           |
+| `self_attn.q/k/v_proj`      | N+2      | AWQ-correctable via input_layernorm                        |
+| `linear_attn.in_proj_qkv/z` | N+2      | AWQ-correctable via input_layernorm                        |
+| `lm_head`                   | N+3      | Safest tensor (KLD ~0.05)                                  |
+| Router gates                | 8        | Standard for MoE routing accuracy                          |
 | `self_attn.o_proj`          | 8 affine | No preceding norm (not AWQ) — kept 8-bit for MTP/AR parity |
 | `linear_attn.out_proj`      | 8 affine | Worst tensor (KLD ~6.0) — kept 8-bit for MTP/AR parity     |
 | `linear_attn.in_proj_a/b`   | 8 affine | Split GDN low-rank projs — kept 8-bit for MTP/AR parity    |
-| GDN params (`A_log`, etc.)  | bf16     | Recurrent state params, errors compound over time         |
+| GDN params (`A_log`, etc.)  | bf16     | Recurrent state params, errors compound over time          |
 
 ## Examples
 

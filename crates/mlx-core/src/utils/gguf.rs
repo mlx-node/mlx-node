@@ -1102,6 +1102,22 @@ fn fixup_qwen35_linear_attn(
     Ok(())
 }
 
+/// GGUF has no HuggingFace `model_type`, so require both a known llama.cpp
+/// Qwen3.5 architecture tag and the characteristic mixed full-attention/GDN
+/// tensor shape before enabling the official Unsloth MXFP map. `qwen3` is kept
+/// for older Qwen3.5 writers; ordinary Qwen3 fails the weight-shape check.
+fn is_qwen35_hybrid_gguf(
+    metadata: &HashMap<String, GgufMetaValue>,
+    weight_keys: &[String],
+) -> bool {
+    let is_qwen35_arch = metadata
+        .get("general.architecture")
+        .and_then(|value| value.as_str())
+        .is_some_and(|arch| matches!(arch, "qwen35" | "qwen35moe" | "qwen3"));
+
+    is_qwen35_arch && crate::convert::has_qwen35_hybrid_weight_shape(weight_keys)
+}
+
 // ── Config Extraction ───────────────────────────────────────────────────────
 
 /// Extract HuggingFace-compatible config.json fields from GGUF metadata
@@ -1513,17 +1529,30 @@ pub async fn convert_gguf_to_safetensors(
             } else {
                 quant_group_size
             };
-            let predicate = crate::convert::build_predicate_for_recipe(
+            // Mirror the SafeTensors selector: verified Qwen hybrids use the
+            // official class map for both translated MXFP and DGX NVFP4;
+            // plain affine and ambiguous/non-Qwen inputs retain Dynamic 2.0.
+            let is_qwen35_hybrid = is_qwen35_hybrid_gguf(&gguf.metadata, &weight_keys);
+            let official_unsloth_kind = crate::convert::select_official_unsloth_recipe(
                 recipe,
-                &weight_keys,
-                quant_bits,
-                recipe_gs,
-            )
-            .map_err(Error::from_reason)?;
+                quant_mxfp,
+                &quant_mode_str,
+                is_qwen35_hybrid,
+            );
+            let predicate = match official_unsloth_kind {
+                Some(kind) => crate::convert::build_official_unsloth_recipe(&weight_keys, kind),
+                None => crate::convert::build_predicate_for_recipe(
+                    recipe,
+                    &weight_keys,
+                    quant_bits,
+                    recipe_gs,
+                )
+                .map_err(Error::from_reason)?,
+            };
             let predicate: Box<dyn Fn(&str) -> crate::convert::QuantDecision + Send + Sync> =
-                if quant_mxfp {
+                if quant_mxfp && official_unsloth_kind.is_none() {
                     crate::convert::apply_mxfp_upgrade(predicate, quant_bits)
-                } else if quant_mode_str == "nvfp4" {
+                } else if quant_mode_str == "nvfp4" && official_unsloth_kind.is_none() {
                     // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions
                     // to NVFP4 (group_size=16). Mutually exclusive with
                     // quant_mxfp, since --q-mxfp requires --q-mode affine.
@@ -2002,6 +2031,72 @@ mod tests {
             gguf_name_to_hf("blk.0.ssm_a"),
             "model.layers.0.linear_attn.A_log"
         );
+    }
+
+    fn qwen35_hybrid_test_keys() -> Vec<String> {
+        [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.1.linear_attn.in_proj_qkv.weight",
+            "model.layers.1.linear_attn.in_proj_z.weight",
+            "model.layers.1.linear_attn.out_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn official_unsloth_gguf_gate_requires_qwen35_arch_and_hybrid_shape() {
+        let keys = qwen35_hybrid_test_keys();
+        for arch in ["qwen35", "qwen35moe", "qwen3"] {
+            let metadata = HashMap::from([(
+                "general.architecture".to_string(),
+                GgufMetaValue::String(arch.to_string()),
+            )]);
+            let is_qwen35_hybrid = is_qwen35_hybrid_gguf(&metadata, &keys);
+            assert!(
+                is_qwen35_hybrid,
+                "{arch} plus the hybrid shape must select the official map"
+            );
+            assert_eq!(
+                crate::convert::select_official_unsloth_recipe(
+                    "unsloth",
+                    true,
+                    "affine",
+                    is_qwen35_hybrid,
+                ),
+                Some(crate::convert::OfficialUnslothRecipeKind::Mxfp)
+            );
+            assert_eq!(
+                crate::convert::select_official_unsloth_recipe(
+                    "unsloth",
+                    false,
+                    "nvfp4",
+                    is_qwen35_hybrid,
+                ),
+                Some(crate::convert::OfficialUnslothRecipeKind::Nvfp4)
+            );
+        }
+
+        for arch in ["gemma", "llama", "qwen3next"] {
+            let metadata = HashMap::from([(
+                "general.architecture".to_string(),
+                GgufMetaValue::String(arch.to_string()),
+            )]);
+            assert!(
+                !is_qwen35_hybrid_gguf(&metadata, &keys),
+                "non-Qwen3.5 arch {arch} must preserve the legacy upgrader"
+            );
+        }
+
+        let metadata = HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen35".to_string()),
+        )]);
+        assert!(!is_qwen35_hybrid_gguf(
+            &metadata,
+            &["model.layers.0.self_attn.q_proj.weight".to_string()]
+        ));
     }
 
     #[test]

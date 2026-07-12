@@ -2549,18 +2549,35 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             } else {
                 quant_group_size
             };
-            let predicate = build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
-                .map_err(Error::from_reason)?;
-            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> = if quant_mxfp {
-                apply_mxfp_upgrade(predicate, quant_bits)
-            } else if quant_mode == "nvfp4" {
-                // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to
-                // NVFP4 (group_size=16). Mutually exclusive with quant_mxfp,
-                // since --q-mxfp requires --q-mode affine.
-                apply_nvfp4_upgrade(predicate)
-            } else {
-                predicate
+            // Verified Qwen hybrids use Unsloth's official float class map:
+            // `--q-mxfp` translates FP8/NVFP4 to MXFP8/MXFP4, while
+            // `--q-mode nvfp4` preserves NVFP4 for the low FFN class and uses
+            // MXFP8 for the high class. This is not a mechanical rewrite of
+            // the legacy Dynamic 2.0 affine decisions.
+            // The official map is Qwen3.5/Qwen3.6-hybrid-specific. Gate on the
+            // input config (ground truth), the requested sanitizer family, and
+            // the sanitized weight shape. If any of those are unavailable or
+            // disagree, preserve the legacy family-agnostic upgrade wrappers.
+            let is_qwen35_hybrid =
+                is_qwen35_hybrid_checkpoint(&config, model_type.as_deref(), &weight_keys);
+            let official_unsloth_kind =
+                select_official_unsloth_recipe(recipe, quant_mxfp, &quant_mode, is_qwen35_hybrid);
+            let predicate = match official_unsloth_kind {
+                Some(kind) => build_official_unsloth_recipe(&weight_keys, kind),
+                None => build_predicate_for_recipe(recipe, &weight_keys, quant_bits, recipe_gs)
+                    .map_err(Error::from_reason)?,
             };
+            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+                if quant_mxfp && official_unsloth_kind.is_none() {
+                    apply_mxfp_upgrade(predicate, quant_bits)
+                } else if quant_mode == "nvfp4" && official_unsloth_kind.is_none() {
+                    // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to
+                    // NVFP4 (group_size=16). Mutually exclusive with quant_mxfp,
+                    // since --q-mxfp requires --q-mode affine.
+                    apply_nvfp4_upgrade(predicate)
+                } else {
+                    predicate
+                };
             // `--q-mtp split` (alias `drafter`) keeps the MTP head BF16 by
             // contract: the head is extracted into a standalone `mtp-drafter/`
             // directory below, and the on-disk drafter must NOT carry `.scales`
@@ -3966,6 +3983,206 @@ pub(crate) fn build_unsloth_recipe(
 
         // Everything else (ffn_gate_proj, ffn_up_proj, etc.) → default bits
         QuantDecision::Default
+    })
+}
+
+/// Collapse Qwen3.5 wrapper/text aliases to the converter's two sanitizer
+/// families. Qwen3.6 checkpoints intentionally use the same Qwen3.5 model
+/// families and loaders in this repository.
+fn qwen35_recipe_family(model_type: Option<&str>) -> Option<&'static str> {
+    match model_type {
+        Some("qwen3_5") | Some("qwen3_5_text") => Some("qwen3_5"),
+        Some("qwen3_5_moe") | Some("qwen3_5_moe_text") => Some("qwen3_5_moe"),
+        _ => None,
+    }
+}
+
+/// Require the characteristic hybrid Qwen3.5/Qwen3.6 tensor shape rather than
+/// trusting a caller-supplied model type alone. Both dense and MoE variants mix
+/// full attention with GatedDeltaNet layers; older Qwen3 and unrelated families
+/// do not have this combination.
+pub(crate) fn has_qwen35_hybrid_weight_shape(weight_keys: &[String]) -> bool {
+    let has_full_attention = weight_keys
+        .iter()
+        .any(|key| key.contains("self_attn.q_proj") && key.ends_with(".weight"));
+    let has_gdn_qkv = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.in_proj_qkv") && key.ends_with(".weight"));
+    let has_gdn_z = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.in_proj_z") && key.ends_with(".weight"));
+    let has_gdn_out = weight_keys
+        .iter()
+        .any(|key| key.contains("linear_attn.out_proj") && key.ends_with(".weight"));
+
+    has_full_attention && has_gdn_qkv && has_gdn_z && has_gdn_out
+}
+
+/// Verify a SafeTensors checkpoint from independent sources of truth: its own
+/// config family, the sanitizer family requested by the caller, and its
+/// sanitized tensor shape. Nested `text_config.model_type` supports VLM wrapper
+/// configs whose root model type is not itself the text family.
+fn is_qwen35_hybrid_checkpoint(
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> bool {
+    let config_family = qwen35_recipe_family(
+        config.get("model_type").and_then(|value| value.as_str()),
+    )
+    .or_else(|| {
+        qwen35_recipe_family(
+            config
+                .get("text_config")
+                .and_then(|value| value.get("model_type"))
+                .and_then(|value| value.as_str()),
+        )
+    });
+    let requested_family = qwen35_recipe_family(requested_model_type);
+
+    config_family.is_some()
+        && requested_family == config_family
+        && has_qwen35_hybrid_weight_shape(weight_keys)
+}
+
+/// Which official Unsloth float class map to emit. The two variants differ only
+/// in the early-FFN low format; their MXFP8 and BF16 tensor classes are shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OfficialUnslothRecipeKind {
+    /// Translate the official NVFP4 class to MLX MXFP4 (4/32).
+    Mxfp,
+    /// Preserve the official DGX NVFP4 class (4/16).
+    Nvfp4,
+}
+
+/// Select an official class map only for a verified Qwen3.5/Qwen3.6 hybrid
+/// checkpoint. Plain affine and non-Qwen/ambiguous inputs continue through the
+/// legacy Dynamic 2.0 predicate and its existing upgrade wrappers.
+pub(crate) fn select_official_unsloth_recipe(
+    recipe: &str,
+    quant_mxfp: bool,
+    quant_mode: &str,
+    is_qwen35_hybrid: bool,
+) -> Option<OfficialUnslothRecipeKind> {
+    if recipe != "unsloth" || !is_qwen35_hybrid {
+        return None;
+    }
+    if quant_mxfp {
+        Some(OfficialUnslothRecipeKind::Mxfp)
+    } else if quant_mode == "nvfp4" {
+        Some(OfficialUnslothRecipeKind::Nvfp4)
+    } else {
+        None
+    }
+}
+
+/// Build the official Unsloth float class map for Qwen3.5 hybrid models.
+///
+/// Selected for verified Qwen hybrids under either `--q-mxfp` (early FFNs use
+/// MXFP4) or `--q-mode nvfp4` (early FFNs use NVFP4). The existing
+/// [`build_unsloth_recipe`] remains unchanged for plain affine and as the safe
+/// fallback for non-Qwen/ambiguous inputs. AWQ pre-scaling is unchanged.
+///
+/// The language-model depth is inferred from the weight keys. FFNs in the final
+/// eight transformer layers use MXFP8; earlier FFNs use the selected MXFP4 or
+/// NVFP4 low format. Attention, GDN qkv/z/out, and lm_head use MXFP8 at every
+/// depth. Embeddings, router gates, split GDN a/b, vision, MTP, norms, and
+/// recurrent parameters remain BF16.
+pub(crate) fn build_official_unsloth_recipe(
+    weight_keys: &[String],
+    kind: OfficialUnslothRecipeKind,
+) -> Box<dyn Fn(&str) -> QuantDecision + Send + Sync> {
+    // Side modules can have their own `layers.N` namespace. Excluding them keeps
+    // a VLM/MTP layer index from shifting the language model's final-eight cut.
+    let num_layers = weight_keys
+        .iter()
+        .filter(|key| {
+            !is_mtp_key(key)
+                && !key.contains("vision_tower")
+                && !key.contains("visual.")
+                && !key.contains("vision_embedder")
+        })
+        .filter_map(|key| extract_layer_index(key))
+        .max()
+        .map(|max_layer| max_layer + 1)
+        .unwrap_or(0);
+    let final_eight_start = num_layers.saturating_sub(8);
+
+    Box::new(move |key: &str| -> QuantDecision {
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+        let mxfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "mxfp4".to_string(),
+        };
+        let nvfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 16,
+            mode: "nvfp4".to_string(),
+        };
+        let low_ffn = || match kind {
+            OfficialUnslothRecipeKind::Mxfp => mxfp4(),
+            OfficialUnslothRecipeKind::Nvfp4 => nvfp4(),
+        };
+
+        // Fail closed for side modules and embeddings, even when a nested key
+        // contains a projection name that would otherwise match below.
+        if is_mtp_key(key)
+            || key.contains("vision_tower")
+            || key.contains("visual.")
+            || key.contains("vision_embedder")
+            || key.contains("embed_tokens")
+            || key.contains("embedding.")
+        {
+            return QuantDecision::Skip;
+        }
+
+        // should_quantize() excludes lm_head family-wide, but Qwen3.5's head is
+        // mode-aware and the official MXFP map explicitly assigns it MXFP8.
+        if key.contains("lm_head") && key.ends_with(".weight") {
+            return mxfp8();
+        }
+
+        if !should_quantize(key, /* embed_quantizable */ false) {
+            return QuantDecision::Skip;
+        }
+
+        // Official map: routers and GDN low-rank a/b remain BF16.
+        if is_router_gate(key)
+            || key.contains("linear_attn.in_proj_a.")
+            || key.contains("linear_attn.in_proj_b.")
+        {
+            return QuantDecision::Skip;
+        }
+
+        let is_attention = key.contains("self_attn.q_proj")
+            || key.contains("self_attn.k_proj")
+            || key.contains("self_attn.v_proj")
+            || key.contains("self_attn.o_proj");
+        let is_gdn = key.contains("linear_attn.in_proj_qkv")
+            || key.contains("linear_attn.in_proj_z")
+            || key.contains("linear_attn.out_proj");
+        if is_attention || is_gdn {
+            return mxfp8();
+        }
+
+        // Covers dense MLPs, stacked routed experts (`switch_mlp`), raw expert
+        // spellings, and shared experts after either HF or GGUF sanitization.
+        let is_ffn = key.contains(".mlp.")
+            && (key.contains("gate_proj") || key.contains("up_proj") || key.contains("down_proj"));
+        if is_ffn {
+            return match extract_layer_index(key) {
+                Some(layer) if layer >= final_eight_start => mxfp8(),
+                Some(_) => low_ffn(),
+                None => QuantDecision::Skip,
+            };
+        }
+
+        QuantDecision::Skip
     })
 }
 
@@ -10939,6 +11156,368 @@ mod tests {
             predicate("model.layers.0.self_attn.q_proj.weight"),
             QuantDecision::Skip,
             "body attention proj must still quantize"
+        );
+    }
+
+    // ── official Unsloth MXFP/NVFP4 recipes ─────────────────────────
+
+    #[test]
+    fn official_unsloth_selector_is_exact() {
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", true),
+            Some(OfficialUnslothRecipeKind::Mxfp)
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", true),
+            Some(OfficialUnslothRecipeKind::Nvfp4)
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "affine", true),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", false),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", false),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("qwen3_5", true, "affine", true),
+            None
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("nvidia", true, "affine", true),
+            None
+        );
+    }
+
+    fn qwen35_hybrid_test_keys() -> Vec<String> {
+        [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.model.layers.1.mlp.gate_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn unsloth_mxfp_family_gate_accepts_dense_moe_and_vlm_wrappers() {
+        let keys = qwen35_hybrid_test_keys();
+        for (config, requested) in [
+            (serde_json::json!({ "model_type": "qwen3_5" }), "qwen3_5"),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3_5_moe",
+                    "text_config": { "model_type": "qwen3_5_moe_text" }
+                }),
+                "qwen3_5_moe",
+            ),
+            (
+                serde_json::json!({
+                    "model_type": "qwen3_5_vl",
+                    "text_config": { "model_type": "qwen3_5_text" }
+                }),
+                "qwen3_5",
+            ),
+        ] {
+            assert!(
+                is_qwen35_hybrid_checkpoint(&config, Some(requested), &keys),
+                "config={config}, requested={requested} must select the official map"
+            );
+        }
+    }
+
+    #[test]
+    fn unsloth_mxfp_family_gate_fails_closed_on_non_qwen_mismatch_or_missing_shape() {
+        let keys = qwen35_hybrid_test_keys();
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "gemma4" }),
+            Some("gemma4"),
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            Some("gemma4"),
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            None,
+            &keys,
+        ));
+        assert!(!is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "qwen3_5" }),
+            Some("qwen3_5"),
+            &["model.layers.0.self_attn.q_proj.weight".to_string()],
+        ));
+    }
+
+    #[test]
+    fn non_qwen_unsloth_mxfp_preserves_legacy_affine_only_head() {
+        let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(
+            &serde_json::json!({ "model_type": "gemma4" }),
+            Some("gemma4"),
+            &qwen35_hybrid_test_keys(),
+        );
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", true, "affine", is_qwen35_hybrid),
+            None
+        );
+
+        // This is the fallback used by both conversion entry points. In
+        // particular, Gemma4's affine-only lm_head must never become MXFP8.
+        let predicate = apply_mxfp_upgrade(build_unsloth_recipe(4, 64), 4);
+        assert_eq!(
+            predicate("language_model.lm_head.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsloth_mxfp_recipe_maps_40_layer_dense_and_vlm_keys() {
+        let weight_keys = [
+            "language_model.model.layers.0.mlp.gate_proj.weight",
+            "language_model.model.layers.31.mlp.down_proj.weight",
+            "language_model.model.layers.32.mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.down_proj.weight",
+            // Side-module depth must not alter the 40-layer LM boundary.
+            "language_model.model.mtp.layers.99.mlp.gate_proj.weight",
+            "vision_tower.layers.99.self_attn.q_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+
+        let mxfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 32,
+            mode: "mxfp4".to_string(),
+        };
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            for layer in [0, 31] {
+                let key = format!("language_model.model.layers.{layer}.mlp.{suffix}.weight");
+                assert_eq!(predicate(&key), mxfp4(), "{key} must be mxfp4");
+            }
+            for layer in [32, 39] {
+                let key = format!("language_model.model.layers.{layer}.mlp.{suffix}.weight");
+                assert_eq!(predicate(&key), mxfp8(), "{key} must be mxfp8");
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.0.self_attn.v_proj.weight",
+            "language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.lm_head.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8");
+        }
+
+        for key in [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+            "language_model.model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.0.input_layernorm.weight",
+            "language_model.model.layers.1.linear_attn.A_log",
+            "language_model.model.layers.1.linear_attn.dt_bias",
+            "language_model.model.mtp.layers.99.self_attn.q_proj.weight",
+            "vision_tower.layers.99.self_attn.q_proj.weight",
+            "visual.blocks.0.mlp.gate_proj.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_mxfp_recipe_maps_routed_and_shared_experts() {
+        let weight_keys = [
+            "language_model.model.layers.31.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.32.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.shared_expert.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Mxfp);
+
+        for family in ["switch_mlp", "experts", "shared_expert"] {
+            for suffix in ["gate_proj", "up_proj", "down_proj"] {
+                let early = format!("language_model.model.layers.31.mlp.{family}.{suffix}.weight");
+                assert_eq!(
+                    predicate(&early),
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 32,
+                        mode: "mxfp4".to_string(),
+                    },
+                    "{early} must be mxfp4"
+                );
+                let late = format!("language_model.model.layers.32.mlp.{family}.{suffix}.weight");
+                assert_eq!(
+                    predicate(&late),
+                    QuantDecision::Custom {
+                        bits: 8,
+                        group_size: 32,
+                        mode: "mxfp8".to_string(),
+                    },
+                    "{late} must be mxfp8"
+                );
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.32.mlp.gate.weight",
+            "language_model.model.layers.32.mlp.shared_expert_gate.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_nvfp4_recipe_uses_official_dgx_classes_and_invariants() {
+        let weight_keys = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.model.layers.31.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.32.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.39.mlp.shared_expert.down_proj.weight",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::Nvfp4);
+
+        let nvfp4 = || QuantDecision::Custom {
+            bits: 4,
+            group_size: 16,
+            mode: "nvfp4".to_string(),
+        };
+        let mxfp8 = || QuantDecision::Custom {
+            bits: 8,
+            group_size: 32,
+            mode: "mxfp8".to_string(),
+        };
+
+        for family in ["switch_mlp", "experts", "shared_expert"] {
+            for suffix in ["gate_proj", "up_proj", "down_proj"] {
+                let early = format!("language_model.model.layers.31.mlp.{family}.{suffix}.weight");
+                assert_eq!(predicate(&early), nvfp4(), "{early} must be nvfp4 4/16");
+                let late = format!("language_model.model.layers.32.mlp.{family}.{suffix}.weight");
+                assert_eq!(predicate(&late), mxfp8(), "{late} must be mxfp8 8/32");
+            }
+        }
+
+        for key in [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.0.self_attn.k_proj.weight",
+            "language_model.model.layers.0.self_attn.v_proj.weight",
+            "language_model.model.layers.0.self_attn.o_proj.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_qkv.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_z.weight",
+            "language_model.model.layers.1.linear_attn.out_proj.weight",
+            "language_model.lm_head.weight",
+        ] {
+            assert_eq!(predicate(key), mxfp8(), "{key} must be mxfp8 8/32");
+        }
+
+        for key in [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_a.weight",
+            "language_model.model.layers.1.linear_attn.in_proj_b.weight",
+            "language_model.model.layers.0.mlp.gate.weight",
+            "language_model.model.layers.0.input_layernorm.weight",
+            "language_model.model.layers.1.linear_attn.A_log",
+            "language_model.model.mtp.layers.0.self_attn.q_proj.weight",
+            "vision_tower.layers.0.self_attn.q_proj.weight",
+        ] {
+            assert_eq!(predicate(key), QuantDecision::Skip, "{key} must stay bf16");
+        }
+    }
+
+    #[test]
+    fn unsloth_plain_affine_predicate_remains_legacy_dynamic_map() {
+        let predicate = build_predicate_for_recipe("unsloth", &[], 4, 64)
+            .expect("legacy unsloth predicate must dispatch");
+        assert_eq!(
+            predicate("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        assert_eq!(
+            predicate("model.layers.0.linear_attn.in_proj_a.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn non_qwen_unsloth_nvfp4_fallback_remains_legacy_dynamic_map() {
+        assert_eq!(
+            select_official_unsloth_recipe("unsloth", false, "nvfp4", false),
+            None
+        );
+        let legacy = build_predicate_for_recipe("unsloth", &[], 4, 64)
+            .expect("legacy unsloth predicate must dispatch");
+        let predicate = apply_nvfp4_upgrade(legacy);
+
+        // Sensitive projections preserve the old 6/8-bit affine fallbacks.
+        assert_eq!(
+            predicate("model.layers.0.self_attn.q_proj.weight"),
+            QuantDecision::Custom {
+                bits: 6,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        assert_eq!(
+            predicate("model.layers.0.linear_attn.in_proj_a.weight"),
+            QuantDecision::Custom {
+                bits: 8,
+                group_size: 64,
+                mode: "affine".to_string(),
+            }
+        );
+        // The legacy 4-bit FFN default still upgrades to NVFP4.
+        assert_eq!(
+            predicate("model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string(),
+            }
         );
     }
 

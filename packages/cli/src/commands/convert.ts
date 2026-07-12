@@ -53,8 +53,17 @@ Quantization Arguments:
                         K%16!=0 layers fall back to 8-bit affine (or bf16)
                         with per-layer overrides. NOT mlx-lm-loadable.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
-                        Applies after the recipe predicate: any 8-bit affine
-                        decision becomes mxfp8, any 4-bit becomes mxfp4 — except
+                        With --q-recipe unsloth, selects the fixed official
+                        Qwen3.5 MXFP map: early FFNs=mxfp4; final eight FFNs,
+                        attention q/k/v/o, GDN qkv/z/out, and lm_head=mxfp8;
+                        embeddings, routers, GDN a/b, vision, MTP, norms, and
+                        recurrent tensors stay bf16. AWQ imatrix pre-scaling
+                        remains enabled. --q-bits/--q-group-size do not alter
+                        this fixed map.
+
+                        With other recipes (or no recipe), applies after the
+                        recipe predicate: any 8-bit affine decision becomes
+                        mxfp8, any 4-bit becomes mxfp4 — except
                         the recipe-pinned attention/GDN projections (o_proj /
                         out_proj / in_proj_a / in_proj_b), which stay 8-bit
                         affine. Requires --quantize and --q-mode affine
@@ -70,19 +79,18 @@ Quantization Arguments:
                         top-K expert routing, matching the Python mlx-lm
                         quant_predicate.
 
-                        Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp
-                        promotes mlp.gate_proj/up_proj to mxfp4 (q/k/v at 6-bit
-                        affine, down_proj at 5-bit affine, router gates at 8-bit
-                        affine, lm_head at 8-bit affine,
-                        o_proj/out_proj/in_proj_a/in_proj_b at 8-bit affine). At
-                        default --q-bits 3 only down_proj
-                        (4b -> mxfp4) gets the upgrade.
   --q-recipe <string>   Per-layer mixed-bit quantization recipe
                         Options: mixed_2_6, mixed_3_4, mixed_3_6, mixed_4_6, qwen3_5, unsloth, nvidia
                         "unsloth" defaults to 3-bit base (gate/up=3b, down=4b,
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" requires --imatrix-path for quality
+                        Add --q-mxfp for the official Qwen3.5 MXFP class map
+                        (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
+                        Use --q-mode nvfp4 for the official DGX map: early
+                        FFNs=nvfp4; final eight FFNs, attention/GDN high
+                        classes, and lm_head=mxfp8; the same protected classes
+                        stay bf16. Plain affine keeps legacy Dynamic 2.0.
                         "nvidia" is a data-free MXFP4 port of NVIDIA modelopt's
                         recipe (dense qwen3_5 + MoE qwen3_5_moe): FFN + lm_head
                         =mxfp4 4/32, attn q/k/v/o + GDN in_proj_qkv/z/out_proj
@@ -139,6 +147,7 @@ Examples:
   mlx convert -i .cache/models/qwen3.5-9b -o ./models/qwen35-recipe -q --q-recipe qwen3_5 -m qwen3_5
   mlx convert -i model-BF16.gguf -o ./models/awq-4bit -q --q-recipe unsloth --imatrix-path imatrix.gguf
   mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth -q --q-recipe unsloth --imatrix-path imatrix.gguf
+  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth-mxfp4 -q --q-recipe unsloth --q-mxfp --imatrix-path imatrix.gguf
 `);
 }
 
@@ -272,7 +281,7 @@ export async function run(argv: string[]) {
     // in_proj_a/in_proj_b at 8-bit affine for MTP/AR T=0 bit-exactness).
     // Based on Unsloth's per-tensor KLD analysis. Requires imatrix for AWQ correction
     // on the attention/SSM projections.
-    if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4') {
+    if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4' && !args['q-mxfp']) {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
     }
     if (quantRecipe === 'unsloth' && !args['imatrix-path']) {
@@ -321,6 +330,12 @@ export async function run(argv: string[]) {
   // produce an inconsistent checkpoint: top-level bits=3 but per-layer
   // overrides at bits=4 from apply_nvfp4_upgrade, with no failure surface).
   const effectiveQuantBits = quantBits ?? (quantMode === 'nvfp4' ? 4 : quantRecipe === 'unsloth' ? 3 : undefined);
+  const usesOfficialUnslothMxfp = quantRecipe === 'unsloth' && args['q-mxfp'];
+  const usesOfficialUnslothNvfp4 = quantRecipe === 'unsloth' && quantMode === 'nvfp4';
+  const officialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
+    `official Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4' : 'MXFP'} map (early FFN=${lowFormat}; final 8 FFN + attention/GDN/head=mxfp8; protected classes=bf16)`;
+  const requestedOfficialUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
+    `requested ${officialUnslothSummary(lowFormat)}; backend verifies Qwen family/shape`;
 
   // MXFP modes have strict bits/group_size invariants enforced by the MLX
   // backend. Surface the failure here rather than letting it bubble up as a
@@ -409,12 +424,18 @@ export async function run(argv: string[]) {
       const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
       const qBits = effectiveQuantBits || defaultBits;
       const qGs = quantGroupSize || defaultGs;
-      const qMxfpSuffix = args['q-mxfp']
-        ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-        : '';
-      console.log(
-        `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
-      );
+      if (usesOfficialUnslothMxfp) {
+        console.log(`Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth`);
+      } else if (usesOfficialUnslothNvfp4) {
+        console.log(`Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth`);
+      } else {
+        const qMxfpSuffix = args['q-mxfp']
+          ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+          : '';
+        console.log(
+          `Quantize:   ${qBits}-bit ${qMode} (group_size=${qGs})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}`,
+        );
+      }
     }
     if (imatrixPath) {
       console.log(`imatrix:    ${imatrixPath}`);
@@ -573,13 +594,23 @@ export async function run(argv: string[]) {
     const [defaultBits, defaultGs] = QUANT_MODE_DEFAULTS[qMode] ?? [4, 64];
     const qBits = effectiveQuantBits || defaultBits;
     const qGs = quantGroupSize || defaultGs;
-    const qMxfpSuffix = args['q-mxfp']
-      ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
-      : '';
     const qGsLabel = qMode === 'sym8' ? 'per-output-channel' : `group_size=${qGs}`;
-    console.log(
-      `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
-    );
+    if (usesOfficialUnslothMxfp) {
+      console.log(
+        `Quantize:   ${requestedOfficialUnslothSummary('mxfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
+      );
+    } else if (usesOfficialUnslothNvfp4) {
+      console.log(
+        `Quantize:   ${requestedOfficialUnslothSummary('nvfp4')}, recipe=unsloth${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
+      );
+    } else {
+      const qMxfpSuffix = args['q-mxfp']
+        ? ', --q-mxfp: eligible 8b->mxfp8/4b->mxfp4 (protected affine keys stay affine)'
+        : '';
+      console.log(
+        `Quantize:   ${qBits}-bit ${qMode} (${qGsLabel})${quantRecipe ? `, recipe=${quantRecipe}` : ''}${qMxfpSuffix}${quantMtp !== 'off' ? `, mtp=${quantMtp}` : ''}`,
+      );
+    }
   }
   if (imatrixPath) {
     console.log(`imatrix:    ${imatrixPath}`);

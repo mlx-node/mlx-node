@@ -20,7 +20,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test'
 vi.mock('@mlx-node/core', () => ({
   convertModel: vi.fn(async () => ({ numTensors: 0, numParameters: 0, outputPath: '', tensorNames: [] })),
   convertForeignWeights: vi.fn(() => ({})),
-  convertGgufToSafetensors: vi.fn(async () => ({})),
+  convertGgufToSafetensors: vi.fn(async () => ({
+    numTensors: 0,
+    numParameters: 0,
+    sourceFormat: 'gguf',
+    outputPath: '',
+    tensorNames: [],
+  })),
 }));
 
 import { convertModel, convertGgufToSafetensors } from '@mlx-node/core';
@@ -110,6 +116,195 @@ describe('mlx convert model-type auto-detection', () => {
     // unloadable.
     expect(await detectModelTypeFromConfig({ architectures: ['Gemma4UnifiedForConditionalGeneration'] })).toBe(
       'gemma4_unified',
+    );
+  });
+});
+
+describe('mlx convert Unsloth MXFP messaging', () => {
+  it('documents the official fixed map without the stale mechanical-upgrade recipe', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    await runConvert(['--help']);
+
+    const help = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(help).toContain('Qwen3.5 MXFP map: early FFNs=mxfp4');
+    expect(help).toContain('Use --q-mode nvfp4 for the official DGX map');
+    expect(help).toContain('Plain affine keeps legacy Dynamic 2.0');
+    expect(help).not.toContain('Recommended combo: --q-recipe unsloth --q-bits 4 --q-mxfp');
+  });
+
+  it('reports the requested DGX map and forwards it without replacing its NVFP4 FFNs', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const imatrixPath = join(tmp, 'imatrix.gguf_file');
+    writeFileSync(imatrixPath, '');
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+
+    await runConvert([
+      '--input',
+      tmp,
+      '--output',
+      join(tmp, 'out'),
+      '--model-type',
+      'qwen3_5',
+      '--quantize',
+      '--q-mode',
+      'nvfp4',
+      '--q-recipe',
+      'unsloth',
+      '--imatrix-path',
+      imatrixPath,
+    ]);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('requested official Unsloth DGX/NVFP4 map');
+    expect(logs).toContain('backend verifies Qwen family/shape');
+    expect(logs).toContain('early FFN=nvfp4');
+    expect(logs).toContain('final 8 FFN + attention/GDN/head=mxfp8');
+    expect(logs).not.toContain('early FFN=mxfp4');
+    expect(logs).not.toContain('Quantize:   official Unsloth DGX/NVFP4 map');
+    expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        quantBits: 4,
+        quantMode: 'nvfp4',
+        quantMxfp: false,
+        quantRecipe: 'unsloth',
+        imatrixPath,
+      }),
+    );
+  });
+
+  it('reports the requested MXFP map and forwards the selector to SafeTensors conversion', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const imatrixPath = join(tmp, 'imatrix.gguf_file');
+    writeFileSync(imatrixPath, '');
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'qwen3_5_moe' }));
+
+    await runConvert([
+      '--input',
+      tmp,
+      '--output',
+      join(tmp, 'out'),
+      '--model-type',
+      'qwen3_5_moe',
+      '--quantize',
+      '--q-recipe',
+      'unsloth',
+      '--q-mxfp',
+      '--imatrix-path',
+      imatrixPath,
+    ]);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('requested official Unsloth MXFP map');
+    expect(logs).toContain('backend verifies Qwen family/shape');
+    expect(logs).toContain('early FFN=mxfp4');
+    expect(logs).toContain('final 8 FFN + attention/GDN/head=mxfp8');
+    expect(logs).not.toContain('unsloth recipe defaults to 3-bit base');
+    expect(logs).not.toContain('eligible 8b->mxfp8/4b->mxfp4');
+    expect(logs).not.toContain('Quantize:   official Unsloth MXFP map');
+
+    expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        quantize: true,
+        quantRecipe: 'unsloth',
+        quantMxfp: true,
+        imatrixPath,
+      }),
+    );
+  });
+
+  it('preserves the generic --q-mxfp upgrade messaging for other recipes', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await runConvert([
+      '--input',
+      join(tmp, 'model'),
+      '--output',
+      join(tmp, 'out'),
+      '--model-type',
+      'qwen3_5',
+      '--quantize',
+      '--q-recipe',
+      'qwen3_5',
+      '--q-mxfp',
+    ]);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('eligible 8b->mxfp8/4b->mxfp4');
+    expect(logs).not.toContain('official Unsloth MXFP map');
+    expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
+      expect.objectContaining({ quantRecipe: 'qwen3_5', quantMxfp: true }),
+    );
+  });
+
+  it.each([
+    ['a non-Qwen config', { input: 'tmp', configModelType: 'lfm2', modelArgs: [] }],
+    [
+      'a non-Qwen config with a mismatched explicit Qwen override',
+      { input: 'tmp', configModelType: 'lfm2', modelArgs: ['--model-type', 'qwen3_5'] },
+    ],
+    ['an ambiguous input without a detected family', { input: 'missing', configModelType: undefined, modelArgs: [] }],
+    [
+      'an unverified explicit Qwen override',
+      { input: 'missing', configModelType: undefined, modelArgs: ['--model-type', 'qwen3_5'] },
+    ],
+  ])('does not claim the official map was applied for %s', async (_label, scenario) => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const imatrixPath = join(tmp, 'imatrix.gguf');
+    writeFileSync(imatrixPath, '');
+    if (scenario.configModelType) {
+      writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: scenario.configModelType }));
+    }
+
+    await runConvert([
+      '--input',
+      scenario.input === 'tmp' ? tmp : join(tmp, 'model'),
+      '--output',
+      join(tmp, 'out'),
+      ...scenario.modelArgs,
+      '--quantize',
+      '--q-recipe',
+      'unsloth',
+      '--q-mxfp',
+      '--imatrix-path',
+      imatrixPath,
+    ]);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('requested official Unsloth MXFP map');
+    expect(logs).toContain('backend verifies Qwen family/shape');
+    expect(logs).not.toContain('Quantize:   official Unsloth MXFP map');
+  });
+
+  it('marks a GGUF official-map selection as requested until the backend verifies its shape', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const imatrixPath = join(tmp, 'imatrix.gguf');
+    writeFileSync(imatrixPath, '');
+
+    await runConvert([
+      '--input',
+      ggufPath,
+      '--output',
+      join(tmp, 'out'),
+      '--quantize',
+      '--q-recipe',
+      'unsloth',
+      '--q-mxfp',
+      '--imatrix-path',
+      imatrixPath,
+    ]);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('requested official Unsloth MXFP map');
+    expect(logs).toContain('backend verifies Qwen family/shape');
+    expect(logs).not.toContain('Quantize:   official Unsloth MXFP map');
+    expect(vi.mocked(convertGgufToSafetensors)).toHaveBeenCalledWith(
+      expect.objectContaining({ quantRecipe: 'unsloth', quantMxfp: true, imatrixPath }),
     );
   });
 });
