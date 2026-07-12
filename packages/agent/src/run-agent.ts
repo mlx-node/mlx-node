@@ -2,8 +2,7 @@
  * `runAgent` — the boot shell that hands control to pi's `main()` with
  * the mlx provider and permission gate installed.
  *
- * Spike-proven boot contract (see
- * `packages/agent/spikes/spike-a-fake-provider.ts`):
+ * Spike-proven boot contract:
  * - The env vars below must be set BEFORE any runtime import of
  *   `@earendil-works/pi-coding-agent` (pi reads its config env at
  *   import/call time) — hence the dynamic import and the type-only
