@@ -48,6 +48,11 @@ export function LandingPage() {
         // overlay). So this only navigates into the chapter index.
         go('/chapters');
       }}
+      onOpenJSpace={() => {
+        // J-Space is a standalone tool with a single route — deliberately NOT
+        // locale-prefixed (there is no /zh/jspace), like /chat.
+        void navigate({ to: '/jspace', search: (prev) => prev });
+      }}
       errorBanner={errorBanner}
       hostedModelAvailable={hostedModelAvailable}
       modelReady={status === 'ready'}

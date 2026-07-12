@@ -155,6 +155,7 @@ export type UiStrings = {
     localPickerTitle: string;
     startLearning: string;
     learnHint: (n: number) => string;
+    jspaceLink: string;
     mascotAlt: string;
     builtWith: string;
     hostedOnVoid: string;
@@ -341,6 +342,7 @@ const EN: UiStrings = {
     localPickerTitle: 'Choose local model directory',
     startLearning: 'Start learning →',
     learnHint: (n) => `New to LLMs? Step through ${n} chapters that explain how this model actually works.`,
+    jspaceLink: 'Open J-Space — the layer-by-layer lens →',
     mascotAlt: 'Capybara mascot',
     builtWith: 'Built with',
     hostedOnVoid: 'Hosted on Void',
@@ -544,6 +546,7 @@ const ZH: UiStrings = {
     localPickerTitle: '选择本地模型目录',
     startLearning: '开始学习 →',
     learnHint: (n) => `第一次接触 LLM？跟着 ${n} 个章节一步步弄懂这个模型的真实工作原理。`,
+    jspaceLink: '打开 J-Space —— 逐层透视这个模型 →',
     mascotAlt: '水豚吉祥物',
     builtWith: '基于',
     hostedOnVoid: '托管于 Void',

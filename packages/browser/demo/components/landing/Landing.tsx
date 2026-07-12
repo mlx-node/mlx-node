@@ -7,6 +7,7 @@ export type LandingProps = {
   onLoad: () => void;
   onLocalModel: () => void;
   onStartLearning: () => void;
+  onOpenJSpace: () => void;
   errorBanner: string | null;
   hostedModelAvailable?: boolean | null;
   loadDisabled?: boolean;
@@ -24,6 +25,7 @@ export function Landing({
   onLoad,
   onLocalModel,
   onStartLearning,
+  onOpenJSpace,
   errorBanner,
   hostedModelAvailable = null,
   loadDisabled = false,
@@ -107,6 +109,10 @@ export function Landing({
           {ui.landing.startLearning}
         </button>
         <p className="landing-learn-hint">{ui.landing.learnHint(CHAPTERS.length)}</p>
+
+        <button type="button" className="landing-jspace-link" onClick={onOpenJSpace}>
+          {ui.landing.jspaceLink}
+        </button>
 
         {errorBanner && (
           <div className="error-banner" style={{ marginTop: 24 }}>

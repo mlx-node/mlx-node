@@ -378,6 +378,31 @@
     color: var(--text-dim);
     max-width: 320px;
   }
+  /* Secondary entry into the standalone J-Space tool — a quiet pink text link
+     below the course CTAs, so it reads as an advanced "bonus door", not a rival
+     to Load Model / Start learning. */
+  .landing-jspace-link {
+    margin-top: 16px;
+    font-family: var(--font-body);
+    font-size: 0.8rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: var(--book-pink);
+    background: transparent;
+    border: 0;
+    padding: 4px 6px;
+    cursor: pointer;
+    opacity: 0.85;
+    transition:
+      opacity 0.2s,
+      transform 0.2s;
+  }
+  .landing-jspace-link:hover {
+    opacity: 1;
+    transform: translateY(-1px);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
   .model-select-overlay {
     position: absolute;
     inset: 0;
@@ -417,6 +442,46 @@
   }
   .landing-footer .local-link:hover {
     color: var(--book-pink);
+  }
+
+  /* Short-viewport guard. The hero (.landing-content) is vertically centered in
+     .overlay-screen, while .landing-footer is pinned at bottom:24px OUTSIDE that
+     flow. On short viewports the centered hero grows tall enough that its bottom
+     (the J-Space bonus link) overlaps the pinned footer. The English hero starts
+     colliding below ~740px; the taller Chinese hero (2-line serif title) collides
+     up to ~800px — so the guard runs to 820px to clear the worst case with margin.
+     We compact the hero's vertical RHYTHM (margins) rather than shrink the serif
+     title, so the approved look is preserved — only the spacing tightens — and we
+     reserve a small footer band so the hero centers ABOVE the footer. Viewports
+     taller than 820px (incl. the design's home turf) never trigger this. */
+  @media (max-height: 820px) {
+    .landing-tag {
+      margin-bottom: 16px;
+    }
+    .landing-title {
+      margin-bottom: 10px;
+    }
+    .landing-sub {
+      margin-bottom: 12px;
+    }
+    .landing-void-ad {
+      margin-bottom: 18px;
+    }
+    .landing-specs {
+      margin-bottom: 18px;
+    }
+    .btn-start-learning {
+      margin-top: 14px;
+    }
+    .landing-learn-hint {
+      margin-top: 8px;
+    }
+    .landing-jspace-link {
+      margin-top: 10px;
+    }
+    .overlay-screen {
+      padding-bottom: 40px;
+    }
   }
 
   @media (max-width: 640px) {
