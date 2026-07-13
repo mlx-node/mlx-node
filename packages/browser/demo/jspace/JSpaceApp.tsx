@@ -8,7 +8,7 @@ import { readStoredLocale, type Locale } from '../lib/i18n';
 import { tokenize } from '../lib/tokenizer-client';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
-import { pinColor } from '../jlens-core/colors';
+import { DIVERGING_LEGEND_STOPS, pinColor } from '../jlens-core/colors';
 import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../jlens-core/jacobian-presets';
 import {
   applyPermalink,
@@ -27,6 +27,7 @@ import { ByLayerStrip } from './ByLayerStrip';
 import { composeAbort } from './compose-abort';
 import { isColdPrompt } from './cold-prompt';
 import { ByPosStrip } from './ByPosStrip';
+import { DivergenceGridCanvas } from './DivergenceGridCanvas';
 import { PinManager } from './PinManager';
 import { PromptTokens } from './PromptTokens';
 import { RankChart } from './RankChart';
@@ -106,6 +107,13 @@ const JSPACE_COPY = {
       'giza-continent': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Africa' (around rank 2, ℓ17–18) while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
       'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 2 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
     } as Record<string, string>,
+    divergence: {
+      toggle: 'Compare lenses',
+      eyebrow: 'Logit vs Jacobian · top-10 disagreement',
+      hint: 'Blue = the two lenses agree on the top-10 here; red = they disagree. Baked starters ship both readouts, so this compares them cell by cell.',
+      legendAgree: 'agree',
+      legendDisagree: 'disagree',
+    },
   },
   zh: {
     galleryLabel: '示例 · 无需模型',
@@ -135,6 +143,13 @@ const JSPACE_COPY = {
       'giza-continent': "微弱但真实：J-lens 在 ℓ17–18 附近以 rank 2 浮现出未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
       'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 2（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
     } as Record<string, string>,
+    divergence: {
+      toggle: '对比两种 lens',
+      eyebrow: 'logit lens 对 Jacobian · top-10 分歧',
+      hint: '蓝色 = 两种 lens 在这里的 top-10 一致；红色 = 不一致。烘焙好的示例同时带有两种读出，因此可以逐格对比。',
+      legendAgree: '一致',
+      legendDisagree: '分歧',
+    },
   },
 } as const;
 
@@ -397,6 +412,7 @@ export default function JSpaceApp() {
       setSelected(null);
       setHovered(null);
       setFocusCell(null); // new run → back to the "hover a cell" placeholder
+      setShowDivergence(false); // divergence is baked-only; a live run has no pair
       await runReadout(promptIds, pinsRef.current, mode, intent);
     } finally {
       setPreparing(false);
@@ -410,6 +426,7 @@ export default function JSpaceApp() {
     setSelected(null);
     setHovered(null);
     setFocusCell(null); // mode swap → back to the "hover a cell" placeholder
+    setShowDivergence(false); // a mode swap re-reads the frame; collapse the compare view
     // User diverged from any permalink-restored state — cancel the one-shot
     // restore so a later run does not resurrect a stale selection (F3).
     pendingSelRef.current = null;
@@ -571,6 +588,20 @@ export default function JSpaceApp() {
     }
     return { kind: 'skeleton', slice: null, pinned: [] };
   }, [liveResult, prompt, mode, starterSlug]);
+
+  // Both runs of the baked frame, for the divergence view (starter-only; free —
+  // the frame already ships .logit and .jacobian). Null for live/skeleton.
+  const divergencePair = React.useMemo(() => {
+    if (view.kind !== 'starter' || !isColdPrompt(prompt)) return null;
+    const frame = STARTERS[resolveStarterSlug(starterSlug)]!;
+    return {
+      logitSlice: buildLensSlice(reviveRun(frame.logit)),
+      jacSlice: buildLensSlice(reviveRun(frame.jacobian)),
+    };
+  }, [view.kind, prompt, starterSlug]);
+  const [showDivergence, setShowDivergence] = React.useState(false);
+  // Stable id for the legend's SVG <linearGradient> (one instance per app).
+  const divergenceGradId = React.useId();
 
   const editable = view.kind === 'live';
   const slice = view.slice;
@@ -977,6 +1008,63 @@ export default function JSpaceApp() {
               )}
             </div>
           </div>
+
+          {/* Compare lenses — baked-only logit↔Jacobian top-10 divergence field.
+              Starter-only: the frame ships BOTH .logit and .jacobian, so this
+              compares them cell by cell with no model. Ephemeral (not in the
+              permalink); the toggle resets on run / mode change. */}
+          {divergencePair ? (
+            <section className="jspace-panel space-y-3 p-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
+                  {copy.divergence.eyebrow}
+                </span>
+                <button
+                  type="button"
+                  aria-pressed={showDivergence}
+                  onClick={() => setShowDivergence((v) => !v)}
+                  className={[
+                    'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.16em] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                    showDivergence
+                      ? 'border-primary/50 bg-primary/10 text-primary'
+                      : 'border-border/70 bg-muted/40 text-[color:var(--text-dim)] hover:border-primary/40 hover:text-foreground',
+                  ].join(' ')}
+                >
+                  {copy.divergence.toggle}
+                </button>
+              </div>
+              {showDivergence ? (
+                <div className="space-y-3">
+                  <p className="max-w-[62ch] text-[12px] leading-relaxed text-[color:var(--text-dim)]">
+                    {copy.divergence.hint}
+                  </p>
+                  {/* Legend: agree (blue) → disagree (red), from DIVERGING_LEGEND_STOPS. */}
+                  <div className="flex items-center gap-2 text-[10px] text-[color:var(--text-dim)]">
+                    <span className="font-mono">{copy.divergence.legendAgree}</span>
+                    <svg viewBox="0 0 120 8" width={120} height={8} aria-hidden="true" className="rounded-sm">
+                      <defs>
+                        <linearGradient id={divergenceGradId} x1="0" y1="0" x2="1" y2="0">
+                          {DIVERGING_LEGEND_STOPS.map((s, i) => (
+                            <stop key={i} offset={s.offset} stopColor={s.color} />
+                          ))}
+                        </linearGradient>
+                      </defs>
+                      <rect x={0} y={0} width={120} height={8} rx={2} fill={`url(#${divergenceGradId})`} />
+                    </svg>
+                    <span className="font-mono">{copy.divergence.legendDisagree}</span>
+                  </div>
+                  <div className="overflow-hidden rounded-lg border border-border/60">
+                    <DivergenceGridCanvas
+                      logitSlice={divergencePair.logitSlice}
+                      jacSlice={divergencePair.jacSlice}
+                      selected={selected}
+                      onSelect={selectCell}
+                    />
+                  </div>
+                </div>
+              ) : null}
+            </section>
+          ) : null}
 
           {/* Pins + rank field + rank charts */}
           <div className="space-y-4">
