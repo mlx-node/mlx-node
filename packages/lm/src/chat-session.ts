@@ -111,6 +111,13 @@ import type { ChatStreamEvent } from './stream.js';
 const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
 
 /**
+ * Default resolved by the native shared chat engine when `maxNewTokens` is
+ * absent. Keep this in sync with `extract_chat_params()` in
+ * `crates/mlx-core/src/engine/params.rs`.
+ */
+const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
+
+/**
  * Stable, provider-neutral error raised before native inference when a
  * rendered prompt cannot fit in the model's physically available hot KV
  * window. The marker is intentionally the canonical string recognized by
@@ -1478,8 +1485,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * existing behavior.
    *
    * The returned config is a copy only when `maxNewTokens` needs clamping.
-   * An omitted output budget is made explicit because leaving it undefined
-   * would let a family preset request more tokens than the remaining window.
+   * An omitted output budget stays omitted when the native default fits; it is
+   * made explicit only when the remaining window is smaller than that default.
    */
   private async constrainToContextCapacity(messages: ChatMessage[], config: ChatConfig): Promise<ChatConfig> {
     if (typeof this.model.applyChatTemplate !== 'function' || typeof this.model.contextLimits !== 'function') {
@@ -1505,7 +1512,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     // generated tokens consume only N-1 additional KV positions.
     const maxOutput = capacity - promptTokens + 1;
     const requested = config.maxNewTokens;
-    const maxNewTokens = requested === undefined ? maxOutput : Math.min(requested, maxOutput);
+    if (requested === undefined) {
+      return maxOutput >= NATIVE_DEFAULT_MAX_NEW_TOKENS ? config : { ...config, maxNewTokens: maxOutput };
+    }
+    const maxNewTokens = Math.min(requested, maxOutput);
     return maxNewTokens === requested ? config : { ...config, maxNewTokens };
   }
 

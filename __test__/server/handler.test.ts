@@ -454,6 +454,51 @@ describe('createHandler', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
+    it('preserves the native output default when streaming preflight has room for it', async () => {
+      const model = Object.assign(
+        createMockStreamModel([
+          {
+            done: true,
+            text: 'ok',
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 100,
+            reasoningTokens: 0,
+            rawText: 'ok',
+          },
+        ]),
+        {
+          contextLimits: () => ({
+            trainedWindowTokens: 262_144,
+            effectiveWindowTokens: 4096,
+            pagedBlockCapacity: 256,
+            pagedBlockSize: 16,
+          }),
+          applyChatTemplate: vi.fn(() => new Uint32Array(100)),
+        },
+      );
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'hello',
+        stream: true,
+      });
+      const response = createMockRes();
+
+      await handler(req, response.res);
+      await response.waitForEnd();
+
+      expect(response.getStatus()).toBe(200);
+      const config = (model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as
+        | { maxNewTokens?: number }
+        | undefined;
+      expect(config?.maxNewTokens).toBeUndefined();
+    });
+
     it('commits initial SSE response events before a delayed first native stream event', async () => {
       let markEntered!: () => void;
       const entered = new Promise<void>((resolve) => {

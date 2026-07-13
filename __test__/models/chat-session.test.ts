@@ -3084,7 +3084,7 @@ describe('ChatSession', () => {
       expect(session.turns).toBe(0);
     });
 
-    it('makes an omitted output budget explicit on a continuation', async () => {
+    it('clamps the omitted native output default when the remaining window is smaller', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 128, 80));
 
@@ -3092,6 +3092,15 @@ describe('ChatSession', () => {
       await session.send('second');
 
       expect(mock.chatSessionContinue.mock.calls[0]?.[3]?.maxNewTokens).toBe(49);
+    });
+
+    it('preserves the native default when an omitted output budget fits', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 4096, 100));
+
+      await session.send('hello');
+
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBeUndefined();
     });
 
     it('rejects an oversized prompt before native allocation and preserves turn state', async () => {
