@@ -74,3 +74,34 @@ export function rankToScore(rank: number): number {
 export function readableInk(score: number): string {
   return score > 0.55 ? '#0b0b0f' : '#f5f5f5';
 }
+
+// Diverging blue→white→red ramp for divergence fills (0 = agree/calm, 1 = disagree/hot).
+const DIVERGING_STOPS: Array<[number, RGB]> = [
+  [0.0, [37, 99, 235]],   // blue-600  (agree)
+  [0.5, [241, 245, 249]], // slate-100 (neutral midpoint)
+  [1.0, [220, 38, 38]],   // red-600   (disagree)
+];
+
+function interpolateStops(stops: Array<[number, RGB]>, t: number): string {
+  const x = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    const [t1, c1] = stops[i]!;
+    if (x <= t1) {
+      const [t0, c0] = stops[i - 1]!;
+      const f = t1 === t0 ? 0 : (x - t0) / (t1 - t0);
+      return `rgb(${Math.round(c0[0] + (c1[0] - c0[0]) * f)}, ${Math.round(c0[1] + (c1[1] - c0[1]) * f)}, ${Math.round(c0[2] + (c1[2] - c0[2]) * f)})`;
+    }
+  }
+  const last = stops[stops.length - 1]![1];
+  return `rgb(${last[0]}, ${last[1]}, ${last[2]})`;
+}
+
+/** Diverging blue-white-red lookup for divergence scalars. `t` clamped to [0,1]. */
+export function divergingRamp(t: number): string {
+  return interpolateStops(DIVERGING_STOPS, t);
+}
+
+/** `stop-color` values for a left(agree)→right(disagree) legend gradient. */
+export const DIVERGING_LEGEND_STOPS: Array<{ offset: string; color: string }> = DIVERGING_STOPS.map(
+  ([t, [r, g, b]]) => ({ offset: `${Math.round(t * 100)}%`, color: `rgb(${r}, ${g}, ${b})` }),
+);
