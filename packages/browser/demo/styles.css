@@ -165,14 +165,19 @@
     visibility: visible;
     opacity: 1;
   }
-  /* When the chat shell is hidden (any non-/chat route, e.g. /jspace) it stays
-     mounted but visibility:hidden — a hidden backdrop-filter still forces a
-     full-viewport re-raster on every hover repaint (whole-page blink). Drop the
-     blur ONLY while hidden; the frosted glass returns the instant .visible is set. */
-  .chat-layer:not(.visible) .chat-header,
-  .chat-layer:not(.visible) .composer-frame {
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
+  /* Frosted glass lives ONLY on the visible chat shell (/chat). The shell stays
+     mounted but visibility:hidden on other routes (e.g. /jspace) to keep the
+     shared WebGPU worker alive — and a backdrop-filter on a hidden element STILL
+     forces a full-viewport re-raster on every hover repaint (whole-page blink).
+     So the blur is scoped to .visible here, NOT declared on the base .chat-header
+     / .composer-frame rules. (Overriding with `backdrop-filter: none` does NOT
+     work: the CSS minifier drops `none` as an initial-value no-op, so it never
+     ships — the blur must simply be absent while hidden, achieved by scoping.) */
+  .chat-layer.visible .chat-header {
+    backdrop-filter: blur(6px);
+  }
+  .chat-layer.visible .composer-frame {
+    backdrop-filter: blur(8px);
   }
   .app-shell {
     @apply flex flex-1 min-h-0 flex-col;
@@ -621,7 +626,8 @@
   .chat-header {
     @apply flex h-14 shrink-0 items-center gap-3 border-b px-5;
     background: rgba(27, 24, 32, 0.85);
-    backdrop-filter: blur(6px);
+    /* backdrop-filter lives on `.chat-layer.visible .chat-header` (see above) so
+       the hidden shell on /jspace carries no blur → no hover-repaint blink. */
   }
   .chat-avatar {
     width: 34px;
@@ -817,7 +823,8 @@
     @apply shrink-0 px-5 pb-4 pt-3;
     background: rgba(27, 24, 32, 0.92);
     border-top: 1px solid var(--border);
-    backdrop-filter: blur(8px);
+    /* backdrop-filter lives on `.chat-layer.visible .composer-frame` (see above)
+       so the hidden shell on /jspace carries no blur → no hover-repaint blink. */
   }
   .composer-card {
     background: rgba(255, 255, 255, 0.03);
