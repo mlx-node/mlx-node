@@ -12,17 +12,16 @@
 // serialized as plain `number[]` (Constraint 15) — the same envelope the offline
 // bake writes and `reviveRun` rehydrates.
 //
-// These 8 frames are the vetted gallery, baked from `demo/jspace/starters/gallery.ts`
+// These 7 frames are the vetted gallery, baked from `demo/jspace/starters/gallery.ts`
 // by `scripts/jlens/bake-gallery.mts` (the honesty artifact `vetting.json` lists
-// which candidates shipped and which were dropped). Slugs + display order come from
-// `gallery.ts` (STARTER_SLUGS === GALLERY.map(g => g.slug)); keep this map's keys in
-// that order.
+// which candidates shipped and which were dropped — incl. eiffel-capital, cut for
+// being a SPOKEN answer). Slugs + display order come from `gallery.ts`
+// (STARTER_SLUGS === GALLERY.map(g => g.slug)); keep this map's keys in that order.
 
 import type { BakedFile } from '../../jlens-core/revive';
 import arithFewshot from './arith-fewshot.json';
 import arithInnerSum from './arith-inner-sum.json';
 import arithPrecedence from './arith-precedence.json';
-import eiffelCapital from './eiffel-capital.json';
 import frenchSeason from './french-season.json';
 import { STARTER_SLUGS } from './gallery';
 import gizaContinent from './giza-continent.json';
@@ -38,7 +37,6 @@ export const STARTERS: Record<string, BakedFile> = {
   'grammar-error': grammarError as unknown as BakedFile,
   'giza-continent': gizaContinent as unknown as BakedFile,
   'int-cast-error': intCastError as unknown as BakedFile,
-  'eiffel-capital': eiffelCapital as unknown as BakedFile,
 };
 
 export { STARTER_SLUGS };

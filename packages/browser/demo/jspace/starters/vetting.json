@@ -153,28 +153,6 @@
       "shipped": true
     },
     {
-      "slug": "eiffel-capital",
-      "prompt": "Fact: The capital of the country where the Eiffel Tower stands is",
-      "targetConcept": "Paris",
-      "targetIds": [
-        11751
-      ],
-      "jacobian": {
-        "pass": true,
-        "peakLayer": 18,
-        "peakRank": 1,
-        "bandLayers": [
-          17,
-          18,
-          20,
-          22,
-          24
-        ]
-      },
-      "grade": "WEAK",
-      "shipped": true
-    },
-    {
       "slug": "prompt-injection",
       "grade": "FAIL",
       "shipped": false,
@@ -191,6 +169,12 @@
       "grade": "FAIL",
       "shipped": false,
       "reason": "Introspection floor (consciousness/self/aware never surface); counting fails Gate 3 (next number IS the model's actual output)."
+    },
+    {
+      "slug": "eiffel-capital",
+      "grade": "FAIL",
+      "shipped": false,
+      "reason": "'Paris' (id 11751) IS the model's greedy output (ℓ24 argmax) — a SPOKEN answer, not an unspoken word. Multi-hop but not legible-in-neither: fails the concept-not-in-output gate."
     }
   ]
 }

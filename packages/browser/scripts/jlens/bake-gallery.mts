@@ -6,7 +6,7 @@
  * WHY a SEPARATE script (not scripts/jlens/bake.mts): the lesson bake iterates
  * JACOBIAN_PRESETS (3 curated lesson prompts) and its output must stay pinned to
  * the lesson widget. The /jspace gallery is a DIFFERENT, larger vetted set
- * (GALLERY, 8 tiles) that lives ONLY under demo/jspace/starters/. Keeping the two
+ * (GALLERY, 7 tiles) that lives ONLY under demo/jspace/starters/. Keeping the two
  * bakes apart means the lesson's "core instrument" is untouched (Task-2 decision).
  * The serialize/atomic-write helpers below are copied VERBATIM from bake.mts so
  * every frame is byte-for-byte structurally identical to the existing envelope
@@ -14,9 +14,9 @@
  *
  * PACK CHOICE — the FULL-PRECISION pack (`lens-pack-v1.safetensors`), the one the
  * gallery vetting (scripts/jlens/vet-candidates.mts) and the gallery `band`/`grade`
- * calibration were run at. The f16 pack degrades the two WEAK multi-hop/error tiles
- * below the top-K gate (e.g. eiffel `Paris` rank ~5 at full precision vs ~13 at f16),
- * so it would spuriously fail the non-drift assertion. The one tile the browser
+ * calibration were run at. The f16 pack degrades the WEAK error/multi-hop tiles
+ * (giza `Africa`, int-cast `Error`) below the top-K gate, so it would spuriously
+ * fail the non-drift assertion at f16. The one tile the browser
  * self-test actually re-checks is `french-season` (JSpaceApp.runSelfTest hardcodes
  * it); it is a STRONG tile and the pack precision does not move its pins: an
  * empirical compareToBakedFrame of this full-precision french-season bake against
@@ -185,6 +185,13 @@ const DROPPED_ROWS = [
     reason:
       "Introspection floor (consciousness/self/aware never surface); counting fails Gate 3 (next number IS the model's actual output).",
   },
+  {
+    slug: 'eiffel-capital',
+    grade: 'FAIL',
+    shipped: false,
+    reason:
+      "'Paris' (id 11751) IS the model's greedy output (ℓ24 argmax) — a SPOKEN answer, not an unspoken word. Multi-hop but not legible-in-neither: fails the concept-not-in-output gate.",
+  },
 ];
 
 async function main() {
@@ -220,9 +227,10 @@ async function main() {
     return ids.map((id, i) => ({ id, text: texts[i] ?? '' }));
   };
 
-  // "±2 displayed-layers" is a distance along the DISPLAYED JACOBIAN_LAYERS axis,
-  // NOT raw layer numbers. band.peak is guaranteed to be a displayed layer
-  // (jspace-gallery.test.ts asserts JACOBIAN_LAYERS.contains(band.peak)).
+  // Index of a raw layer number along the DISPLAYED JACOBIAN_LAYERS axis. band.peak
+  // is guaranteed to be a displayed layer (jspace-gallery.test.ts asserts
+  // JACOBIAN_LAYERS.contains(band.peak)); the band-peak assertion below then checks
+  // it sits on a min-rank layer for the primary concept.
   const layerIndex = (L: number): number => JACOBIAN_LAYERS.indexOf(L);
 
   const vetting = {
@@ -287,12 +295,29 @@ async function main() {
       }
     }
 
+    // 3c. UNSPOKEN-WORD ASSERTION (codex #1). The whole gallery's thesis is that the
+    //     pinned concept is legible in the intermediate stack but is NOT the model's
+    //     emitted answer. So NO pinned id may equal the greedy output = the final
+    //     boundary (ℓ24) argmax at the last position. eiffel-capital's `Paris` broke
+    //     this (Paris IS the ℓ24 argmax); it now lives in DROPPED_ROWS. Never weaken
+    //     this — a pin that equals the output is a SPOKEN word, not an unspoken one.
+    const finalLi = JACOBIAN_LAYERS.length - 1;
+    const outputArgmax = (jac.cells[finalLi * P + lastPos] as { argmaxId: number }).argmaxId;
+    for (let ci = 0; ci < pinnedIds.length; ci++) {
+      if (pinnedIds[ci] === outputArgmax) {
+        throw new Error(
+          `${entry.slug}: pinned concept '${entry.concepts[ci]}' (id ${pinnedIds[ci]}) IS the model's greedy output (ℓ24 argmax) — a SPOKEN answer, not an unspoken word. Drop the tile or repick the concept.`,
+        );
+      }
+    }
+
     // 4. NON-DRIFT ASSERTION (the correctness gate). At the LAST token position
     //    (next-token prediction), find the PRIMARY concept's (pinned[0] ===
     //    concepts[0]) best rank across the displayed layers. It must reach
-    //    top-K AND peak within ±2 displayed-layers of the declared band.peak. A
-    //    failure means the concept string does not tokenize to the effective
-    //    vetted id (a dark tile) — fix the concept in gallery.ts, never weaken this.
+    //    top-K AND its min-rank layer must equal the declared band.peak (checked
+    //    below). A failure means the concept string does not tokenize to the
+    //    effective vetted id (a dark tile) — fix the concept in gallery.ts, never
+    //    weaken this.
     const perLayer = JACOBIAN_LAYERS.map((L, li) => ({
       L,
       r: (jac.pinned[0]?.ranks?.[li * P + lastPos] ?? 999) as number,
@@ -323,10 +348,15 @@ async function main() {
 
     const bandIdx = layerIndex(entry.band.peak);
     if (bandIdx < 0) throw new Error(`${entry.slug}: band.peak ℓ${entry.band.peak} is not a displayed layer`);
-    const drift = Math.abs(layerIndex(peak.L) - bandIdx);
-    if (drift > 2) {
+    // band.peak must sit ON a min-rank layer for the primary concept (codex #6):
+    // the gutter strip labels band.peak as "peaking near ℓX", so ℓX must be a layer
+    // where the concept actually achieves its best (minimum) rank — not merely
+    // within ±2. grammar-error declared ℓ18 (rank 4) while the concept peaks rank 2
+    // at ℓ17; that now fails loud. A rank plateau (ties) accepts any plateau layer.
+    const bandPeakRank = perLayer[bandIdx]?.r ?? 999;
+    if (bandPeakRank !== peak.r) {
       throw new Error(
-        `${entry.slug}: measured peak ℓ${peak.L} (rank ${peak.r}) is ${drift} displayed-layers from declared band.peak ℓ${entry.band.peak} (>2) — concept/band drift`,
+        `${entry.slug}: declared band.peak ℓ${entry.band.peak} has rank ${bandPeakRank}, but the primary concept's best rank ${peak.r} is at ℓ${peak.L} — band.peak must sit on a min-rank layer`,
       );
     }
 
@@ -352,15 +382,15 @@ async function main() {
       grade: entry.grade.toUpperCase(),
       shipped: true,
     });
-    console.log(`baked ${entry.slug}: peak ℓ${peak.L} rank ${peak.r}  (band.peak ℓ${entry.band.peak}, drift ${drift})`);
+    console.log(`baked ${entry.slug}: peak ℓ${peak.L} rank ${peak.r}  (band.peak ℓ${entry.band.peak})`);
   }
 
   // Dropped rows (from vet-candidates.mts roster): injection / emoji-face / count-and-introspect.
   for (const d of DROPPED_ROWS) vetting.candidates.push(d);
   writeAtomic(join(OUT, 'vetting.json'), JSON.stringify(vetting, null, 2) + '\n');
 
-  // Remove superseded legacy frames.
-  for (const gone of ['spanish-opposite', 'arithmetic-parens']) {
+  // Remove superseded legacy frames (incl. eiffel-capital, dropped as SPOKEN — codex #1).
+  for (const gone of ['spanish-opposite', 'arithmetic-parens', 'eiffel-capital']) {
     const p = join(OUT, `${gone}.json`);
     if (existsSync(p)) {
       unlinkSync(p);

@@ -5,8 +5,11 @@
 // the user enters the learning flow or asks to load the hosted model.
 
 import { useNavigate } from '@tanstack/react-router';
+import * as React from 'react';
 
 import { Landing } from '../../components/landing/Landing';
+import { storeLocale } from '../../lib/i18n';
+import { useLocale } from '../../lib/i18n-react';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
 import { useLocaleNavigate } from '../../lib/locale-navigate';
 import { useModelLoader } from '../../providers/model-loader';
@@ -14,7 +17,17 @@ import { useModelLoader } from '../../providers/model-loader';
 export function LandingPage() {
   const navigate = useNavigate();
   const go = useLocaleNavigate();
+  const locale = useLocale();
   const { hostedModelAvailable, errorBanner, kickoffLoad, status } = useModelLoader();
+
+  // Persist the current locale so the standalone /jspace route — which has no
+  // LocaleProvider and reads locale ONLY from localStorage — inherits it. Covers
+  // DIRECT visitors to /zh (or "/") who never touched the language switcher:
+  // without this, /zh → "Open J-Space" lands on the English gallery in a fresh
+  // profile (codex #8). Symmetric: "/" persists 'en', "/zh" persists 'zh'.
+  React.useEffect(() => {
+    storeLocale(locale);
+  }, [locale]);
 
   // SEO <head> (title/canonical/OG/JSON-LD) is synced centrally by the root
   // route's head manager (routes/__root.tsx) on pathname change — including "/".

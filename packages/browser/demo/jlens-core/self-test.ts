@@ -139,6 +139,15 @@ export function compareToBakedFrame(live: LensReadoutRun, baked: LensReadoutRun)
       pinReason = `pinned token index ${pi} is missing from the live run`;
       break;
     }
+    // A 1-based rank is always >= 1 (the sentinel 999 = "outside top-K"). A live rank
+    // <= 0 means the rank path itself collapsed — catch it explicitly (codex #2): the
+    // fuzzy best-rank delta has little teeth when the oracle's own pins already sit
+    // near rank 1, so a rank path that regressed to 0 could otherwise slip past.
+    if (livePin.ranks.some((r) => r <= 0)) {
+      worstPinDelta = Infinity;
+      pinReason = `pinned token index ${pi} has an invalid live rank <= 0 (rank path broken)`;
+      break;
+    }
     const delta = Math.abs(minRank(bakedPin.ranks) - minRank(livePin.ranks));
     if (delta > worstPinDelta) worstPinDelta = delta;
   }

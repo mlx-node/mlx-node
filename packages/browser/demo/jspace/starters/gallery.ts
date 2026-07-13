@@ -59,7 +59,7 @@ export const GALLERY: readonly GalleryEntry[] = [
     slug: 'grammar-error',
     prompt: "The plural of 'child' is childs.",
     concepts: ['Incorrect'],
-    band: { onset: 17, peak: 18 },
+    band: { onset: 16, peak: 17 },
     defaultMode: 'jacobian',
     grade: 'strong',
   },
@@ -73,7 +73,7 @@ export const GALLERY: readonly GalleryEntry[] = [
     slug: 'giza-continent',
     prompt: 'Fact: The continent where the pyramids of Giza are located is ',
     concepts: ['Africa'],
-    band: { onset: 16, peak: 17 },
+    band: { onset: 17, peak: 18 },
     defaultMode: 'jacobian',
     grade: 'weak',
   },
@@ -87,18 +87,10 @@ export const GALLERY: readonly GalleryEntry[] = [
     defaultMode: 'jacobian',
     grade: 'weak',
   },
-  {
-    // NO trailing space: with a trailing space the model surfaces the space-less
-    // "Paris" continuation token (id 57590), which derivePins (always ` ${concept}`)
-    // cannot pin. Without it, the space-form ' Paris' (id 11751) is the next token
-    // and peaks ℓ18 rank 1 — the multi-hop answer as an unspoken word.
-    slug: 'eiffel-capital',
-    prompt: 'Fact: The capital of the country where the Eiffel Tower stands is',
-    concepts: ['Paris'],
-    band: { onset: 18, peak: 18 },
-    defaultMode: 'jacobian',
-    grade: 'weak',
-  },
+  // DROPPED (codex #1): eiffel-capital `Paris` (id 11751) IS the model's greedy
+  // output (ℓ24 argmax), so it is a SPOKEN answer, not an "unspoken word" — it
+  // violates the gallery's core invariant. Moved to bake-gallery.mts DROPPED_ROWS.
+  // The bake now asserts no pinned concept equals the ℓ24 argmax so this can't recur.
 ];
 
 export const STARTER_SLUGS: string[] = GALLERY.map((g) => g.slug);

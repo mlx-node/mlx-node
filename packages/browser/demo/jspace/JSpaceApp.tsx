@@ -84,7 +84,7 @@ const JSPACE_COPY = {
       'french-season': 'French season', 'arith-inner-sum': 'Inner sum',
       'arith-precedence': 'Operator precedence', 'arith-fewshot': 'Few-shot sum',
       'grammar-error': 'Grammar error', 'giza-continent': 'Giza continent',
-      'int-cast-error': 'Bad int() cast', 'eiffel-capital': 'Eiffel capital',
+      'int-cast-error': 'Bad int() cast',
     } as Record<string, string>,
     galleryHooks: {
       'french-season': "Mid-stack the lens surfaces 'season' then 'summer' before the answer 'automne'.",
@@ -94,19 +94,17 @@ const JSPACE_COPY = {
       'grammar-error': "After 'childs', the judgment 'incorrect' surfaces — the correction never does.",
       'giza-continent': "Faint: the answer 'Africa' surfaces mid-stack while the real output is a degenerate '1'; the Egypt bridge hop never appears.",
       'int-cast-error': "Faint: a generic 'error' concept for int('hello') — never 'ValueError'.",
-      'eiffel-capital': "Faint: the answer 'Paris' surfaces; the France bridge hop never does.",
     } as Record<string, string>,
     bandNote: (onset: number, peak: number) =>
       `Legibility band: intermediate concepts start surfacing around ℓ${onset}, peaking near ℓ${peak}.`,
     blurbs: {
       'french-season': "Headline: mid-stack the J-lens surfaces the abstract concept ('season' near rank 1, 'summer' near rank 2, around boundaries 16-17) where the plain logit lens is still ranked 999+. A clean mid-band concept cluster. The target token is 'automne' (autumn).",
-      'arith-inner-sum': "Jacobian lens surfaces the unspoken inner sum '3' (1+2) at rank 2 by ℓ18, then the model correctly outputs 6. The logit lens shows '3' only at the final layer (rank 6). '3' is in neither the prompt nor the output.",
-      'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 0 around ℓ20, then the model answers 11. The logit lens buries '8' at rank 7 in the last layer only.",
-      'arith-fewshot': "The unspoken inner sum '5' (2+3) sits at rank 2 across ℓ20–23 in the Jacobian lens; the logit lens shows it only at the final layer. '5' appears in neither the prompt nor the output.",
-      'grammar-error': "After the error 'childs', both lenses raise the unspoken judgment 'incorrect' to rank 1–2 from ℓ17 — genuine error detection. Honest caveat: the correction 'children' never surfaces, only the flag.",
+      'arith-inner-sum': "Jacobian lens surfaces the unspoken inner sum '3' (1+2) at rank 3 by ℓ18, then the model correctly outputs 6. The logit lens shows '3' only at the final layer (rank 7). '3' is in neither the prompt nor the output.",
+      'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 1 around ℓ20, then the model answers 11. The logit lens buries '8' at rank 7 in the last layer only.",
+      'arith-fewshot': "The unspoken inner sum '5' (2+3) sits at rank 3 across ℓ20–22 in the Jacobian lens; the logit lens shows it only at the final layer. '5' appears in neither the prompt nor the output.",
+      'grammar-error': "After the error 'childs', the Jacobian lens raises the unspoken judgment 'Incorrect' to rank 2 at ℓ17 — genuine error detection. The plain logit lens buries that same token (rank ~20; only a lowercase variant surfaces there). Honest caveat: the correction 'children' never surfaces, only the flag.",
       'giza-continent': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Africa' (around rank 2, ℓ17–18) while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
-      'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 1 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
-      'eiffel-capital': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Paris' at rank 5–6 around ℓ18 while the model's real output is a degenerate '1'; the France bridge hop never appears. The logit lens shows nothing.",
+      'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 2 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
     } as Record<string, string>,
   },
   zh: {
@@ -115,7 +113,7 @@ const JSPACE_COPY = {
       'french-season': '法语·季节', 'arith-inner-sum': '内层求和',
       'arith-precedence': '运算优先级', 'arith-fewshot': '少样本求和',
       'grammar-error': '语法错误', 'giza-continent': '吉萨·大洲',
-      'int-cast-error': 'int() 转换错误', 'eiffel-capital': '埃菲尔·首都',
+      'int-cast-error': 'int() 转换错误',
     } as Record<string, string>,
     galleryHooks: {
       'french-season': "中间层 lens 先浮现 'season'，再是 'summer'，然后才是答案 'automne'。",
@@ -125,19 +123,17 @@ const JSPACE_COPY = {
       'grammar-error': "在 'childs' 之后，判断词 'incorrect' 浮现——但正确写法从未出现。",
       'giza-continent': "微弱：答案 'Africa' 在中间层浮现，而真实输出是退化的 '1'；埃及这一跳桥概念从未出现。",
       'int-cast-error': "微弱：int('hello') 只浮现出泛化的 'error'——从不是 'ValueError'。",
-      'eiffel-capital': "微弱：答案 'Paris' 浮现，但法国这一跳桥概念从未出现。",
     } as Record<string, string>,
     bandNote: (onset: number, peak: number) =>
       `可读性区间：中间概念大约从 ℓ${onset} 开始浮现，在 ℓ${peak} 附近达到峰值。`,
     blurbs: {
       'french-season': "标题示例：J-lens 在中间层浮现出抽象概念（'season' 接近 rank 1，'summer' 接近 rank 2，大约在边界 16-17），而普通的 logit lens 仍停留在 rank 999+。一个干净的中间层概念簇。目标 token 是 'automne'（autumn，秋天）。",
-      'arith-inner-sum': "J-lens 在 ℓ18 以 rank 2 浮现出未说出口的内层和 '3'（1+2），随后模型正确输出 6。logit lens 仅在最后一层（rank 6）显示 '3'。'3' 既不在 prompt 也不在输出中。",
-      'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 0 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 仅在最后一层把 '8' 埋在 rank 7。",
-      'arith-fewshot': "未说出口的内层和 '5'（2+3）在 J-lens 中横跨 ℓ20–23 稳定处于 rank 2；logit lens 仅在最后一层显示。'5' 既不在 prompt 也不在输出中。",
-      'grammar-error': "在错误的 'childs' 之后，两种 lens 都从 ℓ17 起把判断词 'incorrect' 抬到 rank 1–2——真实的错误检测。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
+      'arith-inner-sum': "J-lens 在 ℓ18 以 rank 3 浮现出未说出口的内层和 '3'（1+2），随后模型正确输出 6。logit lens 仅在最后一层（rank 7）显示 '3'。'3' 既不在 prompt 也不在输出中。",
+      'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 1 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 仅在最后一层把 '8' 埋在 rank 7。",
+      'arith-fewshot': "未说出口的内层和 '5'（2+3）在 J-lens 中横跨 ℓ20–22 稳定处于 rank 3；logit lens 仅在最后一层显示。'5' 既不在 prompt 也不在输出中。",
+      'grammar-error': "在错误的 'childs' 之后，J-lens 在 ℓ17 把未说出口的判断词 'Incorrect' 抬到 rank 2——真实的错误检测。普通 logit lens 把同一个 token 埋在 rank ~20（那里只浮现出小写变体）。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
       'giza-continent': "微弱但真实：J-lens 在 ℓ17–18 附近以 rank 2 浮现出未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
-      'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 1（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
-      'eiffel-capital': "微弱但真实：J-lens 在 ℓ18 附近以 rank 5–6 浮现出未说出口的答案 'Paris'，而模型真实输出是退化的 '1'；法国这一跳桥概念从未出现。logit lens 毫无显示。",
+      'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 2（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
     } as Record<string, string>,
   },
 } as const;
@@ -204,6 +200,15 @@ export default function JSpaceApp() {
   // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
   // clamped to that slice. Consumed once; later runs never re-apply it.
   const pendingSelRef = React.useRef<CellRef | null>(null);
+  // Monotonic "current user intent" token. handleRun / handleModeChange / openStarter
+  // each claim a fresh intent; their continuations, which resume AFTER an await on
+  // tokenize or the 46 MB Jacobian activation, bail if a later intent superseded them.
+  // Without this, clicking a gallery tile mid-run lets the older run's continuation
+  // dispatch its custom prompt and paint a LIVE frame OVER the starter grid the tile
+  // just opened — and the mode-change continuation could deref committedPromptIdsRef
+  // after openStarter nulled it (codex #4). Gallery tiles stay enabled (spec §4-B
+  // "always accessible"); this guard, not a disabled button, keeps them safe.
+  const runIntentRef = React.useRef(0);
 
   // -------------------------------------------------------------------------
   // Execution: single-flight lensReadout with the hard jacobianApplied guard.
@@ -328,11 +333,13 @@ export default function JSpaceApp() {
   // -------------------------------------------------------------------------
   // Dispatch a readout (single-flight). Jacobian runs activate first.
   // -------------------------------------------------------------------------
-  async function runReadout(promptIds: number[], pinsArr: number[], m: LensMode): Promise<void> {
+  async function runReadout(promptIds: number[], pinsArr: number[], m: LensMode, intent: number): Promise<void> {
     if (m === 'jacobian') {
       const trust = await ensureJacobianReady();
       if (trust === 'unavailable') return; // model/pack not ready — error already surfaced
+      if (runIntentRef.current !== intent) return; // a tile/run superseded us during the ~46 MB activation
     }
+    if (runIntentRef.current !== intent) return; // superseded before dispatch (openStarter cleared the view)
     committedPromptIdsRef.current = promptIds;
     await lensRun.run({
       promptIds,
@@ -345,6 +352,9 @@ export default function JSpaceApp() {
 
   async function handleRun(): Promise<void> {
     setRunError(null);
+    // Claim the current intent so a gallery tile clicked during the pre-dispatch
+    // `await tokenize` window supersedes this run instead of painting over the tile.
+    const intent = ++runIntentRef.current;
     // `preparing` guards the whole run — including the pre-dispatch `await tokenize`
     // window — so the mode toggle and a second run stay disabled until this settles.
     setPreparing(true);
@@ -379,10 +389,12 @@ export default function JSpaceApp() {
         setRunError(`Prompt is ${promptIds.length} tokens; the maximum is ${LENS_MAX_POSITIONS}. Trim it to run.`);
         return;
       }
+      // A gallery tile clicked while we awaited tokenize wins: skip painting this run.
+      if (runIntentRef.current !== intent) return;
       setSelected(null);
       setHovered(null);
       setFocusCell(null); // new run → back to the "hover a cell" placeholder
-      await runReadout(promptIds, pinsRef.current, mode);
+      await runReadout(promptIds, pinsRef.current, mode, intent);
     } finally {
       setPreparing(false);
     }
@@ -390,6 +402,7 @@ export default function JSpaceApp() {
 
   function handleModeChange(next: LensMode): void {
     if (next === mode) return;
+    const intent = ++runIntentRef.current;
     setMode(next);
     setSelected(null);
     setHovered(null);
@@ -397,17 +410,20 @@ export default function JSpaceApp() {
     // User diverged from any permalink-restored state — cancel the one-shot
     // restore so a later run does not resurrect a stale selection (F3).
     pendingSelRef.current = null;
-    const hasLiveRun = committedPromptIdsRef.current !== null;
+    // Capture the committed ids NOW: openStarter can null committedPromptIdsRef during
+    // the ensureJacobianReady await, so re-reading `.current!` inside the closure would
+    // deref null (codex #4). The intent guard in runReadout then drops the stale run.
+    const ids = committedPromptIdsRef.current;
     if (next === 'jacobian' && modelStatus === 'ready') {
       void (async () => {
         const trust = await ensureJacobianReady();
-        if (hasLiveRun && trust !== 'unavailable') {
-          await runReadout(committedPromptIdsRef.current!, pinsRef.current, next);
+        if (ids && trust !== 'unavailable') {
+          await runReadout(ids, pinsRef.current, next, intent);
         }
       })();
-    } else if (hasLiveRun) {
+    } else if (ids) {
       // → logit, or → jacobian while the model isn't loaded (shows baked starter).
-      void runReadout(committedPromptIdsRef.current!, pinsRef.current, next);
+      void runReadout(ids, pinsRef.current, next, intent);
     }
   }
 
@@ -420,6 +436,9 @@ export default function JSpaceApp() {
     (slug: string): void => {
       const entry = GALLERY.find((g) => g.slug === slug);
       if (!entry) return;
+      // Supersede any in-flight run/mode-change: their post-await continuations see a
+      // newer intent and bail instead of painting a live frame over this tile (codex #4).
+      runIntentRef.current++;
       setStarterSlug(slug);
       setPrompt(''); // cold → view.kind === 'starter'
       resetRun(); // drop any live frame (the memo prefers it otherwise)
@@ -444,7 +463,7 @@ export default function JSpaceApp() {
     setPins(next);
     setActivePinIdx(next.length - 1);
     const ids = committedPromptIdsRef.current;
-    if (ids) void runReadout(ids, next, mode);
+    if (ids) void runReadout(ids, next, mode, ++runIntentRef.current);
   }
 
   function removePin(id: number): void {
@@ -454,7 +473,7 @@ export default function JSpaceApp() {
     setPins(next);
     setActivePinIdx(next.length === 0 ? null : Math.min(activePinIdx ?? 0, next.length - 1));
     const ids = committedPromptIdsRef.current;
-    if (ids) void runReadout(ids, next, mode);
+    if (ids) void runReadout(ids, next, mode, ++runIntentRef.current);
   }
 
   // -------------------------------------------------------------------------
@@ -492,7 +511,12 @@ export default function JSpaceApp() {
     if (typeof window === 'undefined') return;
     const encoded = encodePermalink({ prompt, mode, pins, sel: selected });
     if (encoded === lastWrittenHashRef.current) return;
-    const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null && mode === DEFAULTS.mode;
+    // A cold starter view (no custom prompt, no pins, no deliberate selection) is
+    // "clean" in EITHER lens mode: opening a gallery tile flips mode to jacobian, but
+    // the tile's slug is NOT in the permalink schema, so writing `#p=&mode=j` would
+    // only ever restore the DEFAULT tile — a misleading dirty URL (codex #7). Treat
+    // any cold view as the shareable default so the launcher keeps the URL clean.
+    const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null;
     if (isColdDefault && (lastWrittenHashRef.current === null || lastWrittenHashRef.current === '')) return;
     lastWrittenHashRef.current = encoded;
     const url = `${window.location.pathname}${window.location.search}#${encoded}`;
