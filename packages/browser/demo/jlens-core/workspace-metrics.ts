@@ -92,18 +92,28 @@ export function topKSetStability(slice: LensSliceData, pos: number): number[] {
   return out;
 }
 
-/** The commit ("motor-flip") layer at `pos`: the LOWEST displayed layer index
- *  whose argmax equals the top layer's argmax AND stays equal for every layer
- *  above it. `layers−1` = the top guess only locks in at the final layer;
- *  `−1` for an empty slice. */
-export function motorFlipLayer(slice: LensSliceData, pos: number): number {
+/** The commit ("motor-flip") layer INDEX at `pos`: the lowest displayed-layer
+ *  index whose argmax equals the top layer's argmax AND stays equal at every
+ *  displayed layer above it.
+ *
+ *  Returns `null` when that top-anchored stable run is ONLY the top layer — i.e.
+ *  the output token is not the top guess at ANY displayed layer below the top.
+ *  That is a degenerate "no observed lock" case (the guess changed right before
+ *  the output), and it MUST be rendered distinctly, never as a late commit.
+ *  `null` also for a slice with fewer than two layers.
+ *
+ *  IMPORTANT: displayed layers are SAMPLED (baked frames skip e.g. 19/21/23), so
+ *  this measures stability AMONG the displayed layers — not proof of continuity
+ *  between them. The UI must say "among the displayed layers", not "through the
+ *  output". */
+export function motorFlipLayer(slice: LensSliceData, pos: number): number | null {
   const top = slice.layers.length - 1;
-  if (top < 0) return -1;
+  if (top < 1) return null;
   const target = slice.cellAt(top, pos).argmaxId;
   let flip = top;
   for (let l = top - 1; l >= 0; l--) {
     if (slice.cellAt(l, pos).argmaxId === target) flip = l;
     else break;
   }
-  return flip;
+  return flip < top ? flip : null; // only-the-top-layer run → no observed lock
 }

@@ -103,9 +103,27 @@ describe('workspace metrics', () => {
   it('motorFlipLayer: lowest top-anchored stable-argmax layer', () => {
     expect(metrics.motorFlipLayer(slice, 0)).toBe(1); // argmax 9 holds from L1 up
   });
-  it('motorFlipLayer: commits only at the top when the run never stabilizes early', () => {
+  it('motorFlipLayer: null when the run is ONLY the top layer (no observed lock, codex whole-branch)', () => {
+    // Output argmax 9 appears at no displayed layer below the top → degenerate.
+    // Must be null (rendered "no lock"), NOT the top index (a false late commit).
     const late = buildLensSlice({ ...run(), cells: [cell(5, [5], [1]), cell(6, [6], [1]), cell(9, [9], [1])] });
-    expect(metrics.motorFlipLayer(late, 0)).toBe(2); // only the top row equals the top argmax
+    expect(metrics.motorFlipLayer(late, 0)).toBeNull();
+    // A 1-layer slice also has no below-top evidence → null.
+    const one = buildLensSlice({
+      ...run(),
+      layers: [24],
+      cells: [cell(9, [9], [1])],
+      pinned: [{ tokenId: 9, tokenText: '9', ranks: Int32Array.from([1]) }],
+    });
+    expect(metrics.motorFlipLayer(one, 0)).toBeNull();
+  });
+  it('motorFlipLayer: committed french-season is all no-lock on sparse baked layers (codex whole-branch)', () => {
+    // Shipped baked frames sample only [6,8,10,12,14,16,17,18,20,22,24]; the output
+    // argmax usually first wins in the ℓ22→ℓ24 gap, so EVERY french-season position
+    // is a no-lock (null). This is exactly why the UI shows motor-flip on LIVE
+    // (contiguous 1..24) runs only, never on sparse baked starters.
+    const fs = buildLensSlice(reviveRun(STARTERS['french-season']!.jacobian));
+    for (let p = 0; p < fs.promptLen; p++) expect(metrics.motorFlipLayer(fs, p)).toBeNull();
   });
   it('does NOT export the impossible full-distribution metrics', () => {
     expect((metrics as Record<string, unknown>).excessKurtosis).toBeUndefined();
