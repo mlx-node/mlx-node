@@ -13,6 +13,30 @@ import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+// JSpaceApp renders a `<Link to="/">` back-link (@tanstack/react-router). This
+// harness mounts the component WITHOUT a RouterProvider, so useLinkProps derefs a
+// null router context and throws ('isServer'). The lens-grid/permalink behaviour
+// under test does not exercise navigation, so stub the incidental Link as a plain
+// <a> while preserving every other real export.
+vi.mock('@tanstack/react-router', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  const ReactMod = await import('react');
+  return {
+    ...actual,
+    Link: ({
+      to,
+      children,
+      // Drop router-only props so they don't leak onto the DOM <a> as invalid attrs.
+      search: _search,
+      params: _params,
+      activeProps: _activeProps,
+      inactiveProps: _inactiveProps,
+      ...rest
+    }: Record<string, unknown> & { to?: unknown; children?: React.ReactNode }) =>
+      ReactMod.createElement('a', { href: typeof to === 'string' ? to : '#', ...rest }, children),
+  };
+});
+
 import JSpaceApp, { layersFor } from '../../demo/jspace/JSpaceApp';
 import { ModelLoaderProvider, type ModelLoaderContextValue } from '../../demo/providers/model-loader';
 import { FreeChatProvider, type FreeChatContextValue } from '../../demo/providers/free-chat';
