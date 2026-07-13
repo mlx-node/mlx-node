@@ -12,8 +12,8 @@
 // therefore means "at or beyond the cap — off-scale / not surfaced", NOT an
 // exact rank. The UI must render 999 as an off-scale floor (RankChart already
 // does) and label the trajectory accordingly — never as an exact measurement.
-// `conceptTopKAccuracy` is unaffected: its threshold (10) sits far below the cap,
-// so a censored 999 correctly reads as "not in top-k".
+// `conceptTopKAccuracy` sidesteps the cap AND cutoff ties entirely: it reads
+// actual top-k SET membership from `topKIds`, not the rank track — see its doc.
 import type { LensSliceData } from './types';
 import { RANK_CAP, SURFACE_RANK } from './colors';
 
@@ -31,14 +31,27 @@ export function isCensoredRank(rank: number): boolean {
   return rank >= RANK_CAP;
 }
 
-/** FAITHFUL — per layer, 1 iff the concept sits within top-k. Label "concept in top-k". */
+/** FAITHFUL, exact — per layer, 1 iff the pinned concept is IN the shipped top-k
+ *  SET at `pos` (actual `topKIds` membership, NOT rank<=k). This is deliberate:
+ *  backend rank = 1 + count(logit > pinned), so tokens tied at the cutoff can
+ *  share rank k while being excluded from the selected top-k — a `rank<=k` test
+ *  then FALSE-POSITIVES (verified on the grammar-error starter at ℓ22, where the
+ *  pinned token has rank 10 yet is absent from the ten topKIds). Set membership is
+ *  unambiguous, so this pip is genuinely exact. `k` is clamped to the shipped
+ *  top-K width. */
 export function conceptTopKAccuracy(
   slice: LensSliceData,
   pinIdx: number,
   k = SURFACE_RANK,
   pos = slice.promptLen - 1,
 ): Array<0 | 1> {
-  return slice.layers.map((_, layerIdx) => (slice.rankAt(pinIdx, layerIdx, pos) <= k ? 1 : 0));
+  const tokenId = slice.pinned[pinIdx]?.tokenId;
+  if (tokenId == null) return slice.layers.map(() => 0);
+  return slice.layers.map((_, layerIdx) => {
+    const ids = slice.cellAt(layerIdx, pos).topKIds;
+    const topk = k >= ids.length ? ids : ids.slice(0, k);
+    return topk.includes(tokenId) ? 1 : 0;
+  });
 }
 
 /** PROXY (readout-space, top-10) — Shannon entropy (nats) of the visible probs.

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import * as metrics from '@/jlens-core/workspace-metrics';
 import { buildLensSlice } from '@/jlens-core/types';
+import { reviveRun } from '@/jlens-core/revive';
+import { STARTERS } from '@/jspace/starters';
 import type { LensCell, LensReadoutRun } from '@/../src/inspector-types';
 
 function cell(argmaxId: number, ids: number[], probs: number[]): LensCell {
@@ -36,17 +38,53 @@ describe('workspace metrics', () => {
     // returns it verbatim; isCensoredRank marks it so the UI renders it off-scale.
     const censored = buildLensSlice({
       ...run(),
+      // Cells consistent with the ranks: id 9 is absent from top-10 at L0 (rank 999)
+      // and L1 (rank 40), present at L2 (rank 1) — so membership matches [0,0,1].
+      cells: [
+        cell(5, [5, 1, 2], [0.9, 0.05, 0.05]),
+        cell(5, [5, 2, 3], [0.34, 0.33, 0.33]),
+        cell(9, [9, 5, 2], [0.34, 0.33, 0.33]),
+      ],
       pinned: [{ tokenId: 9, tokenText: '9', ranks: Int32Array.from([999, 40, 1]) }],
     });
     expect(metrics.conceptRankTrajectory(censored, 0)).toEqual([999, 40, 1]);
     expect(metrics.isCensoredRank(999)).toBe(true);
     expect(metrics.isCensoredRank(40)).toBe(false);
-    // top-k accuracy is unaffected: 999 is far above any sane k, so it reads "not in top-k".
+    // top-k accuracy reads set membership: id 9 surfaces only at L2.
     expect(metrics.conceptTopKAccuracy(censored, 0, 10)).toEqual([0, 0, 1]);
   });
-  it('conceptTopKAccuracy: 1 iff rank ≤ k', () => {
-    expect(metrics.conceptTopKAccuracy(slice, 0, 1)).toEqual([0, 1, 1]);
-    expect(metrics.conceptTopKAccuracy(slice, 0, 2)).toEqual([1, 1, 1]);
+  it('conceptTopKAccuracy: committed grammar-error ℓ22 is NOT a false positive (codex T4)', () => {
+    // Shipped data: at grammar-error.jacobian ℓ22 / final position, pinned
+    // ' Incorrect' (79034) has stored rank 10 but is ABSENT from the ten topKIds
+    // (a cutoff tie). A rank<=10 impl WOULD false-positive here; set membership
+    // must read 0. Guards the exact regression codex T4 found in committed data.
+    const g = buildLensSlice(reviveRun(STARTERS['grammar-error']!.jacobian));
+    expect(g.layers).toContain(22);
+    const li = g.layers.indexOf(22);
+    const pos = g.promptLen - 1;
+    expect(g.rankAt(0, li, pos)).toBe(10); // the stored rank a rank<=10 test would trust
+    expect(metrics.conceptTopKAccuracy(g, 0, 10)[li]).toBe(0); // membership: honest 0
+  });
+  it('conceptTopKAccuracy: 1 iff the concept is in the shipped top-k SET', () => {
+    // id 9 sits at index 1 in each cell's topKIds ([5,9,1] / [9,5,2] / [9,5,2]).
+    expect(metrics.conceptTopKAccuracy(slice, 0, 1)).toEqual([0, 1, 1]); // top-1: only L1/L2
+    expect(metrics.conceptTopKAccuracy(slice, 0, 2)).toEqual([1, 1, 1]); // top-2: all
+  });
+  it('conceptTopKAccuracy: tie-proof — a rank<=k token absent from topKIds reads 0 (codex T4)', () => {
+    // Backend rank ties at the cutoff, so a token can have rank<=k yet be excluded
+    // from the selected top-k. Membership over topKIds is the honest exact signal.
+    const tie = buildLensSlice({
+      ...run(),
+      // id 9 is ABSENT from L0's topKIds [5,1,2] but its stored rank is 5 (a cutoff tie).
+      cells: [
+        cell(5, [5, 1, 2], [0.5, 0.3, 0.2]),
+        cell(9, [9, 5, 2], [0.5, 0.3, 0.2]),
+        cell(9, [9, 5, 2], [0.5, 0.3, 0.2]),
+      ],
+      pinned: [{ tokenId: 9, tokenText: '9', ranks: Int32Array.from([5, 1, 1]) }],
+    });
+    // A rank<=10 impl would say [1,1,1]; set membership correctly says [0,1,1].
+    expect(metrics.conceptTopKAccuracy(tie, 0, 10)).toEqual([0, 1, 1]);
   });
   it('readoutEntropy: lower for peaked, higher for flat', () => {
     const peaked = metrics.readoutEntropy(slice, 0, 0);
