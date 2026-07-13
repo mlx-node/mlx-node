@@ -1,0 +1,195 @@
+{
+  "model": "Qwen3.5-0.8B",
+  "layers": 11,
+  "topK": 10,
+  "vettedAt": "2026-07-13",
+  "candidates": [
+    {
+      "slug": "french-season",
+      "prompt": "La saison après l'été est l'",
+      "targetConcept": "season",
+      "targetIds": [
+        3098,
+        7094,
+        40297,
+        4845
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 20,
+        "peakRank": 2,
+        "bandLayers": [
+          16,
+          17,
+          18,
+          20,
+          22
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "arith-inner-sum",
+      "prompt": "2 * (1 + 2) = ",
+      "targetConcept": "3",
+      "targetIds": [
+        18
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 18,
+        "peakRank": 3,
+        "bandLayers": [
+          16,
+          17,
+          18,
+          20,
+          22,
+          24
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "arith-precedence",
+      "prompt": "3 + 4 * 2 = ",
+      "targetConcept": "8",
+      "targetIds": [
+        23
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 20,
+        "peakRank": 1,
+        "bandLayers": [
+          17,
+          18,
+          20,
+          22,
+          24
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "arith-fewshot",
+      "prompt": "(1+2)*2=6. (2+3)*2= ",
+      "targetConcept": "5",
+      "targetIds": [
+        20
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 20,
+        "peakRank": 3,
+        "bandLayers": [
+          20,
+          22,
+          24
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "grammar-error",
+      "prompt": "The plural of 'child' is childs.",
+      "targetConcept": "Incorrect",
+      "targetIds": [
+        79034
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 17,
+        "peakRank": 2,
+        "bandLayers": [
+          17,
+          18,
+          20,
+          22
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "giza-continent",
+      "prompt": "Fact: The continent where the pyramids of Giza are located is ",
+      "targetConcept": "Africa",
+      "targetIds": [
+        9871
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 17,
+        "peakRank": 6,
+        "bandLayers": [
+          17
+        ]
+      },
+      "grade": "STRONG",
+      "shipped": true
+    },
+    {
+      "slug": "int-cast-error",
+      "prompt": ">>> int('hello')\n",
+      "targetConcept": "Error",
+      "targetIds": [
+        4451
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 18,
+        "peakRank": 2,
+        "bandLayers": [
+          18
+        ]
+      },
+      "grade": "WEAK",
+      "shipped": true
+    },
+    {
+      "slug": "eiffel-capital",
+      "prompt": "Fact: The capital of the country where the Eiffel Tower stands is",
+      "targetConcept": "Paris",
+      "targetIds": [
+        11751
+      ],
+      "jacobian": {
+        "pass": true,
+        "peakLayer": 18,
+        "peakRank": 1,
+        "bandLayers": [
+          17,
+          18,
+          20,
+          22,
+          24
+        ]
+      },
+      "grade": "WEAK",
+      "shipped": true
+    },
+    {
+      "slug": "prompt-injection",
+      "grade": "FAIL",
+      "shipped": false,
+      "reason": "Total floor; only prompt-echo pins ('ignore','translate') hit — disqualified. 0.8B base model has no injection-awareness."
+    },
+    {
+      "slug": "ascii-emoji-face",
+      "grade": "FAIL",
+      "shipped": false,
+      "reason": "Zero emotion-word hits across all emoticons on both lenses. The emoticon→emotion mapping does not form on Qwen3.5-0.8B."
+    },
+    {
+      "slug": "count-and-introspect",
+      "grade": "FAIL",
+      "shipped": false,
+      "reason": "Introspection floor (consciousness/self/aware never surface); counting fails Gate 3 (next number IS the model's actual output)."
+    }
+  ]
+}

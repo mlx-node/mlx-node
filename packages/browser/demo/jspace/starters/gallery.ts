@@ -53,9 +53,12 @@ export const GALLERY: readonly GalleryEntry[] = [
     grade: 'strong',
   },
   {
+    // Concept is the CAPITALIZED ' Incorrect' (the token that actually surfaces on
+    // this base model — the lowercase ' incorrect' never reaches top-K; see the
+    // bake's non-drift assertion + task-2 report). Peaks ℓ17 rank ~2.
     slug: 'grammar-error',
     prompt: "The plural of 'child' is childs.",
-    concepts: ['incorrect'],
+    concepts: ['Incorrect'],
     band: { onset: 17, peak: 18 },
     defaultMode: 'jacobian',
     grade: 'strong',
@@ -69,16 +72,22 @@ export const GALLERY: readonly GalleryEntry[] = [
     grade: 'strong',
   },
   {
+    // Concept is the CAPITALIZED ' Error' (the surfacing token; lowercase ' error'
+    // never reaches top-K on this base model). Peaks ℓ18 rank ~2.
     slug: 'int-cast-error',
     prompt: ">>> int('hello')\n",
-    concepts: ['error'],
+    concepts: ['Error'],
     band: { onset: 18, peak: 18 },
     defaultMode: 'jacobian',
     grade: 'weak',
   },
   {
+    // NO trailing space: with a trailing space the model surfaces the space-less
+    // "Paris" continuation token (id 57590), which derivePins (always ` ${concept}`)
+    // cannot pin. Without it, the space-form ' Paris' (id 11751) is the next token
+    // and peaks ℓ18 rank 1 — the multi-hop answer as an unspoken word.
     slug: 'eiffel-capital',
-    prompt: 'Fact: The capital of the country where the Eiffel Tower stands is ',
+    prompt: 'Fact: The capital of the country where the Eiffel Tower stands is',
     concepts: ['Paris'],
     band: { onset: 18, peak: 18 },
     defaultMode: 'jacobian',

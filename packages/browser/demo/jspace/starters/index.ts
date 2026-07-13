@@ -1,4 +1,4 @@
-// starters/index.ts — the model-free /jspace starter frames, as one typed map.
+// starters/index.ts — the model-free /jspace GALLERY frames, as one typed map.
 //
 // A COLD visitor to /jspace (no model, no permalink) sees a real argmax grid
 // built entirely from these committed baked frames — no Worker, no weight
@@ -10,25 +10,35 @@
 // from the shipped bundle. These JSON modules live in the SOURCE tree so Vite
 // bundles them and the starter grid ships to mlx.void.app. Typed arrays are
 // serialized as plain `number[]` (Constraint 15) — the same envelope the offline
-// bake writes (scripts/jlens/bake.mts) and `reviveRun` rehydrates.
+// bake writes and `reviveRun` rehydrates.
 //
-// These three files are seeded from the committed per-preset lesson bakes
-// (demo/learn/widgets/jlens/baked/<slug>.json — real GPU bakes with the exact
-// envelope). Gate C1 re-bakes them for /jspace via `bake.mts` (which now also
-// writes this directory); the shapes are identical either way.
+// These 8 frames are the vetted gallery, baked from `demo/jspace/starters/gallery.ts`
+// by `scripts/jlens/bake-gallery.mts` (the honesty artifact `vetting.json` lists
+// which candidates shipped and which were dropped). Slugs + display order come from
+// `gallery.ts` (STARTER_SLUGS === GALLERY.map(g => g.slug)); keep this map's keys in
+// that order.
 
-import arithmeticParensJson from './arithmetic-parens.json';
-import frenchSeasonJson from './french-season.json';
-import spanishOppositeJson from './spanish-opposite.json';
 import type { BakedFile } from '../../jlens-core/revive';
+import arithFewshot from './arith-fewshot.json';
+import arithInnerSum from './arith-inner-sum.json';
+import arithPrecedence from './arith-precedence.json';
+import eiffelCapital from './eiffel-capital.json';
+import frenchSeason from './french-season.json';
+import { STARTER_SLUGS } from './gallery';
+import gizaContinent from './giza-continent.json';
+import grammarError from './grammar-error.json';
+import intCastError from './int-cast-error.json';
 
-/** Starter frame per preset slug (keys === `JACOBIAN_PRESETS[].slug`). Display
- *  order = insertion order; french-season is the headline. */
+/** Starter frame per gallery slug (keys === `STARTER_SLUGS`, display order). */
 export const STARTERS: Record<string, BakedFile> = {
-  'french-season': frenchSeasonJson as unknown as BakedFile,
-  'spanish-opposite': spanishOppositeJson as unknown as BakedFile,
-  'arithmetic-parens': arithmeticParensJson as unknown as BakedFile,
+  'french-season': frenchSeason as unknown as BakedFile,
+  'arith-inner-sum': arithInnerSum as unknown as BakedFile,
+  'arith-precedence': arithPrecedence as unknown as BakedFile,
+  'arith-fewshot': arithFewshot as unknown as BakedFile,
+  'grammar-error': grammarError as unknown as BakedFile,
+  'giza-continent': gizaContinent as unknown as BakedFile,
+  'int-cast-error': intCastError as unknown as BakedFile,
+  'eiffel-capital': eiffelCapital as unknown as BakedFile,
 };
 
-/** Slugs in display order (drives the starter chip row). */
-export const STARTER_SLUGS: string[] = ['french-season', 'spanish-opposite', 'arithmetic-parens'];
+export { STARTER_SLUGS };
