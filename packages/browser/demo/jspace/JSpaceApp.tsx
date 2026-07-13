@@ -61,6 +61,16 @@ export function layersFor(mode: LensMode): number[] {
   return mode === 'jacobian' ? ALL_LAYERS : ALL_LAYERS;
 }
 
+// Pin ids for a baked gallery frame — model-free (the frame already carries them,
+// as SerializedPinned[] with a plain `tokenId`). At MODULE scope so it can seed the
+// `pins` useState. Prefer the jacobian run's pins (all vetted tiles open jacobian),
+// fall back to the logit run, then to no pins for an unknown slug.
+function pinsForSlug(slug: string): number[] {
+  const frame = STARTERS[slug];
+  const pinned = frame?.jacobian?.pinned ?? frame?.logit?.pinned ?? [];
+  return pinned.map((p) => p.tokenId);
+}
+
 /** Jacobian activation lifecycle: one-time pack load + silent self-test. */
 type JacState =
   | { status: 'idle' }
@@ -150,7 +160,10 @@ export default function JSpaceApp() {
   // ---- state --------------------------------------------------------------
   const [prompt, setPrompt] = React.useState('');
   const [mode, setMode] = React.useState<LensMode>(DEFAULTS.mode);
-  const [pins, setPins] = React.useState<number[]>([]);
+  // Seed the headline example's concept pins so first paint threads (and a later
+  // live run inherits them). The mount permalink-restore effect below overrides
+  // this: a real permalink wins with its own pins; a cold visit resets to [].
+  const [pins, setPins] = React.useState<number[]>(pinsForSlug(STARTER_SLUGS[0]!));
   const [activePinIdx, setActivePinIdx] = React.useState<number | null>(null);
   const [selected, setSelected] = React.useState<CellRef | null>(null);
   const [hovered, setHovered] = React.useState<CellRef | null>(null);
@@ -199,6 +212,14 @@ export default function JSpaceApp() {
   const jacActivationRef = React.useRef<Promise<'ok' | 'failed' | 'unavailable'> | null>(null);
   const hashAppliedRef = React.useRef(false);
   const lastWrittenHashRef = React.useRef<string | null>(null);
+  // The permalink WRITE effect's first invocation is always the mount pass, where
+  // the restore effect has already established the authoritative initial state and
+  // set `lastWrittenHashRef` to the incoming hash — so the write effect must not
+  // persist anything then. Skip that one pass: without it, `pins` is still the
+  // headline SEED (the restore effect's setPins hasn't reconciled within the same
+  // effect flush), so the cold-default skip below misfires and a fresh visit
+  // writes a spurious `#p=&mode=l` instead of keeping a clean URL.
+  const firstHashWriteRef = React.useRef(true);
   // A selection restored from a permalink onto a CUSTOM prompt can't render until
   // the reader runs (skeleton until then) and `handleRun` clears `selected` before
   // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
@@ -411,6 +432,32 @@ export default function JSpaceApp() {
     }
   }
 
+  // Open a baked gallery example: model-free, always available (even after the user
+  // typed a custom prompt). Blanks the prompt back to cold so the baked starter grid
+  // shows, drops any live frame (the view memo prefers it otherwise), opens in the
+  // tile's vetted lens, and seeds the concept pins. Clears the SAME selection/status
+  // state that handleRun + handleModeChange clear so no stale cell/verdict carries in.
+  const openStarter = React.useCallback(
+    (slug: string): void => {
+      const entry = GALLERY.find((g) => g.slug === slug);
+      if (!entry) return;
+      setStarterSlug(slug);
+      setPrompt(''); // cold → view.kind === 'starter'
+      resetRun(); // drop any live frame (the memo prefers it otherwise)
+      committedPromptIdsRef.current = null;
+      setMode(entry.defaultMode); // all vetted tiles open in jacobian
+      setPins(pinsForSlug(slug)); // pins are number[] (token ids) — no conversion
+      setActivePinIdx(null);
+      setSelected(null);
+      setHovered(null);
+      setFocusCell(null);
+      setTokenCount(null);
+      setRunError(null);
+      pendingSelRef.current = null; // cancel any pending permalink restore
+    },
+    [resetRun],
+  );
+
   // ---- pin editing (live runs only) ---------------------------------------
   function addPin(id: number): void {
     if (pins.length >= LENS_MAX_PINNED) return; // client-side cap, refuse the 9th
@@ -465,6 +512,11 @@ export default function JSpaceApp() {
   React.useEffect(() => {
     if (!hashAppliedRef.current) return;
     if (typeof window === 'undefined') return;
+    // Never persist the pre-restore mount transient (see firstHashWriteRef).
+    if (firstHashWriteRef.current) {
+      firstHashWriteRef.current = false;
+      return;
+    }
     const encoded = encodePermalink({ prompt, mode, pins, sel: selected });
     if (encoded === lastWrittenHashRef.current) return;
     const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null && mode === DEFAULTS.mode;
@@ -528,6 +580,14 @@ export default function JSpaceApp() {
     pinnedForView.forEach((p, i) => m.set(p.tokenId, pinColor(i)));
     return m;
   }, [pinnedForView]);
+
+  // Legibility band for the argmax grid gutter: only on the model-free baked
+  // starter in jacobian mode (the band is a per-example vetted claim about the
+  // BAKED frame; a live logit read or a custom prompt has no such band).
+  const band = React.useMemo(
+    () => (view.kind === 'starter' && mode === 'jacobian' && galleryEntry ? galleryEntry.band : null),
+    [view.kind, mode, galleryEntry],
+  );
 
   // labelOf for pins: read the display text from the current view's pinned track.
   const pinLabel = React.useCallback(
@@ -749,34 +809,49 @@ export default function JSpaceApp() {
         ) : null}
       </section>
 
-      {/* Starter chips — only under the model-free starter grid. */}
-      {view.kind === 'starter' ? (
-        <section className="space-y-2">
-          <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
-            Starter · no model needed
-          </span>
-          <div className="flex flex-wrap items-center gap-2">
-            <SegmentedToggle
-              value={starterSlug}
-              onChange={setStarterSlug}
-              ariaLabel="Starter preset"
-              wrap
-              options={STARTER_SLUGS.map((slug) => ({
-                value: slug,
-                label: (STARTERS[slug] as BakedFile).prompt,
-              }))}
-            />
-          </div>
-          {/* D1 — per-example blurb caption, bilingual (from JSPACE_COPY). Only
-              under the model-free starter grid; the empirical claim for the
-              selected example, kept honest (WEAK tiles say "Faint…"/"微弱…"). */}
-          {view.kind === 'starter' && galleryEntry ? (
-            <p className="max-w-[62ch] text-[12px] leading-relaxed text-[color:var(--text-dim)]">
-              {copy.blurbs[galleryEntry.slug]}
-            </p>
-          ) : null}
-        </section>
-      ) : null}
+      {/* Gallery launcher — ALWAYS available (model-free baked frames). Rendered
+          unconditionally so it persists after the user types a custom prompt; the
+          cards highlight only WHILE a starter is displayed (launcher, not mirror). */}
+      <section aria-labelledby="jspace-gallery" className="space-y-2">
+        <span
+          id="jspace-gallery"
+          className="font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]"
+        >
+          {copy.galleryLabel}
+        </span>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {STARTER_SLUGS.map((slug) => {
+            const active = view.kind === 'starter' && slug === starterSlug;
+            return (
+              <button
+                key={slug}
+                type="button"
+                aria-pressed={active}
+                onClick={() => openStarter(slug)}
+                className={[
+                  'rounded-lg border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                  active
+                    ? 'border-primary/50 bg-primary/10'
+                    : 'border-border/60 bg-card/30 hover:border-primary/40 hover:bg-primary/5',
+                ].join(' ')}
+              >
+                <span className="block font-display text-sm text-foreground">{copy.presetNames[slug] ?? slug}</span>
+                <span className="mt-0.5 block text-[11px] leading-snug text-[color:var(--text-dim)]">
+                  {copy.galleryHooks[slug]}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {/* D1 — per-example blurb caption, bilingual (from JSPACE_COPY). Only WHILE
+            the model-free starter grid is displayed; the empirical claim for the
+            selected example, kept honest (WEAK tiles say "Faint…"/"微弱…"). */}
+        {view.kind === 'starter' && galleryEntry ? (
+          <p className="max-w-[62ch] text-[12px] leading-relaxed text-[color:var(--text-dim)]">
+            {copy.blurbs[galleryEntry.slug]}
+          </p>
+        ) : null}
+      </section>
 
       {/* The main grid + panels */}
       {view.kind === 'skeleton' || !slice ? (
@@ -853,6 +928,7 @@ export default function JSpaceApp() {
                   onHover={setHovered}
                   onSelect={selectCell}
                   showWhitespace={showWhitespace}
+                  band={band}
                   ariaLabel={`Argmax grid: ${slice.layers.length} residual boundaries as rows (deepest on top) by ${slice.promptLen} prompt positions as columns.`}
                 />
               </div>
