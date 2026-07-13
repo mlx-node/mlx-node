@@ -3,6 +3,7 @@ import * as React from 'react';
 import { cleanupTokenText } from '../learn/inspector/TopKBars';
 import { RANK_CAP } from '../jlens-core/colors';
 import type { LensSliceData } from '../jlens-core/types';
+import { tintAlphaForRank } from './argmax-tint';
 import { CANVAS, CELL_H, CELL_W, GUTTER_W } from './canvas-theme';
 import { SR_ONLY, type CellRef } from './grid-a11y-shared';
 import { useCanvasGridA11y } from './useCanvasGridA11y';
@@ -77,6 +78,7 @@ export function ArgmaxGridCanvas({
   onSelect,
   showWhitespace,
   ariaLabel,
+  band,
 }: {
   slice: LensSliceData;
   /** argmax id → pin accent, for the "answer surfaces" tint. */
@@ -86,6 +88,10 @@ export function ArgmaxGridCanvas({
   onSelect: (ref: CellRef) => void;
   showWhitespace: boolean;
   ariaLabel: string;
+  /** Optional legibility band on the layer gutter: highlight rows whose layer
+   *  number falls in [onset, peak], with accent marks at the two endpoints.
+   *  Wired by JSpaceApp in a later task; null/undefined = no band drawn. */
+  band?: { onset: number; peak: number } | null;
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -202,10 +208,22 @@ export function ArgmaxGridCanvas({
         const layerIdx = rowOrder[r]!;
         const y = r * CELL_H;
         const cell = slice.cellAt(layerIdx, pos);
-        const accent = colorByPinnedId.get(cell.argmaxId);
-        if (accent) {
-          ctx.globalAlpha = 0.18; // pin accent, ~18% alpha
-          ctx.fillStyle = accent;
+        // Concept threading: tint by the BEST-ranked pinned token in this cell's
+        // top-K. topKIds is descending-logit, so the first hit is the strongest
+        // concept here. Argmax hit (rank 0) keeps the legacy 0.18 tint exactly.
+        let tintColor: string | undefined;
+        let hitRank = 0;
+        for (let k = 0; k < cell.topKIds.length; k++) {
+          const c = colorByPinnedId.get(cell.topKIds[k]!);
+          if (c) {
+            tintColor = c;
+            hitRank = k;
+            break; // strongest wins the cell
+          }
+        }
+        if (tintColor) {
+          ctx.globalAlpha = tintAlphaForRank(hitRank, cell.topKIds.length);
+          ctx.fillStyle = tintColor;
           ctx.fillRect(x, y, CELL_W, CELL_H);
           ctx.globalAlpha = 1;
         }
@@ -256,13 +274,25 @@ export function ArgmaxGridCanvas({
     ctx.moveTo(GUTTER_W + 0.5, 0);
     ctx.lineTo(GUTTER_W + 0.5, cssH);
     ctx.stroke();
-    ctx.fillStyle = CANVAS.inkMuted;
     ctx.textBaseline = 'middle';
+    const ACCENT = CANVAS.selectionRing;
     for (let r = 0; r < rowOrder.length; r++) {
       const layerIdx = rowOrder[r]!;
-      ctx.fillText(`ℓ${slice.layers[layerIdx]}`, CELL_PAD, r * CELL_H + CELL_H / 2);
+      const L = slice.layers[layerIdx]!;
+      // Legibility band: faint accent strip on the gutter inner edge for rows
+      // whose layer number is inside [onset, peak].
+      if (band && L >= band.onset && L <= band.peak) {
+        ctx.globalAlpha = 0.1;
+        ctx.fillStyle = ACCENT;
+        ctx.fillRect(GUTTER_W - 3, r * CELL_H, 3, CELL_H); // 3px inner-edge strip
+        ctx.globalAlpha = 1;
+      }
+      // Accent the two endpoint labels (onset / peak); keep others muted.
+      const isMark = !!band && (L === band.onset || L === band.peak);
+      ctx.fillStyle = isMark ? ACCENT : CANVAS.inkMuted;
+      ctx.fillText(`ℓ${L}`, CELL_PAD, r * CELL_H + CELL_H / 2);
     }
-  }, [slice, sel, colorByPinnedId, showWhitespace, scrollLeft, width, resizeTick]);
+  }, [slice, sel, colorByPinnedId, showWhitespace, scrollLeft, width, resizeTick, band]);
 
   function onScroll() {
     const el = scrollRef.current;
