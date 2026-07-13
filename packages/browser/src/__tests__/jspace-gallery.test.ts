@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { JACOBIAN_LAYERS } from '../../demo/jlens-core/jacobian-presets';
-import { STARTERS } from '../../demo/jspace/starters';
+import { resolveStarterSlug, STARTERS } from '../../demo/jspace/starters';
 import { GALLERY, STARTER_SLUGS } from '../../demo/jspace/starters/gallery';
 
 describe('GALLERY', () => {
@@ -53,6 +53,19 @@ describe('GALLERY', () => {
   });
   it('STARTERS registry keys equal STARTER_SLUGS in order', () => {
     expect(Object.keys(STARTERS)).toEqual(STARTER_SLUGS);
+  });
+  it('resolveStarterSlug clamps untrusted/inherited slugs to the default (codex round-3 #1)', () => {
+    // A crafted `#s=` permalink can carry ANY string. A bare `STARTERS[slug]` would
+    // resolve INHERITED keys — `toString`/`__proto__`/`constructor` return Object.prototype
+    // members instead of undefined, so a `?? default` fallback never fires and the render
+    // hands `reviveRun` a non-frame → crash. resolveStarterSlug must fall back to the default.
+    for (const evil of ['toString', '__proto__', 'constructor', 'valueOf', 'hasOwnProperty', 'nope', '', ' ']) {
+      expect(resolveStarterSlug(evil), `evil slug ${JSON.stringify(evil)}`).toBe(STARTER_SLUGS[0]);
+    }
+    expect(resolveStarterSlug(null)).toBe(STARTER_SLUGS[0]);
+    expect(resolveStarterSlug(undefined)).toBe(STARTER_SLUGS[0]);
+    // Every REAL tile resolves to itself (own key).
+    for (const slug of STARTER_SLUGS) expect(resolveStarterSlug(slug)).toBe(slug);
   });
   it('every baked starter frame is structurally sound (both runs, aligned shapes)', () => {
     for (const g of GALLERY) {

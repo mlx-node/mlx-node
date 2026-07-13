@@ -9,6 +9,7 @@
  * A permalink restores STATE. It never runs: auto-running would auto-download
  * 1.6 GB of weights for a stranger who clicked a link.
  */
+import { isColdPrompt } from '../jspace/cold-prompt';
 import { LENS_MAX_PINNED } from '../../src/inspector-types';
 
 export type LensMode = 'logit' | 'jacobian';
@@ -42,9 +43,12 @@ export function encodePermalink(s: JSpaceState): string {
   const parts = [`p=${encodeURIComponent(s.prompt.toWellFormed())}`, `mode=${s.mode === 'jacobian' ? 'j' : 'l'}`];
   // `s=` (the gallery tile) is meaningful ONLY for the cold starter view; a live
   // prompt renders its own read, so we omit it there to keep custom permalinks clean.
+  // Use the SAME `isColdPrompt` the render view and write gate consult — a bare
+  // `.trim() === ''` would treat a whitespace prompt as cold and put a hidden tile on
+  // the wire while the app renders it as custom content (the two must never diverge).
   // The write-effect's cold-default guard suppresses the whole hash when the tile AND
   // mode are the app defaults, so a fresh cold visit still gets an empty URL.
-  if (s.prompt.trim() === '' && s.starterSlug) parts.push(`s=${encodeURIComponent(s.starterSlug)}`);
+  if (isColdPrompt(s.prompt) && s.starterSlug) parts.push(`s=${encodeURIComponent(s.starterSlug)}`);
   // Never emit a wire value that `decodePermalink` reads back as different, valid
   // state: filter pins to non-negative safe ints BEFORE the cap, and omit `sel`
   // unless both coordinates are non-negative safe ints.
@@ -136,9 +140,10 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
     }
   }
 
-  // Gallery tile slug (cold view only). Any non-empty string is accepted; the app
-  // clamps an unknown slug to its default tile (`STARTERS[slug] ?? default`), so the
-  // codec stays gallery-agnostic. An empty `s=` decodes as absent (→ app default).
+  // Gallery tile slug (cold view only). Any non-empty string is accepted here so the
+  // codec stays gallery-agnostic; the APP clamps an untrusted slug to a real tile with
+  // `resolveStarterSlug` (own-property-safe — a bare `STARTERS[slug]` would resolve an
+  // inherited key like `__proto__`). An empty `s=` decodes as absent (→ app default).
   const starterSlug = params.get('s');
   if (starterSlug !== null && starterSlug !== '') out.starterSlug = starterSlug;
 

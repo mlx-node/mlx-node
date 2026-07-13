@@ -31,7 +31,7 @@ import { PinManager } from './PinManager';
 import { PromptTokens } from './PromptTokens';
 import { RankChart } from './RankChart';
 import { RankHeatmapCanvas } from './RankHeatmapCanvas';
-import { STARTERS, STARTER_SLUGS } from './starters';
+import { resolveStarterSlug, STARTERS, STARTER_SLUGS } from './starters';
 import { GALLERY } from './starters/gallery';
 import { useLensRun } from './useLensRun';
 
@@ -490,7 +490,10 @@ export default function JSpaceApp() {
     setPrompt(restored.prompt);
     setMode(restored.mode);
     setPins(restored.pins);
-    setStarterSlug(restored.starterSlug ?? STARTER_SLUGS[0]!); // a shared cold URL restores the exact tile (#2)
+    // A shared cold URL restores the exact tile (#2) — but `restored.starterSlug`
+    // is untrusted (`#s=` accepts any string), so CLAMP it to a real gallery tile.
+    // An inherited key like `s=__proto__` would otherwise poison the render lookup.
+    setStarterSlug(resolveStarterSlug(restored.starterSlug));
     setSelected(restored.sel); // renders immediately for a STARTER permalink (grid is present)
     pendingSelRef.current = restored.sel; // …and survives the first Run for a CUSTOM permalink
     setActivePinIdx(restored.pins.length > 0 ? 0 : null);
@@ -526,7 +529,18 @@ export default function JSpaceApp() {
       selected === null &&
       mode === DEFAULTS.mode &&
       starterSlug === DEFAULTS.starterSlug;
-    if (isColdDefault && (lastWrittenHashRef.current === null || lastWrittenHashRef.current === '')) return;
+    if (isColdDefault) {
+      // The full default cold view must leave the URL CLEAN. Actively STRIP any hash a
+      // prior non-default state wrote — not merely skip the write when already clean —
+      // so `cold → type a prompt → clear it` returns to a bare URL, not a lingering
+      // `#p=&mode=l&s=french-season` (codex round-3 #3). A fresh cold mount has an
+      // empty ref, so this writes nothing then.
+      if (lastWrittenHashRef.current) {
+        window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}`);
+      }
+      lastWrittenHashRef.current = '';
+      return;
+    }
     lastWrittenHashRef.current = encoded;
     const url = `${window.location.pathname}${window.location.search}#${encoded}`;
     window.history.replaceState(window.history.state, '', url);
@@ -547,7 +561,9 @@ export default function JSpaceApp() {
       return { kind: 'live', slice, pinned: liveResult.pinned };
     }
     if (isColdPrompt(prompt)) {
-      const frame = (STARTERS[starterSlug] ?? STARTERS['french-season']) as BakedFile;
+      // `resolveStarterSlug` guarantees an OWN key, so this can never resolve an
+      // inherited Object.prototype member (defense-in-depth beside the restore clamp).
+      const frame = STARTERS[resolveStarterSlug(starterSlug)]!;
       const run = mode === 'jacobian' ? frame.jacobian : frame.logit;
       const slice = buildLensSlice(reviveRun(run));
       return { kind: 'starter', slice, pinned: slice.pinned };

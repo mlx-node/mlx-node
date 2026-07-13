@@ -39,4 +39,16 @@ export const STARTERS: Record<string, BakedFile> = {
   'int-cast-error': intCastError as unknown as BakedFile,
 };
 
+/**
+ * Resolve a possibly-untrusted slug (e.g. from a shared `#s=` permalink) to a REAL
+ * gallery tile. `STARTERS` is a plain object, so a bare `STARTERS[slug]` lookup
+ * resolves INHERITED keys: `s=toString` / `s=__proto__` / `s=constructor` return
+ * `Object.prototype` members instead of `undefined`, so a `?? default` fallback
+ * never fires and the caller gets a non-frame that crashes `reviveRun` at render.
+ * `Object.hasOwn` accepts ONLY the map's own keys; anything else → the default tile.
+ */
+export function resolveStarterSlug(slug: string | null | undefined): string {
+  return slug != null && Object.hasOwn(STARTERS, slug) ? slug : STARTER_SLUGS[0]!;
+}
+
 export { STARTER_SLUGS };

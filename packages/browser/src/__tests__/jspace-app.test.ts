@@ -270,3 +270,30 @@ describe('rank charts — depth AND position axes both present (F5)', () => {
     expect(labels).toContain('prompt position');
   });
 });
+
+// -- codex round-3: untrusted `#s=` slug + clean-hash-on-return-to-default ----
+describe('permalink hardening (codex round-3)', () => {
+  it('a crafted inherited-key slug (#s=__proto__) renders the default starter, not a crash', async () => {
+    // Pre-fix: STARTERS['__proto__'] resolved an Object.prototype member (truthy, so the
+    // `?? default` never fired) → reviveRun read `.cells` of a non-frame and THREW during
+    // render. resolveStarterSlug must clamp the untrusted slug to the default tile.
+    mountApp('#p=&s=__proto__');
+    await tick();
+    await waitFor(() => gridCanvas() !== null); // renders the starter grid, no throw
+    expect(gridCanvas()).not.toBeNull();
+  });
+
+  it('cold → custom prompt → clear leaves a CLEAN url (strips the lingering hash)', async () => {
+    mountApp(''); // full default cold view → clean url
+    await tick();
+    await waitFor(() => gridCanvas() !== null);
+
+    setPromptText('hello world'); // custom prompt → the write effect dirties the hash
+    await waitFor(() => window.location.hash !== '');
+    expect(window.location.hash).not.toBe('');
+
+    setPromptText(''); // back to the FULL default → hash must be stripped, not left as #s=…
+    await waitFor(() => window.location.hash === '');
+    expect(window.location.hash).toBe('');
+  });
+});

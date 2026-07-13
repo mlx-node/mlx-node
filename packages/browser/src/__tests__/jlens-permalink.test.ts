@@ -227,11 +227,13 @@ describe('starterSlug — the cold gallery tile on the wire (re-review #2)', () 
     expect(new URLSearchParams(live).has('s')).toBe(false);
   });
 
-  it('treats a whitespace-only prompt as cold and still emits s=', () => {
-    // The write-effect's cold guard uses isColdPrompt (whitespace === cold); the codec
-    // agrees via trim() so the two never disagree about whether to carry the tile.
+  it('does NOT emit s= for a whitespace-only prompt (whitespace is CONTENT, not cold)', () => {
+    // The codec's cold gate is the shared `isColdPrompt` (exactly-empty), NOT `.trim()`.
+    // A whitespace prompt renders as a custom skeleton in the app, so putting a hidden
+    // tile on its wire would let a later "clear" expose the sender's stale tile — the
+    // two predicates must never diverge (jspace-cold-prompt.test asserts the app side).
     const ws = encodePermalink({ prompt: '   ', mode: 'logit', pins: [], sel: null, starterSlug: 'giza-continent' });
-    expect(new URLSearchParams(ws).get('s')).toBe('giza-continent');
+    expect(new URLSearchParams(ws).has('s')).toBe(false);
   });
 
   it('omits s= when a cold state has no starterSlug (optional field absent)', () => {
