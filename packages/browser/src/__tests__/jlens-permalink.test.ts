@@ -210,3 +210,67 @@ describe('applyPermalink overlay', () => {
     });
   });
 });
+
+// starterSlug (the cold gallery tile) is the ONLY field that is meaningful just for
+// a cold/empty-prompt view. It rides the wire ONLY there, so a shared cold URL
+// restores the exact tile the sender saw (codex re-review #2). A live/custom prompt
+// carries no tile — the field is genuinely absent, mirroring `pins:[]` / `sel:null`.
+describe('starterSlug — the cold gallery tile on the wire (re-review #2)', () => {
+  it('encodes s=<slug> ONLY for a cold (empty-prompt) state', () => {
+    const cold = encodePermalink({ prompt: '', mode: 'logit', pins: [], sel: null, starterSlug: 'giza-continent' });
+    expect(new URLSearchParams(cold).get('s')).toBe('giza-continent');
+  });
+
+  it('OMITS s= for a live (non-empty-prompt) state even when a slug is set', () => {
+    // A custom read replaces the tile, so the tile is irrelevant — keep custom links clean.
+    const live = encodePermalink({ prompt: 'hello', mode: 'logit', pins: [], sel: null, starterSlug: 'giza-continent' });
+    expect(new URLSearchParams(live).has('s')).toBe(false);
+  });
+
+  it('treats a whitespace-only prompt as cold and still emits s=', () => {
+    // The write-effect's cold guard uses isColdPrompt (whitespace === cold); the codec
+    // agrees via trim() so the two never disagree about whether to carry the tile.
+    const ws = encodePermalink({ prompt: '   ', mode: 'logit', pins: [], sel: null, starterSlug: 'giza-continent' });
+    expect(new URLSearchParams(ws).get('s')).toBe('giza-continent');
+  });
+
+  it('omits s= when a cold state has no starterSlug (optional field absent)', () => {
+    const noSlug = encodePermalink({ prompt: '', mode: 'logit', pins: [], sel: null });
+    expect(new URLSearchParams(noSlug).has('s')).toBe(false);
+  });
+
+  it('decodes s=<slug> into starterSlug; an empty or absent s= decodes as ABSENT', () => {
+    expect(decodePermalink('p=&s=giza-continent').starterSlug).toBe('giza-continent');
+    // Empty value → absent own-property (→ app default tile), never a present ''.
+    expect(Object.hasOwn(decodePermalink('p=&s='), 'starterSlug')).toBe(false);
+    // No s= at all → absent.
+    expect(Object.hasOwn(decodePermalink('p=hi'), 'starterSlug')).toBe(false);
+  });
+
+  it('applyPermalink restores the shared cold tile from s=', () => {
+    const defaults: JSpaceDefaults = { mode: 'logit', pins: [], sel: null, starterSlug: 'french-season' };
+    const restored = applyPermalink(defaults, 'p=&s=giza-continent');
+    expect(restored.starterSlug).toBe('giza-continent');
+    expect(restored.prompt).toBe('');
+  });
+
+  it('applyPermalink falls back to the default tile when s= is absent', () => {
+    const defaults: JSpaceDefaults = { mode: 'logit', pins: [], sel: null, starterSlug: 'french-season' };
+    // A live permalink carries no tile → the RECIPIENT's default tile.
+    expect(applyPermalink(defaults, 'p=hello&mode=j').starterSlug).toBe('french-season');
+    // An empty hash (bare cold-start) → the default tile too.
+    expect(applyPermalink(defaults, '').starterSlug).toBe('french-season');
+  });
+
+  it('round-trips a cold state (prompt + tile) through applyPermalink', () => {
+    const defaults: JSpaceDefaults = { mode: 'logit', pins: [], sel: null, starterSlug: 'french-season' };
+    const wire = encodePermalink({ prompt: '', mode: 'jacobian', pins: [], sel: null, starterSlug: 'giza-continent' });
+    expect(applyPermalink(defaults, wire)).toEqual({
+      prompt: '',
+      mode: 'jacobian',
+      pins: [],
+      sel: null,
+      starterSlug: 'giza-continent',
+    });
+  });
+});

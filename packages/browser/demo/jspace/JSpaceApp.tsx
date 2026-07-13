@@ -47,7 +47,7 @@ import { useLensRun } from './useLensRun';
 const ALL_LAYERS: number[] = Array.from({ length: 24 }, (_, i) => i + 1); // 1..24
 const TOP_K = 10;
 
-const DEFAULTS: JSpaceDefaults = { mode: 'logit', pins: [], sel: null };
+const DEFAULTS: JSpaceDefaults = { mode: 'logit', pins: [], sel: null, starterSlug: STARTER_SLUGS[0]! };
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
@@ -100,9 +100,9 @@ const JSPACE_COPY = {
     blurbs: {
       'french-season': "Headline: mid-stack the J-lens surfaces the abstract concept ('season' near rank 1, 'summer' near rank 2, around boundaries 16-17) where the plain logit lens is still ranked 999+. A clean mid-band concept cluster. The target token is 'automne' (autumn).",
       'arith-inner-sum': "Jacobian lens surfaces the unspoken inner sum '3' (1+2) at rank 3 by ℓ18, then the model correctly outputs 6. The logit lens shows '3' only at the final layer (rank 7). '3' is in neither the prompt nor the output.",
-      'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 1 around ℓ20, then the model answers 11. The logit lens buries '8' at rank 7 in the last layer only.",
+      'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 1 around ℓ20, then the model answers 11. The logit lens only reaches '8' late — rank 9 by ℓ22, rank 7 at ℓ24.",
       'arith-fewshot': "The unspoken inner sum '5' (2+3) sits at rank 3 across ℓ20–22 in the Jacobian lens; the logit lens shows it only at the final layer. '5' appears in neither the prompt nor the output.",
-      'grammar-error': "After the error 'childs', the Jacobian lens raises the unspoken judgment 'Incorrect' to rank 2 at ℓ17 — genuine error detection. The plain logit lens buries that same token (rank ~20; only a lowercase variant surfaces there). Honest caveat: the correction 'children' never surfaces, only the flag.",
+      'grammar-error': "After the error 'childs', the Jacobian lens raises the unspoken judgment 'Incorrect' to rank 2 at ℓ17 — genuine error detection. The plain logit lens buries that same token (rank ~20), even though other 'incorrect' variants rank higher there. Honest caveat: the correction 'children' never surfaces, only the flag.",
       'giza-continent': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Africa' (around rank 2, ℓ17–18) while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
       'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 2 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
     } as Record<string, string>,
@@ -129,9 +129,9 @@ const JSPACE_COPY = {
     blurbs: {
       'french-season': "标题示例：J-lens 在中间层浮现出抽象概念（'season' 接近 rank 1，'summer' 接近 rank 2，大约在边界 16-17），而普通的 logit lens 仍停留在 rank 999+。一个干净的中间层概念簇。目标 token 是 'automne'（autumn，秋天）。",
       'arith-inner-sum': "J-lens 在 ℓ18 以 rank 3 浮现出未说出口的内层和 '3'（1+2），随后模型正确输出 6。logit lens 仅在最后一层（rank 7）显示 '3'。'3' 既不在 prompt 也不在输出中。",
-      'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 1 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 仅在最后一层把 '8' 埋在 rank 7。",
+      'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 1 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 直到最后几层才够到 '8'——ℓ22 rank 9，ℓ24 rank 7。",
       'arith-fewshot': "未说出口的内层和 '5'（2+3）在 J-lens 中横跨 ℓ20–22 稳定处于 rank 3；logit lens 仅在最后一层显示。'5' 既不在 prompt 也不在输出中。",
-      'grammar-error': "在错误的 'childs' 之后，J-lens 在 ℓ17 把未说出口的判断词 'Incorrect' 抬到 rank 2——真实的错误检测。普通 logit lens 把同一个 token 埋在 rank ~20（那里只浮现出小写变体）。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
+      'grammar-error': "在错误的 'childs' 之后，J-lens 在 ℓ17 把未说出口的判断词 'Incorrect' 抬到 rank 2——真实的错误检测。普通 logit lens 把同一个 token 埋在 rank ~20（那里其它 'incorrect' 变体反而排得更高）。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
       'giza-continent': "微弱但真实：J-lens 在 ℓ17–18 附近以 rank 2 浮现出未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
       'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 2（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
     } as Record<string, string>,
@@ -375,9 +375,14 @@ export default function JSpaceApp() {
         toks = await tokenize(worker, prompt, { signal: inspectorAbortRef.current?.signal ?? undefined });
       } catch (err) {
         if (isAbortError(err)) return;
+        if (runIntentRef.current !== intent) return; // superseded → don't surface a stale error
         setRunError(err instanceof Error ? err.message : String(err));
         return;
       }
+      // A gallery tile (or a newer run) claimed the view while we awaited tokenize —
+      // abandon this run BEFORE touching any shared UI (token count, errors, selection)
+      // so it can't paint stale state under the freshly-opened tile (codex #1).
+      if (runIntentRef.current !== intent) return;
       const promptIds = toks.map((t) => t.id);
       setTokenCount(promptIds.length); // live token counter reflects this submit
       if (promptIds.length === 0) {
@@ -389,8 +394,6 @@ export default function JSpaceApp() {
         setRunError(`Prompt is ${promptIds.length} tokens; the maximum is ${LENS_MAX_POSITIONS}. Trim it to run.`);
         return;
       }
-      // A gallery tile clicked while we awaited tokenize wins: skip painting this run.
-      if (runIntentRef.current !== intent) return;
       setSelected(null);
       setHovered(null);
       setFocusCell(null); // new run → back to the "hover a cell" placeholder
@@ -487,6 +490,7 @@ export default function JSpaceApp() {
     setPrompt(restored.prompt);
     setMode(restored.mode);
     setPins(restored.pins);
+    setStarterSlug(restored.starterSlug ?? STARTER_SLUGS[0]!); // a shared cold URL restores the exact tile (#2)
     setSelected(restored.sel); // renders immediately for a STARTER permalink (grid is present)
     pendingSelRef.current = restored.sel; // …and survives the first Run for a CUSTOM permalink
     setActivePinIdx(restored.pins.length > 0 ? 0 : null);
@@ -509,19 +513,24 @@ export default function JSpaceApp() {
   React.useEffect(() => {
     if (!hashAppliedRef.current) return;
     if (typeof window === 'undefined') return;
-    const encoded = encodePermalink({ prompt, mode, pins, sel: selected });
+    const encoded = encodePermalink({ prompt, mode, pins, sel: selected, starterSlug });
     if (encoded === lastWrittenHashRef.current) return;
-    // A cold starter view (no custom prompt, no pins, no deliberate selection) is
-    // "clean" in EITHER lens mode: opening a gallery tile flips mode to jacobian, but
-    // the tile's slug is NOT in the permalink schema, so writing `#p=&mode=j` would
-    // only ever restore the DEFAULT tile — a misleading dirty URL (codex #7). Treat
-    // any cold view as the shareable default so the launcher keeps the URL clean.
-    const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null;
+    // Only the FULL default cold view stays URL-clean: cold prompt, no pins/selection,
+    // default lens AND the default tile. Opening a non-default tile or toggling the
+    // lens now writes an ACCURATE `#s=<slug>&mode=<m>` that restores that exact tile
+    // (codex #7 fixed by encoding the slug, not by suppressing the write; codex #2 —
+    // a deliberate cold-mode choice — is preserved because mode is no longer dropped).
+    const isColdDefault =
+      isColdPrompt(prompt) &&
+      pins.length === 0 &&
+      selected === null &&
+      mode === DEFAULTS.mode &&
+      starterSlug === DEFAULTS.starterSlug;
     if (isColdDefault && (lastWrittenHashRef.current === null || lastWrittenHashRef.current === '')) return;
     lastWrittenHashRef.current = encoded;
     const url = `${window.location.pathname}${window.location.search}#${encoded}`;
     window.history.replaceState(window.history.state, '', url);
-  }, [prompt, mode, pins, selected]);
+  }, [prompt, mode, pins, selected, starterSlug]);
 
   // -------------------------------------------------------------------------
   // What to render: LIVE run › model-free STARTER grid (cold) › skeleton
@@ -637,11 +646,13 @@ export default function JSpaceApp() {
     // the fold.
     <main className="jspace-scroll absolute inset-0 mx-auto max-w-[82rem] space-y-8 overflow-y-auto px-6 py-10 md:px-10 md:py-14">
       <header className="space-y-3 border-b border-border/60 pb-8">
-        {/* Back to the course landing — /jspace is a standalone route with no
-            shared chrome, so without this it is a dead end. Not locale-prefixed
-            (there is no /zh/jspace), matching how the landing links INTO /jspace. */}
+        {/* Back to the course landing — /jspace is a standalone route with no shared
+            chrome, so without this it is a dead end. Locale-aware target: a zh reader
+            returns to /zh (not the EN "/" landing, which would store 'en' on mount and
+            clobber their explicit zh — codex #3). Locale comes from stored prefs, the
+            same source the gallery/captions read (there is no LocaleProvider here). */}
         <Link
-          to="/"
+          to={locale === 'zh' ? '/zh' : '/'}
           search={(prev) => prev}
           className="inline-flex items-center gap-1.5 rounded-sm font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)] transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
         >

@@ -18,6 +18,17 @@ export type JSpaceState = {
   mode: LensMode;
   pins: number[];
   sel: { layerIdx: number; pos: number } | null;
+  /**
+   * Which model-free gallery tile the COLD starter view is showing. Carried on the
+   * wire ONLY for a cold prompt (a live/custom prompt ignores it), so a shared cold
+   * URL restores the exact tile the sender was viewing — not just the default.
+   *
+   * OPTIONAL because it is conditionally meaningful: a live/custom prompt has no
+   * relevant tile, and the field is genuinely absent from the wire there (mirroring
+   * how `pins: []` / `sel: null` are omitted). Absent ⇒ the app's default tile
+   * (`defaults.starterSlug` in {@link applyPermalink}); the app always supplies one.
+   */
+  starterSlug?: string;
 };
 
 export function encodePermalink(s: JSpaceState): string {
@@ -29,6 +40,11 @@ export function encodePermalink(s: JSpaceState): string {
   // lossy permalink beats a crash. Well-formed input (incl. astral pairs) is
   // untouched and round-trips byte-for-byte.
   const parts = [`p=${encodeURIComponent(s.prompt.toWellFormed())}`, `mode=${s.mode === 'jacobian' ? 'j' : 'l'}`];
+  // `s=` (the gallery tile) is meaningful ONLY for the cold starter view; a live
+  // prompt renders its own read, so we omit it there to keep custom permalinks clean.
+  // The write-effect's cold-default guard suppresses the whole hash when the tile AND
+  // mode are the app defaults, so a fresh cold visit still gets an empty URL.
+  if (s.prompt.trim() === '' && s.starterSlug) parts.push(`s=${encodeURIComponent(s.starterSlug)}`);
   // Never emit a wire value that `decodePermalink` reads back as different, valid
   // state: filter pins to non-negative safe ints BEFORE the cap, and omit `sel`
   // unless both coordinates are non-negative safe ints.
@@ -120,10 +136,16 @@ export function decodePermalink(hash: string): Partial<JSpaceState> {
     }
   }
 
+  // Gallery tile slug (cold view only). Any non-empty string is accepted; the app
+  // clamps an unknown slug to its default tile (`STARTERS[slug] ?? default`), so the
+  // codec stays gallery-agnostic. An empty `s=` decodes as absent (→ app default).
+  const starterSlug = params.get('s');
+  if (starterSlug !== null && starterSlug !== '') out.starterSlug = starterSlug;
+
   return out;
 }
 
-export type JSpaceDefaults = Pick<JSpaceState, 'mode' | 'pins' | 'sel'>;
+export type JSpaceDefaults = Pick<JSpaceState, 'mode' | 'pins' | 'sel' | 'starterSlug'>;
 
 /**
  * Resolve a /jspace hash into a FULL state, distinguishing two cases the encoder
@@ -155,16 +177,19 @@ export function applyPermalink(defaults: JSpaceDefaults, hash: string): JSpaceSt
   // accepted argument, and a spread would copy its `prompt` over the `''` (and
   // could drop keys if `defaults` were getter-backed).
   if (raw === '') {
-    return { prompt: '', mode: defaults.mode, pins: defaults.pins, sel: defaults.sel };
+    return { prompt: '', mode: defaults.mode, pins: defaults.pins, sel: defaults.sel, starterSlug: defaults.starterSlug };
   }
   // A non-empty hash IS a complete state snapshot. Fields the encoder omits
   // because they were empty (`pins`) or null (`sel`) restore to those CANONICAL
-  // EMPTIES — never to `defaults`.
+  // EMPTIES — never to `defaults`. `starterSlug` is the exception: it has no
+  // canonical empty (the cold view always shows SOME tile), so an absent `s=`
+  // restores the app's default tile via `defaults.starterSlug`.
   const patch = decodePermalink(raw);
   return {
     prompt: patch.prompt ?? '',
     mode: patch.mode ?? defaults.mode,
     pins: patch.pins ?? [],
     sel: patch.sel ?? null,
+    starterSlug: patch.starterSlug ?? defaults.starterSlug,
   };
 }
