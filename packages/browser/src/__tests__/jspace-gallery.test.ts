@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { JACOBIAN_LAYERS } from '../../jlens-core/jacobian-presets';
-import { GALLERY, STARTER_SLUGS } from './gallery';
+import { GALLERY, STARTER_SLUGS } from '../../demo/jspace/starters/gallery';
+import { JACOBIAN_LAYERS } from '../../demo/jlens-core/jacobian-presets';
 
 describe('GALLERY', () => {
   it('ships exactly 8 tiles, french-season headline first', () => {

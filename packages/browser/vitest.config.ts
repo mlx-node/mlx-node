@@ -32,7 +32,7 @@ export default defineConfig({
     fileParallelism: false,
     isolate: false,
     testTimeout: 120_000,
-    include: ['src/__tests__/**/*.test.ts', 'demo/**/*.test.ts'],
+    include: ['src/__tests__/**/*.test.ts'],
     globals: true,
   },
   server: {
