@@ -48,7 +48,7 @@ The gallery is **honest about the 0.8B scale gap**: the source paper (Anthropic,
 - **BAND onset/peak render nowhere today.** `JacobianLensLive.tsx:523` is the *blurb*; only `BAND.boundaries` is consumed at `:60`. D2 is net-new UI.
 - **`useLocale()` always returns `'en'` on `/jspace`** — the route `routes/jspace.tsx:6` is a bare `/jspace`, never wrapped in `<LocaleProvider>`. Locale MUST come from `readStoredLocale()` in an effect (SSG first paint stays EN-safe).
 - **The vetted example set differs from the three legacy baked starters.** The incoming UI-design copy was written around `french-season / spanish-opposite / arithmetic-parens` (pre-vetting lesson examples). The Tier-1 gallery ships the **empirically vetted winners** (§4-A). Legacy `spanish-opposite` and `arithmetic-parens` are **superseded** and dropped from `/jspace`; `french-season` is **retained as the headline** (pilot-proven STRONG, memory `project_jlens_pilot_green`).
-- **Concept threading requires pins to be set.** The UI design's `openStarter` set `pins=[]`; that would leave (C) dark. Each gallery entry instead auto-pins its concept token ids (resolved at bake time, model-free at runtime) so (C) and the band ranks light up on load. This is a deliberate, documented deviation.
+- **Concept threading is driven by the BAKED frame, not the `pins` state.** `colorByPinnedId` is built from `pinnedForView` = `view.pinned` = the baked frame's `slice.pinned` (and `PinManager`, the rank charts, and the labels all read `pinnedForView` too). So switching to a starter (`setStarterSlug`) is sufficient for (C) threading + chips + band ranks to light up — `openStarter` does **not** touch the `pins` state at all. (The `pins` state is only the permalink/live-run pin set; seeding it with the tile's concepts would merely dirty the cold URL and risk leaking gallery pins into a later custom live run.)
 - **To avoid coupling the lesson, new example data lives in a `/jspace`-local registry** (`starters/gallery.ts`), NOT in the shared `jlens-core/jacobian-presets.ts` (which the lesson `JacobianLensLive.tsx` also imports — "core instrument unchanged").
 
 ---
@@ -69,7 +69,7 @@ The gallery is **honest about the 0.8B scale gap**: the source paper (Anthropic,
 
 ### A — Empirical gallery (vetted winners + honesty artifact)
 
-Vetting was run **headless** (`canRunHeadless:true`) against the real native `lensReadout` (logit + fitted-Jacobian pack, 24 residual boundaries, topK=8, last-position next-prediction) over 35 paper-phenomenon candidates. Result: **5 STRONG + 2 WEAK** honest winners; injection / emoji-face / count-and-introspect **dropped** (total floor). Combined with the retained pilot headline `french-season`, the gallery ships **8 tiles (6 STRONG + 2 WEAK)** — within the 6–8 target, ≥4-STRONG floor satisfied.
+Vetting was run **headless** (`canRunHeadless:true`) against the real native `lensReadout` (logit + fitted-Jacobian pack, 24 residual boundaries, topK=8, last-position next-prediction) over 35 paper-phenomenon candidates. Result: **5 STRONG + 2 WEAK** honest winners; injection / emoji-face / count-and-introspect **dropped** (total floor). Combined with the retained pilot headline `french-season`, the gallery ships **8 tiles (5 STRONG + 3 WEAK)** — within the 6–8 target, ≥4-STRONG floor satisfied. (Recalibrated during the bake: `giza-continent` is graded WEAK, not STRONG — the reproducible bake shows `Africa` at rank ~2 across only 2 band layers with a degenerate `'1'` output and no bridge hop, i.e. the same class as `eiffel-capital`, not a top-3/≥3-layer STRONG tile.)
 
 **Shipped gallery (STRONG first; `french-season` headline):**
 
@@ -80,7 +80,7 @@ Vetting was run **headless** (`canRunHeadless:true`) against the real native `le
 | 3 | `arith-precedence` | `3 + 4 * 2 = ` | `["8"," 8"]` | **8** — product 4×2 held before adding 3 | 20 | 18–20 | STRONG | jacobian |
 | 4 | `arith-fewshot` | `(1+2)*2=6. (2+3)*2= ` | `["5"," 5"]` | **5** — inner sum (2+3) in the analogy | 20 | 20–23 | STRONG | jacobian |
 | 5 | `grammar-error` | `The plural of 'child' is childs.` | `[" incorrect"]` | **incorrect** — error flag on wrong plural | 17 | 17–19 | STRONG | jacobian *(logit also passes)* |
-| 6 | `giza-continent` | `Fact: The continent where the pyramids of Giza are located is ` | `[" Africa","Africa"]` | **Africa** — answer, before degenerate output | 17 | 17–18 | STRONG | jacobian |
+| 6 | `giza-continent` | `Fact: The continent where the pyramids of Giza are located is ` | `[" Africa","Africa"]` | **Africa** — answer, before degenerate output | 17 | 17–18 | WEAK | jacobian |
 | 7 | `int-cast-error` | `>>> int('hello')\n` | `[" error"]` | **error** — generic runtime-error concept | 18 | 18–18 | WEAK | jacobian |
 | 8 | `eiffel-capital` | `Fact: The capital of the country where the Eiffel Tower stands is ` | `[" Paris","Paris"]` | **Paris** — answer, before degenerate output | 18 | 18–18 | WEAK | jacobian |
 
@@ -142,7 +142,7 @@ export const GALLERY: readonly GalleryEntry[] = [ /* the 8 rows of §4-A, in ord
 export const STARTER_SLUGS = GALLERY.map((g) => g.slug);
 ```
 
-**Launcher handler** (add near `handleModeChange`). The view memo (`JSpaceApp.tsx:393`) prefers `liveResult`, so we must `resetRun()` **and** blank the prompt to fall through to the starter branch. Unlike the incoming design, we **auto-pin** the entry's concept ids and set the entry's default lens so (C)/(D)/default-mode render on load:
+**Launcher handler** (add near `handleModeChange`). The view memo prefers `liveResult`, so we must `resetRun()` **and** blank the prompt to fall through to the starter branch. It sets the entry's default lens; it does **not** set `pins` (threading comes from the baked `view.pinned`, per the note in §2):
 
 ```ts
 function openStarter(slug: string): void {
@@ -153,7 +153,7 @@ function openStarter(slug: string): void {
   resetRun();                            // drop any live frame (memo prefers it otherwise)
   committedPromptIdsRef.current = null;
   setMode(entry.defaultMode);            // J-only tiles open in jacobian; band memo gates on this
-  setPins(pinsForSlug(slug));            // concept threading + band ranks light up (ids from baked JSON)
+  // NB: do NOT setPins here — threading/chips/charts read the baked view.pinned (§2).
   setActivePinIdx(null);
   setSelected(null); setHovered(null); setFocusCell(null);
   setTokenCount(null); setRunError(null);
@@ -188,7 +188,7 @@ function openStarter(slug: string): void {
 ```
 
 - **Launcher, not state mirror:** `aria-pressed`/active styling only while a starter is displayed. Live/custom runs highlight nothing — it's a "load this" affordance.
-- **Permalink:** `starterSlug` is not in the permalink schema (`permalink.ts:16-20` = prompt/mode/pins/sel). `openStarter` sets prompt `''`, mode=`defaultMode`, pins=concept ids → the URL now carries `mode` + `pins` (desirable: a shared gallery URL reproduces the pinned, correct-lens view). This diverges from the incoming design's "clean URL / pins:[]" on purpose — a gallery example is only meaningful *with* its pinned concept.
+- **Permalink:** `starterSlug` is not in the permalink schema (`permalink.ts` = prompt/mode/pins/sel). `openStarter` sets prompt `''` and mode, and leaves `pins` empty, so a fresh cold-gallery visit keeps a **clean URL** (the `isColdDefault` guard suppresses the write). Consequently a shared cold-gallery URL restores the *default* tile, not the specific one selected — an accepted Tier-1 limitation (deep-linking a specific tile would require adding `starterSlug` to the permalink schema, which is out of scope). Permalinks remain meaningful for custom prompts + user pins + selection.
 
 ---
 
@@ -375,7 +375,7 @@ const JSPACE_COPY = {
       'arith-precedence': "Precedence: the product '8' (4×2) is held mid-stack before adding 3.",
       'arith-fewshot': "The inner sum '5' (2+3) shows up across ℓ20–23 in the few-shot analogy.",
       'grammar-error': "After 'childs', the judgment 'incorrect' surfaces — the correction never does.",
-      'giza-continent': "The answer 'Africa' surfaces mid-stack while the real output is a degenerate '1'.",
+      'giza-continent': "Faint: the answer 'Africa' surfaces mid-stack while the real output is a degenerate '1'; the Egypt bridge hop never appears.",
       'int-cast-error': "Faint: a generic 'error' concept for int('hello') — never 'ValueError'.",
       'eiffel-capital': "Faint: the answer 'Paris' surfaces; the France bridge hop never does.",
     } as Record<string, string>,
@@ -387,7 +387,7 @@ const JSPACE_COPY = {
       'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 0 around ℓ20, then the model answers 11. The logit lens buries '8' at rank 7 in the last layer only.",
       'arith-fewshot': "The unspoken inner sum '5' (2+3) sits at rank 2 across ℓ20–23 in the Jacobian lens; the logit lens shows it only at the final layer. '5' appears in neither the prompt nor the output.",
       'grammar-error': "After the error 'childs', both lenses raise the unspoken judgment 'incorrect' to rank 1–2 from ℓ17 — genuine error detection. Honest caveat: the correction 'children' never surfaces, only the flag.",
-      'giza-continent': "The Jacobian lens holds the unspoken answer 'Africa' at rank 1 across ℓ17–18 while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
+      'giza-continent': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Africa' (around rank 2, ℓ17–18) while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
       'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 1 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
       'eiffel-capital': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Paris' at rank 5–6 around ℓ18 while the model's real output is a degenerate '1'; the France bridge hop never appears. The logit lens shows nothing.",
     } as Record<string, string>,
@@ -406,7 +406,7 @@ const JSPACE_COPY = {
       'arith-precedence': "优先级：乘积 '8'（4×2）在中间层被暂存，之后才加上 3。",
       'arith-fewshot': "内层和 '5'（2+3）在 ℓ20–23 的少样本类比中出现。",
       'grammar-error': "在 'childs' 之后，判断词 'incorrect' 浮现——但正确写法从未出现。",
-      'giza-continent': "答案 'Africa' 在中间层浮现，而真实输出是退化的 '1'。",
+      'giza-continent': "微弱：答案 'Africa' 在中间层浮现，而真实输出是退化的 '1'；埃及这一跳桥概念从未出现。",
       'int-cast-error': "微弱：int('hello') 只浮现出泛化的 'error'——从不是 'ValueError'。",
       'eiffel-capital': "微弱：答案 'Paris' 浮现，但法国这一跳桥概念从未出现。",
     } as Record<string, string>,
@@ -418,7 +418,7 @@ const JSPACE_COPY = {
       'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 0 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 仅在最后一层把 '8' 埋在 rank 7。",
       'arith-fewshot': "未说出口的内层和 '5'（2+3）在 J-lens 中横跨 ℓ20–23 稳定处于 rank 2；logit lens 仅在最后一层显示。'5' 既不在 prompt 也不在输出中。",
       'grammar-error': "在错误的 'childs' 之后，两种 lens 都从 ℓ17 起把判断词 'incorrect' 抬到 rank 1–2——真实的错误检测。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
-      'giza-continent': "J-lens 在 ℓ17–18 以 rank 1 暂存未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
+      'giza-continent': "微弱但真实：J-lens 在 ℓ17–18 附近以 rank 2 浮现出未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
       'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 1（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
       'eiffel-capital': "微弱但真实：J-lens 在 ℓ18 附近以 rank 5–6 浮现出未说出口的答案 'Paris'，而模型真实输出是退化的 '1'；法国这一跳桥概念从未出现。logit lens 毫无显示。",
     } as Record<string, string>,
