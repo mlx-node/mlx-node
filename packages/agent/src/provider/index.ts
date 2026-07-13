@@ -19,6 +19,7 @@ import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-ag
 
 import { MlxModelHost } from './model-host.js';
 import type { MlxModelInfo } from './models.js';
+import { PerformanceStatus } from './performance-status.js';
 import { makeMlxStreamSimple } from './stream-adapter.js';
 
 /**
@@ -30,7 +31,8 @@ import { makeMlxStreamSimple } from './stream-adapter.js';
  */
 export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxModelHost): InlineExtension {
   const resolvedHost = host ?? new MlxModelHost(models.map((m) => m.discovered));
-  const streamSimple = makeMlxStreamSimple(resolvedHost);
+  const performanceStatus = new PerformanceStatus();
+  const streamSimple = makeMlxStreamSimple(resolvedHost, performanceStatus.record);
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
@@ -40,6 +42,18 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
         apiKey: 'mlx-local',
         streamSimple,
         models: models.map((m) => m.piModel),
+      });
+      pi.on('message_end', (event, ctx) => {
+        performanceStatus.showMessage(event, ctx);
+      });
+      pi.on('turn_start', (_event, ctx) => {
+        performanceStatus.clear(ctx);
+      });
+      pi.on('model_select', (_event, ctx) => {
+        performanceStatus.clear(ctx);
+      });
+      pi.on('session_shutdown', (_event, ctx) => {
+        performanceStatus.clear(ctx);
       });
     },
   };

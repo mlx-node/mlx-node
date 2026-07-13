@@ -16,7 +16,7 @@ import type {
   ChatStreamFinal,
   SessionContextLimits,
 } from '@mlx-node/lm';
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
 import type { DiscoveredModelLike } from '../src/types.js';
@@ -288,6 +288,79 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.maxNewTokens).toBe(64);
     expect(session.configSeen?.reasoningEffort).toBe('none');
     expect(session.configSeen?.tools).toBeUndefined();
+  });
+
+  it('associates terminal performance metrics with the exact Pi assistant message', async () => {
+    const performance = {
+      ttftMs: 125,
+      prefillTokensPerSecond: 812.5,
+      decodeTokensPerSecond: 47.25,
+    };
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({ performance });
+      },
+    ]);
+    const record = vi.fn();
+
+    const events = await collect(makeMlxStreamSimple(makeFakeHost(session), record)(MODEL, CONTEXT));
+    const message = finalMessage(events);
+
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith(message, performance);
+    expect(session.configSeen?.reportPerformance).toBe(true);
+  });
+
+  it('does not publish performance telemetry for a missing or error final', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({
+          finishReason: 'error',
+          performance: {
+            ttftMs: 100,
+            prefillTokensPerSecond: 500,
+            decodeTokensPerSecond: 30,
+          },
+        });
+      },
+    ]);
+    const record = vi.fn();
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), record);
+
+    await collect(streamSimple(MODEL, CONTEXT));
+    await collect(streamSimple(MODEL, CONTEXT));
+
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('still completes the Pi stream when the best-effort performance recorder throws', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent({
+          performance: {
+            ttftMs: 100,
+            prefillTokensPerSecond: 500,
+            decodeTokensPerSecond: 30,
+          },
+        });
+      },
+    ]);
+    const record = vi.fn(() => {
+      throw new Error('status renderer failed');
+    });
+
+    const events = await collect(makeMlxStreamSimple(makeFakeHost(session), record)(MODEL, CONTEXT));
+
+    expect(record).toHaveBeenCalledOnce();
+    expect(events.at(-1)?.type).toBe('done');
+    expect(finalMessage(events).stopReason).toBe('stop');
   });
 
   it('does not prime a prior error/aborted partial assistant turn into the reset session (WB-4)', async () => {

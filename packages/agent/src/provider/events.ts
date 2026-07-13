@@ -23,7 +23,7 @@ import type {
   ToolCall,
   Usage,
 } from '@earendil-works/pi-ai';
-import type { ChatStreamDelta, ChatStreamFinal, ToolCallResult } from '@mlx-node/lm';
+import type { ChatStreamDelta, ChatStreamFinal, PerformanceMetrics, ToolCallResult } from '@mlx-node/lm';
 
 import { coerceErrorMessage } from './error-coercion.js';
 import { ReasoningTagBuffer } from './reasoning-tag-buffer.js';
@@ -100,7 +100,11 @@ export class TurnEmitter {
   private openBlock: TextContent | ThinkingContent | null = null;
   private finished = false;
 
-  constructor(stream: AssistantMessageEventStream, model: Model<Api>) {
+  constructor(
+    stream: AssistantMessageEventStream,
+    model: Model<Api>,
+    private readonly onPerformance?: (message: AssistantMessage, performance: PerformanceMetrics) => void,
+  ) {
     this.stream = stream;
     this.partial = {
       role: 'assistant',
@@ -171,6 +175,13 @@ export class TurnEmitter {
 
       const reason = sawOkToolCall ? 'toolUse' : final.finishReason === 'length' ? 'length' : 'stop';
       this.partial.stopReason = reason;
+      if (final.performance !== undefined && this.onPerformance !== undefined) {
+        try {
+          this.onPerformance(this.partial, final.performance);
+        } catch {
+          // Footer telemetry is best-effort and must never break inference.
+        }
+      }
       this.finished = true;
       this.stream.push({ type: 'done', reason, message: this.partial });
       this.stream.end();

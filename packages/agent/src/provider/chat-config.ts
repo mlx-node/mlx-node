@@ -76,6 +76,9 @@ export function buildChatConfig(
     ...preset.sampling,
     maxNewTokens: preset.maxOutputTokens,
     reasoningEffort: options?.reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[options.reasoning],
+    // The terminal native chunk carries TTFT/prefill/decode telemetry when
+    // requested. The provider keeps it transient and only renders it in TUI.
+    reportPerformance: true,
   };
   if (options?.maxTokens !== undefined) config.maxNewTokens = options.maxTokens;
   if (options?.temperature !== undefined) config.temperature = options.temperature;

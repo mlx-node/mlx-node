@@ -63,6 +63,10 @@ describe('buildChatConfig', () => {
     expect('reuseCache' in config).toBe(false);
   });
 
+  it('requests native performance metrics for the agent footer', () => {
+    expect(buildChatConfig('qwen3_5', undefined, undefined).reportPerformance).toBe(true);
+  });
+
   it('gives lfm2_moe the first-class MoE sampler (LFM2.5-8B-A1B card), NOT the dense lfm2 preset', () => {
     const config = buildChatConfig('lfm2_moe', undefined, undefined);
     // Concrete card values — deliberately not compared against

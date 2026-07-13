@@ -45,7 +45,7 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
-import type { ChatSession } from '@mlx-node/lm';
+import type { ChatSession, PerformanceMetrics } from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
 import { buildChatConfig } from './chat-config.js';
@@ -71,6 +71,8 @@ export interface StreamSimpleHost {
   /** Drop the resident so the next turn reloads it (post-error reset failure). */
   invalidateResident(modelId: string): void;
 }
+
+export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
 function safeString(read: () => string, fallback: string): string {
@@ -126,6 +128,7 @@ function failsafeMessage(model: Model<Api>, reason: 'aborted' | 'error', message
 
 export function makeMlxStreamSimple(
   host: StreamSimpleHost,
+  onPerformance?: PerformanceRecorder,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -205,7 +208,7 @@ export function makeMlxStreamSimple(
       // `options`/`Model` getter or a TurnEmitter constructor failure must
       // become a stream terminal, never a synchronous throw into pi.
       signal = options?.signal;
-      emitter = new TurnEmitter(stream, model);
+      emitter = new TurnEmitter(stream, model, onPerformance);
     } catch (err) {
       terminalize('error', err);
       return stream;
