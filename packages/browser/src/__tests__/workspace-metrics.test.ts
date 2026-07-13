@@ -117,13 +117,32 @@ describe('workspace metrics', () => {
     });
     expect(metrics.motorFlipLayer(one, 0)).toBeNull();
   });
-  it('motorFlipLayer: committed french-season is all no-lock on sparse baked layers (codex whole-branch)', () => {
-    // Shipped baked frames sample only [6,8,10,12,14,16,17,18,20,22,24]; the output
-    // argmax usually first wins in the ℓ22→ℓ24 gap, so EVERY french-season position
-    // is a no-lock (null). This is exactly why the UI shows motor-flip on LIVE
-    // (contiguous 1..24) runs only, never on sparse baked starters.
-    const fs = buildLensSlice(reviveRun(STARTERS['french-season']!.jacobian));
-    for (let p = 0; p < fs.promptLen; p++) expect(metrics.motorFlipLayer(fs, p)).toBeNull();
+  it('motorFlipLayer: relapse [target, other, target] is null — the output appeared below the top yet never held (codex re-review)', () => {
+    // argmax sequence 9 → 6 → 9 (top): the output token 9 IS the top guess at L0,
+    // flickers away at L1, and only wins again at the final layer. There is no
+    // top-anchored STABLE run below the top, so this is null — but the "no lock"
+    // copy must NOT claim "only matches at the final layer" (9 matched at L0 too).
+    // `null` here means "no stable lock before the final layer", not "never appeared".
+    const relapse = buildLensSlice({ ...run(), cells: [cell(9, [9], [1]), cell(6, [6], [1]), cell(9, [9], [1])] });
+    expect(metrics.motorFlipLayer(relapse, 0)).toBeNull();
+  });
+  it('motorFlipLayer: committed french-season is 0/9 on Jacobian but 1/9 on logit (codex re-review)', () => {
+    // Shipped baked frames sample only [6,8,10,12,14,16,17,18,20,22,24]. The output
+    // argmax usually first wins in the ℓ22→ℓ24 gap, so it reads mostly no-lock — but
+    // the two lenses are NOT identical: Jacobian is a clean 0/9 (every position null),
+    // while logit locks exactly one position (#5 at ℓ20). Guards the spec's earlier
+    // false "0/9 on both lenses" claim. This sparse-sampling degeneracy is exactly
+    // why motor-flip renders on LIVE (contiguous 1..24) runs only, never on baked.
+    const jac = buildLensSlice(reviveRun(STARTERS['french-season']!.jacobian));
+    for (let p = 0; p < jac.promptLen; p++) expect(metrics.motorFlipLayer(jac, p)).toBeNull();
+    const log = buildLensSlice(reviveRun(STARTERS['french-season']!.logit));
+    const locks = Array.from({ length: log.promptLen }, (_, p) => metrics.motorFlipLayer(log, p)).filter(
+      (f) => f != null,
+    );
+    expect(locks.length).toBe(1); // exactly one position locks on logit
+    // The single lock is position index 4 (#5), at layer index 8 → physical ℓ20.
+    expect(metrics.motorFlipLayer(log, 4)).toBe(8);
+    expect(log.layers[8]).toBe(20);
   });
   it('does NOT export the impossible full-distribution metrics', () => {
     expect((metrics as Record<string, unknown>).excessKurtosis).toBeUndefined();

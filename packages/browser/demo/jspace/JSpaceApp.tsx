@@ -132,9 +132,10 @@ const JSPACE_COPY = {
     },
     motorFlip: {
       eyebrow: 'Commit depth · where each position locks its top guess',
-      hint: 'On a live run (all 24 layers): the shallowest layer from which a position’s top token already equals the output and stays equal through every layer above it. Early (bright) = settled shallow; late (dark) = settled deep. Positions whose top guess only matches the output at the final layer are marked “no lock”.',
+      hint: 'On a live run (all 24 layers): the shallowest layer from which a position’s top token already equals the output and stays equal through every layer above it. Early (bright) = settled shallow; late (dark) = settled deep. Positions whose top guess doesn’t hold the output continuously up to the final layer — including an early flicker that relapses — are marked “no lock”.',
       cellLabel: (position: number, layer: number) => `position ${position} settles at ℓ${layer}`,
-      noLock: 'no stable lock — the top guess only matches the output at the final layer',
+      noLock: (position: number) =>
+        `position ${position}: no stable lock — the top guess doesn’t hold the output continuously up to the final layer`,
     },
   },
   zh: {
@@ -187,9 +188,9 @@ const JSPACE_COPY = {
     },
     motorFlip: {
       eyebrow: '定型深度 · 每个位置在哪一层锁定 top 猜测',
-      hint: '在实时运行（全部 24 层）时：从哪一层起，某个位置的 top token 已等于输出，并在其上每一层都保持不变。越早（越亮）= 越浅就定型；越晚（越暗）= 很深才定型。若 top 猜测仅在最后一层才与输出一致，则标为「无锁定」。',
+      hint: '在实时运行（全部 24 层）时：从哪一层起，某个位置的 top token 已等于输出，并在其上每一层都保持不变。越早（越亮）= 越浅就定型；越晚（越暗）= 很深才定型。若 top 猜测未能连续保持到最后一层的输出（包括中途一闪即回落的情况），则标为「无锁定」。',
       cellLabel: (position: number, layer: number) => `位置 ${position} 在 ℓ${layer} 定型`,
-      noLock: '无稳定锁定——top 猜测仅在最后一层才与输出一致',
+      noLock: (position: number) => `位置 ${position}：无稳定锁定——top 猜测未能连续保持到最后一层的输出`,
     },
   },
 } as const;

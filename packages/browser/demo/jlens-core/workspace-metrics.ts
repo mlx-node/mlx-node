@@ -97,10 +97,12 @@ export function topKSetStability(slice: LensSliceData, pos: number): number[] {
  *  displayed layer above it.
  *
  *  Returns `null` when that top-anchored stable run is ONLY the top layer — i.e.
- *  the output token is not the top guess at ANY displayed layer below the top.
- *  That is a degenerate "no observed lock" case (the guess changed right before
- *  the output), and it MUST be rendered distinctly, never as a late commit.
- *  `null` also for a slice with fewer than two layers.
+ *  the output token is not the top guess at the layer immediately below the top,
+ *  so there is no STABLE lock reaching the output before the final layer. (The
+ *  token may have flickered to the output at some earlier layer and relapsed;
+ *  `null` means "no stable lock before the final layer", NOT "never appeared".)
+ *  This MUST be rendered distinctly, never as a late commit. `null` also for a
+ *  slice with fewer than two layers.
  *
  *  IMPORTANT: displayed layers are SAMPLED (baked frames skip e.g. 19/21/23), so
  *  this measures stability AMONG the displayed layers — not proof of continuity
