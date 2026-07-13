@@ -3065,6 +3065,25 @@ describe('ChatSession', () => {
       expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
     });
 
+    it('preflights a complete history without starting inference or mutating the session', async () => {
+      const mock = makeMockModel();
+      const model = withCapacity(mock.model, 128, 100);
+      const session = new ChatSession(model);
+      const messages: ChatMessage[] = [
+        { role: 'system', content: 'system' },
+        { role: 'user', content: 'hello' },
+      ];
+
+      const config = await session.preflightContextCapacity(messages, { maxNewTokens: 64 });
+
+      expect(config.maxNewTokens).toBe(29);
+      expect((model.applyChatTemplate as ReturnType<typeof vi.fn>).mock.calls).toEqual([[messages, true, null, null]]);
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
+      expect(mock.resetCaches).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
+    });
+
     it('makes an omitted output budget explicit on a continuation', async () => {
       const mock = makeMockModel();
       const session = new ChatSession(withCapacity(mock.model, 128, 80));

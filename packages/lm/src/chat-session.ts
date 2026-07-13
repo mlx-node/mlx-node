@@ -648,6 +648,47 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   }
 
   /**
+   * Render and validate a complete message list against the model's physical
+   * context window without starting inference or mutating session/native cache
+   * state.
+   *
+   * HTTP streaming callers use this before committing SSE headers so an
+   * oversized prompt can still receive a protocol-shaped 400 response without
+   * delaying those headers until image processing, prefill, or the first
+   * generated token. The returned config carries the same output-budget clamp
+   * applied by the send entry points; those entry points intentionally repeat
+   * the check against their own authoritative history before native dispatch.
+   */
+  async preflightContextCapacity(messages: readonly ChatMessage[], config?: ChatConfig): Promise<ChatConfig> {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot preflight context capacity while a send() is in flight');
+    }
+    return await this.constrainToContextCapacity(messages.slice(), this.mergeConfig(config));
+  }
+
+  /**
+   * Capacity-preflight one pending user/tool message against this session's
+   * preserved history without starting inference or mutating cache state.
+   *
+   * This is the exact counterpart of the delta `send*` paths. It matters for
+   * server-side prompt-cache hits where the HTTP request contains only the new
+   * message while the leased ChatSession owns the earlier conversation.
+   */
+  async preflightPendingContextCapacity(pending: ChatMessage, config?: ChatConfig): Promise<ChatConfig> {
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot preflight pending context capacity while a send() is in flight');
+    }
+    if (pending.role === 'user') {
+      this.assertCanSendPlain('sendStream');
+    } else if (pending.role === 'tool') {
+      this.assertCanSendToolResult('sendToolResultStream');
+    } else {
+      throw new Error('ChatSession: pending context capacity preflight requires a user or tool message');
+    }
+    return await this.constrainToContextCapacity(this.historyWithPending(pending), this.mergeConfig(config));
+  }
+
+  /**
    * Count of `ok` tool calls from the most recent assistant turn, or
    * `null` when the trailing turn produced none. Non-null means the
    * session is parked on an unresolved tool-call turn and the only

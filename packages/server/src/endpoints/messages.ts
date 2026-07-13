@@ -290,22 +290,6 @@ interface MessagesStreamingHandlerResult {
   suppressedToolCalls: boolean;
 }
 
-/** Replay an eagerly-read first stream item, then continue the same iterator. */
-async function* prependFirstEvent(
-  first: IteratorResult<ChatStreamEvent>,
-  rest: AsyncGenerator<ChatStreamEvent>,
-): AsyncGenerator<ChatStreamEvent> {
-  try {
-    if (!first.done) yield first.value;
-    yield* rest;
-  } finally {
-    // If the consumer breaks on the eagerly-read terminal event, delegation
-    // to `rest` has not begun yet. Explicitly close it so ChatSession's
-    // commit/rollback finally still runs.
-    await rest.return(undefined);
-  }
-}
-
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
@@ -318,10 +302,10 @@ async function handleStreamingNative(
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
-  // Enter the generator before committing SSE headers. ChatSession performs
-  // its exact token/capacity preflight before yielding the first native event,
-  // so an oversized request can still return an Anthropic-shaped HTTP 400.
-  const firstEvent = await chatStream.next();
+  // `runSessionStreaming` completed the exact token/capacity preflight before
+  // handing us this iterator. Commit SSE immediately instead of entering the
+  // generator here: its first `next()` also starts image processing/prefill and
+  // may not resolve until the first generated token.
   beginSSE(res);
   // Commit SSE wire format now so any throw before the terminal event routes
   // to the streaming error epilogue instead of corrupting the JSON path.
@@ -426,7 +410,7 @@ async function handleStreamingNative(
   }
 
   try {
-    for await (const event of prependFirstEvent(firstEvent, chatStream)) {
+    for await (const event of chatStream) {
       if (clientAborted) break;
       if (event.done) {
         sawDone = true;
@@ -972,6 +956,10 @@ async function runSessionStreaming(
   signal: AbortSignal | undefined,
   resetNativeCache: boolean,
 ): Promise<MessagesStreamingOutcome> {
+  // Validate the exact canonical history before resetting either JS or native
+  // state. This preserves a clean HTTP 400 path for context overflow while
+  // keeping SSE header latency independent from image processing/prefill.
+  const constrainedConfig = await session.preflightContextCapacity(messages, config);
   // Same dual-branch reset as `runSessionNonStreaming`: native-reset
   // requests wipe both JS and native state to block the cross-request
   // cache-affinity leak described at length in `responses.ts`; native-
@@ -987,7 +975,7 @@ async function runSessionStreaming(
   session.primeHistory(messages);
   const initialTurns = session.turns;
   return {
-    stream: session.startFromHistoryStream(config, signal),
+    stream: session.startFromHistoryStream(constrainedConfig, signal),
     wasCommitted: () => session.turns > initialTurns,
   };
 }

@@ -423,6 +423,114 @@ describe('createHandler', () => {
       expect(parsed.output[0].type).toBe('message');
     });
 
+    it('returns a JSON 400 for streaming context overflow before committing SSE or mutating native cache state', async () => {
+      const model = Object.assign(createMockStreamModel([]), {
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: 64,
+          pagedBlockCapacity: 4,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(65)),
+      });
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'too large',
+        stream: true,
+      });
+      const { res, getStatus, getBody, getHeaders, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      expect(getHeaders()['content-type']).toContain('application/json');
+      expect(getBody()).toContain('context_length_exceeded');
+      expect(getBody()).not.toContain('event:');
+      expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    });
+
+    it('commits initial SSE response events before a delayed first native stream event', async () => {
+      let markEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        markEntered = resolve;
+      });
+      let releaseFirstEvent!: () => void;
+      const firstEventGate = new Promise<void>((resolve) => {
+        releaseFirstEvent = resolve;
+      });
+      let cleanedUp = false;
+      async function* delayedStream() {
+        try {
+          markEntered();
+          await firstEventGate;
+          yield {
+            done: true,
+            text: 'Hello',
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 3,
+            reasoningTokens: 0,
+            rawText: 'Hello',
+          };
+        } finally {
+          cleanedUp = true;
+        }
+      }
+      const model = createMockStreamModel([]);
+      model.chatStreamSessionStart = vi.fn(() => delayedStream());
+      const registry = new ModelRegistry();
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'Hello',
+        stream: true,
+      });
+      const { res, getStatus, getBody, getHeaders, waitForEnd } = createMockRes();
+
+      const handling = handler(req, res);
+      let statusBeforeFirstEvent = 0;
+      let contentTypeBeforeFirstEvent: string | string[] | undefined;
+      let bodyBeforeFirstEvent = '';
+      let entryFailure: unknown;
+      let entryTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          entered,
+          handling.then(() => {
+            throw new Error('streaming handler completed before entering the native stream');
+          }),
+          new Promise<never>((_resolve, reject) => {
+            entryTimer = setTimeout(() => reject(new Error('timed out waiting to enter the native stream')), 1_000);
+          }),
+        ]);
+        statusBeforeFirstEvent = getStatus();
+        contentTypeBeforeFirstEvent = getHeaders()['content-type'];
+        bodyBeforeFirstEvent = getBody();
+      } catch (error) {
+        entryFailure = error;
+      } finally {
+        if (entryTimer !== undefined) clearTimeout(entryTimer);
+        releaseFirstEvent();
+      }
+      await handling;
+      await waitForEnd();
+      if (entryFailure !== undefined) throw entryFailure;
+
+      expect(statusBeforeFirstEvent).toBe(200);
+      expect(contentTypeBeforeFirstEvent).toBe('text/event-stream');
+      expect(bodyBeforeFirstEvent).toContain('event: response.created');
+      expect(bodyBeforeFirstEvent).toContain('event: response.in_progress');
+      expect(cleanedUp).toBe(true);
+    });
+
     it('returns 400 when model is missing', async () => {
       const registry = new ModelRegistry();
       const handler = createHandler(registry);
@@ -11725,6 +11833,64 @@ describe('createHandler', () => {
         expect(chatSessionStart).toHaveBeenCalledTimes(1);
         expect(getHeaders2()['x-session-cache']).toBe('prefix_hit');
         expect(getHeaders2()['x-cached-tokens']).toBe('42');
+      });
+
+      it('preflights a streaming tier-2 delta against the leased session history before SSE', async () => {
+        const streamEvents = [
+          {
+            done: true,
+            text: 'first',
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 8,
+            reasoningTokens: 0,
+            rawText: 'first',
+          },
+        ];
+        const model = Object.assign(createMockStreamModel(streamEvents), {
+          contextLimits: () => ({
+            trainedWindowTokens: 262_144,
+            effectiveWindowTokens: 64,
+            pagedBlockCapacity: 4,
+            pagedBlockSize: 16,
+          }),
+          // Turn 1's request-local history fits. On the tier-2 hit, only the
+          // leased session can supply [user, assistant] before the new user.
+          applyChatTemplate: vi.fn((messages: ChatMessage[]) => new Uint32Array(messages.length >= 3 ? 65 : 8)),
+        });
+        const registry = new ModelRegistry();
+        registry.register('test-model', model);
+        const handler = createHandler(registry);
+
+        const req1 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'hi',
+          stream: true,
+          prompt_cache_key: 'chain-capacity',
+        });
+        const first = createMockRes();
+        await handler(req1, first.res);
+        await first.waitForEnd();
+        expect(first.getStatus()).toBe(200);
+
+        const req2 = createMockReq('POST', '/v1/responses', {
+          model: 'test-model',
+          input: 'follow up',
+          stream: true,
+          prompt_cache_key: 'chain-capacity',
+        });
+        const second = createMockRes();
+        await handler(req2, second.res);
+        await second.waitForEnd();
+
+        expect(second.getStatus()).toBe(400);
+        expect(second.getHeaders()['content-type']).toContain('application/json');
+        expect(second.getBody()).toContain('context_length_exceeded');
+        expect(second.getBody()).not.toContain('event: response.created');
+        expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+        expect((model.chatStreamSessionContinue as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
       });
 
       it('tier-2 hit with cachedTokens === 0 demotes X-Session-Cache from prefix_hit back to fresh', async () => {
