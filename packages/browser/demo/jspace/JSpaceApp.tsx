@@ -79,6 +79,15 @@ export default function JSpaceApp() {
   const [activePinIdx, setActivePinIdx] = React.useState<number | null>(null);
   const [selected, setSelected] = React.useState<CellRef | null>(null);
   const [hovered, setHovered] = React.useState<CellRef | null>(null);
+  // Sticky "last engaged cell". The per-cell readout and the cross-section strips
+  // are MOUNT-gated on `activeCellRef` (= hovered ?? selected). `hovered` flips to
+  // null the instant the cursor leaves the grid, so without this a hover-only
+  // session (no click) would UNMOUNT those large sections on every mouse-out —
+  // which reflows the page (worst when scrolled to the bottom, where the shrink
+  // clamps the scroll and re-slides a cell under the cursor, re-arming hover) in an
+  // unmount→reflow→re-hover blink loop. Persisting the last engaged cell keeps them
+  // mounted; hover still drives their CONTENT. Reset on every new run / mode change.
+  const [focusCell, setFocusCell] = React.useState<CellRef | null>(null);
   const [showWhitespace, setShowWhitespace] = React.useState(false);
   const [starterSlug, setStarterSlug] = React.useState<string>(STARTER_SLUGS[0]!);
   const [tokenCount, setTokenCount] = React.useState<number | null>(null);
@@ -277,6 +286,7 @@ export default function JSpaceApp() {
       }
       setSelected(null);
       setHovered(null);
+      setFocusCell(null); // new run → back to the "hover a cell" placeholder
       await runReadout(promptIds, pinsRef.current, mode);
     } finally {
       setPreparing(false);
@@ -288,6 +298,7 @@ export default function JSpaceApp() {
     setMode(next);
     setSelected(null);
     setHovered(null);
+    setFocusCell(null); // mode swap → back to the "hover a cell" placeholder
     // User diverged from any permalink-restored state — cancel the one-shot
     // restore so a later run does not resurrect a stale selection (F3).
     pendingSelRef.current = null;
@@ -410,7 +421,13 @@ export default function JSpaceApp() {
     pendingSelRef.current = null;
   }, []);
 
-  const activeCellRef = slice ? normalizeSelected(hovered ?? selected, slice) : null;
+  // The user's live pointer/keyboard target; `focusCell` persists the last one so
+  // `activeCellRef` never collapses to null mid-session (see focusCell above).
+  const engagedCell = hovered ?? selected;
+  React.useEffect(() => {
+    if (engagedCell) setFocusCell(engagedCell);
+  }, [engagedCell?.layerIdx, engagedCell?.pos]);
+  const activeCellRef = slice ? normalizeSelected(engagedCell ?? focusCell, slice) : null;
   const colorByPinnedId = React.useMemo(() => {
     const m = new Map<number, string>();
     pinnedForView.forEach((p, i) => m.set(p.tokenId, pinColor(i)));
