@@ -69,7 +69,9 @@ The gallery is **honest about the 0.8B scale gap**: the source paper (Anthropic,
 
 ### A — Empirical gallery (vetted winners + honesty artifact)
 
-Vetting was run **headless** (`canRunHeadless:true`) against the real native `lensReadout` (logit + fitted-Jacobian pack, 24 residual boundaries, topK=8, last-position next-prediction) over 35 paper-phenomenon candidates. Result: **5 STRONG + 2 WEAK** honest winners; injection / emoji-face / count-and-introspect **dropped** (total floor). Combined with the retained pilot headline `french-season`, the gallery ships **8 tiles (5 STRONG + 3 WEAK)** — within the 6–8 target, ≥4-STRONG floor satisfied. (Recalibrated during the bake: `giza-continent` is graded WEAK, not STRONG — the reproducible bake shows `Africa` at rank ~2 across only 2 band layers with a degenerate `'1'` output and no bridge hop, i.e. the same class as `eiffel-capital`, not a top-3/≥3-layer STRONG tile.)
+Vetting was run **headless** (`canRunHeadless:true`) against the real native `lensReadout` (logit + fitted-Jacobian pack, 24 residual boundaries, topK=8, last-position next-prediction) over 35 paper-phenomenon candidates. The gallery ships **7 tiles (5 STRONG + 2 WEAK)** — within the 6–8 target, ≥4-STRONG floor satisfied. `giza-continent` is graded WEAK (the reproducible bake shows `Africa` at rank ~2 with a degenerate `'1'` output and no bridge hop, not a top-3 STRONG tile).
+
+> **Post-review reconciliation (adversarial re-review, 8 findings).** `eiffel-capital` was **DROPPED**: `Paris` (id 11751) is the model's **ℓ24 greedy output** — a *spoken* answer, so it violates the gallery's "unspoken word" invariant. The bake now asserts no pinned concept equals the ℓ24 argmax, and no STRONG/WEAK caption may misstate a rank (all rank numbers are 1-based, matching the committed frames). Injection / emoji-face / count-and-introspect were dropped during vetting (total floor); eiffel joins them in `vetting.json`'s dropped roster. **The shipped copy + rank/band numbers in `demo/jspace/JSpaceApp.tsx` and `gallery.ts` are the source of truth** — the illustrative copy/table below is the design-time snapshot.
 
 **Shipped gallery (STRONG first; `french-season` headline):**
 
@@ -79,10 +81,10 @@ Vetting was run **headless** (`canRunHeadless:true`) against the real native `le
 | 2 | `arith-inner-sum` | `2 * (1 + 2) = ` | `["3"," 3"]` | **3** — inner sum (1+2) before the multiply | 18 | 15–18 | STRONG | jacobian |
 | 3 | `arith-precedence` | `3 + 4 * 2 = ` | `["8"," 8"]` | **8** — product 4×2 held before adding 3 | 20 | 18–20 | STRONG | jacobian |
 | 4 | `arith-fewshot` | `(1+2)*2=6. (2+3)*2= ` | `["5"," 5"]` | **5** — inner sum (2+3) in the analogy | 20 | 20–23 | STRONG | jacobian |
-| 5 | `grammar-error` | `The plural of 'child' is childs.` | `[" incorrect"]` | **incorrect** — error flag on wrong plural | 17 | 17–19 | STRONG | jacobian *(logit also passes)* |
+| 5 | `grammar-error` | `The plural of 'child' is childs.` | `[" Incorrect"]` | **Incorrect** — error flag on wrong plural | 17 | 16–17 | STRONG | jacobian |
 | 6 | `giza-continent` | `Fact: The continent where the pyramids of Giza are located is ` | `[" Africa","Africa"]` | **Africa** — answer, before degenerate output | 17 | 17–18 | WEAK | jacobian |
-| 7 | `int-cast-error` | `>>> int('hello')\n` | `[" error"]` | **error** — generic runtime-error concept | 18 | 18–18 | WEAK | jacobian |
-| 8 | `eiffel-capital` | `Fact: The capital of the country where the Eiffel Tower stands is ` | `[" Paris","Paris"]` | **Paris** — answer, before degenerate output | 18 | 18–18 | WEAK | jacobian |
+| 7 | `int-cast-error` | `>>> int('hello')\n` | `[" Error"]` | **Error** — generic runtime-error concept | 18 | 18–18 | WEAK | jacobian |
+| — | ~~`eiffel-capital`~~ | *dropped post-review — `Paris` IS the ℓ24 output (spoken)* | — | — | — | — | ~~WEAK~~ → **DROPPED** | — |
 
 `band ℓ` = `[bandLayers[0], peakLayer]`, both **rubric-produced** and written to `vetting.json` (§5); the values above are from the completed vetting run and are re-confirmed (never hand-tuned) when the artifact regenerates. `french-season`'s band reuses the lesson's tuned `BAND.onsetBoundary / BAND.legibilityPeak` (no invented numbers).
 
@@ -432,7 +434,7 @@ const JSPACE_COPY = {
 
 | Action | File · anchor | Change |
 |---|---|---|
-| **create** | `demo/jspace/starters/gallery.ts` | `GalleryEntry` type + `GALLERY[]` (8 vetted entries) + `STARTER_SLUGS` derived |
+| **create** | `demo/jspace/starters/gallery.ts` | `GalleryEntry` type + `GALLERY[]` (7 vetted entries) + `STARTER_SLUGS` derived |
 | **create** | `demo/jspace/starters/<slug>.json` ×8 | baked model-free frames incl. resolved `pinIds` (from `bake.mts`) |
 | **create** | `demo/jspace/starters/vetting.json` | honesty artifact (§5) |
 | **create** | `demo/jspace/argmax-tint.ts` *(or export in-file)* | pure `tintAlphaForRank` + `ALPHA_MAX/MIN` |
@@ -461,7 +463,7 @@ const JSPACE_COPY = {
 | `tintAlphaForRank(0, 1)` | `0.18` (K=1 guard, no div-by-zero) |
 | `tintAlphaForRank(k, 10)` for k=1..8 | strictly decreasing, linear, `≈ 0.18 - 0.015·k` |
 
-**8.2 Model-free gallery load** — with wasm/model **blocked** (network offline or model fetch stubbed), Chrome-load `/jspace`: all 8 tiles render, `openStarter` on each loads a baked frame, the grid draws with (C) concept tints and (D2) band strip, no model download, no console errors. Proves the gallery is genuinely model-free.
+**8.2 Model-free gallery load** — with wasm/model **blocked** (network offline or model fetch stubbed), Chrome-load `/jspace`: all 7 tiles render, `openStarter` on each loads a baked frame, the grid draws with (C) concept tints and (D2) band strip, no model download, no console errors. Proves the gallery is genuinely model-free.
 
 **8.3 Live Chrome verify, both locales** (use Chrome MCP per `reference_chrome_mcp_frontend`; subagent smoke reports are unreliable):
 - **en:** fresh visit → gallery visible cold *and* after typing a custom prompt (persistence). Click `arith-inner-sum` → mode=jacobian, pin '3' threads the grid, band strip on ℓ15–18, ℓ18 label accented, blurb caption reads the en string.
