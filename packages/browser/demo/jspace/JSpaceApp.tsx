@@ -516,13 +516,11 @@ export default function JSpaceApp() {
   React.useEffect(() => {
     if (!hashAppliedRef.current) return;
     if (typeof window === 'undefined') return;
-    const encoded = encodePermalink({ prompt, mode, pins, sel: selected, starterSlug });
-    if (encoded === lastWrittenHashRef.current) return;
     // Only the FULL default cold view stays URL-clean: cold prompt, no pins/selection,
-    // default lens AND the default tile. Opening a non-default tile or toggling the
-    // lens now writes an ACCURATE `#s=<slug>&mode=<m>` that restores that exact tile
-    // (codex #7 fixed by encoding the slug, not by suppressing the write; codex #2 —
-    // a deliberate cold-mode choice — is preserved because mode is no longer dropped).
+    // default lens AND the default tile. A non-default tile or a toggled lens writes an
+    // ACCURATE `#s=<slug>&mode=<m>` that restores that exact tile (codex #7 fixed by
+    // encoding the slug, not by suppressing the write; codex #2 — a deliberate cold-mode
+    // choice — is preserved because mode is no longer dropped).
     const isColdDefault =
       isColdPrompt(prompt) &&
       pins.length === 0 &&
@@ -530,17 +528,20 @@ export default function JSpaceApp() {
       mode === DEFAULTS.mode &&
       starterSlug === DEFAULTS.starterSlug;
     if (isColdDefault) {
-      // The full default cold view must leave the URL CLEAN. Actively STRIP any hash a
-      // prior non-default state wrote — not merely skip the write when already clean —
-      // so `cold → type a prompt → clear it` returns to a bare URL, not a lingering
-      // `#p=&mode=l&s=french-season` (codex round-3 #3). A fresh cold mount has an
-      // empty ref, so this writes nothing then.
-      if (lastWrittenHashRef.current) {
+      // The full default cold view must leave the URL CLEAN. Decide from the LIVE
+      // `location.hash`, and BEFORE the encoded/ref equality gate below — otherwise
+      // reloading the exact stale `#p=&mode=l&s=french-season` a pre-fix session left
+      // behind would re-encode to that same string, hit `encoded === ref`, and return
+      // without repairing it (codex round-4). A genuinely clean fresh mount has an empty
+      // `location.hash`, so this writes nothing.
+      if (window.location.hash) {
         window.history.replaceState(window.history.state, '', `${window.location.pathname}${window.location.search}`);
       }
       lastWrittenHashRef.current = '';
       return;
     }
+    const encoded = encodePermalink({ prompt, mode, pins, sel: selected, starterSlug });
+    if (encoded === lastWrittenHashRef.current) return;
     lastWrittenHashRef.current = encoded;
     const url = `${window.location.pathname}${window.location.search}#${encoded}`;
     window.history.replaceState(window.history.state, '', url);

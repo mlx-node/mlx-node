@@ -296,4 +296,22 @@ describe('permalink hardening (codex round-3)', () => {
     await waitFor(() => window.location.hash === '');
     expect(window.location.hash).toBe('');
   });
+
+  it('strips a stale default hash already in the URL on mount (codex round-4)', async () => {
+    // The exact hash a pre-fix cold→custom→clear session left behind. On reload it
+    // re-encodes to itself, so an `encoded === ref` gate would skip repair — the strip
+    // must be decided from the live location.hash BEFORE that gate.
+    mountApp('#p=&mode=l&s=french-season');
+    await tick();
+    await waitFor(() => window.location.hash === '');
+    expect(window.location.hash).toBe('');
+  });
+
+  it('RETAINS a non-default cold tile permalink on mount (a deliberate shareable state)', async () => {
+    mountApp('#p=&mode=j&s=arith-precedence');
+    await tick();
+    await waitFor(() => gridCanvas() !== null);
+    // Not the default tile/lens → NOT cold-default → its hash must survive untouched.
+    expect(window.location.hash).toContain('s=arith-precedence');
+  });
 });
