@@ -28,6 +28,7 @@ import { composeAbort } from './compose-abort';
 import { isColdPrompt } from './cold-prompt';
 import { ByPosStrip } from './ByPosStrip';
 import { DivergenceGridCanvas } from './DivergenceGridCanvas';
+import { MotorFlipStrip } from './MotorFlipStrip';
 import { PinManager } from './PinManager';
 import { PromptTokens } from './PromptTokens';
 import { RankChart } from './RankChart';
@@ -129,6 +130,10 @@ const JSPACE_COPY = {
       omitNote:
         'Excess kurtosis, residual autocorrelation, and activation participation-ratio need the full logit/residual vectors, which are not shipped in-browser — omitted here.',
     },
+    motorFlip: {
+      eyebrow: 'Commit depth · where each position locks its top guess',
+      hint: 'The layer at which each position’s top token stops changing through to the output. Early (bright) = decided early; late (dark) = deliberated deeper in the stack.',
+    },
   },
   zh: {
     galleryLabel: '示例 · 无需模型',
@@ -177,6 +182,10 @@ const JSPACE_COPY = {
       entropy: '读出熵（top-10）',
       stability: 'top-10 集合稳定度（top-10）',
       omitNote: '超额峰度、残差自相关、激活参与比需要完整的 logit / 残差向量，浏览器内并未传输，这里省略。',
+    },
+    motorFlip: {
+      eyebrow: '定型深度 · 每个位置在哪一层锁定 top 猜测',
+      hint: '每个位置的 top token 从哪一层起直到输出都不再改变。越早（越亮）= 越早决定；越晚（越暗）= 在更深的层里才定型。',
     },
   },
 } as const;
@@ -1181,6 +1190,12 @@ export default function JSpaceApp() {
           {slice ? (
             <WorkspaceMetricsStrip slice={slice} pinnedIdx={effectiveActiveIdx ?? 0} copy={copy.metrics} />
           ) : null}
+
+          {/* Motor-flip commit-depth strip — per prompt position, the layer at
+              which the readout's top guess locks onto its final (ℓ-max) token.
+              Client-only over Task-3's pure `motorFlipLayer`; works for baked +
+              live. Coloured by earliness (bright = decided early). */}
+          {slice ? <MotorFlipStrip slice={slice} copy={copy.motorFlip} /> : null}
 
           {/* Cross-sections at the selected cell */}
           {activeCellRef ? (
