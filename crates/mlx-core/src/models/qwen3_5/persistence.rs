@@ -1961,31 +1961,16 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         full_attention_interval: gi(&["full_attention_interval"], 4),
         partial_rotary_factor,
         rope_theta,
-        paged_cache_memory_mb: {
-            let explicit = raw
-                .get("paged_cache_memory_mb")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-            let n_mtp_local = gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0);
-            // Stage 1 (MTP-paged enablement): when MTP heads are
-            // present AND the user did not set a budget, default to
-            // 256 MB instead of the global default 2048 MB so that
-            // opt-in Stage 2 benches via `MLX_QWEN35_PAGED_OVERRIDE=1`
-            // do not pay a measurable memory-pressure tax on the dense
-            // MTP path. The 2048 MB upfront `LayerKVPool` allocation
-            // slows dense MTP decode by ~30% on M5 Max at 27B/nvfp4
-            // (and 512 MB still costs ~16%, while 256 MB is within
-            // ~5%). 256 MB covers ~4k tokens of K/V on qwen3.6-27b
-            // (16 attn layers × 4096 × 8 KV heads × 128 head_dim ×
-            // 2 bytes × 2 K+V ≈ 256 MB). Stage 2's paged-attn verify
-            // port can lift this when it needs more capacity.
-            //
-            // This default is harmless on non-paged paths — the field
-            // is only consulted when `use_block_paged_cache=Some(true)`,
-            // which Stage 1 does NOT auto-set; see the comment on
-            // `use_block_paged_cache` below.
-            explicit.or(if n_mtp_local > 0 { Some(256) } else { None })
-        },
+        // Preserve absence as `None`: model construction distinguishes an
+        // explicit user budget from the implicit full-context default. Dense
+        // MTP checkpoints used to turn absence into `Some(256)` here, which
+        // made the constructor treat a ~4K-token benchmark fallback as a user
+        // override and bypass full-context sizing. Small MTP benchmark pools
+        // remain available by setting `paged_cache_memory_mb` explicitly.
+        paged_cache_memory_mb: raw
+            .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
         paged_block_size: raw
             .get("paged_block_size")
             .and_then(|v| v.as_u64())
@@ -2216,6 +2201,82 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn qwen36_27b_mtp_config_json() -> Value {
+        json!({
+            "model_type": "qwen3_5",
+            "text_config": {
+                "vocab_size": 248320,
+                "hidden_size": 5120,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "num_hidden_layers": 64,
+                "intermediate_size": 17408,
+                "head_dim": 256,
+                "max_position_embeddings": 262144,
+                "full_attention_interval": 4,
+                "mtp_num_hidden_layers": 1
+            }
+        })
+    }
+
+    #[test]
+    fn dense_mtp_missing_paged_budget_reaches_full_context_default() {
+        let raw = qwen36_27b_mtp_config_json();
+        let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
+        assert_eq!(config.n_mtp_layers, 1, "fixture must exercise dense MTP");
+        assert_eq!(
+            config.paged_cache_memory_mb, None,
+            "an absent budget must remain distinguishable from an explicit override"
+        );
+
+        let default_memory_mb =
+            crate::models::qwen3_5::config::qwen35_default_paged_cache_memory_mb(
+                config.max_position_embeddings as u32,
+                config.paged_block_size.unwrap_or(16),
+                config.head_dim as u32,
+                config.num_kv_heads as u32,
+                config.full_attention_layer_count() as u32,
+            );
+        let (memory_mb, source) =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
+                config.paged_cache_memory_mb,
+                default_memory_mb,
+            );
+        assert_eq!(memory_mb, 16_384);
+        assert_eq!(source, "auto_full_context");
+
+        let paged = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: memory_mb,
+            head_size: 256,
+            num_kv_heads: 4,
+            num_layers: 16,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(262_144),
+            max_batch_size: Some(32),
+        };
+        assert_eq!(paged.calculate_num_blocks(), 16_384);
+        assert_eq!(paged.max_cached_tokens(), 262_144);
+    }
+
+    #[test]
+    fn dense_mtp_explicit_paged_budget_stays_explicit() {
+        let mut raw = qwen36_27b_mtp_config_json();
+        raw["paged_cache_memory_mb"] = json!(2_048);
+
+        let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
+        assert_eq!(config.n_mtp_layers, 1);
+        assert_eq!(config.paged_cache_memory_mb, Some(2_048));
+
+        let (memory_mb, source) =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
+                config.paged_cache_memory_mb,
+                16_384,
+            );
+        assert_eq!(memory_mb, 2_048);
+        assert_eq!(source, "config");
+    }
 
     #[test]
     fn collapse_patch_embed_conv3d_sums_temporal_slices() {
