@@ -55,12 +55,18 @@ const streamdownPlugins: PluginConfig = {
   // Render LaTeX the model emits: `$…$` inline and `$$…$$` block. remark-math
   // parses the delimiters; rehype-katex renders with KaTeX. `throwOnError:false`
   // keeps a malformed formula (common from a 0.8B model) from breaking the
-  // message — it falls back to the red source instead.
+  // message — it falls back to the red source instead. `maxSize` caps
+  // user-controlled explicit sizes (`\rule`, `\kern`, `\raisebox`) so a model
+  // emitting e.g. `$\rule{100000em}{100000em}$` can't blow the layout into a
+  // multi-million-pixel element; KaTeX's default `trust:false` and `maxExpand`
+  // (1000) already block `\href`/HTML injection and macro-expansion bombs.
+  // Note: single-dollar math is intentionally on — the model writes `$3+4=7$`;
+  // the tradeoff is that ordinary prose like `$5 and $10` parses as math.
   math: {
     name: 'katex',
     type: 'math',
     remarkPlugin: remarkMath,
-    rehypePlugin: [rehypeKatex, { throwOnError: false }],
+    rehypePlugin: [rehypeKatex, { throwOnError: false, maxSize: 20 }],
   },
 };
 
