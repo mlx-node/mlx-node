@@ -1192,6 +1192,114 @@ impl LayerKVPool {
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         Err("read_blocks_to_host is only supported on macOS (Metal backend)".to_string())
     }
+
+    /// Restore raw cache-layout bytes for physical blocks in one layer.
+    ///
+    /// This is the exact inverse of [`Self::read_blocks_to_host`]. The input
+    /// bytes use the native paged-cache layouts (packed K and vLLM V), not a
+    /// logical token-major tensor. Both buffers must contain exactly one
+    /// block-sized region per `block_ids` entry. Validation happens before
+    /// any Metal command is submitted, so malformed/corrupt cold-cache data
+    /// cannot partially overwrite the pool.
+    #[cfg(target_os = "macos")]
+    pub fn write_blocks_from_host(
+        &self,
+        layer_idx: u32,
+        block_ids: &[u32],
+        keys_bytes: &[u8],
+        values_bytes: &[u8],
+    ) -> Result<(), String> {
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+        use metal::MTLResourceOptions;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        if layer_idx as usize >= self.layers.len() {
+            return Err(format!(
+                "LayerKVPool::write_blocks_from_host: layer_idx {} out of range (num_layers = {})",
+                layer_idx,
+                self.layers.len()
+            ));
+        }
+        for &id in block_ids {
+            if id >= self.num_blocks {
+                return Err(format!(
+                    "LayerKVPool::write_blocks_from_host: block_id {} >= num_blocks {}",
+                    id, self.num_blocks
+                ));
+            }
+        }
+
+        let (element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
+        let block_size = self.config.block_size as u64;
+        let num_kv_heads = self.config.num_kv_heads as u64;
+        let head_size = self.config.head_size as u64;
+        let key_block_size =
+            num_kv_heads * (head_size / x as u64) * block_size * x as u64 * element_size;
+        let value_block_size = num_kv_heads * head_size * block_size * element_size;
+        let expected_keys = key_block_size as usize * block_ids.len();
+        let expected_values = value_block_size as usize * block_ids.len();
+        if keys_bytes.len() != expected_keys || values_bytes.len() != expected_values {
+            return Err(format!(
+                "LayerKVPool::write_blocks_from_host: byte length mismatch (keys {} != {}, values {} != {})",
+                keys_bytes.len(),
+                expected_keys,
+                values_bytes.len(),
+                expected_values
+            ));
+        }
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+
+        let state = MetalState::get()?;
+        let key_staging = state.device.new_buffer_with_data(
+            keys_bytes.as_ptr().cast(),
+            keys_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let value_staging = state.device.new_buffer_with_data(
+            values_bytes.as_ptr().cast(),
+            values_bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
+        let command_buffer = state.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        for (i, &block_id) in block_ids.iter().enumerate() {
+            blit.copy_from_buffer(
+                &key_staging,
+                i as u64 * key_block_size,
+                key_cache,
+                block_id as u64 * key_block_size,
+                key_block_size,
+            );
+            blit.copy_from_buffer(
+                &value_staging,
+                i as u64 * value_block_size,
+                value_cache,
+                block_id as u64 * value_block_size,
+                value_block_size,
+            );
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        Ok(())
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn write_blocks_from_host(
+        &self,
+        _layer_idx: u32,
+        _block_ids: &[u32],
+        _keys_bytes: &[u8],
+        _values_bytes: &[u8],
+    ) -> Result<(), String> {
+        Err("write_blocks_from_host is only supported on macOS (Metal backend)".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1420,6 +1528,41 @@ mod tests {
         // Out-of-range layer
         let oob = pool.key_cache_array_raw(99);
         assert!(oob.is_err());
+    }
+
+    /// Cold-cache persistence operates on the exact packed BF16 bytes. Prove
+    /// that the host upload is the inverse of extraction without routing
+    /// through an MLX tensor or changing the native K/V layout.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_bf16_raw_block_host_metal_round_trip() {
+        let pool = match LayerKVPool::new(base_config(1), 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping test_bf16_raw_block_host_metal_round_trip: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        // heads=2 * head_size=64 * block_size=8 * sizeof(bf16)=2.
+        let block_bytes = 2 * 64 * 8 * 2;
+        let keys: Vec<u8> = (0..block_bytes).map(|i| (i % 251) as u8).collect();
+        let values: Vec<u8> = (0..block_bytes).map(|i| (250 - (i % 251)) as u8).collect();
+
+        pool.write_blocks_from_host(0, &[1], &keys, &values)
+            .expect("raw BF16 upload");
+        let (read_keys, read_values) = pool
+            .read_blocks_to_host(0, &[1])
+            .expect("raw BF16 extraction");
+        assert_eq!(read_keys, keys);
+        assert_eq!(read_values, values);
+
+        let short = &keys[..keys.len() - 1];
+        assert!(
+            pool.write_blocks_from_host(0, &[1], short, &values)
+                .is_err(),
+            "malformed cold data must be rejected before Metal upload"
+        );
     }
 
     #[test]

@@ -611,6 +611,11 @@ unsafe extern "C-unwind" {
     // Rust profile.rs auto-sizer surfaces ProfileError on -1.
     pub fn mlx_total_system_memory(out_value: *mut u64) -> i32;
 
+    // Amount of memory this process can allocate before macOS starts applying
+    // memory-pressure termination. Backed by os_proc_available_memory(3).
+    // Returns 0 on success and -1 when the probe is unavailable.
+    pub fn mlx_process_available_memory(out_value: *mut u64) -> i32;
+
     // GPU-visible working-set bound (`MTLDevice
     // recommendedMaxWorkingSetSize`). Returns 0 on success (writes value
     // through `out_value`); returns -1 if Metal unavailable, device_info

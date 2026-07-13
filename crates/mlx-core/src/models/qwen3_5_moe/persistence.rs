@@ -1646,6 +1646,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         &per_layer_quant,
                     )?;
 
+                    // Delay physical paged-pool allocation until all text and
+                    // vision weights are resident so the live-memory cap sees
+                    // the actual model footprint.
+                    if let Some(ref vparams) = vision_params {
+                        let arrays: Vec<&MxArray> = vparams.values().collect();
+                        crate::array::memory::materialize_weights(&arrays)?;
+                    }
+                    inner.initialize_paged_adapter()?;
+
                     // Deterministic weight-byte total for the cache-limit
                     // coordinator. Includes text + vision weights when a
                     // vision encoder is loaded. `saturating_add` guards
@@ -1672,6 +1681,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let context_limits = crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_tuple(
+                inner.paged_context_limits(),
+            );
 
             Ok((
                 inner,
@@ -1683,6 +1695,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    context_limits,
                 ),
             ))
         },
@@ -1697,6 +1710,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         cache_limit_guard,
         paged_active,
         mtp_active,
+        context_limits,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -1706,6 +1720,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         config,
         paged_active,
         mtp_active,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }
@@ -2812,7 +2827,10 @@ mod tests {
             "affine checkpoints must keep their block-paged request"
         );
         if crate::engine::persistence::compiled_forward_backend_available() {
-            let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            let mut inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
+            inner
+                .initialize_paged_adapter()
+                .expect("post-load paged adapter initialization must succeed");
             assert!(
                 inner.paged_adapter.is_some(),
                 "affine paged config must build the paged adapter"

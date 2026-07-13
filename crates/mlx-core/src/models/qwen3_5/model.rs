@@ -79,6 +79,78 @@ fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
         .collect()
 }
 
+/// Enforce one fixed paged-pool token ceiling against already-resolved chat
+/// parameters. Shared by dense and MoE so every native paged executor uses the
+/// same prompt rejection marker and the same last-sampled-token accounting.
+pub(crate) fn constrain_paged_context_params(
+    family: &str,
+    prompt_tokens: usize,
+    capacity: u32,
+    params: &mut engine::ChatParams,
+) -> Result<()> {
+    let prompt = u32::try_from(prompt_tokens).unwrap_or(u32::MAX);
+    if prompt > capacity {
+        return Err(Error::from_reason(format!(
+            "context_length_exceeded: rendered prompt has {prompt} tokens, effective active \
+             context is {capacity} tokens"
+        )));
+    }
+    // The final sampled token is returned without another model forward, so N
+    // generated tokens consume only N-1 additional KV positions.
+    let max_output = capacity.saturating_sub(prompt).saturating_add(1);
+    let requested = params.max_new_tokens.max(0) as u32;
+    if requested > max_output {
+        warn!(
+            "{family} clamping max_new_tokens from {} to {} for effective context {} \
+             (prompt_tokens={})",
+            requested, max_output, capacity, prompt
+        );
+        params.max_new_tokens = max_output as i32;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod paged_context_capacity_tests {
+    use super::*;
+    use crate::engine::types::ChatConfig;
+
+    fn make_params(max_new_tokens: i32) -> engine::ChatParams {
+        extract_chat_params(&ChatConfig {
+            max_new_tokens: Some(max_new_tokens),
+            ..ChatConfig::default()
+        })
+    }
+
+    #[test]
+    fn rejects_a_prompt_larger_than_the_physical_pool() {
+        let mut params = make_params(32);
+        let err = constrain_paged_context_params("test", 65, 64, &mut params).unwrap_err();
+        assert!(
+            err.reason
+                .starts_with("context_length_exceeded: rendered prompt has 65 tokens")
+        );
+    }
+
+    #[test]
+    fn clamps_output_with_last_sampled_token_accounting() {
+        let mut params = make_params(100);
+        constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
+        assert_eq!(params.max_new_tokens, 17);
+
+        let mut full_prompt = make_params(100);
+        constrain_paged_context_params("test", 64, 64, &mut full_prompt).unwrap();
+        assert_eq!(full_prompt.max_new_tokens, 1);
+    }
+
+    #[test]
+    fn preserves_an_already_safe_output_budget() {
+        let mut params = make_params(10);
+        constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
+        assert_eq!(params.max_new_tokens, 10);
+    }
+}
+
 const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
 
 struct DenseGdnPrefixCheckpoint {
@@ -687,101 +759,12 @@ impl Qwen35Inner {
 
         let model_id = QWEN35_MODEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        // Block-paged KV adapter — selected by `use_block_paged_cache`.
-        //
-        // VLM checkpoints default this flag ON at load (see `parse_config`):
-        // dense image turns ONLY run on the paged-vision core, and the
-        // chat-entry sites error a vision turn that reaches a None adapter.
-        // Text-only forward (`Qwen3_5Attention::forward` with
-        // `position_ids = None`) and the paged forward
-        // (`Qwen3_5Attention::forward_paged`) both go through standard
-        // `self.rope`, so byte-equal parity holds on text-only inputs
-        // even on VLM weights.
-        // Block-paged KV uses Metal-only kernels; when paged is forced on (config
-        // or `MLX_QWEN35_PAGED_OVERRIDE=1`) on a non-Metal backend, leave the
-        // adapter None so dispatch falls through to flat eager instead of hitting
-        // the throwing CUDA stubs. macOS keeps building it (probe always true).
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(false)
-            && crate::engine::persistence::compiled_forward_backend_available()
-        {
-            let attn_layer_count = config.full_attention_layer_count() as u32;
-            if attn_layer_count == 0 {
-                return Err(Error::from_reason(
-                    "Qwen3.5 block-paged adapter: config has no full_attention layers; \
-                     paged KV cache requires at least one attention layer. Check \
-                     full_attention_interval.",
-                ));
-            }
-
-            let block_size = config.paged_block_size.unwrap_or(16);
-            let head_size = config.head_dim as u32;
-            let num_kv_heads = config.num_kv_heads as u32;
-            let max_seq_len = config.max_position_embeddings as u32;
-            let default_gpu_memory_mb = super::config::qwen35_default_paged_cache_memory_mb(
-                max_seq_len,
-                block_size,
-                head_size,
-                num_kv_heads,
-                attn_layer_count,
-            );
-            let (gpu_memory_mb, paged_cache_memory_source) =
-                super::config::qwen35_resolve_paged_cache_memory_mb(
-                    config.paged_cache_memory_mb,
-                    default_gpu_memory_mb,
-                );
-
-            let pa_config = mlx_paged_attn::PagedAttentionConfig {
-                block_size,
-                gpu_memory_mb,
-                head_size,
-                num_kv_heads,
-                // Pool covers only the full-attention layers — GDN
-                // (linear-attention) layers continue to use
-                // `Qwen3_5LayerCache::Linear`.
-                num_layers: attn_layer_count,
-                use_fp8_cache: Some(false),
-                max_seq_len: Some(max_seq_len),
-                max_batch_size: Some(32),
-            };
-
-            let num_blocks = pa_config.calculate_num_blocks();
-            if num_blocks == 0 {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
-                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
-                     block_size={block_size}, num_attn_layers={attn_layer_count})"
-                )));
-            }
-
-            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
-            )));
-
-            let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-                .map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct LayerKVPool for Qwen3.5 block-paged adapter: {e}"
-                    ))
-                })?;
-
-            let adapter =
-                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                    Error::from_reason(format!(
-                        "Failed to construct Qwen3.5 PagedKVCacheAdapter: {e}"
-                    ))
-                })?;
-
-            info!(
-                "Qwen3.5 block-paged adapter enabled: num_blocks={}, block_size={}, \
-                 gpu_memory_mb={}, paged_cache_memory_source={}, num_attn_layers={}, \
-                 cache_dtype=BFloat16",
-                num_blocks, block_size, gpu_memory_mb, paged_cache_memory_source, attn_layer_count
-            );
-            Some(adapter)
-        } else {
-            None
-        };
+        // The physical paged pool is intentionally created only after weight
+        // loading/materialization. At this point the MLX allocator does not yet
+        // know the resident model footprint, so sizing here can overcommit
+        // unified memory. Persistence calls `initialize_paged_adapter()` at the
+        // post-materialization seam.
+        let paged_adapter = None;
 
         // MTP head — constructed only when the checkpoint config
         // declares MTP layers. Weight load happens later, inside
@@ -824,6 +807,146 @@ impl Qwen35Inner {
             turn_is_streaming: Cell::new(false),
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Construct the physical paged KV pool after checkpoint weights have
+    /// been installed and materialized. The configured memory value is a
+    /// requested maximum; live unified-memory/Metal probes may only reduce it.
+    pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
+        if !self.config.use_block_paged_cache.unwrap_or(false)
+            || !crate::engine::persistence::compiled_forward_backend_available()
+        {
+            return Ok(());
+        }
+        if self.paged_adapter.is_some() {
+            return Ok(());
+        }
+
+        let attn_layer_count = self.config.full_attention_layer_count() as u32;
+        if attn_layer_count == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 block-paged adapter: config has no full_attention layers; paged KV \
+                 cache requires at least one attention layer",
+            ));
+        }
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let head_size = self.config.head_dim as u32;
+        let num_kv_heads = self.config.num_kv_heads as u32;
+        let max_seq_len = self.config.max_position_embeddings as u32;
+        let default_memory_mb = super::config::qwen35_default_paged_cache_memory_mb(
+            max_seq_len,
+            block_size,
+            head_size,
+            num_kv_heads,
+            attn_layer_count,
+        );
+        let (requested_memory_mb, requested_source) =
+            super::config::qwen35_resolve_paged_cache_memory_mb(
+                self.config.paged_cache_memory_mb,
+                default_memory_mb,
+            );
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: requested_memory_mb,
+            head_size,
+            num_kv_heads,
+            num_layers: attn_layer_count,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(max_seq_len),
+            max_batch_size: Some(32),
+        };
+        let requested_blocks = pa_config.calculate_num_blocks();
+        if requested_blocks == 0 {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 block-paged adapter: requested paged cache {requested_memory_mb} MiB \
+                 cannot hold one block"
+            )));
+        }
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let (num_blocks, sizing_source) = match mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            attn_layer_count,
+            num_kv_heads,
+            head_size,
+            block_size,
+            cache_dtype,
+        ) {
+            Ok(sizing) => (
+                sizing.selected_blocks,
+                format!(
+                    "adaptive(requested_blocks={}, active_mib={}, process_available_mib={}, working_set_mib={})",
+                    sizing.requested_blocks,
+                    sizing.metal_active_bytes / (1024 * 1024),
+                    sizing
+                        .process_available_bytes
+                        .map(|v| (v / (1024 * 1024)).to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    sizing
+                        .metal_working_set_bytes
+                        .map(|v| (v / (1024 * 1024)).to_string())
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+            ),
+            Err(e) => {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
+                     pool request: {e}"
+                )));
+            }
+        };
+
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            num_blocks, block_size,
+        )));
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+            .map_err(|e| Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}")))?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
+                Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
+            })?,
+        );
+        info!(
+            "Qwen3.5 paged adapter enabled after weight materialization: num_blocks={}, \
+             block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
+             requested_memory_mib={}, requested_source={}, sizing_source={}",
+            num_blocks,
+            block_size,
+            num_blocks.saturating_mul(block_size).min(max_seq_len),
+            max_seq_len,
+            requested_memory_mb,
+            requested_source,
+            sizing_source,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
+        let trained = self.config.max_position_embeddings.max(0) as u32;
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return (trained, trained, 0, 0);
+        };
+        let blocks = adapter.block_capacity();
+        let block_size = adapter.block_size();
+        (
+            trained,
+            trained.min(adapter.max_capacity_tokens()),
+            blocks,
+            block_size,
+        )
+    }
+
+    fn preflight_paged_context(
+        &self,
+        prompt_tokens: usize,
+        params: &mut engine::ChatParams,
+    ) -> Result<()> {
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("context_length_exceeded: paged cache is not initialized")
+        })?;
+        let capacity = adapter
+            .max_capacity_tokens()
+            .min(self.config.max_position_embeddings.max(0) as u32);
+        constrain_paged_context_params("Qwen3.5", prompt_tokens, capacity, params)
     }
 
     /// Store the checkpoint's parsed `generation_config.json` defaults.
@@ -2420,13 +2543,14 @@ impl Qwen35Inner {
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         // This paged turn writes full-attention K/V into the paged adapter
         // pool, NOT the flat `self.caches`, so the flat full-attention slots no
@@ -2972,13 +3096,14 @@ impl Qwen35Inner {
         images: &[Vec<u8>],
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
             match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
@@ -3015,6 +3140,7 @@ impl Qwen35Inner {
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
         let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let image_cache_key = compute_image_cache_key(images);
         let prompt_token_count = expanded_tokens.len() as u32;
 
@@ -3298,7 +3424,7 @@ impl Qwen35Inner {
         images: &[Vec<u8>],
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
@@ -3307,6 +3433,7 @@ impl Qwen35Inner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         let (vision_encoder, img_proc) =
             match (self.vision_encoder.clone(), self.image_processor.as_ref()) {
@@ -3345,6 +3472,7 @@ impl Qwen35Inner {
         let per_image_token_counts =
             compute_image_token_counts_per_image(&processed.grid_thw(), sms)?;
         let expanded_tokens = inject_image_placeholders(&tokens, &per_image_token_counts);
+        self.preflight_paged_context(expanded_tokens.len(), &mut p)?;
         let image_cache_key = compute_image_cache_key(images);
         let prompt_token_count = expanded_tokens.len() as u32;
 
@@ -3698,7 +3826,7 @@ impl Qwen35Inner {
         tokens: Vec<u32>,
         tokenizer: Arc<Qwen3Tokenizer>,
         eos_token_id: u32,
-        p: engine::ChatParams,
+        mut p: engine::ChatParams,
         report_perf: bool,
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
@@ -3707,6 +3835,7 @@ impl Qwen35Inner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
+        self.preflight_paged_context(tokens.len(), &mut p)?;
 
         // This paged turn writes full-attention K/V into the paged adapter
         // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
@@ -7298,8 +7427,30 @@ impl Qwen35Inner {
         // must rebuild the flat caches before decoding. The MTP paged cores
         // set this at their core entry; this is the set-site for the
         // generic path. See `paged_full_attn_caches_dirty`.
+        // The specialized MTP/VLM paged cores perform their own hard capacity
+        // preflight. The ordinary AR path delegates directly to the generic
+        // paged engine, so constrain a copy of the already-resolved params here
+        // and make that exact copy authoritative for prefill + decode. This is
+        // the native backstop for callers that bypass the TypeScript
+        // `ChatSession` preflight.
+        let mut constrained_params = args.params.clone();
+        self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
+        // Only dirty the flat-attention mirror after deterministic preflight
+        // succeeds. A rejected request has not touched the paged adapter.
         self.paged_full_attn_caches_dirty = true;
-        crate::engine::paged_turn::run_paged_turn(self, args)
+        let mut constrained_args = WholeTurnArgs {
+            tokens: args.tokens,
+            tokenizer: args.tokenizer,
+            eos_id: args.eos_id,
+            config: args.config,
+            params: &constrained_params,
+            thinking: args.thinking,
+            plan: args.plan,
+            sink: args.sink,
+            cancelled: args.cancelled,
+            media: args.media,
+        };
+        crate::engine::paged_turn::run_paged_turn(self, &mut constrained_args)
     }
 }
 
@@ -8368,6 +8519,29 @@ pub struct Qwen3_5GenerationResult {
     pub finish_reason: String,
 }
 
+/// Trained and physically available active-context limits for one loaded
+/// Qwen3.5 model. Values are snapshots because the physical pool is fixed for
+/// the lifetime of the resident model.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct Qwen3_5ContextLimits {
+    pub trained_window_tokens: u32,
+    pub effective_window_tokens: u32,
+    pub paged_block_capacity: u32,
+    pub paged_block_size: u32,
+}
+
+impl Qwen3_5ContextLimits {
+    pub(crate) fn from_tuple(value: (u32, u32, u32, u32)) -> Self {
+        Self {
+            trained_window_tokens: value.0,
+            effective_window_tokens: value.1,
+            paged_block_capacity: value.2,
+            paged_block_size: value.3,
+        }
+    }
+}
+
 // Shared chat types live in the model-neutral engine module; import them for
 // internal use (no re-export — consumers import from `crate::engine::types`).
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
@@ -8397,6 +8571,7 @@ pub struct Qwen3_5Model {
     /// auto-default `enableMtp = true` for checkpoints that ship an MTP
     /// head without round-tripping through the model thread.
     pub(crate) mtp_active: bool,
+    pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
@@ -8436,6 +8611,13 @@ impl Qwen3_5Model {
         self.mtp_active
     }
 
+    /// Synchronous snapshot used by higher layers to preflight rendered
+    /// prompts and clamp output before native cache allocation.
+    #[napi]
+    pub fn context_limits(&self) -> Qwen3_5ContextLimits {
+        self.context_limits.clone()
+    }
+
     /// Load a pretrained model from a directory.
     ///
     /// Expects the directory to contain:
@@ -8452,7 +8634,7 @@ impl Qwen3_5Model {
     pub async fn generate(
         &self,
         prompt_tokens: &MxArray,
-        config: Qwen3_5GenerationConfig,
+        mut config: Qwen3_5GenerationConfig,
     ) -> Result<Qwen3_5GenerationResult> {
         if config.max_new_tokens <= 0 {
             return Err(Error::from_reason(format!(
@@ -8467,6 +8649,16 @@ impl Qwen3_5Model {
                 batch_size
             )));
         }
+        let prompt_len = prompt_tokens.shape_at(1)? as u32;
+        let capacity = self.context_limits.effective_window_tokens;
+        if prompt_len > capacity {
+            return Err(Error::from_reason(format!(
+                "context_length_exceeded: prompt has {prompt_len} tokens, effective active \
+                 context is {capacity} tokens"
+            )));
+        }
+        let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
+        config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Generate {
             prompt_tokens: prompt_tokens.clone(),
             config,
@@ -10185,7 +10377,21 @@ mod paged_construction_tests {
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
         let cfg = tiny_paged_forward_cfg();
         match Qwen35Inner::new(cfg.clone()) {
-            Ok(inner) => Some((inner, cfg)),
+            Ok(mut inner) => match inner.initialize_paged_adapter() {
+                Ok(()) => Some((inner, cfg)),
+                Err(err) => {
+                    let msg = err.reason.to_string();
+                    if msg.contains("Metal")
+                        || msg.contains("device")
+                        || msg.contains("LayerKVPool")
+                    {
+                        eprintln!("skipping {test_name} (paged adapter unavailable): {msg}");
+                        None
+                    } else {
+                        panic!("unexpected paged init failure in {test_name}: {msg}");
+                    }
+                }
+            },
             Err(err) => {
                 let msg = err.reason.to_string();
                 if msg.contains("Metal") || msg.contains("device") || msg.contains("LayerKVPool") {
@@ -10845,9 +11051,12 @@ mod paged_construction_tests {
             return;
         }
         let cfg = tiny_cfg(true);
-        let inner = Qwen35Inner::new(cfg).expect(
+        let mut inner = Qwen35Inner::new(cfg).expect(
             "Qwen35Inner::new with use_block_paged_cache=true must succeed on Metal-capable host",
         );
+        inner
+            .initialize_paged_adapter()
+            .expect("post-load paged adapter initialization must succeed");
         assert!(
             inner.paged_adapter.is_some(),
             "paged_adapter must be Some when use_block_paged_cache = Some(true)"
@@ -10868,6 +11077,9 @@ mod paged_construction_tests {
 
         let cfg = tiny_cfg(true);
         let mut inner = Qwen35Inner::new(cfg).unwrap();
+        inner
+            .initialize_paged_adapter()
+            .expect("post-load paged adapter initialization");
         let vision_cfg = Qwen3_5VisionConfig {
             hidden_size: 64,
             intermediate_size: 256,

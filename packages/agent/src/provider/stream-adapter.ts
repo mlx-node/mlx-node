@@ -83,6 +83,28 @@ function safeString(read: () => string, fallback: string): string {
 }
 
 /**
+ * Publish the native model's load-time physical context limit onto pi's shared
+ * model object. The parent session and every in-process subagent resolve this
+ * same object from one `ModelRegistry`, so the first completed model load gives
+ * all later turns the correct auto-compaction window without another channel.
+ *
+ * This is advisory only: the ChatSession preflight remains the correctness
+ * backstop for the first turn and for hostile/invalid getters. Never expand a
+ * discovery-time limit here, and never let metadata synchronization break an
+ * otherwise valid inference turn.
+ */
+function publishEffectiveContextWindow(model: Model<Api>, session: ChatSession): void {
+  try {
+    const effective = Math.floor(session.contextLimits()?.effectiveWindowTokens ?? 0);
+    if (!Number.isSafeInteger(effective) || effective <= 0) return;
+    model.contextWindow = Math.min(model.contextWindow, effective);
+    model.maxTokens = Math.min(model.maxTokens, model.contextWindow);
+  } catch {
+    // Exact native preflight still protects capacity; keep serving the turn.
+  }
+}
+
+/**
  * Minimal terminal `AssistantMessage` for the TurnEmitter-independent
  * failsafe path. Every field read is guarded — this must stay
  * constructible even when the `Model` object itself is hostile (it may be
@@ -213,6 +235,7 @@ export function makeMlxStreamSimple(
         // between stages below): the terminal already went out — skip ALL
         // session work (no warm-reset, no prime, no stream).
         if (terminated) return;
+        publishEffectiveContextWindow(model, session);
         const discovered = host.modelInfo(model.id);
         if (!discovered) {
           throw new Error(`mlx streamSimple: no discovery record for model "${model.id}"`);

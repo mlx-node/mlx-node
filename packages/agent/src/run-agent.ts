@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
-import { createSubagentExtension, isSubagentChild } from './extensions/subagent.js';
+import { createSubagentExtension } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import type { MlxModelInfo } from './provider/models.js';
@@ -56,15 +56,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // with `mainImpl` injected, pi is never imported at all.
   const main: RunAgentMain = opts.mainImpl ?? (await import('@earendil-works/pi-coding-agent')).main;
   const subagentsEnabled =
-    opts.models.length > 0 &&
-    !isSubagentChild() &&
-    !opts.argv.includes('--no-extensions') &&
-    !opts.argv.includes('-ne');
+    opts.models.length > 0 && !opts.argv.includes('--no-extensions') && !opts.argv.includes('-ne');
   await main(opts.argv, {
     extensionFactories: [
       createMlxProviderExtension(opts.models),
       createPermissionGateExtension(),
-      ...(subagentsEnabled ? [createSubagentExtension({ modelsDir: opts.modelsDir })] : []),
+      ...(subagentsEnabled ? [createSubagentExtension()] : []),
       createTerminalTitleExtension(),
     ],
   });

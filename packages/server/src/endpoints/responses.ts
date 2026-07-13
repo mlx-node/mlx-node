@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
+import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -329,6 +330,22 @@ interface StreamingHandlerOutcome {
   cachedTokens: number | undefined;
 }
 
+/** Replay an eagerly-read first stream item, then continue the same iterator. */
+async function* prependFirstEvent(
+  first: IteratorResult<ChatStreamEvent>,
+  rest: AsyncGenerator<ChatStreamEvent>,
+): AsyncGenerator<ChatStreamEvent> {
+  try {
+    if (!first.done) yield first.value;
+    yield* rest;
+  } finally {
+    // If the consumer breaks on the eagerly-read terminal event, delegation
+    // to `rest` has not begun yet. Explicitly close it so ChatSession's
+    // commit/rollback finally still runs.
+    await rest.return(undefined);
+  }
+}
+
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
@@ -340,6 +357,10 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
   serverTiming?: ServerTimingForUsage,
 ): Promise<StreamingHandlerOutcome> {
+  // Enter the generator before committing SSE headers. ChatSession performs
+  // its exact token/capacity preflight before yielding the first native event,
+  // so an oversized request can still return a protocol-shaped HTTP 400.
+  const firstEvent = await chatStream.next();
   beginSSE(res);
   // Commit to SSE wire format synchronously so the outer catch
   // branches on `responseMode` (not `headersSent`) and routes an
@@ -416,7 +437,7 @@ async function handleStreamingNative(
   }
 
   try {
-    for await (const event of chatStream) {
+    for await (const event of prependFirstEvent(firstEvent, chatStream)) {
       // Honor client disconnect at loop-top. Native decode has no
       // AbortSignal yet; `break` drops the generator reference so
       // the producer's `finally` releases per-model locks and the
@@ -3439,9 +3460,14 @@ export async function handleCreateResponse(
             // already received — or no output at all if the terminal
             // already landed.
             if (visibility.responseMode === null) {
-              // Headers never went out. Safe to emit a clean 500 JSON
-              // error.
-              sendInternalError(res, message);
+              // Capacity failures are deterministic request errors, raised
+              // before native cache mutation. Keep them out of the generic
+              // 500 path so clients can compact/truncate and retry.
+              if (isContextCapacityError(err)) {
+                sendBadRequest(res, message);
+              } else {
+                sendInternalError(res, message);
+              }
             } else if (visibility.responseMode === 'json') {
               // We already wrote `Content-Type: application/json` and
               // possibly some body bytes; emitting an SSE frame here

@@ -25,6 +25,8 @@ import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
+import { normalizeSubagentMode } from './subagent.js';
+
 const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit', 'subagent']);
 
 const AUTO_APPROVE_ENV = 'MLX_AGENT_AUTO_APPROVE';
@@ -255,7 +257,7 @@ const FRESH_SESSION_REASONS: ReadonlySet<string> = new Set(['startup', 'new', 'r
  * throw — a handler error would fail closed upstream, but the prompt
  * should still render and let the user decide.
  */
-function describeToolCall(toolName: string, event: ToolCallEvent): string {
+function describeToolCall(toolName: string, event: ToolCallEvent, defaultCwd?: string): string {
   const rawInput: unknown = (event as { input?: unknown }).input;
   const input: Record<string, unknown> =
     typeof rawInput === 'object' && rawInput !== null ? (rawInput as Record<string, unknown>) : {};
@@ -267,25 +269,33 @@ function describeToolCall(toolName: string, event: ToolCallEvent): string {
     const agent = typeof input['agent'] === 'string' ? input['agent'] : undefined;
     const task = typeof input['task'] === 'string' ? input['task'] : undefined;
     const scope = typeof input['agentScope'] === 'string' ? input['agentScope'] : 'user';
+    const tasks = Array.isArray(input['tasks']) ? input['tasks'] : [];
+    const chainItems = Array.isArray(input['chain']) ? input['chain'] : [];
+    const { mode } = normalizeSubagentMode({ agent, task, tasks, chain: chainItems });
     const describeItems = (value: unknown): string[] =>
       Array.isArray(value)
         ? value.map((raw, index) => {
             const item = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
             const itemAgent = typeof item['agent'] === 'string' ? item['agent'] : '(unknown agent)';
             const itemTask = typeof item['task'] === 'string' ? item['task'] : '(unknown task)';
-            const cwd = typeof item['cwd'] === 'string' ? ` [cwd: ${item['cwd']}]` : '';
+            const resolvedCwd = typeof item['cwd'] === 'string' ? item['cwd'] : defaultCwd;
+            const cwd = resolvedCwd ? ` [cwd: ${resolvedCwd}]` : '';
             return `${index + 1}. ${itemAgent}: ${itemTask}${cwd}`;
           })
         : [];
-    const items = describeItems(input['tasks']);
-    const chain = describeItems(input['chain']);
-    const summary = agent
-      ? `${agent}: ${task ?? '(unknown task)'}`
-      : items.length
-        ? `Queued tasks: ${items.join(' | ')}`
-        : `Chain: ${chain.join(' | ')}`;
+    const items = describeItems(tasks);
+    const chain = describeItems(chainItems);
+    const singleCwd = typeof input['cwd'] === 'string' ? input['cwd'] : defaultCwd;
+    const single = `${agent ?? '(unknown agent)'}: ${task ?? '(unknown task)'}${singleCwd ? ` [cwd: ${singleCwd}]` : ''}`;
+    const summary =
+      mode === 'chain'
+        ? `Chain: ${chain.join(' | ')}`
+        : mode === 'parallel'
+          ? `Queued tasks: ${items.join(' | ')}`
+          : single;
     return [
-      'Delegated child agents may use bash/write/edit without further prompts.',
+      'Delegated agent sessions may use bash/write/edit without further prompts.',
+      `Execution mode: ${mode}`,
       `Agent scope: ${scope}`,
       summary,
     ].join('\n');
@@ -364,7 +374,7 @@ export function createPermissionGateExtension(): InlineExtension {
         // title is rendered by a third-party TUI that passes ANSI through.
         // For bash, prepend pi's effective `shellCommandPrefix` so the prompt
         // shows the full program pi will execute, not just the model's arg.
-        const command = describeToolCall(toolName, event);
+        const command = describeToolCall(toolName, event, ctx.cwd);
         let detailSource = command;
         if (toolName === 'bash') {
           // Snapshot is primary (faithful to pi's baked value, incl. reload

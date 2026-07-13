@@ -1,44 +1,92 @@
-import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
 
+import type { Message } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { createSubagentExtension, discoverSubagents } from '../src/extensions/subagent.js';
+import {
+  createSubagentExtension,
+  discoverSubagents,
+  scaleSubagentCompactionSettings,
+  type InProcessSubagentSession,
+  type SubagentSessionCreateOptions,
+} from '../src/extensions/subagent.js';
 
-class FakeChild extends EventEmitter {
-  readonly stdout = new PassThrough();
-  readonly stderr = new PassThrough();
-  exitCode: number | null = null;
-  signalCode: NodeJS.Signals | null = null;
-  readonly kills: NodeJS.Signals[] = [];
+const PARENT_MODEL = { provider: 'mlx', id: 'agents-a1' } as NonNullable<ExtensionContext['model']>;
+const ALT_MODEL = { provider: 'mlx', id: 'alternate' } as NonNullable<ExtensionContext['model']>;
+const MODEL_REGISTRY = {
+  find(provider: string, id: string) {
+    if (provider !== 'mlx') return undefined;
+    if (id === PARENT_MODEL.id) return PARENT_MODEL;
+    if (id === ALT_MODEL.id) return ALT_MODEL;
+    return undefined;
+  },
+} as unknown as ExtensionContext['modelRegistry'];
 
-  kill(signal: NodeJS.Signals = 'SIGTERM'): boolean {
-    this.kills.push(signal);
-    return true;
+function assistantMessage(text: string, stopReason = 'stop'): Message {
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    usage: {
+      input: 10,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 0,
+      totalTokens: 15,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    provider: 'mlx',
+    model: 'agents-a1',
+    timestamp: Date.now(),
+  } as Message;
+}
+
+class FakeSession implements InProcessSubagentSession {
+  readonly prompts: string[] = [];
+  abortCalls = 0;
+  disposed = false;
+  private readonly listeners = new Set<(event: unknown) => void>();
+  private resolvePrompt?: () => void;
+  private rejectPrompt?: (error: Error) => void;
+
+  constructor(private readonly automaticReply?: (prompt: string) => string) {}
+
+  subscribe(listener: (event: unknown) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
-  finish(text = 'done', code = 0): void {
-    const message = {
-      role: 'assistant',
-      content: [{ type: 'text', text }],
-      usage: {
-        input: 10,
-        output: 2,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 12,
-        cost: { total: 0 },
-      },
-      stopReason: 'stop',
-      model: 'local-model',
-    };
-    this.stdout.end(`${JSON.stringify({ type: 'message_end', message })}\n`);
-    this.exitCode = code;
-    this.emit('close', code);
+  prompt(text: string): Promise<void> {
+    this.prompts.push(text);
+    const pending = new Promise<void>((resolve, reject) => {
+      this.resolvePrompt = resolve;
+      this.rejectPrompt = reject;
+    });
+    if (this.automaticReply) queueMicrotask(() => this.finish(this.automaticReply!(text)));
+    return pending;
+  }
+
+  async abort(): Promise<void> {
+    this.abortCalls++;
+    this.resolvePrompt?.();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.listeners.clear();
+  }
+
+  finish(text = 'done', stopReason = 'stop'): void {
+    const message = assistantMessage(text, stopReason);
+    for (const listener of this.listeners) listener({ type: 'message_end', message });
+    this.resolvePrompt?.();
+  }
+
+  fail(error: Error): void {
+    this.rejectPrompt?.(error);
   }
 }
 
@@ -59,7 +107,8 @@ function context(extra: Partial<ExtensionContext> = {}): ExtensionContext {
   return {
     cwd: '/repo',
     hasUI: true,
-    model: { provider: 'mlx', id: 'agents-a1' },
+    model: PARENT_MODEL,
+    modelRegistry: MODEL_REGISTRY,
     ui: { confirm: async () => true },
     ...extra,
   } as unknown as ExtensionContext;
@@ -73,6 +122,46 @@ afterEach(() => {
 });
 
 describe('mlx subagent extension', () => {
+  it('scales pi compaction defaults to a small physical context window', () => {
+    expect(
+      scaleSubagentCompactionSettings(32_768, {
+        enabled: true,
+        reserveTokens: 16_384,
+        keepRecentTokens: 20_000,
+      }),
+    ).toEqual({ enabled: true, reserveTokens: 8_192, keepRecentTokens: 16_384 });
+  });
+
+  it('preserves smaller compaction settings and the enabled flag', () => {
+    expect(
+      scaleSubagentCompactionSettings(32_768, {
+        enabled: false,
+        reserveTokens: 2_048,
+        keepRecentTokens: 4_096,
+      }),
+    ).toEqual({ enabled: false, reserveTokens: 2_048, keepRecentTokens: 4_096 });
+  });
+
+  it('keeps rounded compaction budgets inside three quarters of the physical window', () => {
+    const scaled = scaleSubagentCompactionSettings(101, {
+      enabled: true,
+      reserveTokens: Number.POSITIVE_INFINITY,
+      keepRecentTokens: Number.POSITIVE_INFINITY,
+    });
+    expect(scaled).toEqual({ enabled: true, reserveTokens: 25, keepRecentTokens: 50 });
+    expect(scaled.reserveTokens + scaled.keepRecentTokens).toBeLessThanOrEqual(Math.floor((101 * 3) / 4));
+  });
+
+  it('rejects an invalid physical context window', () => {
+    expect(() =>
+      scaleSubagentCompactionSettings(0, {
+        enabled: true,
+        reserveTokens: 16_384,
+        keepRecentTokens: 20_000,
+      }),
+    ).toThrow('invalid context window');
+  });
+
   it('discovers built-ins and lets user definitions override them', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-test-'));
     try {
@@ -94,77 +183,68 @@ describe('mlx subagent extension', () => {
     }
   });
 
-  it('re-enters mlx with the same models dir/model and a child-only safety environment', async () => {
-    const calls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = [];
-    const child = new FakeChild();
+  it('creates an isolated session with the parent model registry and requested role configuration', async () => {
+    const calls: SubagentSessionCreateOptions[] = [];
+    const sessions: FakeSession[] = [];
     const tool = captureTool(
       createSubagentExtension({
-        modelsDir: '/models/custom',
-        invocation: { command: '/node', args: ['/mlx/cli.js', 'agent'] },
-        spawnChild(command, args, options) {
-          calls.push({ command, args, env: options.env });
-          queueMicrotask(() => child.finish('finished'));
-          return child as never;
+        async createSession(options) {
+          calls.push(options);
+          const session = new FakeSession(() => 'finished');
+          sessions.push(session);
+          return session;
         },
       }),
     );
 
-    const result = await tool.execute('call-1', { agent: 'worker', task: 'do work' }, undefined, undefined, context());
+    const result = await tool.execute(
+      'call-1',
+      { agent: 'scout', task: 'inspect the code', cwd: '/repo/nested' },
+      undefined,
+      undefined,
+      context(),
+    );
+
     expect(result.content).toEqual([{ type: 'text', text: 'finished' }]);
     expect(calls).toHaveLength(1);
-    expect(calls[0]!.command).toBe('/node');
-    expect(calls[0]!.args).toEqual(
-      expect.arrayContaining([
-        '/mlx/cli.js',
-        'agent',
-        '--models-dir',
-        '/models/custom',
-        '--mode',
-        'json',
-        '--no-session',
-        '--no-extensions',
-        '--no-approve',
-        '--model',
-        'mlx/agents-a1',
-      ]),
-    );
-    expect(calls[0]!.env['MLX_AGENT_SUBAGENT_CHILD']).toBe('1');
-    expect(calls[0]!.env['MLX_AGENT_AUTO_APPROVE']).toBe('1');
+    expect(calls[0]).toMatchObject({ cwd: '/repo/nested', model: PARENT_MODEL, modelRegistry: MODEL_REGISTRY });
+    expect(calls[0]!.tools).toEqual(['read', 'grep', 'find', 'ls', 'bash']);
+    expect(calls[0]!.systemPrompt).toContain('You are a scout');
+    expect(sessions[0]!.prompts).toEqual(['Task: inspect the code']);
+    expect(sessions[0]!.disposed).toBe(true);
+    expect((result as typeof result & { details: { results: unknown[] } }).details.results).toHaveLength(1);
   });
 
-  it('derives a real child invocation from the current Node/oxnode CLI process', async () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-    const child = new FakeChild();
-    const tool = captureTool(
-      createSubagentExtension({
-        modelsDir: '/models',
-        spawnChild(command, args) {
-          calls.push({ command, args });
-          queueMicrotask(() => child.finish());
-          return child as never;
-        },
-      }),
-    );
-    await tool.execute('call-route', { agent: 'scout', task: 'inspect' }, undefined, undefined, context());
-
-    expect(calls[0]!.command).toBe(process.execPath);
-    const scriptIndex = calls[0]!.args.indexOf(process.argv[1]!);
-    expect(scriptIndex).toBeGreaterThanOrEqual(0);
-    expect(calls[0]!.args[scriptIndex + 1]).toBe('agent');
+  it('resolves an agent-specific mlx model through the shared parent registry', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-model-'));
+    try {
+      process.env.PI_CODING_AGENT_DIR = root;
+      await mkdir(join(root, 'agents'));
+      await writeFile(
+        join(root, 'agents', 'alternate.md'),
+        '---\nname: alternate\ndescription: alternate model\nmodel: mlx/alternate\n---\nUse the alternate.\n',
+      );
+      let created: SubagentSessionCreateOptions | undefined;
+      const tool = captureTool(
+        createSubagentExtension({
+          async createSession(options) {
+            created = options;
+            return new FakeSession(() => 'alternate done');
+          },
+        }),
+      );
+      await tool.execute('call-model', { agent: 'alternate', task: 'work' }, undefined, undefined, context());
+      expect(created?.model).toBe(ALT_MODEL);
+      expect(created?.modelRegistry).toBe(MODEL_REGISTRY);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
-  it('propagates abort to the child process', async () => {
-    const child = new FakeChild();
+  it('propagates abort to the in-process session and disposes it', async () => {
+    const session = new FakeSession();
     const controller = new AbortController();
-    const tool = captureTool(
-      createSubagentExtension({
-        modelsDir: '/models',
-        invocation: { command: 'mlx', args: ['agent'] },
-        spawnChild() {
-          return child as never;
-        },
-      }),
-    );
+    const tool = captureTool(createSubagentExtension({ createSession: async () => session }));
     const pending = tool.execute(
       'call-abort',
       { agent: 'worker', task: 'work' },
@@ -172,49 +252,106 @@ describe('mlx subagent extension', () => {
       undefined,
       context(),
     );
+    await new Promise((resolve) => setTimeout(resolve, 0));
     controller.abort();
-    expect(child.kills).toEqual(['SIGTERM']);
-    child.finish('', 1);
     const result = await pending;
+
+    expect(session.abortCalls).toBe(1);
+    expect(session.disposed).toBe(true);
     expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain('Subagent was aborted');
   });
 
-  it('serializes parallel-shaped tasks so only one model-owning child is alive', async () => {
-    const children: FakeChild[] = [];
+  it('does not prompt a newly created session when the call was already aborted', async () => {
+    const session = new FakeSession();
+    const controller = new AbortController();
+    controller.abort();
+    const tool = captureTool(createSubagentExtension({ createSession: async () => session }));
+    const result = await tool.execute(
+      'call-pre-abort',
+      { agent: 'worker', task: 'must not run' },
+      controller.signal,
+      undefined,
+      context(),
+    );
+    expect(session.prompts).toEqual([]);
+    expect(session.abortCalls).toBe(1);
+    expect(session.disposed).toBe(true);
+    expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
+  });
+
+  it('runs at most four task loops concurrently and starts queued work as slots finish', async () => {
+    const sessions: FakeSession[] = [];
     const tool = captureTool(
       createSubagentExtension({
-        modelsDir: '/models',
-        invocation: { command: 'mlx', args: ['agent'] },
-        spawnChild() {
-          const child = new FakeChild();
-          children.push(child);
-          return child as never;
+        async createSession() {
+          const session = new FakeSession();
+          sessions.push(session);
+          return session;
         },
       }),
     );
+    const tasks = Array.from({ length: 6 }, (_, index) => ({ agent: 'scout', task: `task ${index + 1}` }));
+    const pending = tool.execute('call-parallel', { tasks }, undefined, undefined, context());
 
-    const pending = tool.execute(
-      'call-2',
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sessions).toHaveLength(4);
+    sessions[0]!.finish('one');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sessions).toHaveLength(5);
+    sessions[1]!.finish('two');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sessions).toHaveLength(6);
+    for (const session of sessions.slice(2)) session.finish('done');
+
+    const result = await pending;
+    expect((result.content[0] as { text: string }).text).toContain('6/6 succeeded');
+    expect(sessions.every((session) => session.disposed)).toBe(true);
+  });
+
+  it('caps a concurrent request at eight tasks before creating sessions', async () => {
+    let created = 0;
+    const tool = captureTool(
+      createSubagentExtension({
+        async createSession() {
+          created++;
+          return new FakeSession(() => 'done');
+        },
+      }),
+    );
+    const tasks = Array.from({ length: 9 }, (_, index) => ({ agent: 'scout', task: `task ${index + 1}` }));
+    const result = await tool.execute('call-too-many', { tasks }, undefined, undefined, context());
+    expect(created).toBe(0);
+    expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain('max is 8');
+  });
+
+  it('feeds successful chain output into the next independent session', async () => {
+    const prompts: string[] = [];
+    const tool = captureTool(
+      createSubagentExtension({
+        async createSession() {
+          return new FakeSession((prompt) => {
+            prompts.push(prompt);
+            return prompts.length === 1 ? 'first result' : 'second result';
+          });
+        },
+      }),
+    );
+    const result = await tool.execute(
+      'call-chain',
       {
-        tasks: [
-          { agent: 'scout', task: 'one' },
-          { agent: 'scout', task: 'two' },
+        chain: [
+          { agent: 'scout', task: 'inspect' },
+          { agent: 'planner', task: 'plan from {previous}' },
         ],
       },
       undefined,
       undefined,
       context(),
     );
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(children).toHaveLength(1);
-    children[0]!.finish('one');
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(children).toHaveLength(2);
-    children[1]!.finish('two');
-    const result = await pending;
-    expect(result.content[0]).toMatchObject({ type: 'text' });
-    expect((result.content[0] as { text: string }).text).toContain('2/2 succeeded');
+    expect(prompts).toEqual(['Task: inspect', 'Task: plan from first result']);
+    expect(result.content).toEqual([{ type: 'text', text: 'second result' }]);
   });
 
   it('rejects a user agent that explicitly requests a cloud provider', async () => {
@@ -226,18 +363,23 @@ describe('mlx subagent extension', () => {
         join(root, 'agents', 'cloud.md'),
         '---\nname: cloud\ndescription: cloud agent\nmodel: anthropic/claude\n---\nNo.\n',
       );
-      let spawned = false;
+      let created = false;
       const tool = captureTool(
         createSubagentExtension({
-          modelsDir: '/models',
-          spawnChild() {
-            spawned = true;
-            return new FakeChild() as never;
+          async createSession() {
+            created = true;
+            return new FakeSession(() => 'unexpected');
           },
         }),
       );
-      const result = await tool.execute('call-3', { agent: 'cloud', task: 'work' }, undefined, undefined, context());
-      expect(spawned).toBe(false);
+      const result = await tool.execute(
+        'call-cloud',
+        { agent: 'cloud', task: 'work' },
+        undefined,
+        undefined,
+        context(),
+      );
+      expect(created).toBe(false);
       expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
       expect((result.content[0] as { text: string }).text).toContain('non-local model');
     } finally {
@@ -253,14 +395,13 @@ describe('mlx subagent extension', () => {
         join(root, '.pi', 'agents', 'worker.md'),
         '---\nname: worker\ndescription: project worker\n---\nProject-controlled prompt.\n',
       );
-      let spawned = false;
+      let created = false;
       let confirmations = 0;
       const tool = captureTool(
         createSubagentExtension({
-          modelsDir: '/models',
-          spawnChild() {
-            spawned = true;
-            return new FakeChild() as never;
+          async createSession() {
+            created = true;
+            return new FakeSession(() => 'unexpected');
           },
         }),
       );
@@ -270,8 +411,6 @@ describe('mlx subagent extension', () => {
           agent: 'worker',
           task: 'work',
           agentScope: 'both',
-          // Deliberately exercise the upstream bypass even though mlx omits it
-          // from the schema: the execution path must ignore hostile extras.
           confirmProjectAgents: false,
         } as never,
         undefined,
@@ -287,7 +426,7 @@ describe('mlx subagent extension', () => {
         }),
       );
       expect(confirmations).toBe(1);
-      expect(spawned).toBe(false);
+      expect(created).toBe(false);
       expect((result as typeof result & { isError?: boolean }).isError).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });

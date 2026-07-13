@@ -16,12 +16,7 @@ const FAKE_MODEL = {
   piModel: {},
 } as never;
 
-const ENV_KEYS = [
-  'PI_CODING_AGENT_DIR',
-  'PI_SKIP_VERSION_CHECK',
-  'MLX_PAGED_PREFILL_CHUNK_SIZE',
-  'MLX_AGENT_SUBAGENT_CHILD',
-] as const;
+const ENV_KEYS = ['PI_CODING_AGENT_DIR', 'PI_SKIP_VERSION_CHECK', 'MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
 
 type EnvKey = (typeof ENV_KEYS)[number];
 
@@ -116,16 +111,6 @@ describe('runAgent', () => {
   it.each([['--no-extensions'], ['-ne']])('respects the extension opt-out %s', async (...argv) => {
     const { main, calls } = makeSeam();
     await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, mainImpl: main });
-    const names = calls[0]!.extensionFactories.map((entry) =>
-      typeof entry === 'function' ? '<anonymous>' : entry.name,
-    );
-    expect(names).not.toContain('mlx-subagent');
-  });
-
-  it('does not expose recursive subagents in a marked child', async () => {
-    process.env.MLX_AGENT_SUBAGENT_CHILD = '1';
-    const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], mainImpl: main });
     const names = calls[0]!.extensionFactories.map((entry) =>
       typeof entry === 'function' ? '<anonymous>' : entry.name,
     );

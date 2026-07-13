@@ -245,6 +245,7 @@ pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGeneratio
 }
 
 /// Extracted chat parameters with defaults applied.
+#[derive(Clone)]
 pub(crate) struct ChatParams {
     pub max_new_tokens: i32,
     pub repetition_penalty: f64,

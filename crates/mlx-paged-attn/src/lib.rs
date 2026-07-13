@@ -20,6 +20,7 @@
 
 mod block_allocator;
 mod block_table;
+mod cold_cache;
 mod config;
 #[cfg(target_os = "macos")]
 mod extern_c;
@@ -53,6 +54,7 @@ pub use extern_c::{
 
 pub use block_allocator::*;
 pub use block_table::*;
+pub use cold_cache::*;
 pub use config::*;
 pub use layer_kv_pool::LayerKVPool;
 

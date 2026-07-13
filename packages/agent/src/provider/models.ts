@@ -7,12 +7,13 @@
  * pairs every discovered checkpoint with a pi `ProviderModelConfig` entry
  * ready for `pi.registerProvider('mlx', { models })`.
  *
- * `contextWindow` is the checkpoint's REAL trained window — it drives
- * pi's auto-compaction thresholds — read from the model dir's
+ * `contextWindow` starts as the checkpoint's trained window, read from the model dir's
  * `config.json` `max_position_embeddings` (root first, then the
  * `text_config` nesting used by qwen3_5 / qwen3_5_moe / gemma4 unified
- * checkpoints). When both are absent the documented per-family fallback
- * below applies.
+ * checkpoints). Once a Qwen model loads, the provider narrows this shared
+ * model metadata to the physical paged-cache window so pi's later
+ * auto-compaction thresholds match reality. When both config fields are
+ * absent the documented per-family fallback below applies.
  */
 
 import type { Dirent } from 'node:fs';

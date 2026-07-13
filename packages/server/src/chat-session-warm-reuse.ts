@@ -21,8 +21,8 @@
  * belongs to this chain — so a JS-state-only reset that preserves the
  * native cache is correct there and only there.
  *
- * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `turnCount`,
- * `unresolvedOkToolCallCount`. These are TypeScript `private` fields on
+ * Fields accessed: `inFlight`, `history`, `lastImagesKey`, `lastAudioKey`, `turnCount`,
+ * `unresolvedOkToolCallCount`, `needsFullReplay`. These are TypeScript `private` fields on
  * `ChatSession` (compile-time only) — at runtime they are ordinary
  * properties. The cast through {@link ChatSessionWarmReuseInternals}
  * gives this helper a typed view of the instance without relaxing the
@@ -45,8 +45,10 @@ interface ChatSessionWarmReuseInternals {
   inFlight: boolean;
   history: unknown[];
   lastImagesKey: string | null;
+  lastAudioKey: string | null;
   turnCount: number;
   unresolvedOkToolCallCount: number | null;
+  needsFullReplay: boolean;
 }
 
 /**
@@ -83,6 +85,8 @@ export async function resetPreservingNativeCacheForWarmReuse<M extends SessionCa
   }
   internals.history = [];
   internals.lastImagesKey = null;
+  internals.lastAudioKey = null;
   internals.turnCount = 0;
   internals.unresolvedOkToolCallCount = null;
+  internals.needsFullReplay = false;
 }

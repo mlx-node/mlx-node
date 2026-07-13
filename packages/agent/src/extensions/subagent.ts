@@ -1,38 +1,37 @@
 /**
  * MLX port of pi's official `examples/extensions/subagent` extension.
  *
- * The upstream example starts a fresh pi process per task. We preserve that
- * isolation, JSONL protocol, agent discovery, and single/parallel/chain modes,
- * while routing children back through `mlx agent` so the local provider is
- * registered. MLX-specific safety differences are intentionally small:
+ * The upstream example starts a fresh pi process per task. MLX instead creates
+ * an in-process `AgentSession` for each task so all delegated sessions reuse
+ * the parent's registered provider and its single `MlxModelHost`. Each task
+ * still has isolated conversation/compaction state and its own cwd/tools:
  *
- * - at most one child runs at once (each process owns a model + KV pool),
- * - children inherit the parent's current local model and models directory,
- * - external extensions/project resources and recursive subagents are disabled,
- * - the permission gate approves the delegation before child-only tool access.
+ * - at most four task loops run concurrently; the host serializes inference,
+ * - sessions inherit the parent's current local model/model registry,
+ * - context files and skills load, while extensions/prompts/themes do not,
+ * - the parent permission gate approves delegated tool access once up front.
  *
  * Upstream source: @earendil-works/pi-coding-agent 0.80.6,
  * examples/extensions/subagent (MIT).
  */
 
-import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import * as path from 'node:path';
 
 import type { Message } from '@earendil-works/pi-ai';
 import { StringEnum } from '@earendil-works/pi-ai';
-import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext, InlineExtension } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 
 const MAX_PARALLEL_TASKS = 8;
-/** Local models are process-owned; do not multiply model/KV allocations. */
-const MAX_CONCURRENCY = 1;
+/** Tool loops can overlap; the shared `MlxModelHost` serializes model calls. */
+const MAX_CONCURRENCY = 4;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const CHILD_ENV = 'MLX_AGENT_SUBAGENT_CHILD';
 
 type AgentScope = 'user' | 'project' | 'both';
 type AgentSource = 'builtin' | 'user' | 'project' | 'unknown';
+export type SubagentMode = 'single' | 'parallel' | 'chain';
 
 export interface SubagentConfig {
   name: string;
@@ -69,33 +68,73 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
-  mode: 'single' | 'parallel' | 'chain';
+  mode: SubagentMode;
   agentScope: AgentScope;
   projectAgentsDir: string | null;
   results: SingleResult[];
 }
 
-interface SpawnedChild {
-  stdout: NodeJS.ReadableStream;
-  stderr: NodeJS.ReadableStream;
-  exitCode: number | null;
-  signalCode: NodeJS.Signals | null;
-  kill(signal?: NodeJS.Signals): boolean;
-  once(event: 'close', listener: (code: number | null) => void): this;
-  once(event: 'error', listener: (error: Error) => void): this;
+export interface InProcessSubagentSession {
+  subscribe(listener: (event: unknown) => void): () => void;
+  prompt(text: string): Promise<void>;
+  abort(): Promise<void>;
+  dispose(): void;
 }
 
-export interface SubagentSpawnOptions {
+export interface SubagentSessionCreateOptions {
   cwd: string;
-  env: NodeJS.ProcessEnv;
+  model: NonNullable<ExtensionContext['model']>;
+  modelRegistry: ExtensionContext['modelRegistry'];
+  tools?: string[];
+  systemPrompt: string;
 }
 
 export interface SubagentExtensionOptions {
-  modelsDir: string;
-  /** Test seam. Production re-enters the current mlx CLI. */
-  spawnChild?: (command: string, args: string[], options: SubagentSpawnOptions) => SpawnedChild;
-  /** Test/programmatic seam. Production derives the current CLI invocation. */
-  invocation?: { command: string; args: string[] };
+  /** Test/programmatic seam. Production uses pi's in-process SDK. */
+  createSession?: (options: SubagentSessionCreateOptions) => Promise<InProcessSubagentSession>;
+}
+
+export interface SubagentCompactionSettings {
+  enabled: boolean;
+  reserveTokens: number;
+  keepRecentTokens: number;
+}
+
+const COMPACTION_RESERVE_WINDOW_FRACTION = 0.25;
+const COMPACTION_KEEP_RECENT_WINDOW_FRACTION = 0.5;
+const COMPACTION_TOTAL_WINDOW_FRACTION = 0.75;
+
+/**
+ * Fit pi's compaction budgets to the model's effective physical context.
+ *
+ * Pi's defaults (16,384 reserved + 20,000 recent) assume a context larger
+ * than some dynamically sized MLX KV pools. Preserve explicitly smaller user
+ * values, but keep the summary reserve at most 25%, retained history at most
+ * 50%, and their combined budget at most 75% of the usable window.
+ */
+export function scaleSubagentCompactionSettings(
+  contextWindow: number,
+  current: SubagentCompactionSettings,
+): SubagentCompactionSettings {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+    throw new RangeError(`Subagent model reported an invalid context window: ${contextWindow}`);
+  }
+
+  const window = Math.floor(contextWindow);
+  const reserveCap = Math.floor(window * COMPACTION_RESERVE_WINDOW_FRACTION);
+  const keepRecentCap = Math.floor(window * COMPACTION_KEEP_RECENT_WINDOW_FRACTION);
+  const totalCap = Math.floor(window * COMPACTION_TOTAL_WINDOW_FRACTION);
+  const capConfiguredValue = (value: number, cap: number): number => {
+    if (!Number.isFinite(value)) return cap;
+    return Math.min(Math.max(0, Math.floor(value)), cap);
+  };
+
+  const reserveTokens = capConfiguredValue(current.reserveTokens, reserveCap);
+  const keepRecentTokens = Math.min(
+    capConfiguredValue(current.keepRecentTokens, keepRecentCap),
+    Math.max(0, totalCap - reserveTokens),
+  );
+  return { enabled: current.enabled, reserveTokens, keepRecentTokens };
 }
 
 const BUILTIN_AGENTS: readonly SubagentConfig[] = [
@@ -250,19 +289,36 @@ function truncateOutput(output: string): string {
   return `${truncated}\n\n[Output truncated; full output remains in tool details.]`;
 }
 
-function normalizedModel(model: string): string | undefined {
-  if (model.startsWith('mlx/')) return model;
+function normalizedModelId(model: string): string | undefined {
+  if (model.startsWith('mlx/')) return model.slice('mlx/'.length) || undefined;
   // A bare name is a local discovered model id. A provider/name pair is not.
-  if (!model.includes('/')) return `mlx/${model}`;
+  if (!model.includes('/')) return model;
   return undefined;
 }
 
-function defaultInvocation(): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  if (currentScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [...process.execArgv, currentScript, 'agent'] };
-  }
-  return { command: 'mlx', args: ['agent'] };
+interface SubagentRequestShape {
+  agent?: string;
+  task?: string;
+  tasks?: unknown[];
+  chain?: unknown[];
+}
+
+/**
+ * Select the mode with the same precedence used by execution. Permission UI
+ * imports this helper so a stray top-level field can never hide the queued
+ * agents that will actually receive delegated tool access.
+ */
+export function normalizeSubagentMode(input: SubagentRequestShape): {
+  mode: SubagentMode;
+  modeCount: number;
+} {
+  const hasSingle = Boolean(input.agent && input.task);
+  const hasParallel = Boolean(input.tasks?.length);
+  const hasChain = Boolean(input.chain?.length);
+  return {
+    mode: hasChain ? 'chain' : hasParallel ? 'parallel' : 'single',
+    modeCount: Number(hasSingle) + Number(hasParallel) + Number(hasChain),
+  };
 }
 
 async function mapWithConcurrencyLimit<T, R>(items: T[], fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -278,8 +334,39 @@ async function mapWithConcurrencyLimit<T, R>(items: T[], fn: (item: T, index: nu
   return results;
 }
 
-function productionSpawn(command: string, args: string[], options: SubagentSpawnOptions): SpawnedChild {
-  return spawn(command, args, { ...options, shell: false, stdio: ['ignore', 'pipe', 'pipe'] }) as SpawnedChild;
+async function createProductionSession(options: SubagentSessionCreateOptions): Promise<InProcessSubagentSession> {
+  // `runAgent()` seeds pi's config environment before the extension can execute,
+  // so defer the runtime import until now instead of importing pi at module load.
+  const { createAgentSession, DefaultResourceLoader, getAgentDir, SessionManager, SettingsManager } =
+    await import('@earendil-works/pi-coding-agent');
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(options.cwd, agentDir);
+  settingsManager.applyOverrides({
+    compaction: scaleSubagentCompactionSettings(options.model.contextWindow, settingsManager.getCompactionSettings()),
+  });
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: options.cwd,
+    agentDir,
+    settingsManager,
+    // Subagents keep project/user context files and skills, but cannot load the
+    // subagent extension recursively or introduce unrelated prompt/theme state.
+    noExtensions: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    appendSystemPromptOverride: (base) => (options.systemPrompt.trim() ? [...base, options.systemPrompt] : base),
+  });
+  await resourceLoader.reload();
+  const { session } = await createAgentSession({
+    cwd: options.cwd,
+    agentDir,
+    model: options.model,
+    modelRegistry: options.modelRegistry,
+    tools: options.tools,
+    resourceLoader,
+    sessionManager: SessionManager.inMemory(options.cwd),
+    settingsManager,
+  });
+  return session;
 }
 
 async function runSingleAgent(
@@ -289,7 +376,7 @@ async function runSingleAgent(
   agentName: string,
   task: string,
   cwd: string | undefined,
-  parentModel: string | undefined,
+  context: ExtensionContext,
   step: number | undefined,
   signal: AbortSignal | undefined,
   onUpdate: ((result: { content: { type: 'text'; text: string }[]; details: SubagentDetails }) => void) | undefined,
@@ -309,8 +396,8 @@ async function runSingleAgent(
     };
   }
 
-  const requestedModel = agent.model ? normalizedModel(agent.model) : parentModel;
-  if (agent.model && !requestedModel) {
+  const requestedModelId = agent.model ? normalizedModelId(agent.model) : undefined;
+  if (agent.model && !requestedModelId) {
     return {
       agent: agent.name,
       agentSource: agent.source,
@@ -323,20 +410,21 @@ async function runSingleAgent(
     };
   }
 
-  const args = [
-    '--models-dir',
-    options.modelsDir,
-    '--mode',
-    'json',
-    '-p',
-    '--no-session',
-    '--no-extensions',
-    '--no-approve',
-  ];
-  if (requestedModel) args.push('--model', requestedModel);
-  if (agent.tools?.length) args.push('--tools', agent.tools.join(','));
+  const model = requestedModelId ? context.modelRegistry.find('mlx', requestedModelId) : context.model;
+  if (!model || model.provider !== 'mlx') {
+    const requested = requestedModelId ? `mlx/${requestedModelId}` : 'the parent mlx model';
+    return {
+      agent: agent.name,
+      agentSource: agent.source,
+      task,
+      exitCode: 1,
+      messages: [],
+      stderr: `Agent ${agent.name} could not resolve ${requested} in the parent model registry.`,
+      usage: emptyUsage(),
+      step,
+    };
+  }
 
-  let promptDir: string | undefined;
   const result: SingleResult = {
     agent: agent.name,
     agentSource: agent.source,
@@ -345,7 +433,7 @@ async function runSingleAgent(
     messages: [],
     stderr: '',
     usage: emptyUsage(),
-    model: requestedModel,
+    model: `mlx/${model.id}`,
     step,
   };
   const emitUpdate = () =>
@@ -354,111 +442,88 @@ async function runSingleAgent(
       details: makeDetails([result]),
     });
 
+  let session: InProcessSubagentSession | undefined;
+  let unsubscribe: (() => void) | undefined;
+  let aborted = signal?.aborted ?? false;
+  let abortPromise: Promise<void> | undefined;
+  const abort = () => {
+    aborted = true;
+    if (session) abortPromise = session.abort().catch(() => undefined);
+  };
+  if (!signal?.aborted) signal?.addEventListener('abort', abort, { once: true });
+
   try {
-    if (agent.systemPrompt.trim()) {
-      promptDir = fs.mkdtempSync(path.join(tmpdir(), 'mlx-subagent-'));
-      const promptPath = path.join(promptDir, `prompt-${agent.name.replace(/[^\w.-]+/g, '_')}.md`);
-      fs.writeFileSync(promptPath, agent.systemPrompt, { encoding: 'utf8', mode: 0o600 });
-      args.push('--append-system-prompt', promptPath);
-    }
-    args.push(`Task: ${task}`);
-
-    const invocation = options.invocation ?? defaultInvocation();
-    const childArgs = [...invocation.args, ...args];
-    const child = (options.spawnChild ?? productionSpawn)(invocation.command, childArgs, {
+    session = await (options.createSession ?? createProductionSession)({
       cwd: cwd ?? defaultCwd,
-      env: {
-        ...process.env,
-        [CHILD_ENV]: '1',
-        // The parent permission gate approved this delegated capability. Keep
-        // auto-approval scoped to the child instead of weakening the parent.
-        MLX_AGENT_AUTO_APPROVE: '1',
-      },
+      model,
+      modelRegistry: context.modelRegistry,
+      tools: agent.tools,
+      systemPrompt: agent.systemPrompt,
     });
+    if (aborted) {
+      abort();
+      await abortPromise;
+      result.exitCode = 1;
+      result.stopReason = 'aborted';
+      result.errorMessage = 'Subagent was aborted';
+      return result;
+    }
 
-    let buffer = '';
-    let aborted = false;
-    let settled = false;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const processLine = (line: string) => {
-      if (!line.trim()) return;
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(line) as Record<string, unknown>;
-      } catch {
-        return;
+    unsubscribe = session.subscribe((rawEvent) => {
+      const event = rawEvent as { type?: unknown; message?: unknown };
+      if (event.type !== 'message_end' || !event.message) return;
+      const message = event.message as Message;
+      result.messages.push(message);
+      if (message.role === 'assistant') {
+        result.usage.turns++;
+        const usage = message.usage;
+        result.usage.input += usage?.input ?? 0;
+        result.usage.output += usage?.output ?? 0;
+        result.usage.cacheRead += usage?.cacheRead ?? 0;
+        result.usage.cacheWrite += usage?.cacheWrite ?? 0;
+        result.usage.cost += usage?.cost?.total ?? 0;
+        result.usage.contextTokens = usage?.totalTokens ?? 0;
+        result.model = message.provider && message.model ? `${message.provider}/${message.model}` : result.model;
+        result.stopReason = message.stopReason;
+        result.errorMessage = message.errorMessage;
       }
-      if ((event['type'] === 'message_end' || event['type'] === 'tool_result_end') && event['message']) {
-        const message = event['message'] as Message;
-        result.messages.push(message);
-        if (event['type'] === 'message_end' && message.role === 'assistant') {
-          result.usage.turns++;
-          const usage = message.usage;
-          result.usage.input += usage?.input ?? 0;
-          result.usage.output += usage?.output ?? 0;
-          result.usage.cacheRead += usage?.cacheRead ?? 0;
-          result.usage.cacheWrite += usage?.cacheWrite ?? 0;
-          result.usage.cost += usage?.cost?.total ?? 0;
-          result.usage.contextTokens = usage?.totalTokens ?? 0;
-          result.model ??= message.model;
-          result.stopReason = message.stopReason;
-          result.errorMessage = message.errorMessage;
-        }
-        emitUpdate();
-      }
-    };
-    child.stdout.on('data', (chunk) => {
-      buffer += chunk.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) processLine(line);
-    });
-    child.stderr.on('data', (chunk) => {
-      result.stderr += chunk.toString();
+      emitUpdate();
     });
 
-    const abort = () => {
-      aborted = true;
-      child.kill('SIGTERM');
-      killTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      }, 5000);
-      killTimer.unref?.();
-    };
-    if (signal?.aborted) abort();
-    else signal?.addEventListener('abort', abort, { once: true });
-
-    result.exitCode = await new Promise<number>((resolve) => {
-      const finish = (code: number) => {
-        if (settled) return;
-        settled = true;
-        resolve(code);
-      };
-      child.once('close', (code) => {
-        if (buffer.trim()) processLine(buffer);
-        finish(code ?? 1);
-      });
-      child.once('error', (error) => {
-        result.stderr += error.message;
-        finish(1);
-      });
-    });
-    signal?.removeEventListener('abort', abort);
-    if (killTimer) clearTimeout(killTimer);
+    try {
+      await session.prompt(`Task: ${task}`);
+      await abortPromise;
+    } catch (error) {
+      result.exitCode = 1;
+      result.stderr = error instanceof Error ? error.message : String(error);
+    }
+    if (aborted) {
+      result.exitCode = 1;
+      result.stopReason = 'aborted';
+      result.errorMessage = 'Subagent was aborted';
+    } else if (result.stopReason === 'error') {
+      result.exitCode = 1;
+    }
+    return result;
+  } catch (error) {
+    result.exitCode = 1;
+    result.stderr = error instanceof Error ? error.message : String(error);
     if (aborted) {
       result.stopReason = 'aborted';
       result.errorMessage = 'Subagent was aborted';
     }
     return result;
   } finally {
-    if (promptDir) fs.rmSync(promptDir, { recursive: true, force: true });
+    signal?.removeEventListener('abort', abort);
+    unsubscribe?.();
+    session?.dispose();
   }
 }
 
 const TaskItem = Type.Object({
   agent: Type.String({ description: 'Name of the agent to invoke' }),
   task: Type.String({ description: 'Task to delegate' }),
-  cwd: Type.Optional(Type.String({ description: 'Working directory for the child process' })),
+  cwd: Type.Optional(Type.String({ description: 'Working directory for the isolated session' })),
 });
 
 const Params = Type.Object({
@@ -470,7 +535,7 @@ const Params = Type.Object({
   agentScope: Type.Optional(StringEnum(['user', 'project', 'both'] as const, { default: 'user' })),
 });
 
-export function createSubagentExtension(options: SubagentExtensionOptions): InlineExtension {
+export function createSubagentExtension(options: SubagentExtensionOptions = {}): InlineExtension {
   return {
     name: 'mlx-subagent',
     factory: (pi: ExtensionAPI) => {
@@ -478,23 +543,19 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
         name: 'subagent',
         label: 'Subagent',
         description:
-          'Delegate one task, a sequential chain, or parallel-shaped tasks to isolated local mlx agents. ' +
-          'Built-ins: scout, planner, reviewer, worker. Local safety serializes all child processes.',
+          'Delegate one task, a sequential chain, or concurrent tasks to isolated in-process mlx agent sessions. ' +
+          'Built-ins: scout, planner, reviewer, worker. Sessions share one model host and KV pool.',
         promptSnippet: 'Delegate isolated research, planning, review, or implementation with the subagent tool.',
         promptGuidelines: [
           'Use subagents for bounded work that benefits from an isolated context.',
-          'Although the tool accepts a tasks array, local mlx children run one at a time to avoid duplicate model/KV pressure.',
+          'A tasks array runs up to four independent tool loops concurrently; shared mlx inference remains serialized.',
         ],
         parameters: Params,
         executionMode: 'sequential',
         async execute(_id, params, signal, onUpdate, ctx) {
           const scope: AgentScope = params.agentScope ?? 'user';
           const discovery = discoverSubagents(ctx.cwd, scope);
-          const hasSingle = Boolean(params.agent && params.task);
-          const hasParallel = Boolean(params.tasks?.length);
-          const hasChain = Boolean(params.chain?.length);
-          const modeCount = Number(hasSingle) + Number(hasParallel) + Number(hasChain);
-          const mode: SubagentDetails['mode'] = hasChain ? 'chain' : hasParallel ? 'parallel' : 'single';
+          const { mode, modeCount } = normalizeSubagentMode(params);
           const makeDetails = (results: SingleResult[]): SubagentDetails => ({
             mode,
             agentScope: scope,
@@ -510,9 +571,9 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
           }
 
           const requested = new Set<string>();
-          if (params.agent) requested.add(params.agent);
-          for (const item of params.tasks ?? []) requested.add(item.agent);
-          for (const item of params.chain ?? []) requested.add(item.agent);
+          if (mode === 'single' && params.agent) requested.add(params.agent);
+          if (mode === 'parallel') for (const item of params.tasks ?? []) requested.add(item.agent);
+          if (mode === 'chain') for (const item of params.chain ?? []) requested.add(item.agent);
           const projectAgents = [...requested]
             .map((name) => discovery.agents.find((agent) => agent.name === name))
             .filter((agent): agent is SubagentConfig => agent?.source === 'project');
@@ -537,7 +598,6 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
             }
           }
 
-          const parentModel = ctx.model?.provider === 'mlx' ? `mlx/${ctx.model.id}` : undefined;
           const run = (
             agent: string,
             task: string,
@@ -552,7 +612,7 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
               agent,
               task,
               cwd,
-              parentModel,
+              ctx,
               step,
               signal,
               update,
@@ -600,7 +660,7 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
               content: [
                 {
                   type: 'text',
-                  text: `Parallel-shaped queue: ${success}/${results.length} succeeded\n\n${summaries.join('\n\n---\n\n')}`,
+                  text: `Concurrent tasks: ${success}/${results.length} succeeded\n\n${summaries.join('\n\n---\n\n')}`,
                 },
               ],
               details: makeDetails(results),
@@ -618,8 +678,4 @@ export function createSubagentExtension(options: SubagentExtensionOptions): Inli
       });
     },
   };
-}
-
-export function isSubagentChild(): boolean {
-  return process.env[CHILD_ENV] === '1';
 }

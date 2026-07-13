@@ -1794,6 +1794,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     info!("Qwen3.5 model loaded successfully");
                 }
 
+                // The resident weight footprint is now known and materialized;
+                // only now allocate/cap the physical paged KV pool.
+                if let Some(ref vparams) = vision_params {
+                    let arrays: Vec<&MxArray> = vparams.values().collect();
+                    crate::array::memory::materialize_weights(&arrays)?;
+                }
+                inner.initialize_paged_adapter()?;
+
                 // Deterministic weight-byte total for the cache-limit
                 // coordinator. Includes both text `params` and the
                 // separated `vision_params` (when present) so the
@@ -1822,6 +1830,8 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let context_limits =
+                super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
 
             Ok((
                 inner,
@@ -1833,6 +1843,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    context_limits,
                 ),
             ))
         },
@@ -1847,6 +1858,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         cache_limit_guard,
         paged_active,
         mtp_active,
+        context_limits,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -1856,6 +1868,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         config,
         paged_active,
         mtp_active,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }

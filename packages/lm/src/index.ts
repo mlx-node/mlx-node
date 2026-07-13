@@ -22,7 +22,7 @@ export { Gemma4Model } from './stream.js';
 // Embedding models
 export { HarrierModel } from '@mlx-node/core';
 export { Qwen35Model } from './stream.js';
-export type { Qwen35Config } from '@mlx-node/core';
+export type { Qwen35Config, Qwen35ContextLimits } from '@mlx-node/core';
 
 // LFM2 models
 export { Lfm2Model } from './stream.js';
@@ -74,8 +74,8 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 // generative model wrapper and used as the upper-bound for
 // `ChatSession<M>`; exported so the VLM wrapper can pin a compile-time
 // conformance assertion.
-export { ChatSession } from './chat-session.js';
-export type { ChatSessionOptions, SendOptions, SessionCapableModel } from './chat-session.js';
+export { ChatSession, ContextCapacityError, isContextCapacityError } from './chat-session.js';
+export type { ChatSessionOptions, SendOptions, SessionCapableModel, SessionContextLimits } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
 export {

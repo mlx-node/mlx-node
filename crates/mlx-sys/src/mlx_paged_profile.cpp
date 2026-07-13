@@ -25,6 +25,7 @@
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
+#include <dlfcn.h>
 #endif
 
 #if defined(__APPLE__)
@@ -59,6 +60,40 @@ int32_t mlx_total_system_memory(uint64_t* out_value) {
     }
     if (out_value != nullptr) {
       *out_value = static_cast<uint64_t>(memsize);
+    }
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+#else
+  (void)out_value;
+  return -1;
+#endif
+}
+
+// Live process allocation headroom reported by macOS. Unlike hw.memsize,
+// this accounts for current VM pressure and the process's memorystatus limit,
+// so load-time KV sizing does not consume memory that is physically present
+// but no longer safely available to this process.
+int32_t mlx_process_available_memory(uint64_t* out_value) {
+#if defined(__APPLE__)
+  try {
+    // Resolve dynamically because some supported Xcode SDK headers do not
+    // declare os_proc_available_memory even though the symbol exists on the
+    // deployment OS. A missing symbol cleanly triggers the Rust static-size
+    // fallback instead of becoming a compile/link failure.
+    using ProcessAvailableMemoryFn = size_t (*)();
+    auto* symbol = dlsym(RTLD_DEFAULT, "os_proc_available_memory");
+    if (symbol == nullptr) {
+      return -1;
+    }
+    const auto probe = reinterpret_cast<ProcessAvailableMemoryFn>(symbol);
+    const size_t available = probe();
+    if (available == 0) {
+      return -1;
+    }
+    if (out_value != nullptr) {
+      *out_value = static_cast<uint64_t>(available);
     }
     return 0;
   } catch (...) {

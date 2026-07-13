@@ -1245,6 +1245,11 @@ export declare class Qwen35Model {
    */
   hasMtpWeights(): boolean;
   /**
+   * Synchronous snapshot used by higher layers to preflight rendered
+   * prompts and clamp output before native cache allocation.
+   */
+  contextLimits(): Qwen35ContextLimits;
+  /**
    * Load a pretrained model from a directory.
    *
    * Expects the directory to contain:
@@ -1388,6 +1393,8 @@ export declare class Qwen35MoeModel {
    * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /** Synchronous active-context snapshot shared with the dense wrapper. */
+  contextLimits(): Qwen35ContextLimits;
   /** Load a pretrained model from a directory. */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
@@ -4048,6 +4055,18 @@ export interface Qwen35Config {
    * unavailable.
    */
   nMtpLayers: number;
+}
+
+/**
+ * Trained and physically available active-context limits for one loaded
+ * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
+ * the lifetime of the resident model.
+ */
+export interface Qwen35ContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
 }
 
 /** Generation configuration for Qwen3.5 */

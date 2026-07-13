@@ -1018,6 +1018,45 @@ impl BlockAllocator {
     pub fn set_max_prefix_cache_entries(&mut self, max_entries: usize) {
         self.max_prefix_cache_entries = max_entries;
     }
+
+    /// Publish a fully restored cold-cache block into the hot prefix cache.
+    ///
+    /// The caller must have reserved `block` with [`Self::allocate`] and
+    /// restored all of its physical layer bytes before calling this method.
+    /// Keeping publication as the final step makes restore transactional:
+    /// a failed upload is not discoverable, and the caller can simply
+    /// [`Self::free`] the reservation. `token_ids` must describe exactly one
+    /// immutable full block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_restored_prefix(
+        &mut self,
+        block: Arc<PhysicalBlock>,
+        hash: u64,
+        token_ids: &[u32],
+        parent_hash: u64,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        block_index: usize,
+    ) -> Result<bool, &'static str> {
+        if token_ids.len() != self.block_size as usize {
+            return Err("restored prefix must contain exactly one full block");
+        }
+        if !self.allocated.contains_key(&block.block_id) {
+            return Err("restored prefix block was not reserved by this allocator");
+        }
+        if !self.register_prefix(Arc::clone(&block), hash) {
+            return Ok(false);
+        }
+        self.remember_prefix_identity(
+            hash,
+            token_ids,
+            parent_hash,
+            extra_keys,
+            cache_salt,
+            block_index,
+        );
+        Ok(true)
+    }
 }
 
 /// Hash function for token sequences (for prefix caching).

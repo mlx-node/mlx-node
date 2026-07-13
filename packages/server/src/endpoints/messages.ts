@@ -60,6 +60,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, PerformanceMetrics } from '@mlx-node/core';
+import { isContextCapacityError } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -289,6 +290,22 @@ interface MessagesStreamingHandlerResult {
   suppressedToolCalls: boolean;
 }
 
+/** Replay an eagerly-read first stream item, then continue the same iterator. */
+async function* prependFirstEvent(
+  first: IteratorResult<ChatStreamEvent>,
+  rest: AsyncGenerator<ChatStreamEvent>,
+): AsyncGenerator<ChatStreamEvent> {
+  try {
+    if (!first.done) yield first.value;
+    yield* rest;
+  } finally {
+    // If the consumer breaks on the eagerly-read terminal event, delegation
+    // to `rest` has not begun yet. Explicitly close it so ChatSession's
+    // commit/rollback finally still runs.
+    await rest.return(undefined);
+  }
+}
+
 async function handleStreamingNative(
   res: ServerResponse,
   chatStream: AsyncGenerator<ChatStreamEvent>,
@@ -301,6 +318,10 @@ async function handleStreamingNative(
   serverTiming?: ServerTimingForUsage,
 ): Promise<MessagesStreamingHandlerResult> {
   const messageId = genId('msg_');
+  // Enter the generator before committing SSE headers. ChatSession performs
+  // its exact token/capacity preflight before yielding the first native event,
+  // so an oversized request can still return an Anthropic-shaped HTTP 400.
+  const firstEvent = await chatStream.next();
   beginSSE(res);
   // Commit SSE wire format now so any throw before the terminal event routes
   // to the streaming error epilogue instead of corrupting the JSON path.
@@ -405,7 +426,7 @@ async function handleStreamingNative(
   }
 
   try {
-    for await (const event of chatStream) {
+    for await (const event of prependFirstEvent(firstEvent, chatStream)) {
       if (clientAborted) break;
       if (event.done) {
         sawDone = true;
@@ -1536,7 +1557,11 @@ export async function handleCreateMessage(
             sessionReg.drop(MESSAGES_WARM_SLOT_ID);
             const message = err instanceof Error ? err.message : 'Unknown error during inference';
             if (visibility.responseMode === null) {
-              sendAnthropicInternalError(res, message);
+              if (isContextCapacityError(err)) {
+                sendAnthropicBadRequest(res, message);
+              } else {
+                sendAnthropicInternalError(res, message);
+              }
             } else if (visibility.responseMode === 'json') {
               // Already committed to JSON — destroy the socket rather than corrupt the body.
               try {

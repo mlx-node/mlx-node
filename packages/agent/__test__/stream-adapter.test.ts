@@ -8,7 +8,14 @@ import type {
   Tool,
   TSchema,
 } from '@earendil-works/pi-ai';
-import type { ChatConfig, ChatMessage, ChatSession, ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
+import type {
+  ChatConfig,
+  ChatMessage,
+  ChatSession,
+  ChatStreamEvent,
+  ChatStreamFinal,
+  SessionContextLimits,
+} from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { makeMlxStreamSimple, type StreamSimpleHost } from '../src/provider/stream-adapter.js';
@@ -82,7 +89,12 @@ class FakeChatSession {
   constructor(
     private readonly scripts: Script[],
     readonly log: string[] = [],
+    private readonly limits?: SessionContextLimits,
   ) {}
+
+  contextLimits(): SessionContextLimits | undefined {
+    return this.limits;
+  }
 
   /**
    * Full public reset — distinct from the JS-only warm-reuse wipe. The
@@ -211,6 +223,29 @@ function finalMessage(events: AssistantMessageEvent[]): AssistantMessage {
 }
 
 describe('makeMlxStreamSimple', () => {
+  it('publishes the loaded physical context limit on the shared pi model object', async () => {
+    const session = new FakeChatSession(
+      [
+        // eslint-disable-next-line @typescript-eslint/require-await
+        async function* () {
+          yield finalEvent();
+        },
+      ],
+      [],
+      {
+        trainedWindowTokens: 262144,
+        effectiveWindowTokens: 12288,
+        pagedBlockCapacity: 768,
+        pagedBlockSize: 16,
+      },
+    );
+    const sharedModel = { ...MODEL };
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, CONTEXT));
+
+    expect(sharedModel.contextWindow).toBe(12288);
+    expect(sharedModel.maxTokens).toBe(12288);
+  });
+
   it('streams a happy text turn in order with stopReason stop', async () => {
     const session = new FakeChatSession([
       // eslint-disable-next-line @typescript-eslint/require-await

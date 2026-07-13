@@ -53,11 +53,7 @@ function makeMockModel(): SessionCapableModel & { resetCaches: ReturnType<typeof
   } as unknown as SessionCapableModel & { resetCaches: ReturnType<typeof vi.fn> };
 }
 
-/**
- * Runtime-mutable view of the ChatSession private fields these tests poke.
- * `lastAudioKey` is included ONLY to pin the faithful-port invariant that
- * warm reuse leaves it alone (unlike the full `reset()`).
- */
+/** Runtime-mutable view of the ChatSession private fields these tests poke. */
 interface SessionInternals {
   inFlight: boolean;
   history: ChatMessage[];
@@ -65,6 +61,7 @@ interface SessionInternals {
   lastAudioKey: string | null;
   turnCount: number;
   unresolvedOkToolCallCount: number | null;
+  needsFullReplay: boolean;
 }
 
 function internalsOf(session: ChatSession): SessionInternals {
@@ -92,15 +89,19 @@ describe('warm-reuse drift detection', () => {
     expect(Array.isArray(internals.history)).toBe(true);
     expect(internals.history).toEqual([]);
     expect(internals.lastImagesKey).toBeNull();
+    expect(internals.lastAudioKey).toBeNull();
     expect(internals.turnCount).toBe(0);
     expect(internals.unresolvedOkToolCallCount).toBeNull();
+    expect(internals.needsFullReplay).toBe(false);
   });
 
   it('the touched-field list is non-empty and matches the documented contract', () => {
     expect([...WARM_REUSE_TOUCHED_FIELDS].sort()).toEqual([
       'history',
       'inFlight',
+      'lastAudioKey',
       'lastImagesKey',
+      'needsFullReplay',
       'turnCount',
       'unresolvedOkToolCallCount',
     ]);
@@ -120,6 +121,7 @@ describe('resetPreservingNativeCacheForWarmReuse', () => {
     internals.lastAudioKey = 'cafe';
     internals.turnCount = 3;
     internals.unresolvedOkToolCallCount = 2;
+    internals.needsFullReplay = true;
     return { model, session, internals };
   }
 
@@ -130,8 +132,10 @@ describe('resetPreservingNativeCacheForWarmReuse', () => {
 
     expect(internals.history).toEqual([]);
     expect(internals.lastImagesKey).toBeNull();
+    expect(internals.lastAudioKey).toBeNull();
     expect(internals.turnCount).toBe(0);
     expect(internals.unresolvedOkToolCallCount).toBeNull();
+    expect(internals.needsFullReplay).toBe(false);
     // Public getters read the same state — turnCount 0 is what re-arms
     // `primeHistory()` for the next warm replay.
     expect(session.turns).toBe(0);
@@ -139,15 +143,14 @@ describe('resetPreservingNativeCacheForWarmReuse', () => {
     expect(session.hasImages).toBe(false);
   });
 
-  it('preserves the native cache: model.resetCaches is NOT called and lastAudioKey is untouched', async () => {
+  it('preserves the native cache while clearing all JS media and replay state', async () => {
     const { model, session, internals } = makePopulatedSession();
 
     await resetPreservingNativeCacheForWarmReuse(session);
 
     expect(model.resetCaches).not.toHaveBeenCalled();
-    // Faithful-port invariant: the server helper never wiped lastAudioKey
-    // (full reset() does) — proves this did not route through reset().
-    expect(internals.lastAudioKey).toBe('cafe');
+    expect(internals.lastAudioKey).toBeNull();
+    expect(internals.needsFullReplay).toBe(false);
   });
 
   it('full reset() DOES call model.resetCaches — the spy can tell the paths apart', async () => {
@@ -169,6 +172,8 @@ describe('resetPreservingNativeCacheForWarmReuse', () => {
     expect(internals.turnCount).toBe(3);
     expect(internals.history).toHaveLength(2);
     expect(internals.lastImagesKey).toBe('deadbeef');
+    expect(internals.lastAudioKey).toBe('cafe');
     expect(internals.unresolvedOkToolCallCount).toBe(2);
+    expect(internals.needsFullReplay).toBe(true);
   });
 });

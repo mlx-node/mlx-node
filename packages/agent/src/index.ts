@@ -5,9 +5,12 @@ export { createPermissionGateExtension } from './extensions/permission-gate.js';
 export {
   createSubagentExtension,
   discoverSubagents,
-  isSubagentChild,
+  normalizeSubagentMode,
+  type InProcessSubagentSession,
   type SubagentConfig,
   type SubagentExtensionOptions,
+  type SubagentMode,
+  type SubagentSessionCreateOptions,
 } from './extensions/subagent.js';
 export { createTerminalTitleExtension } from './extensions/terminal-title.js';
 export { buildChatConfig } from './provider/chat-config.js';

@@ -1232,6 +1232,12 @@ impl PagedKVCacheAdapter {
     /// the prompt's blocks are reserved at prefill, decode allocates one
     /// block every `block_size` tokens.
     pub fn allocate_suffix_blocks(&mut self, total_tokens: u32) -> Result<u32, String> {
+        let capacity = self.max_capacity_tokens();
+        if total_tokens > capacity {
+            return Err(format!(
+                "context_length_exceeded: requested {total_tokens} tokens, paged cache capacity is {capacity} tokens"
+            ));
+        }
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "allocate_suffix_blocks called before reset_for_new_request".to_string()
         })?;
@@ -1263,8 +1269,10 @@ impl PagedKVCacheAdapter {
                         guard.free(partial);
                     }
                     return Err(format!(
-                        "BlockAllocator exhausted: needed {needed_blocks} blocks, allocated {i} \
-                         before running out"
+                        "context_length_exceeded: paged cache could not reserve {needed_blocks} \
+                         block(s) for {total_tokens} tokens (reserved {i} before rollback, \
+                         capacity {} tokens)",
+                        capacity
                     ));
                 }
             }
@@ -1289,6 +1297,13 @@ impl PagedKVCacheAdapter {
     /// (caller-visible state stays consistent with the pre-call state and
     /// the next decode step can choose to abort gracefully).
     fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
+        let capacity = self.max_capacity_tokens();
+        if new_total_tokens > capacity {
+            return Err(format!(
+                "context_length_exceeded: requested {new_total_tokens} tokens during decode, \
+                 paged cache capacity is {capacity} tokens"
+            ));
+        }
         let block_table = self.block_table.as_mut().ok_or_else(|| {
             "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
         })?;
@@ -1316,10 +1331,11 @@ impl PagedKVCacheAdapter {
                         guard.free(partial);
                     }
                     return Err(format!(
-                        "BlockAllocator exhausted: lazy decode allocation needed \
-                         {to_allocate} more block(s) (request had {current_blocks}, \
-                         needs {needed_total_blocks} for {new_total_tokens} tokens), \
-                         allocated {i} before running out"
+                        "context_length_exceeded: paged decode could not reserve {to_allocate} \
+                         more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
+                         for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
+                         {} tokens)",
+                        capacity
                     ));
                 }
             }
@@ -3472,6 +3488,18 @@ impl PagedKVCacheAdapter {
 
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// Hard token capacity of this adapter's physical KV pool.
+    pub fn max_capacity_tokens(&self) -> u32 {
+        self.layer_kv_pool
+            .num_blocks()
+            .saturating_mul(self.block_size)
+    }
+
+    /// Number of physical blocks shared by the allocator and layer pool.
+    pub fn block_capacity(&self) -> u32 {
+        self.layer_kv_pool.num_blocks()
     }
 
     pub fn cached_token_count(&self) -> u32 {
@@ -6423,10 +6451,8 @@ mod tests {
         );
         let msg = res.err().unwrap();
         assert!(
-            msg.contains("BlockAllocator exhausted")
-                || msg.contains("lazy decode allocation")
-                || msg.contains("running out"),
-            "error must indicate allocator exhaustion, got: {msg}"
+            msg.starts_with("context_length_exceeded:"),
+            "error must expose the recoverable context-capacity marker, got: {msg}"
         );
         // Caller-visible state must be unchanged on failure (token cursor
         // and block table not advanced past the prior successful state).

@@ -20,7 +20,7 @@
  * export is added in T5.
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
-import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, ContextCapacityError, type SessionCapableModel } from '@mlx-node/lm';
 import type { ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -1048,26 +1048,33 @@ describe('ChatSession', () => {
       expect(chatSessionContinueTool.mock.calls[0][2]?.reuseCache).toBe(true);
     });
 
-    it('clears inFlight on exception', async () => {
-      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
-      // Seed two successive outstanding single-call turns so both
-      // sendToolResult dispatches have a legal pre-state. The first
-      // chatSessionContinueTool call rejects (tool-boom), which must
-      // NOT consume the outstanding-call flag; the second dispatch
-      // proceeds against the same outstanding state.
+    it('clears inFlight on exception and replays the retry from preserved history', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
+      // Seed an outstanding single-call turn. The failed native delta may
+      // already have mutated its cached history, so the retry must preserve
+      // the outstanding-call flag but use a clean full replay.
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
       chatSessionContinueTool.mockRejectedValueOnce(new Error('tool-boom'));
-      chatSessionContinueTool.mockResolvedValueOnce(makeChatResult('recovered'));
       const session = new ChatSession(model);
 
       await session.send('fire');
       await expect(session.sendToolResult('c1', 'out')).rejects.toThrow('tool-boom');
-      // Follow-up works against the same outstanding call — the
-      // failed dispatch rolled back the flag, so the second call
-      // still sees `unresolvedOkToolCallCount === 1`.
+      // The failed dispatch did not commit JS history or consume the
+      // outstanding-call flag.
       expect(session.pendingUnresolvedToolCallCount).toBe(1);
       await session.sendToolResult('c1', 'out2');
-      expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+
+      // Retrying does not issue another delta against the possibly-desynced
+      // native cache. It wipes that cache and replays the preserved history
+      // plus the replacement tool result through chatSessionStart.
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionStart.mock.calls[1][0]).toEqual([
+        { role: 'user', content: 'fire' },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'out2', toolCallId: 'c1', isError: undefined },
+      ]);
     });
 
     // ---------------------------------------------------------------
@@ -1564,13 +1571,14 @@ describe('ChatSession', () => {
       expect(session.turns).toBe(1);
     });
 
-    it('caller break during delta-continue stream does NOT advance turnCount (finally path)', async () => {
+    it('caller break during delta-continue stream forces the retry through full replay', async () => {
       // Turn 1 succeeds via a normal start stream. Turn 2 takes the
       // delta path, and the stream yields two deltas with no done.
       // Caller breaks after reading one, triggering `iterator.return()`
       // so only the inner `finally` runs. Because the delta path never
       // pushes to history before commit, the assertion here is purely
-      // "turnCount did NOT advance" — no start-path re-routing needed.
+      // "turnCount did NOT advance". Native Qwen still commits the cancelled
+      // delta into cached_token_history, so the retry must reset and replay.
       let continueCall = 0;
       const chatStreamSessionContinue = vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
         continueCall++;
@@ -1580,21 +1588,21 @@ describe('ChatSession', () => {
           // No done:true — caller breaks before getting here.
           return;
         }
-        // Subsequent continue call (the retry) — successful.
-        yield finalChunk('retry-reply');
       });
+      const chatStreamSessionStart = vi.fn(async function* () {
+        yield finalChunk('start-reply');
+      });
+      const resetCaches = vi.fn();
       const model: SessionCapableModel = {
         chatSessionStart: vi.fn(async () => makeChatResult('x')),
         chatSessionContinue: vi.fn(async () => makeChatResult('x')),
         chatSessionContinueTool: vi.fn(async () => makeChatResult('x')),
-        chatStreamSessionStart: vi.fn(async function* () {
-          yield finalChunk('turn-1-reply');
-        }),
+        chatStreamSessionStart,
         chatStreamSessionContinue,
         chatStreamSessionContinueTool: vi.fn(async function* () {
           yield finalChunk('x');
         }),
-        resetCaches: vi.fn(),
+        resetCaches,
       };
       const session = new ChatSession(model);
 
@@ -1615,6 +1623,9 @@ describe('ChatSession', () => {
       // Retry succeeds: turnCount goes 1 → 2 (not 1 → 3).
       for await (const _e of session.sendStream('turn 2 retry')) void _e;
       expect(session.turns).toBe(2);
+      expect(chatStreamSessionContinue).toHaveBeenCalledTimes(1);
+      expect(chatStreamSessionStart).toHaveBeenCalledTimes(2);
+      expect(resetCaches).toHaveBeenCalledTimes(1);
     });
 
     // -----------------------------------------------------------------
@@ -2050,8 +2061,8 @@ describe('ChatSession', () => {
       });
     });
 
-    it('sendToolResult(): a non-prefix tool-result rejection propagates without replay', async () => {
-      const { model, chatSessionStart, chatSessionContinueTool } = makeMockModel();
+    it('sendToolResult(): a non-prefix rejection propagates, then forces a full replay on retry', async () => {
+      const { model, chatSessionStart, chatSessionContinueTool, resetCaches } = makeMockModel();
       const session = new ChatSession(model);
 
       chatSessionStart.mockResolvedValueOnce(makeChatResultWithSingleToolCall('first-call', 'c1'));
@@ -2061,16 +2072,25 @@ describe('ChatSession', () => {
       chatSessionContinueTool.mockRejectedValueOnce(new Error('some other native failure'));
       await expect(session.sendToolResult('c1', 'tool-out')).rejects.toThrow('some other native failure');
 
-      // No replay — chatSessionStart not called a second time.
+      // The failing call itself propagates without an eager replay.
       expect(chatSessionStart).toHaveBeenCalledTimes(1);
       // The failed turn did not advance the counter and left the
       // outstanding-call flag intact for a retry.
       expect(session.turns).toBe(1);
       expect(session.pendingUnresolvedToolCallCount).toBe(1);
 
-      // inFlight cleared — a retry against the same outstanding call works.
+      // inFlight cleared — a retry against the same outstanding call works,
+      // but it must not issue another delta against native state that the
+      // failed call may already have advanced.
       await session.sendToolResult('c1', 'retry');
-      expect(chatSessionContinueTool).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinueTool).toHaveBeenCalledTimes(1);
+      expect(resetCaches).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionStart.mock.calls[1][0]).toEqual([
+        { role: 'user', content: 'describe', images: [imgA] },
+        { role: 'assistant', content: 'first-call', toolCalls: [{ id: 'c1', name: 'tool_fn', arguments: '{}' }] },
+        { role: 'tool', content: 'retry', toolCallId: 'c1', isError: undefined },
+      ]);
     });
 
     it('sendToolResultStream(): media-held rejection replays through chatStreamSessionStart', async () => {
@@ -3019,6 +3039,51 @@ describe('ChatSession', () => {
         // The key is either absent or undefined — never an empty array.
         expect(entry.toolCalls).toBeUndefined();
       }
+    });
+  });
+
+  describe('physical context-capacity preflight', () => {
+    function withCapacity(model: SessionCapableModel, capacity: number, promptTokens: number): SessionCapableModel {
+      return {
+        ...model,
+        contextLimits: () => ({
+          trainedWindowTokens: 262_144,
+          effectiveWindowTokens: capacity,
+          pagedBlockCapacity: capacity / 16,
+          pagedBlockSize: 16,
+        }),
+        applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
+      };
+    }
+
+    it('clamps an explicit output budget before native start', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 128, 100));
+
+      await session.send('hello', { config: { maxNewTokens: 64 } });
+
+      expect(mock.chatSessionStart.mock.calls[0]?.[1]?.maxNewTokens).toBe(29);
+    });
+
+    it('makes an omitted output budget explicit on a continuation', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 128, 80));
+
+      await session.send('first');
+      await session.send('second');
+
+      expect(mock.chatSessionContinue.mock.calls[0]?.[3]?.maxNewTokens).toBe(49);
+    });
+
+    it('rejects an oversized prompt before native allocation and preserves turn state', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 64, 65));
+
+      const failure = session.send('too large');
+      await expect(failure).rejects.toBeInstanceOf(ContextCapacityError);
+      await expect(failure).rejects.toThrow('context_length_exceeded');
+      expect(mock.chatSessionStart).not.toHaveBeenCalled();
+      expect(session.turns).toBe(0);
     });
   });
 });
