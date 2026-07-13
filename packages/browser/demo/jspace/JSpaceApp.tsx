@@ -61,16 +61,6 @@ export function layersFor(mode: LensMode): number[] {
   return mode === 'jacobian' ? ALL_LAYERS : ALL_LAYERS;
 }
 
-// Pin ids for a baked gallery frame — model-free (the frame already carries them,
-// as SerializedPinned[] with a plain `tokenId`). At MODULE scope so it can seed the
-// `pins` useState. Prefer the jacobian run's pins (all vetted tiles open jacobian),
-// fall back to the logit run, then to no pins for an unknown slug.
-function pinsForSlug(slug: string): number[] {
-  const frame = STARTERS[slug];
-  const pinned = frame?.jacobian?.pinned ?? frame?.logit?.pinned ?? [];
-  return pinned.map((p) => p.tokenId);
-}
-
 /** Jacobian activation lifecycle: one-time pack load + silent self-test. */
 type JacState =
   | { status: 'idle' }
@@ -160,10 +150,7 @@ export default function JSpaceApp() {
   // ---- state --------------------------------------------------------------
   const [prompt, setPrompt] = React.useState('');
   const [mode, setMode] = React.useState<LensMode>(DEFAULTS.mode);
-  // Seed the headline example's concept pins so first paint threads (and a later
-  // live run inherits them). The mount permalink-restore effect below overrides
-  // this: a real permalink wins with its own pins; a cold visit resets to [].
-  const [pins, setPins] = React.useState<number[]>(pinsForSlug(STARTER_SLUGS[0]!));
+  const [pins, setPins] = React.useState<number[]>([]);
   const [activePinIdx, setActivePinIdx] = React.useState<number | null>(null);
   const [selected, setSelected] = React.useState<CellRef | null>(null);
   const [hovered, setHovered] = React.useState<CellRef | null>(null);
@@ -212,14 +199,6 @@ export default function JSpaceApp() {
   const jacActivationRef = React.useRef<Promise<'ok' | 'failed' | 'unavailable'> | null>(null);
   const hashAppliedRef = React.useRef(false);
   const lastWrittenHashRef = React.useRef<string | null>(null);
-  // The permalink WRITE effect's first invocation is always the mount pass, where
-  // the restore effect has already established the authoritative initial state and
-  // set `lastWrittenHashRef` to the incoming hash — so the write effect must not
-  // persist anything then. Skip that one pass: without it, `pins` is still the
-  // headline SEED (the restore effect's setPins hasn't reconciled within the same
-  // effect flush), so the cold-default skip below misfires and a fresh visit
-  // writes a spurious `#p=&mode=l` instead of keeping a clean URL.
-  const firstHashWriteRef = React.useRef(true);
   // A selection restored from a permalink onto a CUSTOM prompt can't render until
   // the reader runs (skeleton until then) and `handleRun` clears `selected` before
   // dispatch — so hold it here and re-apply it ONCE after the first slice arrives,
@@ -435,7 +414,7 @@ export default function JSpaceApp() {
   // Open a baked gallery example: model-free, always available (even after the user
   // typed a custom prompt). Blanks the prompt back to cold so the baked starter grid
   // shows, drops any live frame (the view memo prefers it otherwise), opens in the
-  // tile's vetted lens, and seeds the concept pins. Clears the SAME selection/status
+  // tile's vetted lens. Clears the SAME selection/status
   // state that handleRun + handleModeChange clear so no stale cell/verdict carries in.
   const openStarter = React.useCallback(
     (slug: string): void => {
@@ -446,7 +425,6 @@ export default function JSpaceApp() {
       resetRun(); // drop any live frame (the memo prefers it otherwise)
       committedPromptIdsRef.current = null;
       setMode(entry.defaultMode); // all vetted tiles open in jacobian
-      setPins(pinsForSlug(slug)); // pins are number[] (token ids) — no conversion
       setActivePinIdx(null);
       setSelected(null);
       setHovered(null);
@@ -512,11 +490,6 @@ export default function JSpaceApp() {
   React.useEffect(() => {
     if (!hashAppliedRef.current) return;
     if (typeof window === 'undefined') return;
-    // Never persist the pre-restore mount transient (see firstHashWriteRef).
-    if (firstHashWriteRef.current) {
-      firstHashWriteRef.current = false;
-      return;
-    }
     const encoded = encodePermalink({ prompt, mode, pins, sel: selected });
     if (encoded === lastWrittenHashRef.current) return;
     const isColdDefault = isColdPrompt(prompt) && pins.length === 0 && selected === null && mode === DEFAULTS.mode;
