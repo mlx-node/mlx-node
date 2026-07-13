@@ -1,15 +1,20 @@
 /**
- * `runAgent` boot-shell contract, via the `mainImpl` seam (pi itself is
- * never imported here): env seeding with `??=` semantics, the exact
- * extension set, and verbatim argv forwarding.
+ * `runAgent` boot-shell contract, via the `piImpl` seam: env seeding with
+ * `??=` semantics, the exact extension set, registry-policy lifecycle, and
+ * verbatim argv forwarding.
  */
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import type { InlineExtension } from '@earendil-works/pi-coding-agent';
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { AuthStorage, type InlineExtension, ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { runAgent, type RunAgentMain } from '../src/run-agent.js';
+import {
+  runAgent,
+  type AgentPagedConfigOverrides,
+  type RunAgentMain,
+  type RunAgentPi,
+} from '../src/run-agent.js';
 
 const FAKE_MODEL = {
   discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' },
@@ -42,6 +47,17 @@ function makeSeam(): { main: RunAgentMain; calls: SeamCapture[] } {
   return { main, calls };
 }
 
+function piImpl(main: RunAgentMain): RunAgentPi {
+  return { main, ModelRegistry };
+}
+
+function pagedConfigOverrides(): AgentPagedConfigOverrides & { cleanup: ReturnType<typeof vi.fn> } {
+  return {
+    resolve: vi.fn(async (path: string) => `/paged${path}`),
+    cleanup: vi.fn(async () => undefined),
+  };
+}
+
 describe('runAgent', () => {
   let savedEnv: Record<EnvKey, string | undefined>;
 
@@ -59,7 +75,7 @@ describe('runAgent', () => {
 
   it('seeds the three env vars before invoking main when they are absent', async () => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     expect(calls).toHaveLength(1);
     const env = calls[0]!.envAtCall;
@@ -74,7 +90,7 @@ describe('runAgent', () => {
     process.env.MLX_PAGED_PREFILL_CHUNK_SIZE = '512';
 
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     const env = calls[0]!.envAtCall;
     expect(env.PI_CODING_AGENT_DIR).toBe('/custom/agent-home');
@@ -84,7 +100,7 @@ describe('runAgent', () => {
 
   it('passes exactly the built-in mlx extensions, in order', async () => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv: [], piImpl: piImpl(main) });
 
     const factories = calls[0]!.extensionFactories;
     const names = factories.map((entry) => {
@@ -100,7 +116,7 @@ describe('runAgent', () => {
 
   it('adds subagents only for a real parent model session', async () => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], piImpl: piImpl(main) });
 
     const names = calls[0]!.extensionFactories.map((entry) =>
       typeof entry === 'function' ? '<anonymous>' : entry.name,
@@ -110,7 +126,7 @@ describe('runAgent', () => {
 
   it.each([['--no-extensions'], ['-ne']])('respects the extension opt-out %s', async (...argv) => {
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, piImpl: piImpl(main) });
     const names = calls[0]!.extensionFactories.map((entry) =>
       typeof entry === 'function' ? '<anonymous>' : entry.name,
     );
@@ -120,7 +136,7 @@ describe('runAgent', () => {
   it('forwards argv verbatim', async () => {
     const argv = ['--mode', 'json', '--no-session', '-p', 'Reply with exactly: hi'];
     const { main, calls } = makeSeam();
-    await runAgent({ modelsDir: '/models', models: [], argv, mainImpl: main });
+    await runAgent({ modelsDir: '/models', models: [], argv, piImpl: piImpl(main) });
 
     expect(calls[0]!.argv).toBe(argv);
     expect(calls[0]!.argv).toEqual(['--mode', 'json', '--no-session', '-p', 'Reply with exactly: hi']);
@@ -128,15 +144,50 @@ describe('runAgent', () => {
 
   it('propagates a rejection from main', async () => {
     const boom = new Error('pi main failed');
+    const paged = pagedConfigOverrides();
     await expect(
       runAgent({
         modelsDir: '/models',
         models: [],
         argv: [],
-        mainImpl: async () => {
+        pagedConfigOverrides: paged,
+        piImpl: piImpl(async () => {
           throw boom;
-        },
+        }),
       }),
     ).rejects.toBe(boom);
+    expect(paged.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('cleans up paged config overlays when main returns', async () => {
+    const paged = pagedConfigOverrides();
+    await runAgent({
+      modelsDir: '/models',
+      models: [],
+      argv: [],
+      pagedConfigOverrides: paged,
+      piImpl: piImpl(async () => undefined),
+    });
+
+    expect(paged.cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('applies the registry policy while main runs and restores it afterward', async () => {
+    const authStorage = AuthStorage.inMemory({ groq: { type: 'api_key', key: 'test-groq-key' } });
+    const registry = ModelRegistry.inMemory(authStorage);
+    const groq = registry.getAll().find((model) => model.provider === 'groq');
+    expect(groq).toBeDefined();
+
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      argv: [],
+      piImpl: piImpl(async () => {
+        expect(registry.find('groq', groq!.id)).toBeUndefined();
+        expect(registry.getAll()).toEqual([]);
+      }),
+    });
+
+    expect(registry.find('groq', groq!.id)).toBeDefined();
   });
 });

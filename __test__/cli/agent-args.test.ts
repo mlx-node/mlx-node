@@ -228,23 +228,25 @@ describe('scanAgentArgs', () => {
 });
 
 describe('withDefaultModel', () => {
-  it('prepends --model mlx/<id> to a fresh run', () => {
+  it('prepends an mlx-only scope and --model mlx/<id> to a fresh run', () => {
     expect(withDefaultModel(['-p', 'hi'], 'qwen3.5-0.8b-mlx-bf16')).toEqual([
+      '--models',
+      'mlx/*',
       '--model',
       'mlx/qwen3.5-0.8b-mlx-bf16',
       '-p',
       'hi',
     ]);
-    expect(withDefaultModel([], 'some-model')).toEqual(['--model', 'mlx/some-model']);
+    expect(withDefaultModel([], 'some-model')).toEqual(['--models', 'mlx/*', '--model', 'mlx/some-model']);
   });
 
-  it('respects an explicit --model, --models scope, or --provider', () => {
+  it('scopes an explicit --model while respecting an explicit --models scope', () => {
     const withModel = ['--model', 'mlx/other-model', '-p', 'hi'];
-    expect(withDefaultModel(withModel, 'default-model')).toBe(withModel);
+    expect(withDefaultModel(withModel, 'default-model')).toEqual(['--models', 'mlx/*', ...withModel]);
     const withScope = ['--models', 'mlx/a,mlx/b'];
     expect(withDefaultModel(withScope, 'default-model')).toBe(withScope);
     const withProvider = ['--provider', 'mlx', '--model', 'x'];
-    expect(withDefaultModel(withProvider, 'default-model')).toBe(withProvider);
+    expect(withDefaultModel(withProvider, 'default-model')).toEqual(['--models', 'mlx/*', ...withProvider]);
   });
 
   it('scopes a provider-only run to mlx/* instead of a bare --model (no bogus cloud model)', () => {
@@ -264,7 +266,7 @@ describe('withDefaultModel', () => {
     // model (options.model stays undefined) and only picks an mlx model for a
     // new / unknown / empty session — never a cloud default. So prepend the
     // scope, never a bare --model that would fight the restore. (--fork is a
-    // full suppressor, covered separately below.)
+    // scoped session carrier, covered separately below.)
     for (const args of [['-c'], ['--continue'], ['-r'], ['--resume'], ['--session', 'abc'], ['--session-id', 'abc']]) {
       const out = withDefaultModel(args, 'default-model');
       expect(out).toEqual(['--models', 'mlx/*', ...args]);
@@ -272,14 +274,23 @@ describe('withDefaultModel', () => {
     }
   });
 
-  it('leaves a --fork run unchanged — the forked session restores its own model', () => {
+  it('scopes a --fork run without replacing the forked session model', () => {
     const argv = ['--fork', 'abc123', '-p', 'continue where we left off'];
-    expect(withDefaultModel(argv, 'default-model')).toBe(argv);
+    const out = withDefaultModel(argv, 'default-model');
+    expect(out).toEqual(['--models', 'mlx/*', ...argv]);
+    expect(out).not.toContain('--model');
   });
 
   it('does not treat prompt text as a flag', () => {
     const argv = ['-p', 'please run --continue for me'];
-    expect(withDefaultModel(argv, 'm')).toEqual(['--model', 'mlx/m', '-p', 'please run --continue for me']);
+    expect(withDefaultModel(argv, 'm')).toEqual([
+      '--models',
+      'mlx/*',
+      '--model',
+      'mlx/m',
+      '-p',
+      'please run --continue for me',
+    ]);
   });
 
   describe('value-aware scan: a sentinel consumed as a VALUE must not suppress injection', () => {
@@ -291,6 +302,8 @@ describe('withDefaultModel', () => {
       // Mutation guard: reverting to `passthrough.some(FULL_SUPPRESS_ARGS.has)`
       // makes this expect the unchanged argv and the test fails.
       expect(withDefaultModel(['--system-prompt', '--model', '-p', 'hi'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
         '--model',
         'mlx/d',
         '--system-prompt',
@@ -302,6 +315,8 @@ describe('withDefaultModel', () => {
 
     it('injects a local model when --provider is the VALUE of --append-system-prompt', () => {
       expect(withDefaultModel(['--append-system-prompt', '--provider'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
         '--model',
         'mlx/d',
         '--append-system-prompt',
@@ -312,16 +327,24 @@ describe('withDefaultModel', () => {
     it('injects a local model when a carrier (-c) is consumed as the VALUE of --name', () => {
       // --name consumes `-c` as its value (pi: args[++i]); the benign reverse
       // direction — the leftover run is a plain fresh run → concrete --model.
-      expect(withDefaultModel(['--name', '-c'], 'd')).toEqual(['--model', 'mlx/d', '--name', '-c']);
+      expect(withDefaultModel(['--name', '-c'], 'd')).toEqual([
+        '--models',
+        'mlx/*',
+        '--model',
+        'mlx/d',
+        '--name',
+        '-c',
+      ]);
     });
 
     it('still classifies a REAL option name after its consumer sentinel skips its own value', () => {
       // A real `--session-id foo` (consumer + carrier) still scopes to mlx/*, and
-      // a real explicit `--model x` (consumer + full-suppress) still forwards
-      // unchanged — the sentinel classifies AND skips its value in one pass.
+      // a real explicit `--model x` (consumer) keeps its concrete selection but
+      // gains the local-only scope. The sentinel classifies AND skips its value
+      // in one pass.
       expect(withDefaultModel(['--session-id', 'foo'], 'd')).toEqual(['--models', 'mlx/*', '--session-id', 'foo']);
       const explicit = ['--model', 'x', '-p', 'hi'];
-      expect(withDefaultModel(explicit, 'd')).toBe(explicit);
+      expect(withDefaultModel(explicit, 'd')).toEqual(['--models', 'mlx/*', ...explicit]);
     });
   });
 });
@@ -480,21 +503,21 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
   });
 
-  it('still injects --model mlx/<id> on a fresh agent run', async () => {
+  it('injects an mlx-only scope and --model mlx/<id> on a fresh agent run', async () => {
     const { deps, calls } = makeDeps();
     await run(['-p', 'hi'], deps);
     expect(calls.discover).toHaveLength(1);
     expect(calls.wizard).toHaveLength(0);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/fake-model', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi']);
     expect(calls.runAgent[0]!.models.map((m) => m.discovered.name)).toEqual(['fake-model']);
   });
 
-  it('still skips injection when the run already carries --model', async () => {
+  it('keeps an explicit model and adds the mlx-only selector scope', async () => {
     const { deps, calls } = makeDeps();
     await run(['--model', 'mlx/other', '-p', 'hi'], deps);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/other', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/other', '-p', 'hi']);
   });
 
   it('still runs the wizard for a fresh agent run with no models, then injects the downloaded one', async () => {
@@ -503,14 +526,14 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(1);
     expect(calls.discover).toHaveLength(2);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '-p', 'hi']);
   });
 
-  it('forwards a --fork run unchanged so pi restores the forked session model', async () => {
+  it('scopes a --fork run while allowing pi to restore the forked session model', async () => {
     const { deps, calls } = makeDeps();
     await run(['--fork', 'abc123', '-p', 'hi'], deps);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--fork', 'abc123', '-p', 'hi']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--fork', 'abc123', '-p', 'hi']);
     expect(calls.runAgent[0]!.argv).not.toContain('--model');
   });
 
@@ -546,7 +569,7 @@ describe('run() argv routing', () => {
     await run(['--list-models'], deps);
     expect(calls.wizard).toHaveLength(1);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--list-models']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '--list-models']);
   });
 
   it('keeps an empty --export value on the wizard path with zero models (pi would silently no-op)', async () => {
@@ -554,7 +577,7 @@ describe('run() argv routing', () => {
     await run(['--export', ''], deps);
     expect(calls.wizard).toHaveLength(1);
     expect(calls.runAgent).toHaveLength(1);
-    expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/downloaded-model', '--export', '']);
+    expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/downloaded-model', '--export', '']);
   });
 
   /**
@@ -587,7 +610,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-b', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-b', '-p', 'hi']);
       });
     });
 
@@ -596,7 +619,7 @@ describe('run() argv routing', () => {
         const { deps, calls } = makeDeps(twoModels());
         deps.readPersistedDefault = () => readPersistedDefaultModel(agentDir);
         await run(['-p', 'hi'], deps);
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-a', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-a', '-p', 'hi']);
       });
     });
 
@@ -612,7 +635,7 @@ describe('run() argv routing', () => {
         } finally {
           errorSpy.mockRestore();
         }
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-a', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-a', '-p', 'hi']);
         expect(notices).toContain('anthropic/claude-x');
         expect(notices).toContain('mlx/model-a');
       });
@@ -630,7 +653,7 @@ describe('run() argv routing', () => {
         } finally {
           errorSpy.mockRestore();
         }
-        expect(calls.runAgent[0]!.argv).toEqual(['--model', 'mlx/model-b', '-p', 'hi']);
+        expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/model-b', '-p', 'hi']);
         expect(errorCallCount).toBe(0);
       });
     });
@@ -757,7 +780,7 @@ describe('run() argv routing', () => {
       // `--models mlx/*` for carriers) is applied regardless of whether the
       // belt seed persisted.
       const cases: Array<{ argv: string[]; expected: string[] }> = [
-        { argv: ['-p', 'hi'], expected: ['--model', 'mlx/fake-model', '-p', 'hi'] },
+        { argv: ['-p', 'hi'], expected: ['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi'] },
         { argv: ['-c'], expected: ['--models', 'mlx/*', '-c'] },
         { argv: ['--session-id', 'unknown-xyz'], expected: ['--models', 'mlx/*', '--session-id', 'unknown-xyz'] },
         { argv: ['--provider', 'groq'], expected: ['--models', 'mlx/*', '--provider', 'groq'] },

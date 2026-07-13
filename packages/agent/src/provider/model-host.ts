@@ -20,6 +20,18 @@ import type { DiscoveredModelLike } from '../types.js';
 export interface MlxModelHostOptions {
   /** Injectable model loader so tests can stub native loading. */
   loadModelFn?: typeof loadModel;
+  /**
+   * Optional load-path policy. `mlx agent` uses this to point the loader at
+   * an ephemeral config overlay with block-paged attention enabled while
+   * leaving the checkpoint directory untouched.
+   */
+  resolveModelPathFn?: (model: DiscoveredModelLike) => Promise<string>;
+  /**
+   * Reject a loaded model unless its native paged-cache adapter is active.
+   * The agent entrypoint enables this so a model/platform incompatibility
+   * fails clearly instead of silently falling back to flat KV cache.
+   */
+  requirePagedCache?: boolean;
 }
 
 interface ResidentModel {
@@ -42,12 +54,16 @@ interface ResidentModel {
 export class MlxModelHost {
   private readonly byName = new Map<string, DiscoveredModelLike>();
   private readonly loadModelFn: typeof loadModel;
+  private readonly resolveModelPathFn: (model: DiscoveredModelLike) => Promise<string>;
+  private readonly requirePagedCache: boolean;
   private resident: ResidentModel | null = null;
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(models: DiscoveredModelLike[], opts: MlxModelHostOptions = {}) {
     for (const model of models) this.byName.set(model.name, model);
     this.loadModelFn = opts.loadModelFn ?? loadModel;
+    this.resolveModelPathFn = opts.resolveModelPathFn ?? (async (model) => model.path);
+    this.requirePagedCache = opts.requirePagedCache ?? false;
   }
 
   get residentId(): string | null {
@@ -90,8 +106,28 @@ export class MlxModelHost {
         session = this.resident.session;
       } else {
         this.resident = null;
-        const model = await this.loadModelFn(entry.path);
-        session = new ChatSession(model as unknown as SessionCapableModel);
+        const resolvedPath = await this.resolveModelPathFn(entry);
+        const model = await this.loadModelFn(resolvedPath);
+        const sessionModel = model as unknown as SessionCapableModel;
+        if (this.requirePagedCache && sessionModel.hasBlockPagedCache?.() !== true) {
+          throw new Error(
+            `MlxModelHost: model "${modelId}" (${entry.modelType}) loaded without an active ` +
+              `PagedAttention cache; this checkpoint, quantization, or platform is not compatible ` +
+              `with the mlx agent paged-cache requirement`,
+          );
+        }
+        if (
+          this.requirePagedCache &&
+          entry.modelType === 'qwen3_5_moe' &&
+          sessionModel.hasMtpWeights?.() === true
+        ) {
+          throw new Error(
+            `MlxModelHost: model "${modelId}" has Qwen3.5 MoE MTP weights, but the native MoE ` +
+              `backend cannot combine MTP with PagedAttention yet; refusing to silently downgrade ` +
+              `this agent session to paged autoregressive decoding`,
+          );
+        }
+        session = new ChatSession(sessionModel);
         this.resident = { id: modelId, session, model, dirty: false };
       }
       return await fn(session);

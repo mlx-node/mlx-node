@@ -8,13 +8,12 @@ import { constants as osConstants } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { loadModel } from '@mlx-node/lm';
+import { loadModel, PagedConfigOverrideManager, QWEN35_PAGED_MODEL_TYPES } from '@mlx-node/lm';
 import { createServer } from '@mlx-node/server';
 
 import { resolveMlxNodeHome, resolveModelsDir } from '../../config.js';
 import { discoverModels } from './discover.js';
 import { attachLogger, resolveLogDir, type Logger } from './logger.js';
-import { cleanupPagedOverrides, resolvePagedAwareModelPath } from './paged-config-override.js';
 import { makeSwapController } from './swap.js';
 
 function printHelp(): void {
@@ -204,7 +203,9 @@ export async function run(argv: string[]): Promise<void> {
   // The swap controller needs the registry from the server instance, but the
   // server needs the controller's callbacks at construction. Bridge via a
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
-  const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = {
+    current: null,
+  };
   const server = await createServer({
     port,
     host,
@@ -213,10 +214,13 @@ export async function run(argv: string[]): Promise<void> {
   });
   // Wrap loadModel so Qwen3.5 dense / MoE checkpoints get
   // `use_block_paged_cache: true` injected via a temp-dir clone with
-  // patched config.json (see ./paged-config-override.ts for why this
-  // command turns paged ON despite the upstream Qwen3.5 default being
-  // OFF). Other model types pass through unmodified.
-  const loadModelPagedAware = async (path: string) => loadModel(await resolvePagedAwareModelPath(path));
+  // patched config.json. The shared LM manager owns an isolated temp root;
+  // this launcher's historical Qwen3.5-only policy is kept explicit while
+  // agent hosts can select the full chat-family policy.
+  const pagedConfigOverrides = new PagedConfigOverrideManager({
+    modelTypes: QWEN35_PAGED_MODEL_TYPES,
+  });
+  const loadModelPagedAware = async (path: string) => loadModel(await pagedConfigOverrides.resolve(path));
   ctrlRef.current = makeSwapController(discovered, server.registry, loadModelPagedAware, boundModel.name);
 
   // Verbose logging: attach AFTER `createServer` so we wrap every
@@ -278,7 +282,7 @@ export async function run(argv: string[]): Promise<void> {
       /* ignore */
     }
     try {
-      await cleanupPagedOverrides();
+      await pagedConfigOverrides.cleanup();
     } catch {
       /* ignore */
     }

@@ -44,6 +44,61 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
+  it('resolves the model path inside the serialized load before invoking the loader', async () => {
+    const events: string[] = [];
+    const resolveModelPathFn = vi.fn(async (model: DiscoveredModelLike) => {
+      events.push(`resolve:${model.path}`);
+      return `/paged${model.path}`;
+    });
+    const loader = vi.fn(async (path: string) => {
+      events.push(`load:${path}`);
+      return { fakeModelFor: path } as unknown as LoadableModel;
+    });
+    const host = new MlxModelHost(MODELS, { loadModelFn: loader, resolveModelPathFn });
+
+    await getSession(host, 'qwen-small');
+
+    expect(events).toEqual(['resolve:/models/qwen-small', 'load:/paged/models/qwen-small']);
+    expect(resolveModelPathFn).toHaveBeenCalledWith(MODELS[0]);
+    expect(loader).toHaveBeenCalledWith('/paged/models/qwen-small');
+  });
+
+  it('enforces the agent paged-cache invariant before residentizing a model', async () => {
+    const flatLoader = vi.fn(async () => ({ hasBlockPagedCache: () => false }) as unknown as LoadableModel);
+    const host = new MlxModelHost(MODELS, {
+      loadModelFn: flatLoader,
+      requirePagedCache: true,
+    });
+
+    await expect(getSession(host, 'qwen-small')).rejects.toThrow(
+      /qwen-small.*qwen3_5.*without an active PagedAttention cache/s,
+    );
+    expect(host.residentId).toBeNull();
+
+    flatLoader.mockResolvedValueOnce({ hasBlockPagedCache: () => true } as unknown as LoadableModel);
+    await expect(getSession(host, 'qwen-small')).resolves.toBeInstanceOf(ChatSession);
+    expect(host.residentId).toBe('qwen-small');
+  });
+
+  it('rejects Qwen3.5 MoE MTP rather than silently routing a paged session through AR', async () => {
+    const loader = vi.fn(
+      async () =>
+        ({
+          hasBlockPagedCache: () => true,
+          hasMtpWeights: () => true,
+        }) as unknown as LoadableModel,
+    );
+    const host = new MlxModelHost(
+      [{ name: 'qwen-moe-mtp', path: '/models/qwen-moe-mtp', modelType: 'qwen3_5_moe' }],
+      { loadModelFn: loader, requirePagedCache: true },
+    );
+
+    await expect(getSession(host, 'qwen-moe-mtp')).rejects.toThrow(
+      /cannot combine MTP with PagedAttention.*refusing to silently downgrade/s,
+    );
+    expect(host.residentId).toBeNull();
+  });
+
   it('rejects unknown model ids with a clear error listing known ids', async () => {
     const loader = makeLoader();
     const host = new MlxModelHost(MODELS, { loadModelFn: loader });

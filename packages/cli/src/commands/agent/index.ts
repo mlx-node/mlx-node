@@ -189,14 +189,13 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
 }
 
 /**
- * Args carrying an EXPLICIT model choice or a concrete session copy: ALL
- * default injection is suppressed and the argv is forwarded verbatim.
- * - `--model` / `--models` — the user already named a model or a scope; pi
- *   resolves it directly.
- * - `--fork` — copies the source session (messages + saved model) into a new
- *   one; injecting anything would fight the restore.
+ * An explicit `--models` scope is authoritative: the user already named the
+ * complete picker/cycling scope, so forward it verbatim. A concrete `--model`
+ * is different: it chooses the active model but does NOT constrain pi's model
+ * selector, so {@link withDefaultModel} still adds the local-only scope around
+ * it.
  */
-const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--model', '--models', '--fork']);
+const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--models']);
 
 /**
  * Session / provider carriers where a bare `--model mlx/<id>` injection is
@@ -218,6 +217,10 @@ const FULL_SUPPRESS_ARGS: ReadonlySet<string> = new Set(['--model', '--models', 
  *   <p>` via `buildFallbackModel`, minting a bogus CLOUD `<p>/mlx/<id>` custom
  *   model; a `--models` scope carries no provider and cannot. Verified against
  *   pi 0.80.6 `core/model-resolver.js` + `main.js` `buildSessionOptions`.
+ * - `--fork`: like the other session carriers, pi restores the copied
+ *   session's model because the session already contains messages; the scope
+ *   only keeps the model selector/cycling list local and does not replace the
+ *   restored model.
  */
 const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--provider',
@@ -227,7 +230,29 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--resume',
   '--session',
   '--session-id',
+  '--fork',
 ]);
+
+/** Collect real option names with the same unconditional value consumption as pi. */
+function collectPiOptionNames(argv: readonly string[]): Set<string> {
+  const optionNames = new Set<string>();
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i]!;
+    optionNames.add(token);
+    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < argv.length) {
+      i++;
+    }
+  }
+  return optionNames;
+}
+
+function injectsConcreteDefault(optionNames: ReadonlySet<string>): boolean {
+  return (
+    !optionNames.has('--models') &&
+    !optionNames.has('--model') &&
+    !Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))
+  );
+}
 
 /**
  * Keep a launch on-machine at the AUTHORITATIVE CLI-arg layer (above settings
@@ -235,11 +260,14 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
  * (e.g. a `GROQ_API_KEY` in the shell) make pi's "first available model"
  * fallback pick a CLOUD model over the local ones — the opposite of what
  * `mlx agent` promises. Three cases:
- * - explicit model / scope / fork ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
- * - session / provider carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
+ * - explicit scope ({@link FULL_SUPPRESS_ARGS}) → forward as-is;
+ * - session / provider / fork carrier ({@link SESSION_PROVIDER_CARRIER_ARGS}) →
  *   prepend `--models mlx/*` (a local-only scope that preserves session restore
  *   yet blocks a cloud default for a new / unknown / empty session);
- * - plain fresh run → prepend `--model mlx/<default>`.
+ * - explicit model → prepend `--models mlx/*` so the picker starts in the
+ *   local scope (the registry boundary separately keeps its `all` view local);
+ * - plain fresh run → prepend both the local scope and
+ *   `--model mlx/<default>`.
  * Pure function, exported for tests.
  */
 export function withDefaultModel(passthrough: string[], defaultModelId: string): string[] {
@@ -251,24 +279,22 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
   // a consumer both classifies AND skips its own following value in this one
   // pass; a sentinel consumed as some earlier option's value is skipped here and
   // never classifies.
-  const optionNames = new Set<string>();
-  for (let i = 0; i < passthrough.length; i++) {
-    const token = passthrough[i]!;
-    optionNames.add(token);
-    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < passthrough.length) {
-      i++; // the next token is this option's value, never an option name
-    }
-  }
+  const optionNames = collectPiOptionNames(passthrough);
 
-  // Fail-closed default is to inject a LOCAL model; suppress only on a real
-  // explicit model/scope/fork, and scope (not bare --model) for a real carrier.
+  // Fail-closed default is to inject a LOCAL model and LOCAL picker scope.
+  // Suppress only when the user supplied an explicit scope. A concrete model
+  // still needs the scope: --model selects one model but pi otherwise exposes
+  // every authenticated provider in /model.
   if (Array.from(FULL_SUPPRESS_ARGS).some((arg) => optionNames.has(arg))) {
     return passthrough;
+  }
+  if (optionNames.has('--model')) {
+    return ['--models', 'mlx/*', ...passthrough];
   }
   if (Array.from(SESSION_PROVIDER_CARRIER_ARGS).some((arg) => optionNames.has(arg))) {
     return ['--models', 'mlx/*', ...passthrough];
   }
-  return ['--model', `mlx/${defaultModelId}`, ...passthrough];
+  return ['--models', 'mlx/*', '--model', `mlx/${defaultModelId}`, ...passthrough];
 }
 
 /** A `defaultProvider`/`defaultModel` pair persisted by pi's `/model`. */
@@ -588,13 +614,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   if (persisted === undefined) {
     (deps.writePersistedDefault ?? writePersistedDefaultModel)('mlx', modelId);
   }
+  const passthroughOptionNames = collectPiOptionNames(scan.passthrough);
   const agentArgv = withDefaultModel(scan.passthrough, modelId);
-  // A notice only makes sense when injection actually overrode a non-mlx
-  // persisted default. An identity return (FULL_SUPPRESS: --model/--models/
-  // --fork) overrode nothing, so the notice would be a lie; both the
-  // `--models mlx/*` scope and the fresh-run `--model` injection return a new
-  // array, so `agentArgv !== scan.passthrough` marks a real override.
-  if (notice !== undefined && agentArgv !== scan.passthrough) {
+  // A notice only makes sense when a concrete default actually overrode a
+  // non-mlx persisted default. Adding the local picker scope around an explicit
+  // --model does not override that explicit choice and must stay silent.
+  if (notice !== undefined && injectsConcreteDefault(passthroughOptionNames)) {
     console.error(notice);
   }
 

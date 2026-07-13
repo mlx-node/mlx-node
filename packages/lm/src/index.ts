@@ -97,6 +97,13 @@ export {
   type LoadModelOptions,
 } from './models/model-loader.js';
 
+export {
+  AGENT_PAGED_MODEL_TYPES,
+  PagedConfigOverrideManager,
+  QWEN35_PAGED_MODEL_TYPES,
+  type PagedConfigOverrideManagerOptions,
+} from './models/paged-config-override.js';
+
 export { QWEN35_CONFIGS, getQwen35Config } from './models/qwen3_5-configs.js';
 
 // Tool calling utilities
