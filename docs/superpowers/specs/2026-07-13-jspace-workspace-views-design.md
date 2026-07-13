@@ -43,11 +43,11 @@ Plus up to `LENS_MAX_PINNED = 8` pinned tokens, each with an **exact 1-based ful
 ### 1. Divergence (per cell, from two slices of the SAME source)
 - **`jaccardTopK(cellA, cellB)` → [0,1]** — `1 − |A∩B|/|A∪B|` over the two `topKIds` sets. **Default fill metric** (continuous). `divergence = 1 − Jaccard`.
 - **`argmaxAgree(cellA, cellB)` → 0|1** — binary top-1 (dis)agreement. Optional overlay/mark.
-- **`pinnedRankDelta(sliceA, sliceB, pinIdx, ℓ, p)` → number** — `|rank_A − rank_B|` from the exact pinned tracks (escapes the depth-10 truncation), pinned concepts only. Optional.
+- ~~`pinnedRankDelta`~~ — **DROPPED (codex T1).** A delta of two pinned ranks is dishonest: `rankAt` returns `RANK_CAP` (999) for both a genuine ≥999 rank and an out-of-range lookup, so the delta reports false agreement (both capped → 0) or a fabricated exact gap (one capped). `jaccardTopK` over the top-10 *set* has no such censoring and is the honest divergence signal (its only limit — depth 10 — is a stated scope bound, not a hidden lie).
 - Never compare baked-vs-live (11 rows vs 24). Compare logit-vs-Jacobian **within one source only**.
 
 ### 2. Workspace-metrics strip (across layers, one slice)
-- **(A) Concept rank trajectory** — `slice.rankAt(pinIdx, ℓ, lastPos)` across displayed layers. **FAITHFUL** full-vocab (1..999). The real deliverable; directly carries the unspoken-word thesis.
+- **(A) Concept rank trajectory** — `slice.rankAt(pinIdx, ℓ, lastPos)` across displayed layers. **FAITHFUL** full-vocab, exact **below** the cap; a value of `RANK_CAP` (999) is a censored off-scale floor ("at/beyond cap → not surfaced"), NOT an exact rank — the UI renders it off-scale (via `isCensoredRank`) and never labels it exact (codex T3). The real deliverable; directly carries the unspoken-word thesis (watch the concept dive from off-scale to ~1).
 - **(B) Concept top-k accuracy** — `1[rank_concept ≤ k]` from the same exact track. **FAITHFUL**, labeled "concept in top-k" (not gold-token).
 - **(C) Readout entropy / effective-dim** — `H = −Σ topKProbs·log topKProbs`, or `1/Σ topKProbs²`, over the visible 10. **Labeled "readout-space proxy (top-10)."**
 - **(D) Top-K set stability** — adjacent-layer `Jaccard(topKIds_ℓ, topKIds_{ℓ+1})` at the last position. **Labeled "readout-space proxy"** (stand-in for autocorrelation, not the residual metric).

@@ -1,16 +1,34 @@
 // workspace-metrics.ts — pure across-layer readouts that locate the "workspace
-// band" from what lensReadout actually ships. FAITHFUL metrics read the EXACT
-// pinned full-vocab rank track; PROXY metrics read the visible top-10 and are
-// labeled as readout-space proxies in the UI (they are NOT the paper's
-// activation/residual quantities). The impossible full-distribution metrics
-// (excess kurtosis, residual autocorrelation, activation participation ratio)
-// are intentionally absent — they need data no cell ships.
+// band" from what lensReadout actually ships. FAITHFUL metrics read the pinned
+// full-vocab rank track (exact for ranks below the display cap); PROXY metrics
+// read the visible top-10 and are labeled as readout-space proxies in the UI
+// (they are NOT the paper's activation/residual quantities). The impossible
+// full-distribution metrics (excess kurtosis, residual autocorrelation,
+// activation participation ratio) are intentionally absent — they need data no
+// cell ships.
+//
+// CENSORING CAVEAT: `rankAt` returns RANK_CAP (999) both for a genuine rank
+// at/beyond the cap and for any out-of-range lookup. A trajectory value of 999
+// therefore means "at or beyond the cap — off-scale / not surfaced", NOT an
+// exact rank. The UI must render 999 as an off-scale floor (RankChart already
+// does) and label the trajectory accordingly — never as an exact measurement.
+// `conceptTopKAccuracy` is unaffected: its threshold (10) sits far below the cap,
+// so a censored 999 correctly reads as "not in top-k".
 import type { LensSliceData } from './types';
-import { SURFACE_RANK } from './colors';
+import { RANK_CAP, SURFACE_RANK } from './colors';
 
-/** FAITHFUL — the pinned concept's exact full-vocab rank per displayed layer. */
+/** FAITHFUL (with the RANK_CAP caveat above) — the pinned concept's full-vocab
+ *  rank per displayed layer. Exact where rank < {@link RANK_CAP}; a value of
+ *  {@link RANK_CAP} (999) is a censored floor (at/beyond cap → off-scale), NOT an
+ *  exact rank. Render 999 as off-scale, never as a precise value. */
 export function conceptRankTrajectory(slice: LensSliceData, pinIdx: number, pos = slice.promptLen - 1): number[] {
   return slice.layers.map((_, layerIdx) => slice.rankAt(pinIdx, layerIdx, pos));
+}
+
+/** True iff `rank` is the censored floor ({@link RANK_CAP}) rather than an exact
+ *  value — a helper for the UI to mark off-scale trajectory points. */
+export function isCensoredRank(rank: number): boolean {
+  return rank >= RANK_CAP;
 }
 
 /** FAITHFUL — per layer, 1 iff the concept sits within top-k. Label "concept in top-k". */

@@ -27,8 +27,22 @@ function run(): LensReadoutRun {
 
 describe('workspace metrics', () => {
   const slice = buildLensSlice(run());
-  it('conceptRankTrajectory: exact per-layer ranks off the pinned track', () => {
+  it('conceptRankTrajectory: per-layer ranks off the pinned track (exact below the cap)', () => {
     expect(metrics.conceptRankTrajectory(slice, 0)).toEqual([2, 1, 1]);
+  });
+  it('conceptRankTrajectory: RANK_CAP (999) is a censored floor, flagged by isCensoredRank', () => {
+    // A concept that never surfaces early: the producer stores min(rank, 999), so a
+    // 999 means "at/beyond cap — off-scale", NOT an exact rank. The trajectory
+    // returns it verbatim; isCensoredRank marks it so the UI renders it off-scale.
+    const censored = buildLensSlice({
+      ...run(),
+      pinned: [{ tokenId: 9, tokenText: '9', ranks: Int32Array.from([999, 40, 1]) }],
+    });
+    expect(metrics.conceptRankTrajectory(censored, 0)).toEqual([999, 40, 1]);
+    expect(metrics.isCensoredRank(999)).toBe(true);
+    expect(metrics.isCensoredRank(40)).toBe(false);
+    // top-k accuracy is unaffected: 999 is far above any sane k, so it reads "not in top-k".
+    expect(metrics.conceptTopKAccuracy(censored, 0, 10)).toEqual([0, 0, 1]);
   });
   it('conceptTopKAccuracy: 1 iff rank ≤ k', () => {
     expect(metrics.conceptTopKAccuracy(slice, 0, 1)).toEqual([0, 1, 1]);

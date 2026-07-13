@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { argmaxDisagree, jaccardTopK, pinnedRankDelta } from '@/jlens-core/divergence';
+import { argmaxDisagree, jaccardTopK } from '@/jlens-core/divergence';
 import { divergingRamp } from '@/jlens-core/colors';
-import { buildLensSlice } from '@/jlens-core/types';
-import type { LensCell, LensReadoutRun } from '@/../src/inspector-types';
+import type { LensCell } from '@/../src/inspector-types';
 
 function cell(argmaxId: number, topKIds: number[]): LensCell {
   return {
@@ -24,18 +23,6 @@ describe('divergence metrics', () => {
     // A={1,2,3}, B={1,2,3,4,5,6} → inter=3 union=6 → similarity .5 → distance .5
     expect(jaccardTopK(cell(1, [1, 2, 3]), cell(1, [1, 2, 3, 4, 5, 6]))).toBeCloseTo(0.5, 6);
     expect(jaccardTopK(cell(0, []), cell(0, []))).toBe(0);
-  });
-  it('pinnedRankDelta: absolute full-vocab rank gap for a pinned concept', () => {
-    const mk = (r0: number, r1: number): LensReadoutRun => ({
-      promptLen: 1, topK: 2, useJacobian: false, jacobianApplied: false, layers: [12, 24],
-      tokens: [{ text: 'x', id: 5 } as any],
-      cells: [cell(0, [0]), cell(0, [0])],
-      pinned: [{ tokenId: 9, tokenText: '9', ranks: Int32Array.from([r0, r1]) }],
-    });
-    const a = buildLensSlice(mk(3, 1));
-    const b = buildLensSlice(mk(40, 1));
-    expect(pinnedRankDelta(a, b, 0, 0, 0)).toBe(37); // |3-40|
-    expect(pinnedRankDelta(a, b, 0, 1, 0)).toBe(0);  // |1-1|
   });
 });
 
