@@ -35,6 +35,7 @@ import { RankHeatmapCanvas } from './RankHeatmapCanvas';
 import { resolveStarterSlug, STARTERS, STARTER_SLUGS } from './starters';
 import { GALLERY } from './starters/gallery';
 import { useLensRun } from './useLensRun';
+import { WorkspaceMetricsStrip } from './WorkspaceMetricsStrip';
 
 // ---------------------------------------------------------------------------
 // Read settings. BOTH lenses read every residual boundary 1..24 so the LOGIT ↔
@@ -117,6 +118,17 @@ const JSPACE_COPY = {
       cellDesc: (layer: number, position: number, pct: number) =>
         `ℓ${layer} · position ${position}: ${pct}% top-10 disagreement`,
     },
+    metrics: {
+      title: 'Where the readout commits',
+      faithfulTag: 'exact',
+      proxyTag: 'readout-space proxy',
+      rankTrajectory: 'Concept rank across layers (full-vocab; ≥999 = off-scale, not surfaced)',
+      topkAcc: 'Concept in top-10 by layer',
+      entropy: 'Readout entropy (top-10)',
+      stability: 'Top-10 set stability (top-10)',
+      omitNote:
+        'Excess kurtosis, residual autocorrelation, and activation participation-ratio need the full logit/residual vectors, which are not shipped in-browser — omitted here.',
+    },
   },
   zh: {
     galleryLabel: '示例 · 无需模型',
@@ -155,6 +167,16 @@ const JSPACE_COPY = {
       ariaGrid: '分歧网格：logit lens 对 Jacobian 的 top-10 分歧，最深层在顶部。',
       cellDesc: (layer: number, position: number, pct: number) =>
         `ℓ${layer} · 位置 ${position}：top-10 分歧 ${pct}%`,
+    },
+    metrics: {
+      title: '读出在哪一层定型',
+      faithfulTag: '精确',
+      proxyTag: 'readout 空间近似',
+      rankTrajectory: '概念的逐层 rank（全词表；≥999 = 超出量程、未浮现）',
+      topkAcc: '概念是否进入逐层 top-10',
+      entropy: '读出熵（top-10）',
+      stability: 'top-10 集合稳定度（top-10）',
+      omitNote: '超额峰度、残差自相关、激活参与比需要完整的 logit / 残差向量，浏览器内并未传输，这里省略。',
     },
   },
 } as const;
@@ -1151,6 +1173,14 @@ export default function JSpaceApp() {
               </div>
             ) : null}
           </div>
+
+          {/* Workspace-metrics strip — honest across-layer readouts that locate
+              where the readout commits. Client-only over Task-3's pure module; the
+              faithful concept curves need a pin (guarded inside), the labeled
+              proxy charts + omit note always render. Works for baked + live. */}
+          {slice ? (
+            <WorkspaceMetricsStrip slice={slice} pinnedIdx={effectiveActiveIdx ?? 0} copy={copy.metrics} />
+          ) : null}
 
           {/* Cross-sections at the selected cell */}
           {activeCellRef ? (
