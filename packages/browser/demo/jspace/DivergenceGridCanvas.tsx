@@ -45,6 +45,7 @@ export function DivergenceGridCanvas({
   jacSlice,
   selected,
   onSelect,
+  copy,
 }: {
   /** The baked frame's plain logit-lens run. Provides the grid dims + row order. */
   logitSlice: LensSliceData;
@@ -52,6 +53,15 @@ export function DivergenceGridCanvas({
   jacSlice: LensSliceData;
   selected: CellRef | null;
   onSelect: (ref: CellRef) => void;
+  /** Localized aria strings (grid label + per-cell description template). The
+   *  VISIBLE copy is already localized in JSpaceApp, so the aria-label / per-cell
+   *  SR description / live announce must be too — they are built from these props,
+   *  never string literals. `cellDesc` interpolates (ℓlayer, 1-based position,
+   *  disagreement %). Glossary terms (Jacobian, logit lens, ℓ) stay English in zh. */
+  copy: {
+    ariaGrid: string;
+    cellDesc: (layer: number, position: number, pct: number) => string;
+  };
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -76,10 +86,10 @@ export function DivergenceGridCanvas({
   const { gridProps, proxyNode } = useCanvasGridA11y({
     slice: logitSlice,
     sel,
-    ariaLabel: 'Divergence grid: logit vs Jacobian top-10 disagreement, deepest layer on top.',
+    ariaLabel: copy.ariaGrid,
     describeCell: (ref) => {
       const d = divergenceAt(logitSlice, jacSlice, ref.layerIdx, ref.pos);
-      return `ℓ${logitSlice.layers[ref.layerIdx]} · position ${ref.pos + 1}: ${Math.round(d * 100)}% top-10 disagreement`;
+      return copy.cellDesc(logitSlice.layers[ref.layerIdx]!, ref.pos + 1, Math.round(d * 100));
     },
   });
 
@@ -116,11 +126,9 @@ export function DivergenceGridCanvas({
   React.useEffect(() => {
     if (sel) {
       const d = divergenceAt(logitSlice, jacSlice, sel.layerIdx, sel.pos);
-      setAnnounce(
-        `ℓ${logitSlice.layers[sel.layerIdx]} · position ${sel.pos + 1}: ${Math.round(d * 100)}% top-10 disagreement`,
-      );
+      setAnnounce(copy.cellDesc(logitSlice.layers[sel.layerIdx]!, sel.pos + 1, Math.round(d * 100)));
     }
-  }, [sel, logitSlice, jacSlice]);
+  }, [sel, logitSlice, jacSlice, copy]);
 
   React.useEffect(() => {
     const canvas = canvasRef.current;

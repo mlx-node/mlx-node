@@ -61,6 +61,15 @@ describe('baked divergence pair alignment (every gallery frame)', () => {
       // cells is layer-major/position-minor: length === layers × promptLen, matched.
       expect(logit.cells.length).toBe(logit.layers.length * logit.promptLen);
       expect(jac.cells.length).toBe(logit.cells.length);
+      // COORDINATE IDENTITY (not just count): every flat cell index i must address
+      // the SAME (layer, position) in both runs — the exact indexing the canvas
+      // relies on (logit.cellAt(l,p) paired with jac.cellAt(l,p)). Equal counts
+      // alone would still pass if the two runs' cells were ordered differently, so
+      // assert per-cell layer/position equality across the whole flat grid.
+      for (let i = 0; i < logit.cells.length; i++) {
+        expect(jac.cells[i]!.layer).toBe(logit.cells[i]!.layer);
+        expect(jac.cells[i]!.position).toBe(logit.cells[i]!.position);
+      }
     }
   });
 });

@@ -110,9 +110,12 @@ const JSPACE_COPY = {
     divergence: {
       toggle: 'Compare lenses',
       eyebrow: 'Logit vs Jacobian · top-10 disagreement',
-      hint: 'Blue = the two lenses agree on the top-10 here; red = they disagree. Baked starters ship both readouts, so this compares them cell by cell.',
+      hint: 'Blue = the two lenses agree on the top-10 here; red = they disagree. Baked starters ship both readouts, so this compares them cell by cell. The deepest layer (ℓ24) is identical by construction — the Jacobian is the identity there — so its row is always calm, not a measured agreement.',
       legendAgree: 'agree',
       legendDisagree: 'disagree',
+      ariaGrid: 'Divergence grid: logit vs Jacobian top-10 disagreement, deepest layer on top.',
+      cellDesc: (layer: number, position: number, pct: number) =>
+        `ℓ${layer} · position ${position}: ${pct}% top-10 disagreement`,
     },
   },
   zh: {
@@ -146,9 +149,12 @@ const JSPACE_COPY = {
     divergence: {
       toggle: '对比两种 lens',
       eyebrow: 'logit lens 对 Jacobian · top-10 分歧',
-      hint: '蓝色 = 两种 lens 在这里的 top-10 一致；红色 = 不一致。烘焙好的示例同时带有两种读出，因此可以逐格对比。',
+      hint: '蓝色 = 两种 lens 在这里的 top-10 一致；红色 = 不一致。烘焙好的示例同时带有两种读出，因此可以逐格对比。最深的一层（ℓ24）在构造上就是恒等的——那里的 Jacobian 就是单位矩阵——所以它那一行始终平静，并非测得的一致。',
       legendAgree: '一致',
       legendDisagree: '分歧',
+      ariaGrid: '分歧网格：logit lens 对 Jacobian 的 top-10 分歧，最深层在顶部。',
+      cellDesc: (layer: number, position: number, pct: number) =>
+        `ℓ${layer} · 位置 ${position}：top-10 分歧 ${pct}%`,
     },
   },
 } as const;
@@ -468,6 +474,7 @@ export default function JSpaceApp() {
       setSelected(null);
       setHovered(null);
       setFocusCell(null);
+      setShowDivergence(false); // opening a DIFFERENT tile → collapse the compare view
       setTokenCount(null);
       setRunError(null);
       pendingSelRef.current = null; // cancel any pending permalink restore
@@ -594,10 +601,29 @@ export default function JSpaceApp() {
   const divergencePair = React.useMemo(() => {
     if (view.kind !== 'starter' || !isColdPrompt(prompt)) return null;
     const frame = STARTERS[resolveStarterSlug(starterSlug)]!;
-    return {
-      logitSlice: buildLensSlice(reviveRun(frame.logit)),
-      jacSlice: buildLensSlice(reviveRun(frame.jacobian)),
-    };
+    const logitSlice = buildLensSlice(reviveRun(frame.logit));
+    const jacSlice = buildLensSlice(reviveRun(frame.jacobian));
+    // FAIL CLOSED: DivergenceGridCanvas pairs logitSlice.cellAt(l,p) with
+    // jacSlice.cellAt(l,p) but derives its grid bounds (rows/promptLen/row order)
+    // from logitSlice ALONE. Both slices come from the SAME baked frame so at
+    // runtime they align, but if a bad re-bake ever drifted their shape, indexing
+    // jacSlice by logit's bounds would silently mis-pair (or read out of range).
+    // Verify identical shape — same layer axis (length AND values in order), same
+    // promptLen, and per-cell coordinate identity — and if it fails, return null so
+    // the whole Compare-lenses toggle/panel simply never renders. One-time loop; memoized.
+    if (logitSlice.layers.length !== jacSlice.layers.length) return null;
+    if (logitSlice.promptLen !== jacSlice.promptLen) return null;
+    for (let i = 0; i < logitSlice.layers.length; i++) {
+      if (logitSlice.layers[i] !== jacSlice.layers[i]) return null;
+    }
+    for (let l = 0; l < logitSlice.layers.length; l++) {
+      for (let p = 0; p < logitSlice.promptLen; p++) {
+        const a = logitSlice.cellAt(l, p);
+        const b = jacSlice.cellAt(l, p);
+        if (a.layer !== b.layer || a.position !== b.position) return null;
+      }
+    }
+    return { logitSlice, jacSlice };
   }, [view.kind, prompt, starterSlug]);
   const [showDivergence, setShowDivergence] = React.useState(false);
   // Stable id for the legend's SVG <linearGradient> (one instance per app).
@@ -1059,6 +1085,7 @@ export default function JSpaceApp() {
                       jacSlice={divergencePair.jacSlice}
                       selected={selected}
                       onSelect={selectCell}
+                      copy={copy.divergence}
                     />
                   </div>
                 </div>
