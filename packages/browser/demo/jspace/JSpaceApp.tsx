@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { Link } from '@tanstack/react-router';
 
 import type { LensPinned, TokenInfo } from '../../src/inspector-types';
 import { LENS_MAX_PINNED, LENS_MAX_POSITIONS } from '../../src/inspector-types';
@@ -485,6 +486,16 @@ export default function JSpaceApp() {
     // the fold.
     <main className="jspace-scroll absolute inset-0 mx-auto max-w-[82rem] space-y-8 overflow-y-auto px-6 py-10 md:px-10 md:py-14">
       <header className="space-y-3 border-b border-border/60 pb-8">
+        {/* Back to the course landing — /jspace is a standalone route with no
+            shared chrome, so without this it is a dead end. Not locale-prefixed
+            (there is no /zh/jspace), matching how the landing links INTO /jspace. */}
+        <Link
+          to="/"
+          search={(prev) => prev}
+          className="inline-flex items-center gap-1.5 rounded-sm font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)] transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+        >
+          <span aria-hidden>←</span> How LLMs Work
+        </Link>
         <span className="inline-flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
           <span
             aria-hidden
