@@ -4,6 +4,7 @@ import { Link } from '@tanstack/react-router';
 import type { LensPinned, TokenInfo } from '../../src/inspector-types';
 import { LENS_MAX_PINNED, LENS_MAX_POSITIONS } from '../../src/inspector-types';
 import { lensReadout, loadLensPack } from '../lib/lens-client';
+import { readStoredLocale, type Locale } from '../lib/i18n';
 import { tokenize } from '../lib/tokenizer-client';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
@@ -31,6 +32,7 @@ import { PromptTokens } from './PromptTokens';
 import { RankChart } from './RankChart';
 import { RankHeatmapCanvas } from './RankHeatmapCanvas';
 import { STARTERS, STARTER_SLUGS } from './starters';
+import { GALLERY } from './starters/gallery';
 import { useLensRun } from './useLensRun';
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,79 @@ type JacState =
   | { status: 'failed'; verdict: SelfTestVerdict }
   | { status: 'error'; message: string };
 
+// ---------------------------------------------------------------------------
+// Bilingual copy for the model-free gallery surfaces (names · hooks · blurbs ·
+// bandNote). /jspace has no LocaleProvider, so `locale` is resolved from the
+// stored preference in an effect (see the component). Glossary terms — logit
+// lens, Jacobian, J-lens, token, rank, ℓ — stay English per the zh convention.
+// `galleryLabel`, `presetNames`, `galleryHooks`, `bandNote` are declared now but
+// consumed by the Task-6 gallery launcher; `blurbs` powers the D1 caption today.
+// ---------------------------------------------------------------------------
+const JSPACE_COPY = {
+  en: {
+    galleryLabel: 'Examples · no model needed',
+    presetNames: {
+      'french-season': 'French season', 'arith-inner-sum': 'Inner sum',
+      'arith-precedence': 'Operator precedence', 'arith-fewshot': 'Few-shot sum',
+      'grammar-error': 'Grammar error', 'giza-continent': 'Giza continent',
+      'int-cast-error': 'Bad int() cast', 'eiffel-capital': 'Eiffel capital',
+    } as Record<string, string>,
+    galleryHooks: {
+      'french-season': "Mid-stack the lens surfaces 'season' then 'summer' before the answer 'automne'.",
+      'arith-inner-sum': "The unspoken inner sum '3' (1+2) surfaces at ℓ18; the model then answers 6.",
+      'arith-precedence': "Precedence: the product '8' (4×2) is held mid-stack before adding 3.",
+      'arith-fewshot': "The inner sum '5' (2+3) shows up across ℓ20–23 in the few-shot analogy.",
+      'grammar-error': "After 'childs', the judgment 'incorrect' surfaces — the correction never does.",
+      'giza-continent': "Faint: the answer 'Africa' surfaces mid-stack while the real output is a degenerate '1'; the Egypt bridge hop never appears.",
+      'int-cast-error': "Faint: a generic 'error' concept for int('hello') — never 'ValueError'.",
+      'eiffel-capital': "Faint: the answer 'Paris' surfaces; the France bridge hop never does.",
+    } as Record<string, string>,
+    bandNote: (onset: number, peak: number) =>
+      `Legibility band: intermediate concepts start surfacing around ℓ${onset}, peaking near ℓ${peak}.`,
+    blurbs: {
+      'french-season': "Headline: mid-stack the J-lens surfaces the abstract concept ('season' near rank 1, 'summer' near rank 2, around boundaries 16-17) where the plain logit lens is still ranked 999+. A clean mid-band concept cluster. The target token is 'automne' (autumn).",
+      'arith-inner-sum': "Jacobian lens surfaces the unspoken inner sum '3' (1+2) at rank 2 by ℓ18, then the model correctly outputs 6. The logit lens shows '3' only at the final layer (rank 6). '3' is in neither the prompt nor the output.",
+      'arith-precedence': "Precedence in action: the Jacobian lens holds the unspoken product '8' (4×2) at rank 0 around ℓ20, then the model answers 11. The logit lens buries '8' at rank 7 in the last layer only.",
+      'arith-fewshot': "The unspoken inner sum '5' (2+3) sits at rank 2 across ℓ20–23 in the Jacobian lens; the logit lens shows it only at the final layer. '5' appears in neither the prompt nor the output.",
+      'grammar-error': "After the error 'childs', both lenses raise the unspoken judgment 'incorrect' to rank 1–2 from ℓ17 — genuine error detection. Honest caveat: the correction 'children' never surfaces, only the flag.",
+      'giza-continent': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Africa' (around rank 2, ℓ17–18) while the logit lens shows nothing and the model's actual greedy output is a degenerate '1'. Honest caveat: the Egypt bridge hop never appears on this 0.8B model.",
+      'int-cast-error': "Faint but real: the Jacobian lens raises a generic 'error' concept to rank 1 at ℓ18 for the invalid int('hello') cast (the logit lens shows nothing). Never 'ValueError' or 'invalid' as the paper's larger models show.",
+      'eiffel-capital': "Faint but real: the Jacobian lens surfaces the unspoken answer 'Paris' at rank 5–6 around ℓ18 while the model's real output is a degenerate '1'; the France bridge hop never appears. The logit lens shows nothing.",
+    } as Record<string, string>,
+  },
+  zh: {
+    galleryLabel: '示例 · 无需模型',
+    presetNames: {
+      'french-season': '法语·季节', 'arith-inner-sum': '内层求和',
+      'arith-precedence': '运算优先级', 'arith-fewshot': '少样本求和',
+      'grammar-error': '语法错误', 'giza-continent': '吉萨·大洲',
+      'int-cast-error': 'int() 转换错误', 'eiffel-capital': '埃菲尔·首都',
+    } as Record<string, string>,
+    galleryHooks: {
+      'french-season': "中间层 lens 先浮现 'season'，再是 'summer'，然后才是答案 'automne'。",
+      'arith-inner-sum': "未说出口的内层和 '3'（1+2）在 ℓ18 浮现，随后模型答出 6。",
+      'arith-precedence': "优先级：乘积 '8'（4×2）在中间层被暂存，之后才加上 3。",
+      'arith-fewshot': "内层和 '5'（2+3）在 ℓ20–23 的少样本类比中出现。",
+      'grammar-error': "在 'childs' 之后，判断词 'incorrect' 浮现——但正确写法从未出现。",
+      'giza-continent': "微弱：答案 'Africa' 在中间层浮现，而真实输出是退化的 '1'；埃及这一跳桥概念从未出现。",
+      'int-cast-error': "微弱：int('hello') 只浮现出泛化的 'error'——从不是 'ValueError'。",
+      'eiffel-capital': "微弱：答案 'Paris' 浮现，但法国这一跳桥概念从未出现。",
+    } as Record<string, string>,
+    bandNote: (onset: number, peak: number) =>
+      `可读性区间：中间概念大约从 ℓ${onset} 开始浮现，在 ℓ${peak} 附近达到峰值。`,
+    blurbs: {
+      'french-season': "标题示例：J-lens 在中间层浮现出抽象概念（'season' 接近 rank 1，'summer' 接近 rank 2，大约在边界 16-17），而普通的 logit lens 仍停留在 rank 999+。一个干净的中间层概念簇。目标 token 是 'automne'（autumn，秋天）。",
+      'arith-inner-sum': "J-lens 在 ℓ18 以 rank 2 浮现出未说出口的内层和 '3'（1+2），随后模型正确输出 6。logit lens 仅在最后一层（rank 6）显示 '3'。'3' 既不在 prompt 也不在输出中。",
+      'arith-precedence': "优先级实况：J-lens 在 ℓ20 附近以 rank 0 暂存乘积 '8'（4×2），随后模型答出 11。logit lens 仅在最后一层把 '8' 埋在 rank 7。",
+      'arith-fewshot': "未说出口的内层和 '5'（2+3）在 J-lens 中横跨 ℓ20–23 稳定处于 rank 2；logit lens 仅在最后一层显示。'5' 既不在 prompt 也不在输出中。",
+      'grammar-error': "在错误的 'childs' 之后，两种 lens 都从 ℓ17 起把判断词 'incorrect' 抬到 rank 1–2——真实的错误检测。诚实提醒：正确写法 'children' 从未浮现，只有错误标记。",
+      'giza-continent': "微弱但真实：J-lens 在 ℓ17–18 附近以 rank 2 浮现出未说出口的答案 'Africa'，而 logit lens 毫无显示，模型真实的贪心输出是退化的 '1'。诚实提醒：埃及这一跳桥概念在 0.8B 模型上从未出现。",
+      'int-cast-error': "微弱但真实：J-lens 在 ℓ18 为非法的 int('hello') 转换把泛化的 'error' 概念抬到 rank 1（logit lens 毫无显示）。从不是论文中大模型显示的 'ValueError' 或 'invalid'。",
+      'eiffel-capital': "微弱但真实：J-lens 在 ℓ18 附近以 rank 5–6 浮现出未说出口的答案 'Paris'，而模型真实输出是退化的 '1'；法国这一跳桥概念从未出现。logit lens 毫无显示。",
+    } as Record<string, string>,
+  },
+} as const;
+
 export default function JSpaceApp() {
   const { status: modelStatus, kickoffLoad, loadingText, loadKickoff } = useModelLoader();
   const { mlxWorkerRef, inspectorAbortRef } = useFreeChat();
@@ -98,6 +173,19 @@ export default function JSpaceApp() {
   // is set yet, so the mode toggle can't change out from under an in-flight run and a
   // second Enter/Run can't start a duplicate (F1).
   const [preparing, setPreparing] = React.useState(false);
+
+  // ---- locale (no LocaleProvider on /jspace) ------------------------------
+  // SSG first paint = EN (prerender stays deterministic); a zh visitor arriving
+  // from the /zh landing already has `mlx:preferences:locale = 'zh'` stored, so
+  // the gallery/captions flip to zh after mount. `useLocale()` would always be EN
+  // here because this standalone route has no provider — read storage in an effect.
+  const [locale, setLocale] = React.useState<Locale>('en');
+  React.useEffect(() => {
+    const s = readStoredLocale();
+    if (s) setLocale(s);
+  }, []);
+  const copy = JSPACE_COPY[locale];
+  const galleryEntry = GALLERY.find((g) => g.slug === starterSlug) ?? null;
 
   // ---- refs (async-closure-safe mirrors + one-shot guards) ----------------
   const pinsRef = React.useRef(pins);
@@ -679,6 +767,14 @@ export default function JSpaceApp() {
               }))}
             />
           </div>
+          {/* D1 — per-example blurb caption, bilingual (from JSPACE_COPY). Only
+              under the model-free starter grid; the empirical claim for the
+              selected example, kept honest (WEAK tiles say "Faint…"/"微弱…"). */}
+          {view.kind === 'starter' && galleryEntry ? (
+            <p className="max-w-[62ch] text-[12px] leading-relaxed text-[color:var(--text-dim)]">
+              {copy.blurbs[galleryEntry.slug]}
+            </p>
+          ) : null}
         </section>
       ) : null}
 
