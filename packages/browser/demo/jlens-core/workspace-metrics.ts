@@ -66,14 +66,13 @@ export function readoutEntropy(slice: LensSliceData, layerIdx: number, pos: numb
   return h;
 }
 
-/** PROXY (readout-space, top-10) — inverse participation ratio 1/Σp² over the
- *  visible probs. OVERestimates the true PR (omitted tail can only lower it). */
-export function readoutEffectiveDim(slice: LensSliceData, layerIdx: number, pos: number): number {
-  const p = slice.cellAt(layerIdx, pos).topKProbs;
-  let s = 0;
-  for (let i = 0; i < p.length; i++) s += p[i]! * p[i]!;
-  return s > 0 ? 1 / s : 0;
-}
+// NOTE: a `readoutEffectiveDim` (inverse participation ratio 1/Σp²) was
+// intentionally DROPPED. Over the visible top-10 — a NON-normalized subset of a
+// full softmax — 1/Σp² has no honest fixed upper bound (it exceeds 10 whenever
+// the surfaced mass is small), so it cannot be plotted on a fixed honest axis
+// without clamping (a distortion). It is also redundant with `readoutEntropy`
+// (both summarize top-10 concentration) and reads as the paper's activation
+// participation-ratio, which the honesty note OMITS as impossible in-browser.
 
 /** PROXY (readout-space) — adjacent-layer top-K set stability at `pos`: Jaccard
  *  SIMILARITY of topKIds between ℓ and ℓ+1. Stand-in for autocorrelation, NOT the

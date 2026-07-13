@@ -35,7 +35,8 @@ Plus up to `LENS_MAX_PINNED = 8` pinned tokens, each with an **exact 1-based ful
 
 **Honesty invariants (binding on all UI copy):**
 - The final **output token is never pinned** on a baked tile — the unspoken-word gate guarantees no pin equals the ℓ24 argmax. So exact full-vocab rank is available for **concepts**, not for the gold output token. The strip ships the **concept** rank trajectory, labeled as such — never "gold-token accuracy."
-- Readout entropy / effective-dim / set-stability are computed over the visible top-10 and **MUST be labeled "readout-space proxy (top-10)"**, never presented as the paper's activation/residual quantity. `topKProbs` are true full-vocab probabilities, so entropy-over-visible is an honest *lower bound* (tail mass only sharpens it); `1/Σp²` over the visible set *overestimates* participation ratio — label as proxy, do not assert exactness.
+- Readout entropy / set-stability are computed over the visible top-10 and **MUST be labeled "readout-space proxy (top-10)"**, never presented as the paper's activation/residual quantity. `topKProbs` are true full-vocab probabilities, so entropy-over-visible is an honest *lower bound* (tail mass only sharpens it). Proxy charts plot on a **fixed honest axis** (entropy `[0, ln 10]` nats; stability `[0, 1]` Jaccard) with the domain shown — never per-series auto-scale, which would make a flat `[0,0]` and a flat `[1,1]` render identically and destroy cross-run magnitude (codex final).
+- **`readoutEffectiveDim` (`1/Σp²`) was DROPPED (codex final):** over the visible top-10 — a *non-normalized* subset — it has no honest fixed upper bound (it exceeds 10 whenever the surfaced mass is small), so it cannot be plotted on a fixed axis without clamping (a distortion); it is redundant with entropy and reads as the OMITTED activation participation-ratio. Entropy is the retained top-10-concentration proxy.
 - Excess kurtosis, residual autocorrelation, and activation participation-ratio are **OMITTED** with a one-line "needs full logits/residuals (not shipped in-browser)" note. Do **not** ship an approximate KL/JS full-distribution distance (only 10 probs/cell ship).
 
 ## What each feature computes
@@ -49,8 +50,9 @@ Plus up to `LENS_MAX_PINNED = 8` pinned tokens, each with an **exact 1-based ful
 ### 2. Workspace-metrics strip (across layers, one slice)
 - **(A) Concept rank trajectory** — `slice.rankAt(pinIdx, ℓ, lastPos)` across displayed layers. **FAITHFUL** full-vocab, exact **below** the cap; a value of `RANK_CAP` (999) is a censored off-scale floor ("at/beyond cap → not surfaced"), NOT an exact rank — the UI renders it off-scale (via `isCensoredRank`) and never labels it exact (codex T3). The real deliverable; directly carries the unspoken-word thesis (watch the concept dive from off-scale to ~1).
 - **(B) Concept top-k accuracy** — `1[rank_concept ≤ k]` from the same exact track. **FAITHFUL**, labeled "concept in top-k" (not gold-token).
-- **(C) Readout entropy / effective-dim** — `H = −Σ topKProbs·log topKProbs`, or `1/Σ topKProbs²`, over the visible 10. **Labeled "readout-space proxy (top-10)."**
-- **(D) Top-K set stability** — adjacent-layer `Jaccard(topKIds_ℓ, topKIds_{ℓ+1})` at the last position. **Labeled "readout-space proxy"** (stand-in for autocorrelation, not the residual metric).
+- **(C) Readout entropy** — `H = −Σ topKProbs·log topKProbs` over the visible 10, on a fixed `[0, ln 10]` nats axis. **Labeled "readout-space proxy (top-10)."** (`effective-dim` dropped — see the honesty invariant above.)
+- **(D) Top-K set stability** — adjacent-layer `Jaccard(topKIds_ℓ, topKIds_{ℓ+1})` at the last position, on a fixed `[0, 1]` axis. **Labeled "readout-space proxy"** (stand-in for autocorrelation, not the residual metric).
+- **All four series are read at the FINAL prompt position** (the answer position), fixed — NOT the selected grid cell. The strip discloses this explicitly (`atPosition(#promptLen)`) in a visible sub-caption and each chart's accessible name, so final-position readings are never mistaken for selected-position or prompt-wide ones (codex final).
 - Explicit one-line omit note for kurtosis / residual-autocorr / activation-PR.
 
 ### 3. Motor-flip crossover (per position)

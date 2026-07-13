@@ -92,10 +92,6 @@ describe('workspace metrics', () => {
     expect(flat).toBeGreaterThan(peaked);
     expect(peaked).toBeGreaterThan(0);
   });
-  it('readoutEffectiveDim: ~1 for a delta, near topK for uniform', () => {
-    expect(metrics.readoutEffectiveDim(slice, 0, 0)).toBeGreaterThan(1);
-    expect(metrics.readoutEffectiveDim(slice, 1, 0)).toBeGreaterThan(2.9); // ~3
-  });
   it('topKSetStability: adjacent-layer Jaccard similarity, length layers−1', () => {
     // L0 ids {5,9,1} vs L1 {9,5,2}: inter {5,9}=2 union 4 → .5 ; L1 vs L2 identical → 1
     expect(metrics.topKSetStability(slice, 0)).toEqual([0.5, 1]);
@@ -148,5 +144,10 @@ describe('workspace metrics', () => {
     expect((metrics as Record<string, unknown>).excessKurtosis).toBeUndefined();
     expect((metrics as Record<string, unknown>).residualAutocorrelation).toBeUndefined();
     expect((metrics as Record<string, unknown>).participationRatio).toBeUndefined();
+  });
+  it('does NOT export readoutEffectiveDim (dropped: unbounded over a non-normalized top-10, codex final)', () => {
+    // 1/Σp² over the visible top-10 has no honest fixed axis (exceeds 10 when the
+    // surfaced mass is small) and reads as the OMITTED participation-ratio; removed.
+    expect((metrics as Record<string, unknown>).readoutEffectiveDim).toBeUndefined();
   });
 });

@@ -36,10 +36,18 @@ export type WorkspaceMetricsCopy = {
   title: string;
   faithfulTag: string;
   proxyTag: string;
+  /** Sub-caption: every series is read at the FINAL prompt position (1-based #n). */
+  atPosition: (position: number) => string;
+  /** Short per-chart suffix naming the same fixed position (for accessible names). */
+  atPositionShort: (position: number) => string;
   rankTrajectory: string;
   topkAcc: string;
   entropy: string;
+  /** Fixed-domain scale hint for the entropy chart, e.g. "0–ln 10 nats". */
+  entropyScale: string;
   stability: string;
+  /** Fixed-domain scale hint for the stability chart, e.g. "0–1 Jaccard". */
+  stabilityScale: string;
   omitNote: string;
 };
 
@@ -48,6 +56,16 @@ const MINI_H = 48;
 const PAD = { t: 5, b: 7, l: 5, r: 5 };
 const INNER_W = MINI_W - PAD.l - PAD.r;
 const INNER_H = MINI_H - PAD.t - PAD.b;
+
+// FIXED honest domains for the PROXY charts (codex final): auto-scaling each
+// series to its own min→max destroyed magnitude — a flat [0,0] and a flat [1,1]
+// rendered identically, and [0.49,0.51] filled the same height as [0,1]. Plot on
+// a constant axis so heights are comparable across lenses and runs.
+//  - entropy over the visible top-10 is bounded by ln(SURFACE_RANK) (equal shares
+//    of a mass ≤ 1 maximize it exactly at ln K); floor 0.
+//  - top-10 set Jaccard stability is a similarity in [0, 1] by construction.
+const ENTROPY_DOMAIN: readonly [number, number] = [0, Math.log(SURFACE_RANK)];
+const STABILITY_DOMAIN: readonly [number, number] = [0, 1];
 
 /** faithful/exact = primary-tinted chip; proxy = de-emphasised neutral chip so it
  *  reads as "an approximation, not the real quantity" at a glance. */
@@ -165,33 +183,39 @@ function RankTrajectoryMini({
   );
 }
 
-/** Generic auto-scaled mini line for the PROXY series (entropy / stability). */
-function LineMini({ values, ariaLabel }: { values: number[]; ariaLabel: string }) {
+/** FIXED-domain mini line for the PROXY series (entropy / stability). Plots on a
+ *  constant [lo, hi] axis (NOT per-series auto-scale) so heights are comparable
+ *  across lenses and runs; a flat series sits at its true level, not the middle.
+ *  The `scaleHint` is drawn (faintly) and folded into the accessible name so the
+ *  axis is never a hidden normalization. */
+function LineMini({
+  values,
+  ariaLabel,
+  domain,
+  scaleHint,
+}: {
+  values: number[];
+  ariaLabel: string;
+  domain: readonly [number, number];
+  scaleHint: string;
+}) {
   const n = values.length;
-  let min = Infinity;
-  let max = -Infinity;
-  for (const v of values) {
-    if (Number.isFinite(v)) {
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
-  }
-  if (!Number.isFinite(min) || !Number.isFinite(max)) {
-    min = 0;
-    max = 1;
-  }
-  const span = max - min;
-  const yFor = (v: number) => (span > 0 ? PAD.t + (1 - (v - min) / span) * INNER_H : PAD.t + INNER_H / 2);
-  const pts = values.map((v, i) => ({ x: xAcross(i, n), y: yFor(v) }));
+  const [lo, hi] = domain;
+  const span = hi - lo || 1;
+  const clamp01 = (t: number) => (t < 0 ? 0 : t > 1 ? 1 : t);
+  const yFor = (v: number) => PAD.t + (1 - clamp01((v - lo) / span)) * INNER_H;
+  const pts = values.map((v, i) => ({ x: xAcross(i, n), y: yFor(Number.isFinite(v) ? v : lo) }));
 
   return (
     <svg
       viewBox={`0 0 ${MINI_W} ${MINI_H}`}
       role="img"
-      aria-label={ariaLabel}
+      aria-label={`${ariaLabel} · ${scaleHint}`}
       className="block h-auto w-full text-foreground/45"
       style={{ maxWidth: '100%' }}
     >
+      {/* Fixed-domain guides: floor (lo) and ceiling (hi), so magnitude is legible. */}
+      <line x1={PAD.l} x2={MINI_W - PAD.r} y1={PAD.t} y2={PAD.t} stroke="currentColor" strokeOpacity={0.08} />
       <line
         x1={PAD.l}
         x2={MINI_W - PAD.r}
@@ -210,6 +234,9 @@ function LineMini({ values, ariaLabel }: { values: number[]; ariaLabel: string }
           strokeWidth={1.4}
         />
       )}
+      <text x={MINI_W - PAD.r} y={MINI_H - 1.5} textAnchor="end" fontSize={5.5} fill="currentColor" opacity={0.55}>
+        {scaleHint}
+      </text>
     </svg>
   );
 }
@@ -262,29 +289,50 @@ export function WorkspaceMetricsStrip({
   );
   const stability = React.useMemo(() => topKSetStability(slice, pos), [slice, pos]);
 
+  // Every series is read at the FINAL prompt position (1-based #promptLen). It is
+  // fixed, NOT the currently-selected grid cell, so disclose it (codex final) —
+  // both as a visible sub-caption and inside each chart's accessible name.
+  const posN = slice.promptLen;
+  const posSuffix = copy.atPositionShort(posN);
+
   return (
     <section aria-label={copy.title} className="jspace-panel space-y-3 p-4">
       <h3 className="jspace-eyebrow">{copy.title}</h3>
+      <p className="text-[11px] leading-snug text-[color:var(--text-dim)]">{copy.atPosition(posN)}</p>
       <div className="grid gap-3 sm:grid-cols-2">
         {hasPins ? (
           <>
             {/* (A) FAITHFUL-with-cap — no "exact" tag; caption states ≥999 off-scale. */}
             <MiniPanel label={copy.rankTrajectory}>
-              <RankTrajectoryMini trajectory={trajectory} color={accent} ariaLabel={copy.rankTrajectory} />
+              <RankTrajectoryMini
+                trajectory={trajectory}
+                color={accent}
+                ariaLabel={`${copy.rankTrajectory} · ${posSuffix}`}
+              />
             </MiniPanel>
             {/* (B) FAITHFUL, exact — k=10 sits far below the 999 cap. */}
             <MiniPanel label={copy.topkAcc} tag={<Tag label={copy.faithfulTag} kind="faithful" />}>
-              <PipRow bits={topkAcc} color={accent} ariaLabel={copy.topkAcc} />
+              <PipRow bits={topkAcc} color={accent} ariaLabel={`${copy.topkAcc} · ${posSuffix}`} />
             </MiniPanel>
           </>
         ) : null}
-        {/* (C) PROXY — readout-space top-10 entropy. */}
+        {/* (C) PROXY — readout-space top-10 entropy, fixed [0, ln 10] axis. */}
         <MiniPanel label={copy.entropy} tag={<Tag label={copy.proxyTag} kind="proxy" />}>
-          <LineMini values={entropy} ariaLabel={copy.entropy} />
+          <LineMini
+            values={entropy}
+            ariaLabel={`${copy.entropy} · ${posSuffix}`}
+            domain={ENTROPY_DOMAIN}
+            scaleHint={copy.entropyScale}
+          />
         </MiniPanel>
-        {/* (D) PROXY — readout-space adjacent-layer top-10 set stability. */}
+        {/* (D) PROXY — readout-space adjacent-layer top-10 set stability, fixed [0,1]. */}
         <MiniPanel label={copy.stability} tag={<Tag label={copy.proxyTag} kind="proxy" />}>
-          <LineMini values={stability} ariaLabel={copy.stability} />
+          <LineMini
+            values={stability}
+            ariaLabel={`${copy.stability} · ${posSuffix}`}
+            domain={STABILITY_DOMAIN}
+            scaleHint={copy.stabilityScale}
+          />
         </MiniPanel>
       </div>
       {/* Honesty footer (mandatory): the impossible full-distribution metrics. */}

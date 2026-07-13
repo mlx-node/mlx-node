@@ -80,7 +80,7 @@ type JacState =
 // `galleryLabel`, `presetNames`, `galleryHooks`, `bandNote` are declared now but
 // consumed by the Task-6 gallery launcher; `blurbs` powers the D1 caption today.
 // ---------------------------------------------------------------------------
-const JSPACE_COPY = {
+export const JSPACE_COPY = {
   en: {
     galleryLabel: 'Examples · no model needed',
     presetNames: {
@@ -123,10 +123,15 @@ const JSPACE_COPY = {
       title: 'Where the readout commits',
       faithfulTag: 'exact',
       proxyTag: 'readout-space proxy',
+      atPosition: (position: number) =>
+        `All series are read at the final prompt position (#${position}) — fixed to the answer position, not the selected grid cell.`,
+      atPositionShort: (position: number) => `final position #${position}`,
       rankTrajectory: 'Concept rank across layers (full-vocab; ≥999 = off-scale, not surfaced)',
       topkAcc: 'Concept in top-10 by layer',
       entropy: 'Readout entropy (top-10)',
+      entropyScale: '0–ln 10 nats',
       stability: 'Top-10 set stability (top-10)',
+      stabilityScale: '0–1 Jaccard',
       omitNote:
         'Excess kurtosis, residual autocorrelation, and activation participation-ratio need the full logit/residual vectors, which are not shipped in-browser — omitted here.',
     },
@@ -180,10 +185,15 @@ const JSPACE_COPY = {
       title: '读出在哪一层定型',
       faithfulTag: '精确',
       proxyTag: 'readout 空间近似',
+      atPosition: (position: number) =>
+        `所有曲线都读取自最后一个 prompt 位置（#${position}）——固定在答案位置，而非当前选中的格子。`,
+      atPositionShort: (position: number) => `最后位置 #${position}`,
       rankTrajectory: '概念的逐层 rank（全词表；≥999 = 超出量程、未浮现）',
       topkAcc: '概念是否进入逐层 top-10',
       entropy: '读出熵（top-10）',
+      entropyScale: '0–ln 10 nats',
       stability: 'top-10 集合稳定度（top-10）',
+      stabilityScale: '0–1 Jaccard',
       omitNote: '超额峰度、残差自相关、激活参与比需要完整的 logit / 残差向量，浏览器内并未传输，这里省略。',
     },
     motorFlip: {
