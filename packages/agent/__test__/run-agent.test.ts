@@ -11,7 +11,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { runAgent, type RunAgentMain } from '../src/run-agent.js';
 
-const ENV_KEYS = ['PI_CODING_AGENT_DIR', 'PI_SKIP_VERSION_CHECK', 'MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
+const FAKE_MODEL = {
+  discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' },
+  piModel: {},
+} as never;
+
+const ENV_KEYS = [
+  'PI_CODING_AGENT_DIR',
+  'PI_SKIP_VERSION_CHECK',
+  'MLX_PAGED_PREFILL_CHUNK_SIZE',
+  'MLX_AGENT_SUBAGENT_CHILD',
+] as const;
 
 type EnvKey = (typeof ENV_KEYS)[number];
 
@@ -91,6 +101,35 @@ describe('runAgent', () => {
       return named.name;
     });
     expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-terminal-title']);
+  });
+
+  it('adds subagents only for a real parent model session', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], mainImpl: main });
+
+    const names = calls[0]!.extensionFactories.map((entry) =>
+      typeof entry === 'function' ? '<anonymous>' : entry.name,
+    );
+    expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-subagent', 'mlx-terminal-title']);
+  });
+
+  it.each([['--no-extensions'], ['-ne']])('respects the extension opt-out %s', async (...argv) => {
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, mainImpl: main });
+    const names = calls[0]!.extensionFactories.map((entry) =>
+      typeof entry === 'function' ? '<anonymous>' : entry.name,
+    );
+    expect(names).not.toContain('mlx-subagent');
+  });
+
+  it('does not expose recursive subagents in a marked child', async () => {
+    process.env.MLX_AGENT_SUBAGENT_CHILD = '1';
+    const { main, calls } = makeSeam();
+    await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv: [], mainImpl: main });
+    const names = calls[0]!.extensionFactories.map((entry) =>
+      typeof entry === 'function' ? '<anonymous>' : entry.name,
+    );
+    expect(names).not.toContain('mlx-subagent');
   });
 
   it('forwards argv verbatim', async () => {

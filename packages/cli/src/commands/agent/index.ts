@@ -457,11 +457,15 @@ First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
 
 Environment:
-  MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit tool calls in headless
+  MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit/subagent tool calls in headless
                             print/json runs — without an attached UI the
                             permission gate blocks them otherwise.
 
 Notes:
+  The built-in subagent tool provides scout/planner/reviewer/worker. Each child
+  is an isolated mlx agent process; tasks-array work is queued one at a time to
+  avoid loading several model + KV allocations concurrently. --no-extensions
+  (or -ne) disables subagents as well as discovered extensions.
   'mlx agent update' is disabled — update @mlx-node/cli via your package
   manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
   skills under the agent config home; 'config' edits which are enabled.

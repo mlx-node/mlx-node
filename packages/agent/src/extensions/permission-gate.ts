@@ -1,12 +1,12 @@
 /**
  * `createPermissionGateExtension` — pi has no permission system of its
  * own, so this inline extension is the product's v1 safety layer: every
- * `bash` / `write` / `edit` tool call must be approved before pi
+ * `bash` / `write` / `edit` / delegated `subagent` tool call must be approved before pi
  * executes it.
  *
  * Behavior (settled design):
  * - Interactive (`ctx.hasUI`): prompt via `ctx.ui.select` with the
- *   command (bash) or file path (write/edit) as the detail line, passed
+ *   command (bash), file path (write/edit), or delegated task (subagent) as the detail line, passed
  *   through `sanitizeDetail` (control-byte encoding + length cap).
  *   "Always (this session)" allow-lists the tool name in memory for the
  *   lifetime of this extension instance.
@@ -25,7 +25,7 @@ import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
-const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit']);
+const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit', 'subagent']);
 
 const AUTO_APPROVE_ENV = 'MLX_AGENT_AUTO_APPROVE';
 
@@ -263,6 +263,33 @@ function describeToolCall(toolName: string, event: ToolCallEvent): string {
     const command = input['command'];
     return typeof command === 'string' && command.length > 0 ? command : '(unknown command)';
   }
+  if (toolName === 'subagent') {
+    const agent = typeof input['agent'] === 'string' ? input['agent'] : undefined;
+    const task = typeof input['task'] === 'string' ? input['task'] : undefined;
+    const scope = typeof input['agentScope'] === 'string' ? input['agentScope'] : 'user';
+    const describeItems = (value: unknown): string[] =>
+      Array.isArray(value)
+        ? value.map((raw, index) => {
+            const item = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+            const itemAgent = typeof item['agent'] === 'string' ? item['agent'] : '(unknown agent)';
+            const itemTask = typeof item['task'] === 'string' ? item['task'] : '(unknown task)';
+            const cwd = typeof item['cwd'] === 'string' ? ` [cwd: ${item['cwd']}]` : '';
+            return `${index + 1}. ${itemAgent}: ${itemTask}${cwd}`;
+          })
+        : [];
+    const items = describeItems(input['tasks']);
+    const chain = describeItems(input['chain']);
+    const summary = agent
+      ? `${agent}: ${task ?? '(unknown task)'}`
+      : items.length
+        ? `Queued tasks: ${items.join(' | ')}`
+        : `Chain: ${chain.join(' | ')}`;
+    return [
+      'Delegated child agents may use bash/write/edit without further prompts.',
+      `Agent scope: ${scope}`,
+      summary,
+    ].join('\n');
+  }
   // write/edit: pi's canonical field is `path`; `file_path` is the
   // compat alias pi's own renderers also accept.
   const path = typeof input['path'] === 'string' ? input['path'] : input['file_path'];
@@ -364,7 +391,8 @@ export function createPermissionGateExtension(): InlineExtension {
           detailSource = raw ? `${String(raw)}\n${command}` : command;
         }
         const detail = sanitizeDetail(detailSource);
-        const choice = await ctx.ui.select(`Allow ${toolName}?\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No']);
+        const title = toolName === 'subagent' ? 'Allow delegated subagent tool access?' : `Allow ${toolName}?`;
+        const choice = await ctx.ui.select(`${title}\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No']);
 
         if (choice === 'Yes') {
           return undefined;

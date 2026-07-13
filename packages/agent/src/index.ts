@@ -2,6 +2,13 @@ export type { DiscoveredModelLike } from './types.js';
 
 export { type CatalogEntry, MODEL_CATALOG, visibleCatalog } from './catalog.js';
 export { createPermissionGateExtension } from './extensions/permission-gate.js';
+export {
+  createSubagentExtension,
+  discoverSubagents,
+  isSubagentChild,
+  type SubagentConfig,
+  type SubagentExtensionOptions,
+} from './extensions/subagent.js';
 export { createTerminalTitleExtension } from './extensions/terminal-title.js';
 export { buildChatConfig } from './provider/chat-config.js';
 export { contextToChatMessages, toolsToDefinitions } from './provider/convert-messages.js';

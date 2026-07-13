@@ -1,6 +1,6 @@
 /**
  * `runAgent` — the boot shell that hands control to pi's `main()` with
- * the mlx provider and permission gate installed.
+ * the mlx provider, permission gate, local subagents, and terminal branding installed.
  *
  * Spike-proven boot contract:
  * - The env vars below must be set BEFORE any runtime import of
@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
+import { createSubagentExtension, isSubagentChild } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import type { MlxModelInfo } from './provider/models.js';
@@ -41,7 +42,7 @@ export interface RunAgentOptions {
 
 /**
  * Seed the pi/mlx environment (never clobbering user-set values) and run
- * pi's `main()` with the two mlx inline extensions. May not return: pi
+ * pi's `main()` with the mlx inline extensions. May not return: pi
  * `process.exit()`s on help/error paths.
  */
 export async function runAgent(opts: RunAgentOptions): Promise<void> {
@@ -54,10 +55,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
   // The `??` short-circuit keeps the pi import strictly behind the seam:
   // with `mainImpl` injected, pi is never imported at all.
   const main: RunAgentMain = opts.mainImpl ?? (await import('@earendil-works/pi-coding-agent')).main;
+  const subagentsEnabled =
+    opts.models.length > 0 &&
+    !isSubagentChild() &&
+    !opts.argv.includes('--no-extensions') &&
+    !opts.argv.includes('-ne');
   await main(opts.argv, {
     extensionFactories: [
       createMlxProviderExtension(opts.models),
       createPermissionGateExtension(),
+      ...(subagentsEnabled ? [createSubagentExtension({ modelsDir: opts.modelsDir })] : []),
       createTerminalTitleExtension(),
     ],
   });

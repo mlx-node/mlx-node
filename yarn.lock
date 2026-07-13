@@ -1090,6 +1090,7 @@ __metadata:
     "@mlx-node/lm": "workspace:*"
     "@mlx-node/server": "workspace:*"
     "@types/node": "npm:^26.0.0"
+    typebox: "npm:1.3.6"
   languageName: unknown
   linkType: soft
 
@@ -5987,6 +5988,13 @@ __metadata:
   version: 1.1.38
   resolution: "typebox@npm:1.1.38"
   checksum: 10c0/b4a5996a25b9265e88335a75697630be82822fae5e7b1993d5eb52ac6b71e80fec924ffa1976269a05524a0954b3f9e6e52f380348ea6836f76920e556fa3ca1
+  languageName: node
+  linkType: hard
+
+"typebox@npm:1.3.6":
+  version: 1.3.6
+  resolution: "typebox@npm:1.3.6"
+  checksum: 10c0/1546a5a407f7ef1ff313eaac173fa18cc3f8acc38a6ee23738c8eb8de28f8a0d89669b0d561815c49c181418da12b9cdff4ae731c379b2e31551f56dc83d38f7
   languageName: node
   linkType: hard
 

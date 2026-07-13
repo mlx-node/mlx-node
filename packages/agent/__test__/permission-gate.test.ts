@@ -187,6 +187,36 @@ describe('createPermissionGateExtension', () => {
     expect(selectCalls[0]!.options).toEqual(['Yes', 'Always (this session)', 'No']);
   });
 
+  it('gates subagent delegation and discloses child tool access', async () => {
+    const handler = loadGateHandler();
+    const { ctx, selectCalls } = makeCtx(true, 'Yes');
+    const result = await handler(toolCallEvent('subagent', { agent: 'worker', task: 'fix the bug' }), ctx);
+    expect(result).toBeUndefined();
+    expect(selectCalls).toHaveLength(1);
+    expect(selectCalls[0]!.title).toContain('Allow delegated subagent tool access?');
+    expect(selectCalls[0]!.title).toContain('may use bash/write/edit without further prompts');
+    expect(selectCalls[0]!.title).toContain('worker: fix the bug');
+  });
+
+  it('discloses queued subagent names, tasks, cwd, and project scope', async () => {
+    const handler = loadGateHandler();
+    const { ctx, selectCalls } = makeCtx(true, 'Yes');
+    await handler(
+      toolCallEvent('subagent', {
+        agentScope: 'both',
+        tasks: [
+          { agent: 'scout', task: 'trace auth', cwd: '/repo/a' },
+          { agent: 'reviewer', task: 'review the diff' },
+        ],
+      }),
+      ctx,
+    );
+    const title = selectCalls[0]!.title;
+    expect(title).toContain('Agent scope: both');
+    expect(title).toContain('scout: trace auth [cwd: /repo/a]');
+    expect(title).toContain('reviewer: review the diff');
+  });
+
   it('blocks a gated tool when the user answers No', async () => {
     const handler = loadGateHandler();
     const { ctx } = makeCtx(true, 'No');
