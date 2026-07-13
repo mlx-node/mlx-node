@@ -3,7 +3,6 @@ use std::time::Instant;
 
 use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
-use crate::array::mask::create_causal_mask;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -66,22 +65,229 @@ pub struct Qwen3_5Attention {
     q_gate_block_bias: Option<MxArray>,
 }
 
-fn paged_prefill_paged_attention_enabled() -> bool {
-    // Without a Metal backend (CUDA/Linux build) the C++ paged-attention
-    // kernel throws, so a flat-path cache-hit prefill must NOT dispatch it.
-    // Hard-close the path here so reuse-turn prefills stay on the
-    // device-agnostic SDPA fallback. (Single-turn fresh prompts never reach
-    // this branch anyway, but this closes the multi-turn case too.)
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheHitPrefillMode {
+    /// Keep the paged pool authoritative and select the compute kernel from
+    /// live memory headroom.
+    Auto,
+    /// Force compact varlen PagedAttention for cache-hit prefill.
+    ForcePaged,
+    /// Force graph-native pool gather + MLX causal SDPA.
+    ForceSdpa,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheHitPrefillPath {
+    PagedVarlen,
+    PagedPoolSdpa,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheHitPrefillPlan {
+    path: CacheHitPrefillPath,
+    estimated_sdpa_bytes: u64,
+    estimated_varlen_bytes: u64,
+    live_headroom_bytes: Option<u64>,
+}
+
+const FAST_SDPA_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
+const FAST_SDPA_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn parse_cache_hit_prefill_mode(value: Option<&str>) -> CacheHitPrefillMode {
+    match value.map(str::trim) {
+        Some(value) if crate::inference_trace::env_flag_value_enabled(value) => {
+            CacheHitPrefillMode::ForcePaged
+        }
+        Some(_) => CacheHitPrefillMode::ForceSdpa,
+        None => CacheHitPrefillMode::Auto,
     }
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default(
-            "MLX_PAGED_PREFILL_PAGED_ATTENTION",
-            true,
+}
+
+fn cache_hit_prefill_mode() -> CacheHitPrefillMode {
+    static MODE: OnceLock<CacheHitPrefillMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        parse_cache_hit_prefill_mode(
+            std::env::var("MLX_PAGED_PREFILL_PAGED_ATTENTION")
+                .ok()
+                .as_deref(),
         )
     })
+}
+
+fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: bool) -> bool {
+    !sdpa_constructed && mode != CacheHitPrefillMode::ForceSdpa
+}
+
+fn mlx_sdpa_uses_fused_kernel(
+    query_tokens: u64,
+    num_query_heads: u64,
+    num_kv_heads: u64,
+    head_dim: u64,
+) -> bool {
+    if num_kv_heads == 0 || num_query_heads % num_kv_heads != 0 {
+        return false;
+    }
+    if query_tokens <= 8 {
+        let supported = matches!(head_dim, 64 | 96 | 128 | 256);
+        return supported && query_tokens.saturating_mul(num_query_heads / num_kv_heads) <= 32;
+    }
+    matches!(head_dim, 64 | 80 | 128)
+}
+
+/// Conservative peak for gathering one paged layer into contiguous K/V and
+/// running MLX causal SDPA. The gather can transiently hold both the selected
+/// block tensors and their unpacked contiguous copies, hence four K/V-sized
+/// tensors. When MLX cannot use its fused kernel (notably Qwen3.6-27B's
+/// head_dim=256 multi-token prefill), include the materialized score matrix
+/// and fp32 output using the same shape gate as MLX's Metal dispatcher.
+fn estimate_paged_pool_sdpa_bytes(
+    query_tokens: u64,
+    total_context: u64,
+    num_query_heads: u64,
+    num_kv_heads: u64,
+    head_dim: u64,
+    dtype_bytes: u64,
+) -> u64 {
+    let one_kv = total_context
+        .saturating_mul(num_kv_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(dtype_bytes);
+    let one_query = query_tokens
+        .saturating_mul(num_query_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(dtype_bytes);
+    let gathered = one_kv
+        .saturating_mul(4)
+        .saturating_add(one_query.saturating_mul(2))
+        .saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
+    if mlx_sdpa_uses_fused_kernel(query_tokens, num_query_heads, num_kv_heads, head_dim) {
+        return gathered;
+    }
+    let scores = num_query_heads
+        .saturating_mul(query_tokens)
+        .saturating_mul(total_context)
+        .saturating_mul(dtype_bytes);
+    let fp32_output = num_query_heads
+        .saturating_mul(query_tokens)
+        .saturating_mul(head_dim)
+        .saturating_mul(4);
+    gathered.saturating_add(scores).saturating_add(fp32_output)
+}
+
+/// Peak auxiliary storage used by the varlen paged kernel. Above one 512-token
+/// partition, V2 keeps per-query/head/partition softmax state and a partial
+/// head-sized output. For long multi-token chunks this can be larger than the
+/// contiguous K/V needed by fused SDPA. For unfused head_dim=256 SDPA it is
+/// still the O(L) safety path when the faster score-matrix route will not fit.
+fn estimate_varlen_paged_attention_bytes(
+    query_tokens: u64,
+    total_context: u64,
+    num_query_heads: u64,
+    head_dim: u64,
+    dtype_bytes: u64,
+) -> u64 {
+    let output = query_tokens
+        .saturating_mul(num_query_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(dtype_bytes);
+    if total_context <= 512 {
+        return output.saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
+    }
+    let partitions = total_context.div_ceil(512);
+    let rows = query_tokens
+        .saturating_mul(num_query_heads)
+        .saturating_mul(partitions);
+    let softmax_state = rows.saturating_mul(2).saturating_mul(4);
+    let partial_output = rows.saturating_mul(head_dim).saturating_mul(dtype_bytes);
+    output
+        .saturating_add(softmax_state)
+        .saturating_add(partial_output)
+        .saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES)
+}
+
+fn select_cache_hit_prefill_plan(
+    mode: CacheHitPrefillMode,
+    query_tokens: u64,
+    estimated_sdpa_bytes: u64,
+    estimated_varlen_bytes: u64,
+    live_headroom_bytes: Option<u64>,
+) -> CacheHitPrefillPlan {
+    let path = match mode {
+        CacheHitPrefillMode::ForcePaged => CacheHitPrefillPath::PagedVarlen,
+        CacheHitPrefillMode::ForceSdpa => CacheHitPrefillPath::PagedPoolSdpa,
+        CacheHitPrefillMode::Auto => match live_headroom_bytes {
+            Some(headroom) => {
+                // Keep a fixed process reserve plus a 10% cushion for the
+                // model's MLP/quantized-matmul transients. Multi-token stock
+                // SDPA is the fast path (including M5's NAX matmul fallback
+                // for head_dim=256) whenever its full transient fits. If that
+                // misses the budget, prefer compact varlen paging when it fits;
+                // if neither fits, choose the smaller estimated transient.
+                let budget = headroom
+                    .saturating_sub(FAST_SDPA_HEADROOM_RESERVE_BYTES)
+                    .saturating_mul(9)
+                    / 10;
+                if query_tokens <= 8 {
+                    CacheHitPrefillPath::PagedVarlen
+                } else if estimated_sdpa_bytes <= budget {
+                    CacheHitPrefillPath::PagedPoolSdpa
+                } else if estimated_varlen_bytes <= budget
+                    || estimated_varlen_bytes <= estimated_sdpa_bytes
+                {
+                    CacheHitPrefillPath::PagedVarlen
+                } else {
+                    CacheHitPrefillPath::PagedPoolSdpa
+                }
+            }
+            None => {
+                if query_tokens > 8 && estimated_sdpa_bytes < estimated_varlen_bytes {
+                    CacheHitPrefillPath::PagedPoolSdpa
+                } else {
+                    CacheHitPrefillPath::PagedVarlen
+                }
+            }
+        },
+    };
+    CacheHitPrefillPlan {
+        path,
+        estimated_sdpa_bytes,
+        estimated_varlen_bytes,
+        live_headroom_bytes,
+    }
+}
+
+/// Return the tightest live allocation allowance reported by macOS/MLX.
+/// `os_proc_available_memory` accounts for the externally allocated Metal
+/// paged pool; MLX's allocator limit additionally accounts for active/cached
+/// graph allocations. If probes are unavailable, the router uses the smaller
+/// of the two conservative transient estimates.
+fn live_prefill_headroom_bytes() -> Option<u64> {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return None;
+    }
+
+    let mut process_available = 0u64;
+    let process_ok = unsafe {
+        mlx_sys::mlx_process_available_memory(&mut process_available) == 0 && process_available > 0
+    };
+    if !process_ok {
+        return None;
+    }
+
+    let mut headroom = process_available;
+    let mut active = 0u64;
+    let mut cached = 0u64;
+    let mut limit = 0u64;
+    let allocator_ok = unsafe {
+        mlx_sys::mlx_get_active_memory(&mut active) == 0
+            && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
+            && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
+            && limit > 0
+    };
+    if allocator_ok {
+        headroom = headroom.min(limit.saturating_sub(active.saturating_add(cached)));
+    }
+    Some(headroom)
 }
 
 fn native_kv_write_enabled() -> bool {
@@ -566,17 +772,114 @@ impl Qwen3_5Attention {
                     )?
                 }
             } else {
-                // Cache-hit prefill: read full [0, total_ctx) K/V back
-                // from the pool. The suffix was just written above. When
-                // explicitly enabled, try the MLX paged-attention bridge first
-                // so the suffix attends directly against the pool without
-                // host-side K/V materialization.
+                // Cache-hit prefill keeps the paged pool authoritative. With
+                // sufficient live headroom, gather this layer's blocks inside
+                // the MLX graph and use MLX causal SDPA. Under
+                // pressure, use compact varlen PagedAttention directly over
+                // the pool. Decode remains paged regardless of this choice.
                 let total_ctx = cached_prefix_len + (seq_len as u32);
-                let maybe_paged_attn = if batch == 1 && paged_prefill_paged_attention_enabled() {
+                let graph_backend_available =
+                    crate::engine::persistence::compiled_forward_backend_available();
+                let dtype_bytes = match queries.dtype()? {
+                    crate::array::DType::Float16 | crate::array::DType::BFloat16 => 2,
+                    crate::array::DType::Float32 => 4,
+                    _ => 2,
+                };
+                let estimated_sdpa_bytes = estimate_paged_pool_sdpa_bytes(
+                    seq_len as u64,
+                    total_ctx as u64,
+                    self.num_heads as u64,
+                    self.num_kv_heads as u64,
+                    self.head_dim as u64,
+                    dtype_bytes,
+                );
+                let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
+                    seq_len as u64,
+                    total_ctx as u64,
+                    self.num_heads as u64,
+                    self.head_dim as u64,
+                    dtype_bytes,
+                );
+                let prefill_mode = cache_hit_prefill_mode();
+                let plan = select_cache_hit_prefill_plan(
+                    prefill_mode,
+                    seq_len as u64,
+                    estimated_sdpa_bytes,
+                    estimated_varlen_bytes,
+                    live_prefill_headroom_bytes(),
+                );
+
+                let maybe_sdpa = if batch == 1
+                    && graph_backend_available
+                    && plan.path == CacheHitPrefillPath::PagedPoolSdpa
+                {
+                    let sdpa_trace_start = trace_enabled.then(Instant::now);
+                    match adapter.gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx) {
+                        Ok((k_full, v_full)) => match scaled_dot_product_attention_causal(
+                            &queries_bhtd,
+                            &k_full,
+                            &v_full,
+                            self.scale as f64,
+                        ) {
+                            Ok(attn) => {
+                                if trace_enabled {
+                                    write_inference_trace(format_args!(
+                                        "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
+                                         layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                         path=paged_pool_sdpa estimated_sdpa_mib={:.1} \
+                                         estimated_varlen_mib={:.1} \
+                                         live_headroom_mib={:.1} elapsed_ms={:.1}",
+                                        attn_layer_idx,
+                                        seq_len,
+                                        cached_prefix_len,
+                                        total_ctx,
+                                        plan.estimated_sdpa_bytes as f64 / (1024.0 * 1024.0),
+                                        plan.estimated_varlen_bytes as f64 / (1024.0 * 1024.0),
+                                        plan.live_headroom_bytes.unwrap_or(0) as f64
+                                            / (1024.0 * 1024.0),
+                                        sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                                    ));
+                                }
+                                Some(attn)
+                            }
+                            Err(err) => {
+                                if trace_enabled {
+                                    write_inference_trace(format_args!(
+                                        "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_sdpa_construction_fallback \
+                                         layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                         stage=sdpa error={}",
+                                        attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
+                                    ));
+                                }
+                                None
+                            }
+                        },
+                        Err(err) => {
+                            if trace_enabled {
+                                write_inference_trace(format_args!(
+                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_sdpa_construction_fallback \
+                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
+                                     stage=paged_pool_gather error={}",
+                                    attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
+                                ));
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let maybe_paged_attn = if should_try_varlen_after_sdpa(
+                    prefill_mode,
+                    maybe_sdpa.is_some(),
+                ) && batch == 1
+                    && graph_backend_available
+                {
                     let paged_trace_start = trace_enabled.then(Instant::now);
                     let queries_paged =
                         queries.reshape(&[seq_len, self.num_heads as i64, self.head_dim as i64])?;
-                    match adapter.gather_kv_for_prefill_chunk(
+                    match adapter.gather_kv_for_prefill_chunk_varlen(
                         attn_layer_idx,
                         &queries_paged,
                         cached_prefix_len,
@@ -596,13 +899,18 @@ impl Qwen3_5Attention {
                                 write_inference_trace(format_args!(
                                     "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
                                      layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     path=paged_attention bridge_ms={:.1} read_kv_range_ms=0.0 \
-                                     mask_ms=0.0 sdpa_mode=none sdpa_graph_ms=0.0",
+                                     path=paged_attention_varlen bridge_ms={:.1} \
+                                     estimated_sdpa_mib={:.1} estimated_varlen_mib={:.1} \
+                                     live_headroom_mib={:.1}",
                                     attn_layer_idx,
                                     seq_len,
                                     cached_prefix_len,
                                     total_ctx,
-                                    paged_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                                    paged_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                                    plan.estimated_sdpa_bytes as f64 / (1024.0 * 1024.0),
+                                    plan.estimated_varlen_bytes as f64 / (1024.0 * 1024.0),
+                                    plan.live_headroom_bytes.unwrap_or(0) as f64
+                                        / (1024.0 * 1024.0)
                                 ));
                             }
                             Some(attn)
@@ -610,7 +918,7 @@ impl Qwen3_5Attention {
                         Err(err) => {
                             if trace_enabled {
                                 write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_paged_fallback \
+                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_paged_construction_fallback \
                                      layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
                                      error={}",
                                     attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
@@ -623,41 +931,36 @@ impl Qwen3_5Attention {
                     None
                 };
 
-                match maybe_paged_attn {
+                match maybe_sdpa.or(maybe_paged_attn) {
                     Some(attn) => attn,
                     None => {
+                        // Last-resort graph-construction path. Metal dispatch
+                        // errors surface later when the lazy graph evaluates.
+                        // This synchronously reads K/V through the host, so it
+                        // is intentionally never the normal route.
                         let read_trace_start = trace_enabled.then(Instant::now);
                         let (k_full, v_full) = adapter
                             .read_kv_range(attn_layer_idx, 0, total_ctx)
                             .map_err(napi::Error::from_reason)?;
                         let read_kv_range_ms = read_trace_start.map(elapsed_ms);
-                        let mask_trace_start = trace_enabled.then(Instant::now);
-                        let mask = create_causal_mask(
-                            seq_len as i32,
-                            Some(cached_prefix_len as i32),
-                            None,
-                        )?;
-                        let mask_ms = mask_trace_start.map(elapsed_ms);
                         let sdpa_trace_start = trace_enabled.then(Instant::now);
-                        let attn = scaled_dot_product_attention(
+                        let attn = scaled_dot_product_attention_causal(
                             &queries_bhtd,
                             &k_full,
                             &v_full,
                             self.scale as f64,
-                            Some(&mask),
                         )?;
                         if trace_enabled {
                             write_inference_trace(format_args!(
                                 "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
                                  layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                 path=read_kv_range read_kv_range_ms={:.1} mask_ms={:.1} \
-                                 sdpa_mode=explicit_mask sdpa_graph_ms={:.1}",
+                                 path=host_read_fallback read_kv_range_ms={:.1} \
+                                 sdpa_mode=causal sdpa_graph_ms={:.1}",
                                 attn_layer_idx,
                                 seq_len,
                                 cached_prefix_len,
                                 total_ctx,
                                 read_kv_range_ms.unwrap_or(0.0),
-                                mask_ms.unwrap_or(0.0),
                                 sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
                             ));
                         }
@@ -890,6 +1193,172 @@ impl Qwen3_5Attention {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hit_prefill_mode_preserves_explicit_override_semantics() {
+        assert_eq!(
+            parse_cache_hit_prefill_mode(None),
+            CacheHitPrefillMode::Auto
+        );
+        for value in ["1", "true", " yes ", "ON"] {
+            assert_eq!(
+                parse_cache_hit_prefill_mode(Some(value)),
+                CacheHitPrefillMode::ForcePaged,
+                "{value:?} should force paged prefill"
+            );
+        }
+        for value in ["0", "false", "off", "", "invalid"] {
+            assert_eq!(
+                parse_cache_hit_prefill_mode(Some(value)),
+                CacheHitPrefillMode::ForceSdpa,
+                "{value:?} should preserve the prior disabled-paged override"
+            );
+        }
+    }
+
+    #[test]
+    fn force_sdpa_never_falls_through_to_varlen_paged_attention() {
+        assert!(!should_try_varlen_after_sdpa(
+            CacheHitPrefillMode::ForceSdpa,
+            false,
+        ));
+        assert!(should_try_varlen_after_sdpa(
+            CacheHitPrefillMode::Auto,
+            false,
+        ));
+        assert!(should_try_varlen_after_sdpa(
+            CacheHitPrefillMode::ForcePaged,
+            false,
+        ));
+        assert!(!should_try_varlen_after_sdpa(
+            CacheHitPrefillMode::Auto,
+            true,
+        ));
+    }
+
+    #[test]
+    fn mlx_sdpa_fused_shape_gate_matches_metal_dispatcher() {
+        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 128));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256));
+        assert!(mlx_sdpa_uses_fused_kernel(1, 24, 4, 256));
+        assert!(!mlx_sdpa_uses_fused_kernel(8, 24, 4, 256));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 5, 128));
+    }
+
+    #[test]
+    fn qwen27b_long_prefill_fits_fast_sdpa_with_healthy_headroom() {
+        // Exact Qwen3.6-27B attention shape from the local checkpoint:
+        // 24 query heads, 4 KV heads, head_dim 256, bf16 activations.
+        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
+        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 256, 2);
+        assert_eq!(estimate, 7_063_814_144);
+        assert_eq!(varlen_estimate, 3_338_272_768);
+        let plan = select_cache_hit_prefill_plan(
+            CacheHitPrefillMode::Auto,
+            2_048,
+            estimate,
+            varlen_estimate,
+            Some(16 * 1024 * 1024 * 1024),
+        );
+        assert_eq!(plan.path, CacheHitPrefillPath::PagedPoolSdpa);
+    }
+
+    #[test]
+    fn automatic_prefill_uses_varlen_when_sdpa_score_matrix_will_not_fit() {
+        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
+        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 256, 2);
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                estimate,
+                varlen_estimate,
+                None,
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                estimate,
+                varlen_estimate,
+                Some(8 * 1024 * 1024 * 1024),
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+
+        // Decode-shaped reuse prefills stay directly on varlen paging instead
+        // of gathering the full contiguous K/V for MLX's vector SDPA.
+        assert_eq!(
+            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 1, 1, 1, Some(u64::MAX),).path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+    }
+
+    #[test]
+    fn automatic_prefill_chooses_smaller_transient_when_neither_path_fits() {
+        let headroom = Some(2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                256,
+                622_739_456,
+                1_727_660_032,
+                headroom,
+            )
+            .path,
+            CacheHitPrefillPath::PagedPoolSdpa
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                7_063_814_144,
+                3_338_272_768,
+                headroom,
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+    }
+
+    #[test]
+    fn automatic_prefill_uses_smaller_estimate_without_memory_probe() {
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                256,
+                622_739_456,
+                1_727_660_032,
+                None,
+            )
+            .path,
+            CacheHitPrefillPath::PagedPoolSdpa
+        );
+    }
+
+    #[test]
+    fn explicit_prefill_override_wins_over_memory_heuristic() {
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::ForcePaged,
+                1,
+                1,
+                u64::MAX,
+                Some(u64::MAX),
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(CacheHitPrefillMode::ForceSdpa, 1, u64::MAX, 1, Some(1),)
+                .path,
+            CacheHitPrefillPath::PagedPoolSdpa
+        );
+    }
 
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {

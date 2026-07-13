@@ -1979,6 +1979,31 @@ fn paged_attention_varlen_factory_accepts_wellformed() {
 }
 
 #[test]
+fn paged_attention_varlen_forward_rejects_invalid_kv_dtype() {
+    let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() };
+    assert_eq!(
+        rc, 1,
+        "varlen C ABI must reject unsupported kv_dtype_raw values before enum conversion"
+    );
+}
+
+#[test]
+fn paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_seq_len() {
+    let rc = unsafe {
+        mlx_sys::mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_seq_len()
+    };
+    if rc == -3 {
+        eprintln!("varlen query-span validation: Metal not available; skipping");
+        return;
+    }
+    assert_ne!(rc, -1, "varlen query-span validation helper failed setup");
+    assert_eq!(
+        rc, 1,
+        "PagedAttentionVarlen::eval_gpu must reject q_len > seq_len before dispatch"
+    );
+}
+
+#[test]
 fn paged_attention_varlen_factory_rejects_cu_seqlens_len() {
     let rc = unsafe { mlx_sys::mlx_paged_attention_varlen_factory_rejects_cu_seqlens_len() };
     assert_eq!(rc, 1, "factory must reject cu_seqlens_q with wrong length");

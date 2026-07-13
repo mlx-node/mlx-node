@@ -748,6 +748,31 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
     ) -> *mut mlx_array;
 
+    /// Emit the MLX C++ `paged_attention_varlen(...)` Custom primitive and
+    /// return its lazy on-device output. `q` is flat over all query tokens;
+    /// `cu_seqlens_q` maps those rows to the compact per-sequence rows in
+    /// `block_table` and `seq_lens`. Returns null for bridge/factory validation
+    /// errors; GPU dispatch errors surface when MLX evaluates the output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_varlen_forward(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        cu_seqlens_q: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+    ) -> *mut mlx_array;
+
     /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
     /// lazy K/V pool output arrays through `out_k_pool` / `out_v_pool`.
     /// Returns false for bridge/factory validation errors.
@@ -1233,6 +1258,15 @@ unsafe extern "C-unwind" {
     /// accepts well-formed tracer inputs and produces an output array of
     /// the expected shape. -1 on shape mismatch, 0 on factory exception.
     pub fn mlx_paged_attention_varlen_factory_accepts_wellformed() -> i32;
+
+    /// Returns 1 iff the public varlen C ABI rejects an unsupported
+    /// `kv_dtype_raw` wire value before casting it to the native enum.
+    pub fn mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() -> i32;
+
+    /// Returns 1 iff `PagedAttentionVarlen::eval_gpu` rejects a per-sequence
+    /// query span larger than the matching `seq_lens` context. Returns -3 when
+    /// Metal is unavailable and -1 on test setup errors.
+    pub fn mlx_paged_attention_varlen_eval_gpu_rejects_query_span_exceeds_seq_len() -> i32;
 
     /// Returns 1 iff the factory rejects a `cu_seqlens_q` array whose
     /// length is not `num_seqs + 1`.

@@ -384,3 +384,26 @@ array paged_attention_varlen(
     StreamOrDevice s = {});
 
 } // namespace mlx::core::fast
+
+// C ABI bridge for Rust callers that need the graph-native ragged-Q primitive.
+// The returned `mlx_array` owns a lazy `PagedAttentionVarlen` graph node and
+// must be released through the normal MLX array lifetime API.
+struct mlx_array;
+
+extern "C" mlx_array* mlx_paged_attention_varlen_forward(
+    mlx_array* q,
+    mlx_array* k_pool,
+    mlx_array* v_pool,
+    mlx_array* block_table,
+    mlx_array* seq_lens,
+    mlx_array* cu_seqlens_q,
+    mlx_array* k_scale,
+    mlx_array* v_scale,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype);
