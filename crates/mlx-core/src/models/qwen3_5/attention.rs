@@ -124,7 +124,7 @@ fn mlx_sdpa_uses_fused_kernel(
     num_kv_heads: u64,
     head_dim: u64,
 ) -> bool {
-    if num_kv_heads == 0 || num_query_heads % num_kv_heads != 0 {
+    if num_kv_heads == 0 || !num_query_heads.is_multiple_of(num_kv_heads) {
         return false;
     }
     if query_tokens <= 8 {

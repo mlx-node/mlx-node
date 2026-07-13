@@ -2739,7 +2739,7 @@ impl PagedKVCacheAdapter {
         let x_pack = 16usize / dtype_size;
         let head_size = self.layer_kv_pool.config().head_size as usize;
         let num_kv_heads = self.layer_kv_pool.config().num_kv_heads as usize;
-        if head_size % x_pack != 0 {
+        if !head_size.is_multiple_of(x_pack) {
             return Err(format!(
                 "gather_kv_for_prefill_sdpa: head_size {head_size} is not divisible by \
                  x_pack {x_pack}"
