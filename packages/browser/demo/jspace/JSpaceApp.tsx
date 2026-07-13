@@ -466,7 +466,7 @@ export default function JSpaceApp() {
     // mx-auto` still centers the body (auto margins on an inset-0 box). Without this
     // the live view (grid + heatmap + charts + cross-sections) is unreachable below
     // the fold.
-    <main className="absolute inset-0 mx-auto max-w-[82rem] space-y-8 overflow-y-auto px-6 py-10 md:px-10 md:py-14">
+    <main className="jspace-scroll absolute inset-0 mx-auto max-w-[82rem] space-y-8 overflow-y-auto px-6 py-10 md:px-10 md:py-14">
       <header className="space-y-3 border-b border-border/60 pb-8">
         <span className="inline-flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)]">
           <span

@@ -129,6 +129,30 @@
     @apply font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--text-dim)];
   }
 
+  /* /jspace owns its own scroll surface (main.jspace-scroll). Theme the scrollbar
+     so it reads as part of the dark UI instead of the bright OS default. */
+  .jspace-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .jspace-scroll::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  .jspace-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .jspace-scroll::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  .jspace-scroll::-webkit-scrollbar-thumb:hover {
+    background: #413c49;
+    background-clip: content-box;
+  }
+
   /* Chat layer — always mounted, hidden until ready */
   .chat-layer {
     @apply absolute inset-0 flex flex-col;
@@ -140,6 +164,15 @@
   .chat-layer.visible {
     visibility: visible;
     opacity: 1;
+  }
+  /* When the chat shell is hidden (any non-/chat route, e.g. /jspace) it stays
+     mounted but visibility:hidden — a hidden backdrop-filter still forces a
+     full-viewport re-raster on every hover repaint (whole-page blink). Drop the
+     blur ONLY while hidden; the frosted glass returns the instant .visible is set. */
+  .chat-layer:not(.visible) .chat-header,
+  .chat-layer:not(.visible) .composer-frame {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
   }
   .app-shell {
     @apply flex flex-1 min-h-0 flex-col;
