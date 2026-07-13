@@ -8,7 +8,6 @@ import { tokenize } from '../lib/tokenizer-client';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
 import { pinColor } from '../jlens-core/colors';
-import { derivePins } from '../jlens-core/derive-pins';
 import { JACOBIAN_LAYERS, JACOBIAN_PRESETS } from '../jlens-core/jacobian-presets';
 import {
   applyPermalink,
@@ -175,9 +174,17 @@ export default function JSpaceApp() {
     const toks = await tokenize(worker, preset.prompt, { signal });
     const promptIds = toks.map((t) => t.id);
     if (promptIds.length === 0) throw new Error('self-test prompt tokenized to zero tokens');
-    // derivePins is used ONLY here (Constraint 8: never in PinManager) — it
-    // reproduces the four french-season concept pins [3098, 7094, 40297, 4845].
-    const { pinnedIds } = await derivePins(preset.concepts, (text) => tokenize(worker, text, { signal }));
+    // Replay the EXACT baked french-season frame: source the pins from the frame we
+    // validate against, NOT derivePins. The gallery bake now re-pins each concept to
+    // the token that actually SURFACES it (robust pin resolution, Task-2 fix #1), so
+    // a baked pin id can differ from derivePins' first-token guess (e.g. 'season' →
+    // the standalone token 16306, not the ' season' fragment 3098). Re-deriving here
+    // would structurally mismatch the baked frame and spuriously fail the self-test.
+    // The garbage detector is the per-cell top-1 agreement, which is pin-independent.
+    // (This is the /jspace app's only former derivePins use; PinManager never used it
+    // either — Constraint 8 — so the app no longer imports derivePins at all.)
+    const baked = reviveRun((STARTERS['french-season'] as unknown as BakedFile).jacobian);
+    const pinnedIds = baked.pinned.map((p) => p.tokenId);
     const live = await lensReadout(
       worker,
       { promptIds, layers: JACOBIAN_LAYERS, topK: TOP_K, pinnedIds, useJacobian: true },
@@ -188,7 +195,6 @@ export default function JSpaceApp() {
     if (live.jacobianApplied !== true) {
       throw new Error('self-test: Jacobian readout downgraded (jacobianApplied=false)');
     }
-    const baked = reviveRun((STARTERS['french-season'] as unknown as BakedFile).jacobian);
     return compareToBakedFrame(live, baked);
   }
 

@@ -14,9 +14,9 @@ describe('GALLERY', () => {
     expect(new Set(slugs).size).toBe(8);
     expect(STARTER_SLUGS).toEqual(slugs);
   });
-  it('grades 6 strong + 2 weak', () => {
-    expect(GALLERY.filter((g) => g.grade === 'strong')).toHaveLength(6);
-    expect(GALLERY.filter((g) => g.grade === 'weak')).toHaveLength(2);
+  it('grades 5 strong + 3 weak', () => {
+    expect(GALLERY.filter((g) => g.grade === 'strong')).toHaveLength(5);
+    expect(GALLERY.filter((g) => g.grade === 'weak')).toHaveLength(3);
   });
   it('every band has onset <= peak and peak is a displayed layer', () => {
     for (const g of GALLERY) {

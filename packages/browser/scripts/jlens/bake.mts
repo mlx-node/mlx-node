@@ -56,8 +56,6 @@
  *   JLENS_META       meta sidecar path    (default: lens-pack-v1.meta.json)
  *   JLENS_BAKE_DATE  override bakedDate    (default: meta.fit_date)
  *   JLENS_OUT_DIR    output dir           (default: demo/learn/widgets/jlens/baked)
- *   JLENS_STARTER_DIR  /jspace starter dir  (default: demo/jspace/starters; auto-skips
- *                       when JLENS_OUT_DIR is set; pass '' to force-skip)
  * DETERMINISM: this script NEVER calls Date.now()/new Date(); bakedDate comes from
  * JLENS_BAKE_DATE or the meta sidecar's fit_date, so a re-run is byte-identical.
  */
@@ -85,19 +83,12 @@ const PACK_ENV = process.env.JLENS_PACK;
 const PACK_PATH = PACK_ENV ? (PACK_ENV.includes('/') ? PACK_ENV : join(JLENS_CACHE_DIR, PACK_ENV)) : DEFAULT_PACK;
 const META_PATH = process.env.JLENS_META ?? DEFAULT_META;
 const OUT_DIR = process.env.JLENS_OUT_DIR ?? join(HERE, '../../demo/learn/widgets/jlens/baked');
-// The /jspace app also renders these frames as its model-free STARTER grid
-// (demo/jspace/starters/<slug>.json). Same envelope, same plain-number[] typed
-// arrays (Constraint 15) — so one bake run keeps the lesson and the /jspace
-// starters in lockstep. Override with JLENS_STARTER_DIR; set to '' to skip.
-// CRITICAL: when JLENS_OUT_DIR redirects the lesson output (e.g. an isolation
-// check into /tmp), the starter mirror must NOT keep rewriting the committed
-// production starters — so it auto-skips unless the caller explicitly opts back
-// in with JLENS_STARTER_DIR. The canonical, non-redirected controller run is
-// unchanged (JLENS_OUT_DIR unset → mirror as before).
-const OUT_REDIRECTED = process.env.JLENS_OUT_DIR != null;
-const STARTER_DIR =
-  process.env.JLENS_STARTER_DIR ??
-  (OUT_REDIRECTED ? '' : join(HERE, '../../demo/jspace/starters'));
+// NOTE: this LESSON bake writes ONLY to OUT_DIR (demo/learn/widgets/jlens/baked).
+// The /jspace GALLERY starters (demo/jspace/starters/) are owned EXCLUSIVELY by
+// scripts/jlens/bake-gallery.mts — a different, larger vetted set. bake.mts used to
+// mirror its 3 lesson presets into the starter dir; that mirror is REMOVED (Task-2
+// fix #4) so re-running the lesson bake can no longer re-add the retired legacy
+// frames or clobber the gallery's french-season with the lesson version.
 
 const TOP_K = 10;
 const EXPECTED_JACOBIANS = 23; // J.1..J.23 in the v1 pack (eval.mts:179).
@@ -195,7 +186,6 @@ async function main() {
   console.log(`bakedDate=${bakedDate} (source: ${process.env.JLENS_BAKE_DATE ? 'JLENS_BAKE_DATE' : 'meta.fit_date'}); out=${OUT_DIR}\n`);
 
   mkdirSync(OUT_DIR, { recursive: true });
-  if (STARTER_DIR) mkdirSync(STARTER_DIR, { recursive: true });
 
   // `derivePins` needs {id,text}[]; the native model returns ids and texts from
   // two calls. Adapting here keeps ONE pin predicate across bake and the browsers.
@@ -269,11 +259,9 @@ async function main() {
     const serialized = JSON.stringify(envelope, null, 2) + '\n';
     const outPath = join(OUT_DIR, `${preset.slug}.json`);
     writeAtomic(outPath, serialized);
-    // Mirror the SAME envelope into the /jspace starter dir (model-free grid).
-    if (STARTER_DIR) writeAtomic(join(STARTER_DIR, `${preset.slug}.json`), serialized);
     console.log(
       `[${preset.slug.padEnd(18)}] P=${String(promptIds.length).padStart(2)} pins=${pinnedIds.length} ` +
-        `cells=${logit.cells.length} → ${outPath}${STARTER_DIR ? ` (+ starter)` : ''}`,
+        `cells=${logit.cells.length} → ${outPath}`,
     );
   }
 

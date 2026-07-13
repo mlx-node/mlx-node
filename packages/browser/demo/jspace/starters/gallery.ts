@@ -64,12 +64,18 @@ export const GALLERY: readonly GalleryEntry[] = [
     grade: 'strong',
   },
   {
+    // The answer 'Africa' surfaces as the STANDALONE vocab token (rank ~2 at
+    // ℓ17–18), NOT derivePins' ' Africa' fragment — the bake's robust pin
+    // resolution re-pins to it. Graded WEAK (not strong): only ~2 legible band
+    // layers, the greedy output is a degenerate '1', and the Egypt bridge never
+    // surfaces — the same faint-but-genuine class as eiffel-capital, so it is
+    // graded WEAK for consistency (Task-2 fix #2). First of the WEAK group.
     slug: 'giza-continent',
     prompt: 'Fact: The continent where the pyramids of Giza are located is ',
     concepts: ['Africa'],
     band: { onset: 16, peak: 17 },
     defaultMode: 'jacobian',
-    grade: 'strong',
+    grade: 'weak',
   },
   {
     // Concept is the CAPITALIZED ' Error' (the surfacing token; lowercase ' error'

@@ -116,6 +116,49 @@ function writeAtomic(path: string, data: string): void {
   renameSync(tmp, path);
 }
 
+/** ROBUST PIN RESOLUTION (Task-2 fix #1). `derivePins` pins the FIRST token of
+ *  encoding ` ${concept}`, which for some concepts is a sub-word FRAGMENT that
+ *  ranks far below the STANDALONE vocab token the model actually surfaces (giza:
+ *  the ' Africa' fragment sits at rank 6 while the whole-word 'Africa' is rank 2 at
+ *  ℓ17/ℓ18). Once we have a readout we KNOW the per-cell top-K, so we can re-pin to
+ *  the exact surfacing token: across every displayed-layer cell at the last
+ *  position, find any top-K token whose decoded text — a single leading space
+ *  trimmed, case-folded — EQUALS the concept word, and pin the one with the BEST
+ *  (lowest) rank. Fall back to derivePins' id ONLY when no top-K exact-text match
+ *  exists. This changes a pin ONLY when the surfacing token differs from the guess
+ *  — and when it differs, the surfacing token is the correct one. */
+function resolvePinIds(
+  concepts: string[],
+  jacReadout: any,
+  lastPos: number,
+  fallbackIds: number[],
+): { ids: number[]; changed: boolean } {
+  const cellsAtLast = (jacReadout.cells as any[]).filter((c) => c.position === lastPos);
+  let changed = false;
+  const ids = concepts.map((concept, ci) => {
+    const target = concept.trim().toLowerCase();
+    let bestId: number | null = null;
+    let bestRank = Infinity;
+    for (const cell of cellsAtLast) {
+      const texts = cell.topKTexts as ArrayLike<string>;
+      const kids = cell.topKIds as ArrayLike<number>;
+      for (let k = 0; k < texts.length; k++) {
+        const decoded = String(texts[k]).replace(/^ /, '').toLowerCase();
+        if (decoded === target) {
+          const rank = k + 1; // top-K arrays are sorted descending by logit.
+          if (rank < bestRank) {
+            bestRank = rank;
+            bestId = kids[k]!;
+          }
+        }
+      }
+    }
+    if (bestId != null && bestId !== fallbackIds[ci]) changed = true;
+    return bestId != null ? bestId : fallbackIds[ci]!;
+  });
+  return { ids, changed };
+}
+
 /** Dropped candidates from scripts/jlens/vet-candidates.mts's roster (the three
  *  phenomena whose gate the 0.8B base model fails). Verbatim from the Task-2
  *  brief; the raw per-layer evidence is in
@@ -196,34 +239,45 @@ async function main() {
     if (promptIds.length === 0) throw new Error(`${entry.slug}: prompt tokenized to zero tokens`);
     if (promptIds.length > 48) throw new Error(`${entry.slug}: ${promptIds.length} > 48 tokens (addon cap)`);
 
+    // next-token prediction reads the LAST position; needed for pin resolution too.
+    const P = promptIds.length;
+    const lastPos = P - 1;
+
     // 2. derive pins exactly as the widget does (` ${concept}` first token, with
     //    the whitespace-fallback for digits so a pin never tracks bare space).
-    const { pinnedIds, partialFlags } = await derivePins(entry.concepts, encodeWithText);
-    if (pinnedIds.length !== entry.concepts.length) {
+    const { pinnedIds: derivedIds, partialFlags } = await derivePins(entry.concepts, encodeWithText);
+    if (derivedIds.length !== entry.concepts.length) {
       throw new Error(
-        `${entry.slug}: ${entry.concepts.length - pinnedIds.length} concept(s) tokenized to zero tokens — concept↔pin alignment broken`,
+        `${entry.slug}: ${entry.concepts.length - derivedIds.length} concept(s) tokenized to zero tokens — concept↔pin alignment broken`,
       );
     }
-    if (pinnedIds.length > LENS_MAX_PINNED) {
-      throw new Error(`${entry.slug}: ${pinnedIds.length} pins > LENS_MAX_PINNED=${LENS_MAX_PINNED}`);
+    if (derivedIds.length > LENS_MAX_PINNED) {
+      throw new Error(`${entry.slug}: ${derivedIds.length} pins > LENS_MAX_PINNED=${LENS_MAX_PINNED}`);
     }
 
-    // 3. TWO readouts over the same layer set (logit + jacobian).
-    const logit = await model.lensReadout(promptIds, {
-      layers: JACOBIAN_LAYERS,
-      topK: TOP_K,
-      pinnedIds,
-      useJacobian: false,
-    });
-    const jac = await model.lensReadout(promptIds, {
-      layers: JACOBIAN_LAYERS,
-      topK: TOP_K,
-      pinnedIds,
-      useJacobian: true,
-    });
-    if (jac.jacobianApplied !== true) {
-      throw new Error(`${entry.slug}: jacobianApplied=false (a true request that silently downgraded is a bug)`);
+    // 3. TWO readouts over the same layer set (logit + jacobian). The per-cell
+    //    top-K is INDEPENDENT of the pins, so this first pass gives us the top-K we
+    //    need to resolve robust pins (step 3b) — only the pinned rank tracks depend
+    //    on the pin ids, so we re-run only if resolution moved a pin.
+    const readouts = async (ids: number[]) => {
+      const lg = await model.lensReadout(promptIds, { layers: JACOBIAN_LAYERS, topK: TOP_K, pinnedIds: ids, useJacobian: false });
+      const jc = await model.lensReadout(promptIds, { layers: JACOBIAN_LAYERS, topK: TOP_K, pinnedIds: ids, useJacobian: true });
+      if (jc.jacobianApplied !== true) {
+        throw new Error(`${entry.slug}: jacobianApplied=false (a true request that silently downgraded is a bug)`);
+      }
+      return { lg, jc };
+    };
+    let { lg: logit, jc: jac } = await readouts(derivedIds);
+
+    // 3b. Re-pin each concept to the exact top-K token that actually surfaces it
+    //     (Task-2 fix #1); re-run the readouts so the baked pinned rank tracks
+    //     reflect the resolved ids. `changed` stays false when derivePins already
+    //     guessed the surfacing token (french-season / arithmetic tiles).
+    const { ids: pinnedIds, changed } = resolvePinIds(entry.concepts, jac, lastPos, derivedIds);
+    if (changed) {
+      ({ lg: logit, jc: jac } = await readouts(pinnedIds));
     }
+
     // A pin the reader sees as a concept track must be a real token, not a space.
     for (const pin of jac.pinned as { tokenId: number; tokenText: string }[]) {
       if (pin.tokenText.trim() === '') {
@@ -239,8 +293,6 @@ async function main() {
     //    top-K AND peak within ±2 displayed-layers of the declared band.peak. A
     //    failure means the concept string does not tokenize to the effective
     //    vetted id (a dark tile) — fix the concept in gallery.ts, never weaken this.
-    const P = promptIds.length;
-    const lastPos = P - 1;
     const perLayer = JACOBIAN_LAYERS.map((L, li) => ({
       L,
       r: (jac.pinned[0]?.ranks?.[li * P + lastPos] ?? 999) as number,
@@ -252,6 +304,23 @@ async function main() {
       );
     }
     const peak = inTopK.reduce((a, b) => (b.r < a.r ? b : a));
+
+    // 4b. GRADE-CONSISTENCY ASSERTION (Task-2 fix #3). The displayed grade must
+    //     match the measured legibility: ANY tile's primary concept must reach
+    //     top-K, and a STRONG tile's must reach top-3 across the displayed layers.
+    //     FAIL LOUD (slug + measured rank) rather than ship a mislabeled tile — do
+    //     NOT weaken this to pass; regrade the tile in gallery.ts or fix the pin.
+    if (peak.r > TOP_K) {
+      throw new Error(
+        `${entry.slug}: primary concept '${entry.concepts[0]}' best rank ${peak.r} > TOP_K=${TOP_K} across displayed layers`,
+      );
+    }
+    if (entry.grade === 'strong' && peak.r > 3) {
+      throw new Error(
+        `${entry.slug}: grade='strong' but primary concept '${entry.concepts[0]}' best rank ${peak.r} > 3 across displayed layers — regrade WEAK or fix the pin`,
+      );
+    }
+
     const bandIdx = layerIndex(entry.band.peak);
     if (bandIdx < 0) throw new Error(`${entry.slug}: band.peak ℓ${entry.band.peak} is not a displayed layer`);
     const drift = Math.abs(layerIndex(peak.L) - bandIdx);

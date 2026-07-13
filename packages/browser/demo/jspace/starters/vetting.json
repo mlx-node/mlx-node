@@ -9,15 +9,15 @@
       "prompt": "La saison après l'été est l'",
       "targetConcept": "season",
       "targetIds": [
-        3098,
-        7094,
+        16306,
+        60457,
         40297,
-        4845
+        226151
       ],
       "jacobian": {
         "pass": true,
-        "peakLayer": 20,
-        "peakRank": 2,
+        "peakLayer": 16,
+        "peakRank": 1,
         "bandLayers": [
           16,
           17,
@@ -120,17 +120,18 @@
       "prompt": "Fact: The continent where the pyramids of Giza are located is ",
       "targetConcept": "Africa",
       "targetIds": [
-        9871
+        71090
       ],
       "jacobian": {
         "pass": true,
         "peakLayer": 17,
-        "peakRank": 6,
+        "peakRank": 2,
         "bandLayers": [
-          17
+          17,
+          18
         ]
       },
-      "grade": "STRONG",
+      "grade": "WEAK",
       "shipped": true
     },
     {
