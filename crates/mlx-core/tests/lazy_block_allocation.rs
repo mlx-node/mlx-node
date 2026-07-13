@@ -146,18 +146,16 @@ fn allocate_suffix_blocks_does_not_pre_reserve_max_new_tokens() {
     );
 }
 
-/// `record_tokens` must surface a clean error when lazy allocation fails
-/// mid-decode (pool truly exhausted) and leave caller-visible state
+/// `record_tokens` must surface the canonical context-capacity error when a
+/// lazy decode would exceed the physical pool and leave caller-visible state
 /// unchanged so the model can stop generation gracefully without writing
 /// to a non-existent block.
 #[test]
-fn record_tokens_lazy_alloc_propagates_pool_exhaustion() {
+fn record_tokens_lazy_alloc_reports_context_capacity() {
     let block_size: u32 = 4;
     // 2-block pool → 8 token slots total.
     let Some(mut adapter) = build_adapter(2, block_size) else {
-        eprintln!(
-            "skipping record_tokens_lazy_alloc_propagates_pool_exhaustion: Metal unavailable"
-        );
+        eprintln!("skipping record_tokens_lazy_alloc_reports_context_capacity: Metal unavailable");
         return;
     };
     adapter.reset_for_new_request(0).unwrap();
@@ -178,11 +176,13 @@ fn record_tokens_lazy_alloc_propagates_pool_exhaustion() {
     let prior_count = adapter.current_token_count();
     let prior_blocks = adapter.num_allocated_blocks();
     let res = adapter.record_tokens(&[9]);
-    assert!(res.is_err(), "expected pool-exhaustion error");
+    assert!(res.is_err(), "expected context-capacity error");
     let msg = res.err().unwrap();
     assert!(
-        msg.contains("BlockAllocator exhausted") || msg.contains("running out"),
-        "error must indicate allocator exhaustion, got: {msg}"
+        msg.starts_with("context_length_exceeded:")
+            && msg.contains("requested 9 tokens during decode")
+            && msg.contains("capacity is 8 tokens"),
+        "error must report the canonical physical context limit, got: {msg}"
     );
     // State must be unchanged so the model can abort cleanly without
     // writing to a non-existent block.
