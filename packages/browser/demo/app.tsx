@@ -4,7 +4,9 @@ import { createCodePlugin } from '@streamdown/code';
 import { RouterProvider } from '@tanstack/react-router';
 import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { Streamdown } from 'streamdown';
+import rehypeKatex from 'rehype-katex';
+import remarkMath from 'remark-math';
+import { Streamdown, type PluginConfig } from 'streamdown';
 
 import { createSabRingOverHeap } from '../src/chat-stream-sab.js';
 import {
@@ -27,6 +29,8 @@ import { ModelLoaderProvider, type ModelLoaderContextValue } from './providers/m
 import { TelemetryProvider, type TelemetryContextValue } from './providers/telemetry';
 import { router } from './router';
 import 'streamdown/styles.css';
+import 'katex/dist/katex.min.css';
+
 import './styles.css';
 
 type StatusState = 'info' | 'ready' | 'error';
@@ -44,10 +48,20 @@ const APP_PREVIEW_SYSTEM_PROMPT = [
   `When tools are enabled and the user asks you to build, write, prototype, preview, or render an app, UI, animation, game, or HTML/CSS/JS demo, call ${APP_PREVIEW_TOOL_NAME} exactly once with a complete self-contained runnable HTML document in the html argument.`,
   'Do not print raw HTML/CSS/JS outside the tool call.',
 ].join(' ');
-const streamdownPlugins = {
+const streamdownPlugins: PluginConfig = {
   code: createCodePlugin({
     themes: ['github-dark-high-contrast', 'github-dark-high-contrast'],
   }),
+  // Render LaTeX the model emits: `$…$` inline and `$$…$$` block. remark-math
+  // parses the delimiters; rehype-katex renders with KaTeX. `throwOnError:false`
+  // keeps a malformed formula (common from a 0.8B model) from breaking the
+  // message — it falls back to the red source instead.
+  math: {
+    name: 'katex',
+    type: 'math',
+    remarkPlugin: remarkMath,
+    rehypePlugin: [rehypeKatex, { throwOnError: false }],
+  },
 };
 
 function systemPromptForTools(toolsEnabled: boolean) {
