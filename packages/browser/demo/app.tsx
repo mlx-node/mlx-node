@@ -1013,7 +1013,14 @@ function App() {
     function sanitizeThinkingText(thinking: string | null | undefined, latestUserText?: string) {
       const cleaned = sanitizeThinkingMarkup(splitAssistantThinking(thinking, latestUserText).thinking || thinking);
       if (/^[A-Z]$/u.test(cleaned)) return '';
-      return cleaned;
+      // The thinking block is the model's scratchpad, and a 0.8B model's backtick
+      // usage is unreliable: a single stray/unclosed backtick makes Markdown swallow
+      // a huge inline-code span — everything up to the next backtick (including
+      // `**bold**` headers and list markers) renders as one monospace run. Strip
+      // backtick runs here so no inline-code/fence span can form; bold, lists, and
+      // headers still render and math shows as plain readable text. This is scoped
+      // to reasoning only — the answer path (sanitizeAssistantText) keeps code blocks.
+      return cleaned.replace(/`+/g, '');
     }
 
     function mergeThinkingText(current: string, next: string) {
