@@ -42,8 +42,15 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
       // shrinks and offsets the visual viewport without reflowing the layout
       // viewport, so innerWidth would place the popup off-screen at >1x zoom.
       // offsetLeft/width are layout-viewport-relative CSS px, the same space as
-      // getBoundingClientRect(), so the two are directly comparable. `scroll`
-      // fires on pan (which changes offsetLeft); `resize` on zoom/rotate.
+      // getBoundingClientRect() on every engine that exposes visualViewport
+      // (Chrome 61+/Safari 13+/Firefox 91+ all return layout-viewport rects,
+      // unaffected by pinch scale); engines without it take the innerWidth
+      // fallback, so the two coordinate systems never mix. `scroll` fires on
+      // pan (which changes offsetLeft); `resize` on zoom/rotate.
+      // Bound: the popup can shrink to ~116px (two 44px buttons + a zero-width
+      // input); below that visible width (>~2.8x zoom on a phone) a sliver of
+      // the far control clips, but it stays left-aligned and pannable. Not
+      // worth a stacked-layout reflow for that self-inflicted extreme.
       const vv = window.visualViewport;
       const viewLeft = vv ? vv.offsetLeft : 0;
       const viewWidth = vv ? vv.width : window.innerWidth;
