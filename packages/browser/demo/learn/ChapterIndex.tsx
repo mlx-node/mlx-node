@@ -62,7 +62,9 @@ export function ChapterIndex({
           <button
             type="button"
             onClick={onBackToLanding}
-            className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+            // 44px tap target on touch; `-mx-2` outsets the padding as pure hit
+            // area so the row height is unchanged, compact (h-8) from sm up.
+            className="-mx-2 inline-flex h-11 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground sm:h-8"
           >
             <ArrowLeftIcon className="size-4" />
             {ui.chapterIndex.back}

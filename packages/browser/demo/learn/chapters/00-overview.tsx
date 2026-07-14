@@ -83,7 +83,7 @@ export const learning: ChapterLearningData = {
   ],
   exercise: {
     prompt:
-      'In the generation-loop animation, watch the pseudocode. Which line is highlighted at the exact moment a new token joins the strip on the left?',
+      'In the generation-loop animation, watch the pseudocode. Which line is highlighted at the exact moment a new token joins the token strip?',
     answer:
       'tokens.push(next) — the append step. The strip only grows after a token has been sampled from the forward pass, then pushed onto the list; the loop then runs again on the now-longer sequence.',
   },

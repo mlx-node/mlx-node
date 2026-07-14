@@ -98,7 +98,7 @@ export function ArgmaxGrid({
                   onClick={() => onSelect({ layerIdx, pos })}
                   title={`ℓ${slice.layers[layerIdx]} · pos ${pos + 1}: ${cell.topKTexts[0] ?? ''}`}
                   className={[
-                    'cursor-pointer px-1.5 py-1 text-center font-mono transition-colors',
+                    'cursor-pointer px-1.5 py-2 text-center font-mono transition-colors',
                     finalCol(pos) ? 'border-l border-primary/40 bg-primary/[0.06] text-foreground' : 'bg-card text-foreground/80',
                     isSelected ? 'outline outline-2 -outline-offset-2 outline-primary' : 'hover:bg-muted',
                   ].join(' ')}

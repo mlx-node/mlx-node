@@ -267,7 +267,7 @@ export function SamplingChapterBody() {
         </ul>
         <p>
           A common default is <code>T = 0.7</code> with <code>top_p = 0.9</code>: the temperature gives the model some
-          room to be creative, and top-p guarantees we never sample from the absurd tail. The widget on the right lets
+          room to be creative, and top-p guarantees we never sample from the absurd tail. The widget here lets
           you sweep both knobs over a captured run and see what would have happened.
         </p>
 

@@ -103,7 +103,7 @@ export function GradClipDemo() {
           <div className="space-y-0.5 rounded-md border border-border/60 bg-muted/20 p-2">
             {raw.map((g, i) => (
               <div key={`r-${i}`} className="flex items-center gap-1">
-                <span className="w-5 font-mono text-[9px] text-muted-foreground">g{i}</span>
+                <span className="w-5 font-mono text-[11px] text-muted-foreground">g{i}</span>
                 <div className="relative flex h-2.5 flex-1 items-stretch overflow-hidden rounded-sm bg-muted/30">
                   <div className="flex flex-1 justify-end">
                     {g < 0 ? (
@@ -123,7 +123,7 @@ export function GradClipDemo() {
                     ) : null}
                   </div>
                 </div>
-                <span className="w-9 text-right font-mono text-[9px] text-foreground/75">{g.toFixed(2)}</span>
+                <span className="w-10 text-right font-mono text-[11px] text-foreground/75">{g.toFixed(2)}</span>
               </div>
             ))}
           </div>
@@ -149,7 +149,7 @@ export function GradClipDemo() {
           >
             {clipped.map((g, i) => (
               <div key={`c-${i}`} className="flex items-center gap-1">
-                <span className="w-5 font-mono text-[9px] text-muted-foreground">g{i}</span>
+                <span className="w-5 font-mono text-[11px] text-muted-foreground">g{i}</span>
                 <div className="relative flex h-2.5 flex-1 items-stretch overflow-hidden rounded-sm bg-muted/30">
                   <div className="flex flex-1 justify-end">
                     {g < 0 ? (
@@ -169,7 +169,7 @@ export function GradClipDemo() {
                     ) : null}
                   </div>
                 </div>
-                <span className="w-9 text-right font-mono text-[9px] text-foreground/75">{g.toFixed(2)}</span>
+                <span className="w-10 text-right font-mono text-[11px] text-foreground/75">{g.toFixed(2)}</span>
               </div>
             ))}
           </div>

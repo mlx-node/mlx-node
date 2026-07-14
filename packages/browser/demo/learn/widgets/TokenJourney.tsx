@@ -874,7 +874,7 @@ export function TokenJourney() {
               aria-current={isCurrent ? 'step' : undefined}
               aria-label={copy.goToStage(s.n, s.title)}
               className={cn(
-                'flex items-center gap-1.5 rounded-md border px-2 py-1 text-left text-[11px] transition-colors',
+                'flex items-center gap-1.5 rounded-md border px-2 py-1 max-sm:px-2.5 max-sm:py-1.5 max-sm:min-h-[40px] text-left text-[11px] transition-colors',
                 reducedMotion && 'transition-none',
                 isCurrent
                   ? 'border-primary/50 bg-primary/15 text-primary'
@@ -883,7 +883,7 @@ export function TokenJourney() {
             >
               <span
                 className={cn(
-                  'inline-flex h-4 w-4 items-center justify-center rounded-full font-mono text-[10px] tabular-nums',
+                  'inline-flex h-4 w-4 max-sm:h-5 max-sm:w-5 items-center justify-center rounded-full font-mono text-[10px] tabular-nums',
                   isCurrent ? 'bg-primary text-primary-foreground' : 'bg-foreground/10 text-foreground/70',
                 )}
               >

@@ -355,7 +355,7 @@ export function GpuHierarchyDiagram() {
                 onClick={() => setLevel(l)}
                 aria-pressed={l === level}
                 className={[
-                  'px-2.5 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                  'px-2.5 py-1 max-sm:px-3 max-sm:py-2 max-sm:min-h-[44px] inline-flex items-center text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
                   l === level ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
                 ].join(' ')}
               >
@@ -372,7 +372,7 @@ export function GpuHierarchyDiagram() {
                   onClick={() => setOverlay(o)}
                   aria-pressed={o === overlay}
                   className={[
-                    'px-2.5 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                    'px-2.5 py-1 max-sm:px-3 max-sm:py-2 max-sm:min-h-[44px] inline-flex items-center text-[11px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
                     o === overlay ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground',
                   ].join(' ')}
                 >

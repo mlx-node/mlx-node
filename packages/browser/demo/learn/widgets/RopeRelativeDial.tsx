@@ -493,7 +493,7 @@ export function RopeRelativeDial() {
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
             <div className="rounded-md border border-border/60 bg-muted/20 p-2">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{copy.offsetTile}</div>
               <div className="font-mono text-lg text-foreground/90" aria-live="polite">

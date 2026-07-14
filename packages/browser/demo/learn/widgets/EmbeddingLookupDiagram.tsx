@@ -91,7 +91,7 @@ const COPY = {
     ] as readonly React.ReactNode[],
     footnote: (
       <>
-        The eight floats are illustrative stand-ins — the live demo on the right fetches the real {HIDDEN_COLS}-dim rows
+        The eight floats are illustrative stand-ins — the interactive demo fetches the real {HIDDEN_COLS}-dim rows
         from the loaded model. The mechanism is the lesson: token id in, one row of the table out.
       </>
     ),
@@ -127,7 +127,7 @@ const COPY = {
     ] as readonly React.ReactNode[],
     footnote: (
       <>
-        这 8 个浮点数是示意性替身——右侧的实时演示会从已加载的模型里取出真实的 {HIDDEN_COLS}{' '}
+        这 8 个浮点数是示意性替身——实时演示会从已加载的模型里取出真实的 {HIDDEN_COLS}{' '}
         维行向量。机制本身才是课程重点：输入 token id，输出表中的一行。
       </>
     ),

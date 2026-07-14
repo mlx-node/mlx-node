@@ -71,7 +71,7 @@ export const learning: ChapterLearningData = {
     '推理阶段的全部工作就是“预测下一个 token”；能力是这个目标逼着模型学会的东西。',
   ],
   exercise: {
-    prompt: '在生成循环的动画里观察伪代码。当一个新 token 加入左侧的 token 条时，恰好是哪一行被高亮？',
+    prompt: '在生成循环的动画里观察伪代码。当一个新 token 加入 token 条时，恰好是哪一行被高亮？',
     answer:
       'tokens.push(next)——追加这一步。token 条只有在前向传播采样出一个 token、并把它 push 进列表之后才会变长；随后循环在变长了的序列上再跑一轮。',
   },

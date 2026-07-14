@@ -628,7 +628,7 @@ export function EmbeddingsChapterBody() {
           <code>lm_head</code> that turns the final hidden state back into logits over the vocabulary — we cover that in
           the LM-head chapter; for now just read it as "the layer that scores the next token"). Tying these two matrices
           saves parameters, and forces the representations to be useful in both directions: the same vector space that{' '}
-          <em>reads</em> the prompt also <em>writes</em> the next token's logit. The widget on the right plots rows from
+          <em>reads</em> the prompt also <em>writes</em> the next token's logit. The widget in this section plots rows from
           this exact shared matrix.
         </p>
 
@@ -706,7 +706,7 @@ export function EmbeddingsChapterBody() {
         <h2>Cosine similarity, side by side</h2>
         <p>
           The panel below skips the projection entirely: each bar shows a ballpark cosine similarity for this model
-          family — the live scatter on the right uses the real embeddings. The ordering teaches the lesson — identical
+          family — the live scatter here uses the real embeddings. The ordering teaches the lesson — identical
           &gt; synonym &gt; related &gt; antonym &gt; cross-language &gt; unrelated.
         </p>
 

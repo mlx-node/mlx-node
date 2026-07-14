@@ -191,8 +191,8 @@ export function AttentionChapterBody() {
           the next word. To guess well you have to look back at the earlier tokens: <code>cat</code> tells you the
           subject is an animal, <code>sat</code> tells you it's resting on something, <code>on the</code> tells you a
           noun is coming next. Self-attention is a learned, tunable-by-training version of that "look back": for every token
-          in the sequence the model decides <em>how much</em> it should pay attention to every other token. The panel on
-          the right runs exactly this prompt and shows you the attention pattern.
+          in the sequence the model decides <em>how much</em> it should pay attention to every other token. This panel
+          runs exactly this prompt and shows you the attention pattern.
         </p>
 
         <h2>Same word, same starting vector</h2>
@@ -315,7 +315,7 @@ export function AttentionChapterBody() {
           So before the softmax we set the upper-triangle of <code>QKᵀ</code> to <code>-∞</code> (equivalently, add a
           mask matrix that's <code>0</code> on and below the diagonal and <code>-∞</code> above, then softmax each row).
           After softmax those cells become exactly <code>0</code> — token <em>i</em> can only attend to keys{' '}
-          <em>0 … i</em>. The heatmap on the right is <strong>lower-triangular</strong> for exactly this reason. The
+          <em>0 … i</em>. The heatmap here is <strong>lower-triangular</strong> for exactly this reason. The
           bottom row — the last token of the prompt — is the only row that sees the whole prompt, which is why{' '}
           <em>that</em> row produces the next-token prediction.
         </p>
@@ -336,7 +336,7 @@ export function AttentionChapterBody() {
 
         <h2>What each cell in the heatmap means</h2>
         <p>
-          The heatmap on the right is exactly the <code>softmax(QKᵀ/√d)</code> matrix for one layer and one head:
+          The heatmap here is exactly the <code>softmax(QKᵀ/√d)</code> matrix for one layer and one head:
         </p>
         <ul>
           <li>
@@ -370,7 +370,7 @@ export function AttentionChapterBody() {
           One subtlety about <em>this</em> model: it is hybrid. Only every 4th layer — 6 of its 24 — uses the full
           softmax self-attention you have been reading about. The other 18 use a cheaper linear-attention variant
           (GatedDeltaNet) that keeps a fixed-size running state instead of attending over all past tokens (covered in the
-          KV-cache chapter). The live heatmap on the right reflects that: scrub the layer slider onto one of the 6
+          KV-cache chapter). The live heatmap here reflects that: scrub the layer slider onto one of the 6
           full-attention layers to see real scores; land on a linear layer and the panel just notes that it does not
           expose a softmax attention matrix.
         </p>
@@ -398,7 +398,7 @@ export function AttentionChapterBody() {
         <CausalMaskVisual />
 
         <p className="mt-6 text-muted-foreground">
-          Hit <em>Run</em> on the right. The model's predicted next token appears at the end of the prompt with a
+          Hit <em>Run</em> in the interactive panel. The model's predicted next token appears at the end of the prompt with a
           rainbow shimmer, and the heatmap shows the real post-softmax attention scores from the forward pass that
           produced it. Edit the prompt or change layer / head to watch the pattern (and the prediction) change.
         </p>

@@ -209,7 +209,7 @@ export function LmHeadChapterBody() {
         <p>
           This is why you'll sometimes see plausible-looking tokens you didn't expect at the top of the top-K: their
           rows happen to be aligned with the hidden state, even if the model wouldn't end up sampling them. The top-K
-          panel on the right will show this concretely once you hit Run.
+          panel here will show this concretely once you hit Run.
         </p>
 
         <h2>Weight tying: the same matrix, used twice</h2>
@@ -242,7 +242,7 @@ export function LmHeadChapterBody() {
           beyond a few billion parameters sometimes <em>untie</em> the head. For Qwen3.5-0.8B, the savings dominate.
         </p>
 
-        <h2>What you'll see on the right</h2>
+        <h2>What you'll see</h2>
         <p>
           The panel runs one inspector call: tokenize the prompt, run a forward pass, capture the top-K logits at the
           last position, render them as bars. Each row is one of the <code>{TOP_K}</code> highest-logit vocab tokens;

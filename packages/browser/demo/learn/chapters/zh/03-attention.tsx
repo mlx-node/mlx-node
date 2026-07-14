@@ -136,7 +136,7 @@ export function AttentionChapterBody() {
           想象你是模型，有人递给你提示词 <code>"The cat sat on the ___"</code>，让你猜下一个词。要猜得好，你必须回看前面的
           token：<code>cat</code> 告诉你主语是一只动物，<code>sat</code> 告诉你它正停在某个东西上，<code>on the</code>{' '}
           告诉你接下来要出现一个名词。自注意力就是这种“回看”的可学习、可被训练调节的版本：对序列中的每一个
-          token，模型决定它应该对其他每个 token 投入<em>多少</em>注意力。右侧面板运行的正是这条提示词，并展示它的注意力模式。
+          token，模型决定它应该对其他每个 token 投入<em>多少</em>注意力。本节的面板运行的正是这条提示词，并展示它的注意力模式。
         </p>
 
         <h2>同一个词，同一个起点向量</h2>
@@ -240,7 +240,7 @@ export function AttentionChapterBody() {
         <p>
           所以在 softmax 之前，我们把 <code>QKᵀ</code> 的上三角设为 <code>-∞</code>（等价地，加上一个对角线及以下为{' '}
           <code>0</code>、对角线以上为 <code>-∞</code> 的掩码矩阵，再逐行 softmax）。softmax 之后这些格子恰好变成{' '}
-          <code>0</code>——token <em>i</em> 只能注意 key <em>0 … i</em>。右侧热力图呈<strong>下三角</strong>
+          <code>0</code>——token <em>i</em> 只能注意 key <em>0 … i</em>。这里的热力图呈<strong>下三角</strong>
           正是这个原因。最下面一行——提示词的最后一个 token——是唯一能看到整条提示词的一行，所以下一个 token 的预测由
           <em>那一行</em>产生。
         </p>
@@ -258,7 +258,7 @@ export function AttentionChapterBody() {
 
         <h2>热力图里每个格子的含义</h2>
         <p>
-          右侧热力图正是某一层、某一个头的 <code>softmax(QKᵀ/√d)</code> 矩阵：
+          这里的热力图正是某一层、某一个头的 <code>softmax(QKᵀ/√d)</code> 矩阵：
         </p>
         <ul>
           <li>
@@ -289,7 +289,7 @@ export function AttentionChapterBody() {
         <p>
           关于<em>这个</em>模型的一个细节：它是混合架构。只有每第 4 层——24 层中的 6 层——使用你一直在读的完整 softmax
           自注意力。其余 18 层使用更便宜的线性注意力变体（GatedDeltaNet），它维护固定大小的滚动状态，而不是对所有过去的
-          token 做注意力（KV 缓存一章会讲）。右侧的实时热力图反映了这一点：把层滑块拨到 6
+          token 做注意力（KV 缓存一章会讲）。这里的实时热力图反映了这一点：把层滑块拨到 6
           个全量注意力层之一就能看到真实分数；落在线性层上时，面板只会提示该层不输出 softmax 注意力矩阵。
         </p>
         <p className="text-muted-foreground">
@@ -315,7 +315,7 @@ export function AttentionChapterBody() {
         <CausalMaskVisual />
 
         <p className="mt-6 text-muted-foreground">
-          在右侧点击 <em>Run</em>。模型预测的下一个 token
+          在交互面板中点击 <em>Run</em>。模型预测的下一个 token
           会带着一道彩虹流光出现在提示词末尾，热力图展示的是产生该预测的那次前向传播中真实的 softmax
           后注意力分数。编辑提示词，或者换一个层/头，观察模式（和预测）如何变化。
         </p>

@@ -276,7 +276,7 @@ export function RopeChapterBody() {
           偏移上应该如何表现，而这天然地泛化到它从未见过的长度。
         </p>
         <p>
-          右侧第三个面板把这一点变得具体。把 query 位置固定在 <code>m = {DOT_QUERY_POS}</code>、变动 key 位置{' '}
+          本节第三个面板把这一点变得具体。把 query 位置固定在 <code>m = {DOT_QUERY_POS}</code>、变动 key 位置{' '}
           <code>n</code>，旋转后的点积在 <code>n - m = 0</code>{' '}
           处出现尖锐峰值，并随着距离拉远向两侧（带着涟漪地）衰减。这种衰减正是让注意力天然“偏爱”近处 token
           胜过远处 token 的归纳偏置——而且完全不需要逐位置的参数。

@@ -241,7 +241,7 @@ export function ResidualStream() {
           <button
             type="button"
             onClick={() => setPlaying((p) => !p)}
-            className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
+            className="rounded border border-border/60 bg-muted/40 inline-flex items-center justify-center px-2 py-0.5 text-[11px] max-sm:min-h-[44px] max-sm:min-w-[44px] hover:bg-muted/70"
             aria-pressed={playing}
           >
             {playing ? copy.pause : copy.play}
@@ -252,7 +252,7 @@ export function ResidualStream() {
               setPlaying(false);
               setStep((s) => (s - 1 + (STEP_LABELS.length + 1)) % (STEP_LABELS.length + 1));
             }}
-            className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
+            className="rounded border border-border/60 bg-muted/40 inline-flex items-center justify-center px-2 py-0.5 text-[11px] max-sm:min-h-[44px] max-sm:min-w-[44px] hover:bg-muted/70"
             aria-label={copy.prevStepAria}
           >
             ◀
@@ -263,7 +263,7 @@ export function ResidualStream() {
               setPlaying(false);
               setStep((s) => (s + 1) % (STEP_LABELS.length + 1));
             }}
-            className="rounded border border-border/60 bg-muted/40 px-2 py-0.5 text-[11px] hover:bg-muted/70"
+            className="rounded border border-border/60 bg-muted/40 inline-flex items-center justify-center px-2 py-0.5 text-[11px] max-sm:min-h-[44px] max-sm:min-w-[44px] hover:bg-muted/70"
             aria-label={copy.nextStepAria}
           >
             ▶

@@ -438,7 +438,7 @@ export function SpeculativeDecodeDiagram() {
             onClick={() => step(-1)}
             disabled={phase === 0}
             aria-label={copy.prevAria}
-            className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
+            className="inline-flex items-center justify-center max-sm:min-h-[40px] max-sm:min-w-[40px] rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
           >
             ‹
           </button>
@@ -447,7 +447,7 @@ export function SpeculativeDecodeDiagram() {
             onClick={() => step(1)}
             disabled={phase === PHASES - 1}
             aria-label={copy.nextAria}
-            className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
+            className="inline-flex items-center justify-center max-sm:min-h-[40px] max-sm:min-w-[40px] rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-30"
           >
             ›
           </button>

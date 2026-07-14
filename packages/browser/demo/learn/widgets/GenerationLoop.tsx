@@ -162,7 +162,7 @@ export function GenerationLoop() {
           type="button"
           onClick={() => setPlaying((p) => !p)}
           aria-pressed={playing}
-          className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+          className="rounded px-2.5 py-1 max-sm:py-2 max-sm:min-h-[44px] text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
         >
           {playing ? copy.pause : copy.play}
         </button>

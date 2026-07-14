@@ -71,7 +71,7 @@ export const learning: ChapterLearningData = {
   ],
   exercise: {
     prompt:
-      '自动运行结束后，通道图默认选中 Q0，右侧的并排对比把它和同组的 Q1 放在一起。点一点同组里其余的 Q0–Q3 芯片，对比它们的热力图。这些模式是完全相同、彼此相似，还是差异很大？',
+      '自动运行结束后，通道图默认选中 Q0，并排对比把它和同组的 Q1 放在一起。点一点同组里其余的 Q0–Q3 芯片，对比它们的热力图。这些模式是完全相同、彼此相似，还是差异很大？',
     answer:
       '它们共享同一份 K 和 V，所以模式“押韵”但并不相同——两者仍会点亮相似的 key 位置，但每行的权重不同，因为 Q0 和 Q1 各有自己的 Wq。这正是 GQA 保留下来的东西：同样的 key，不同的问题。',
   },
@@ -347,7 +347,7 @@ export function MultiheadGqaChapterBody() {
         <MhaVsGqaCacheBar />
 
         <p className="mt-6 text-muted-foreground">
-          右侧的小部件运行与第 4 章相同的 <code>"The cat sat on the"</code>{' '}
+          这里的小部件运行与第 4 章相同的 <code>"The cat sat on the"</code>{' '}
           提示词，并在末尾用彩虹流光“幽灵”出模型预测的下一个 token。上方的通道图展示哪些 query 头共享哪个 K/V
           头；下方的双联热力图对比同组的两个 query 头——相同的 K、不同的 Q，因此在同样的 key
           上呈现出不同的注意力模式。

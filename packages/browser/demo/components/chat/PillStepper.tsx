@@ -94,7 +94,9 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
               border: '1px solid var(--border)',
               color: 'var(--text)',
               fontFamily: 'var(--font-mono)',
-              fontSize: 12,
+              // 16px so iOS Safari doesn't auto-zoom the page when this numeric
+              // input is focused (any <16px input triggers the zoom).
+              fontSize: 16,
               textAlign: 'center',
             }}
           />

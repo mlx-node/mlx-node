@@ -106,7 +106,7 @@ const COPY = {
     takeawayEnd: (n: number) =>
       `After ${n} tokens: full attention is storing ${n} entries (and would keep growing); the running state is still one slot.`,
     takeawayStart:
-      'Feed a token to start. Watch the left side grow by one box each step while the right side updates one slot in place.',
+      'Feed a token to start. Watch the full-attention cache grow by one box each step while the running state updates one slot in place.',
     takeawayProgress: (fed: number) =>
       `${fed} token${fed === 1 ? '' : 's'} fed: full attention now holds ${fed} entries; the running state is still exactly one slot.`,
     liveSummary: (fed: number, n: number, s: string, lastText: string | undefined) =>
@@ -177,7 +177,7 @@ const COPY = {
     oneUnit: '1 个单元',
     takeawayEnd: (n: number) =>
       `${n} 个 token 之后：全量注意力已存下 ${n} 条记录（而且还会继续增长）；运行状态仍然只有一个槽位。`,
-    takeawayStart: '喂入一个 token 开始。注意左边每一步都多出一个格子，而右边只是原地更新同一个槽位。',
+    takeawayStart: '喂入一个 token 开始。注意全量注意力缓存每一步都多出一个格子，而运行状态只是原地更新同一个槽位。',
     takeawayProgress: (fed: number) =>
       `已喂入 ${fed} 个 token：全量注意力现在存着 ${fed} 条记录；运行状态仍然恰好是一个槽位。`,
     liveSummary: (fed: number, n: number, s: string, lastText: string | undefined) =>

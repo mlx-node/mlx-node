@@ -243,7 +243,7 @@ export function KvCacheChapterBody() {
         <p>
           在 {LINEAR_NUM_HEADS} 个线性头、<code>head_dim = {LINEAR_HEAD_DIM}</code> 的配置下，每个线性层的状态恒为{' '}
           <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code>，与上下文无关。所以 Qwen3.5-0.8B 的总缓存是{' '}
-          <code>6 × full + 18 × constant</code>——右侧的图表把它和一个每层都用全量注意力的假想 Qwen 画在了一起。
+          <code>6 × full + 18 × constant</code>——这里的图表把它和一个每层都用全量注意力的假想 Qwen 画在了一起。
         </p>
         <p>
           这也正是模型那个完整的{' '}
@@ -326,7 +326,7 @@ export function KvCacheChapterBody() {
         <KvGrowthCurve />
 
         <p className="mt-6 text-muted-foreground">
-          右侧的小组件画出了 MHA、纯 GQA 和 Qwen3.5
+          这里的小组件画出了 MHA、纯 GQA 和 Qwen3.5
           混合布局的缓存曲线；拖动上下文滑块即可读出任意长度下的内存占用。它下方的层条展示精确的交错方式——点击任意一层，可查看该层在当前上下文长度下的缓存形态。
         </p>
       </Prose>

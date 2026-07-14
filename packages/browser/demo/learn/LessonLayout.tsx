@@ -103,25 +103,46 @@ export function LessonLayout({
           // `h-8 px-2` floors it to a real ~32x32 target matching the neighboring
           // `size="sm"` Buttons (also `h-8`), and `-mx-2` outsets that padding as
           // pure hit area so the icon's position and the row height are unchanged.
-          className="-mx-2 inline-flex h-8 shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground"
+          className="-mx-2 inline-flex h-11 shrink-0 items-center gap-2 px-2 text-sm text-muted-foreground hover:text-foreground sm:h-8"
         >
           <ArrowLeftIcon className="size-4" />
           <span className="sr-only sm:not-sr-only">{ui.lessonLayout.allChapters}</span>
         </button>
         <div className="min-w-0 flex-1 truncate text-center font-mono text-[0.65rem] uppercase tracking-[0.1em] text-muted-foreground sm:text-xs sm:tracking-[0.15em]">
-          {ui.lessonLayout.breadcrumb(current.number, current.title)}
-          {sectionTitle ? <span className="text-foreground/80"> › {sectionTitle}</span> : null}
+          {sectionTitle ? (
+            <>
+              {/* In a sub-chapter the full "Chapter N · Title › Section" crumb
+                  truncates to "Chapter N · Ti…" on a phone, dropping the section's
+                  own identity. Below sm, show just the section title (its most
+                  specific name); the full breadcrumb returns from sm up. */}
+              <span className="hidden sm:inline">
+                {ui.lessonLayout.breadcrumb(current.number, current.title)}
+              </span>
+              <span className="hidden text-foreground/80 sm:inline"> › </span>
+              <span className="text-foreground/80">{sectionTitle}</span>
+            </>
+          ) : (
+            ui.lessonLayout.breadcrumb(current.number, current.title)
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-1 sm:gap-2">
           {/* Global pre-load affordance. Hidden once the model is ready (there
               is nothing left to load); omit `onLoadModel` to drop it entirely. */}
+          {/* Hidden on mobile: the interactive "Try it now" panel (and the chat
+              overlay) each carry their own load CTA there, so the header stays
+              uncluttered and the breadcrumb keeps its width. */}
           {onLoadModel && !modelReady ? (
-            <Button variant="outline" size="sm" onClick={onLoadModel} className="gap-2">
+            <Button variant="outline" size="sm" onClick={onLoadModel} className="hidden gap-2 sm:inline-flex">
               <DownloadIcon className="size-4" />
               <span className="sr-only sm:not-sr-only">{ui.lessonLayout.loadModel}</span>
             </Button>
           ) : null}
-          <Button variant="ghost" size="sm" onClick={onOpenFreeChat} className="gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onOpenFreeChat}
+            className="h-11 w-11 gap-2 sm:h-8 sm:w-auto"
+          >
             <MessageSquareIcon className="size-4" />
             <span className="sr-only sm:not-sr-only">{ui.lessonLayout.freeChat}</span>
           </Button>
@@ -146,7 +167,7 @@ export function LessonLayout({
           />
         </aside>
 
-        <main ref={mainRef} className="min-h-0 overflow-y-auto px-8 py-10">
+        <main ref={mainRef} className="min-h-0 overflow-y-auto px-5 py-8 sm:px-8 sm:py-10">
           {/* Chapters with a try-it panel keep their natural (narrow) reading
               column from the 3-col grid. Panel-less chapters span the whole
               remaining width, so we cap and center their body: pure-reading
@@ -163,7 +184,10 @@ export function LessonLayout({
         </main>
 
         {hasTryIt ? (
-          <section ref={tryItRef} className="min-h-0 overflow-y-auto border-l border-border bg-card/30 p-6">
+          <section
+            ref={tryItRef}
+            className="min-h-0 overflow-y-auto border-t border-border bg-card/30 p-6 lg:border-t-0 lg:border-l"
+          >
             <div className="mb-4 flex items-center gap-2">
               <PlayIcon className="size-4 text-primary" />
               <h2 className="text-sm font-semibold uppercase tracking-wider text-foreground">

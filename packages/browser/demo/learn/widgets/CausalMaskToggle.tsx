@@ -200,20 +200,27 @@ export function CausalMaskToggle() {
           <button
             type="button"
             onClick={() => setMaskOn((v) => !v)}
-            className={[
-              'relative inline-flex h-6 w-11 items-center rounded-full border transition-colors duration-200',
-              maskOn ? 'border-primary/50 bg-primary/30' : 'border-amber-500/50 bg-amber-500/30',
-            ].join(' ')}
+            // 44px-tall transparent hit area (touch floor) wrapping the visual
+            // pill — grows the tap target without inflating the h-6 rounded-full
+            // switch itself (which would render as a tall distorted stadium).
+            className="inline-flex min-h-[44px] items-center"
             role="switch"
             aria-checked={maskOn}
             aria-label={copy.toggleAria}
           >
             <span
               className={[
-                'inline-block size-4 rounded-full bg-background shadow transition-transform duration-200',
-                maskOn ? 'translate-x-6' : 'translate-x-1',
+                'relative inline-flex h-6 w-11 items-center rounded-full border transition-colors duration-200',
+                maskOn ? 'border-primary/50 bg-primary/30' : 'border-amber-500/50 bg-amber-500/30',
               ].join(' ')}
-            />
+            >
+              <span
+                className={[
+                  'inline-block size-4 rounded-full bg-background shadow transition-transform duration-200',
+                  maskOn ? 'translate-x-6' : 'translate-x-1',
+                ].join(' ')}
+              />
+            </span>
           </button>
           <span
             className={[

@@ -118,7 +118,7 @@ export function TokenizationChapterBody() {
           在 Transformer 能对你的句子做任何事情之前，句子必须先被切成模型认识的片段。这些片段叫作{' '}
           <strong>token</strong>（词元），而决定从哪里下刀的规则叫作<em>分词器</em>。token
           既不是字符，也不是词——它介于两者之间，由一种叫<strong>字节对编码（Byte-Pair Encoding，BPE）</strong>
-          的算法选出。右侧的小部件在你的浏览器里运行 Qwen3.5 的原版分词器。敲几个字，看色块实时刷新。
+          的算法选出。这里的小部件在你的浏览器里运行 Qwen3.5 的原版分词器。敲几个字，看色块实时刷新。
         </p>
 
         <h2>为什么是子词？</h2>
@@ -149,7 +149,7 @@ export function TokenizationChapterBody() {
           <li>
             <strong>空格住在 token 里面。</strong>BPE 算法把带空格前缀的词和裸词当作两个不同的符号，所以句首的{' '}
             <code>"cat"</code> 和句中的 <code>" cat"</code>{' '}
-            通常是两个不同的 token。右侧的色块用一个小圆点（<code>·</code>
+            通常是两个不同的 token。这里的色块用一个小圆点（<code>·</code>
             ）标出前导空格，让你能看见这件原本不可见的事。
           </li>
           <li>

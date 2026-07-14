@@ -368,7 +368,7 @@ export function RopeChapterBody() {
           lengths it has never seen.
         </p>
         <p>
-          The third panel on the right makes this concrete. Holding the query position fixed at{' '}
+          The third panel in this section makes this concrete. Holding the query position fixed at{' '}
           <code>m = {DOT_QUERY_POS}</code> and varying the key position <code>n</code>, the rotated dot product peaks
           sharply at <code>n - m = 0</code> and falls off (with ripples) either side as you move further apart. That
           fall-off is exactly the inductive bias that makes attention "want" nearby tokens more than distant ones, with

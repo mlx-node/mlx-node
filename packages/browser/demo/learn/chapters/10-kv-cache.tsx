@@ -296,7 +296,7 @@ export function KvCacheChapterBody() {
         <p>
           With {LINEAR_NUM_HEADS} linear heads at <code>head_dim = {LINEAR_HEAD_DIM}</code>, each linear layer's state
           is a constant <code>{formatBytes(LINEAR_STATE_SIZE_BYTES)}</code> regardless of context. So total cache for
-          Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart on the right plots that against a
+          Qwen3.5-0.8B is <code>6 × full + 18 × constant</code> — the chart here plots that against a
           hypothetical Qwen with full attention on every layer.
         </p>
         <p>
@@ -395,7 +395,7 @@ export function KvCacheChapterBody() {
         <KvGrowthCurve />
 
         <p className="mt-6 text-muted-foreground">
-          The right-hand widget plots the cache curves for MHA, GQA-only, and Qwen3.5's hybrid layout; drag the context
+          The interactive widget here plots the cache curves for MHA, GQA-only, and Qwen3.5's hybrid layout; drag the context
           slider to read off memory at any length. The layer strip below it shows the exact interleave — click any layer
           to see what its cache looks like at the current context length.
         </p>

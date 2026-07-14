@@ -238,14 +238,14 @@ export function FlashTrafficDiagram() {
                 type="button"
                 onClick={() => setPlaying((p) => !p)}
                 aria-pressed={playing}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
+                className="rounded px-2.5 py-1 max-sm:py-2 max-sm:min-h-[44px] text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
               >
                 {playing ? copy.pause : copy.play}
               </button>
               <button
                 type="button"
                 onClick={step}
-                className="rounded px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
+                className="rounded px-2.5 py-1 max-sm:py-2 max-sm:min-h-[44px] text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary"
               >
                 {copy.step}
               </button>

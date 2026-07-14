@@ -231,7 +231,7 @@ const EN: UiStrings = {
     eyebrow: 'Learn LLMs · powered by Qwen3.5 in your browser',
     heading: 'Chapters',
     description: (n) =>
-      `${n} guided lessons that explain how a modern transformer LLM works, using the real model running in your browser via WebGPU. Read the prose on the left, then poke at the live model on the right.`,
+      `${n} guided lessons that explain how a modern transformer LLM works, using the real model running in your browser via WebGPU. Read the prose, then poke at the live model as you go.`,
     chapterChip: (padded) => `Ch. ${padded}`,
     readyBadge: 'Ready',
     comingSoonBadge: 'Coming soon',
@@ -424,7 +424,7 @@ const ZH: UiStrings = {
     eyebrow: '学习 LLM · 由浏览器中的 Qwen3.5 驱动',
     heading: '章节',
     description: (n) =>
-      `${n} 节循序渐进的课程，讲解现代 Transformer LLM 的工作原理——真实模型通过 WebGPU 在你的浏览器里运行。左边读讲解，右边动手玩真实模型。`,
+      `${n} 节循序渐进的课程，讲解现代 Transformer LLM 的工作原理——真实模型通过 WebGPU 在你的浏览器里运行。先读讲解，再动手玩真实模型。`,
     chapterChip: (padded) => `第 ${padded} 章`,
     readyBadge: '可学习',
     comingSoonBadge: '即将上线',

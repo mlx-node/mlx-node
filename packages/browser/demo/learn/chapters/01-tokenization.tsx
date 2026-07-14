@@ -157,7 +157,7 @@ export function TokenizationChapterBody() {
           Before a transformer can do anything with your sentence, the sentence has to be cut into pieces the model
           knows. Those pieces are called <strong>tokens</strong>, and the rule that decides where the cuts go is called
           the <em>tokenizer</em>. Tokens are not characters, and they are not words — they are something in between,
-          chosen by an algorithm called <strong>Byte-Pair Encoding (BPE)</strong>. The widget on the right runs
+          chosen by an algorithm called <strong>Byte-Pair Encoding (BPE)</strong>. The interactive widget here runs
           Qwen3.5's exact tokenizer in your browser. Type, watch the chips refresh.
         </p>
 
@@ -196,7 +196,7 @@ export function TokenizationChapterBody() {
           <li>
             <strong>Spaces live inside tokens.</strong> The BPE algorithm treats a space-prefixed word as a different
             symbol from the bare word, so <code>"cat"</code> at the start of a sentence and <code>" cat"</code>{' '}
-            mid-sentence are usually two different tokens. The chips on the right mark a leading space with a small dot
+            mid-sentence are usually two different tokens. The token chips here mark a leading space with a small dot
             (<code>·</code>) so you can see this without it being invisible.
           </li>
           <li>

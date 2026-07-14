@@ -415,6 +415,33 @@ export function QuantMethodsMap() {
         })}
       </svg>
 
+      {/* Touch-friendly method selector: real buttons with ≥44px tap targets for
+          coarse pointers. The SVG dots above stay for fine (mouse) pointers. */}
+      <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.heading}>
+        {METHODS.map((m) => {
+          const isSel = m.id === selected;
+          const color = m.quant === 'weight' ? EMERALD : 'var(--primary)';
+          return (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => setSelected(m.id)}
+              aria-pressed={isSel}
+              aria-label={copy.pickAria(m.label)}
+              className={[
+                'min-h-[44px] inline-flex items-center px-3 rounded border font-mono text-xs transition-colors',
+                isSel
+                  ? 'border-primary text-foreground ring-1 ring-primary'
+                  : 'border-border/60 text-muted-foreground hover:bg-foreground/5',
+              ].join(' ')}
+            >
+              <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ background: color }} />
+              {m.label}
+            </button>
+          );
+        })}
+      </div>
+
       {/* axis-honesty note */}
       <p className="text-[11px] text-muted-foreground">{copy.axisNote}</p>
 

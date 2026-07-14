@@ -406,7 +406,7 @@ export function MultiheadGqaChapterBody() {
         <MhaVsGqaCacheBar />
 
         <p className="mt-6 text-muted-foreground">
-          The widget on the right runs the same <code>"The cat sat on the"</code> prompt as chapter 4 and ghosts the
+          The interactive widget here runs the same <code>"The cat sat on the"</code> prompt as chapter 4 and ghosts the
           model's predicted next token at the end with a rainbow shimmer. The lane diagram above shows which query heads
           share which K/V head, and the two-up heatmaps below compare two query heads in the same group — same K,
           different Q, so different attention patterns over the same keys.

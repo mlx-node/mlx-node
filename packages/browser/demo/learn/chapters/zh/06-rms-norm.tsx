@@ -138,7 +138,7 @@ export function RmsNormChapterBody() {
         <h1>RMSNorm：让激活值保持可控</h1>
         <p>
           <strong>一句话：</strong>Qwen3.5 的 24 层中，每一层都把注意力和 MLP 的输出加回同一条残差流——如果没有什么东西约束幅值，隐藏向量会一直增长，直到
-          softmax 饱和、梯度更新失去意义。RMSNorm 就是那个便宜、几乎无状态、负责踩刹车的小技巧。右侧图表展示了一个真实
+          softmax 饱和、梯度更新失去意义。RMSNorm 就是那个便宜、几乎无状态、负责踩刹车的小技巧。这里的图表展示了一个真实
           prompt 的情况：残差流仍随深度爬升大约一个数量级（下方可见的那条线），但每个子模块的输入被 RMSNorm 按平在
           √hidden_dim 附近（粉色线）。
         </p>

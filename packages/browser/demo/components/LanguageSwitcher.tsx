@@ -43,7 +43,9 @@ export function LanguageSwitcher({ className }: { className?: string }) {
             aria-pressed={active}
             onClick={() => switchTo(l)}
             className={[
-              'rounded-md border px-2 py-1 text-xs font-medium transition-colors outline-none',
+              // 44px tap target on touch/small screens, compact (h-8, matching the
+              // header's other controls) from sm up.
+              'inline-flex min-h-11 items-center justify-center rounded-md border px-3 py-1 text-xs font-medium transition-colors outline-none sm:min-h-8',
               'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50',
               active
                 ? 'border-primary/60 bg-primary/10 text-foreground'

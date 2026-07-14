@@ -20,14 +20,14 @@ const COPY = {
     loadModel: 'Load a model',
     initializing: 'Initializing model…',
     progressAria: (pct: number) => `Loading progress ${pct}%`,
-    readyOnLeft: 'The lesson is ready to read on the left — this panel will light up when the model finishes.',
+    readyOnLeft: 'The lesson is ready to read — this panel will light up when the model finishes.',
   },
   zh: {
     needsModel: '这个在线演示需要加载模型。',
     loadModel: '加载模型',
     initializing: '正在初始化模型……',
     progressAria: (pct: number) => `加载进度 ${pct}%`,
-    readyOnLeft: '左侧的课文已经可以阅读——模型就绪后，这个面板会自动亮起。',
+    readyOnLeft: '课文已经可以阅读——模型就绪后，这个面板会自动亮起。',
   },
 } as const;
 

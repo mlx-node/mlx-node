@@ -239,7 +239,7 @@ export function RmsNormChapterBody() {
           output and MLP output back into the same residual stream — without something holding magnitudes in check,
           the hidden vector grows until softmaxes
           saturate and gradient updates stop being meaningful. RMSNorm is the cheap, almost-stateless trick that puts
-          the brakes on. The chart on the right shows a real prompt: the residual still climbs roughly an order of
+          the brakes on. The chart here shows a real prompt: the residual still climbs roughly an order of
           magnitude over depth (visible bottom line), but the input to each sub-block is held flat near √hidden_dim by
           RMSNorm (pink line).
         </p>

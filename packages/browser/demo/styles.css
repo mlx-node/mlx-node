@@ -1116,9 +1116,11 @@
     border: 1px solid rgba(244, 200, 215, 0.4);
     color: var(--book-pink);
     border-radius: 6px;
-    padding: 3px 8px;
+    /* 10px min for an interactive label (9px is below the legibility floor on a
+       phone); a touch more padding gives the tap a little more room. */
+    padding: 4px 10px;
     font-family: var(--font-mono);
-    font-size: 9px;
+    font-size: 10px;
     cursor: pointer;
   }
   .inline-preview-frame {
@@ -1300,6 +1302,61 @@
       transform: translateX(0);
       opacity: 1;
     }
+  }
+}
+
+/* ── Mobile / touch polish ──────────────────────────────────────────────
+   Unlayered (so it beats the @layer components base rules on the cascade).
+   `pointer: coarse` = touch ergonomics that must NOT change desktop-pointer
+   pixels (44px tap floor, iOS no-zoom input font). `max-width: 640px` =
+   narrow-screen spacing. Together these clear the chat-surface tap-target and
+   iOS-zoom findings without touching the desktop layout. */
+@media (pointer: coarse) {
+  /* Raise the chat control cluster to the ~44px touch floor. The composer row
+     is align-items:flex-end, so taller controls stay bottom-aligned with the
+     growing textarea. composer-icon-btn is also reused by the PillStepper +/-. */
+  .composer-icon-btn,
+  .composer-send {
+    width: 44px;
+    height: 44px;
+  }
+  .pill {
+    height: 40px;
+    padding: 0 14px;
+  }
+  .btn-reset {
+    padding: 11px 16px;
+  }
+  .assistant-inspect-btn {
+    padding: 8px 14px;
+  }
+  /* 16px is the exact iOS Safari auto-zoom threshold: focusing an input below
+     it zooms the whole page in and never zooms back. Keep the field at 16px on
+     touch so the chat UI never jerks larger on send. */
+  .composer-textarea {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Recover ~32px of reading/​composing width on the chat surface at 375px. */
+  .chat-messages {
+    padding: 16px 16px 12px;
+  }
+  /* The telemetry strip is a fixed-height NO-wrap flex row (~570px of content);
+     body{overflow:hidden} silently clips its tail off-screen on a phone. Let it
+     scroll instead, and drop the redundant trailing model line. */
+  .telemetry-strip {
+    gap: 8px;
+    letter-spacing: 0.02em;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .telemetry-strip::-webkit-scrollbar {
+    display: none;
+  }
+  .telemetry-strip .right {
+    display: none;
   }
 }
 

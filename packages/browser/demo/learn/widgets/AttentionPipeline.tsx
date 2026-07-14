@@ -383,7 +383,7 @@ function StageBox({ stage, active, onActivate }: { stage: Stage; active: boolean
       ].join(' ')}
     >
       <span className="font-mono">{stage.label}</span>
-      {stage.sub ? <span className="mt-0.5 text-[9px] opacity-70">{stage.sub}</span> : null}
+      {stage.sub ? <span className="mt-0.5 text-[10px] opacity-80">{stage.sub}</span> : null}
     </button>
   );
 }

@@ -176,7 +176,7 @@ export function LmHeadChapterBody() {
 
         <p>
           这就是为什么你有时会在 top-K 顶部看到一些出乎你意料、却看起来还算合理的
-          token：它们的行恰好与隐藏状态对齐，即使模型最终未必会采样它们。点击 Run 之后，右侧的 top-K
+          token：它们的行恰好与隐藏状态对齐，即使模型最终未必会采样它们。点击 Run 之后，这里的 top-K
           面板会具体展示这一点。
         </p>
 
@@ -208,7 +208,7 @@ export function LmHeadChapterBody() {
           风格模型有时会<em>解开</em>（untie）这个头。对 Qwen3.5-0.8B 来说，省下的参数占了上风。
         </p>
 
-        <h2>右侧你将看到什么</h2>
+        <h2>你将看到什么</h2>
         <p>
           该面板执行一次 inspector 调用：对提示词分词、运行一次前向传播、在最后一个位置捕获 top-K
           logits、把它们渲染成柱状图。每一行是 logit 最高的 <code>{TOP_K}</code> 个词表 token

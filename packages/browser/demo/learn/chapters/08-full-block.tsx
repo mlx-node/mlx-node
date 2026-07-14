@@ -248,7 +248,7 @@ export function FullBlockChapterBody() {
           layers); the residual's identity path is what lets it survive. Second, <strong>magnitudes</strong>: the
           residual stream grows in L2 (the vector's length — the √ of the sum of its squared components) with depth,
           since each layer adds a non-zero contribution, while every <em>individual</em> sub-block's output stays small.
-          The 3D widget on the right colors each ring by the per-token L2 of the layer output — you can see the
+          The 3D widget here colors each ring by the per-token L2 of the layer output — you can see the
           magnitude generally climb as you scan up the tower (the trend is upward, though any single layer can dip),
           roughly mirroring the bar growing in the animation.
         </p>

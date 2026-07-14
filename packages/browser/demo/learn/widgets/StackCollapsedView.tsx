@@ -55,7 +55,7 @@ const COPY = {
     intro: (lastIdx: number) => (
       <>
         Each of Qwen3.5's <span className="font-mono">{NUM_LAYERS}</span> layers has the same six-step body. The 3D
-        tower to the right gives you the <em>stack</em> view; this strip gives you the <em>anatomy</em> view, with
+        tower gives you the <em>stack</em> view; this strip gives you the <em>anatomy</em> view, with
         layers 1–{lastIdx - 1} collapsed because they all look exactly like layer 0.
       </>
     ),
@@ -103,7 +103,7 @@ const COPY = {
     identicalBody: `${NUM_LAYERS} 层，结构完全相同`,
     intro: (lastIdx: number) => (
       <>
-        Qwen3.5 的 <span className="font-mono">{NUM_LAYERS}</span> 层中的每一层都有同样的六步结构。右侧的 3D
+        Qwen3.5 的 <span className="font-mono">{NUM_LAYERS}</span> 层中的每一层都有同样的六步结构。旁边的 3D
         塔给你的是<em>堆叠</em>视角；这条横带给你的是<em>解剖</em>视角——第 1–{lastIdx - 1} 层被折叠起来，因为它们和第
         0 层长得一模一样。
       </>
