@@ -262,6 +262,22 @@ function py(y: number) {
 export function QuantMethodsMap() {
   const copy = COPY[useLocale()];
   const [selected, setSelected] = React.useState<MethodId>(DEFAULT_ID);
+  // Below 40rem the map downscales and the SVG dots become too small to tap, so
+  // a touch-friendly <button> chip row replaces them. Expose exactly ONE
+  // interactive selector set per mode — chips when narrow, SVG dots otherwise —
+  // so a method is never focusable/clickable twice.
+  const [narrow, setNarrow] = React.useState(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    return window.matchMedia('(max-width: 639px)').matches;
+  });
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia('(max-width: 639px)');
+    const onChange = (e: MediaQueryListEvent) => setNarrow(e.matches);
+    setNarrow(mql.matches);
+    mql.addEventListener('change', onChange);
+    return () => mql.removeEventListener('change', onChange);
+  }, []);
   const sel = METHODS.find((m) => m.id === selected)!;
   const det = copy.detail[selected];
 
@@ -374,19 +390,26 @@ export function QuantMethodsMap() {
                 cy={cy}
                 r={14}
                 fill="transparent"
-                role="button"
-                tabIndex={0}
-                aria-label={copy.pickAria(m.label)}
-                aria-pressed={isSel}
-                onClick={() => setSelected(m.id)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    setSelected(m.id);
-                  }
-                }}
+                // When narrow, the chip row below is the interactive selector;
+                // deactivate the dots so a method isn't focusable/clickable twice.
+                role={narrow ? undefined : 'button'}
+                tabIndex={narrow ? -1 : 0}
+                aria-hidden={narrow ? true : undefined}
+                aria-label={narrow ? undefined : copy.pickAria(m.label)}
+                aria-pressed={narrow ? undefined : isSel}
+                onClick={narrow ? undefined : () => setSelected(m.id)}
+                onKeyDown={
+                  narrow
+                    ? undefined
+                    : (e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          setSelected(m.id);
+                        }
+                      }
+                }
                 className="cursor-pointer focus-visible:outline-none"
-                style={{ outline: 'none' }}
+                style={{ outline: 'none', pointerEvents: narrow ? 'none' : undefined }}
               />
               {/* selection ring */}
               {isSel ? (
@@ -415,9 +438,11 @@ export function QuantMethodsMap() {
         })}
       </svg>
 
-      {/* Touch-friendly method selector: real buttons with ≥44px tap targets for
-          coarse pointers. The SVG dots above stay for fine (mouse) pointers. */}
-      <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.heading}>
+      {/* Touch-friendly method selector: real ≥44px <button> chips shown ONLY on
+          narrow screens (the SVG dots above are deactivated there), so each
+          method is selectable exactly once per input mode. */}
+      {narrow && (
+        <div className="flex flex-wrap gap-1.5" role="group" aria-label={copy.heading}>
         {METHODS.map((m) => {
           const isSel = m.id === selected;
           const color = m.quant === 'weight' ? EMERALD : 'var(--primary)';
@@ -440,7 +465,8 @@ export function QuantMethodsMap() {
             </button>
           );
         })}
-      </div>
+        </div>
+      )}
 
       {/* axis-honesty note */}
       <p className="text-[11px] text-muted-foreground">{copy.axisNote}</p>

@@ -103,7 +103,7 @@ const COPY = {
     identicalBody: `${NUM_LAYERS} 层，结构完全相同`,
     intro: (lastIdx: number) => (
       <>
-        Qwen3.5 的 <span className="font-mono">{NUM_LAYERS}</span> 层中的每一层都有同样的六步结构。旁边的 3D
+        Qwen3.5 的 <span className="font-mono">{NUM_LAYERS}</span> 层中的每一层都有同样的六步结构。这座 3D
         塔给你的是<em>堆叠</em>视角；这条横带给你的是<em>解剖</em>视角——第 1–{lastIdx - 1} 层被折叠起来，因为它们和第
         0 层长得一模一样。
       </>

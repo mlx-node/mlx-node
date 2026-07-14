@@ -1349,8 +1349,18 @@
   .telemetry-strip {
     gap: 8px;
     letter-spacing: 0.02em;
+    /* Keep the fixed-height row a single scrolling line: children must not
+       shrink or wrap (below, their TEXT would wrap to 2 lines and — because
+       overflow-x:auto promotes overflow-y to auto — the row would clip/scroll
+       vertically). nowrap + overflow-y:hidden pins it to horizontal scroll. */
+    flex-wrap: nowrap;
     overflow-x: auto;
+    overflow-y: hidden;
     scrollbar-width: none;
+  }
+  .telemetry-strip > * {
+    flex: none;
+    white-space: nowrap;
   }
   .telemetry-strip::-webkit-scrollbar {
     display: none;
