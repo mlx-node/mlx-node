@@ -64,6 +64,19 @@ describe('PerformanceStatus', () => {
     expect(print.statuses).toEqual([]);
   });
 
+  it('keeps a completed assistant sample visible while its tool result starts the next turn', () => {
+    const status = new PerformanceStatus();
+    const { ctx, statuses } = makeContext();
+    status.record(MESSAGE, METRICS);
+
+    status.showMessage(messageEnd(), ctx);
+    status.showMessage(messageEnd({ role: 'toolResult' }), ctx);
+
+    expect(statuses).toEqual([
+      ['mlx-performance', '[dim]mlx · prefill 1,234.6 tok/s · decode 42.3 tok/s'],
+    ]);
+  });
+
   it.each([
     { prefillTokensPerSecond: Number.NaN, decodeTokensPerSecond: 10 },
     { prefillTokensPerSecond: 10, decodeTokensPerSecond: Number.POSITIVE_INFINITY },

@@ -27,10 +27,19 @@ describe('createMlxProviderExtension', () => {
     const { handlers, registerProvider } = loadExtension();
 
     expect(registerProvider).toHaveBeenCalledOnce();
-    expect([...handlers.keys()]).toEqual(['message_end', 'turn_start', 'model_select', 'session_shutdown']);
+    expect([...handlers.keys()]).toEqual(['message_end', 'model_select', 'session_shutdown']);
   });
 
-  it.each(['turn_start', 'model_select', 'session_shutdown'])('clears stale TUI performance on %s', (event) => {
+  it('retains the last completed sample through a tool-loop turn boundary', () => {
+    const { handlers } = loadExtension();
+
+    // Pi starts a new turn after a tool result. There must be no turn_start
+    // clear handler: the in-flight response has no replacement metrics until
+    // its terminal event, so the latest completed sample stays informative.
+    expect(handlers.has('turn_start')).toBe(false);
+  });
+
+  it.each(['model_select', 'session_shutdown'])('clears stale TUI performance on %s', (event) => {
     const { handlers } = loadExtension();
     const setStatus = vi.fn();
     const ctx = { mode: 'tui', ui: { setStatus } } as unknown as ExtensionContext;

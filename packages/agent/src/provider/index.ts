@@ -46,9 +46,10 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
       pi.on('message_end', (event, ctx) => {
         performanceStatus.showMessage(event, ctx);
       });
-      pi.on('turn_start', (_event, ctx) => {
-        performanceStatus.clear(ctx);
-      });
+      // Do not clear on turn_start. Pi emits a fresh turn after every tool
+      // result, before the next inference has terminal metrics to replace the
+      // completed sample; clearing here makes the footer disappear precisely
+      // while a long tool-follow-up prefill is running.
       pi.on('model_select', (_event, ctx) => {
         performanceStatus.clear(ctx);
       });

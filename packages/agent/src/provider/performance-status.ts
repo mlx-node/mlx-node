@@ -60,7 +60,7 @@ export class PerformanceStatus {
     ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg('dim', formatSample(sample)));
   }
 
-  /** Prevent a completed turn from the previous model lingering in the footer. */
+  /** Prevent the selected model's completed sample lingering after its lifecycle ends. */
   clear(ctx: ExtensionContext): void {
     if (ctx.mode === 'tui') ctx.ui.setStatus(STATUS_KEY, undefined);
   }
