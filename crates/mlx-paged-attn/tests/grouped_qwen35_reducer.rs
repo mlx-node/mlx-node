@@ -8,7 +8,7 @@
 //! production stripe counts (256, 512, and 1024), including deterministic
 //! empty-stripe sentinels.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use metal::{MTLResourceOptions, MTLSize};
 use mlx_paged_attn::metal::MetalState;

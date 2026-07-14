@@ -1,5 +1,25 @@
 #include "mlx_common.h"
 
+#if defined(__APPLE__) && !defined(MLX_NODE_METAL_ENABLED)
+#include <sys/sysctl.h>
+#endif
+
+#ifdef MLX_NODE_METAL_ENABLED
+#include "mlx/backend/metal/device.h"
+
+namespace mlx::core::fast {
+bool d256_full_sdpa_available(bool effective_dtype_is_float32);
+bool d256_full_sdpa_would_use(
+    bool effective_dtype_is_float32,
+    int32_t query_head_dim,
+    int32_t value_head_dim,
+    int32_t query_length,
+    int32_t key_length,
+    bool do_causal,
+    bool has_array_mask);
+}  // namespace mlx::core::fast
+#endif
+
 // ============================================================================
 // Stream Operations (extern "C" for FFI)
 // ============================================================================
@@ -113,6 +133,136 @@ bool mlx_metal_is_available() {
     return false;
   }
 }
+
+// Check whether the active Metal device can execute MLX's NAX kernels.
+// Keep this fallible C boundary alongside mlx_metal_is_available(): device
+// discovery is lazy and may throw when Metal is unavailable or degraded.
+bool mlx_metal_is_nax_available() {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    return mlx::core::metal::is_nax_available();
+  } catch (...) {
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+
+// Report the runtime capability used by MLX's D=256 full-SDPA dispatcher.
+// `effective_dtype_is_float32` must describe the promoted dtype consumed by
+// scaled_dot_product_attention, not merely the query's original dtype.
+//
+// Return 0 when the probe completed (including a supported non-Metal build,
+// which conservatively reports false), or -1 for an invalid output pointer or
+// a caught C++ exception. The output is initialized to false before probing so
+// every failure is conservative across the FFI boundary.
+int32_t mlx_metal_d256_full_sdpa_available(
+    bool effective_dtype_is_float32,
+    bool* out_available) {
+  if (out_available == nullptr) {
+    return -1;
+  }
+  *out_available = false;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    *out_available = mlx::core::fast::d256_full_sdpa_available(
+        effective_dtype_is_float32);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+#else
+  (void)effective_dtype_is_float32;
+  return 0;
+#endif
+}
+
+// D=256 eligibility probe for tests and planners. This calls the same helper
+// used inside ScaledDotProductAttention::use_fallback; callers still own the
+// dispatcher's outer inference/stream gates. It avoids logging, counters, or
+// atomics on the inference hot path.
+int32_t mlx_metal_d256_full_sdpa_would_use(
+    bool effective_dtype_is_float32,
+    int32_t query_head_dim,
+    int32_t value_head_dim,
+    int32_t query_length,
+    int32_t key_length,
+    bool do_causal,
+    bool has_array_mask,
+    bool* out_would_use) {
+  if (out_would_use == nullptr) {
+    return -1;
+  }
+  *out_would_use = false;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    *out_would_use = mlx::core::fast::d256_full_sdpa_would_use(
+        effective_dtype_is_float32,
+        query_head_dim,
+        value_head_dim,
+        query_length,
+        key_length,
+        do_causal,
+        has_array_mask);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+#else
+  (void)effective_dtype_is_float32;
+  (void)query_head_dim;
+  (void)value_head_dim;
+  (void)query_length;
+  (void)key_length;
+  (void)do_causal;
+  (void)has_array_mask;
+  return 0;
+#endif
+}
+
+#ifndef MLX_NODE_METAL_ENABLED
+// CPU-only bridge definitions for the three entry points normally supplied by
+// mlx_paged_profile.cpp. That translation unit includes Metal/Metal.hpp and is
+// therefore intentionally excluded when MLX_DISABLE_METAL=1 (and on non-Apple
+// builds). Keep these stubs in a translation unit that consumes only MLX's
+// public, backend-neutral headers so a supported CPU-only build can link.
+int32_t mlx_total_system_memory(uint64_t* out_value) {
+#if defined(__APPLE__)
+  size_t memsize = 0;
+  size_t length = sizeof(memsize);
+  if (sysctlbyname("hw.memsize", &memsize, &length, nullptr, 0) != 0) {
+    return -1;
+  }
+  if (out_value != nullptr) {
+    *out_value = static_cast<uint64_t>(memsize);
+  }
+  return 0;
+#else
+  (void)out_value;
+  return -1;
+#endif
+}
+
+int32_t mlx_max_recommended_working_set_size(uint64_t* out_value) {
+  if (out_value != nullptr) {
+    *out_value = 0;
+  }
+  return 0;
+}
+
+mlx_array* mlx_array_from_metal_buffer_view(
+    void* metal_buffer_ptr,
+    const int64_t* dims,
+    size_t ndim,
+    int32_t dtype_code) {
+  (void)metal_buffer_ptr;
+  (void)dims;
+  (void)ndim;
+  (void)dtype_code;
+  return nullptr;
+}
+#endif
 
 // Get Metal device information as JSON string
 // Returns a JSON string with device properties like max_recommended_working_set_size

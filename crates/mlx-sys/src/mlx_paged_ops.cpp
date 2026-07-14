@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -31,6 +32,19 @@
 namespace mlx::core::fast {
 
 namespace {
+
+// The runtime validators establish `value >= 0` and `divisor > 0` before
+// either caller reaches this helper. Widen before arithmetic so INT32_MAX is
+// a valid sequence length rather than overflowing in `value + divisor - 1`.
+constexpr int64_t ceil_div_nonnegative_i32(int32_t value, int32_t divisor) {
+  const int64_t wide_value = static_cast<int64_t>(value);
+  const int64_t wide_divisor = static_cast<int64_t>(divisor);
+  return wide_value / wide_divisor + (wide_value % wide_divisor != 0);
+}
+
+static_assert(
+    ceil_div_nonnegative_i32(std::numeric_limits<int32_t>::max(), 16) ==
+    134217728);
 
 // Derive `x_pack` (the inner-axis vLLM K-pool packing factor) from the
 // on-cache KV dtype. `x_pack` is `16 / sizeof(scalar)`:
@@ -955,12 +969,11 @@ void PagedAttention::eval_gpu(
             << "(including the compile-cached path).";
         throw std::invalid_argument(msg.str());
       }
-      // ceil(s / block_size_); s >= 0 so integer division is fine.
-      const int32_t num_used_blocks =
-          (s + block_size_ - 1) / block_size_;
+      const int64_t num_used_blocks =
+          ceil_div_nonnegative_i32(s, block_size_);
       const size_t row_offset =
           static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
-      for (int32_t j = 0; j < num_used_blocks; ++j) {
+      for (int64_t j = 0; j < num_used_blocks; ++j) {
         const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
         if (blk < 0 || blk >= num_blocks) {
           std::ostringstream msg;
@@ -1541,11 +1554,11 @@ void PagedAttentionVarlen::eval_gpu(
             << "]";
         throw std::invalid_argument(msg.str());
       }
-      const int32_t num_used_blocks =
-          (s + block_size_ - 1) / block_size_;
+      const int64_t num_used_blocks =
+          ceil_div_nonnegative_i32(s, block_size_);
       const size_t row_offset =
           static_cast<size_t>(i) * static_cast<size_t>(max_blocks_per_seq);
-      for (int32_t j = 0; j < num_used_blocks; ++j) {
+      for (int64_t j = 0; j < num_used_blocks; ++j) {
         const int32_t blk = block_table_data[row_offset + static_cast<size_t>(j)];
         if (blk < 0 || blk >= num_blocks) {
           std::ostringstream msg;
@@ -5426,7 +5439,7 @@ int mlx_paged_kv_write_eval_gpu_rejects_zero_kv_heads() {
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
 /// validator must reject; otherwise the runtime bounds check would
-/// compute `(s + block_size_ - 1) / block_size_` and divide by zero.
+/// divide the sequence length by `block_size_` in host code.
 int mlx_paged_kv_write_eval_gpu_rejects_zero_block_size() {
   try {
     using namespace mlx::core::fast;
@@ -5649,7 +5662,7 @@ int mlx_paged_attention_eval_gpu_rejects_sliding_window() {
 
 /// Primitive directly constructed with `block_size_=0`. eval_gpu's
 /// validator must reject; otherwise the runtime bounds check would
-/// divide `(s + block_size_ - 1) / block_size_` by zero in host code,
+/// divide the sequence length by `block_size_` in host code,
 /// crashing the process before the `max_context_len <= 0` guard runs.
 int mlx_paged_attention_eval_gpu_rejects_zero_block_size() {
   try {

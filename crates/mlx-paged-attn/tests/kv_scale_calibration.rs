@@ -28,7 +28,7 @@
 //! determinism regressions on those hosts. Run on Metal-capable machines
 //! with `cargo test -p mlx-paged-attn -- --ignored`.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use mlx_paged_attn::metal::KvScaleManager;
 

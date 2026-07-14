@@ -45,7 +45,7 @@
 //! tests run on every host that successfully linked the mlx-sys
 //! library.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use std::ffi::c_void;
 

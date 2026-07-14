@@ -2,8 +2,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::array::MxArray;
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::{DType, MxArray};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -13,7 +13,10 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedPrefillMemorySnapshot};
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
+    paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
+};
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
@@ -143,11 +146,42 @@ fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: boo
     !sdpa_constructed && mode != CacheHitPrefillMode::ForceSdpa
 }
 
+fn prefill_sdpa_effective_dtype(query: DType, cache: Option<DType>) -> Option<DType> {
+    let cache = cache?;
+    match (query, cache) {
+        (DType::Float16, DType::Float16) => Some(DType::Float16),
+        (DType::BFloat16, DType::BFloat16) => Some(DType::BFloat16),
+        (DType::Float32, DType::Float16 | DType::BFloat16 | DType::Float32)
+        | (DType::Float16 | DType::BFloat16, DType::Float32)
+        | (DType::Float16, DType::BFloat16)
+        | (DType::BFloat16, DType::Float16) => Some(DType::Float32),
+        _ => None,
+    }
+}
+
+fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
+    static LOW_PRECISION_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    static FLOAT32_AVAILABLE: OnceLock<bool> = OnceLock::new();
+    let available = if effective_dtype_is_float32 {
+        &FLOAT32_AVAILABLE
+    } else {
+        &LOW_PRECISION_AVAILABLE
+    };
+    *available.get_or_init(|| {
+        let mut supported = false;
+        let status = unsafe {
+            mlx_sys::mlx_metal_d256_full_sdpa_available(effective_dtype_is_float32, &mut supported)
+        };
+        status == 0 && supported
+    })
+}
+
 fn mlx_sdpa_uses_fused_kernel(
     query_tokens: u64,
     num_query_heads: u64,
     num_kv_heads: u64,
     head_dim: u64,
+    d256_full_sdpa_available: bool,
 ) -> bool {
     if num_kv_heads == 0 || !num_query_heads.is_multiple_of(num_kv_heads) {
         return false;
@@ -157,14 +191,16 @@ fn mlx_sdpa_uses_fused_kernel(
         return supported && query_tokens.saturating_mul(num_query_heads / num_kv_heads) <= 32;
     }
     matches!(head_dim, 64 | 80 | 128)
+        || (head_dim == 256 && query_tokens >= 1_024 && d256_full_sdpa_available)
 }
 
 /// Conservative peak for gathering one paged layer into contiguous K/V and
 /// running MLX causal SDPA. The gather can transiently hold both the selected
 /// block tensors and their unpacked contiguous copies, hence four K/V-sized
-/// tensors. When MLX cannot use its fused kernel (notably Qwen3.6-27B's
-/// head_dim=256 multi-token prefill), include the materialized score matrix
-/// and fp32 output using the same shape gate as MLX's Metal dispatcher.
+/// tensors. When MLX cannot use its fused kernel (including Qwen3.6-27B
+/// D=256 residual chunks below 1,024 tokens, non-NAX hosts, or an explicit
+/// rollback), include the materialized score matrix and fp32 output using the
+/// same shape gate as MLX's Metal dispatcher.
 fn estimate_paged_pool_sdpa_bytes(
     query_tokens: u64,
     total_context: u64,
@@ -172,6 +208,7 @@ fn estimate_paged_pool_sdpa_bytes(
     num_kv_heads: u64,
     head_dim: u64,
     dtype_bytes: u64,
+    d256_full_sdpa_available: bool,
 ) -> u64 {
     let one_kv = total_context
         .saturating_mul(num_kv_heads)
@@ -185,7 +222,44 @@ fn estimate_paged_pool_sdpa_bytes(
         .saturating_mul(4)
         .saturating_add(one_query.saturating_mul(2))
         .saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
-    if mlx_sdpa_uses_fused_kernel(query_tokens, num_query_heads, num_kv_heads, head_dim) {
+    if mlx_sdpa_uses_fused_kernel(
+        query_tokens,
+        num_query_heads,
+        num_kv_heads,
+        head_dim,
+        d256_full_sdpa_available,
+    ) {
+        // The D=256 NAX kernel deliberately pads ragged sequence dimensions
+        // so every block can use its aligned pipeline. Those buffers coexist
+        // with the original gathered K/V and Q/output until the command
+        // encoder completes, so include them in the live-headroom estimate.
+        if head_dim == 256 {
+            let kv_padding = if total_context.is_multiple_of(32) {
+                0
+            } else {
+                total_context
+                    .div_ceil(32)
+                    .saturating_mul(32)
+                    .saturating_mul(num_kv_heads)
+                    .saturating_mul(head_dim)
+                    .saturating_mul(dtype_bytes)
+                    .saturating_mul(2)
+            };
+            let query_padding = if query_tokens.is_multiple_of(64) {
+                0
+            } else {
+                query_tokens
+                    .div_ceil(64)
+                    .saturating_mul(64)
+                    .saturating_mul(num_query_heads)
+                    .saturating_mul(head_dim)
+                    .saturating_mul(dtype_bytes)
+                    .saturating_mul(2)
+            };
+            return gathered
+                .saturating_add(kv_padding)
+                .saturating_add(query_padding);
+        }
         return gathered;
     }
     let scores = num_query_heads
@@ -219,33 +293,47 @@ fn estimate_varlen_paged_attention_bytes(
     if total_context <= 512 {
         return output.saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
     }
-    // The exact Qwen3.5/3.6 dense BF16 q_len=1/2 specialization uses
-    // strided block stripes rather than generic 512-token partitions. Keep
-    // this schedule byte-for-byte aligned with both Metal dispatchers so the
-    // prefill planner accounts for the real temporary allocation.
-    let grouped_qwen35 = num_query_heads == 24
-        && num_kv_heads == 4
-        && head_dim == 256
-        && dtype_bytes == 2
-        && ((query_tokens == 1 && total_context >= 16_384)
-            || (query_tokens == 2 && total_context >= 8_192));
-    let partitions = if grouped_qwen35 {
-        match total_context {
-            0..=4_096 => 32,
-            4_097..=8_192 => 64,
-            8_193..=16_383 => 128,
-            16_384..=32_768 => 256,
-            32_769..=65_536 => 512,
-            _ => 1_024,
-        }
-    } else {
-        total_context.div_ceil(512)
+    let Ok(query_tokens_u32) = u32::try_from(query_tokens) else {
+        return u64::MAX;
     };
+    let Ok(total_context_u32) = u32::try_from(total_context) else {
+        return u64::MAX;
+    };
+    let Ok(num_query_heads_u32) = u32::try_from(num_query_heads) else {
+        return u64::MAX;
+    };
+    let Ok(num_kv_heads_u32) = u32::try_from(num_kv_heads) else {
+        return u64::MAX;
+    };
+    let Ok(head_dim_u32) = u32::try_from(head_dim) else {
+        return u64::MAX;
+    };
+    // Share the layout-aware conservative partition upper bound and
+    // signed-32-bit auxiliary-buffer guard with the runtime adapter.
+    if !paged_attention_v2_aux_fits(
+        PagedAttentionV2Layout::Varlen,
+        query_tokens_u32,
+        num_query_heads_u32,
+        num_kv_heads_u32,
+        total_context_u32,
+        head_dim_u32,
+    ) {
+        return u64::MAX;
+    }
+    let partitions = paged_attention_v2_partition_upper_bound(
+        PagedAttentionV2Layout::Varlen,
+        query_tokens_u32,
+        num_query_heads_u32,
+        num_kv_heads_u32,
+        total_context_u32,
+        head_dim_u32,
+    );
     let rows = query_tokens
         .saturating_mul(num_query_heads)
         .saturating_mul(partitions);
+    let partial_output_elements = rows.saturating_mul(head_dim);
     let softmax_state = rows.saturating_mul(2).saturating_mul(4);
-    let partial_output = rows.saturating_mul(head_dim).saturating_mul(dtype_bytes);
+    let partial_output = partial_output_elements.saturating_mul(dtype_bytes);
     output
         .saturating_add(softmax_state)
         .saturating_add(partial_output)
@@ -265,9 +353,9 @@ fn select_cache_hit_prefill_plan(
         CacheHitPrefillMode::Auto => match live_headroom_bytes {
             Some(headroom) => {
                 // Keep a fixed process reserve plus a 10% cushion for the
-                // model's MLP/quantized-matmul transients. Multi-token stock
-                // SDPA is the fast path (including M5's NAX matmul fallback
-                // for head_dim=256) whenever its full transient fits. If that
+                // model's MLP/quantized-matmul transients. Multi-token SDPA is
+                // the fast path (including fused D=256 full attention on NAX)
+                // whenever its full transient fits. If that
                 // misses the budget, prefer compact varlen paging when it fits;
                 // if neither fits, choose the smaller estimated transient.
                 let budget = headroom
@@ -905,11 +993,17 @@ impl Qwen3_5Attention {
                 let total_ctx = cached_prefix_len + (seq_len as u32);
                 let graph_backend_available =
                     crate::engine::persistence::compiled_forward_backend_available();
-                let dtype_bytes = match queries.dtype()? {
-                    crate::array::DType::Float16 | crate::array::DType::BFloat16 => 2,
-                    crate::array::DType::Float32 => 4,
-                    _ => 2,
+                let query_dtype = queries.dtype()?;
+                let effective_sdpa_dtype =
+                    prefill_sdpa_effective_dtype(query_dtype, adapter.prefill_sdpa_cache_dtype());
+                let dtype_bytes = match effective_sdpa_dtype {
+                    Some(DType::Float16 | DType::BFloat16) => 2,
+                    Some(DType::Float32) | None => 4,
+                    Some(_) => 4,
                 };
+                let d256_full_sdpa_available = effective_sdpa_dtype
+                    .map(|dtype| d256_full_sdpa_available(dtype == DType::Float32))
+                    .unwrap_or(false);
                 let estimated_sdpa_bytes = estimate_paged_pool_sdpa_bytes(
                     seq_len as u64,
                     total_ctx as u64,
@@ -917,6 +1011,7 @@ impl Qwen3_5Attention {
                     self.num_kv_heads as u64,
                     self.head_dim as u64,
                     dtype_bytes,
+                    d256_full_sdpa_available,
                 );
                 let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
                     seq_len as u64,
@@ -926,6 +1021,7 @@ impl Qwen3_5Attention {
                     self.head_dim as u64,
                     dtype_bytes,
                 );
+                let varlen_aux_fits = estimated_varlen_bytes != u64::MAX;
                 let prefill_mode = cache_hit_prefill_mode();
                 // Tiny MTP verification prefills are hard-routed to varlen,
                 // and explicit overrides ignore memory heuristics. Avoid all
@@ -971,6 +1067,9 @@ impl Qwen3_5Attention {
                         configured_mode,
                         planned_path,
                         graph_backend_available,
+                        effective_sdpa_dtype = ?effective_sdpa_dtype,
+                        d256_full_sdpa_available,
+                        varlen_aux_fits,
                         estimated_sdpa_mib = plan.estimated_sdpa_bytes as f64
                             / (1024.0 * 1024.0),
                         estimated_varlen_mib = plan.estimated_varlen_bytes as f64
@@ -1574,18 +1673,46 @@ mod tests {
 
     #[test]
     fn mlx_sdpa_fused_shape_gate_matches_metal_dispatcher() {
-        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 128));
-        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256));
-        assert!(mlx_sdpa_uses_fused_kernel(1, 24, 4, 256));
-        assert!(!mlx_sdpa_uses_fused_kernel(8, 24, 4, 256));
-        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 5, 128));
+        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 128, false));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, false));
+        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, true));
+        assert!(!mlx_sdpa_uses_fused_kernel(1_023, 24, 4, 256, true));
+        assert!(mlx_sdpa_uses_fused_kernel(1_024, 24, 4, 256, true));
+        assert!(mlx_sdpa_uses_fused_kernel(1, 24, 4, 256, false));
+        assert!(!mlx_sdpa_uses_fused_kernel(8, 24, 4, 256, true));
+        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 5, 128, true));
+    }
+
+    #[test]
+    fn paged_prefill_accounts_for_mlx_sdpa_dtype_promotion() {
+        assert_eq!(
+            prefill_sdpa_effective_dtype(DType::BFloat16, Some(DType::BFloat16)),
+            Some(DType::BFloat16)
+        );
+        assert_eq!(
+            prefill_sdpa_effective_dtype(DType::Float16, Some(DType::Float16)),
+            Some(DType::Float16)
+        );
+        assert_eq!(
+            prefill_sdpa_effective_dtype(DType::Float16, Some(DType::BFloat16)),
+            Some(DType::Float32)
+        );
+        assert_eq!(
+            prefill_sdpa_effective_dtype(DType::BFloat16, Some(DType::Float32)),
+            Some(DType::Float32)
+        );
+        assert_eq!(
+            prefill_sdpa_effective_dtype(DType::BFloat16, None),
+            None,
+            "FP8 paged caches cannot feed graph-native SDPA without dequantization"
+        );
     }
 
     #[test]
     fn qwen27b_long_prefill_fits_fast_sdpa_with_healthy_headroom() {
         // Exact Qwen3.6-27B attention shape from the local checkpoint:
         // 24 query heads, 4 KV heads, head_dim 256, bf16 activations.
-        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
+        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
         let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
         assert_eq!(estimate, 7_063_814_144);
         assert_eq!(varlen_estimate, 3_338_272_768);
@@ -1600,8 +1727,71 @@ mod tests {
     }
 
     #[test]
+    fn qwen27b_fused_d256_estimate_drops_scores_only_at_supported_boundary() {
+        let unfused = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
+        let fused = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, true);
+        assert!(fused < unfused / 4, "fused={fused} unfused={unfused}");
+
+        let one_kv = 64_754_u64 * 4 * 256 * 2;
+        let one_query = 2_048_u64 * 24 * 256 * 2;
+        let padded_kv = 64_768_u64 * 4 * 256 * 2;
+        assert_eq!(
+            fused,
+            one_kv * 4 + one_query * 2 + FAST_SDPA_FIXED_OVERHEAD_BYTES + padded_kv * 2,
+            "ragged K/V padding must remain in the fused peak estimate"
+        );
+
+        let ragged_query = estimate_paged_pool_sdpa_bytes(1_031, 4_129, 24, 4, 256, 2, true);
+        let ragged_one_kv = 4_129_u64 * 4 * 256 * 2;
+        let ragged_one_query = 1_031_u64 * 24 * 256 * 2;
+        let ragged_padded_kv = 4_160_u64 * 4 * 256 * 2;
+        let ragged_padded_query = 1_088_u64 * 24 * 256 * 2;
+        assert_eq!(
+            ragged_query,
+            ragged_one_kv * 4
+                + ragged_one_query * 2
+                + FAST_SDPA_FIXED_OVERHEAD_BYTES
+                + ragged_padded_kv * 2
+                + ragged_padded_query * 2,
+            "ragged Q and K/V padding must both remain in the fused peak estimate"
+        );
+
+        // Residual chunks below the upstream q_len=1024 routing boundary
+        // still use the primitives fallback and must retain score storage.
+        assert_eq!(
+            estimate_paged_pool_sdpa_bytes(1_023, 64_754, 24, 4, 256, 2, true),
+            estimate_paged_pool_sdpa_bytes(1_023, 64_754, 24, 4, 256, 2, false),
+        );
+
+        let varlen = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
+        let headroom = Some(4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                unfused,
+                varlen,
+                headroom,
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen,
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                fused,
+                varlen,
+                headroom,
+            )
+            .path,
+            CacheHitPrefillPath::PagedPoolSdpa,
+        );
+    }
+
+    #[test]
     fn automatic_prefill_uses_varlen_when_sdpa_score_matrix_will_not_fit() {
-        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
+        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
         let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
         assert_eq!(
             select_cache_hit_prefill_plan(
@@ -1635,8 +1825,8 @@ mod tests {
     }
 
     #[test]
-    fn qwen27b_grouped_varlen_estimate_uses_long_context_stripes() {
-        // q_len=2, 24Q/4KV, D256, BF16 at >64K selects 1,024 stripes.
+    fn qwen27b_varlen_estimate_respects_query_layout() {
+        // q_len=2, 24Q/4KV, D256, BF16 at >64K can select 1,024 stripes.
         // Aux state is 49,152 rows * (two f32 stats + 256 BF16 values),
         // plus final output and the planner's fixed 64 MiB headroom.
         assert_eq!(
@@ -1645,7 +1835,57 @@ mod tests {
         );
         assert_eq!(
             estimate_varlen_paged_attention_bytes(1, 114_688, 24, 4, 256, 2),
-            79_900_672
+            69_916_672,
+            "one varlen row uses generic 512-token partitions"
+        );
+    }
+
+    #[test]
+    fn automatic_prefill_rejects_varlen_beyond_metal_aux_element_limit() {
+        // At 114,688 tokens the generic V2 route has 224 partitions. With
+        // 24 heads and D=256, q=1,560 is the last shape whose partial-output
+        // tensor fits the bridge's signed 32-bit element count.
+        assert_ne!(
+            estimate_varlen_paged_attention_bytes(1_560, 114_688, 24, 4, 256, 2),
+            u64::MAX
+        );
+        assert_eq!(
+            estimate_varlen_paged_attention_bytes(1_561, 114_688, 24, 4, 256, 2),
+            u64::MAX
+        );
+
+        let sdpa = estimate_paged_pool_sdpa_bytes(2_048, 114_688, 24, 4, 256, 2, false);
+        let varlen = estimate_varlen_paged_attention_bytes(2_048, 114_688, 24, 4, 256, 2);
+        assert_eq!(varlen, u64::MAX);
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                2_048,
+                sdpa,
+                varlen,
+                Some(4 * 1024 * 1024 * 1024),
+            )
+            .path,
+            CacheHitPrefillPath::PagedPoolSdpa,
+            "auto mode must not select a varlen graph the Metal bridge rejects"
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 2_048, sdpa, varlen, None,)
+                .path,
+            CacheHitPrefillPath::PagedPoolSdpa,
+            "the no-probe planner branch must reject the same invalid graph"
+        );
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::ForcePaged,
+                2_048,
+                sdpa,
+                varlen,
+                None,
+            )
+            .path,
+            CacheHitPrefillPath::PagedVarlen,
+            "an explicit diagnostic override retains its existing semantics"
         );
     }
 

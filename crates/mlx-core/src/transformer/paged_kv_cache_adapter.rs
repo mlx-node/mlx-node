@@ -91,7 +91,17 @@ use crate::inference_trace::{
 const PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
-fn paged_attention_v2_aux_fits(
+/// The two paged-attention V2 entry points assign query rows differently.
+/// The fixed-row path treats each row as a sequence, while varlen keeps one
+/// sequence and assigns multiple query rows through `cu_seqlens_q`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagedAttentionV2Layout {
+    SingleRowBatch,
+    Varlen,
+}
+
+pub(crate) fn paged_attention_v2_aux_fits(
+    layout: PagedAttentionV2Layout,
     num_new_tokens: u32,
     num_query_heads: u32,
     num_kv_heads: u32,
@@ -101,11 +111,21 @@ fn paged_attention_v2_aux_fits(
     if num_new_tokens == 0 || num_query_heads == 0 || max_context_len == 0 || head_size == 0 {
         return false;
     }
+    let signed_limit = i32::MAX as u32;
+    if num_new_tokens > signed_limit
+        || num_query_heads > signed_limit
+        || num_kv_heads > signed_limit
+        || max_context_len > signed_limit
+        || head_size > signed_limit
+    {
+        return false;
+    }
     if max_context_len as u64 <= PAGED_ATTENTION_V2_PARTITION_SIZE {
         return true;
     }
 
-    let max_num_partitions = paged_attention_v2_partition_count(
+    let max_num_partitions = paged_attention_v2_partition_upper_bound(
+        layout,
         num_new_tokens,
         num_query_heads,
         num_kv_heads,
@@ -121,29 +141,40 @@ fn paged_attention_v2_aux_fits(
         && tmp_out_size <= PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
 }
 
-fn paged_attention_v2_partition_count(
+/// Conservative partition upper bound across the generic and optional
+/// grouped-Qwen3.5 dispatches. Grouped-kernel enablement, dtype, block size,
+/// and pipeline availability are runtime concerns; taking the larger possible
+/// count keeps this preflight safe regardless of which C++ path wins.
+pub(crate) fn paged_attention_v2_partition_upper_bound(
+    layout: PagedAttentionV2Layout,
     num_new_tokens: u32,
     num_query_heads: u32,
     num_kv_heads: u32,
     max_context_len: u32,
     head_size: u32,
 ) -> u64 {
-    let grouped_qwen35 = num_query_heads == 24
+    let generic = (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
+    let grouped_qwen35_candidate = num_query_heads == 24
         && num_kv_heads == 4
         && head_size == 256
-        && ((num_new_tokens == 1 && max_context_len >= 16_384)
-            || (num_new_tokens == 2 && max_context_len >= 8_192));
-    if grouped_qwen35 {
-        match max_context_len {
+        && match layout {
+            PagedAttentionV2Layout::SingleRowBatch => {
+                num_new_tokens == 1 && max_context_len >= 16_384
+            }
+            PagedAttentionV2Layout::Varlen => num_new_tokens == 2 && max_context_len >= 8_192,
+        };
+    if grouped_qwen35_candidate {
+        let grouped = match max_context_len {
             0..=4_096 => 32,
             4_097..=8_192 => 64,
             8_193..=16_383 => 128,
             16_384..=32_768 => 256,
             32_769..=65_536 => 512,
             _ => 1_024,
-        }
+        };
+        generic.max(grouped)
     } else {
-        (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE)
+        generic
     }
 }
 
@@ -2727,6 +2758,7 @@ impl PagedKVCacheAdapter {
             "gather_kv_for_prefill_chunk_varlen: total context overflow".to_string()
         })?;
         if !paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
             query_len,
             num_query_heads,
             self.layer_kv_pool.config().num_kv_heads,
@@ -2734,8 +2766,8 @@ impl PagedKVCacheAdapter {
             expected_head_size,
         ) {
             return Err(format!(
-                "gather_kv_for_prefill_chunk_varlen: paged-attention V2 auxiliary buffer \
-                 would exceed INT_MAX (query_len={query_len}, \
+                "gather_kv_for_prefill_chunk_varlen: paged-attention V2 metadata or auxiliary \
+                 buffer would exceed INT_MAX (query_len={query_len}, \
                  num_query_heads={num_query_heads}, total_context={total_context}, \
                  head_size={expected_head_size}); reduce MLX_PAGED_PREFILL_CHUNK_SIZE"
             ));
@@ -2996,6 +3028,7 @@ impl PagedKVCacheAdapter {
                 "gather_kv_for_prefill_chunk: max context length overflow".to_string()
             })?;
         if !paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::SingleRowBatch,
             num_new_tokens,
             num_query_heads,
             self.layer_kv_pool.config().num_kv_heads,
@@ -3003,8 +3036,8 @@ impl PagedKVCacheAdapter {
             expected_head_size,
         ) {
             return Err(format!(
-                "gather_kv_for_prefill_chunk: paged-attention V2 auxiliary buffer would exceed \
-                 INT_MAX (num_new_tokens={num_new_tokens}, num_query_heads={num_query_heads}, \
+                "gather_kv_for_prefill_chunk: paged-attention V2 metadata or auxiliary buffer \
+                 would exceed INT_MAX (num_new_tokens={num_new_tokens}, num_query_heads={num_query_heads}, \
                  max_context_len={max_context_len}, head_size={expected_head_size}); \
                  reduce MLX_PAGED_PREFILL_CHUNK_SIZE or let Gemma4 dynamic chunking split the request"
             ));
@@ -4209,6 +4242,18 @@ impl PagedKVCacheAdapter {
         self.cached_token_count
     }
 
+    /// Element dtype exposed by a graph-native paged K/V gather. `None`
+    /// means the cache requires dequantization and cannot feed plain MLX
+    /// SDPA directly.
+    pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
+        match self.layer_kv_pool.cache_dtype() {
+            mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
+            mlx_paged_attn::metal::MetalDtype::Float32 => Some(DType::Float32),
+            mlx_paged_attn::metal::MetalDtype::UChar => None,
+        }
+    }
+
     pub fn current_token_count(&self) -> u32 {
         self.request_tokens.len() as u32
     }
@@ -4680,23 +4725,187 @@ mod tests {
 
     #[test]
     fn test_paged_attention_v2_aux_limit_matches_gemma4_overflow_shape() {
-        assert!(paged_attention_v2_aux_fits(8192, 16, 8, 8208, 512));
-        assert!(!paged_attention_v2_aux_fits(8192, 16, 8, 16400, 512));
-        assert!(paged_attention_v2_aux_fits(8176, 16, 8, 16384, 512));
+        assert!(paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            8192,
+            16,
+            8,
+            8208,
+            512
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            8192,
+            16,
+            8,
+            16400,
+            512
+        ));
+        assert!(paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            8176,
+            16,
+            8,
+            16384,
+            512
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::SingleRowBatch,
+            1,
+            24,
+            4,
+            i32::MAX as u32 + 1,
+            256,
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::SingleRowBatch,
+            i32::MAX as u32 + 1,
+            24,
+            4,
+            i32::MAX as u32 + 1,
+            256,
+        ));
     }
 
     #[test]
-    fn qwen27b_grouped_aux_uses_dispatch_stripe_schedule() {
-        assert_eq!(paged_attention_v2_partition_count(2, 24, 4, 8_192, 256), 64);
+    fn qwen27b_aux_upper_bound_tracks_dispatch_layout() {
         assert_eq!(
-            paged_attention_v2_partition_count(2, 24, 4, 16_384, 256),
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                1,
+                24,
+                4,
+                16_384,
+                256,
+            ),
             256
         );
         assert_eq!(
-            paged_attention_v2_partition_count(2, 24, 4, 65_537, 256),
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                2,
+                24,
+                4,
+                114_688,
+                256,
+            ),
+            224,
+            "two fixed rows are two sequences and cannot use grouped Qwen paging"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                1,
+                24,
+                4,
+                114_688,
+                256,
+            ),
+            224,
+            "one varlen query cannot use the two-row grouped verifier"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                24,
+                4,
+                8_192,
+                256,
+            ),
+            64
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                24,
+                4,
+                16_384,
+                256,
+            ),
+            256
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                24,
+                4,
+                65_537,
+                256,
+            ),
             1_024
         );
-        assert!(paged_attention_v2_aux_fits(2, 24, 4, 114_688, 256));
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                24,
+                4,
+                524_289,
+                256,
+            ),
+            1_025,
+            "generic fallback must win once it exceeds the fixed stripe count"
+        );
+        assert!(paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            2,
+            24,
+            4,
+            114_688,
+            256
+        ));
+    }
+
+    #[test]
+    fn qwen27b_varlen_aux_limit_matches_dispatch_boundaries() {
+        // With q=2,048, 24 heads and D=256, context 87,040 is the last
+        // generic 512-token partition count whose partial output fits i32.
+        assert!(paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            2_048,
+            24,
+            4,
+            87_040,
+            256
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            2_048,
+            24,
+            4,
+            87_041,
+            256
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            2_048,
+            24,
+            4,
+            114_688,
+            256
+        ));
+
+        // At context 114,688 (224 partitions), q=1,560 is the exact
+        // maximum; one more query row crosses the same element limit.
+        assert!(paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            1_560,
+            24,
+            4,
+            114_688,
+            256
+        ));
+        assert!(!paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            1_561,
+            24,
+            4,
+            114_688,
+            256
+        ));
     }
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {

@@ -53,7 +53,7 @@
 //! Skips on hosts without Metal (the underlying C++ dispatch checks
 //! `mlx::core::metal::is_available()`).
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 const SEQ_LEN_V1: i32 = 8;
 // Pick a context length strictly greater than the V1/V2 partition

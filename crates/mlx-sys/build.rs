@@ -200,6 +200,10 @@ fn main() {
     // and the paged-attn metallib compile; changing it must re-run this
     // script or the caches keep the old floor.
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    // This changes the CMake backend set, bridge translation-unit set, and
+    // exported C ABI. Re-run even when Cargo otherwise considers the inputs
+    // unchanged so toggling CPU-only mode cannot reuse Metal artifacts.
+    println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
     // Watch all C++ source files, headers, and Metal kernel includes
     let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
     if let Ok(entries) = std::fs::read_dir(&src_dir) {
@@ -493,6 +497,14 @@ fn main() {
         .include(&include_source)
         .include(&mlx_dir);
 
+    // `__APPLE__` alone does not mean this build contains MLX's Metal backend:
+    // `MLX_DISABLE_METAL=1` is a supported CPU-only macOS configuration.  Keep
+    // bridge translation units from including/calling Metal-only APIs unless
+    // the CMake build above actually enabled them.
+    if build_metal {
+        bridge.define("MLX_NODE_METAL_ENABLED", None);
+    }
+
     if is_macos {
         // macOS keeps C++17 (its clang accepts MLX's defaulted operator==
         // under C++17). Unchanged from the original build to guarantee no
@@ -529,7 +541,8 @@ fn main() {
 
     // Translation units that depend on Metal *by header* (raw `MTL::` types
     // or `#include mlx/backend/metal/device.h`). These do not compile on a
-    // non-Metal host. They are excluded from the Linux build; the symbols
+    // non-Metal host. They are excluded from every non-Metal build (including
+    // `MLX_DISABLE_METAL=1` on macOS); the symbols
     // their `eval_gpu` consumers need (`paged_kv_write` / `paged_attention` /
     // `paged_attention_varlen`) are provided as runtime-throwing stubs in
     // `mlx_paged_stubs_linux.cpp`, and the Rust callers fall back to the
@@ -549,7 +562,7 @@ fn main() {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if !is_macos && METAL_ONLY_TUS.contains(&file_name.as_str()) {
+            if !build_metal && METAL_ONLY_TUS.contains(&file_name.as_str()) {
                 continue;
             }
             bridge.file(&path);

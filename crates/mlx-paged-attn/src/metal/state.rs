@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 /// Embedded metallib bytes (compiled at build time)
-const METALLIB_BYTES: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/paged_attn.metallib"));
+#[cfg(mlx_node_metal_enabled)]
+const METALLIB_BYTES: &[u8] = include_bytes!(env!("PAGED_ATTN_METALLIB"));
 
 /// Global Metal state singleton
 static METAL_STATE: OnceLock<Result<MetalState, String>> = OnceLock::new();
@@ -46,26 +46,32 @@ impl MetalState {
 
     /// Initialize Metal state
     fn init() -> Result<MetalState, String> {
-        let device = Device::system_default().ok_or("No Metal device found")?;
+        #[cfg(not(mlx_node_metal_enabled))]
+        return Err("No Metal device found: Metal backend disabled at build time".to_string());
 
-        // Write metallib to temp file and load
-        // (Metal requires loading from file path, not memory)
-        let temp_path = std::env::temp_dir().join("mlx_paged_attn.metallib");
-        std::fs::write(&temp_path, METALLIB_BYTES)
-            .map_err(|e| format!("Failed to write metallib to temp: {}", e))?;
+        #[cfg(mlx_node_metal_enabled)]
+        {
+            let device = Device::system_default().ok_or("No Metal device found")?;
 
-        let library = device
-            .new_library_with_file(&temp_path)
-            .map_err(|e| format!("Failed to load metallib: {}", e))?;
+            // Write metallib to temp file and load
+            // (Metal requires loading from file path, not memory)
+            let temp_path = std::env::temp_dir().join("mlx_paged_attn.metallib");
+            std::fs::write(&temp_path, METALLIB_BYTES)
+                .map_err(|e| format!("Failed to write metallib to temp: {}", e))?;
 
-        let command_queue = device.new_command_queue();
+            let library = device
+                .new_library_with_file(&temp_path)
+                .map_err(|e| format!("Failed to load metallib: {}", e))?;
 
-        Ok(MetalState {
-            device,
-            library,
-            command_queue,
-            pipelines: RwLock::new(HashMap::new()),
-        })
+            let command_queue = device.new_command_queue();
+
+            Ok(MetalState {
+                device,
+                library,
+                command_queue,
+                pipelines: RwLock::new(HashMap::new()),
+            })
+        }
     }
 
     /// Get or create a compute pipeline for a kernel

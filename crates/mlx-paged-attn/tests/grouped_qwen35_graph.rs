@@ -2,7 +2,7 @@
 //! paged-decode specialization. This is the same C++ Custom primitive path
 //! used by `mlx agent`, not only the standalone raw Metal dispatcher.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 #[test]
 fn grouped_qwen35_graph_decode_and_mtp_parity() {

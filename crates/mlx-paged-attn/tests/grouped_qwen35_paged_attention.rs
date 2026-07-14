@@ -26,7 +26,7 @@
 //!   grouped_qwen35_exact_shape_sequential_benchmark -- --ignored --exact --nocapture
 //! ```
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use std::ffi::c_void;
 use std::time::{Duration, Instant};

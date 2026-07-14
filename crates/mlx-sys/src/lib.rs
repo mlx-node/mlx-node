@@ -592,6 +592,29 @@ unsafe extern "C-unwind" {
     // the FFI boundary and aborts the process). Pass null `out_*` to
     // ignore the value.
     pub fn mlx_metal_is_available() -> bool;
+    pub fn mlx_metal_is_nax_available() -> bool;
+    /// Probe whether MLX can dispatch the fused D=256 full-SDPA kernel for the
+    /// effective input dtype. Returns 0 on success and writes a conservative
+    /// result to `out_available`; returns -1 on invalid output or a caught C++
+    /// exception. Non-Metal builds return success with `false`.
+    pub fn mlx_metal_d256_full_sdpa_available(
+        effective_dtype_is_float32: bool,
+        out_available: *mut bool,
+    ) -> i32;
+    /// Evaluate the D=256-specific eligibility predicate shared with MLX's
+    /// Metal dispatcher, without adding hot-path logging or counters. The
+    /// caller still owns the dispatcher's outer inference/stream gates.
+    /// Uses the same 0/-1 fallible-output contract as the capability probe.
+    pub fn mlx_metal_d256_full_sdpa_would_use(
+        effective_dtype_is_float32: bool,
+        query_head_dim: i32,
+        value_head_dim: i32,
+        query_length: i32,
+        key_length: i32,
+        do_causal: bool,
+        has_array_mask: bool,
+        out_would_use: *mut bool,
+    ) -> i32;
     pub fn mlx_metal_device_info() -> *const std::os::raw::c_char;
     pub fn mlx_set_wired_limit(limit: u64, out_old_limit: *mut u64) -> i32;
     pub fn mlx_get_peak_memory(out_value: *mut u64) -> i32;
@@ -988,8 +1011,8 @@ unsafe extern "C-unwind" {
 
     /// block_size = 0 must be rejected. Without this check the pool
     /// shape equality accepts a zero-sized pool block dim when
-    /// block_size=0, and `eval_gpu`'s bounds check then divides by
-    /// zero in host code (`(s + block_size - 1) / block_size`).
+    /// block_size=0, and `eval_gpu`'s bounds check then divides the
+    /// sequence length by zero in host code.
     pub fn mlx_paged_attention_factory_rejects_zero_block_size() -> i32;
 
     /// head_size = 0 must be rejected. The Metal kernel uses head_size

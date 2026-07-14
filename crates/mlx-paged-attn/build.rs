@@ -4,20 +4,23 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=metal/");
+    println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
+    println!("cargo:rustc-check-cfg=cfg(mlx_node_metal_enabled)");
 
-    // Only compile Metal shaders on macOS
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Set a placeholder path for non-macOS builds
+    // A build script runs for the host, so compile-time `cfg(target_os)` would
+    // misroute cross-target builds. Match mlx-sys's effective backend decision
+    // using Cargo's target metadata and the shared CPU-only escape hatch.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
+    let build_metal = target_os == "macos" && env::var_os("MLX_DISABLE_METAL").is_none();
+    if !build_metal {
         println!("cargo:rustc-env=PAGED_ATTN_METALLIB=");
         return;
     }
 
-    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-cfg=mlx_node_metal_enabled");
     compile_metal_shaders();
 }
 
-#[cfg(target_os = "macos")]
 fn compile_metal_shaders() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();

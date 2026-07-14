@@ -1,8 +1,8 @@
-// Non-Apple stubs for the block-paged custom primitives.
+// Non-Metal stubs for the block-paged custom primitives.
 //
 // `mlx_paged_ops.cpp` (which DEFINES `mlx::core::fast::paged_kv_write` /
 // `paged_attention` / `paged_attention_varlen`) is excluded from the
-// non-Apple build because it `#include`s `mlx/backend/metal/device.h` and
+// non-Metal build because it `#include`s `mlx/backend/metal/device.h` and
 // dispatches Metal kernels. But other FFI translation units reference these
 // symbols (the paged dispatch entry points in `mlx_paged_dispatch.cpp` and
 // their callers), so the Linux link would fail with undefined references
@@ -14,11 +14,12 @@
 // therefore only need to exist for the linker; reaching one at runtime is a
 // bug, so they throw loudly rather than silently mis-compute.
 //
-// This file is compiled ONLY on non-Apple hosts (the whole body is under
-// `#if !defined(__APPLE__)`); on macOS it is an empty TU and the real
-// definitions in `mlx_paged_ops.cpp` are used.
+// This file is active whenever build.rs did not define
+// `MLX_NODE_METAL_ENABLED`, including `MLX_DISABLE_METAL=1` on macOS. In a
+// Metal build it is an empty TU and the real definitions in
+// `mlx_paged_ops.cpp` are used.
 
-#if !defined(__APPLE__)
+#if !defined(MLX_NODE_METAL_ENABLED)
 
 #include <stdexcept>
 #include <utility>
@@ -96,4 +97,74 @@ array paged_attention_varlen(
 
 } // namespace mlx::core::fast
 
-#endif // !defined(__APPLE__)
+// Rust still links the macOS adapter methods in a CPU-only macOS build even
+// though runtime `mlx_metal_is_available()` gates them off. Provide the same
+// conservative C ABI surface as Linux so those unreachable calls fail closed
+// instead of leaving the final binary with undefined symbols.
+extern "C" {
+
+mlx_array* mlx_paged_attention_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    float,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t) {
+  return nullptr;
+}
+
+mlx_array* mlx_paged_attention_varlen_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    float,
+    float,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t) {
+  return nullptr;
+}
+
+bool mlx_paged_kv_write_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    int,
+    int,
+    int,
+    uint8_t,
+    mlx_array** out_k_pool,
+    mlx_array** out_v_pool) {
+  if (out_k_pool) {
+    *out_k_pool = nullptr;
+  }
+  if (out_v_pool) {
+    *out_v_pool = nullptr;
+  }
+  return false;
+}
+
+} // extern "C"
+
+#endif // !defined(MLX_NODE_METAL_ENABLED)

@@ -9,6 +9,8 @@
 //! the same FFI that the higher-level `PagedKVCacheAdapter::{key,value}_
 //! pool_array` thin wrappers in `mlx-core` call.
 
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
+
 use mlx_paged_attn::metal::MetalDtype;
 use mlx_paged_attn::{LayerKVPool, PagedAttentionConfig};
 

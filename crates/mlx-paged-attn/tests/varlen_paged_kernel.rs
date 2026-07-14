@@ -27,7 +27,7 @@
 //!
 //! All tests skip cleanly on hosts without Metal.
 
-#![cfg(target_os = "macos")]
+#![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
 use metal::MTLResourceOptions;
 use mlx_paged_attn::metal::{

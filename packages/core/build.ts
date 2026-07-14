@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFile, writeFile, copyFile, stat, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, copyFile, stat, mkdir, rm } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -77,8 +77,21 @@ await copyNativeAddon(outputs);
 // The metallibs exist only on macOS (the Metal build). On the CUDA/Linux
 // build there is no Metal toolchain and no metallib to copy, so skip the
 // whole step (and its presence assert) on non-darwin platforms.
-if (process.platform === 'darwin') {
+if (process.platform === 'darwin' && process.env.MLX_DISABLE_METAL == null) {
   await copyMetallibs(outputs);
+} else if (process.platform === 'darwin') {
+  await removeMetallibsForCpuOnlyBuild();
+}
+
+async function removeMetallibsForCpuOnlyBuild() {
+  const destDirs = [__dirname, join(__dirname, 'npm', 'darwin-arm64')];
+  const names = ['mlx.metallib', 'paged_attn.metallib'];
+  for (const dest of destDirs) {
+    for (const name of names) {
+      await rm(join(dest, name), { force: true });
+    }
+  }
+  console.log('Removed stale metallibs from MLX_DISABLE_METAL CPU-only build outputs.');
 }
 
 // Derive the napi addon file name + the matching `npm/<triple>/` directory
