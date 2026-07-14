@@ -1067,9 +1067,10 @@ export default function JSpaceApp() {
                 grid COLUMN under the cursor = every layer at the hovered position,
                 deepest-on-top like the canvas) below it. The sticky+cap treatment
                 (and the by-layer's internal scroll) lives in `.jspace-inspector-rail`
-                — gated on min-height:640px so a short/zoomed/devtools-docked window,
-                where the shrink-0 readout alone can exceed the cap, falls back to
-                normal page flow instead of collapsing the by-layer list off-screen. */}
+                — gated (rem units, matching Tailwind's lg) so a short/zoomed/
+                enlarged-font/devtools-docked window, where the shrink-0 readout alone
+                can exceed the cap, falls back to normal page flow instead of
+                collapsing the by-layer list off-screen. See styles.css. */}
             <div className="mt-4 flex flex-col gap-4 lg:mt-0 jspace-inspector-rail">
               <div className="shrink-0">
                 {activeCellRef ? (

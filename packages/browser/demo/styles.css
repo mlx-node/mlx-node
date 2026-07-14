@@ -159,11 +159,21 @@
      shrink-0 and, fully populated, is ~380px — taller than the whole cap once
      the viewport is short (docked devtools, browser zoom, a split window). At
      that point min-height:0 collapses the by-layer list to nothing and its rows
-     become unreachable. So the sticky+cap treatment is gated on BOTH axes: below
-     640px tall (or under lg width) we fall back to normal page flow — the rail
-     un-pins, the by-layer strip drops its flex-fill/scroll and renders at natural
-     height, and the page scrolls. Every layer row stays reachable either way. */
-  @media (min-width: 1024px) and (min-height: 640px) {
+     become unreachable. So the sticky+cap treatment is gated: below the gate (or
+     under lg width) we fall back to normal page flow — the rail un-pins, the
+     by-layer strip drops its flex-fill/scroll and renders at natural height, and
+     the page scrolls. Every layer row stays reachable either way.
+
+     Units track the layout, which is rem-based: `min-width:64rem` matches
+     Tailwind v4's `lg` breakpoint EXACTLY (Tailwind v4 breakpoints are rem, not
+     px), so the capped rail never activates before the two-column grid does —
+     even when the user's default font is enlarged (at 28px, `lg` = 1792px, not
+     1024px). The height guard is the stricter of an absolute floor and a
+     font-scaled headroom: `min-height:640px` keeps a sane pixel minimum at tiny
+     fonts, while `min-height:40rem` scales the guard UP with the rem-sized
+     readout rows so an enlarged-font viewport (where the 10-row readout balloons
+     past a fixed 640px cap) falls back instead of re-collapsing the list. */
+  @media (min-width: 64rem) and (min-height: 640px) and (min-height: 40rem) {
     .jspace-inspector-rail {
       position: sticky;
       top: 1.5rem;
