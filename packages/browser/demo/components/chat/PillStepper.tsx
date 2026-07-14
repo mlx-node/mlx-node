@@ -15,46 +15,64 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
   const wrapperRef = useRef<HTMLDivElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const [shiftX, setShiftX] = useState(0);
+  const [maxW, setMaxW] = useState<number | undefined>(undefined);
 
   useEffect(() => {
     if (disabled) setOpen(false);
   }, [disabled]);
 
-  // Keep the popup inside the viewport. It is anchored at left:0 of the trigger
-  // pill, so when that pill sits near the right edge on a narrow screen the
-  // popup overflows and gets clipped by the root overflow:hidden (the enlarged
-  // coarse-pointer +/- buttons make it wider still). Nudge it back in while open,
-  // and re-run on viewport changes so a popup opened in one orientation isn't
-  // left with a stale offset after a rotate / split-view resize / zoom.
+  // Keep the popup inside the *visible* viewport. It is anchored at left:0 of the
+  // trigger pill, so when that pill sits near an edge the popup overflows and
+  // gets clipped by the root overflow:hidden (the enlarged coarse-pointer +/-
+  // buttons make it wider still). Re-run on every viewport change so a popup
+  // opened in one state isn't left with a stale offset after a rotate,
+  // split-view resize, or pinch-zoom + pan.
   useLayoutEffect(() => {
     if (!open) {
       setShiftX(0);
+      setMaxW(undefined);
       return;
     }
-    // Measure from the UNTRANSFORMED anchor so re-clamping is idempotent: the
-    // popup is position:absolute; left:0 of the (never-transformed) wrapper, so
-    // wrapper.left is its natural left edge and popup.offsetWidth is its layout
-    // width — both independent of the translateX we apply. Reading the popup's
-    // own getBoundingClientRect() would fold in the current shift and drift on
-    // every recompute.
     const measure = () => {
       const wrap = wrapperRef.current;
       const el = popupRef.current;
       if (!wrap || !el) return;
       const margin = 8;
+      // Clamp against the VISUAL viewport, not window.innerWidth: pinch-zoom
+      // shrinks and offsets the visual viewport without reflowing the layout
+      // viewport, so innerWidth would place the popup off-screen at >1x zoom.
+      // offsetLeft/width are layout-viewport-relative CSS px, the same space as
+      // getBoundingClientRect(), so the two are directly comparable. `scroll`
+      // fires on pan (which changes offsetLeft); `resize` on zoom/rotate.
+      const vv = window.visualViewport;
+      const viewLeft = vv ? vv.offsetLeft : 0;
+      const viewWidth = vv ? vv.width : window.innerWidth;
+      const viewRight = viewLeft + viewWidth;
+      // Cap the popup to the visible width (the input shrinks via minWidth:0) so
+      // it can never be wider than what the user can see; use the capped width
+      // for the position math so shift and cap settle together in one pass.
+      const cap = Math.max(0, viewWidth - 2 * margin);
+      setMaxW(cap);
+      // Measure from the UNTRANSFORMED anchor so re-clamping is idempotent: the
+      // popup is position:absolute; left:0 of the (never-transformed) wrapper, so
+      // wrapper.left is its natural left edge, independent of the translateX we
+      // apply. Reading the popup's own rect would fold in the current shift.
       const left0 = wrap.getBoundingClientRect().left;
-      const right0 = left0 + el.offsetWidth;
+      const right0 = left0 + Math.min(el.offsetWidth, cap);
       let dx = 0;
-      if (right0 > window.innerWidth - margin) dx = window.innerWidth - margin - right0;
-      if (left0 + dx < margin) dx = margin - left0;
+      if (right0 > viewRight - margin) dx = viewRight - margin - right0;
+      if (left0 + dx < viewLeft + margin) dx = viewLeft + margin - left0;
       setShiftX(dx);
     };
     measure();
+    const vv = window.visualViewport;
     window.addEventListener('resize', measure);
-    window.visualViewport?.addEventListener('resize', measure);
+    vv?.addEventListener('resize', measure);
+    vv?.addEventListener('scroll', measure);
     return () => {
       window.removeEventListener('resize', measure);
-      window.visualViewport?.removeEventListener('resize', measure);
+      vv?.removeEventListener('resize', measure);
+      vv?.removeEventListener('scroll', measure);
     };
   }, [open]);
 
@@ -98,9 +116,10 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
             bottom: 'calc(100% + 8px)',
             left: 0,
             transform: shiftX ? `translateX(${shiftX}px)` : undefined,
-            // Never let the popup exceed the viewport; otherwise the clamp above
-            // can only fit one edge and the opposite control gets cut off.
-            maxWidth: 'calc(100vw - 16px)',
+            // Never let the popup exceed the VISIBLE viewport (measured live,
+            // incl. pinch-zoom); otherwise the clamp can only fit one edge and
+            // the opposite control gets cut off.
+            maxWidth: maxW,
             boxSizing: 'border-box',
             background: 'var(--surface)',
             border: '1px solid var(--border)',
@@ -134,6 +153,11 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
             }}
             style={{
               width: 80,
+              // Let the input shrink (below its 80px basis) when the popup is
+              // capped to a very small visible viewport under pinch-zoom; the
+              // +/- buttons keep their tap size and the input gives way first.
+              minWidth: 0,
+              flexShrink: 1,
               padding: '6px 8px',
               borderRadius: 6,
               background: 'var(--surface-2)',
