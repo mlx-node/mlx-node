@@ -33,12 +33,12 @@ export function ByLayerStrip({
   return (
     <section
       aria-label={`By layer at position ${pos + 1}`}
-      className="jspace-panel flex flex-col space-y-2 p-4"
+      className="jspace-panel flex flex-col space-y-2 p-4 lg:min-h-0 lg:flex-1"
     >
       <h3 className="font-mono text-[10px] uppercase tracking-[0.16em] text-[color:var(--text-dim)]">
         By Layer (Pos={pos + 1} {promptToken})
       </h3>
-      <div className="min-h-0 flex-1 space-y-0.5 rounded-lg bg-background/40 p-2">
+      <div className="jspace-scroll min-h-0 flex-1 space-y-0.5 rounded-lg bg-background/40 p-2 lg:overflow-y-auto">
         {rowOrder.map((layerIdx) => {
           const cell = slice.cellAt(layerIdx, pos);
           const isSelected = selected?.pos === pos && selected?.layerIdx === layerIdx;

@@ -1026,7 +1026,7 @@ export default function JSpaceApp() {
           {/* Argmax grid (instrument) docked beside the per-cell readout on lg.
               SOURCE ORDER stays grid-then-detail so selectCell / aria-activedescendant
               / the permalink one-shot restore are unaffected; mobile stacks. */}
-          <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_19rem] lg:gap-6 lg:items-start">
+          <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_24rem] lg:gap-6 lg:items-start">
             {/* LEFT — the argmax grid panel. min-w-0 keeps the inner
                 .jspace-grid-scroll horizontally scrollable instead of blowing out. */}
             <div className="jspace-panel min-w-0 space-y-3 p-4 lg:p-5">
@@ -1062,24 +1062,41 @@ export default function JSpaceApp() {
               </div>
             </div>
 
-            {/* RIGHT — the per-cell readout, sticky within the page scroller on lg. */}
-            <div className="mt-4 lg:mt-0 lg:sticky lg:top-6">
+            {/* RIGHT — the hovered cell's INSPECTOR, sticky beside the grid: the
+                per-cell readout pinned on top, and the BY-LAYER cross-section (the
+                grid COLUMN under the cursor = every layer at the hovered position,
+                deepest-on-top like the canvas) below it. Capped to the viewport so
+                the 24-row by-layer list scrolls INSIDE the pinned rail (lg:min-h-0
+                at BOTH levels) instead of pushing the sticky box off-screen. */}
+            <div className="mt-4 flex flex-col gap-4 lg:mt-0 lg:sticky lg:top-6 lg:max-h-[calc(100dvh-3rem)] lg:min-h-0">
+              <div className="shrink-0">
+                {activeCellRef ? (
+                  <LensTooltip
+                    slice={slice}
+                    layerIdx={activeCellRef.layerIdx}
+                    pos={activeCellRef.pos}
+                    runKey={lensRun.runKey}
+                    header={`ℓ${slice.layers[activeCellRef.layerIdx]} · position ${activeCellRef.pos + 1} · after "${renderTokenDisplay(slice.tokens[activeCellRef.pos]?.text ?? '')}"`}
+                    probLabel="full-vocab probability"
+                  />
+                ) : (
+                  <p className="flex min-h-[6rem] items-center justify-center rounded-lg border border-dashed border-border/60 bg-card/30 p-4 text-center font-mono text-[11px] leading-relaxed text-[color:var(--text-dim)]">
+                    Hover or tap any cell to see that layer’s top-K read.
+                  </p>
+                )}
+              </div>
               {activeCellRef ? (
-                <LensTooltip
-                  slice={slice}
-                  layerIdx={activeCellRef.layerIdx}
-                  pos={activeCellRef.pos}
-                  runKey={lensRun.runKey}
-                  header={`ℓ${slice.layers[activeCellRef.layerIdx]} · position ${activeCellRef.pos + 1} · after "${renderTokenDisplay(slice.tokens[activeCellRef.pos]?.text ?? '')}"`}
-                  probLabel="full-vocab probability"
-                />
-              ) : (
-                <p className="flex min-h-[6rem] items-center justify-center rounded-lg border border-dashed border-border/60 bg-card/30 p-4 text-center font-mono text-[11px] leading-relaxed text-[color:var(--text-dim)]">
-                  Hover or tap any cell to see that layer’s top-K read.
-                </p>
-              )}
+                <ByLayerStrip slice={slice} pos={activeCellRef.pos} selected={selected} onSelect={selectCell} />
+              ) : null}
             </div>
           </div>
+
+          {/* BY-POS cross-section — the grid ROW: the hovered LAYER across all
+              positions. Full width directly under the grid (the horizontal rail of
+              the crosshair) so a hover repaint lands in view without scrolling. */}
+          {activeCellRef ? (
+            <ByPosStrip slice={slice} layerIdx={activeCellRef.layerIdx} selected={selected} onSelect={selectCell} />
+          ) : null}
 
           {/* Compare lenses — baked-only logit↔Jacobian top-10 divergence field.
               Starter-only: the frame ships BOTH .logit and .jacobian, so this
@@ -1214,14 +1231,6 @@ export default function JSpaceApp() {
               ℓ22→ℓ24 gap and nearly every position reads "no lock". Coloured by
               physical layer depth (bright = settled shallow). */}
           {view.kind === 'live' && slice ? <MotorFlipStrip slice={slice} copy={copy.motorFlip} /> : null}
-
-          {/* Cross-sections at the selected cell */}
-          {activeCellRef ? (
-            <div className="grid gap-5 lg:grid-cols-2">
-              <ByLayerStrip slice={slice} pos={activeCellRef.pos} selected={selected} onSelect={selectCell} />
-              <ByPosStrip slice={slice} layerIdx={activeCellRef.layerIdx} selected={selected} onSelect={selectCell} />
-            </div>
-          ) : null}
         </section>
       )}
     </main>
