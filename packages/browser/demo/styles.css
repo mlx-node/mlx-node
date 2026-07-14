@@ -153,6 +153,32 @@
     background-clip: content-box;
   }
 
+  /* /jspace crosshair-inspector rail. On a tall-enough lg viewport we pin the
+     per-cell readout + the by-LAYER cross-section beside the grid and let the
+     24-row by-layer list scroll INSIDE the capped rail. But the readout is
+     shrink-0 and, fully populated, is ~380px — taller than the whole cap once
+     the viewport is short (docked devtools, browser zoom, a split window). At
+     that point min-height:0 collapses the by-layer list to nothing and its rows
+     become unreachable. So the sticky+cap treatment is gated on BOTH axes: below
+     640px tall (or under lg width) we fall back to normal page flow — the rail
+     un-pins, the by-layer strip drops its flex-fill/scroll and renders at natural
+     height, and the page scrolls. Every layer row stays reachable either way. */
+  @media (min-width: 1024px) and (min-height: 640px) {
+    .jspace-inspector-rail {
+      position: sticky;
+      top: 1.5rem;
+      max-height: calc(100dvh - 3rem);
+      min-height: 0;
+    }
+    .jspace-inspector-rail .jspace-inspector-bylayer {
+      flex: 1 1 0%;
+      min-height: 0;
+    }
+    .jspace-inspector-rail .jspace-inspector-bylayer-list {
+      overflow-y: auto;
+    }
+  }
+
   /* Chat layer — always mounted, hidden until ready */
   .chat-layer {
     @apply absolute inset-0 flex flex-col;

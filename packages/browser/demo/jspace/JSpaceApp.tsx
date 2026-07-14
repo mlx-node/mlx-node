@@ -1065,10 +1065,12 @@ export default function JSpaceApp() {
             {/* RIGHT — the hovered cell's INSPECTOR, sticky beside the grid: the
                 per-cell readout pinned on top, and the BY-LAYER cross-section (the
                 grid COLUMN under the cursor = every layer at the hovered position,
-                deepest-on-top like the canvas) below it. Capped to the viewport so
-                the 24-row by-layer list scrolls INSIDE the pinned rail (lg:min-h-0
-                at BOTH levels) instead of pushing the sticky box off-screen. */}
-            <div className="mt-4 flex flex-col gap-4 lg:mt-0 lg:sticky lg:top-6 lg:max-h-[calc(100dvh-3rem)] lg:min-h-0">
+                deepest-on-top like the canvas) below it. The sticky+cap treatment
+                (and the by-layer's internal scroll) lives in `.jspace-inspector-rail`
+                — gated on min-height:640px so a short/zoomed/devtools-docked window,
+                where the shrink-0 readout alone can exceed the cap, falls back to
+                normal page flow instead of collapsing the by-layer list off-screen. */}
+            <div className="mt-4 flex flex-col gap-4 lg:mt-0 jspace-inspector-rail">
               <div className="shrink-0">
                 {activeCellRef ? (
                   <LensTooltip
