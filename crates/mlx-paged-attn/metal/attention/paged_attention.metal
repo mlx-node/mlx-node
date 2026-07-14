@@ -1187,6 +1187,305 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   }
 }
 
+// ========================================== Grouped GQA paged attention
+//
+// Long-context Qwen3.5/3.6 dense decode uses 24 query heads, 4 KV heads,
+// head_dim=256, and block_size=16.  The generic kernel above launches one
+// 256-thread threadgroup per *query* head.  Consequently the six query heads
+// mapped to one KV head traverse the same paged K/V range in six independent
+// threadgroups.
+//
+// This deliberately narrow two-pass specialization mirrors MLX's
+// `sdpa_vector_2pass_1/2` geometry: one threadgroup is keyed by a KV head and
+// contains one SIMD group per query head (and one set per two-row MTP query).
+// The grid z-axis is a large set of strided *logical-block* stripes. Each SIMD
+// computes all 16 QK scores in a page with two lanes per token, then every lane
+// owns eight output dimensions and vector-loads that dimension's contiguous
+// V[16] row. This preserves the native paged V layout while retaining MLX's
+// long-context parallelism, with no threadgroup staging or barriers.
+//
+// The host dispatcher only selects this entry point for the exact BF16
+// D256/BS16/GQA6 shape, one sequence, and q_len 1 or 2.  Keeping the entry
+// point concrete avoids growing the already-large generic instantiation
+// matrix and leaves every other model/configuration on the proven fallback.
+
+[[kernel]] void paged_attention_grouped_bfloat16_hs256_bs16_striped(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device bfloat16_t *tmp_out [[buffer(2)]],
+    device const bfloat16_t *q [[buffer(3)]],
+    device const bfloat16_t *k_cache [[buffer(4)]],
+    device const bfloat16_t *v_cache [[buffer(5)]],
+    const device float *__restrict__ k_scale [[buffer(6)]],
+    const device float *__restrict__ v_scale [[buffer(7)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes [[buffer(14)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const constant int &sliding_window [[buffer(18)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int HEAD_SIZE = 256;
+  constexpr int BLOCK_SIZE = 16;
+  constexpr int PACKS_PER_HALF_HEAD = HEAD_SIZE / 8 / 2;
+  constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
+
+  const int kv_head_idx = int(threadgroup_position_in_grid.x);
+  // The exact guard fixes num_seqs=1. Query rows occupy grid.y rather than
+  // threadgroup.z so q_len=2 keeps the same 192-thread occupancy as decode;
+  // adjacent row groups still traverse identical pages and share GPU caches.
+  const int seq_idx = 0;
+  const int stripe_idx = int(threadgroup_position_in_grid.z);
+  const int num_stripes = int(threadgroups_per_grid.z);
+  const int local_q_head = int(thread_position_in_threadgroup.y);
+  const int q_pos_in_seq = int(threadgroup_position_in_grid.y);
+  const int q_len = int(threadgroups_per_grid.y);
+  const int lane = int(thread_position_in_threadgroup.x);
+
+  // The dispatch guard fixes GQA=6, but derive the global query-head index
+  // from the actual threadgroup geometry so a host/kernel mismatch fails by
+  // producing an obviously invalid launch rather than silently aliasing heads.
+  const int gqa_factor = int(threads_per_threadgroup.y);
+  const int head_idx = kv_head_idx * gqa_factor + local_q_head;
+  const int num_heads = q_stride / HEAD_SIZE;
+
+  const uint32_t context_len = context_lens[seq_idx];
+  const int effective_context_len =
+      int(context_len) - q_len + q_pos_in_seq + 1;
+  const int sliding_lower =
+      (sliding_window > 0 && effective_context_len > sliding_window)
+          ? (effective_context_len - sliding_window)
+          : 0;
+
+  // q_len is one for normal decode and two for the depth-1 MTP verifier.
+  // The dispatcher restricts this kernel to a single sequence, so the packed
+  // query-row index is exactly q_pos_in_seq.
+  const int q_token_idx = q_pos_in_seq;
+  const device bfloat16_t *q_ptr =
+      q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
+
+  float acc[OUTPUTS_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+    acc[i] = 0.0f;
+  }
+
+  float running_max = -FLT_MAX;
+  float running_sum = 0.0f;
+  const device uint32_t *block_table =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+
+  const int token_in_block = lane / 2;
+  const int half_head = lane & 1;
+  const int num_context_blocks =
+      DIVIDE_ROUND_UP(int(context_len), BLOCK_SIZE);
+
+  // Each SIMD row owns one (query row, query head). A pair of lanes evaluates
+  // one token: each lane covers half of D256 in sixteen BF16x8 packs.
+  for (int logical_block = stripe_idx; logical_block < num_context_blocks;
+       logical_block += num_stripes) {
+    const int block_start_token = logical_block * BLOCK_SIZE;
+    if (block_start_token + BLOCK_SIZE <= sliding_lower) {
+      continue;
+    }
+    const int64_t physical_block =
+        static_cast<int64_t>(block_table[logical_block]);
+
+    const device bfloat16_t *k_block =
+        k_cache + physical_block * int64_t(kv_block_stride) +
+        kv_head_idx * kv_head_stride;
+    float partial = 0.0f;
+#pragma unroll
+    for (int pack = 0; pack < PACKS_PER_HALF_HEAD; ++pack) {
+      const int head_pack = half_head * PACKS_PER_HALF_HEAD + pack;
+      const Bfloat8_ q_pack =
+          *reinterpret_cast<const device Bfloat8_ *>(q_ptr + head_pack * 8);
+      const Bfloat8_ k_pack =
+          *reinterpret_cast<const device Bfloat8_ *>(
+              k_block +
+              (head_pack * BLOCK_SIZE + token_in_block) * 8);
+      partial += sum(mul<Float8_, Bfloat8_, Bfloat8_>(q_pack, k_pack));
+    }
+    float score = (partial + simd_shuffle_xor(partial, 1)) * scale;
+    if (softcapping != 1.0f) {
+      score = precise::tanh(score / softcapping) * softcapping;
+    }
+
+    const int token_idx = block_start_token + token_in_block;
+    const bool valid = token_idx < effective_context_len &&
+        token_idx >= sliding_lower;
+    const float owned_score = ((lane & 1) == 0 && valid) ? score : -FLT_MAX;
+    const float block_max = simd_max(owned_score);
+    const float new_max = max(running_max, block_max);
+    const float old_factor = running_sum > 0.0f
+        ? fast::exp(running_max - new_max)
+        : 0.0f;
+    const float owned_weight = ((lane & 1) == 0 && valid)
+        ? fast::exp(score - new_max)
+        : 0.0f;
+    const float block_sum = simd_sum(owned_weight);
+
+    float weights[BLOCK_SIZE];
+#pragma unroll
+    for (int token = 0; token < BLOCK_SIZE; ++token) {
+      weights[token] = simd_shuffle(owned_weight, token * 2);
+    }
+
+    const bool full_valid_block = block_start_token >= sliding_lower &&
+        block_start_token + BLOCK_SIZE <= effective_context_len;
+    const device bfloat16_t *v_block =
+        v_cache + physical_block * int64_t(kv_block_stride) +
+        kv_head_idx * kv_head_stride;
+    Bfloat8_ weights0_bf16;
+    Bfloat8_ weights1_bf16;
+    if (full_valid_block) {
+      Float8_ weights0;
+      weights0.x = float4(weights[0], weights[1], weights[2], weights[3]);
+      weights0.y = float4(weights[4], weights[5], weights[6], weights[7]);
+      Float8_ weights1;
+      weights1.x =
+          float4(weights[8], weights[9], weights[10], weights[11]);
+      weights1.y =
+          float4(weights[12], weights[13], weights[14], weights[15]);
+      from_float(weights0_bf16, weights0);
+      from_float(weights1_bf16, weights1);
+    }
+#pragma unroll
+    for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+      const int dim = lane * OUTPUTS_PER_LANE + i;
+      const device bfloat16_t *v_row = v_block + dim * BLOCK_SIZE;
+      float block_acc = 0.0f;
+      if (full_valid_block) {
+        const Bfloat8_ values0 =
+            *reinterpret_cast<const device Bfloat8_ *>(v_row);
+        const Bfloat8_ values1 =
+            *reinterpret_cast<const device Bfloat8_ *>(v_row + 8);
+        block_acc =
+            sum(mul<Float8_, Bfloat8_, Bfloat8_>(weights0_bf16, values0)) +
+            sum(mul<Float8_, Bfloat8_, Bfloat8_>(weights1_bf16, values1));
+      } else {
+#pragma unroll
+        for (int token = 0; token < BLOCK_SIZE; ++token) {
+          const int value_token = block_start_token + token;
+          if (value_token < effective_context_len &&
+              value_token >= sliding_lower) {
+            block_acc += weights[token] * float(v_row[token]);
+          }
+        }
+      }
+      acc[i] = acc[i] * old_factor + block_acc;
+    }
+    running_max = new_max;
+    running_sum = running_sum * old_factor + block_sum;
+  }
+
+  const int row = q_token_idx * num_heads + head_idx;
+  const int stats_offset = row * num_stripes + stripe_idx;
+  if (simd_lid == 0) {
+    exp_sums[stats_offset] = running_sum;
+    max_logits[stats_offset] = running_max;
+  }
+
+  device bfloat16_t *out_ptr =
+      tmp_out + stats_offset * HEAD_SIZE + lane * OUTPUTS_PER_LANE;
+#pragma unroll
+  for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+    out_ptr[i] = bfloat16_t(acc[i]);
+  }
+
+  // These are intentionally unused for the BF16-only specialization.  Keep
+  // the bindings identical to the generic kernel so the host can switch
+  // pipelines without rebuilding the argument table.
+  (void)k_scale;
+  (void)v_scale;
+  (void)num_kv_heads;
+  (void)alibi_slopes;
+}
+
+[[kernel]] void paged_attention_grouped_bfloat16_hs256_striped_reduce(
+    device bfloat16_t *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device bfloat16_t *partials [[buffer(3)]],
+    device const uint32_t *context_lens [[buffer(4)]],
+    const constant int &num_stripes [[buffer(5)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int HEAD_SIZE = 256;
+  constexpr int NUM_REDUCE_SIMDS = 32;
+  constexpr int ELEMS_PER_LANE = HEAD_SIZE / 32;
+
+  const int head_idx = int(threadgroup_position_in_grid.x);
+  const int q_pos = int(threadgroup_position_in_grid.y);
+  const int num_heads = int(threadgroups_per_grid.x);
+  const int row = q_pos * num_heads + head_idx;
+
+  const device float *row_sums = exp_sums + row * num_stripes;
+  const device float *row_maxs = max_logits + row * num_stripes;
+  const device bfloat16_t *row_partials =
+      partials + row * num_stripes * HEAD_SIZE;
+
+  float global_max = -FLT_MAX;
+  for (int b = 0; b < num_stripes / NUM_REDUCE_SIMDS; ++b) {
+    global_max = max(global_max, row_maxs[int(simd_lid) + NUM_REDUCE_SIMDS * b]);
+  }
+  global_max = simd_max(global_max);
+
+  float global_sum = 0.0f;
+  for (int b = 0; b < num_stripes / NUM_REDUCE_SIMDS; ++b) {
+    const int stripe = int(simd_lid) + NUM_REDUCE_SIMDS * b;
+    const float factor = fast::exp(row_maxs[stripe] - global_max);
+    global_sum += factor * row_sums[stripe];
+  }
+  global_sum = simd_sum(global_sum);
+
+  float acc[ELEMS_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_LANE; ++i) {
+    acc[i] = 0.0f;
+  }
+  for (int stripe = int(simd_gid); stripe < num_stripes;
+       stripe += NUM_REDUCE_SIMDS) {
+    const float factor = fast::exp(row_maxs[stripe] - global_max);
+    const device bfloat16_t *partial =
+        row_partials + stripe * HEAD_SIZE + int(simd_lid) * ELEMS_PER_LANE;
+#pragma unroll
+    for (int i = 0; i < ELEMS_PER_LANE; ++i) {
+      acc[i] += factor * float(partial[i]);
+    }
+  }
+
+  // Transpose [contributing SIMD, output lane] in 4 KiB of static
+  // threadgroup storage, then reduce all 32 stripe classes per output lane.
+  threadgroup float outputs[NUM_REDUCE_SIMDS * 32];
+#pragma unroll
+  for (int i = 0; i < ELEMS_PER_LANE; ++i) {
+    outputs[int(simd_lid) * NUM_REDUCE_SIMDS + int(simd_gid)] = acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float value = outputs[int(simd_gid) * 32 + int(simd_lid)];
+    value = simd_sum(value);
+    value = global_sum == 0.0f ? value : value / global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lid == 0) {
+      out[row * HEAD_SIZE + int(simd_gid) * ELEMS_PER_LANE + i] =
+          bfloat16_t(value);
+    }
+  }
+
+  (void)context_lens;
+}
+
 template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
           int PARTITION_SIZE = 0>
 [[kernel]] void paged_attention_v2_reduce(

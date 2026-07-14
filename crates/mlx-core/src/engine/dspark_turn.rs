@@ -151,6 +151,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         }
         generated.push(initial_token_id);
         hist.push(initial_token_id);
+        profiler.step();
         let _is_reasoning = tracker.observe_token(initial_token_id);
         if let Some(s) = streaming.as_mut() {
             *s.last_is_reasoning = _is_reasoning;
@@ -171,7 +172,6 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 );
             }
         }
-        profiler.step();
         // The just-emitted anchor has no K/V yet — the first cycle's verify
         // writes it at position 0.
         last_in_cache = false;
@@ -516,6 +516,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         for (idx, &tok_id) in accepted[..emit_count].iter().enumerate() {
             generated.push(tok_id);
             hist.push(tok_id);
+            profiler.step();
             let _is_reasoning = tracker.observe_token(tok_id);
             if let Some(s) = streaming.as_mut() {
                 *s.last_is_reasoning = _is_reasoning;
@@ -572,7 +573,6 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         anchor = boundary_id;
         let y_arr = MxArray::from_int32(&[boundary_id as i32], &[1])?;
         step.eval_boundary(&y_arr);
-        profiler.step();
     }
 
     profiler.snapshot_memory_after();
@@ -948,6 +948,8 @@ mod tests {
 
     struct TurnOut {
         generated: Vec<u32>,
+        profiled_generated_tokens: u64,
+        profiled_decode_tokens: u64,
         finish_reason: String,
         last_in_cache: bool,
         ledger: Vec<Call>,
@@ -963,6 +965,8 @@ mod tests {
     struct RawTurnOut {
         result: Result<super::DsparkTurnOutcome>,
         generated: Vec<u32>,
+        profiled_generated_tokens: u64,
+        profiled_decode_tokens: u64,
         finish_reason: String,
         acceptance: Option<(f64, Vec<f64>, u32)>,
     }
@@ -1012,10 +1016,13 @@ mod tests {
         // The commit-exactly-once design keeps the histories in lockstep on
         // BOTH the success and the error path (emission always pushes both).
         assert_eq!(token_history, generated, "history must mirror generated");
+        let (profiled_generated_tokens, profiled_decode_tokens) = profiler.token_counts_for_test();
 
         RawTurnOut {
             result,
             generated,
+            profiled_generated_tokens,
+            profiled_decode_tokens,
             finish_reason,
             acceptance: profiler.mtp_acceptance_summary(),
         }
@@ -1037,6 +1044,8 @@ mod tests {
 
         TurnOut {
             generated: raw.generated,
+            profiled_generated_tokens: raw.profiled_generated_tokens,
+            profiled_decode_tokens: raw.profiled_decode_tokens,
             finish_reason: raw.finish_reason,
             last_in_cache: outcome.last_in_cache,
             ledger: backend.ledger_snapshot(),
@@ -1116,6 +1125,12 @@ mod tests {
             out.generated,
             vec![3, 4, 5, 6, 7, 9, 10, 11],
             "seed + per-cycle accepted prefix + boundary, in cycle order"
+        );
+        assert_eq!(out.profiled_generated_tokens, out.generated.len() as u64);
+        assert_eq!(
+            out.profiled_decode_tokens,
+            out.generated.len().saturating_sub(1) as u64,
+            "variable DSpark cycle commits must obey the shared profiler invariant"
         );
         assert_eq!(out.finish_reason, "length");
         assert!(

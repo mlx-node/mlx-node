@@ -30,7 +30,6 @@
 #![cfg(target_os = "macos")]
 
 use metal::MTLResourceOptions;
-use metal::foreign_types::ForeignType;
 use mlx_paged_attn::metal::{
     MetalDtype, MetalState, PagedAttentionParams, PagedAttentionVarlenParams, RawBufferInfo,
     dispatch_paged_attention_v1_raw, dispatch_paged_attention_varlen_auto,

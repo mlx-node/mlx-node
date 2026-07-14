@@ -1,0 +1,35 @@
+[package]
+name = "mlx-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Narrow objc2-metal adapter for mlx-node"
+license = "MIT"
+
+[lib]
+name = "metal"
+
+[dependencies]
+foreign-types = "0.5"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSError",
+  "NSString",
+] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "bitflags",
+  "MTLAllocation",
+  "MTLBlitCommandEncoder",
+  "MTLBuffer",
+  "MTLCommandBuffer",
+  "MTLCommandEncoder",
+  "MTLCommandQueue",
+  "MTLComputeCommandEncoder",
+  "MTLComputePipeline",
+  "MTLDevice",
+  "MTLLibrary",
+  "MTLResource",
+  "MTLTypes",
+] }

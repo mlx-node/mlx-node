@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::array::MxArray;
@@ -12,7 +13,7 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedPrefillMemorySnapshot};
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
@@ -90,8 +91,24 @@ struct CacheHitPrefillPlan {
     live_headroom_bytes: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LivePrefillHeadroom {
+    selected_bytes: Option<u64>,
+    allocator_available_bytes: Option<u64>,
+    metal_available_bytes: Option<u64>,
+    allocator_active_bytes: Option<u64>,
+    allocator_cached_bytes: Option<u64>,
+    allocator_limit_bytes: Option<u64>,
+    allocator_ceiling_bytes: Option<u64>,
+    metal_recommended_working_set_bytes: Option<u64>,
+    metal_current_allocated_bytes: Option<u64>,
+    paged_pool_allocated_bytes: Option<u64>,
+}
+
 const FAST_SDPA_FIXED_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const FAST_SDPA_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+static NATIVE_KV_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
+static DECODE_GATHER_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn parse_cache_hit_prefill_mode(value: Option<&str>) -> CacheHitPrefillMode {
     match value.map(str::trim) {
@@ -112,6 +129,14 @@ fn cache_hit_prefill_mode() -> CacheHitPrefillMode {
                 .as_deref(),
         )
     })
+}
+
+fn should_probe_cache_hit_prefill_memory(
+    mode: CacheHitPrefillMode,
+    query_tokens: i64,
+    graph_backend_available: bool,
+) -> bool {
+    mode == CacheHitPrefillMode::Auto && query_tokens > 8 && graph_backend_available
 }
 
 fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: bool) -> bool {
@@ -183,6 +208,7 @@ fn estimate_varlen_paged_attention_bytes(
     query_tokens: u64,
     total_context: u64,
     num_query_heads: u64,
+    num_kv_heads: u64,
     head_dim: u64,
     dtype_bytes: u64,
 ) -> u64 {
@@ -193,7 +219,28 @@ fn estimate_varlen_paged_attention_bytes(
     if total_context <= 512 {
         return output.saturating_add(FAST_SDPA_FIXED_OVERHEAD_BYTES);
     }
-    let partitions = total_context.div_ceil(512);
+    // The exact Qwen3.5/3.6 dense BF16 q_len=1/2 specialization uses
+    // strided block stripes rather than generic 512-token partitions. Keep
+    // this schedule byte-for-byte aligned with both Metal dispatchers so the
+    // prefill planner accounts for the real temporary allocation.
+    let grouped_qwen35 = num_query_heads == 24
+        && num_kv_heads == 4
+        && head_dim == 256
+        && dtype_bytes == 2
+        && ((query_tokens == 1 && total_context >= 16_384)
+            || (query_tokens == 2 && total_context >= 8_192));
+    let partitions = if grouped_qwen35 {
+        match total_context {
+            0..=4_096 => 32,
+            4_097..=8_192 => 64,
+            8_193..=16_383 => 128,
+            16_384..=32_768 => 256,
+            32_769..=65_536 => 512,
+            _ => 1_024,
+        }
+    } else {
+        total_context.div_ceil(512)
+    };
     let rows = query_tokens
         .saturating_mul(num_query_heads)
         .saturating_mul(partitions);
@@ -256,38 +303,70 @@ fn select_cache_hit_prefill_plan(
     }
 }
 
-/// Return the tightest live allocation allowance reported by macOS/MLX.
-/// `os_proc_available_memory` accounts for the externally allocated Metal
-/// paged pool; MLX's allocator limit additionally accounts for active/cached
-/// graph allocations. If probes are unavailable, the router uses the smaller
-/// of the two conservative transient estimates.
-fn live_prefill_headroom_bytes() -> Option<u64> {
-    if !crate::engine::persistence::compiled_forward_backend_available() {
-        return None;
+/// Return the tightest live allocation allowance reported by Metal/MLX.
+///
+/// `MTLDevice.currentAllocatedSize` is process-local and includes the private
+/// paged-pool buffers that bypass MLX's allocator. MLX's active/cache counters
+/// distinguish live graph allocations from reclaimable cache, while its
+/// effective GC ceiling is bounded by 95% of Metal's recommended working set.
+/// Use the tighter of those independently useful allowances.
+fn select_live_prefill_headroom(
+    allocator_available_bytes: Option<u64>,
+    metal_available_bytes: Option<u64>,
+) -> Option<u64> {
+    match (allocator_available_bytes, metal_available_bytes) {
+        (Some(allocator), Some(metal)) => Some(allocator.min(metal)),
+        (Some(allocator), None) => Some(allocator),
+        (None, Some(metal)) => Some(metal),
+        (None, None) => None,
+    }
+}
+
+fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHeadroom {
+    let allocator_ceiling_bytes = snapshot.allocator_limit_bytes.map(|limit| {
+        snapshot
+            .metal_recommended_working_set_bytes
+            .map(|recommended| limit.min(recommended.saturating_mul(95) / 100))
+            .unwrap_or(limit)
+    });
+    let mut allocator_available_bytes = allocator_ceiling_bytes
+        .zip(snapshot.allocator_active_bytes)
+        .map(|(ceiling, active)| ceiling.saturating_sub(active));
+
+    let metal_available_bytes = snapshot
+        .metal_recommended_working_set_bytes
+        .zip(snapshot.metal_current_allocated_bytes)
+        .map(|(recommended, current)| {
+            // MLX's cache is reclaimable at its GC threshold. Add back only
+            // bytes known to be part of the device's current allocation.
+            let reclaimable_cache = snapshot.allocator_cached_bytes.unwrap_or(0).min(current);
+            recommended.saturating_sub(current.saturating_sub(reclaimable_cache))
+        });
+
+    if metal_available_bytes.is_none() {
+        // A missing Metal snapshot should be rare once a paged adapter exists.
+        // Keep the allocator fallback conservative by subtracting the known
+        // external K/V pool that MLX active-memory accounting omits.
+        allocator_available_bytes = allocator_available_bytes.map(|available| {
+            available.saturating_sub(snapshot.paged_pool_allocated_bytes.unwrap_or(0))
+        });
     }
 
-    let mut process_available = 0u64;
-    let process_ok = unsafe {
-        mlx_sys::mlx_process_available_memory(&mut process_available) == 0 && process_available > 0
-    };
-    if !process_ok {
-        return None;
+    LivePrefillHeadroom {
+        selected_bytes: select_live_prefill_headroom(
+            allocator_available_bytes,
+            metal_available_bytes,
+        ),
+        allocator_available_bytes,
+        metal_available_bytes,
+        allocator_active_bytes: snapshot.allocator_active_bytes,
+        allocator_cached_bytes: snapshot.allocator_cached_bytes,
+        allocator_limit_bytes: snapshot.allocator_limit_bytes,
+        allocator_ceiling_bytes,
+        metal_recommended_working_set_bytes: snapshot.metal_recommended_working_set_bytes,
+        metal_current_allocated_bytes: snapshot.metal_current_allocated_bytes,
+        paged_pool_allocated_bytes: snapshot.paged_pool_allocated_bytes,
     }
-
-    let mut headroom = process_available;
-    let mut active = 0u64;
-    let mut cached = 0u64;
-    let mut limit = 0u64;
-    let allocator_ok = unsafe {
-        mlx_sys::mlx_get_active_memory(&mut active) == 0
-            && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
-            && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
-            && limit > 0
-    };
-    if allocator_ok {
-        headroom = headroom.min(limit.saturating_sub(active.saturating_add(cached)));
-    }
-    Some(headroom)
 }
 
 fn native_kv_write_enabled() -> bool {
@@ -699,7 +778,14 @@ impl Qwen3_5Attention {
         ])?;
 
         let trace_enabled = inference_trace_enabled();
-        let write_trace_start = trace_enabled.then(Instant::now);
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let inference_debug_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
+        let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
+        let write_info_start =
+            (inference_info_enabled && is_prefill && attn_layer_idx == 0 && seq_len > 8)
+                .then(Instant::now);
         let write_path = if native_kv_write_enabled() {
             match adapter.update_keys_values_native(
                 attn_layer_idx,
@@ -715,6 +801,21 @@ impl Qwen3_5Attention {
                              layer={} first_position={} seq_len={} error={}",
                             attn_layer_idx, first_logical_position, seq_len, err
                         ));
+                    }
+                    if inference_info_enabled && attn_layer_idx == 0 {
+                        let first_report =
+                            !NATIVE_KV_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
+                        if is_prefill || first_report || first_logical_position.is_multiple_of(32) {
+                            tracing::warn!(
+                                target: "mlx_core::inference",
+                                event = "paged_kv_write_fallback",
+                                layer = attn_layer_idx,
+                                first_position = first_logical_position,
+                                sequence_tokens = seq_len,
+                                error = %err,
+                                "native paged KV write failed; using legacy write path"
+                            );
+                        }
                     }
                     adapter
                         .update_keys_values(
@@ -748,6 +849,30 @@ impl Qwen3_5Attention {
                 write_path,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
+        }
+        if inference_debug_enabled {
+            tracing::debug!(
+                target: "mlx_core::inference",
+                event = "paged_kv_write_done",
+                layer = attn_layer_idx,
+                first_position = first_logical_position,
+                sequence_tokens = seq_len,
+                path = write_path,
+                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                "paged KV layer write completed"
+            );
+        }
+        if inference_info_enabled && is_prefill && attn_layer_idx == 0 && seq_len > 8 {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "paged_kv_write_done",
+                layer = attn_layer_idx,
+                first_position = first_logical_position,
+                sequence_tokens = seq_len,
+                path = write_path,
+                elapsed_ms = write_info_start.map(elapsed_ms).unwrap_or(0.0),
+                "paged prefill KV write completed"
+            );
         }
 
         // Compute attention output.
@@ -797,23 +922,113 @@ impl Qwen3_5Attention {
                     seq_len as u64,
                     total_ctx as u64,
                     self.num_heads as u64,
+                    self.num_kv_heads as u64,
                     self.head_dim as u64,
                     dtype_bytes,
                 );
                 let prefill_mode = cache_hit_prefill_mode();
+                // Tiny MTP verification prefills are hard-routed to varlen,
+                // and explicit overrides ignore memory heuristics. Avoid all
+                // live probes on those hot paths. The adapter caches the
+                // snapshot for real prefills, so every full-attention layer in
+                // one chunk uses a single, consistent route decision.
+                let memory_probe_performed = should_probe_cache_hit_prefill_memory(
+                    prefill_mode,
+                    seq_len,
+                    graph_backend_available,
+                );
+                let live_headroom = if memory_probe_performed {
+                    live_prefill_headroom(adapter.prefill_memory_snapshot())
+                } else {
+                    LivePrefillHeadroom::default()
+                };
                 let plan = select_cache_hit_prefill_plan(
                     prefill_mode,
                     seq_len as u64,
                     estimated_sdpa_bytes,
                     estimated_varlen_bytes,
-                    live_prefill_headroom_bytes(),
+                    live_headroom.selected_bytes,
                 );
+                let planned_path = match plan.path {
+                    CacheHitPrefillPath::PagedVarlen => "paged_attention_varlen",
+                    CacheHitPrefillPath::PagedPoolSdpa => "paged_pool_sdpa",
+                };
+                let configured_mode = match prefill_mode {
+                    CacheHitPrefillMode::Auto => "auto",
+                    CacheHitPrefillMode::ForcePaged => "force_paged",
+                    CacheHitPrefillMode::ForceSdpa => "force_sdpa",
+                };
+                let report_prefill_route =
+                    inference_info_enabled && attn_layer_idx == 0 && seq_len > 8;
+                if report_prefill_route {
+                    tracing::info!(
+                        target: "mlx_core::inference",
+                        event = "cache_hit_prefill_plan",
+                        layer = attn_layer_idx,
+                        suffix_tokens = seq_len,
+                        cached_prefix_tokens = cached_prefix_len,
+                        total_context_tokens = total_ctx,
+                        configured_mode,
+                        planned_path,
+                        graph_backend_available,
+                        estimated_sdpa_mib = plan.estimated_sdpa_bytes as f64
+                            / (1024.0 * 1024.0),
+                        estimated_varlen_mib = plan.estimated_varlen_bytes as f64
+                            / (1024.0 * 1024.0),
+                        memory_probe_performed,
+                        allocator_headroom_reported = live_headroom
+                            .allocator_available_bytes
+                            .is_some(),
+                        allocator_headroom_mib = live_headroom
+                            .allocator_available_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        allocator_active_mib = live_headroom
+                            .allocator_active_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        allocator_cached_mib = live_headroom
+                            .allocator_cached_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        allocator_limit_mib = live_headroom
+                            .allocator_limit_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        allocator_ceiling_mib = live_headroom
+                            .allocator_ceiling_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        metal_headroom_reported = live_headroom.metal_available_bytes.is_some(),
+                        metal_headroom_mib = live_headroom
+                            .metal_available_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        metal_recommended_working_set_mib = live_headroom
+                            .metal_recommended_working_set_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        metal_current_allocated_mib = live_headroom
+                            .metal_current_allocated_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        paged_pool_allocated_mib = live_headroom
+                            .paged_pool_allocated_bytes
+                            .unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        live_headroom_reported = plan.live_headroom_bytes.is_some(),
+                        live_headroom_mib = plan.live_headroom_bytes.unwrap_or(0) as f64
+                            / (1024.0 * 1024.0),
+                        "cache-hit prefill route selected"
+                    );
+                }
 
                 let maybe_sdpa = if batch == 1
                     && graph_backend_available
                     && plan.path == CacheHitPrefillPath::PagedPoolSdpa
                 {
-                    let sdpa_trace_start = trace_enabled.then(Instant::now);
+                    let sdpa_trace_start =
+                        (trace_enabled || report_prefill_route).then(Instant::now);
                     match adapter.gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx) {
                         Ok((k_full, v_full)) => match scaled_dot_product_attention_causal(
                             &queries_bhtd,
@@ -840,6 +1055,21 @@ impl Qwen3_5Attention {
                                         sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
                                     ));
                                 }
+                                if report_prefill_route {
+                                    tracing::info!(
+                                        target: "mlx_core::inference",
+                                        event = "cache_hit_prefill_route",
+                                        layer = attn_layer_idx,
+                                        suffix_tokens = seq_len,
+                                        cached_prefix_tokens = cached_prefix_len,
+                                        total_context_tokens = total_ctx,
+                                        path = "paged_pool_sdpa",
+                                        elapsed_ms = sdpa_trace_start
+                                            .map(elapsed_ms)
+                                            .unwrap_or(0.0),
+                                        "cache-hit prefill attention graph constructed"
+                                    );
+                                }
                                 Some(attn)
                             }
                             Err(err) => {
@@ -851,6 +1081,18 @@ impl Qwen3_5Attention {
                                         attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
                                     ));
                                 }
+                                tracing::warn!(
+                                    target: "mlx_core::inference",
+                                    event = "cache_hit_prefill_fallback",
+                                    layer = attn_layer_idx,
+                                    suffix_tokens = seq_len,
+                                    cached_prefix_tokens = cached_prefix_len,
+                                    total_context_tokens = total_ctx,
+                                    failed_path = "paged_pool_sdpa",
+                                    stage = "sdpa",
+                                    error = %err,
+                                    "cache-hit prefill SDPA construction failed"
+                                );
                                 None
                             }
                         },
@@ -863,6 +1105,18 @@ impl Qwen3_5Attention {
                                     attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
                                 ));
                             }
+                            tracing::warn!(
+                                target: "mlx_core::inference",
+                                event = "cache_hit_prefill_fallback",
+                                layer = attn_layer_idx,
+                                suffix_tokens = seq_len,
+                                cached_prefix_tokens = cached_prefix_len,
+                                total_context_tokens = total_ctx,
+                                failed_path = "paged_pool_sdpa",
+                                stage = "paged_pool_gather",
+                                error = %err,
+                                "cache-hit prefill paged-pool gather failed"
+                            );
                             None
                         }
                     }
@@ -876,7 +1130,8 @@ impl Qwen3_5Attention {
                 ) && batch == 1
                     && graph_backend_available
                 {
-                    let paged_trace_start = trace_enabled.then(Instant::now);
+                    let paged_trace_start =
+                        (trace_enabled || report_prefill_route).then(Instant::now);
                     let queries_paged =
                         queries.reshape(&[seq_len, self.num_heads as i64, self.head_dim as i64])?;
                     match adapter.gather_kv_for_prefill_chunk_varlen(
@@ -913,6 +1168,21 @@ impl Qwen3_5Attention {
                                         / (1024.0 * 1024.0)
                                 ));
                             }
+                            if report_prefill_route {
+                                tracing::info!(
+                                    target: "mlx_core::inference",
+                                    event = "cache_hit_prefill_route",
+                                    layer = attn_layer_idx,
+                                    suffix_tokens = seq_len,
+                                    cached_prefix_tokens = cached_prefix_len,
+                                    total_context_tokens = total_ctx,
+                                    path = "paged_attention_varlen",
+                                    graph_build_ms = paged_trace_start
+                                        .map(elapsed_ms)
+                                        .unwrap_or(0.0),
+                                    "cache-hit prefill attention graph constructed"
+                                );
+                            }
                             Some(attn)
                         }
                         Err(err) => {
@@ -924,6 +1194,18 @@ impl Qwen3_5Attention {
                                     attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
                                 ));
                             }
+                            tracing::warn!(
+                                target: "mlx_core::inference",
+                                event = "cache_hit_prefill_fallback",
+                                layer = attn_layer_idx,
+                                suffix_tokens = seq_len,
+                                cached_prefix_tokens = cached_prefix_len,
+                                total_context_tokens = total_ctx,
+                                failed_path = "paged_attention_varlen",
+                                stage = "graph_construction",
+                                error = %err,
+                                "cache-hit varlen PagedAttention construction failed"
+                            );
                             None
                         }
                     }
@@ -938,12 +1220,14 @@ impl Qwen3_5Attention {
                         // errors surface later when the lazy graph evaluates.
                         // This synchronously reads K/V through the host, so it
                         // is intentionally never the normal route.
-                        let read_trace_start = trace_enabled.then(Instant::now);
+                        let read_trace_start =
+                            (trace_enabled || inference_info_enabled).then(Instant::now);
                         let (k_full, v_full) = adapter
                             .read_kv_range(attn_layer_idx, 0, total_ctx)
                             .map_err(napi::Error::from_reason)?;
                         let read_kv_range_ms = read_trace_start.map(elapsed_ms);
-                        let sdpa_trace_start = trace_enabled.then(Instant::now);
+                        let sdpa_trace_start =
+                            (trace_enabled || inference_info_enabled).then(Instant::now);
                         let attn = scaled_dot_product_attention_causal(
                             &queries_bhtd,
                             &k_full,
@@ -964,6 +1248,18 @@ impl Qwen3_5Attention {
                                 sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
                             ));
                         }
+                        tracing::warn!(
+                            target: "mlx_core::inference",
+                            event = "cache_hit_prefill_route",
+                            layer = attn_layer_idx,
+                            suffix_tokens = seq_len,
+                            cached_prefix_tokens = cached_prefix_len,
+                            total_context_tokens = total_ctx,
+                            path = "host_read_fallback",
+                            read_kv_range_ms = read_kv_range_ms.unwrap_or(0.0),
+                            sdpa_graph_ms = sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                            "cache-hit prefill used synchronous host-read fallback"
+                        );
                         attn
                     }
                 }
@@ -976,7 +1272,7 @@ impl Qwen3_5Attention {
                 self.num_heads as i64,
                 self.head_dim as i64,
             ])?;
-            let gather_trace_start = trace_enabled.then(Instant::now);
+            let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
             let attn_3d = match adapter.gather_kv_for_decode_graph(
                 attn_layer_idx,
                 &queries_3d,
@@ -993,6 +1289,17 @@ impl Qwen3_5Attention {
                             gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
                         ));
                     }
+                    if inference_debug_enabled {
+                        tracing::debug!(
+                            target: "mlx_core::inference",
+                            event = "paged_attention_gather_done",
+                            layer = attn_layer_idx,
+                            path = "graph",
+                            context_tokens = adapter.current_token_count(),
+                            elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                            "paged attention layer gather completed"
+                        );
+                    }
                     attn_3d
                 }
                 Err(err) => {
@@ -1005,14 +1312,43 @@ impl Qwen3_5Attention {
                             err
                         ));
                     }
-                    adapter
+                    if inference_info_enabled && attn_layer_idx == 0 {
+                        let context_tokens = adapter.current_token_count();
+                        let first_report =
+                            !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
+                        if first_report || context_tokens.is_multiple_of(32) {
+                            tracing::warn!(
+                                target: "mlx_core::inference",
+                                event = "paged_attention_gather_fallback",
+                                layer = attn_layer_idx,
+                                context_tokens,
+                                failed_path = "graph",
+                                fallback_path = "raw",
+                                error = %err,
+                                "graph paged-attention gather failed; using raw gather"
+                            );
+                        }
+                    }
+                    let attn_3d = adapter
                         .gather_kv_for_decode(
                             attn_layer_idx,
                             &queries_3d,
                             self.scale,
                             /* softcap */ 1.0,
                         )
-                        .map_err(napi::Error::from_reason)?
+                        .map_err(napi::Error::from_reason)?;
+                    if inference_debug_enabled {
+                        tracing::debug!(
+                            target: "mlx_core::inference",
+                            event = "paged_attention_gather_done",
+                            layer = attn_layer_idx,
+                            path = "raw_fallback",
+                            context_tokens = adapter.current_token_count(),
+                            elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                            "paged attention layer gather completed"
+                        );
+                    }
+                    attn_3d
                 }
             };
             let target_dtype = x.dtype()?;
@@ -1250,7 +1586,7 @@ mod tests {
         // Exact Qwen3.6-27B attention shape from the local checkpoint:
         // 24 query heads, 4 KV heads, head_dim 256, bf16 activations.
         let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
-        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 256, 2);
+        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
         assert_eq!(estimate, 7_063_814_144);
         assert_eq!(varlen_estimate, 3_338_272_768);
         let plan = select_cache_hit_prefill_plan(
@@ -1266,7 +1602,7 @@ mod tests {
     #[test]
     fn automatic_prefill_uses_varlen_when_sdpa_score_matrix_will_not_fit() {
         let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2);
-        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 256, 2);
+        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
         assert_eq!(
             select_cache_hit_prefill_plan(
                 CacheHitPrefillMode::Auto,
@@ -1295,6 +1631,21 @@ mod tests {
         assert_eq!(
             select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 1, 1, 1, Some(u64::MAX),).path,
             CacheHitPrefillPath::PagedVarlen
+        );
+    }
+
+    #[test]
+    fn qwen27b_grouped_varlen_estimate_uses_long_context_stripes() {
+        // q_len=2, 24Q/4KV, D256, BF16 at >64K selects 1,024 stripes.
+        // Aux state is 49,152 rows * (two f32 stats + 256 BF16 values),
+        // plus final output and the planner's fixed 64 MiB headroom.
+        assert_eq!(
+            estimate_varlen_paged_attention_bytes(2, 114_688, 24, 4, 256, 2),
+            92_692_480
+        );
+        assert_eq!(
+            estimate_varlen_paged_attention_bytes(1, 114_688, 24, 4, 256, 2),
+            79_900_672
         );
     }
 
@@ -1338,6 +1689,89 @@ mod tests {
             .path,
             CacheHitPrefillPath::PagedPoolSdpa
         );
+    }
+
+    #[test]
+    fn allocator_and_metal_headroom_are_independent_bounds() {
+        assert_eq!(
+            select_live_prefill_headroom(None, Some(16 * 1024 * 1024 * 1024)),
+            Some(16 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(select_live_prefill_headroom(Some(12), Some(8)), Some(8));
+        assert_eq!(select_live_prefill_headroom(Some(12), None), Some(12));
+        assert_eq!(select_live_prefill_headroom(None, None), None);
+    }
+
+    #[test]
+    fn live_headroom_includes_external_metal_pool_and_reclaimable_cache() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_prefill_headroom(PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(20 * gib),
+            allocator_cached_bytes: Some(4 * gib),
+            allocator_limit_bytes: Some(120 * gib),
+            metal_recommended_working_set_bytes: Some(100 * gib),
+            metal_current_allocated_bytes: Some(40 * gib),
+            paged_pool_allocated_bytes: Some(16 * gib),
+        });
+
+        // MLX GC ceiling: min(120 GiB, 95% of 100 GiB) - 20 GiB active.
+        assert_eq!(headroom.allocator_ceiling_bytes, Some(95 * gib));
+        assert_eq!(headroom.allocator_available_bytes, Some(75 * gib));
+        // Metal sees the external 16 GiB pool in currentAllocatedSize; only
+        // the 4 GiB MLX cache is reclaimable.
+        assert_eq!(headroom.metal_available_bytes, Some(64 * gib));
+        assert_eq!(headroom.selected_bytes, Some(64 * gib));
+    }
+
+    #[test]
+    fn missing_metal_probe_subtracts_known_external_pool_from_allocator() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_prefill_headroom(PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(70 * gib),
+            allocator_cached_bytes: Some(2 * gib),
+            allocator_limit_bytes: Some(100 * gib),
+            paged_pool_allocated_bytes: Some(16 * gib),
+            ..PagedPrefillMemorySnapshot::default()
+        });
+        assert_eq!(headroom.allocator_available_bytes, Some(14 * gib));
+        assert_eq!(headroom.selected_bytes, Some(14 * gib));
+
+        let exhausted = live_prefill_headroom(PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(95 * gib),
+            allocator_limit_bytes: Some(100 * gib),
+            paged_pool_allocated_bytes: Some(16 * gib),
+            ..PagedPrefillMemorySnapshot::default()
+        });
+        assert_eq!(exhausted.selected_bytes, Some(0));
+    }
+
+    #[test]
+    fn memory_probe_is_skipped_for_mtp_and_explicit_routes() {
+        assert!(!should_probe_cache_hit_prefill_memory(
+            CacheHitPrefillMode::Auto,
+            2,
+            true,
+        ));
+        assert!(!should_probe_cache_hit_prefill_memory(
+            CacheHitPrefillMode::ForcePaged,
+            2_048,
+            true,
+        ));
+        assert!(!should_probe_cache_hit_prefill_memory(
+            CacheHitPrefillMode::ForceSdpa,
+            2_048,
+            true,
+        ));
+        assert!(!should_probe_cache_hit_prefill_memory(
+            CacheHitPrefillMode::Auto,
+            2_048,
+            false,
+        ));
+        assert!(should_probe_cache_hit_prefill_memory(
+            CacheHitPrefillMode::Auto,
+            2_048,
+            true,
+        ));
     }
 
     #[test]

@@ -184,7 +184,6 @@ pub struct LoadTimePoolSizing {
     pub bytes_per_block: u64,
     pub selected_bytes: u64,
     pub total_memory_bytes: u64,
-    pub process_available_bytes: Option<u64>,
     pub metal_working_set_bytes: Option<u64>,
     pub metal_active_bytes: u64,
 }
@@ -499,7 +498,6 @@ pub fn compute_num_blocks_with_working_set(
 pub fn compute_load_time_pool_sizing(
     requested_blocks: u32,
     total_memory_bytes: u64,
-    process_available_bytes: Option<u64>,
     metal_working_set_bytes: Option<u64>,
     metal_active_bytes: u64,
     util: f64,
@@ -522,19 +520,14 @@ pub fn compute_load_time_pool_sizing(
     };
 
     // Total-memory and Metal ceilings are absolute, so subtract current MLX
-    // active allocation. os_proc_available_memory is already a remaining
-    // allocation allowance and therefore has no `used` subtraction.
+    // active allocation from both.
     let total_budget = budget(total_memory_bytes, metal_active_bytes);
-    let process_budget = process_available_bytes.map(|available| budget(available, 0));
     let metal_budget = metal_working_set_bytes.map(|ws| budget(ws, metal_active_bytes));
 
     // Total physical memory is the mandatory safety ceiling. Optional live
     // probes may only tighten it; their absence must never restore the full
     // requested pool.
     let mut safe_bytes = total_budget;
-    if let Some(process) = process_budget {
-        safe_bytes = safe_bytes.min(process);
-    }
     if let Some(metal) = metal_budget {
         safe_bytes = safe_bytes.min(metal);
     }
@@ -555,18 +548,16 @@ pub fn compute_load_time_pool_sizing(
         bytes_per_block,
         selected_bytes: selected_blocks as u64 * bytes_per_block,
         total_memory_bytes,
-        process_available_bytes,
         metal_working_set_bytes,
         metal_active_bytes,
     })
 }
 
 /// Read the live macOS/Metal probes and apply [`compute_load_time_pool_sizing`].
-/// Total system memory and current MLX active memory are mandatory. Process
-/// headroom and the Metal working-set ceiling are optional and independently
-/// tighten the result when reported. Callers must fail closed on an error;
-/// restoring `requested_blocks` would turn an explicit value into an uncapped
-/// allocation request.
+/// Total system memory and current MLX active memory are mandatory. The Metal
+/// working-set ceiling optionally tightens the result when reported. Callers
+/// must fail closed on an error; restoring `requested_blocks` would turn an
+/// explicit value into an uncapped allocation request.
 pub fn load_time_pool_sizing(
     requested_blocks: u32,
     num_layers: u32,
@@ -585,15 +576,6 @@ pub fn load_time_pool_sizing(
         if !unsafe { mlx_sys::mlx_metal_is_available() } {
             return Err(ProfileError::MetalUnavailable);
         }
-        let mut process_available = 0u64;
-        let process_available =
-            if unsafe { mlx_sys::mlx_process_available_memory(&mut process_available) } == 0
-                && process_available > 0
-            {
-                Some(process_available)
-            } else {
-                None
-            };
         let mut active = 0u64;
         if unsafe { mlx_sys::mlx_get_active_memory(&mut active) } != 0 {
             return Err(ProfileError::MetalUnavailable);
@@ -602,7 +584,6 @@ pub fn load_time_pool_sizing(
         compute_load_time_pool_sizing(
             requested_blocks,
             total,
-            process_available,
             working_set,
             active,
             util,
@@ -864,17 +845,9 @@ mod tests {
     fn load_time_sizing_treats_requested_pool_as_maximum() {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
-        let sizing = compute_load_time_pool_sizing(
-            2048,
-            64 * gib,
-            Some(32 * gib),
-            Some(48 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-        )
-        .unwrap();
+        let sizing =
+            compute_load_time_pool_sizing(2048, 64 * gib, Some(48 * gib), 20 * gib, 0.85, gib, bpb)
+                .unwrap();
         assert_eq!(sizing.requested_blocks, 2048);
         assert_eq!(sizing.selected_blocks, 2048);
         assert_eq!(sizing.selected_bytes, 2 * gib);
@@ -884,19 +857,21 @@ mod tests {
     fn load_time_sizing_clamps_to_tightest_live_budget_and_whole_blocks() {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 3 * 1024 * 1024;
-        // Process headroom is tightest: floor(8 GiB * .85 - 1 GiB).
+        // Metal working-set headroom is tightest:
+        // floor(32 GiB * .85 - 20 GiB active - 1 GiB safety).
         let sizing = compute_load_time_pool_sizing(
             u32::MAX,
             64 * gib,
-            Some(8 * gib),
-            Some(48 * gib),
+            Some(32 * gib),
             20 * gib,
             0.85,
             gib,
             bpb,
         )
         .unwrap();
-        let expected_bytes = ((8f64 * gib as f64 * 0.85) as u64).saturating_sub(gib);
+        let expected_bytes = ((32f64 * gib as f64 * 0.85) as u64)
+            .saturating_sub(20 * gib)
+            .saturating_sub(gib);
         assert_eq!(sizing.selected_blocks as u64, expected_bytes / bpb);
         assert_eq!(sizing.selected_bytes % bpb, 0);
         assert!(sizing.selected_blocks < sizing.requested_blocks);
@@ -908,7 +883,6 @@ mod tests {
         let err = compute_load_time_pool_sizing(
             16,
             8 * gib,
-            Some(gib),
             Some(6 * gib),
             5 * gib,
             0.85,
@@ -924,44 +898,34 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
         let sizing =
-            compute_load_time_pool_sizing(u32::MAX, 16 * gib, None, None, 4 * gib, 0.85, gib, bpb)
+            compute_load_time_pool_sizing(u32::MAX, 16 * gib, None, 4 * gib, 0.85, gib, bpb)
                 .unwrap();
         let expected_budget = ((16f64 * gib as f64 * 0.85) as u64)
             .saturating_sub(4 * gib)
             .saturating_sub(gib);
         assert_eq!(sizing.selected_blocks as u64, expected_budget / bpb);
-        assert_eq!(sizing.process_available_bytes, None);
         assert_eq!(sizing.metal_working_set_bytes, None);
         assert!(sizing.selected_blocks < sizing.requested_blocks);
     }
 
     #[test]
-    fn load_time_sizing_applies_each_available_optional_ceiling_independently() {
+    fn load_time_sizing_applies_optional_working_set_ceiling() {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
-        let without_process = compute_load_time_pool_sizing(
+        let without_working_set =
+            compute_load_time_pool_sizing(u32::MAX, 64 * gib, None, 20 * gib, 0.85, gib, bpb)
+                .unwrap();
+        let with_tight_working_set = compute_load_time_pool_sizing(
             u32::MAX,
             64 * gib,
-            None,
-            Some(48 * gib),
+            Some(32 * gib),
             20 * gib,
             0.85,
             gib,
             bpb,
         )
         .unwrap();
-        let with_tight_process = compute_load_time_pool_sizing(
-            u32::MAX,
-            64 * gib,
-            Some(8 * gib),
-            Some(48 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-        )
-        .unwrap();
-        assert!(with_tight_process.selected_blocks < without_process.selected_blocks);
+        assert!(with_tight_working_set.selected_blocks < without_working_set.selected_blocks);
     }
 
     #[test]

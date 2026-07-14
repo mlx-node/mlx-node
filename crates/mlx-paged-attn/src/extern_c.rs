@@ -34,7 +34,6 @@
 use std::ffi::c_void;
 
 use metal::Buffer;
-use metal::foreign_types::ForeignType;
 
 use crate::metal::{
     MetalDtype, PagedAttentionParams, PagedAttentionVarlenParams, RawBufferInfo,
@@ -89,21 +88,16 @@ fn parse_kv_dtype(raw: u8) -> Option<KvDtypeC> {
     }
 }
 
-/// Borrow an `MTLBuffer*` (held by MLX) as an owned `Buffer` so the
-/// existing dispatcher API can take it. The caller MUST `mem::forget`
-/// the wrapper after the call so the underlying refcount isn't
-/// decremented — MLX still owns the allocation.
+/// Retain an `MTLBuffer*` held by MLX for the duration of a synchronous
+/// dispatch. The returned wrapper owns that explicit retain and releases it
+/// normally on drop.
 ///
 /// # Safety
 /// - `raw` must be a live `MTLBuffer*` (`id<MTLBuffer>` retained by
-///   MLX) and remain valid until the caller forgets the returned
-///   wrapper. Otherwise, the wrapper's `Drop` will decrement an
-///   already-zero refcount and crash.
-unsafe fn borrow_buffer(raw: *mut c_void) -> Buffer {
-    // SAFETY: ForeignType::from_ptr is the documented round-trip from
-    // a raw pointer. The wrapper takes ownership semantics; we
-    // counterbalance with `mem::forget` at every call site.
-    unsafe { Buffer::from_ptr(raw as *mut _) }
+///   MLX) and remain valid while the retain is taken.
+unsafe fn retain_buffer(raw: *mut c_void) -> Buffer {
+    // SAFETY: the caller guarantees a live, non-null MTLBuffer pointer.
+    unsafe { Buffer::retain_from_ptr(raw) }
 }
 
 /// `extern "C"` wrapper around `dispatch_reshape_and_cache_raw`.
@@ -216,10 +210,9 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
     };
 
     // SAFETY: caller guarantees the pool buffers are live MTLBuffer*
-    // pointers retained by MLX. We forget the owned wrappers after the
-    // dispatch returns to avoid double-release.
-    let key_pool = unsafe { borrow_buffer(key_pool_buffer) };
-    let value_pool = unsafe { borrow_buffer(value_pool_buffer) };
+    // pointers retained by MLX. Each wrapper takes its own temporary retain.
+    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
+    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
 
     let result = unsafe {
         dispatch_reshape_and_cache_raw(
@@ -233,9 +226,6 @@ pub unsafe extern "C" fn mlx_paged_attn_reshape_and_cache_dispatch(
             cache_dtype,
         )
     };
-
-    std::mem::forget(key_pool);
-    std::mem::forget(value_pool);
 
     match result {
         Ok(()) => 0,
@@ -372,10 +362,10 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
 
     // SAFETY: caller guarantees the pool/aux buffers are live MTLBuffer*
     // pointers retained by MLX.
-    let key_pool = unsafe { borrow_buffer(key_pool_buffer) };
-    let value_pool = unsafe { borrow_buffer(value_pool_buffer) };
-    let block_table = unsafe { borrow_buffer(block_table_buffer) };
-    let seq_lens = unsafe { borrow_buffer(seq_lens_buffer) };
+    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
+    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
+    let block_table = unsafe { retain_buffer(block_table_buffer) };
+    let seq_lens = unsafe { retain_buffer(seq_lens_buffer) };
 
     let dispatch_result = unsafe {
         dispatch_paged_attention_auto(
@@ -394,20 +384,12 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_dispatch(
     let blit_result = match dispatch_result {
         Ok(out) => {
             // SAFETY: caller guarantees output_buffer is live for the
-            // call, and large enough to hold the output. We forget the
-            // owned wrapper after the blit.
-            let output_owned = unsafe { borrow_buffer(output_buffer) };
-            let r = blit_attention_output(&out, &output_owned, output_offset, io_dtype);
-            std::mem::forget(output_owned);
-            r
+            // call, and large enough to hold the output.
+            let output_owned = unsafe { retain_buffer(output_buffer) };
+            blit_attention_output(&out, &output_owned, output_offset, io_dtype)
         }
         Err(e) => Err(e),
     };
-
-    std::mem::forget(key_pool);
-    std::mem::forget(value_pool);
-    std::mem::forget(block_table);
-    std::mem::forget(seq_lens);
 
     match blit_result {
         Ok(()) => 0,
@@ -569,13 +551,12 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
     };
 
     // SAFETY: caller guarantees the buffers are live MTLBuffer* pointers
-    // retained by MLX. Forget the owned wrappers after the dispatch so
-    // the underlying refcounts aren't double-decremented.
-    let key_pool = unsafe { borrow_buffer(key_pool_buffer) };
-    let value_pool = unsafe { borrow_buffer(value_pool_buffer) };
-    let block_table = unsafe { borrow_buffer(block_table_buffer) };
-    let seq_lens = unsafe { borrow_buffer(seq_lens_buffer) };
-    let cu_seqlens_q = unsafe { borrow_buffer(cu_seqlens_q_buffer) };
+    // retained by MLX. Each wrapper takes its own temporary retain.
+    let key_pool = unsafe { retain_buffer(key_pool_buffer) };
+    let value_pool = unsafe { retain_buffer(value_pool_buffer) };
+    let block_table = unsafe { retain_buffer(block_table_buffer) };
+    let seq_lens = unsafe { retain_buffer(seq_lens_buffer) };
+    let cu_seqlens_q = unsafe { retain_buffer(cu_seqlens_q_buffer) };
 
     let dispatch_result = unsafe {
         dispatch_paged_attention_varlen_auto(
@@ -596,19 +577,11 @@ pub unsafe extern "C" fn mlx_paged_attn_paged_attention_varlen_dispatch(
         Ok(out) => {
             // SAFETY: caller guarantees output_buffer is live and large
             // enough. Reuses the same blit helper as the single-row path.
-            let output_owned = unsafe { borrow_buffer(output_buffer) };
-            let r = blit_attention_output(&out, &output_owned, output_offset, io_dtype);
-            std::mem::forget(output_owned);
-            r
+            let output_owned = unsafe { retain_buffer(output_buffer) };
+            blit_attention_output(&out, &output_owned, output_offset, io_dtype)
         }
         Err(e) => Err(e),
     };
-
-    std::mem::forget(key_pool);
-    std::mem::forget(value_pool);
-    std::mem::forget(block_table);
-    std::mem::forget(seq_lens);
-    std::mem::forget(cu_seqlens_q);
 
     match blit_result {
         Ok(()) => 0,

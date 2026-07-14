@@ -6550,4 +6550,271 @@ int mlx_paged_attention_varlen_compile_trace_smoke() {
   return 1;
 }
 
+/// Exact-shape, model-free numerical parity probe for the graph-native
+/// Qwen3.5/3.6 grouped-GQA V2 path. `query_rows=1` exercises normal decode;
+/// `query_rows=2` exercises the varlen MTP verifier. The block table is a
+/// non-identity physical permutation and unused slots in the final physical
+/// block are NaNs, so an addressing or causal-mask regression fails loudly.
+///
+/// Returns 1 on success, -3 when Metal is unavailable, and -1 on failure.
+int mlx_paged_grouped_qwen35_graph_parity(int query_rows) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+
+  if (!mlx::core::metal::is_available()) {
+    return -3;
+  }
+  if (query_rows != 1 && query_rows != 2) {
+    return -1;
+  }
+
+  constexpr int kNumQHeads = 24;
+  constexpr int kNumKvHeads = 4;
+  constexpr int kHeadSize = 256;
+  constexpr int kBlockSize = 16;
+  constexpr int kXPack = 8;
+  constexpr float kScale = 1.0f / 16.0f;
+  constexpr int kSlidingWindow = 73;
+  // These lengths are deliberately at/above the measured selector
+  // thresholds, so this fixture exercises the grouped graph route rather
+  // than merely proving parity for the generic fallback.
+  const int context_len = query_rows == 1 ? 16385 : 8194;
+  const int logical_blocks =
+      (context_len + kBlockSize - 1) / kBlockSize;
+  const int num_physical_blocks = logical_blocks + 3;
+
+  auto f32_to_bf16 = [](float value) -> uint16_t {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t lsb = (bits >> 16) & 1u;
+    return static_cast<uint16_t>((bits + 0x7fffu + lsb) >> 16);
+  };
+  auto bf16_to_f32 = [](uint16_t bits) -> float {
+    uint32_t wide = static_cast<uint32_t>(bits) << 16;
+    float value;
+    std::memcpy(&value, &wide, sizeof(value));
+    return value;
+  };
+
+  try {
+    const size_t elems_per_kv_head =
+        static_cast<size_t>(kHeadSize) * kBlockSize;
+    const size_t elems_per_physical_block =
+        static_cast<size_t>(kNumKvHeads) * elems_per_kv_head;
+    // Quiet BF16 NaN. Real logical tokens overwrite every K/V dimension;
+    // unused tail slots deliberately remain NaN.
+    std::vector<uint16_t> k_pool_bits(
+        static_cast<size_t>(num_physical_blocks) * elems_per_physical_block,
+        0x7fc1u);
+    std::vector<uint16_t> v_pool_bits(k_pool_bits.size(), 0x7fc1u);
+    std::vector<int32_t> block_table(logical_blocks);
+
+    for (int logical_block = 0; logical_block < logical_blocks;
+         ++logical_block) {
+      // Reverse the logical pages into distinct non-zero physical pages.
+      block_table[logical_block] = logical_blocks - logical_block;
+    }
+
+    auto k_value = [](int token, int kv_head, int dim) -> float {
+      return std::sin(
+                 0.019f * static_cast<float>(token) +
+                 0.31f * static_cast<float>(kv_head) +
+                 0.011f * static_cast<float>(dim)) *
+          0.32f;
+    };
+    auto v_value = [](int token, int kv_head, int dim) -> float {
+      return std::sin(
+                 0.013f * static_cast<float>(token) +
+                 0.17f * static_cast<float>(kv_head) +
+                 0.007f * static_cast<float>(dim)) *
+          0.25f;
+    };
+    auto q_value = [](int row, int q_head, int dim) -> float {
+      return std::cos(
+                 0.37f * static_cast<float>(row) +
+                 0.071f * static_cast<float>(q_head) +
+                 0.017f * static_cast<float>(dim)) *
+          0.29f;
+    };
+
+    for (int token = 0; token < context_len; ++token) {
+      const int logical_block = token / kBlockSize;
+      const int block_offset = token % kBlockSize;
+      const int physical_block = block_table[logical_block];
+      for (int kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
+        const size_t head_base =
+            static_cast<size_t>(physical_block) * elems_per_physical_block +
+            static_cast<size_t>(kv_head) * elems_per_kv_head;
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          const size_t k_idx = head_base +
+              static_cast<size_t>(dim / kXPack) * kBlockSize * kXPack +
+              static_cast<size_t>(block_offset) * kXPack + dim % kXPack;
+          const size_t v_idx =
+              head_base + static_cast<size_t>(dim) * kBlockSize + block_offset;
+          k_pool_bits[k_idx] = f32_to_bf16(k_value(token, kv_head, dim));
+          v_pool_bits[v_idx] = f32_to_bf16(v_value(token, kv_head, dim));
+        }
+      }
+    }
+
+    std::vector<uint16_t> q_bits(
+        static_cast<size_t>(query_rows) * kNumQHeads * kHeadSize);
+    for (int row = 0; row < query_rows; ++row) {
+      for (int head = 0; head < kNumQHeads; ++head) {
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          const size_t idx =
+              (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize + dim;
+          q_bits[idx] = f32_to_bf16(q_value(row, head, dim));
+        }
+      }
+    }
+
+    auto* q_data = reinterpret_cast<const bfloat16_t*>(q_bits.data());
+    auto* k_data = reinterpret_cast<const bfloat16_t*>(k_pool_bits.data());
+    auto* v_data = reinterpret_cast<const bfloat16_t*>(v_pool_bits.data());
+    array q(
+        q_data,
+        Shape{query_rows, kNumQHeads, kHeadSize},
+        bfloat16);
+    array k_pool(
+        k_data,
+        Shape{
+            num_physical_blocks,
+            kNumKvHeads,
+            kHeadSize / kXPack,
+            kBlockSize,
+            kXPack},
+        bfloat16);
+    array v_pool(
+        v_data,
+        Shape{num_physical_blocks, kNumKvHeads, kHeadSize, kBlockSize},
+        bfloat16);
+    array block_table_arr(
+        block_table.data(), Shape{1, logical_blocks}, int32);
+    const int32_t seq_len_value = context_len;
+    array seq_lens(&seq_len_value, Shape{1}, int32);
+    array k_scale(1.0f, float32);
+    array v_scale(1.0f, float32);
+
+    array out = [&]() {
+      if (query_rows == 1) {
+        return paged_attention(
+            q,
+            k_pool,
+            v_pool,
+            block_table_arr,
+            seq_lens,
+            k_scale,
+            v_scale,
+            /*scale=*/kScale,
+            /*softcap=*/1.0f,
+            /*sliding_window=*/kSlidingWindow,
+            kBlockSize,
+            kNumQHeads,
+            kNumKvHeads,
+            kHeadSize,
+            KvDtype::Bf16);
+      }
+      const int32_t cu_values[2] = {0, 2};
+      array cu_seqlens_q(cu_values, Shape{2}, int32);
+      return paged_attention_varlen(
+          q,
+          k_pool,
+          v_pool,
+          block_table_arr,
+          seq_lens,
+          cu_seqlens_q,
+          k_scale,
+          v_scale,
+          /*scale=*/kScale,
+          /*softcap=*/1.0f,
+          /*sliding_window=*/kSlidingWindow,
+          kBlockSize,
+          kNumQHeads,
+          kNumKvHeads,
+          kHeadSize,
+          KvDtype::Bf16);
+    }();
+    mlx::core::eval(out);
+
+    const auto* out_bits =
+        reinterpret_cast<const uint16_t*>(out.data<bfloat16_t>());
+    float max_diff = 0.0f;
+    size_t max_idx = 0;
+    for (int row = 0; row < query_rows; ++row) {
+      const int effective_context = context_len - query_rows + row + 1;
+      const int first_token =
+          std::max(0, effective_context - kSlidingWindow);
+      const int visible_tokens = effective_context - first_token;
+      for (int head = 0; head < kNumQHeads; ++head) {
+        const int kv_head = head / (kNumQHeads / kNumKvHeads);
+        const size_t q_idx =
+            (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize;
+        std::vector<float> weights(visible_tokens);
+        float max_score = -INFINITY;
+        for (int token = first_token; token < effective_context; ++token) {
+          float score = 0.0f;
+          for (int dim = 0; dim < kHeadSize; ++dim) {
+            const float q_dim = bf16_to_f32(q_bits[q_idx + dim]);
+            const float k_dim = bf16_to_f32(
+                f32_to_bf16(k_value(token, kv_head, dim)));
+            score += q_dim * k_dim;
+          }
+          const int visible_idx = token - first_token;
+          weights[visible_idx] = score * kScale;
+          if (weights[visible_idx] > max_score) {
+            max_score = weights[visible_idx];
+          }
+        }
+        float sum = 0.0f;
+        for (float& weight : weights) {
+          weight = std::exp(weight - max_score);
+          sum += weight;
+        }
+        const float inv_sum = 1.0f / (sum + 1e-6f);
+
+        for (int dim = 0; dim < kHeadSize; ++dim) {
+          float expected = 0.0f;
+          for (int token = first_token; token < effective_context; ++token) {
+            const float value = bf16_to_f32(
+                f32_to_bf16(v_value(token, kv_head, dim)));
+            expected += weights[token - first_token] * inv_sum * value;
+          }
+          const size_t out_idx =
+              (static_cast<size_t>(row) * kNumQHeads + head) * kHeadSize + dim;
+          const float actual = bf16_to_f32(out_bits[out_idx]);
+          const float diff = std::fabs(actual - expected);
+          if (!std::isfinite(actual) || diff > max_diff) {
+            max_diff = diff;
+            max_idx = out_idx;
+          }
+        }
+      }
+    }
+
+    // BF16 output quantization dominates; this is roughly five ULP at the
+    // synthetic output magnitudes and still catches indexing/masking errors.
+    if (!std::isfinite(max_diff) || max_diff > 0.01f) {
+      fprintf(
+          stderr,
+          "[mlx_paged_grouped_qwen35_graph_parity] rows=%d max_diff=%g "
+          "at output index %zu\n",
+          query_rows,
+          static_cast<double>(max_diff),
+          max_idx);
+      return -1;
+    }
+    return 1;
+  } catch (const std::exception& e) {
+    fprintf(
+        stderr,
+        "[mlx_paged_grouped_qwen35_graph_parity] rows=%d threw: %s\n",
+        query_rows,
+        e.what());
+    return -1;
+  } catch (...) {
+    return -1;
+  }
+}
+
 } // extern "C"

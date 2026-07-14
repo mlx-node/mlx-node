@@ -688,13 +688,9 @@ impl Qwen35MoeInner {
             Ok(sizing) => (
                 sizing.selected_blocks,
                 format!(
-                    "adaptive(requested_blocks={}, active_mib={}, process_available_mib={}, working_set_mib={})",
+                    "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
                     sizing.requested_blocks,
                     sizing.metal_active_bytes / (1024 * 1024),
-                    sizing
-                        .process_available_bytes
-                        .map(|v| (v / (1024 * 1024)).to_string())
-                        .unwrap_or_else(|| "n/a".to_string()),
                     sizing
                         .metal_working_set_bytes
                         .map(|v| (v / (1024 * 1024)).to_string())

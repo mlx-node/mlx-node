@@ -68,6 +68,7 @@ fn is_env_enabled() -> bool {
 pub struct DecodeProfiler {
     enabled: bool,
     env_enabled: bool,
+    inference_logging_enabled: bool,
     label: &'static str,
     model_type: &'static str,
     phases: HashMap<&'static str, PhaseStats>,
@@ -77,12 +78,17 @@ pub struct DecodeProfiler {
     /// can wrap inner `draft`, `verify`, etc. without losing the cycle total).
     phase_stack: Vec<(&'static str, Instant)>,
     loop_start: Instant,
+    /// Number of emitted generated output tokens, including the first token.
+    /// Decode throughput derives its numerator as `num_tokens - 1` because the
+    /// first token belongs to TTFT.
     num_tokens: u64,
     prompt_tokens: u32,
     prefill_start: Option<Instant>,
     prefill_ms: f64,
     first_token_time: Option<Instant>,
     first_token_marked: bool,
+    #[cfg(test)]
+    report_count: std::cell::Cell<u64>,
     memory_before: Option<MemorySnapshot>,
     memory_after: Option<MemorySnapshot>,
     /// MTP speculative-decode acceptance counters. Updated by
@@ -110,13 +116,16 @@ impl DecodeProfiler {
     /// `model_type` identifies the model (e.g. "qwen3_5", "qwen3_5_moe", "qwen3").
     pub fn new(label: &'static str, model_type: &'static str) -> Self {
         let env_enabled = is_env_enabled();
-        let enabled = env_enabled || profiling::is_active();
+        let inference_logging_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let enabled = env_enabled || inference_logging_enabled || profiling::is_active();
         if enabled {
             tracing::info!(target: "mlx_core::decode", label, "decode profiling enabled");
         }
         Self {
             enabled,
             env_enabled,
+            inference_logging_enabled,
             label,
             model_type,
             phases: HashMap::new(),
@@ -129,6 +138,8 @@ impl DecodeProfiler {
             prefill_ms: 0.0,
             first_token_time: None,
             first_token_marked: false,
+            #[cfg(test)]
+            report_count: std::cell::Cell::new(0),
             memory_before: None,
             memory_after: None,
             mtp_cycles: 0,
@@ -274,7 +285,13 @@ impl DecodeProfiler {
         }
     }
 
-    /// Mark one token as completed. Call once per decode step.
+    /// Record one emitted generated output token, including the first token.
+    ///
+    /// Call exactly once, immediately after that token is committed to the
+    /// generated-token output. Do not call at cycle/forward boundaries: one
+    /// MTP cycle may commit several tokens, while a chained cycle can skip a
+    /// forward without emitting anything. [`Self::mark_first_token`] is timing
+    /// only; `report()` derives the decode numerator as `num_tokens - 1`.
     #[inline]
     pub fn step(&mut self) {
         self.num_tokens += 1;
@@ -322,6 +339,17 @@ impl DecodeProfiler {
         self.enabled = true;
     }
 
+    /// Test-only view of the turn-start metadata recorded before decode.
+    #[cfg(test)]
+    pub(crate) fn turn_start_state_for_test(&self) -> (u32, bool, bool, f64) {
+        (
+            self.prompt_tokens,
+            self.prefill_start.is_some(),
+            self.memory_before.is_some(),
+            self.prefill_ms,
+        )
+    }
+
     /// Test-only: did a phase with this exact name run (i.e. was
     /// `begin(name)` reached while the profiler was enabled)? Used by
     /// accept-path coverage tests to assert which decode branch executed
@@ -332,6 +360,20 @@ impl DecodeProfiler {
     #[cfg(test)]
     pub(crate) fn ran_phase(&self, name: &str) -> bool {
         self.phases.contains_key(name)
+    }
+
+    /// Test-only view of `(generated tokens, post-first decode tokens)`.
+    #[cfg(test)]
+    pub(crate) fn token_counts_for_test(&self) -> (u64, u64) {
+        (self.num_tokens, self.num_tokens.saturating_sub(1))
+    }
+
+    /// Test-only count of completed `report()` calls. A report that returns
+    /// early because profiling is disabled or no token was committed does not
+    /// count.
+    #[cfg(test)]
+    pub(crate) fn report_count_for_test(&self) -> u64 {
+        self.report_count.get()
     }
 
     /// MTP acceptance summary: `(mean_accepted_per_cycle,
@@ -418,15 +460,34 @@ impl DecodeProfiler {
     ///
     /// - If env var is set → print to stderr (backward compat)
     /// - If programmatic profiling is active → push `GenerationProfile` to store
+    ///
+    /// The headline decode rate uses this profiler's internal timing window:
+    /// `first_token_time` (or `loop_start` when unmarked) through the instant
+    /// `report()` begins. Callers may expose a separate end-to-end terminal
+    /// metric whose window also includes post-loop cache save/finalization.
     pub fn report(&self) {
-        if !self.enabled || self.num_tokens == 0 {
+        let generated_tokens = self.num_tokens;
+        if !self.enabled || generated_tokens == 0 {
             return;
         }
+        #[cfg(test)]
+        self.report_count.set(self.report_count.get() + 1);
 
-        let n = self.num_tokens as f64;
-        let decode_ms = self.loop_start.elapsed().as_secs_f64() * 1000.0;
-        let total_ms = self.prefill_ms + decode_ms;
-        let tok_s = n / (decode_ms / 1000.0);
+        // Same convention as `compute_performance_metrics`: the first token is
+        // charged to TTFT, and only subsequent emitted tokens contribute to
+        // decode throughput.
+        let n = self.num_tokens.saturating_sub(1) as f64;
+        let report_time = Instant::now();
+        let decode_start = self.first_token_time.unwrap_or(self.loop_start);
+        let decode_ms = report_time
+            .saturating_duration_since(decode_start)
+            .as_secs_f64()
+            * 1000.0;
+        let tok_s = if decode_ms > 0.0 && n > 0.0 {
+            n / (decode_ms / 1000.0)
+        } else {
+            0.0
+        };
 
         let ttft_ms = self
             .first_token_time
@@ -437,10 +498,62 @@ impl DecodeProfiler {
                 self.prefill_ms + from_loop_start
             })
             .unwrap_or(0.0);
+        let total_ms = if self.first_token_time.is_some() {
+            ttft_ms + decode_ms
+        } else {
+            self.prefill_ms + decode_ms
+        };
 
         // Stderr output (backward compat when env var set)
         if self.env_enabled {
             self.print_stderr_report(n, decode_ms, tok_s);
+        }
+
+        // Structured inference diagnostics retain the profiler's aggregate
+        // timings without writing to stderr (which would corrupt the TUI) or
+        // adding per-token I/O.
+        if self.inference_logging_enabled {
+            let (mtp_drafts, mtp_total, mtp_cycles, mtp_depth) = self
+                .mtp_acceptance_summary()
+                .map(|(drafts, _, cycles)| {
+                    (
+                        drafts,
+                        self.mtp_mean_accepted_tokens_total()
+                            .unwrap_or(drafts + 1.0),
+                        cycles,
+                        self.mtp_mean_depth().unwrap_or(0.0),
+                    )
+                })
+                .unwrap_or((0.0, 0.0, 0, 0.0));
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "decode_profile_summary",
+                label = self.label,
+                model = self.model_type,
+                prompt_tokens = self.prompt_tokens,
+                generated_tokens,
+                prefill_ms = self.prefill_ms,
+                decode_ms,
+                ttft_ms,
+                decode_tok_s = tok_s,
+                mtp_cycles,
+                mtp_mean_drafts = mtp_drafts,
+                mtp_mean_total = mtp_total,
+                mtp_mean_depth = mtp_depth,
+                "decode profile completed"
+            );
+            for phase in self.phase_profiles() {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "decode_profile_phase",
+                    label = self.label,
+                    phase = phase.name,
+                    total_ms = phase.total_ms,
+                    avg_us = phase.avg_us_per_token,
+                    calls = phase.count,
+                    "decode profile phase completed"
+                );
+            }
         }
 
         // Push to global store (when programmatic profiling is active)
@@ -454,7 +567,7 @@ impl DecodeProfiler {
             profiling::push_generation(GenerationProfile {
                 label: self.label.to_string(),
                 model_type: self.model_type.to_string(),
-                num_tokens: self.num_tokens as u32,
+                num_tokens: generated_tokens.min(u64::from(u32::MAX)) as u32,
                 prompt_tokens: self.prompt_tokens,
                 prefill_ms: self.prefill_ms,
                 decode_ms,
@@ -479,7 +592,7 @@ impl DecodeProfiler {
         self.enabled
     }
 
-    fn print_stderr_report(&self, n: f64, wall_ms: f64, wall_tok_s: f64) {
+    fn format_stderr_report(&self, n: f64, wall_ms: f64, wall_tok_s: f64) -> String {
         let mut lines = Vec::new();
 
         if self.prefill_ms > 0.0 {
@@ -499,7 +612,11 @@ impl DecodeProfiler {
             if let Some(stats) = self.phases.get(phase) {
                 cpu_total_us += stats.total_us;
                 let ms = stats.total_us as f64 / 1000.0;
-                let us_per_tok = stats.total_us as f64 / n;
+                let us_per_tok = if n > 0.0 {
+                    stats.total_us as f64 / n
+                } else {
+                    0.0
+                };
                 lines.push(format!(
                     "  {:<20} {:>8.1}ms ({:>7.1}us/tok, {} calls)",
                     phase, ms, us_per_tok, stats.count
@@ -508,13 +625,19 @@ impl DecodeProfiler {
         }
 
         let cpu_ms = cpu_total_us as f64 / 1000.0;
-        let cpu_tok_s = n / (cpu_total_us as f64 / 1_000_000.0);
+        let cpu_us_per_tok = if n > 0.0 {
+            cpu_total_us as f64 / n
+        } else {
+            0.0
+        };
+        let cpu_tok_s = if n > 0.0 && cpu_total_us > 0 {
+            n / (cpu_total_us as f64 / 1_000_000.0)
+        } else {
+            0.0
+        };
         lines.push(format!(
             "  {:<20} {:>8.1}ms ({:>7.1}us/tok = {:.1} tok/s)",
-            "TOTAL (measured)",
-            cpu_ms,
-            cpu_total_us as f64 / n,
-            cpu_tok_s
+            "TOTAL (measured)", cpu_ms, cpu_us_per_tok, cpu_tok_s
         ));
 
         if let Some((mean, per_pos, cycles)) = self.mtp_acceptance_summary() {
@@ -536,7 +659,11 @@ impl DecodeProfiler {
             ));
         }
 
-        let report = lines.join("\n");
+        lines.join("\n")
+    }
+
+    fn print_stderr_report(&self, n: f64, wall_ms: f64, wall_tok_s: f64) {
+        let report = self.format_stderr_report(n, wall_ms, wall_tok_s);
         eprintln!("{}", report);
         tracing::info!(target: "mlx_core::decode", "{}", report);
     }
@@ -695,6 +822,69 @@ mod tests {
                 last.tokens_per_second
             );
         });
+    }
+
+    #[test]
+    fn test_report_separates_total_generated_from_post_first_decode_tokens() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_first_token_convention", "qwen3_5");
+            profiler.end_prefill();
+
+            // One TTFT token plus three later committed tokens means the public
+            // profile reports four generated tokens, while decode tok/s uses
+            // exactly three tokens as its numerator.
+            profiler.mark_first_token();
+            for _ in 0..4 {
+                profiler.step();
+            }
+            thread::sleep(Duration::from_millis(1));
+            profiler.report();
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+            assert_eq!(last.num_tokens, 4);
+            let reconstructed_decode_tokens = last.tokens_per_second * (last.decode_ms / 1000.0);
+            assert!(
+                (reconstructed_decode_tokens - 3.0).abs() < 1e-9,
+                "decode throughput numerator should exclude the first token, got {reconstructed_decode_tokens}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_single_generated_token_has_zero_decode_throughput() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_single_token", "qwen3_5");
+            profiler.end_prefill();
+            profiler.mark_first_token();
+            profiler.step();
+            profiler.report();
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+            assert_eq!(last.num_tokens, 1);
+            assert_eq!(last.tokens_per_second, 0.0);
+        });
+    }
+
+    #[test]
+    fn test_single_generated_token_stderr_breakdown_is_finite() {
+        let mut profiler = DecodeProfiler::new("test_single_stderr", "qwen3_5");
+        profiler.enable_for_test();
+        profiler.record_duration("forward", Duration::from_micros(250));
+        profiler.step();
+
+        // One generated token means zero post-first decode tokens. The stderr
+        // phase and TOTAL denominators must remain finite instead of dividing
+        // by zero.
+        let report = profiler.format_stderr_report(0.0, 0.0, 0.0);
+        let lower = report.to_ascii_lowercase();
+        assert!(!lower.contains("inf"), "unexpected infinity: {report}");
+        assert!(!lower.contains("nan"), "unexpected NaN: {report}");
+        assert!(
+            report.contains("0.0us/tok = 0.0 tok/s"),
+            "TOTAL line should use finite zero rates: {report}"
+        );
     }
 
     #[test]

@@ -4,16 +4,16 @@
  *
  * pi owns almost every flag, so this command never `parseArgs`es the
  * full argv: {@link scanAgentArgs} lifts out only what mlx handles
- * (`--models-dir`, help, the blocked `update` positional) and forwards
+ * (`--models-dir`, tracing, help, the blocked `update` positional) and forwards
  * the rest verbatim. Boot discipline (spike-proven, see
  * `packages/agent/src/run-agent.ts`): pi may `process.exit()` inside
  * `runAgent`, print mode owns stdout/stdin, so nothing here runs after
  * the handoff and nothing here reads stdin.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
@@ -23,6 +23,12 @@ export interface AgentArgScan {
   modelsDir?: string;
   /** `--models-dir` was present without a value — usage error. */
   modelsDirMissingValue: boolean;
+  /** Enable bounded native inference diagnostics (`--trace-dir` implies this). */
+  trace: boolean;
+  /** Directory selected by `--trace-dir` (the flag pair is removed from `passthrough`). */
+  traceDir?: string;
+  /** `--trace-dir` was present without a value — usage error. */
+  traceDirMissingValue: boolean;
   /**
    * `-h`/`--help` seen and this is NOT a pi pass-through invocation
    * (`install`/`remove`/`uninstall`/`list`/`config` print their own
@@ -107,7 +113,7 @@ const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
  *
  * ONE pi-parity, value-aware walk (sibling of {@link withDefaultModel}'s model
  * scan, sharing {@link VALUE_CONSUMING_ARGS}): mlx's own options
- * (`--models-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
+ * (`--models-dir`, `--trace`, `--trace-dir`, `-h`/`--help`) are recognized ONLY in an option-NAME
  * position. A token sitting in a pi value-consumer's value slot
  * (`--system-prompt --models-dir` → "--models-dir" is systemPrompt's value) is
  * forwarded verbatim, never hijacked as mlx's flag. Routing (`help`/`update`)
@@ -118,6 +124,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   const passthrough: string[] = [];
   let modelsDir: string | undefined;
   let modelsDirMissingValue = false;
+  let trace = false;
+  let traceDir: string | undefined;
+  let traceDirMissingValue = false;
   let helpSeen = false;
   let piOneShot = false;
 
@@ -166,6 +175,36 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       }
       continue;
     }
+    if (arg === '--trace') {
+      trace = true;
+      continue;
+    }
+    if (arg === '--trace-dir') {
+      trace = true;
+      const next = argv[i + 1];
+      // Match --models-dir's value rules: never swallow the next option. A
+      // dash-leading directory remains available through --trace-dir=<dir>.
+      if (next === undefined || next.startsWith('-')) {
+        traceDirMissingValue = true;
+      } else if (next.length === 0) {
+        traceDirMissingValue = true;
+        i++;
+      } else {
+        traceDir = next;
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--trace-dir=')) {
+      trace = true;
+      const value = arg.slice('--trace-dir='.length);
+      if (value.length === 0) {
+        traceDirMissingValue = true;
+      } else {
+        traceDir = value;
+      }
+      continue;
+    }
     if (arg === '-h' || arg === '--help') {
       helpSeen = true;
     }
@@ -181,11 +220,89 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   return {
     modelsDir,
     modelsDirMissingValue,
+    trace,
+    traceDir,
+    traceDirMissingValue,
     help: helpSeen && !PI_PASSTHROUGH_COMMANDS.has(passthrough[0] ?? ''),
     update: passthrough[0] === 'update',
     piOneShot,
     passthrough,
   };
+}
+
+const DEFAULT_AGENT_LOG_FILTER = 'mlx_core::inference=info,mlx_core::decode=info';
+
+export interface AgentTracingSetupOptions {
+  /** @internal Hermetic environment seam for tests. */
+  env?: NodeJS.ProcessEnv;
+  /** @internal Home-directory seam for tests. */
+  homeDir?: string;
+  /** @internal Clock seam for a deterministic per-run directory. */
+  now?: Date;
+  /** @internal Process-id seam for a deterministic per-run directory. */
+  pid?: number;
+  /** @internal Output seam. Production writes to stderr so pi keeps stdout. */
+  announce?: (line: string) => void;
+}
+
+/**
+ * Configure the native Rust `tracing` subscriber before `@mlx-node/agent`
+ * imports the addon. N-API initializes the subscriber while loading the addon,
+ * so the target filter and file must already be present in the environment.
+ *
+ * The diagnostics are opt-in through `--trace` or `--trace-dir`. Caller-supplied
+ * `MLX_NODE_LOG` and `MLX_NODE_LOG_FILE` values always win. Otherwise each
+ * process gets a bounded inference/decode filter and a fresh file below
+ * `~/.mlx-node/logs/agent/` (or the explicit trace directory).
+ */
+export function configureAgentTracing(
+  scan: Pick<AgentArgScan, 'trace' | 'traceDir'>,
+  options: AgentTracingSetupOptions = {},
+): string | undefined {
+  const env = options.env ?? process.env;
+  const requested = scan.trace || scan.traceDir !== undefined;
+  if (!requested) return undefined;
+
+  env.MLX_NODE_LOG ??= DEFAULT_AGENT_LOG_FILTER;
+
+  const explicitFile = env.MLX_NODE_LOG_FILE;
+  let traceDir: string | undefined;
+  let logFile: string;
+  if (explicitFile !== undefined && explicitFile.trim() !== '') {
+    // Preserve the user's environment value verbatim; use its trimmed path for
+    // pre-creation/announcement because the Rust subscriber applies the same
+    // trim before opening it.
+    logFile = explicitFile.trim();
+  } else {
+    traceDir = scan.traceDir
+      ? resolve(scan.traceDir)
+      : join(
+          options.homeDir ?? homedir(),
+          '.mlx-node',
+          'logs',
+          'agent',
+          `${(options.now ?? new Date()).toISOString().replace(/[:.]/g, '-')}-pid-${options.pid ?? process.pid}`,
+        );
+    logFile = join(traceDir, 'inference.log');
+    env.MLX_NODE_LOG_FILE = logFile;
+  }
+
+  // Diagnostics are never a launch prerequisite. Pre-create private paths when
+  // possible; subscriber initialization remains responsible for opening its
+  // actual writer after the deferred addon import.
+  try {
+    const parent = dirname(logFile);
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+    if (traceDir !== undefined) chmodSync(traceDir, 0o700);
+    const fd = openSync(logFile, 'a', 0o600);
+    closeSync(fd);
+    chmodSync(logFile, 0o600);
+  } catch {
+    // Best effort by contract: diagnostics I/O must never prevent startup.
+  }
+
+  (options.announce ?? ((line: string) => console.error(line)))(`mlx agent: inference log ${logFile}`);
+  return logFile;
 }
 
 /**
@@ -478,6 +595,9 @@ mlx options (handled before pi sees the args):
   --models-dir <dir>        Local models directory (default: ~/.mlx-node/models;
                             also via MLX_MODELS_DIR or ~/.mlx-node/config.json).
                             Dash-leading paths need the --models-dir=<dir> form.
+  --trace                   Enable bounded native inference diagnostics.
+  --trace-dir <dir>         Write inference.log in this directory (implies
+                            --trace; dash-leading paths need --trace-dir=<dir>).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-node/agent (override: PI_CODING_AGENT_DIR).
@@ -486,6 +606,8 @@ Environment:
   MLX_AGENT_AUTO_APPROVE=1  Auto-approve bash/write/edit/subagent tool calls in headless
                             print/json runs — without an attached UI the
                             permission gate blocks them otherwise.
+  MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
+  MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 
 Notes:
   The built-in subagent tool provides scout/planner/reviewer/worker. Each child
@@ -547,6 +669,16 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     process.exitCode = 1;
     return;
   }
+
+  if (scan.traceDirMissingValue) {
+    console.error('Missing value for --trace-dir (a dash-leading path needs the --trace-dir=<dir> form)');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Must run before the deferred `@mlx-node/agent` import below. The native
+  // tracing subscriber is installed while the native addon initializes.
+  configureAgentTracing(scan);
 
   // Deferred imports: `@mlx-node/agent` loads the native addon and the
   // pure `scanAgentArgs` export above must stay importable without it.

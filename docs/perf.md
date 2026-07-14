@@ -53,6 +53,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL` | Override decode-time `clear_cache` cadence |
 | `MLX_PAGED_PREFILL_EVAL_INTERVAL`       | Override prefill `eval` cadence            |
 | `MLX_PAGED_PREFILL_CHUNK_SIZE`          | Prefill chunk size                         |
+| `MLX_PAGED_GROUPED_QWEN35=0`            | Disable the default-on BF16 D256/BS16 24Q/4KV grouped decode kernel for same-binary A/B or driver rollback |
 | `MLX_TEST_PAGED`                        | Test-only paged-path toggle                |
 
 ### Memory pool

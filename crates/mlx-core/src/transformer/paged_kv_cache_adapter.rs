@@ -94,6 +94,7 @@ const PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 fn paged_attention_v2_aux_fits(
     num_new_tokens: u32,
     num_query_heads: u32,
+    num_kv_heads: u32,
     max_context_len: u32,
     head_size: u32,
 ) -> bool {
@@ -104,7 +105,13 @@ fn paged_attention_v2_aux_fits(
         return true;
     }
 
-    let max_num_partitions = (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
+    let max_num_partitions = paged_attention_v2_partition_count(
+        num_new_tokens,
+        num_query_heads,
+        num_kv_heads,
+        max_context_len,
+        head_size,
+    );
     let exp_sums_size = (num_new_tokens as u128)
         .saturating_mul(num_query_heads as u128)
         .saturating_mul(max_num_partitions as u128);
@@ -112,6 +119,32 @@ fn paged_attention_v2_aux_fits(
 
     exp_sums_size <= PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
         && tmp_out_size <= PAGED_ATTENTION_V2_AUX_ELEM_LIMIT
+}
+
+fn paged_attention_v2_partition_count(
+    num_new_tokens: u32,
+    num_query_heads: u32,
+    num_kv_heads: u32,
+    max_context_len: u32,
+    head_size: u32,
+) -> u64 {
+    let grouped_qwen35 = num_query_heads == 24
+        && num_kv_heads == 4
+        && head_size == 256
+        && ((num_new_tokens == 1 && max_context_len >= 16_384)
+            || (num_new_tokens == 2 && max_context_len >= 8_192));
+    if grouped_qwen35 {
+        match max_context_len {
+            0..=4_096 => 32,
+            4_097..=8_192 => 64,
+            8_193..=16_383 => 128,
+            16_384..=32_768 => 256,
+            32_769..=65_536 => 512,
+            _ => 1_024,
+        }
+    } else {
+        (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE)
+    }
 }
 
 /// Outcome of `validate_kv_input`: the (kernel-input dtype, num_tokens) tuple
@@ -534,6 +567,23 @@ pub struct PagedTurnPlan {
     pub reason: PagedTurnPlanReason,
 }
 
+/// Process-local Metal/MLX memory counters captured once for a prefill chunk.
+///
+/// `metal_current_allocated_bytes` includes buffers allocated outside MLX's
+/// allocator, notably [`LayerKVPool`]'s private Metal K/V buffers. The MLX
+/// counters remain useful for identifying reclaimable cache and the allocator
+/// limit. Consumers combine both bounds rather than treating either one as a
+/// complete process-memory measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PagedPrefillMemorySnapshot {
+    pub allocator_active_bytes: Option<u64>,
+    pub allocator_cached_bytes: Option<u64>,
+    pub allocator_limit_bytes: Option<u64>,
+    pub metal_recommended_working_set_bytes: Option<u64>,
+    pub metal_current_allocated_bytes: Option<u64>,
+    pub paged_pool_allocated_bytes: Option<u64>,
+}
+
 /// Per-model session-friendly KV cache adapter.
 ///
 /// Holds shared `BlockAllocator` (`Arc<Mutex<...>>`) so multiple in-flight
@@ -626,6 +676,13 @@ pub struct PagedKVCacheAdapter {
     /// rebuilding and re-evaluating identical int64 metadata per layer.
     #[cfg(target_os = "macos")]
     write_slot_mapping_cache: Option<WriteSlotMappingCache>,
+
+    /// One process-memory sample per recorded prefill chunk. Every
+    /// full-attention layer in that chunk must make the same routing decision;
+    /// re-running the probes per layer is both wasteful and can produce a
+    /// mixed SDPA/varlen plan as lazy graph allocations change.
+    #[cfg(target_os = "macos")]
+    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
 }
 
 #[cfg(target_os = "macos")]
@@ -684,12 +741,20 @@ struct WriteSlotMappingCache {
     slot_mapping: MxArray,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct PrefillMemorySnapshotCache {
+    token_count: u32,
+    snapshot: PagedPrefillMemorySnapshot,
+}
+
 impl PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     fn clear_prefill_attention_inputs_cache(&mut self) {
         self.prefill_attention_inputs_cache = None;
         self.compact_prefill_inputs_cache = None;
         self.varlen_prefill_inputs_cache = None;
+        self.prefill_memory_snapshot_cache = None;
     }
 
     #[cfg(target_os = "macos")]
@@ -779,6 +844,8 @@ impl PagedKVCacheAdapter {
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
             #[cfg(target_os = "macos")]
             write_slot_mapping_cache: None,
+            #[cfg(target_os = "macos")]
+            prefill_memory_snapshot_cache: None,
         })
     }
 
@@ -1894,7 +1961,9 @@ impl PagedKVCacheAdapter {
         self.eval_pending_pool_write_for_layer(layer_idx)?;
         let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
         let trace_enabled = inference_trace_enabled();
-        let write_trace_start = trace_enabled.then(Instant::now);
+        let inference_debug_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
+        let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] paged_kv update_keys_values_start layer={} first_position={} num_tokens={} current_tokens={} blocks={} first_slot={} last_slot={}",
@@ -1935,6 +2004,17 @@ impl PagedKVCacheAdapter {
                 num_tokens,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
+        }
+        if inference_debug_enabled {
+            tracing::debug!(
+                target: "mlx_core::inference",
+                event = "paged_kv_legacy_write_done",
+                layer = layer_idx,
+                first_position = first_logical_position,
+                sequence_tokens = num_tokens,
+                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                "paged KV legacy layer write completed"
+            );
         }
         self.clear_native_pool_arrays_for_layer(layer_idx)?;
         Ok(())
@@ -1994,8 +2074,11 @@ impl PagedKVCacheAdapter {
         }
 
         let trace_enabled = inference_trace_enabled();
-        let write_trace_start = trace_enabled.then(Instant::now);
-        let metadata_trace_start = trace_enabled.then(Instant::now);
+        let inference_debug_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
+        let detail_enabled = trace_enabled || inference_debug_enabled;
+        let write_trace_start = detail_enabled.then(Instant::now);
+        let metadata_trace_start = detail_enabled.then(Instant::now);
         let (slot_mapping, first_slot, last_slot) =
             self.write_slot_mapping_array(first_logical_position, num_tokens)?;
         let metadata_ms = metadata_trace_start.map(elapsed_ms).unwrap_or(0.0);
@@ -2018,7 +2101,7 @@ impl PagedKVCacheAdapter {
         let v_scale = self.v_scale_array(layer_idx)?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
-        let ffi_trace_start = trace_enabled.then(Instant::now);
+        let ffi_trace_start = detail_enabled.then(Instant::now);
         let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let ok = unsafe {
@@ -2078,6 +2161,19 @@ impl PagedKVCacheAdapter {
                 ffi_trace_start.map(elapsed_ms).unwrap_or(0.0),
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
+        }
+        if inference_debug_enabled {
+            tracing::debug!(
+                target: "mlx_core::inference",
+                event = "paged_kv_native_write_done",
+                layer = layer_idx,
+                first_position = first_logical_position,
+                sequence_tokens = num_tokens,
+                metadata_ms,
+                ffi_ms = ffi_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                "paged KV native layer write completed"
+            );
         }
         Ok(())
     }
@@ -2633,6 +2729,7 @@ impl PagedKVCacheAdapter {
         if !paged_attention_v2_aux_fits(
             query_len,
             num_query_heads,
+            self.layer_kv_pool.config().num_kv_heads,
             total_context,
             expected_head_size,
         ) {
@@ -2901,6 +2998,7 @@ impl PagedKVCacheAdapter {
         if !paged_attention_v2_aux_fits(
             num_new_tokens,
             num_query_heads,
+            self.layer_kv_pool.config().num_kv_heads,
             max_context_len,
             expected_head_size,
         ) {
@@ -4024,6 +4122,89 @@ impl PagedKVCacheAdapter {
         self.layer_kv_pool.num_blocks()
     }
 
+    /// Capture the process-local memory bounds used by cache-hit prefill.
+    ///
+    /// The snapshot is cached until the adapter's token cursor changes, so a
+    /// Qwen3.6 chunk probes once and all 16 full-attention layers use the same
+    /// numbers. Metal's `currentAllocatedSize` is process-wide for the device
+    /// and therefore includes the private buffers backing `LayerKVPool`, which
+    /// MLX's active/cache counters intentionally do not own or report.
+    pub fn prefill_memory_snapshot(&mut self) -> PagedPrefillMemorySnapshot {
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_memory_snapshot_with(Self::probe_prefill_memory_snapshot)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            PagedPrefillMemorySnapshot::default()
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prefill_memory_snapshot_with(
+        &mut self,
+        probe: impl FnOnce(&Self) -> PagedPrefillMemorySnapshot,
+    ) -> PagedPrefillMemorySnapshot {
+        let token_count = self.current_token_count();
+        if let Some(cached) = self.prefill_memory_snapshot_cache
+            && cached.token_count == token_count
+        {
+            return cached.snapshot;
+        }
+
+        let snapshot = probe(self);
+        self.prefill_memory_snapshot_cache = Some(PrefillMemorySnapshotCache {
+            token_count,
+            snapshot,
+        });
+        snapshot
+    }
+
+    #[cfg(target_os = "macos")]
+    fn probe_prefill_memory_snapshot(&self) -> PagedPrefillMemorySnapshot {
+        let mut active = 0u64;
+        let mut cached = 0u64;
+        let mut limit = 0u64;
+        let allocator_ok = unsafe {
+            mlx_sys::mlx_get_active_memory(&mut active) == 0
+                && mlx_sys::mlx_get_cache_memory(&mut cached) == 0
+                && mlx_sys::mlx_get_memory_limit(&mut limit) == 0
+                && limit > 0
+        };
+
+        let metal = mlx_paged_attn::metal::MetalState::get()
+            .ok()
+            .map(|state| {
+                (
+                    state.device.recommended_max_working_set_size(),
+                    state.device.current_allocated_size(),
+                )
+            })
+            .filter(|(recommended, _)| *recommended > 0);
+        let pool_cfg = self.layer_kv_pool.config();
+        let paged_pool_allocated_bytes = mlx_paged_attn::profile::bytes_per_block(
+            self.layer_kv_pool.num_layers() as u32,
+            pool_cfg.num_kv_heads,
+            pool_cfg.head_size,
+            pool_cfg.block_size,
+            self.layer_kv_pool.cache_dtype(),
+        )
+        .ok()
+        .map(|bytes_per_block| {
+            bytes_per_block.saturating_mul(self.layer_kv_pool.num_blocks() as u64)
+        });
+
+        PagedPrefillMemorySnapshot {
+            allocator_active_bytes: allocator_ok.then_some(active),
+            allocator_cached_bytes: allocator_ok.then_some(cached),
+            allocator_limit_bytes: allocator_ok.then_some(limit),
+            metal_recommended_working_set_bytes: metal.map(|(recommended, _)| recommended),
+            metal_current_allocated_bytes: metal.map(|(_, current)| current),
+            paged_pool_allocated_bytes,
+        }
+    }
+
     pub fn cached_token_count(&self) -> u32 {
         self.cached_token_count
     }
@@ -4499,9 +4680,23 @@ mod tests {
 
     #[test]
     fn test_paged_attention_v2_aux_limit_matches_gemma4_overflow_shape() {
-        assert!(paged_attention_v2_aux_fits(8192, 16, 8208, 512));
-        assert!(!paged_attention_v2_aux_fits(8192, 16, 16400, 512));
-        assert!(paged_attention_v2_aux_fits(8176, 16, 16384, 512));
+        assert!(paged_attention_v2_aux_fits(8192, 16, 8, 8208, 512));
+        assert!(!paged_attention_v2_aux_fits(8192, 16, 8, 16400, 512));
+        assert!(paged_attention_v2_aux_fits(8176, 16, 8, 16384, 512));
+    }
+
+    #[test]
+    fn qwen27b_grouped_aux_uses_dispatch_stripe_schedule() {
+        assert_eq!(paged_attention_v2_partition_count(2, 24, 4, 8_192, 256), 64);
+        assert_eq!(
+            paged_attention_v2_partition_count(2, 24, 4, 16_384, 256),
+            256
+        );
+        assert_eq!(
+            paged_attention_v2_partition_count(2, 24, 4, 65_537, 256),
+            1_024
+        );
+        assert!(paged_attention_v2_aux_fits(2, 24, 4, 114_688, 256));
     }
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {
@@ -4580,6 +4775,50 @@ mod tests {
         block_size: u32,
     ) -> Option<PagedKVCacheAdapter> {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefill_memory_snapshot_is_probed_once_per_chunk() {
+        use std::cell::Cell;
+
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            return;
+        };
+        let probes = Cell::new(0u32);
+        let expected = PagedPrefillMemorySnapshot {
+            allocator_active_bytes: Some(1),
+            allocator_cached_bytes: Some(2),
+            allocator_limit_bytes: Some(3),
+            metal_recommended_working_set_bytes: Some(4),
+            metal_current_allocated_bytes: Some(5),
+            paged_pool_allocated_bytes: Some(6),
+        };
+
+        let first = adapter.prefill_memory_snapshot_with(|_| {
+            probes.set(probes.get() + 1);
+            expected
+        });
+        let second = adapter.prefill_memory_snapshot_with(|_| {
+            probes.set(probes.get() + 1);
+            PagedPrefillMemorySnapshot::default()
+        });
+
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert_eq!(probes.get(), 1);
+
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.record_tokens(&[7]).unwrap();
+        let third = adapter.prefill_memory_snapshot_with(|_| {
+            probes.set(probes.get() + 1);
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(7),
+                ..PagedPrefillMemorySnapshot::default()
+            }
+        });
+        assert_eq!(third.allocator_active_bytes, Some(7));
+        assert_eq!(probes.get(), 2);
     }
 
     /// Convenience: simulates a previous completed request that registered

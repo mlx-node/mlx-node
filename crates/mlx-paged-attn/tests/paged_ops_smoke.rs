@@ -50,7 +50,6 @@
 use std::ffi::c_void;
 
 use metal::MTLResourceOptions;
-use metal::foreign_types::ForeignType;
 
 use mlx_paged_attn::metal::MetalState;
 use mlx_paged_attn::mlx_paged_attn_reshape_and_cache_dispatch;

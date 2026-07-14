@@ -887,6 +887,7 @@ macro_rules! decode_loop {
 
             $gen.push(token_id);
             $hist.push(token_id);
+            $profiler.step();
             let _is_reasoning = $tracker.observe_token(token_id);
 
             // Throttled per-step decode trace (AR / single-token loop).
@@ -968,8 +969,6 @@ macro_rules! decode_loop {
                 Some(next) => $y = next,
                 None => break,
             }
-
-            $profiler.step();
 
             if (step + 1) % 256 == 0 {
                 $crate::array::synchronize_and_clear_cache();

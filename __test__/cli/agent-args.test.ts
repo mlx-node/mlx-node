@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import {
   type AgentRunDeps,
   chooseDefaultModel,
+  configureAgentTracing,
   expandPiAgentDir,
   readPersistedDefaultModel,
   run,
@@ -73,6 +74,51 @@ describe('scanAgentArgs', () => {
       expect(scan.modelsDir).toBe('-odd-dir');
       expect(scan.modelsDirMissingValue).toBe(false);
       expect(scan.passthrough).toEqual(['-p', 'hi']);
+    });
+  });
+
+  describe('trace extraction', () => {
+    it('extracts --trace without forwarding it to pi', () => {
+      const scan = scanAgentArgs(['--trace', '-p', 'hi']);
+      expect(scan.trace).toBe(true);
+      expect(scan.traceDir).toBeUndefined();
+      expect(scan.traceDirMissingValue).toBe(false);
+      expect(scan.passthrough).toEqual(['-p', 'hi']);
+    });
+
+    it('extracts both --trace-dir forms and makes them imply tracing', () => {
+      const spaced = scanAgentArgs(['--trace-dir', '/tmp/mlx-trace', '-p', 'hi']);
+      expect(spaced.trace).toBe(true);
+      expect(spaced.traceDir).toBe('/tmp/mlx-trace');
+      expect(spaced.traceDirMissingValue).toBe(false);
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+
+      const inline = scanAgentArgs(['--trace-dir=-odd-dir', '-c']);
+      expect(inline.trace).toBe(true);
+      expect(inline.traceDir).toBe('-odd-dir');
+      expect(inline.traceDirMissingValue).toBe(false);
+      expect(inline.passthrough).toEqual(['-c']);
+    });
+
+    it('reports a missing --trace-dir value without swallowing the next option', () => {
+      for (const argv of [['--trace-dir'], ['--trace-dir='], ['--trace-dir', ''], ['--trace-dir', '--help']]) {
+        const scan = scanAgentArgs(argv);
+        expect(scan.trace).toBe(true);
+        expect(scan.traceDir).toBeUndefined();
+        expect(scan.traceDirMissingValue).toBe(true);
+      }
+      expect(scanAgentArgs(['--trace-dir', '--help']).passthrough).toEqual(['--help']);
+    });
+
+    it('does not hijack trace flags that occupy a pi option value slot', () => {
+      const flagValue = scanAgentArgs(['--system-prompt', '--trace', '-p', 'hi']);
+      expect(flagValue.trace).toBe(false);
+      expect(flagValue.passthrough).toEqual(['--system-prompt', '--trace', '-p', 'hi']);
+
+      const dirFlagValue = scanAgentArgs(['--system-prompt', '--trace-dir', '/still-passthrough']);
+      expect(dirFlagValue.trace).toBe(false);
+      expect(dirFlagValue.traceDir).toBeUndefined();
+      expect(dirFlagValue.passthrough).toEqual(['--system-prompt', '--trace-dir', '/still-passthrough']);
     });
   });
 
@@ -223,6 +269,102 @@ describe('scanAgentArgs', () => {
       const scan = scanAgentArgs(['--list-models']);
       expect(scan.piOneShot).toBe(false);
       expect(scan.passthrough).toEqual(['--list-models']);
+    });
+  });
+});
+
+describe('configureAgentTracing', () => {
+  async function withTempHome(fn: (home: string) => Promise<void> | void): Promise<void> {
+    const home = await mkdtemp(join(tmpdir(), 'mlx-agent-trace-'));
+    try {
+      await fn(home);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  it('does nothing when the CLI does not request diagnostics', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const announcements: string[] = [];
+    expect(
+      configureAgentTracing({ trace: false }, { env, announce: (line) => announcements.push(line) }),
+    ).toBeUndefined();
+    expect(env.MLX_NODE_LOG).toBeUndefined();
+    expect(env.MLX_NODE_LOG_FILE).toBeUndefined();
+    expect(announcements).toEqual([]);
+  });
+
+  it('creates a private deterministic per-run file for --trace and announces its exact path once', async () => {
+    await withTempHome((home) => {
+      const env: NodeJS.ProcessEnv = {};
+      const announcements: string[] = [];
+      const logFile = configureAgentTracing(
+        { trace: true },
+        {
+          env,
+          homeDir: home,
+          now: new Date('2026-07-14T01:02:03.456Z'),
+          pid: 4242,
+          announce: (line) => announcements.push(line),
+        },
+      );
+      const expectedDir = join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T01-02-03-456Z-pid-4242');
+      const expectedFile = join(expectedDir, 'inference.log');
+      expect(logFile).toBe(expectedFile);
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(expectedFile);
+      expect(statSync(expectedDir).mode & 0o777).toBe(0o700);
+      expect(statSync(expectedFile).mode & 0o777).toBe(0o600);
+      expect(announcements).toEqual([`mlx agent: inference log ${expectedFile}`]);
+    });
+  });
+
+  it('uses an explicit --trace-dir and enables tracing even without a separate --trace', async () => {
+    await withTempHome((home) => {
+      const traceDir = join(home, 'chosen');
+      const env: NodeJS.ProcessEnv = {};
+      const logFile = configureAgentTracing({ trace: false, traceDir }, { env, announce: () => {} });
+      expect(logFile).toBe(join(traceDir, 'inference.log'));
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
+      expect(statSync(traceDir).mode & 0o777).toBe(0o700);
+      expect(statSync(logFile!).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  it('preserves an explicit MLX_NODE_LOG filter', async () => {
+    await withTempHome((home) => {
+      const env: NodeJS.ProcessEnv = { MLX_NODE_LOG: 'mlx_core::inference=info' };
+      const logFile = configureAgentTracing(
+        { trace: true },
+        {
+          env,
+          homeDir: home,
+          now: new Date('2026-07-14T02:00:00.000Z'),
+          pid: 7,
+          announce: () => {},
+        },
+      );
+      expect(logFile).toBe(join(home, '.mlx-node', 'logs', 'agent', '2026-07-14T02-00-00-000Z-pid-7', 'inference.log'));
+      expect(env.MLX_NODE_LOG).toBe('mlx_core::inference=info');
+      expect(env.MLX_NODE_LOG_FILE).toBe(logFile);
+    });
+  });
+
+  it('preserves an explicit MLX_NODE_LOG_FILE over --trace-dir', async () => {
+    await withTempHome((home) => {
+      const explicit = join(home, 'explicit', 'native.log');
+      const explicitEnvValue = `  ${explicit}  `;
+      const env: NodeJS.ProcessEnv = { MLX_NODE_LOG_FILE: explicitEnvValue };
+      const announcements: string[] = [];
+      const logFile = configureAgentTracing(
+        { trace: true, traceDir: join(home, 'ignored') },
+        { env, announce: (line) => announcements.push(line) },
+      );
+      expect(logFile).toBe(explicit);
+      expect(env.MLX_NODE_LOG_FILE).toBe(explicitEnvValue);
+      expect(statSync(explicit).mode & 0o777).toBe(0o600);
+      expect(announcements).toEqual([`mlx agent: inference log ${explicit}`]);
     });
   });
 });
@@ -486,6 +628,78 @@ describe('run() argv routing', () => {
       expect(calls.runAgent).toHaveLength(0);
       expect(calls.discover).toHaveLength(0);
       expect(calls.wizard).toHaveLength(0);
+    }
+  });
+
+  it('exits 1 on a valueless --trace-dir before importing or handing off to the agent', async () => {
+    for (const argv of [['--trace-dir'], ['--trace-dir='], ['--trace-dir', ''], ['--trace-dir', '--help']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain('Missing value for --trace-dir');
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.runAgent).toHaveLength(0);
+      expect(calls.discover).toHaveLength(0);
+      expect(calls.wizard).toHaveLength(0);
+    }
+  });
+
+  it('documents the mlx trace flags and environment in the help preamble', async () => {
+    const { deps, calls } = makeDeps();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await run(['--help'], deps);
+      const output = logSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('--trace');
+      expect(output).toContain('--trace-dir <dir>');
+      expect(output).toContain('MLX_NODE_LOG');
+      expect(output).toContain('MLX_NODE_LOG_FILE');
+    } finally {
+      logSpy.mockRestore();
+    }
+    expect(calls.runAgent).toHaveLength(1);
+    expect(calls.runAgent[0]!.argv).toEqual(['--help']);
+  });
+
+  it('configures Rust tracing and strips mlx trace flags before the agent handoff', async () => {
+    const traceRoot = await mkdtemp(join(tmpdir(), 'mlx-agent-run-trace-'));
+    const logDir = join(traceRoot, 'logs');
+    const previousFilter = process.env.MLX_NODE_LOG;
+    const previousFile = process.env.MLX_NODE_LOG_FILE;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      delete process.env.MLX_NODE_LOG;
+      delete process.env.MLX_NODE_LOG_FILE;
+      const { deps, calls } = makeDeps();
+      const baseResolve = deps.resolveModelsDir!;
+      deps.resolveModelsDir = (explicit) => {
+        // This dependency is resolved immediately after the deferred-import
+        // boundary, so observing both values here guards the required ordering.
+        expect(process.env.MLX_NODE_LOG).toBe('mlx_core::inference=info,mlx_core::decode=info');
+        expect(process.env.MLX_NODE_LOG_FILE).toBe(join(logDir, 'inference.log'));
+        return baseResolve(explicit);
+      };
+
+      await run(['--trace-dir', logDir, '-p', 'hi'], deps);
+
+      expect(calls.runAgent).toHaveLength(1);
+      expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi']);
+      expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+        `mlx agent: inference log ${join(logDir, 'inference.log')}`,
+      );
+    } finally {
+      if (previousFilter === undefined) delete process.env.MLX_NODE_LOG;
+      else process.env.MLX_NODE_LOG = previousFilter;
+      if (previousFile === undefined) delete process.env.MLX_NODE_LOG_FILE;
+      else process.env.MLX_NODE_LOG_FILE = previousFile;
+      errorSpy.mockRestore();
+      await rm(traceRoot, { recursive: true, force: true });
     }
   });
 

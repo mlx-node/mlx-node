@@ -611,11 +611,6 @@ unsafe extern "C-unwind" {
     // Rust profile.rs auto-sizer surfaces ProfileError on -1.
     pub fn mlx_total_system_memory(out_value: *mut u64) -> i32;
 
-    // Amount of memory this process can allocate before macOS starts applying
-    // memory-pressure termination. Backed by os_proc_available_memory(3).
-    // Returns 0 on success and -1 when the probe is unavailable.
-    pub fn mlx_process_available_memory(out_value: *mut u64) -> i32;
-
     // GPU-visible working-set bound (`MTLDevice
     // recommendedMaxWorkingSetSize`). Returns 0 on success (writes value
     // through `out_value`); returns -1 if Metal unavailable, device_info
@@ -1280,6 +1275,24 @@ unsafe extern "C-unwind" {
     /// `mlx::core::compile(...)` and returns an output of the expected
     /// shape. -1 on any thrown exception or shape mismatch.
     pub fn mlx_paged_attention_varlen_compile_trace_smoke() -> i32;
+
+    /// Model-free exact-shape graph-native numerical parity probe for the
+    /// grouped Qwen3.5/3.6 paged decode kernel. Pass 1 for normal decode or 2
+    /// for the varlen MTP verifier. Returns 1 on success, -3 without Metal.
+    pub fn mlx_paged_grouped_qwen35_graph_parity(query_rows: i32) -> i32;
+
+    /// Reset/read the environment-gated grouped-route test probe. Production
+    /// dispatch only touches its atomic counter when
+    /// `MLX_PAGED_GROUPED_QWEN35_TEST_PROBE=1` was set before first use.
+    pub fn mlx_paged_grouped_qwen35_test_probe_reset();
+    pub fn mlx_paged_grouped_qwen35_test_probe_count() -> u64;
+
+    /// Pure shape/threshold guard used to pin the grouped Qwen3.5/3.6 route.
+    /// This bypasses the environment escape hatch and GPU capability check.
+    pub fn mlx_paged_grouped_qwen35_shape_guard_for_test(
+        query_rows: i32,
+        max_context_len: i32,
+    ) -> i32;
 }
 
 // ================================================================================

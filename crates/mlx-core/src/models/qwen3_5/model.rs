@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -79,6 +79,65 @@ fn fresh_dense_layer_caches(config: &Qwen3_5Config) -> Vec<Qwen3_5LayerCache> {
         .collect()
 }
 
+/// Create the profiler owned by a paged-MTP turn before its prefill starts.
+///
+/// Paged AR intentionally keeps its existing terminal-only metrics path and
+/// therefore does not allocate a decode profiler here. This helper starts the
+/// prefill timer immediately before the actual paged prefill; the caller ends
+/// it immediately afterward, then carries this same instance into
+/// `run_mtp_turn` for decode and acceptance accounting.
+fn configure_paged_mtp_profiler(
+    mut profiler: crate::decode_profiler::DecodeProfiler,
+    fresh_suffix_tokens: u32,
+) -> crate::decode_profiler::DecodeProfiler {
+    profiler.set_prompt_tokens(fresh_suffix_tokens);
+    profiler.snapshot_memory_before();
+    profiler.begin_prefill();
+    profiler
+}
+
+fn begin_paged_mtp_profiler(
+    eager_mtp_paged: bool,
+    fresh_suffix_tokens: u32,
+) -> Option<crate::decode_profiler::DecodeProfiler> {
+    eager_mtp_paged.then(|| {
+        configure_paged_mtp_profiler(
+            crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5"),
+            fresh_suffix_tokens,
+        )
+    })
+}
+
+#[cfg(test)]
+mod paged_mtp_profiler_tests {
+    use super::*;
+
+    #[test]
+    fn paged_mtp_profiler_is_gated_away_from_ar() {
+        assert!(begin_paged_mtp_profiler(false, 37).is_none());
+        assert!(begin_paged_mtp_profiler(true, 37).is_some());
+    }
+
+    #[test]
+    fn paged_mtp_profiler_starts_with_fresh_suffix_metadata() {
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("paged_mtp_test", "qwen3_5");
+        profiler.enable_for_test();
+
+        let mut profiler = configure_paged_mtp_profiler(profiler, 37);
+        let (prompt_tokens, prefill_active, memory_before, prefill_ms) =
+            profiler.turn_start_state_for_test();
+        assert_eq!(prompt_tokens, 37);
+        assert!(prefill_active);
+        assert!(memory_before);
+        assert_eq!(prefill_ms, 0.0);
+
+        profiler.end_prefill();
+        let (_, prefill_active, _, prefill_ms) = profiler.turn_start_state_for_test();
+        assert!(!prefill_active);
+        assert!(prefill_ms.is_finite());
+    }
+}
+
 /// Enforce one fixed paged-pool token ceiling against already-resolved chat
 /// parameters. Shared by dense and MoE so every native paged executor uses the
 /// same prompt rejection marker and the same last-sampled-token accounting.
@@ -151,7 +210,10 @@ mod paged_context_capacity_tests {
     }
 }
 
-const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
+// A Qwen3.6-27B GDN sidecar retains roughly 75 MiB of recurrent/conv state.
+// Two entries cover the normal linear agent chain plus one recent branch
+// without quietly pinning the ~600 MiB implied by the old opt-in limit of 8.
+const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 2;
 
 struct DenseGdnPrefixCheckpoint {
     prefix_len: u32,
@@ -169,12 +231,13 @@ struct DenseGdnHistoryCheckpoint {
 struct DenseGdnPrefixPreparation {
     state: &'static str,
     already_primed: bool,
+    restored_prefix_tokens: u32,
+    replayed_prefix_tokens: u32,
 }
 
 #[derive(Default)]
 struct DenseGdnCheckpointStoreTrace {
     stored: bool,
-    hash_ms: f64,
     eval_ms: f64,
     clone_ms: f64,
     token_clone_ms: f64,
@@ -187,13 +250,6 @@ impl DenseGdnCheckpointStoreTrace {
         self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
         self
     }
-}
-
-fn dense_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled("MLX_DENSE_GDN_REPLAY_PREFIX_CHECKPOINT")
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -874,13 +930,9 @@ impl Qwen35Inner {
             Ok(sizing) => (
                 sizing.selected_blocks,
                 format!(
-                    "adaptive(requested_blocks={}, active_mib={}, process_available_mib={}, working_set_mib={})",
+                    "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
                     sizing.requested_blocks,
                     sizing.metal_active_bytes / (1024 * 1024),
-                    sizing
-                        .process_available_bytes
-                        .map(|v| (v / (1024 * 1024)).to_string())
-                        .unwrap_or_else(|| "n/a".to_string()),
                     sizing
                         .metal_working_set_bytes
                         .map(|v| (v / (1024 * 1024)).to_string())
@@ -1033,47 +1085,46 @@ impl Qwen35Inner {
     fn find_dense_gdn_prefix_checkpoint(
         &self,
         tokens: &[u32],
-        prefix_len: u32,
+        requested_prefix_len: u32,
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
+    ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
         let final_block_hash = compute_paged_prefix_block_hash(
             tokens,
-            prefix_len,
+            requested_prefix_len,
             block_size,
             extra_keys_per_block,
             cache_salt,
         )?;
-        let prefix_tokens = tokens.get(..prefix_len as usize)?;
-
-        self.gdn_prefix_checkpoints
+        let prefix_tokens = tokens.get(..requested_prefix_len as usize)?;
+        let checkpoint = self
+            .gdn_prefix_checkpoints
             .iter()
             .rev()
             .find(|checkpoint| {
-                checkpoint.prefix_len == prefix_len
+                checkpoint.prefix_len == requested_prefix_len
                     && checkpoint.block_size == block_size
                     && checkpoint.final_block_hash == final_block_hash
                     && checkpoint.tokens.as_slice() == prefix_tokens
                     && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-            })
-            .and_then(|checkpoint| {
-                clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
-            })
+            })?;
+        clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+            .map(|caches| (checkpoint.prefix_len, caches))
     }
 
-    fn remember_dense_gdn_prefix_checkpoint(
+    fn remember_dense_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
-        prefix_len: u32,
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> Result<DenseGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = DenseGdnCheckpointStoreTrace::default();
-        let hash_start = trace_enabled.then(std::time::Instant::now);
+        checkpoint: super::paged_forward::MaterializedGdnPrefixCheckpoint,
+    ) -> bool {
+        let prefix_len = checkpoint.prefix_len;
+        if !dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
+            return false;
+        }
         let Some(final_block_hash) = compute_paged_prefix_block_hash(
             tokens,
             prefix_len,
@@ -1081,53 +1132,67 @@ impl Qwen35Inner {
             extra_keys_per_block,
             cache_salt,
         ) else {
-            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
+            return false;
         };
-        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
+            return false;
         };
 
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        else {
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_prefix_checkpoints.retain(|checkpoint| {
-            !(checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens == prefix_tokens)
+        self.gdn_prefix_checkpoints.retain(|existing| {
+            !(existing.prefix_len == prefix_len
+                && existing.block_size == block_size
+                && existing.final_block_hash == final_block_hash
+                && existing.tokens.as_slice() == prefix_tokens)
         });
         self.gdn_prefix_checkpoints
             .push_back(DenseGdnPrefixCheckpoint {
                 prefix_len,
                 block_size,
                 final_block_hash,
-                tokens: prefix_tokens,
-                caches,
+                tokens: prefix_tokens.to_vec(),
+                caches: checkpoint.caches,
             });
         while self.gdn_prefix_checkpoints.len() > DENSE_GDN_PREFIX_CHECKPOINT_LIMIT {
             self.gdn_prefix_checkpoints.pop_front();
         }
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
+        true
+    }
 
-        Ok(trace.finish(total_start))
+    fn publish_dense_gdn_materialized_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        checkpoint: Option<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    ) {
+        let Some(checkpoint) = checkpoint else {
+            return;
+        };
+        let prefix_len = checkpoint.prefix_len;
+        let Some(block_size) = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| adapter.block_size())
+        else {
+            return;
+        };
+        let extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let stored = self.remember_dense_gdn_materialized_prefix_checkpoint(
+            tokens,
+            block_size,
+            &extra_keys,
+            0,
+            checkpoint,
+        );
+        if tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO) {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "gdn_prefix_checkpoint_store",
+                prefix_tokens = prefix_len,
+                block_size,
+                stored,
+                retained_checkpoints = self.gdn_prefix_checkpoints.len(),
+                "dense GDN prefix checkpoint stored"
+            );
+        }
     }
 
     fn prepare_dense_gdn_prefix_state(
@@ -1140,40 +1205,43 @@ impl Qwen35Inner {
         continued_live_prefix: bool,
     ) -> Result<DenseGdnPrefixPreparation> {
         let trace_enabled = inference_trace_enabled();
-        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
+        let finish = |state: &'static str,
+                      restored_prefix_tokens: u32,
+                      replayed_prefix_tokens: u32|
+         -> DenseGdnPrefixPreparation {
+            if inference_info_enabled {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "gdn_prefix_prepare",
+                    state,
+                    cached_prefix_tokens = cached_prefix_len,
+                    restored_prefix_tokens,
+                    replayed_prefix_tokens,
+                    elapsed_ms = prepare_start.map(elapsed_ms).unwrap_or(0.0),
+                    "dense GDN prefix state prepared"
+                );
+            }
+            DenseGdnPrefixPreparation {
+                state,
+                already_primed: cached_prefix_len > 0,
+                restored_prefix_tokens,
+                replayed_prefix_tokens,
+            }
+        };
         let gdn_caches_ready =
             dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=live \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "live",
-                already_primed: true,
-            });
+            return Ok(finish("live", cached_prefix_len, 0));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if gdn_caches_ready && gdn_prefix_from_history {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=last_history \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "last_history",
-                already_primed: true,
-            });
+            return Ok(finish("last_history", cached_prefix_len, 0));
         }
 
         if cached_prefix_len > 0 {
@@ -1183,20 +1251,7 @@ impl Qwen35Inner {
             let history_lookup_ms = history_lookup_start.map(elapsed_ms);
             if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
-                if let Some(start) = prepare_trace_start {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done \
-                         state=last_history_checkpoint cached_prefix_tokens={} \
-                         history_lookup_ms={:.1} elapsed_ms={:.1}",
-                        cached_prefix_len,
-                        history_lookup_ms.unwrap_or(0.0),
-                        elapsed_ms(start)
-                    ));
-                }
-                return Ok(DenseGdnPrefixPreparation {
-                    state: "last_history_checkpoint",
-                    already_primed: true,
-                });
+                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
             } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
@@ -1230,37 +1285,15 @@ impl Qwen35Inner {
             cache_salt,
         );
         let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
-        if let Some(checkpoint) = prefix_checkpoint {
+        if let Some((restored_prefix_len, checkpoint)) = prefix_checkpoint {
+            debug_assert_eq!(restored_prefix_len, cached_prefix_len);
             self.caches = Some(checkpoint);
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=checkpoint \
-                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "checkpoint",
-                already_primed: true,
-            });
+            return Ok(finish("checkpoint", restored_prefix_len, 0));
         }
 
         self.caches = Some(fresh_dense_layer_caches(&self.config));
         if cached_prefix_len == 0 {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state=replay \
-                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(DenseGdnPrefixPreparation {
-                state: "replay",
-                already_primed: false,
-            });
+            return Ok(finish("cold", 0, 0));
         }
 
         let prefix = tokens.get(..cached_prefix_len as usize).ok_or_else(|| {
@@ -1271,54 +1304,14 @@ impl Qwen35Inner {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("dense paged GDN prefix caches not initialized"))?;
-        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
-        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
-        let replay_ms = replay_trace_start.map(elapsed_ms);
-        let store_trace = if dense_gdn_store_replayed_prefix_checkpoint_enabled() {
-            self.remember_dense_gdn_prefix_checkpoint(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        } else {
-            DenseGdnCheckpointStoreTrace::default()
-        };
-        if let Some(start) = prepare_trace_start {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-dense gdn_prefix_prepare_done state={} \
-                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
-                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
-                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
-                 elapsed_ms={:.1}",
-                if store_trace.stored {
-                    "replay_store"
-                } else {
-                    "replay"
-                },
-                cached_prefix_len,
-                prefix_lookup_ms.unwrap_or(0.0),
-                replay_ms.unwrap_or(0.0),
-                store_trace.stored,
-                store_trace.hash_ms,
-                store_trace.eval_ms,
-                store_trace.clone_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms,
-                elapsed_ms(start)
-            ));
-        }
-
-        Ok(DenseGdnPrefixPreparation {
-            state: if store_trace.stored {
-                "replay_store"
-            } else {
-                "replay"
-            },
-            already_primed: true,
-        })
+        super::paged_forward::run_gdn_only_prefill_materialized(
+            prefix,
+            &embed,
+            &mut self.layers,
+            caches_ref,
+        )?;
+        let _ = prefix_lookup_ms;
+        Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
 
     /// Save model weights and configuration to a directory (synchronous).
@@ -2839,15 +2832,15 @@ impl Qwen35Inner {
         // `cached_prefix_len == 0` clause matches dense: on a cache-reuse turn
         // the suffix-only prefill cannot produce the full prompt's hidden
         // tensor.
-        let want_prompt_hidden = p.enable_mtp
-            && self.has_mtp_weights()
-            && !mtp_decode::mtp_no_prompt_prefill()
-            && cached_prefix_len == 0;
+        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
+        let want_prompt_hidden =
+            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
         let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
 
         // === PREFILL ===
         let mut prompt_hidden: Option<MxArray> = None;
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -2861,26 +2854,27 @@ impl Qwen35Inner {
             // keys stay aligned with the compressed-position image keys.
             let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
             if want_prompt_hidden {
-                let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    Some(mtp_prompt_history.keep_tokens),
-                    rope_deltas,
-                )?;
+                let (logits, ph, checkpoint) =
+                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
+                        tokens,
+                        suffix,
+                        cached_prefix_len,
+                        gdn_prefix_already_primed,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                        Some(mtp_prompt_history.keep_tokens),
+                        rope_deltas,
+                    )?;
                 prompt_hidden = Some(ph);
-                logits
+                (logits, checkpoint)
             } else {
-                super::paged_forward::run_paged_prefill_chunk(
+                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                     tokens,
                     suffix,
                     cached_prefix_len,
@@ -2897,6 +2891,10 @@ impl Qwen35Inner {
                 )?
             }
         };
+        if let Some(profiler) = mtp_profiler.as_mut() {
+            profiler.end_prefill();
+        }
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
 
         // First-token sample.
         let mut token_history: Vec<u32> = tokens.to_vec();
@@ -2910,6 +2908,9 @@ impl Qwen35Inner {
         // MLX's caching allocator holds them.
         crate::array::synchronize_and_clear_cache();
 
+        if let Some(profiler) = mtp_profiler.as_mut() {
+            profiler.mark_first_token();
+        }
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
@@ -2923,7 +2924,6 @@ impl Qwen35Inner {
         // Pure-Rust ("eager") paged MTP gate. The paged adapter IS present
         // here (this is the paged core), so — unlike the flat eager gate —
         // the gate does NOT require `paged_adapter.is_none()`.
-        let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
         info!(
             "Qwen3.5 MTP gate (paged): enable_mtp={} has_mtp_weights={} -> eager_mtp_paged={}",
             p.enable_mtp,
@@ -2942,10 +2942,9 @@ impl Qwen35Inner {
             // NOT a `self.caches` KV trim.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler =
-                crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5");
-            profiler.set_prompt_tokens(token_history.len() as u32);
-            profiler.snapshot_memory_before();
+            let mut profiler = mtp_profiler
+                .take()
+                .expect("paged MTP profiler must be created before prefill");
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -3832,8 +3831,30 @@ impl Qwen35Inner {
         cancelled: &AtomicBool,
         thinking: ThinkingSetup,
     ) -> Result<()> {
+        static NEXT_TRACE_TURN_ID: AtomicU64 = AtomicU64::new(1);
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
+        }
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let trace_turn_id = if inference_info_enabled {
+            NEXT_TRACE_TURN_ID.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
+        let turn_trace_start = inference_info_enabled.then(std::time::Instant::now);
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "turn_start",
+                turn_id = trace_turn_id,
+                path = "qwen3_5_dense_paged_stream",
+                prompt_tokens = tokens.len(),
+                mtp_requested = p.enable_mtp,
+                mtp_depth = p.mtp_depth,
+                report_performance = report_perf,
+                "inference turn started"
+            );
         }
         self.preflight_paged_context(tokens.len(), &mut p)?;
 
@@ -3866,6 +3887,7 @@ impl Qwen35Inner {
         let mut decode_stream = tokenizer.inner().decode_stream(true);
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
+        let prefix_plan_start = inference_info_enabled.then(std::time::Instant::now);
 
         // === Adapter lifecycle: warm continue OR cold start ===
         let seq_id: u32 = 0;
@@ -3955,6 +3977,8 @@ impl Qwen35Inner {
         )?;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         let gdn_prefix_state = gdn_prefix_preparation.state;
+        let gdn_restored_prefix_tokens = gdn_prefix_preparation.restored_prefix_tokens;
+        let gdn_replayed_prefix_tokens = gdn_prefix_preparation.replayed_prefix_tokens;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         // Carry the cross-turn M-RoPE delta only when this turn extends the live
@@ -3973,6 +3997,28 @@ impl Qwen35Inner {
                     "paged_turn_stream_core: cached_prefix_len > total_prompt_tokens",
                 )
             })?;
+
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "prefix_plan",
+                turn_id = trace_turn_id,
+                prompt_tokens = prompt_token_count,
+                cached_prefix_tokens = cached_prefix_len,
+                suffix_tokens = suffix_len,
+                continued_live_prefix,
+                live_ready,
+                live_prefix_match,
+                live_tokens = live_tokens_len,
+                block_size,
+                gdn_prefix_state,
+                gdn_already_primed = gdn_prefix_already_primed,
+                gdn_restored_prefix_tokens,
+                gdn_replayed_prefix_tokens,
+                elapsed_ms = prefix_plan_start.map(elapsed_ms).unwrap_or(0.0),
+                "paged prefix plan resolved"
+            );
+        }
 
         if trace_enabled {
             write_inference_trace(format_args!(
@@ -4008,9 +4054,11 @@ impl Qwen35Inner {
             cb,
             cancelled,
             gdn_prefix_already_primed,
+            trace_turn_id,
+            turn_trace_start,
         );
 
-        let (generated_tokens, finish_reason) = match result {
+        let (generated_tokens, finish_reason, decode_profiler) = match result {
             Ok(t) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let total_for_finalize = adapter.request_tokens().len();
@@ -4023,6 +4071,17 @@ impl Qwen35Inner {
             Err(e) => {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
                     let _ = adapter.release_request();
+                }
+                if inference_info_enabled {
+                    tracing::info!(
+                        target: "mlx_core::inference",
+                        event = "turn_done",
+                        turn_id = trace_turn_id,
+                        status = "error",
+                        stage = "prefill_or_decode",
+                        elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                        "inference turn completed"
+                    );
                 }
                 return Err(e);
             }
@@ -4041,6 +4100,20 @@ impl Qwen35Inner {
         }
         self.cached_token_history = full_history;
         let gdn_history_checkpoint_store = self.remember_dense_gdn_history_checkpoint()?;
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "cache_commit",
+                turn_id = trace_turn_id,
+                stored = gdn_history_checkpoint_store.stored,
+                history_tokens = self.cached_token_history.len(),
+                eval_ms = gdn_history_checkpoint_store.eval_ms,
+                clone_ms = gdn_history_checkpoint_store.clone_ms,
+                update_ms = gdn_history_checkpoint_store.update_ms,
+                elapsed_ms = gdn_history_checkpoint_store.total_ms,
+                "inference cache committed"
+            );
+        }
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \
@@ -4094,6 +4167,12 @@ impl Qwen35Inner {
                 tokens.len() - cached_prefix_len as usize,
                 generated_tokens.len(),
             )
+            .map(|mut metrics| {
+                if let Some(profiler) = decode_profiler.as_ref() {
+                    profiler.fill_mtp_acceptance(&mut metrics);
+                }
+                metrics
+            })
         } else {
             None
         };
@@ -4113,6 +4192,40 @@ impl Qwen35Inner {
             reasoning_tokens,
         )?;
         result.cached_tokens = cached_prefix_len;
+
+        if inference_info_enabled {
+            let (ttft_ms, prefill_tok_s, decode_tok_s, mtp_cycles, mtp_mean_total) = result
+                .performance
+                .as_ref()
+                .map(|metrics| {
+                    (
+                        metrics.ttft_ms,
+                        metrics.prefill_tokens_per_second,
+                        metrics.decode_tokens_per_second,
+                        metrics.mtp_cycles.unwrap_or(0),
+                        metrics.mtp_mean_accepted_tokens_total.unwrap_or(0.0),
+                    )
+                })
+                .unwrap_or((0.0, 0.0, 0.0, 0, 0.0));
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "turn_done",
+                turn_id = trace_turn_id,
+                status = "ok",
+                prompt_tokens = prompt_token_count,
+                cached_prefix_tokens = cached_prefix_len,
+                fresh_prefill_tokens = tokens.len().saturating_sub(cached_prefix_len as usize),
+                generated_tokens = generated_tokens.len(),
+                finish_reason = result.finish_reason.as_str(),
+                elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                ttft_ms,
+                prefill_tok_s,
+                decode_tok_s,
+                mtp_cycles,
+                mtp_mean_total,
+                "inference turn completed"
+            );
+        }
 
         // Terminal chunk.
         cb.call(
@@ -4171,7 +4284,13 @@ impl Qwen35Inner {
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
         gdn_prefix_already_primed: bool,
-    ) -> Result<(Vec<u32>, String)> {
+        trace_turn_id: u64,
+        turn_trace_start: Option<std::time::Instant>,
+    ) -> Result<(
+        Vec<u32>,
+        String,
+        Option<crate::decode_profiler::DecodeProfiler>,
+    )> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
             suffix_len > 0,
@@ -4191,9 +4310,29 @@ impl Qwen35Inner {
         let want_prompt_hidden =
             eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
         let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let prefill_trace_start = inference_info_enabled.then(std::time::Instant::now);
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "prefill_start",
+                turn_id = trace_turn_id,
+                suffix_tokens = suffix_len,
+                cached_prefix_tokens = cached_prefix_len,
+                mtp = eager_mtp_paged,
+                keep_prompt_hidden_tokens = if want_prompt_hidden {
+                    mtp_prompt_history.keep_tokens
+                } else {
+                    0
+                },
+                "prefill started"
+            );
+        }
 
+        let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
         let mut prompt_hidden: Option<MxArray> = None;
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -4206,26 +4345,27 @@ impl Qwen35Inner {
             // an image prefill); feeds the scalar-offset RoPE for the suffix.
             let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
             if want_prompt_hidden {
-                let (logits, ph) = super::paged_forward::run_paged_prefill_chunk_with_hidden(
-                    tokens,
-                    suffix,
-                    cached_prefix_len,
-                    gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
-                    &embedding_weight,
-                    &layer_kinds,
-                    adapter,
-                    Some(mtp_prompt_history.keep_tokens),
-                    rope_deltas,
-                )?;
+                let (logits, ph, checkpoint) =
+                    super::paged_forward::run_paged_prefill_chunk_with_hidden_and_checkpoint(
+                        tokens,
+                        suffix,
+                        cached_prefix_len,
+                        gdn_prefix_already_primed,
+                        &embed,
+                        &mut self.layers,
+                        caches_ref,
+                        &self.final_norm,
+                        &self.lm_head,
+                        &embedding_weight,
+                        &layer_kinds,
+                        adapter,
+                        Some(mtp_prompt_history.keep_tokens),
+                        rope_deltas,
+                    )?;
                 prompt_hidden = Some(ph);
-                logits
+                (logits, checkpoint)
             } else {
-                super::paged_forward::run_paged_prefill_chunk(
+                super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                     tokens,
                     suffix,
                     cached_prefix_len,
@@ -4242,16 +4382,40 @@ impl Qwen35Inner {
                 )?
             }
         };
+        if let Some(profiler) = mtp_profiler.as_mut() {
+            profiler.end_prefill();
+        }
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
         let mut y = sample(&last_logits, sampling_config)?;
         y.eval();
 
+        if inference_info_enabled {
+            let prefill_elapsed = prefill_trace_start.map(elapsed_ms).unwrap_or(0.0);
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "first_token_sampled",
+                turn_id = trace_turn_id,
+                suffix_tokens = suffix_len,
+                elapsed_ms = prefill_elapsed,
+                materialized_prefill_tok_s = if prefill_elapsed > 0.0 {
+                    suffix_len as f64 / (prefill_elapsed / 1000.0)
+                } else {
+                    0.0
+                },
+                "first token sampled"
+            );
+        }
+
         // Smooth memory peak: drop transient prefill buffers before decode
         // starts allocating (see paged_turn_sync_core_inner for rationale).
         crate::array::synchronize_and_clear_cache();
 
+        if let Some(profiler) = mtp_profiler.as_mut() {
+            profiler.mark_first_token();
+        }
         if report_perf {
             *first_token_instant = Some(std::time::Instant::now());
         }
@@ -4260,6 +4424,10 @@ impl Qwen35Inner {
         let mut generated_tokens: Vec<u32> =
             Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
         let mut finish_reason = String::from("length");
+        let decode_progress_start = std::time::Instant::now();
+        let mut decode_progress_window_start = decode_progress_start;
+        let mut decode_progress_last_generated = 0usize;
+        let mut decode_progress_next_generated = 32usize;
 
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
@@ -4267,10 +4435,9 @@ impl Qwen35Inner {
             // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler =
-                crate::decode_profiler::DecodeProfiler::new("chat_paged_mtp_eager", "qwen3_5");
-            profiler.set_prompt_tokens(token_history.len() as u32);
-            profiler.snapshot_memory_before();
+            let mut profiler = mtp_profiler
+                .take()
+                .expect("paged MTP profiler must be created before prefill");
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -4287,6 +4454,19 @@ impl Qwen35Inner {
             };
 
             let mut rng = rand::rng();
+
+            if inference_info_enabled {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "mtp_decode_start",
+                    turn_id = trace_turn_id,
+                    depth = p.mtp_depth,
+                    prompt_hidden_tokens = prompt_hidden_ids.len(),
+                    position_base = prompt_hidden_position_base,
+                    elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                    "MTP decode started"
+                );
+            }
 
             // Streaming twin of the sync paged arm: the propose/verify whole-turn
             // loop is engine-owned (`run_mtp_turn`) and drives the
@@ -4332,7 +4512,7 @@ impl Qwen35Inner {
             )?;
             let _ = outcome.last_in_cache;
 
-            return Ok((generated_tokens, finish_reason));
+            return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
 
         for step in 0..max_new_tokens {
@@ -4341,6 +4521,42 @@ impl Qwen35Inner {
             token_history.push(token_id);
             let is_reasoning = reasoning_tracker.observe_token(token_id);
             *last_is_reasoning = is_reasoning;
+
+            if inference_info_enabled && generated_tokens.len() >= decode_progress_next_generated {
+                let now = std::time::Instant::now();
+                let window_tokens = generated_tokens
+                    .len()
+                    .saturating_sub(decode_progress_last_generated);
+                let window_elapsed_ms = now
+                    .saturating_duration_since(decode_progress_window_start)
+                    .as_secs_f64()
+                    * 1000.0;
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "decode_progress",
+                    mode = "ar",
+                    generated_tokens = generated_tokens.len(),
+                    window_tokens,
+                    window_elapsed_ms,
+                    window_tok_s = if window_elapsed_ms > 0.0 {
+                        window_tokens as f64 / (window_elapsed_ms / 1000.0)
+                    } else {
+                        0.0
+                    },
+                    elapsed_ms = now
+                        .saturating_duration_since(decode_progress_start)
+                        .as_secs_f64()
+                        * 1000.0,
+                    "decode progress"
+                );
+                decode_progress_last_generated = generated_tokens.len();
+                decode_progress_window_start = now;
+                decode_progress_next_generated = generated_tokens
+                    .len()
+                    .saturating_div(32)
+                    .saturating_add(1)
+                    .saturating_mul(32);
+            }
 
             if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
@@ -4437,7 +4653,7 @@ impl Qwen35Inner {
             crate::array::maybe_clear_cache_for_paged_step(step);
         }
 
-        Ok((generated_tokens, finish_reason))
+        Ok((generated_tokens, finish_reason, None))
     }
 
     /// Prefill the delta tokens and run the streaming decode loop.
@@ -7118,29 +7334,33 @@ impl PagedBackend for Qwen35Inner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-        super::paged_forward::run_paged_prefill_chunk(
-            &prefix.full_tokens,
-            suffix_tokens,
-            prefix.effective_cached_prefix_len as u32,
-            prefix.gdn_prefix_already_primed,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-            &self.final_norm,
-            &self.lm_head,
-            &embedding_weight,
-            &layer_kinds,
-            adapter,
-            rope_deltas,
-        )
+        let (logits, checkpoint) = {
+            let caches_ref = self
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
+            let adapter = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
+                &prefix.full_tokens,
+                suffix_tokens,
+                prefix.effective_cached_prefix_len as u32,
+                prefix.gdn_prefix_already_primed,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+                rope_deltas,
+            )?
+        };
+        self.publish_dense_gdn_materialized_prefix_checkpoint(&prefix.full_tokens, checkpoint);
+        Ok(logits)
     }
 
     fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
@@ -8063,6 +8283,11 @@ impl MtpBackend for Qwen35Inner {
         Self: 'a;
 
     fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let seed_trace_start = inference_info_enabled.then(std::time::Instant::now);
+        let mut seed_tokens = 0usize;
+        let mut seed_chunks = 0usize;
         // Turn-constant captures the eager-MTP block built before the loop:
         // the embedding table (+ its transpose for the tied projection) and a
         // config clone for the per-cycle drafter cache reset.
@@ -8140,6 +8365,8 @@ impl MtpBackend for Qwen35Inner {
             committed_ids.push(y_id as i32);
 
             let chunk_sizes = partition_prefill_chunks(prompt_len);
+            seed_tokens = prompt_len;
+            seed_chunks = chunk_sizes.len();
             let mut cursor: usize = 0;
             for &chunk in &chunk_sizes {
                 let chunk_i64 = chunk as i64;
@@ -8164,6 +8391,24 @@ impl MtpBackend for Qwen35Inner {
                 stepper.committed_len += chunk as i32;
                 cursor += chunk;
             }
+        }
+
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "mtp_prompt_seed_done",
+                mode = if use_committed {
+                    "committed_history"
+                } else {
+                    "cycle_history"
+                },
+                seed_tokens,
+                chunks = seed_chunks,
+                max_chunk_tokens = 7,
+                position_base = setup.prompt_hidden_position_base,
+                setup_elapsed_ms = seed_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                "MTP prompt seed completed"
+            );
         }
 
         Ok(stepper)
@@ -10521,6 +10766,26 @@ mod paged_construction_tests {
         cached_prefix_len: u32,
         chunk_size: i32,
     ) -> Result<MxArray> {
+        run_dense_paged_prefill_with_size_and_checkpoint(
+            inner,
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            chunk_size,
+        )
+        .map(|(logits, _checkpoint)| logits)
+    }
+
+    fn run_dense_paged_prefill_with_size_and_checkpoint(
+        inner: &mut Qwen35Inner,
+        full_tokens: &[u32],
+        suffix_tokens: &[u32],
+        cached_prefix_len: u32,
+        chunk_size: i32,
+    ) -> Result<(
+        MxArray,
+        Option<super::super::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
         let layer_kinds =
             decoder_layer::compute_layer_kinds(inner.config.num_layers as usize, |i| {
                 inner.config.is_linear_layer(i)
@@ -11218,6 +11483,69 @@ mod paged_construction_tests {
         adapter.release_request().expect("release_request");
     }
 
+    /// Regression coverage for Pi-style agent turns: normal full prefill must
+    /// retain exact GDN state at the final complete paged block (32 of 33
+    /// tokens here), and the token/hash lookup must restore that sidecar.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_paged_prefill_captures_exact_gdn_block_checkpoint() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_paged_prefill_captures_exact_gdn_block_checkpoint")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+
+        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 13 + 9) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+
+        let (logits, checkpoint) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 16,
+        )
+        .expect("dense paged checkpoint prefill");
+        assert_finite_vocab_logits(&logits, cfg.vocab_size, "checkpoint prefill logits");
+
+        let checkpoint = checkpoint.expect("final full-block GDN checkpoint");
+        assert_eq!(checkpoint.prefix_len, 32);
+        assert!(dense_paged_linear_caches_ready(
+            &inner.config,
+            Some(&checkpoint.caches)
+        ));
+
+        let block_size = inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged_adapter")
+            .block_size();
+        let extra_keys = engine::build_paged_extra_keys(prompt.len(), block_size, &[]);
+        assert!(inner.remember_dense_gdn_materialized_prefix_checkpoint(
+            &prompt,
+            block_size,
+            &extra_keys,
+            0,
+            checkpoint,
+        ));
+        let restored = inner
+            .find_dense_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, 0)
+            .expect("exact checkpoint restore");
+        assert_eq!(restored.0, 32);
+        assert!(dense_paged_linear_caches_ready(
+            &inner.config,
+            Some(&restored.1)
+        ));
+        let prepared = inner
+            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
+            .expect("prepare exact checkpoint");
+        assert_eq!(prepared.state, "checkpoint");
+        assert!(prepared.already_primed);
+        assert_eq!(prepared.restored_prefix_tokens, 32);
+        assert_eq!(prepared.replayed_prefix_tokens, 0);
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        adapter.release_request().expect("release_request");
+    }
+
     /// Compatibility guard for the current/default dense Qwen3.5 paged
     /// prefill behavior: a full suffix passed in one call remains a valid
     /// single-shot prefill and is stable across a fresh adapter reset.
@@ -11231,13 +11559,19 @@ mod paged_construction_tests {
         };
         cast_qwen35_inner_weights_bf16(&mut inner);
 
-        let prompt: Vec<u32> = vec![5, 11, 21, 33, 47, 60, 71, 83];
+        // Longer than two 16-token blocks: if chunk_size=0 accidentally starts
+        // splitting at checkpoint boundaries, this test observes a sidecar.
+        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 17 + 5) % 257).collect();
 
         reset_paged_request(&mut inner, &prompt);
-        let logits_a = run_dense_paged_prefill_with_size(
+        let (logits_a, checkpoint_a) = run_dense_paged_prefill_with_size_and_checkpoint(
             &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
         )
         .expect("single-shot A");
+        assert!(
+            checkpoint_a.is_none(),
+            "chunk_size=0 must not split to capture a GDN checkpoint"
+        );
         assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "single-shot A");
         {
             let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
@@ -11250,10 +11584,14 @@ mod paged_construction_tests {
         }
 
         reset_paged_request(&mut inner, &prompt);
-        let logits_b = run_dense_paged_prefill_with_size(
+        let (logits_b, checkpoint_b) = run_dense_paged_prefill_with_size_and_checkpoint(
             &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
         )
         .expect("single-shot B");
+        assert!(
+            checkpoint_b.is_none(),
+            "chunk_size=0 must stay single-shot after adapter reset"
+        );
         let a = logits_to_f32_vec(&logits_a);
         let b = logits_to_f32_vec(&logits_b);
         assert_eq!(a.len(), cfg.vocab_size as usize);

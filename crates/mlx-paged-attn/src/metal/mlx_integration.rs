@@ -9,7 +9,7 @@
 //! ```text
 //! MxArray (Rust) → mlx_array* (C++ FFI) → buffer().ptr() → MTLBuffer*
 //!                                                              ↓
-//!                                       Rust metal crate ← Buffer::from_ptr()
+//!                                   objc2-metal adapter ← retained MTLBuffer*
 //!                                                              ↓
 //!                                       dispatch_reshape_and_cache()
 //! ```

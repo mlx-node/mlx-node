@@ -12,7 +12,9 @@
 #include "mlx_paged_dispatch.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <filesystem>
@@ -299,6 +301,99 @@ const std::string& paged_attention_v2_reduce_kernel_name(
   });
 }
 
+const std::string& paged_attention_grouped_qwen35_kernel_name() {
+  // Deliberately concrete: the Metal entry point is a narrow BF16
+  // D256/BS16/GQA6 specialization for Qwen3.5/3.6 dense long-context decode.
+  static const std::string name =
+      "paged_attention_grouped_bfloat16_hs256_bs16_striped";
+  return name;
+}
+
+const std::string& paged_attention_grouped_qwen35_reduce_kernel_name() {
+  static const std::string name =
+      "paged_attention_grouped_bfloat16_hs256_striped_reduce";
+  return name;
+}
+
+uint32_t grouped_qwen35_stripe_count(int max_context_len) {
+  // Power-of-two, block-size-aligned stripe counts. Representative long
+  // contexts mirror MLX's vector 2-pass occupancy curve: 16K -> 256,
+  // 64K -> 512, and >64K -> 1024. Smaller contexts avoid over-dispatch.
+  if (max_context_len <= 4096) {
+    return 32;
+  }
+  if (max_context_len <= 8192) {
+    return 64;
+  }
+  if (max_context_len < 16384) {
+    return 128;
+  }
+  if (max_context_len <= 32768) {
+    return 256;
+  }
+  if (max_context_len <= 65536) {
+    return 512;
+  }
+  return 1024;
+}
+
+bool grouped_qwen35_paged_attention_enabled() {
+  // Default-on escape hatch for A/B profiling and driver-specific rollback.
+  // Cache once: dispatch is on the token hot path and must not call getenv for
+  // every attention layer/token.
+  static const bool enabled = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_QWEN35");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled;
+}
+
+bool grouped_qwen35_shape_matches(
+    bool enabled,
+    KvDtype io_dtype,
+    KvDtype cache_dtype,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int query_rows,
+    int max_context_len) {
+  // Model-free A/B break-even on the target Apple GPU. Decode is deliberately
+  // more conservative; the two-row verifier benefits sooner because the
+  // generic path repeats more partition work.
+  const int min_context = query_rows == 1 ? 16384 : 8192;
+  return enabled &&
+      io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
+      num_seqs == 1 && num_q_heads == 24 && num_kv_heads == 4 &&
+      head_size == 256 && block_size == 16 &&
+      (query_rows == 1 || query_rows == 2) &&
+      max_context_len >= min_context;
+}
+
+bool use_grouped_qwen35_paged_attention(
+    KvDtype io_dtype,
+    KvDtype cache_dtype,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int query_rows,
+    int max_context_len) {
+  return grouped_qwen35_shape_matches(
+      grouped_qwen35_paged_attention_enabled(),
+      io_dtype,
+      cache_dtype,
+      num_seqs,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      block_size,
+      query_rows,
+      max_context_len);
+}
+
 const std::string& paged_attention_varlen_v1_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
@@ -381,7 +476,108 @@ MTL::ComputePipelineState* load_pipeline(
   return device.get_kernel(kernel_name, lib);
 }
 
+bool grouped_qwen35_pipelines_supported(
+    mlx::core::metal::Device& device) {
+  // There is one active Metal device in this backend. Cache the immutable
+  // pipeline capability after first use so every attention layer/token does
+  // not take two additional pipeline-cache locks merely to re-read it.
+  // The specialization is optional: a missing/invalid metallib entry must
+  // permanently select generic V2 instead of failing inference or retrying
+  // pipeline creation for every layer/token. Static initialization completes
+  // even on failure, so this warning can appear at most once in a process.
+  static const bool supported = [&device]() noexcept {
+    try {
+      auto* stage = load_pipeline(
+          device, paged_attention_grouped_qwen35_kernel_name());
+      auto* reduce = load_pipeline(
+          device, paged_attention_grouped_qwen35_reduce_kernel_name());
+      if (stage == nullptr || reduce == nullptr) {
+        std::fprintf(
+            stderr,
+            "[mlx][warn] grouped Qwen3.5 paged-attention pipeline lookup "
+            "returned null; using generic V2\n");
+        return false;
+      }
+      const auto stage_threads = stage->maxTotalThreadsPerThreadgroup();
+      const auto reduce_threads = reduce->maxTotalThreadsPerThreadgroup();
+      if (stage_threads < 192 || reduce_threads < 1024) {
+        std::fprintf(
+            stderr,
+            "[mlx][warn] grouped Qwen3.5 paged-attention threadgroup limits "
+            "unsupported (stage=%lu, reducer=%lu); using generic V2\n",
+            static_cast<unsigned long>(stage_threads),
+            static_cast<unsigned long>(reduce_threads));
+        return false;
+      }
+      return true;
+    } catch (const std::exception& error) {
+      std::fprintf(
+          stderr,
+          "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable "
+          "(%s); using generic V2\n",
+          error.what());
+      return false;
+    } catch (...) {
+      std::fprintf(
+          stderr,
+          "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable; "
+          "using generic V2\n");
+      return false;
+    }
+  }();
+  return supported;
+}
+
+// Test-only route observation. Production dispatch pays no atomic cost: the
+// counter is touched only when the cached opt-in environment flag is exactly
+// `1`. This lets integrated graph tests prove that numerical parity did not
+// silently pass through generic V2.
+std::atomic<uint64_t>& grouped_qwen35_test_probe_counter() {
+  static std::atomic<uint64_t> counter{0};
+  return counter;
+}
+
+bool grouped_qwen35_test_probe_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("MLX_PAGED_GROUPED_QWEN35_TEST_PROBE");
+    return value != nullptr && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
+void record_grouped_qwen35_route_for_test() {
+  if (grouped_qwen35_test_probe_enabled()) {
+    grouped_qwen35_test_probe_counter().fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 } // namespace
+
+extern "C" void mlx_paged_grouped_qwen35_test_probe_reset() {
+  grouped_qwen35_test_probe_counter().store(0, std::memory_order_relaxed);
+}
+
+extern "C" uint64_t mlx_paged_grouped_qwen35_test_probe_count() {
+  return grouped_qwen35_test_probe_counter().load(std::memory_order_relaxed);
+}
+
+extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
+    int query_rows,
+    int max_context_len) {
+  return grouped_qwen35_shape_matches(
+      /*enabled=*/true,
+      KvDtype::Bf16,
+      KvDtype::Bf16,
+      /*num_seqs=*/1,
+      /*num_q_heads=*/24,
+      /*num_kv_heads=*/4,
+      /*head_size=*/256,
+      /*block_size=*/16,
+      query_rows,
+      max_context_len)
+      ? 1
+      : 0;
+}
 
 // =============================================================================
 // dispatch_reshape_and_cache
@@ -599,10 +795,24 @@ void dispatch_paged_attention_v2_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  // Number of partitions for V2 (mirrors Rust path).
-  const uint32_t max_num_partitions =
-      (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
-      kPartitionSize;
+  const bool grouped_shape = use_grouped_qwen35_paged_attention(
+      io_dtype,
+      cache_dtype,
+      num_seqs,
+      num_q_heads,
+      num_kv_heads,
+      head_size,
+      block_size,
+      /*query_rows=*/1,
+      max_context_len);
+  const bool use_grouped = grouped_shape &&
+      grouped_qwen35_pipelines_supported(device);
+  // Generic V2 uses contiguous 512-token partitions. The grouped path uses
+  // MLX-style strided stripes and its dedicated second pass.
+  const uint32_t max_num_partitions = use_grouped
+      ? grouped_qwen35_stripe_count(max_context_len)
+      : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
+          kPartitionSize;
 
   // Auxiliary buffers. Rust path allocates `MTLResourceOptions::
   // StorageModePrivate` device buffers; we allocate via MLX so the
@@ -657,8 +867,14 @@ void dispatch_paged_attention_v2_inner(
 
   // Stage 1: partitioned attention.
   {
-    const std::string& kernel_name = paged_attention_v2_kernel_name(
-        io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
+    const std::string& kernel_name = use_grouped
+        ? paged_attention_grouped_qwen35_kernel_name()
+        : paged_attention_v2_kernel_name(
+              io_dtype,
+              cache_dtype,
+              head_size,
+              block_size,
+              /*use_alibi=*/false);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -690,25 +906,39 @@ void dispatch_paged_attention_v2_inner(
     // Sliding-window mask. 0 = full context (default).
     encoder.set_bytes<int32_t>(sliding_window, 18);
 
-    // Threadgroup memory: V2 partitions context into PARTITION_SIZE
-    // chunks, so logits is sized by PARTITION_SIZE (not max_seq_len).
-    // V-reduce phase still needs (NUM_WARPS/2) * head_size f32s.
-    const size_t logits_bytes =
-        static_cast<size_t>(kPartitionSize) * sizeof(float);
-    const size_t v_reduce_bytes =
-        static_cast<size_t>(kNumWarps / 2) *
-        static_cast<size_t>(head_size) * sizeof(float);
-    const size_t red_smem_bytes =
-        2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-    const size_t threadgroup_mem =
-        std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-    encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
-
-    MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
-    MTL::Size grid = MTL::Size::Make(
-        static_cast<size_t>(num_q_heads),
-        static_cast<size_t>(num_seqs),
-        static_cast<size_t>(max_num_partitions));
+    // Match MLX's long-context GQA vector geometry on the specialized path:
+    // one SIMD group per query head, grouped under the KV head they share.
+    const int gqa_factor = num_q_heads / num_kv_heads;
+    MTL::Size group = use_grouped
+        ? MTL::Size::Make(32, static_cast<size_t>(gqa_factor), 1)
+        : MTL::Size::Make(kNumThreads, 1, 1);
+    MTL::Size grid = use_grouped
+        ? MTL::Size::Make(
+              static_cast<size_t>(num_kv_heads),
+              static_cast<size_t>(num_seqs),
+              static_cast<size_t>(max_num_partitions))
+        : MTL::Size::Make(
+              static_cast<size_t>(num_q_heads),
+              static_cast<size_t>(num_seqs),
+              static_cast<size_t>(max_num_partitions));
+    if (!use_grouped) {
+      // Threadgroup memory: V2 partitions context into PARTITION_SIZE
+      // chunks, so logits is sized by PARTITION_SIZE (not max_seq_len).
+      // V-reduce phase still needs (NUM_WARPS/2) * head_size f32s.
+      const size_t logits_bytes =
+          static_cast<size_t>(kPartitionSize) * sizeof(float);
+      const size_t v_reduce_bytes =
+          static_cast<size_t>(kNumWarps / 2) *
+          static_cast<size_t>(head_size) * sizeof(float);
+      const size_t red_smem_bytes =
+          2 * static_cast<size_t>(kNumWarps) * sizeof(float);
+      const size_t threadgroup_mem =
+          std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
+      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    }
+    if (use_grouped) {
+      record_grouped_qwen35_route_for_test();
+    }
     encoder.dispatch_threadgroups(grid, group);
   }
 
@@ -718,8 +948,9 @@ void dispatch_paged_attention_v2_inner(
   // via `set_output_array` in stage 1 and re-set as `set_input_array`
   // here, so MLX's dependency tracking fences via `prev_outputs_`.
   {
-    const std::string& kernel_name =
-        paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
+    const std::string& kernel_name = use_grouped
+        ? paged_attention_grouped_qwen35_reduce_kernel_name()
+        : paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -730,12 +961,15 @@ void dispatch_paged_attention_v2_inner(
     encoder.set_input_array(seq_lens, 4); // context_lens
     encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 5);
 
-    // Threadgroup memory: 2 * max_num_partitions * sizeof(f32).
-    const size_t threadgroup_mem =
-        2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
-    encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    if (!use_grouped) {
+      // Threadgroup memory: 2 * max_num_partitions * sizeof(f32).
+      const size_t threadgroup_mem =
+          2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
+      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    }
 
-    MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
+    MTL::Size group =
+        MTL::Size::Make(use_grouped ? 1024 : kNumThreads, 1, 1);
     MTL::Size grid = MTL::Size::Make(
         static_cast<size_t>(num_q_heads),
         static_cast<size_t>(num_seqs),
@@ -976,9 +1210,23 @@ void dispatch_paged_attention_varlen_v2_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype) {
-  const uint32_t max_num_partitions =
-      (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
-      kPartitionSize;
+  const bool grouped_shape = total_queries == 2 &&
+      use_grouped_qwen35_paged_attention(
+          io_dtype,
+          cache_dtype,
+          num_seqs,
+          num_q_heads,
+          num_kv_heads,
+          head_size,
+          block_size,
+          total_queries,
+          max_context_len);
+  const bool use_grouped = grouped_shape &&
+      grouped_qwen35_pipelines_supported(device);
+  const uint32_t max_num_partitions = use_grouped
+      ? grouped_qwen35_stripe_count(max_context_len)
+      : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
+          kPartitionSize;
 
   // Aux buffers indexed by q_token_idx (not seq_idx) — size by total_queries.
   const int64_t exp_sums_size_i64 =
@@ -1018,8 +1266,14 @@ void dispatch_paged_attention_varlen_v2_inner(
 
   // Stage 1: partitioned varlen attention.
   {
-    const std::string& kernel_name = paged_attention_varlen_v2_kernel_name(
-        io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
+    const std::string& kernel_name = use_grouped
+        ? paged_attention_grouped_qwen35_kernel_name()
+        : paged_attention_varlen_v2_kernel_name(
+              io_dtype,
+              cache_dtype,
+              head_size,
+              block_size,
+              /*use_alibi=*/false);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -1052,29 +1306,48 @@ void dispatch_paged_attention_varlen_v2_inner(
     encoder.set_input_array(cu_seqlens_q, 19);
     encoder.set_bytes<int32_t>(num_seqs, 20);
 
-    const size_t logits_bytes =
-        static_cast<size_t>(kPartitionSize) * sizeof(float);
-    const size_t v_reduce_bytes =
-        static_cast<size_t>(kNumWarps / 2) *
-        static_cast<size_t>(head_size) * sizeof(float);
-    const size_t red_smem_bytes =
-        2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-    const size_t threadgroup_mem =
-        std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-    encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
-
-    MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
-    MTL::Size grid = MTL::Size::Make(
-        static_cast<size_t>(num_q_heads),
-        static_cast<size_t>(total_queries),
-        static_cast<size_t>(max_num_partitions));
+    // Keep one 192-thread group per query row. A 384-thread q_len=2 group
+    // cuts occupancy sharply on Apple GPUs; adjacent y groups still traverse
+    // identical pages and retain cache locality.
+    const int gqa_factor = num_q_heads / num_kv_heads;
+    MTL::Size group = use_grouped
+        ? MTL::Size::Make(
+              32,
+              static_cast<size_t>(gqa_factor),
+              1)
+        : MTL::Size::Make(kNumThreads, 1, 1);
+    MTL::Size grid = use_grouped
+        ? MTL::Size::Make(
+              static_cast<size_t>(num_kv_heads),
+              static_cast<size_t>(total_queries),
+              static_cast<size_t>(max_num_partitions))
+        : MTL::Size::Make(
+              static_cast<size_t>(num_q_heads),
+              static_cast<size_t>(total_queries),
+              static_cast<size_t>(max_num_partitions));
+    if (!use_grouped) {
+      const size_t logits_bytes =
+          static_cast<size_t>(kPartitionSize) * sizeof(float);
+      const size_t v_reduce_bytes =
+          static_cast<size_t>(kNumWarps / 2) *
+          static_cast<size_t>(head_size) * sizeof(float);
+      const size_t red_smem_bytes =
+          2 * static_cast<size_t>(kNumWarps) * sizeof(float);
+      const size_t threadgroup_mem =
+          std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
+      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    }
+    if (use_grouped) {
+      record_grouped_qwen35_route_for_test();
+    }
     encoder.dispatch_threadgroups(grid, group);
   }
 
   // Stage 2: reduce partitions.
   {
-    const std::string& kernel_name =
-        paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);
+    const std::string& kernel_name = use_grouped
+        ? paged_attention_grouped_qwen35_reduce_kernel_name()
+        : paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -1088,11 +1361,14 @@ void dispatch_paged_attention_varlen_v2_inner(
     encoder.set_input_array(cu_seqlens_q, 6);
     encoder.set_bytes<int32_t>(num_seqs, 7);
 
-    const size_t threadgroup_mem =
-        2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
-    encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    if (!use_grouped) {
+      const size_t threadgroup_mem =
+          2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
+      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+    }
 
-    MTL::Size group = MTL::Size::Make(kNumThreads, 1, 1);
+    MTL::Size group =
+        MTL::Size::Make(use_grouped ? 1024 : kNumThreads, 1, 1);
     MTL::Size grid = MTL::Size::Make(
         static_cast<size_t>(num_q_heads),
         static_cast<size_t>(total_queries),

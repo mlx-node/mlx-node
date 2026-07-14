@@ -233,6 +233,17 @@ impl MetalState {
         )
     }
 
+    /// Concrete long-context grouped-GQA stage-1 specialization used by
+    /// Qwen3.5/3.6 dense decode (BF16, D256, block size 16, 24Q/4KV).
+    pub fn paged_attention_grouped_qwen35_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs256_bs16_striped"
+    }
+
+    /// Dedicated MLX-style second pass for the grouped strided specialization.
+    pub fn paged_attention_grouped_qwen35_reduce_kernel_name() -> &'static str {
+        "paged_attention_grouped_bfloat16_hs256_striped_reduce"
+    }
+
     /// Varlen counterparts to the V1/V2/reduce kernel name helpers above.
     /// The naming convention mirrors the single-row helpers
     /// 1:1 except for the `varlen` infix so the metallib lookup is

@@ -514,7 +514,6 @@ impl LayerKVPool {
     #[cfg(target_os = "macos")]
     pub fn key_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
         use crate::metal::is_metal_extraction_supported;
-        use metal::foreign_types::ForeignType;
 
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
@@ -563,7 +562,6 @@ impl LayerKVPool {
     #[cfg(target_os = "macos")]
     pub fn value_cache_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
         use crate::metal::is_metal_extraction_supported;
-        use metal::foreign_types::ForeignType;
 
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
@@ -675,7 +673,6 @@ impl LayerKVPool {
             dispatch_reshape_and_cache_raw, is_metal_extraction_supported, synchronize_mlx,
         };
         use metal::MTLResourceOptions;
-        use metal::foreign_types::ForeignType;
 
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());

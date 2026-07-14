@@ -8,6 +8,7 @@ use super::state::{MetalDtype, MetalState};
 use metal::foreign_types::ForeignTypeRef;
 use metal::{Buffer, BufferRef, MTLSize};
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 /// Convert IEEE 754 half-precision (f16) to single-precision (f32)
 #[inline]
@@ -109,6 +110,195 @@ impl Default for PagedAttentionParams {
 
 /// Partition size for V2 kernel
 const PARTITION_SIZE: u32 = 512;
+fn grouped_qwen35_stripe_count(max_context_len: u32) -> u32 {
+    match max_context_len {
+        0..=4096 => 32,
+        4097..=8192 => 64,
+        8193..=16383 => 128,
+        16384..=32768 => 256,
+        32769..=65536 => 512,
+        _ => 1024,
+    }
+}
+
+fn grouped_qwen35_env_enabled_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+fn grouped_qwen35_paged_attention_enabled() -> bool {
+    // Default-on escape hatch for A/B profiling and driver-specific rollback.
+    // Cache once: dispatch is on the token hot path and must not read the
+    // process environment for every attention layer/token.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        grouped_qwen35_env_enabled_value(std::env::var("MLX_PAGED_GROUPED_QWEN35").ok().as_deref())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_qwen35_shape_matches(
+    enabled: bool,
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    num_seqs: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    query_rows: u32,
+    max_context_len: u32,
+) -> bool {
+    let min_context = if query_rows == 1 { 16_384 } else { 8_192 };
+    enabled
+        && io_dtype == MetalDtype::BFloat16
+        && cache_dtype == MetalDtype::BFloat16
+        && num_seqs == 1
+        && num_heads == 24
+        && num_kv_heads == 4
+        && head_size == 256
+        && block_size == 16
+        && matches!(query_rows, 1 | 2)
+        && max_context_len >= min_context
+}
+
+#[allow(clippy::too_many_arguments)]
+fn use_grouped_qwen35_paged_attention(
+    io_dtype: MetalDtype,
+    cache_dtype: MetalDtype,
+    num_seqs: u32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    query_rows: u32,
+    max_context_len: u32,
+) -> bool {
+    grouped_qwen35_shape_matches(
+        grouped_qwen35_paged_attention_enabled(),
+        io_dtype,
+        cache_dtype,
+        num_seqs,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        query_rows,
+        max_context_len,
+    )
+}
+
+fn grouped_qwen35_pipelines_supported(state: &MetalState) -> bool {
+    // MetalState owns one process-wide device. Cache this immutable
+    // capability result so dispatch does not take two extra pipeline-cache
+    // locks per layer and token after the first grouped candidate.
+    // A missing/invalid specialized pipeline is an optional-optimization
+    // failure, not an inference failure. Cache `false`, warn once through the
+    // normal tracing subscriber, and leave every later token on generic V2.
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let stage = match state
+            .get_pipeline(MetalState::paged_attention_grouped_qwen35_kernel_name())
+        {
+            Ok(stage) => stage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mlx_paged_attn::metal",
+                    %error,
+                    "grouped Qwen3.5 paged-attention stage pipeline unavailable; using generic V2"
+                );
+                return false;
+            }
+        };
+        let reduce = match state
+            .get_pipeline(MetalState::paged_attention_grouped_qwen35_reduce_kernel_name())
+        {
+            Ok(reduce) => reduce,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mlx_paged_attn::metal",
+                    %error,
+                    "grouped Qwen3.5 paged-attention reducer pipeline unavailable; using generic V2"
+                );
+                return false;
+            }
+        };
+        let stage_threads = stage.max_total_threads_per_threadgroup();
+        let reduce_threads = reduce.max_total_threads_per_threadgroup();
+        let supported = stage_threads >= 192 && reduce_threads >= 1024;
+        if !supported {
+            tracing::warn!(
+                target: "mlx_paged_attn::metal",
+                stage_threads,
+                reduce_threads,
+                "grouped Qwen3.5 paged-attention threadgroup limits unsupported; using generic V2"
+            );
+        }
+        supported
+    })
+}
+
+#[cfg(test)]
+mod grouped_qwen35_selection_tests {
+    use super::*;
+
+    #[test]
+    fn env_escape_hatch_is_default_on_and_zero_disables() {
+        assert!(grouped_qwen35_env_enabled_value(None));
+        assert!(grouped_qwen35_env_enabled_value(Some("1")));
+        assert!(grouped_qwen35_env_enabled_value(Some("true")));
+        assert!(!grouped_qwen35_env_enabled_value(Some("0")));
+    }
+
+    #[test]
+    fn exact_qwen35_dense_shapes_select_only_when_enabled() {
+        let matches = |enabled, query_rows, max_context_len| {
+            grouped_qwen35_shape_matches(
+                enabled,
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                24,
+                4,
+                256,
+                16,
+                query_rows,
+                max_context_len,
+            )
+        };
+        assert!(matches(true, 1, 16_384));
+        assert!(!matches(true, 1, 16_383));
+        assert!(matches(true, 2, 8_192));
+        assert!(!matches(true, 2, 8_191));
+        assert!(!matches(false, 1, 16_384));
+        assert!(!matches(false, 2, 8_192));
+        assert!(!matches(true, 3, 16_384));
+
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::Float16,
+            MetalDtype::BFloat16,
+            1,
+            24,
+            4,
+            256,
+            16,
+            1,
+            16_384,
+        ));
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::BFloat16,
+            MetalDtype::BFloat16,
+            1,
+            24,
+            4,
+            128,
+            16,
+            1,
+            16_384,
+        ));
+    }
+}
 
 /// Output from paged attention dispatch
 ///
@@ -124,12 +314,17 @@ pub struct PagedAttentionOutput {
     pub head_size: u32,
     /// Data type
     pub dtype: MetalDtype,
+    /// Whether this dispatch actually selected the narrow grouped Qwen3.5
+    /// long-context route. This is dispatch metadata (not a hot-path probe),
+    /// used by integration tests to distinguish numerical parity from a
+    /// silent generic fallback.
+    #[doc(hidden)]
+    pub used_grouped_qwen35: bool,
 }
 
 impl PagedAttentionOutput {
     /// Get the raw buffer pointer
     pub fn buffer_ptr(&self) -> *mut c_void {
-        use metal::foreign_types::ForeignType;
         self.buffer.as_ptr() as *mut c_void
     }
 
@@ -478,6 +673,7 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
+        used_grouped_qwen35: false,
     })
 }
 
@@ -512,8 +708,23 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
 
-    // Calculate number of partitions
-    let max_num_partitions = params.max_seq_len.div_ceil(PARTITION_SIZE);
+    let grouped_shape = use_grouped_qwen35_paged_attention(
+        io_dtype,
+        cache_dtype,
+        params.num_seqs,
+        params.num_heads,
+        params.num_kv_heads,
+        params.head_size,
+        params.block_size,
+        1,
+        params.max_seq_len,
+    );
+    let use_grouped = grouped_shape && grouped_qwen35_pipelines_supported(state);
+    let max_num_partitions = if use_grouped {
+        grouped_qwen35_stripe_count(params.max_seq_len)
+    } else {
+        params.max_seq_len.div_ceil(PARTITION_SIZE)
+    };
 
     // Allocate temporary buffers. `tmp_out` holds partition outputs in the
     // io dtype (NOT the cache dtype) — the reduce kernel reads io-typed
@@ -544,13 +755,17 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
     // Phase 1: Compute partitioned attention
     {
-        let kernel_name = MetalState::paged_attention_v2_kernel_name(
-            io_dtype,
-            cache_dtype,
-            params.head_size,
-            params.block_size,
-            false,
-        );
+        let kernel_name = if use_grouped {
+            MetalState::paged_attention_grouped_qwen35_kernel_name().to_string()
+        } else {
+            MetalState::paged_attention_v2_kernel_name(
+                io_dtype,
+                cache_dtype,
+                params.head_size,
+                params.block_size,
+                false,
+            )
+        };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -627,28 +842,42 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         let sliding_window_buf = create_int_buffer(params.sliding_window);
         encoder.set_buffer(18, Some(&sliding_window_buf), 0);
 
-        // Threadgroup memory — same dual-purpose layout as V1 (see
-        // `dispatch_paged_attention_v1_raw`). V2 partitions context into
-        // PARTITION_SIZE chunks, so logits is sized by PARTITION_SIZE
-        // rather than max_seq_len. V-reduction still needs
-        // `(NUM_WARPS/2) * HEAD_SIZE` f32s; for HEAD_SIZE >= 256 that
-        // exceeds PARTITION_SIZE * 4 bytes (4*256*4 = 4096 > 512*4 =
-        // 2048), so the per-phase max keeps the largest models safe.
-        const NUM_WARPS_V2: usize = 8;
-        let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
-        let v_reduce_bytes_v2 =
-            (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
-        let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
-        let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
-        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        if !use_grouped {
+            // Threadgroup memory — same dual-purpose layout as V1 (see
+            // `dispatch_paged_attention_v1_raw`). V2 partitions context into
+            // PARTITION_SIZE chunks, so logits is sized by PARTITION_SIZE
+            // rather than max_seq_len. V-reduction still needs
+            // `(NUM_WARPS/2) * HEAD_SIZE` f32s; for HEAD_SIZE >= 256 that
+            // exceeds PARTITION_SIZE * 4 bytes (4*256*4 = 4096 > 512*4 =
+            // 2048), so the per-phase max keeps the largest models safe.
+            const NUM_WARPS_V2: usize = 8;
+            let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
+            let v_reduce_bytes_v2 =
+                (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+            let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
+            let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
+            encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        }
 
-        // Dispatch: (num_heads, num_seqs, max_num_partitions)
-        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
-        let threadgroups = MTLSize::new(
-            params.num_heads as u64,
-            params.num_seqs as u64,
-            max_num_partitions as u64,
-        );
+        let gqa_factor = params.num_heads / params.num_kv_heads;
+        let threads_per_threadgroup = if use_grouped {
+            MTLSize::new(32, gqa_factor as u64, 1)
+        } else {
+            MTLSize::new(256, 1, 1)
+        };
+        let threadgroups = if use_grouped {
+            MTLSize::new(
+                params.num_kv_heads as u64,
+                params.num_seqs as u64,
+                max_num_partitions as u64,
+            )
+        } else {
+            MTLSize::new(
+                params.num_heads as u64,
+                params.num_seqs as u64,
+                max_num_partitions as u64,
+            )
+        };
 
         encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
         encoder.end_encoding();
@@ -659,8 +888,11 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
     // Phase 2: Reduce partitions
     {
-        let kernel_name =
-            MetalState::paged_attention_v2_reduce_kernel_name(io_dtype, params.head_size);
+        let kernel_name = if use_grouped {
+            MetalState::paged_attention_grouped_qwen35_reduce_kernel_name().to_string()
+        } else {
+            MetalState::paged_attention_v2_reduce_kernel_name(io_dtype, params.head_size)
+        };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -681,12 +913,15 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         );
         encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
 
-        // Threadgroup memory for reduce
-        let threadgroup_mem_size = 2 * (max_num_partitions as usize) * std::mem::size_of::<f32>();
-        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        if !use_grouped {
+            // Threadgroup memory for the generic contiguous-partition reduce.
+            let threadgroup_mem_size =
+                2 * (max_num_partitions as usize) * std::mem::size_of::<f32>();
+            encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        }
 
         // Dispatch: (num_heads, num_seqs, 1)
-        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
+        let threads_per_threadgroup = MTLSize::new(if use_grouped { 1024 } else { 256 }, 1, 1);
         let threadgroups = MTLSize::new(params.num_heads as u64, params.num_seqs as u64, 1);
 
         encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
@@ -704,6 +939,7 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
+        used_grouped_qwen35: use_grouped,
     })
 }
 
@@ -995,6 +1231,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
+        used_grouped_qwen35: false,
     })
 }
 
@@ -1026,13 +1263,31 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         .device
         .new_buffer(output_size, metal::MTLResourceOptions::StorageModePrivate);
 
+    let grouped_shape = params.total_queries == 2
+        && use_grouped_qwen35_paged_attention(
+            io_dtype,
+            cache_dtype,
+            params.num_seqs,
+            params.num_heads,
+            params.num_kv_heads,
+            params.head_size,
+            params.block_size,
+            params.total_queries,
+            params.max_seq_len,
+        );
+    let use_grouped = grouped_shape && grouped_qwen35_pipelines_supported(state);
+
     // Sized off the worst-case effective_context_len (the caller's
     // `max_seq_len`), so every query token fits in the allocated grid.
     // Per-token short-context queries simply leave some partition slots
     // empty — the reduce kernel skips them via the
     // `effective_context_len`-derived `num_partitions` it computes
     // independently.
-    let max_num_partitions = params.max_seq_len.div_ceil(PARTITION_SIZE);
+    let max_num_partitions = if use_grouped {
+        grouped_qwen35_stripe_count(params.max_seq_len)
+    } else {
+        params.max_seq_len.div_ceil(PARTITION_SIZE)
+    };
 
     // Note: the V2 main kernel writes exp_sums / max_logits / tmp_out
     // indexed by q_token_idx (NOT seq_idx), so size by total_queries.
@@ -1061,13 +1316,17 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
 
     // Phase 1: partitioned varlen attention.
     {
-        let kernel_name = MetalState::paged_attention_varlen_v2_kernel_name(
-            io_dtype,
-            cache_dtype,
-            params.head_size,
-            params.block_size,
-            false,
-        );
+        let kernel_name = if use_grouped {
+            MetalState::paged_attention_grouped_qwen35_kernel_name().to_string()
+        } else {
+            MetalState::paged_attention_varlen_v2_kernel_name(
+                io_dtype,
+                cache_dtype,
+                params.head_size,
+                params.block_size,
+                false,
+            )
+        };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -1142,21 +1401,35 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         let num_seqs_buf = create_int_buffer(params.num_seqs as i32);
         encoder.set_buffer(20, Some(&num_seqs_buf), 0);
 
-        const NUM_WARPS_V2: usize = 8;
-        let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
-        let v_reduce_bytes_v2 =
-            (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
-        let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
-        let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
-        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        if !use_grouped {
+            const NUM_WARPS_V2: usize = 8;
+            let logits_bytes_v2 = PARTITION_SIZE as usize * std::mem::size_of::<f32>();
+            let v_reduce_bytes_v2 =
+                (NUM_WARPS_V2 / 2) * params.head_size as usize * std::mem::size_of::<f32>();
+            let red_smem_bytes_v2 = 2 * NUM_WARPS_V2 * std::mem::size_of::<f32>();
+            let threadgroup_mem_size = logits_bytes_v2.max(v_reduce_bytes_v2) + red_smem_bytes_v2;
+            encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        }
 
-        // Grid: (num_heads, total_queries, max_num_partitions).
-        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
-        let threadgroups = MTLSize::new(
-            params.num_heads as u64,
-            params.total_queries as u64,
-            max_num_partitions as u64,
-        );
+        let gqa_factor = params.num_heads / params.num_kv_heads;
+        let threads_per_threadgroup = if use_grouped {
+            MTLSize::new(32, gqa_factor as u64, 1)
+        } else {
+            MTLSize::new(256, 1, 1)
+        };
+        let threadgroups = if use_grouped {
+            MTLSize::new(
+                params.num_kv_heads as u64,
+                params.total_queries as u64,
+                max_num_partitions as u64,
+            )
+        } else {
+            MTLSize::new(
+                params.num_heads as u64,
+                params.total_queries as u64,
+                max_num_partitions as u64,
+            )
+        };
 
         encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
         encoder.end_encoding();
@@ -1169,8 +1442,11 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
     // ragged query layout the same way as the main kernel (y =
     // q_token_idx, binary-search to seq_idx).
     {
-        let kernel_name =
-            MetalState::paged_attention_varlen_v2_reduce_kernel_name(io_dtype, params.head_size);
+        let kernel_name = if use_grouped {
+            MetalState::paged_attention_grouped_qwen35_reduce_kernel_name().to_string()
+        } else {
+            MetalState::paged_attention_varlen_v2_reduce_kernel_name(io_dtype, params.head_size)
+        };
         let pipeline = state.get_pipeline(&kernel_name)?;
 
         let command_buffer = state.command_queue.new_command_buffer();
@@ -1198,10 +1474,13 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         );
         encoder.set_buffer(7, Some(&num_seqs_buf), 0);
 
-        let threadgroup_mem_size = 2 * (max_num_partitions as usize) * std::mem::size_of::<f32>();
-        encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        if !use_grouped {
+            let threadgroup_mem_size =
+                2 * (max_num_partitions as usize) * std::mem::size_of::<f32>();
+            encoder.set_threadgroup_memory_length(0, threadgroup_mem_size as u64);
+        }
 
-        let threads_per_threadgroup = MTLSize::new(256, 1, 1);
+        let threads_per_threadgroup = MTLSize::new(if use_grouped { 1024 } else { 256 }, 1, 1);
         let threadgroups = MTLSize::new(params.num_heads as u64, params.total_queries as u64, 1);
 
         encoder.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
@@ -1217,6 +1496,7 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         num_heads: params.num_heads,
         head_size: params.head_size,
         dtype: io_dtype,
+        used_grouped_qwen35: use_grouped,
     })
 }
 

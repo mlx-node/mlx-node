@@ -1110,6 +1110,69 @@ pub(crate) struct MtpTurnOutcome {
     pub desynced: bool,
 }
 
+struct DecodeProgressTrace {
+    enabled: bool,
+    turn_start: Instant,
+    window_start: Instant,
+    last_generated: usize,
+    next_generated: usize,
+}
+
+impl DecodeProgressTrace {
+    fn new(enabled: bool, generated: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled,
+            turn_start: now,
+            window_start: now,
+            last_generated: generated,
+            next_generated: generated.saturating_div(32).saturating_add(1) * 32,
+        }
+    }
+
+    fn emit_if_due(&mut self, generated: usize, profiler: &DecodeProfiler) {
+        if !self.enabled || generated < self.next_generated {
+            return;
+        }
+
+        let now = Instant::now();
+        let window_tokens = generated.saturating_sub(self.last_generated);
+        let window_elapsed_ms = now
+            .saturating_duration_since(self.window_start)
+            .as_secs_f64()
+            * 1000.0;
+        let elapsed_ms = now.saturating_duration_since(self.turn_start).as_secs_f64() * 1000.0;
+        let window_tok_s = if window_elapsed_ms > 0.0 {
+            window_tokens as f64 / (window_elapsed_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let (mtp_mean_drafts, mtp_cycles) = profiler
+            .mtp_acceptance_summary()
+            .map(|(mean, _, cycles)| (mean, cycles))
+            .unwrap_or((0.0, 0));
+
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "decode_progress",
+            mode = "mtp",
+            generated_tokens = generated,
+            window_tokens,
+            window_elapsed_ms,
+            window_tok_s,
+            elapsed_ms,
+            mtp_cycles,
+            mtp_mean_drafts,
+            mtp_mean_total = profiler.mtp_mean_accepted_tokens_total().unwrap_or(0.0),
+            "decode progress"
+        );
+
+        self.last_generated = generated;
+        self.window_start = now;
+        self.next_generated = generated.saturating_div(32).saturating_add(1) * 32;
+    }
+}
+
 /// Engine-owned MTP propose/verify whole-turn loop — the relocated SYNC
 /// (non-streaming) body of `decode_loop_mtp!`, generic over
 /// [`MtpBackend`]. The MTP analog of
@@ -1167,6 +1230,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     args: MtpTurnArgs<'_>,
     mut streaming: Option<StreamingCtx<'_, '_>>,
 ) -> Result<MtpTurnOutcome> {
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let MtpTurnArgs {
         mut y,
         depth,
@@ -1185,6 +1250,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         prompt_hidden_ids,
         prompt_hidden_position_base,
     } = args;
+    let mut decode_progress = DecodeProgressTrace::new(inference_info_enabled, generated.len());
 
     // Materialize the first sampled token's id before building the setup.
     // The eager block's prompt seed read `y.item_at_int32(0)` after a
@@ -1211,6 +1277,17 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         first_sampled_token,
     };
     let mut step = backend.begin_mtp_decode(&setup)?;
+    if inference_info_enabled {
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "mtp_stepper_ready",
+            depth,
+            prompt_hidden_tokens = setup.prompt_hidden_ids.map_or(0, |ids| ids.len()),
+            position_base = prompt_hidden_position_base,
+            elapsed_ms = decode_progress.turn_start.elapsed().as_secs_f64() * 1000.0,
+            "MTP stepper ready"
+        );
+    }
     // Turn-entry reads the engine takes over from the macro/family wiring:
     // the profiler relabel (mirrors `DecodeStep::profiler_relabel`) and the
     // owned embedding-weight handle the macro passed as `$emb`.
@@ -1322,9 +1399,11 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // `gen`. Without this push MTP's output is the AR output
     // shifted left by one token. We mirror the per-token bookkeeping
     // Step A does (eval, tracker.observe_token, profiler) so the
-    // initial token participates identically. The stop checks (EOS,
-    // length, cancel, repetition) run at the top of the loop body
-    // below — they read `gen` so the initial push is visible.
+    // initial token participates identically. `profiler.step()` counts this
+    // committed output token; the profiler derives decode tok/s with the
+    // documented `generated - 1` convention. The stop checks (EOS, length,
+    // cancel, repetition) run at the top of the loop body below — they read
+    // `gen` so the initial push is visible.
     //
     // Guarded on the budget: at entry `gen` holds only
     // generated tokens (0 here), so `generated.len() < max_as_usize` is
@@ -1332,6 +1411,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // AR. For `max >= 1` the guard is `0 < max` (true) ⇒ the push
     // runs exactly as before.
     if generated.len() < max_as_usize {
+        let mut first_token_emitted = false;
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
         profiler.begin("extract");
         y.eval();
@@ -1343,6 +1423,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         }
         generated.push(initial_token_id);
         hist.push(initial_token_id);
+        profiler.step();
         let _is_reasoning = tracker.observe_token(initial_token_id);
         // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
         // initial-`$y` arm. The initial seed's cancel-check just SKIPS the
@@ -1367,9 +1448,19 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
                     p.include_reasoning,
                     s.callback,
                 );
+                first_token_emitted = true;
             }
         }
-        profiler.step();
+        if inference_info_enabled {
+            tracing::info!(
+                target: "mlx_core::inference",
+                event = "mtp_first_token_ready",
+                callback_emitted = first_token_emitted,
+                elapsed_ms = decode_progress.turn_start.elapsed().as_secs_f64() * 1000.0,
+                "MTP first token ready"
+            );
+        }
+        decode_progress.emit_if_due(generated.len(), profiler);
     }
 
     loop {
@@ -1508,6 +1599,9 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
 
             generated.push(token_id);
             hist.push(token_id);
+            // Every committed output contributes exactly one generated token,
+            // including a token that immediately stops on a terminal check.
+            profiler.step();
             let _is_reasoning = tracker.observe_token(token_id);
 
             // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
@@ -1538,6 +1632,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
                     s.callback,
                 );
             }
+            decode_progress.emit_if_due(generated.len(), profiler);
 
             if token_id == eos_id || p.extra_eos_ids.contains(&token_id) {
                 *reason = String::from("stop");
@@ -1617,8 +1712,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             // the prior cycle's emit loop already handled all of
             // that for the same `token_id`.
         }
-        profiler.step();
-
         // ---- Step B: ONE MTP draft+verify cycle. -------------------
         // On the chained path the prior verify already committed
         // bonus/residual; this cycle's verify writes the chained
@@ -1752,20 +1845,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         let (outcome, verify_last_hidden) = cycle_res?;
         chained_hidden_opt = Some(verify_last_hidden);
 
-        // Throttled per-cycle MTP trace. Mirrors the AR loop's
-        // every-32-steps cadence in token-count units so MTP and
-        // AR runs leave comparable breadcrumb density.
-        if (generated.len() / 32) != ((generated.len() + outcome.tokens.len()) / 32) {
-            let first_tok_id = outcome.tokens.first().copied().unwrap_or(0);
-            tracing::info!(
-                "Qwen3.5 decode MTP cycle gen_len={} depth={} committed={} \
-                 first_tok={}",
-                generated.len(),
-                outcome.effective_depth,
-                outcome.tokens.len(),
-                first_tok_id,
-            );
-        }
         // Feed observation to the policy AFTER the cycle's tokens
         // have been counted but BEFORE the emit loop's stop checks
         // (so the record always runs even on partial-emit due to
@@ -1816,6 +1895,10 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             generated.push(tok_id);
             hist.push(tok_id);
             cycle_emitted += 1;
+            // Count actual committed output, not the surrounding MTP cycle.
+            // A cycle can emit 1..=depth+1 tokens, and a mid-cycle stop counts
+            // only the prefix that was really pushed.
+            profiler.step();
             let _is_reasoning = tracker.observe_token(tok_id);
             // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
             // emit-loop arm. It runs AFTER `observe_token` and BEFORE the EOS
@@ -1872,6 +1955,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             }
         }
         profiler.end();
+        decode_progress.emit_if_due(generated.len(), profiler);
         tracing::debug!(
             target: "mlx_core::mtp",
             cycle_committed,
@@ -1939,21 +2023,21 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         if chained_cycles_enabled && let Some(ref h) = chained_hidden_opt {
             step.eval_step_with_chained_hidden(&y, h);
         }
-        profiler.step();
     }
-
-    profiler.snapshot_memory_after();
-    profiler.report();
 
     // Surface any GDN tape-replay error stashed by the infallible
     // `rollback` on a FULL-accept cycle (the partial-accept path
     // already surfaces it via `restore_and_replay_main`'s `?` inside
     // `run_mtp_cycle`). Without this, a full-accept replay failure would
-    // be silently swallowed. == the macro callers' post-loop
-    // `replay_err_cell.borrow_mut().take()` check.
+    // be silently swallowed. Check it BEFORE publishing the completed
+    // decode profile: a replay failure aborts the turn and must not leave a
+    // success-shaped `decode_profile_summary` with no terminal result. == the
+    // macro callers' post-loop `replay_err_cell.borrow_mut().take()` check.
+    profiler.snapshot_memory_after();
     if let Some(e) = step.take_replay_error() {
         return Err(e);
     }
+    profiler.report();
 
     // `into_desynced` consumes the stepper; the caller threads the
     // result into `self.flat_mtp_caches_desynced` exactly as the
@@ -3699,6 +3783,9 @@ mod tests {
         /// Canned [`MtpStepper::into_desynced`] terminal (paged MUST be false;
         /// flat/MoE may set true on a mid-cycle stop).
         desynced: bool,
+        /// Optional full-accept rollback replay failure surfaced only at the
+        /// post-loop `take_replay_error` check.
+        replay_error: Option<&'static str>,
         /// Shared ledger the constructed stepper mirrors every call into.
         ledger: Rc<RefCell<Vec<Call>>>,
         /// Records that `begin_mtp_decode` ran exactly once.
@@ -3719,9 +3806,15 @@ mod tests {
                 step_a_tokens,
                 cycles,
                 desynced,
+                replay_error: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: std::cell::Cell::new(0),
             }
+        }
+
+        fn with_replay_error(mut self, reason: &'static str) -> Self {
+            self.replay_error = Some(reason);
+            self
         }
 
         fn ledger_snapshot(&self) -> Vec<Call> {
@@ -3794,6 +3887,9 @@ mod tests {
                 self.cycles.clone(),
             );
             step.desynced = self.desynced;
+            if let Some(reason) = self.replay_error {
+                *step.replay_error.borrow_mut() = Some(Error::from_reason(reason));
+            }
             step.shared_ledger = Some(Rc::clone(&self.ledger));
             Ok(step)
         }
@@ -3801,6 +3897,8 @@ mod tests {
 
     struct TurnOut {
         generated: Vec<u32>,
+        profiled_generated_tokens: u64,
+        profiled_decode_tokens: u64,
         finish_reason: String,
         last_in_cache: bool,
         desynced: bool,
@@ -3826,6 +3924,10 @@ mod tests {
         };
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_turn_test", "test");
+        // The production profiler is enabled by tracing/profiling config. Force
+        // it on here so `mark_first_token` participates in the test-only total
+        // while the scripted turn still runs without a model.
+        profiler.enable_for_test();
         let mut generated: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
@@ -3863,9 +3965,12 @@ mod tests {
 
         // The loop keeps token_history in lockstep with generated_tokens.
         assert_eq!(token_history, generated, "history must mirror generated");
+        let (profiled_generated_tokens, profiled_decode_tokens) = profiler.token_counts_for_test();
 
         TurnOut {
             generated,
+            profiled_generated_tokens,
+            profiled_decode_tokens,
             finish_reason,
             last_in_cache: outcome.last_in_cache,
             desynced: outcome.desynced,
@@ -3919,6 +4024,16 @@ mod tests {
             out.generated,
             vec![3, 7, 4, 5, 6, 8, 4, 5],
             "seed + 2 full outer iterations (Step A + full-accept cycle each)"
+        );
+        assert_eq!(
+            out.profiled_generated_tokens,
+            out.generated.len() as u64,
+            "variable 3-token and 2-token MTP cycle commits must be counted once each"
+        );
+        assert_eq!(
+            out.profiled_decode_tokens,
+            out.generated.len().saturating_sub(1) as u64,
+            "decode count excludes only the initial TTFT token"
         );
         assert_eq!(out.finish_reason, "length");
         // Clean length exit at the top of the loop (no mid-cycle truncation):
@@ -4007,6 +4122,12 @@ mod tests {
             vec![3, 7, 4, 15],
             "seed + Step-A(7) + cycle(accept 4, residual EOS 15)"
         );
+        assert_eq!(out.profiled_generated_tokens, out.generated.len() as u64);
+        assert_eq!(
+            out.profiled_decode_tokens,
+            out.generated.len().saturating_sub(1) as u64,
+            "the terminal EOS token is committed output and must be counted"
+        );
         assert_eq!(out.finish_reason, "stop");
         assert!(
             !out.last_in_cache,
@@ -4072,6 +4193,12 @@ mod tests {
             vec![3, 9, 4, 15],
             "seed + Step-A(9) + 2 of the cycle's 4 tokens before the mid-cycle EOS"
         );
+        assert_eq!(out.profiled_generated_tokens, out.generated.len() as u64);
+        assert_eq!(
+            out.profiled_decode_tokens,
+            out.generated.len().saturating_sub(1) as u64,
+            "accepted-but-unemitted cycle tail must not be counted"
+        );
         assert_eq!(out.finish_reason, "stop");
         // The EOS (15) is an emitted-but-not-last cycle token whose K/V verify
         // wrote, and the boundary (bonus 7) was never emitted — so the last
@@ -4098,5 +4225,75 @@ mod tests {
             "rollback_unemitted(2) — the 2 accepted-but-unemitted cycle tokens"
         );
         assert_eq!(count(&out.ledger, |c| matches!(c, Call::IntoDesynced)), 1);
+    }
+
+    #[test]
+    fn run_mtp_turn_replay_error_prevents_completed_profile() {
+        let _chained_off = force_chained_off();
+        let mut backend =
+            MockMtpBackend::new(16, 4, Vec::new(), Vec::new(), /* desynced */ false)
+                .with_replay_error("scripted replay failure");
+        let mut params = greedy_params();
+        // Emit only the prefill seed, then take the stashed replay error at the
+        // post-loop boundary. This isolates report/error ordering from MTP-cycle
+        // acceptance behavior.
+        params.max_new_tokens = 1;
+        params.mtp_depth = 2;
+
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut profiler =
+            crate::decode_profiler::DecodeProfiler::new("mtp_turn_replay_error_test", "test");
+        profiler.enable_for_test();
+        let mut generated = Vec::new();
+        let mut token_history = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant = None;
+        let mut rng = rand::rng();
+        let y = MxArray::from_int32(&[3], &[1]).expect("seed construction");
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        let result = run_mtp_turn(
+            &mut backend,
+            &mut rng,
+            MtpTurnArgs {
+                y,
+                depth: params.mtp_depth,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: params.max_new_tokens,
+                eos_id: 15,
+                generated_tokens: &mut generated,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream,
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                prompt_hidden_position_base: 0,
+            },
+            None,
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("stashed replay failure must abort the turn"),
+        };
+        assert_eq!(err.reason, "scripted replay failure");
+        assert_eq!(generated, vec![3], "the committed seed remains observable");
+        assert_eq!(token_history, generated, "histories remain in lockstep");
+        assert_eq!(
+            profiler.report_count_for_test(),
+            0,
+            "a failed replay must not publish a completed decode profile"
+        );
+        let ledger = backend.ledger_snapshot();
+        assert_eq!(count(&ledger, |c| matches!(c, Call::TakeReplayError)), 1);
+        assert_eq!(
+            count(&ledger, |c| matches!(c, Call::IntoDesynced)),
+            0,
+            "the error returns before consuming the successful outcome"
+        );
     }
 }

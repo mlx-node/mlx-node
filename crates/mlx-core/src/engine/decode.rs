@@ -252,6 +252,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // `generated_tokens`, so pushing it here is safe; both histories
         // advance together at the top.
         generated_tokens.push(token_id);
+        profiler.step();
 
         // Cache-maintenance cadence runs EVERY committed step, here at the
         // loop TOP — including terminal/length-exit steps that break
@@ -494,8 +495,6 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             Some(next) => y = next,
             None => break,
         }
-
-        profiler.step();
     }
 
     profiler.snapshot_memory_after();
