@@ -259,20 +259,27 @@ function py(y: number) {
   return PLOT_T + (1 - y) * PLOT_H;
 }
 
+// Switch to the touch-friendly chip selector when EITHER the viewport is narrow
+// OR the primary pointer is coarse (touch). Width alone misses landscape phones
+// and tablets (>639px, but the capped article never grows the SVG dots to 44px),
+// so those coarse-pointer devices would otherwise be stuck with ~30px dots. One
+// query, used by both the initializer and the listener, keeps the two in sync.
+const COMPACT_MQ = '(max-width: 639px), (pointer: coarse)';
+
 export function QuantMethodsMap() {
   const copy = COPY[useLocale()];
   const [selected, setSelected] = React.useState<MethodId>(DEFAULT_ID);
-  // Below 40rem the map downscales and the SVG dots become too small to tap, so
+  // When compact, the map downscales and the SVG dots become too small to tap, so
   // a touch-friendly <button> chip row replaces them. Expose exactly ONE
-  // interactive selector set per mode — chips when narrow, SVG dots otherwise —
+  // interactive selector set per mode — chips when compact, SVG dots otherwise —
   // so a method is never focusable/clickable twice.
   const [narrow, setNarrow] = React.useState(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-    return window.matchMedia('(max-width: 639px)').matches;
+    return window.matchMedia(COMPACT_MQ).matches;
   });
   React.useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
-    const mql = window.matchMedia('(max-width: 639px)');
+    const mql = window.matchMedia(COMPACT_MQ);
     const onChange = (e: MediaQueryListEvent) => setNarrow(e.matches);
     setNarrow(mql.matches);
     mql.addEventListener('change', onChange);

@@ -23,21 +23,39 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
   // Keep the popup inside the viewport. It is anchored at left:0 of the trigger
   // pill, so when that pill sits near the right edge on a narrow screen the
   // popup overflows and gets clipped by the root overflow:hidden (the enlarged
-  // coarse-pointer +/- buttons make it wider still). Measure on open and nudge
-  // it back in; reset when closed.
+  // coarse-pointer +/- buttons make it wider still). Nudge it back in while open,
+  // and re-run on viewport changes so a popup opened in one orientation isn't
+  // left with a stale offset after a rotate / split-view resize / zoom.
   useLayoutEffect(() => {
     if (!open) {
       setShiftX(0);
       return;
     }
-    const el = popupRef.current;
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const margin = 8;
-    let dx = 0;
-    if (r.right > window.innerWidth - margin) dx = window.innerWidth - margin - r.right;
-    if (r.left + dx < margin) dx = margin - r.left;
-    setShiftX(dx);
+    // Measure from the UNTRANSFORMED anchor so re-clamping is idempotent: the
+    // popup is position:absolute; left:0 of the (never-transformed) wrapper, so
+    // wrapper.left is its natural left edge and popup.offsetWidth is its layout
+    // width — both independent of the translateX we apply. Reading the popup's
+    // own getBoundingClientRect() would fold in the current shift and drift on
+    // every recompute.
+    const measure = () => {
+      const wrap = wrapperRef.current;
+      const el = popupRef.current;
+      if (!wrap || !el) return;
+      const margin = 8;
+      const left0 = wrap.getBoundingClientRect().left;
+      const right0 = left0 + el.offsetWidth;
+      let dx = 0;
+      if (right0 > window.innerWidth - margin) dx = window.innerWidth - margin - right0;
+      if (left0 + dx < margin) dx = margin - left0;
+      setShiftX(dx);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    window.visualViewport?.addEventListener('resize', measure);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.visualViewport?.removeEventListener('resize', measure);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -80,6 +98,10 @@ export function PillStepper({ label, value, min, max, step, disabled = false, on
             bottom: 'calc(100% + 8px)',
             left: 0,
             transform: shiftX ? `translateX(${shiftX}px)` : undefined,
+            // Never let the popup exceed the viewport; otherwise the clamp above
+            // can only fit one edge and the opposite control gets cut off.
+            maxWidth: 'calc(100vw - 16px)',
+            boxSizing: 'border-box',
             background: 'var(--surface)',
             border: '1px solid var(--border)',
             borderRadius: 10,
