@@ -227,18 +227,16 @@ fn probe_execution(config: &BenchConfig) -> BenchResult<ExecutionProbe> {
         }
         Route::Varlen => ExpectedExecution::Varlen,
     };
-    if matches!(config.route, Route::Sdpa) {
-        if predicted_execution != config.expected_execution {
-            return Err(format!(
-                "SDPA execution expectation mismatch before allocation: expected {}, but MLX's \
-                 D=256 eligibility predicate predicts {} (available={available}, query={}, context={}); \
-                 check MLX_ENABLE_D256_FULL_SDPA, MLX_ENABLE_TF32, OS, and GPU capability",
-                config.expected_execution.name(),
-                predicted_execution.name(),
-                config.query,
-                config.context,
-            ));
-        }
+    if matches!(config.route, Route::Sdpa) && predicted_execution != config.expected_execution {
+        return Err(format!(
+            "SDPA execution expectation mismatch before allocation: expected {}, but MLX's \
+             D=256 eligibility predicate predicts {} (available={available}, query={}, context={}); \
+             check MLX_ENABLE_D256_FULL_SDPA, MLX_ENABLE_TF32, OS, and GPU capability",
+            config.expected_execution.name(),
+            predicted_execution.name(),
+            config.query,
+            config.context,
+        ));
     }
 
     Ok(ExecutionProbe {
