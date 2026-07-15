@@ -611,9 +611,11 @@ Environment:
 
 Notes:
   The built-in subagent tool provides scout/planner/reviewer/worker. Each child
-  is an isolated mlx agent process; tasks-array work is queued one at a time to
-  avoid loading several model + KV allocations concurrently. --no-extensions
-  (or -ne) disables subagents as well as discovered extensions.
+  is an isolated in-memory Pi session inside the parent process. Child sessions
+  share one resident model/cache host; up to four tool loops may overlap while
+  model inference is serialized. Separate mlx agent processes do not share
+  model memory. --no-extensions (or -ne) disables subagents as well as
+  discovered extensions.
   'mlx agent update' is disabled — update @mlx-node/cli via your package
   manager instead. 'install'/'remove'/'list' manage pi extensions, themes and
   skills under the agent config home; 'config' edits which are enabled.
@@ -678,7 +680,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
 
   // Must run before the deferred `@mlx-node/agent` import below. The native
   // tracing subscriber is installed while the native addon initializes.
-  configureAgentTracing(scan);
+  const traceLogFile = configureAgentTracing(scan);
 
   // Deferred imports: `@mlx-node/agent` loads the native addon and the
   // pure `scanAgentArgs` export above must stay importable without it.
@@ -690,7 +692,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   if (scan.help) {
     printAgentPreamble();
     // pi appends its full flag list and process.exit(0)s on this path.
-    await runAgent({ modelsDir, models: [], argv: ['--help'] });
+    await runAgent({ modelsDir, models: [], argv: ['--help'], traceLogFile });
     return;
   }
 
@@ -707,7 +709,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   // path downloads a model in a TTY — then actually lists it — or prints
   // the exact `mlx download model` commands headless.
   if (PI_PASSTHROUGH_COMMANDS.has(scan.passthrough[0] ?? '') || scan.piOneShot) {
-    await runAgent({ modelsDir, models: [], argv: scan.passthrough });
+    await runAgent({ modelsDir, models: [], argv: scan.passthrough, traceLogFile });
     return;
   }
 
@@ -755,5 +757,5 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, argv: agentArgv });
+  await runAgent({ modelsDir, models, argv: agentArgv, traceLogFile });
 }

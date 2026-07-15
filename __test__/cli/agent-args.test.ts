@@ -536,7 +536,12 @@ describe('run() argv routing', () => {
     const calls = {
       discover: [] as string[],
       wizard: [] as string[],
-      runAgent: [] as Array<{ modelsDir: string; models: MlxModelInfo[]; argv: string[] }>,
+      runAgent: [] as Array<{
+        modelsDir: string;
+        models: MlxModelInfo[];
+        argv: string[];
+        traceLogFile?: string;
+      }>,
       writes: [] as Array<{ provider: string; modelId: string }>,
     };
     const deps: AgentRunDeps = {
@@ -546,7 +551,12 @@ describe('run() argv routing', () => {
         return Promise.resolve(discoverBatches[Math.min(calls.discover.length - 1, discoverBatches.length - 1)]!);
       },
       runAgent: (opts) => {
-        calls.runAgent.push({ modelsDir: opts.modelsDir, models: opts.models, argv: opts.argv });
+        calls.runAgent.push({
+          modelsDir: opts.modelsDir,
+          models: opts.models,
+          argv: opts.argv,
+          traceLogFile: opts.traceLogFile,
+        });
         return Promise.resolve();
       },
       wizard: (modelsDir) => {
@@ -660,6 +670,9 @@ describe('run() argv routing', () => {
       expect(output).toContain('--trace-dir <dir>');
       expect(output).toContain('MLX_NODE_LOG');
       expect(output).toContain('MLX_NODE_LOG_FILE');
+      expect(output).toContain('isolated in-memory Pi session');
+      expect(output).toContain('model inference is serialized');
+      expect(output).toContain('Separate mlx agent processes do not share');
     } finally {
       logSpy.mockRestore();
     }
@@ -690,6 +703,7 @@ describe('run() argv routing', () => {
 
       expect(calls.runAgent).toHaveLength(1);
       expect(calls.runAgent[0]!.argv).toEqual(['--models', 'mlx/*', '--model', 'mlx/fake-model', '-p', 'hi']);
+      expect(calls.runAgent[0]!.traceLogFile).toBe(join(logDir, 'inference.log'));
       expect(errorSpy.mock.calls.flat().join('\n')).toContain(
         `mlx agent: inference log ${join(logDir, 'inference.log')}`,
       );

@@ -26,6 +26,7 @@ import { PagedConfigOverrideManager } from '@mlx-node/lm';
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
 import { createTerminalTitleExtension } from './extensions/terminal-title.js';
+import { createTraceNoticeExtension } from './extensions/trace-notice.js';
 import { createMlxProviderExtension } from './provider/index.js';
 import { MlxModelHost } from './provider/model-host.js';
 import {
@@ -55,6 +56,8 @@ export interface RunAgentOptions {
   models: MlxModelInfo[];
   /** Passthrough args handed to pi's `main()` verbatim. */
   argv: string[];
+  /** Native inference-log path to surface after Pi takes over the TUI. */
+  traceLogFile?: string;
   /** @internal Test seam; when set, the pi dynamic import is skipped entirely. */
   piImpl?: RunAgentPi;
   /** @internal Test seam for paged model-path resolution and cleanup. */
@@ -108,6 +111,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
         createMlxProviderExtension(opts.models, modelHost),
         createPermissionGateExtension(),
         ...(subagentsEnabled ? [createSubagentExtension()] : []),
+        ...(opts.traceLogFile !== undefined ? [createTraceNoticeExtension(opts.traceLogFile)] : []),
         createTerminalTitleExtension(),
       ],
     });

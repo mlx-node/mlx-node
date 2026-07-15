@@ -124,6 +124,28 @@ describe('runAgent', () => {
     expect(names).toEqual(['mlx-provider', 'mlx-permission-gate', 'mlx-subagent', 'mlx-terminal-title']);
   });
 
+  it('adds a TUI trace notice only when the CLI supplies a log path', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      argv: [],
+      traceLogFile: '/logs/inference.log',
+      piImpl: piImpl(main),
+    });
+
+    const names = calls[0]!.extensionFactories.map((entry) =>
+      typeof entry === 'function' ? '<anonymous>' : entry.name,
+    );
+    expect(names).toEqual([
+      'mlx-provider',
+      'mlx-permission-gate',
+      'mlx-subagent',
+      'mlx-trace-notice',
+      'mlx-terminal-title',
+    ]);
+  });
+
   it.each([['--no-extensions'], ['-ne']])('respects the extension opt-out %s', async (...argv) => {
     const { main, calls } = makeSeam();
     await runAgent({ modelsDir: '/models', models: [FAKE_MODEL], argv, piImpl: piImpl(main) });
