@@ -54,6 +54,27 @@ impl MTLSize {
 
 type ObjcBuffer = ProtocolObject<dyn MTLBuffer>;
 
+mod private {
+    pub trait Sealed {}
+}
+
+/// A scalar whose initialized object representation can be copied into a Metal buffer.
+///
+/// This trait is sealed so safe buffer creation cannot be extended to types
+/// with padding or otherwise uninitialized bytes.
+pub trait MetalBufferElement: private::Sealed {}
+
+macro_rules! impl_metal_buffer_element {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl private::Sealed for $ty {}
+            impl MetalBufferElement for $ty {}
+        )+
+    };
+}
+
+impl_metal_buffer_element!(u8, u16, u32, i32, i64, f32);
+
 /// A borrowed `MTLBuffer` reference.
 ///
 /// The transparent wrapper preserves the raw-pointer bridge used when MLX
@@ -170,24 +191,57 @@ impl Device {
         )
     }
 
+    /// Allocate a Metal buffer initialized from a slice of plain scalar values.
+    #[inline]
+    pub fn new_buffer_with_slice<T: MetalBufferElement>(
+        &self,
+        values: &[T],
+        options: MTLResourceOptions,
+    ) -> Buffer {
+        // SAFETY: the sealed element set has no padding or uninitialized bytes,
+        // and the slice remains readable for its complete inferred byte length
+        // until Metal's synchronous copy returns.
+        unsafe {
+            self.new_buffer_with_data(
+                values.as_ptr().cast(),
+                std::mem::size_of_val(values) as u64,
+                options,
+            )
+        }
+    }
+
+    /// Allocate a Metal buffer initialized from one plain scalar value.
+    #[inline]
+    pub fn new_buffer_with_value<T: MetalBufferElement>(
+        &self,
+        value: &T,
+        options: MTLResourceOptions,
+    ) -> Buffer {
+        self.new_buffer_with_slice(std::slice::from_ref(value), options)
+    }
+
     /// Allocate a Metal buffer and copy `length` bytes from `bytes`.
     ///
     /// # Safety
-    /// `bytes` must point to at least `length` readable bytes.
+    ///
+    /// `bytes` must be non-null and point to at least `length` readable bytes.
+    /// The region must remain valid until this method returns; Metal copies it
+    /// synchronously and does not retain the source pointer.
     #[inline]
-    pub fn new_buffer_with_data(
+    pub unsafe fn new_buffer_with_data(
         &self,
         bytes: *const c_void,
         length: u64,
         options: MTLResourceOptions,
     ) -> Buffer {
         let bytes = NonNull::new(bytes.cast_mut()).expect("buffer source pointer must not be null");
-        // SAFETY: callers provide a readable region of `length` bytes; Metal
-        // copies it before returning.
+        let length = usize::try_from(length).expect("Metal buffer length does not fit usize");
+        // SAFETY: upheld by this method's caller; Metal copies the source
+        // region before returning.
         Buffer(
             unsafe {
                 self.0
-                    .newBufferWithBytes_length_options(bytes, length as usize, options)
+                    .newBufferWithBytes_length_options(bytes, length, options)
             }
             .expect("Metal device failed to allocate initialized buffer"),
         )
@@ -378,5 +432,32 @@ mod tests {
         assert_send_sync::<Library>();
         assert_send_sync::<ComputePipelineState>();
         assert_send_sync::<CommandQueue>();
+    }
+
+    #[test]
+    fn initialized_buffer_helpers_copy_exact_values() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("skipping initialized buffer copy test: no Metal device");
+            return;
+        };
+
+        let values = [0x1020_3040u32, 0x5060_7080, 0x90a0_b0c0];
+        let slice_buffer =
+            device.new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
+        assert_eq!(slice_buffer.length(), std::mem::size_of_val(&values) as u64);
+        // SAFETY: StorageModeShared exposes CPU-readable contents, and the
+        // constructor allocated exactly `values.len()` initialized `u32`s.
+        let copied = unsafe {
+            std::slice::from_raw_parts(slice_buffer.contents().cast::<u32>(), values.len())
+        };
+        assert_eq!(copied, values);
+
+        let value = -1234i32;
+        let value_buffer =
+            device.new_buffer_with_value(&value, MTLResourceOptions::StorageModeShared);
+        assert_eq!(value_buffer.length(), std::mem::size_of::<i32>() as u64);
+        // SAFETY: same StorageModeShared and initialized-length guarantees as
+        // above, for one `i32`.
+        assert_eq!(unsafe { *value_buffer.contents().cast::<i32>() }, value);
     }
 }

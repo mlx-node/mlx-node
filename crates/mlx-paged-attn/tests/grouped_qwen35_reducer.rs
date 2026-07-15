@@ -127,33 +127,26 @@ fn run_reducer_case(state: &MetalState, num_stripes: usize) {
     let output = state
         .device
         .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared);
-    let exp_sums = state.device.new_buffer_with_data(
-        inputs.exp_sums.as_ptr() as *const _,
-        std::mem::size_of_val(inputs.exp_sums.as_slice()) as u64,
+    let exp_sums = state.device.new_buffer_with_slice(
+        inputs.exp_sums.as_ref(),
         MTLResourceOptions::StorageModeShared,
     );
-    let max_logits = state.device.new_buffer_with_data(
-        inputs.max_logits.as_ptr() as *const _,
-        std::mem::size_of_val(inputs.max_logits.as_slice()) as u64,
+    let max_logits = state.device.new_buffer_with_slice(
+        inputs.max_logits.as_ref(),
         MTLResourceOptions::StorageModeShared,
     );
-    let partials = state.device.new_buffer_with_data(
-        inputs.partials_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(inputs.partials_bf16.as_slice()) as u64,
+    let partials = state.device.new_buffer_with_slice(
+        inputs.partials_bf16.as_ref(),
         MTLResourceOptions::StorageModeShared,
     );
     let context_lens = [num_stripes as u32; QUERY_ROWS];
-    let context_lens = state.device.new_buffer_with_data(
-        context_lens.as_ptr() as *const _,
-        std::mem::size_of_val(context_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let context_lens = state
+        .device
+        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
     let num_stripes_i32 = num_stripes as i32;
-    let num_stripes_buffer = state.device.new_buffer_with_data(
-        &num_stripes_i32 as *const i32 as *const _,
-        std::mem::size_of::<i32>() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let num_stripes_buffer = state
+        .device
+        .new_buffer_with_value(&num_stripes_i32, MTLResourceOptions::StorageModeShared);
 
     let pipeline = state
         .get_pipeline(MetalState::paged_attention_grouped_qwen35_reduce_kernel_name())

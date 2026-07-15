@@ -213,31 +213,21 @@ fn run_dispatch(
     sliding_window: i32,
     scale: f32,
 ) -> Vec<f32> {
-    let key_pool = state.device.new_buffer_with_data(
-        k_pool_bytes.as_ptr() as *const _,
-        std::mem::size_of_val(k_pool_bytes) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let value_pool = state.device.new_buffer_with_data(
-        v_pool_bytes.as_ptr() as *const _,
-        std::mem::size_of_val(v_pool_bytes) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let q_buf = state.device.new_buffer_with_data(
-        q_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(q_bf16) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let block_table_buf = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let seq_lens_buf = state.device.new_buffer_with_data(
-        seq_lens.as_ptr() as *const _,
-        std::mem::size_of_val(seq_lens) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let key_pool = state
+        .device
+        .new_buffer_with_slice(k_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer_with_slice(v_pool_bytes.as_ref(), MTLResourceOptions::StorageModeShared);
+    let q_buf = state
+        .device
+        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+    let block_table_buf = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+    let seq_lens_buf = state
+        .device
+        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
     let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;

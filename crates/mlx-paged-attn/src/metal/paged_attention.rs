@@ -587,11 +587,9 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 
     // Create dummy buffers for exp_sums/max_logits (unused in V1)
     let dummy_float: f32 = 0.0;
-    let dummy_buffer = state.device.new_buffer_with_data(
-        &dummy_float as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let dummy_buffer = state
+        .device
+        .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
 
     // Convert queries raw pointer to BufferRef
     // SAFETY: Caller guarantees queries.ptr is a valid MTLBuffer*
@@ -606,14 +604,12 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
     encoder.set_buffer(5, Some(value_cache), 0);
 
     // k_scale and v_scale - use params values for FP8 support
-    let k_scale_buffer = state.device.new_buffer_with_data(
-        &params.k_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let k_scale_buffer = state.device.new_buffer_with_value(
+        &params.k_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
-    let v_scale_buffer = state.device.new_buffer_with_data(
-        &params.v_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let v_scale_buffer = state.device.new_buffer_with_value(
+        &params.v_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
     encoder.set_buffer(6, Some(&k_scale_buffer), 0);
@@ -621,19 +617,15 @@ pub unsafe fn dispatch_paged_attention_v1_raw(
 
     // Set constant buffers
     let create_int_buffer = |value: i32| {
-        state.device.new_buffer_with_data(
-            &value as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
+        state
+            .device
+            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
     };
 
     let create_float_buffer = |value: f32| {
-        state.device.new_buffer_with_data(
-            &value as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
+        state
+            .device
+            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
     };
 
     let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
@@ -822,14 +814,12 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         encoder.set_buffer(5, Some(value_cache), 0);
 
         // k_scale and v_scale - use params values for FP8 support
-        let k_scale_buffer = state.device.new_buffer_with_data(
-            &params.k_scale as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
+        let k_scale_buffer = state.device.new_buffer_with_value(
+            &params.k_scale,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        let v_scale_buffer = state.device.new_buffer_with_data(
-            &params.v_scale as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
+        let v_scale_buffer = state.device.new_buffer_with_value(
+            &params.v_scale,
             metal::MTLResourceOptions::StorageModeShared,
         );
         encoder.set_buffer(6, Some(&k_scale_buffer), 0);
@@ -837,19 +827,15 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
 
         // Set constant buffers
         let create_int_buffer = |value: i32| {
-            state.device.new_buffer_with_data(
-                &value as *const i32 as *const _,
-                std::mem::size_of::<i32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
+            state
+                .device
+                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
         };
 
         let create_float_buffer = |value: f32| {
-            state.device.new_buffer_with_data(
-                &value as *const f32 as *const _,
-                std::mem::size_of::<f32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
+            state
+                .device
+                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
         };
 
         let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
@@ -861,11 +847,9 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
 
         let dummy_float: f32 = 0.0;
-        let dummy_buffer = state.device.new_buffer_with_data(
-            &dummy_float as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let dummy_buffer = state
+            .device
+            .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
 
         encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
         encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -946,9 +930,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         encoder.set_buffer(3, Some(&tmp_out), 0);
         encoder.set_buffer(4, Some(context_lens), 0);
 
-        let max_num_partitions_buf = state.device.new_buffer_with_data(
-            &(max_num_partitions as i32) as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
+        let max_num_partitions_buf = state.device.new_buffer_with_value(
+            &(max_num_partitions as i32),
             metal::MTLResourceOptions::StorageModeShared,
         );
         encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
@@ -1167,11 +1150,9 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     encoder.set_compute_pipeline_state(&pipeline);
 
     let dummy_float: f32 = 0.0;
-    let dummy_buffer = state.device.new_buffer_with_data(
-        &dummy_float as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let dummy_buffer = state
+        .device
+        .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
 
     // SAFETY: caller guarantees queries.ptr is a valid MTLBuffer*.
     let queries_ref: &BufferRef = unsafe { ForeignTypeRef::from_ptr(queries.ptr as *mut _) };
@@ -1183,32 +1164,26 @@ pub unsafe fn dispatch_paged_attention_varlen_v1_raw(
     encoder.set_buffer(4, Some(key_cache), 0);
     encoder.set_buffer(5, Some(value_cache), 0);
 
-    let k_scale_buffer = state.device.new_buffer_with_data(
-        &params.k_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let k_scale_buffer = state.device.new_buffer_with_value(
+        &params.k_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
-    let v_scale_buffer = state.device.new_buffer_with_data(
-        &params.v_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let v_scale_buffer = state.device.new_buffer_with_value(
+        &params.v_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
     encoder.set_buffer(6, Some(&k_scale_buffer), 0);
     encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
     let create_int_buffer = |value: i32| {
-        state.device.new_buffer_with_data(
-            &value as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
+        state
+            .device
+            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
     };
     let create_float_buffer = |value: f32| {
-        state.device.new_buffer_with_data(
-            &value as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
+        state
+            .device
+            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
     };
 
     let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
@@ -1381,32 +1356,26 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(4, Some(key_cache), 0);
         encoder.set_buffer(5, Some(value_cache), 0);
 
-        let k_scale_buffer = state.device.new_buffer_with_data(
-            &params.k_scale as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
+        let k_scale_buffer = state.device.new_buffer_with_value(
+            &params.k_scale,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        let v_scale_buffer = state.device.new_buffer_with_data(
-            &params.v_scale as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
+        let v_scale_buffer = state.device.new_buffer_with_value(
+            &params.v_scale,
             metal::MTLResourceOptions::StorageModeShared,
         );
         encoder.set_buffer(6, Some(&k_scale_buffer), 0);
         encoder.set_buffer(7, Some(&v_scale_buffer), 0);
 
         let create_int_buffer = |value: i32| {
-            state.device.new_buffer_with_data(
-                &value as *const i32 as *const _,
-                std::mem::size_of::<i32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
+            state
+                .device
+                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
         };
         let create_float_buffer = |value: f32| {
-            state.device.new_buffer_with_data(
-                &value as *const f32 as *const _,
-                std::mem::size_of::<f32>() as u64,
-                metal::MTLResourceOptions::StorageModeShared,
-            )
+            state
+                .device
+                .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
         };
 
         let num_kv_heads_buf = create_int_buffer(params.num_kv_heads as i32);
@@ -1418,11 +1387,9 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         let kv_head_stride_buf = create_int_buffer(params.kv_head_stride);
 
         let dummy_float: f32 = 0.0;
-        let dummy_buffer = state.device.new_buffer_with_data(
-            &dummy_float as *const f32 as *const _,
-            std::mem::size_of::<f32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let dummy_buffer = state
+            .device
+            .new_buffer_with_value(&dummy_float, metal::MTLResourceOptions::StorageModeShared);
 
         encoder.set_buffer(8, Some(&num_kv_heads_buf), 0);
         encoder.set_buffer(9, Some(&scale_buf), 0);
@@ -1500,17 +1467,15 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
         encoder.set_buffer(3, Some(&tmp_out), 0);
         encoder.set_buffer(4, Some(context_lens), 0);
 
-        let max_num_partitions_buf = state.device.new_buffer_with_data(
-            &(max_num_partitions as i32) as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
+        let max_num_partitions_buf = state.device.new_buffer_with_value(
+            &(max_num_partitions as i32),
             metal::MTLResourceOptions::StorageModeShared,
         );
         encoder.set_buffer(5, Some(&max_num_partitions_buf), 0);
 
         encoder.set_buffer(6, Some(cu_seqlens_q), 0);
-        let num_seqs_buf = state.device.new_buffer_with_data(
-            &(params.num_seqs as i32) as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
+        let num_seqs_buf = state.device.new_buffer_with_value(
+            &(params.num_seqs as i32),
             metal::MTLResourceOptions::StorageModeShared,
         );
         encoder.set_buffer(7, Some(&num_seqs_buf), 0);

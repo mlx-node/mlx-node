@@ -272,32 +272,26 @@ struct MetalInputs {
 
 impl MetalInputs {
     fn new(state: &MetalState, inputs: &ExactShapeInputs) -> Self {
-        let key_pool = state.device.new_buffer_with_data(
-            inputs.k_pool_bf16.as_ptr() as *const _,
-            std::mem::size_of_val(inputs.k_pool_bf16.as_slice()) as u64,
+        let key_pool = state.device.new_buffer_with_slice(
+            inputs.k_pool_bf16.as_ref(),
             MTLResourceOptions::StorageModeShared,
         );
-        let value_pool = state.device.new_buffer_with_data(
-            inputs.v_pool_bf16.as_ptr() as *const _,
-            std::mem::size_of_val(inputs.v_pool_bf16.as_slice()) as u64,
+        let value_pool = state.device.new_buffer_with_slice(
+            inputs.v_pool_bf16.as_ref(),
             MTLResourceOptions::StorageModeShared,
         );
-        let q = state.device.new_buffer_with_data(
-            inputs.q_bf16.as_ptr() as *const _,
-            std::mem::size_of_val(inputs.q_bf16.as_slice()) as u64,
+        let q = state.device.new_buffer_with_slice(
+            inputs.q_bf16.as_ref(),
             MTLResourceOptions::StorageModeShared,
         );
-        let block_table = state.device.new_buffer_with_data(
-            inputs.block_table.as_ptr() as *const _,
-            std::mem::size_of_val(inputs.block_table.as_slice()) as u64,
+        let block_table = state.device.new_buffer_with_slice(
+            inputs.block_table.as_ref(),
             MTLResourceOptions::StorageModeShared,
         );
         let context_lens = [inputs.context_len as u32];
-        let context_lens = state.device.new_buffer_with_data(
-            context_lens.as_ptr() as *const _,
-            std::mem::size_of_val(context_lens.as_slice()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let context_lens = state
+            .device
+            .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
         Self {
             key_pool,
             value_pool,
@@ -391,11 +385,9 @@ fn dispatch_varlen_two_rows(
 ) -> (Vec<f32>, bool) {
     let metal = MetalInputs::new(state, inputs);
     let cu_seqlens = [0i32, 2];
-    let cu_seqlens = state.device.new_buffer_with_data(
-        cu_seqlens.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let cu_seqlens = state
+        .device
+        .new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared);
     let (q_stride, kv_block_stride, kv_head_stride) =
         common_strides(inputs.shape.num_heads, inputs.shape.num_kv_heads);
     let params = PagedAttentionVarlenParams {
@@ -700,17 +692,13 @@ fn run_full_context_stage1_case(state: &MetalState, context_len: usize) {
         state,
         NUM_HEADS as usize * HEAD_SIZE as usize * std::mem::size_of::<u16>(),
     );
-    let block_table_buffer = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let block_table_buffer = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
     let context_lens = [context_len as u32];
-    let context_lens_buffer = state.device.new_buffer_with_data(
-        context_lens.as_ptr() as *const _,
-        std::mem::size_of_val(context_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let context_lens_buffer = state
+        .device
+        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
     let q_raw = RawBufferInfo {
         ptr: q.as_ptr() as *mut c_void,
         offset: 0,
@@ -831,17 +819,13 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
     let key_pool = zeroed_shared_buffer(state, pool_bytes);
     let value_pool = zeroed_shared_buffer(state, pool_bytes);
     let block_table: Vec<u32> = (0..logical_blocks).collect();
-    let block_table = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let block_table = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
     let context_lens = [context_len];
-    let context_lens = state.device.new_buffer_with_data(
-        context_lens.as_ptr() as *const _,
-        std::mem::size_of_val(context_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let context_lens = state
+        .device
+        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
     let q_elements = 2 * NUM_HEADS as usize * HEAD_SIZE as usize;
     let q = zeroed_shared_buffer(state, q_elements * std::mem::size_of::<u16>());
     let q_raw = RawBufferInfo {
@@ -886,11 +870,9 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
         sliding_window: 0,
     };
     let cu_seqlens = [0i32, 2];
-    let cu_seqlens = state.device.new_buffer_with_data(
-        cu_seqlens.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let cu_seqlens = state
+        .device
+        .new_buffer_with_slice(cu_seqlens.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let run_decode = || unsafe {
         dispatch_paged_attention_v2_raw(

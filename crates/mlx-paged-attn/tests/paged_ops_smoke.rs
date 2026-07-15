@@ -188,23 +188,18 @@ fn round_trip_k_v_through_shim() {
             }
         }
     }
-    let new_k = state.device.new_buffer_with_data(
-        new_k_host.as_ptr() as *const _,
-        (tokens_size_elements * 2) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let new_v = state.device.new_buffer_with_data(
-        new_v_host.as_ptr() as *const _,
-        (tokens_size_elements * 2) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let new_k = state
+        .device
+        .new_buffer_with_slice(new_k_host.as_ref(), MTLResourceOptions::StorageModeShared);
+    let new_v = state
+        .device
+        .new_buffer_with_slice(new_v_host.as_ref(), MTLResourceOptions::StorageModeShared);
 
     // Slot mapping: token 0 → slot 5 (block 0, position 5),
     //               token 1 → slot 21 (block 1, position 5).
     let slot_mapping_host: Vec<i64> = vec![5, 21];
-    let slot_mapping = state.device.new_buffer_with_data(
-        slot_mapping_host.as_ptr() as *const _,
-        (slot_mapping_host.len() * std::mem::size_of::<i64>()) as u64,
+    let slot_mapping = state.device.new_buffer_with_slice(
+        slot_mapping_host.as_ref(),
         MTLResourceOptions::StorageModeShared,
     );
 
@@ -468,7 +463,6 @@ fn fp8_dispatch_uses_runtime_scales() {
     let block_size: u32 = 16;
     let x: u32 = 16;
     let cache_element_size: u64 = 1; // FP8 is 1 byte
-    let input_element_size: u64 = 2; // BF16 inputs
 
     let key_cache_size = (num_blocks as u64)
         * (num_kv_heads as u64)
@@ -515,23 +509,18 @@ fn fp8_dispatch_uses_runtime_scales() {
     let new_k_host: Vec<u16> = vec![k_bf16; tokens_size_elements];
     let new_v_host: Vec<u16> = vec![v_bf16; tokens_size_elements];
 
-    let new_k = state.device.new_buffer_with_data(
-        new_k_host.as_ptr() as *const _,
-        (tokens_size_elements as u64) * input_element_size,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let new_v = state.device.new_buffer_with_data(
-        new_v_host.as_ptr() as *const _,
-        (tokens_size_elements as u64) * input_element_size,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let new_k = state
+        .device
+        .new_buffer_with_slice(new_k_host.as_slice(), MTLResourceOptions::StorageModeShared);
+    let new_v = state
+        .device
+        .new_buffer_with_slice(new_v_host.as_slice(), MTLResourceOptions::StorageModeShared);
 
     // Slot mapping: token 0 → slot 0, token 1 → slot 1 (block 0,
     // positions 0/1).
     let slot_mapping_host: Vec<i64> = vec![0, 1];
-    let slot_mapping = state.device.new_buffer_with_data(
-        slot_mapping_host.as_ptr() as *const _,
-        (slot_mapping_host.len() * std::mem::size_of::<i64>()) as u64,
+    let slot_mapping = state.device.new_buffer_with_slice(
+        slot_mapping_host.as_ref(),
         MTLResourceOptions::StorageModeShared,
     );
 

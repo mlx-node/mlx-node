@@ -236,36 +236,24 @@ fn varlen_t1_matches_single_row_kernel() {
     let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
     let cu_seqlens_q: Vec<i32> = vec![0, 1];
 
-    let key_pool = state.device.new_buffer_with_data(
-        k_pool.as_ptr() as *const _,
-        std::mem::size_of_val(k_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let value_pool = state.device.new_buffer_with_data(
-        v_pool.as_ptr() as *const _,
-        std::mem::size_of_val(v_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let q_buf = state.device.new_buffer_with_data(
-        q_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(q_bf16.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let block_table_buf = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let seq_lens_buf = state.device.new_buffer_with_data(
-        seq_lens.as_ptr() as *const _,
-        std::mem::size_of_val(seq_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let cu_seqlens_q_buf = state.device.new_buffer_with_data(
-        cu_seqlens_q.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens_q.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let key_pool = state
+        .device
+        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let q_buf = state
+        .device
+        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+    let block_table_buf = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+    let seq_lens_buf = state
+        .device
+        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+    let cu_seqlens_q_buf = state
+        .device
+        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
     let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
@@ -522,36 +510,24 @@ fn varlen_ragged_batch_matches_host_reference() {
     }
     let q_host_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
-    let key_pool = state.device.new_buffer_with_data(
-        k_pool.as_ptr() as *const _,
-        std::mem::size_of_val(k_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let value_pool = state.device.new_buffer_with_data(
-        v_pool.as_ptr() as *const _,
-        std::mem::size_of_val(v_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let q_buf = state.device.new_buffer_with_data(
-        q_host_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(q_host_bf16.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let block_table_buf = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let seq_lens_buf = state.device.new_buffer_with_data(
-        context_lens.as_ptr() as *const _,
-        std::mem::size_of_val(context_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let cu_seqlens_q_buf = state.device.new_buffer_with_data(
-        cu_seqlens_q.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens_q.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let key_pool = state
+        .device
+        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let q_buf = state
+        .device
+        .new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+    let block_table_buf = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+    let seq_lens_buf = state
+        .device
+        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+    let cu_seqlens_q_buf = state
+        .device
+        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
@@ -753,36 +729,24 @@ fn varlen_v2_high_partition_matches_host_reference() {
     }
     let q_host_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
-    let key_pool = state.device.new_buffer_with_data(
-        k_pool.as_ptr() as *const _,
-        std::mem::size_of_val(k_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let value_pool = state.device.new_buffer_with_data(
-        v_pool.as_ptr() as *const _,
-        std::mem::size_of_val(v_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let q_buf = state.device.new_buffer_with_data(
-        q_host_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(q_host_bf16.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let block_table_buf = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let seq_lens_buf = state.device.new_buffer_with_data(
-        context_lens.as_ptr() as *const _,
-        std::mem::size_of_val(context_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let cu_seqlens_q_buf = state.device.new_buffer_with_data(
-        cu_seqlens_q.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens_q.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let key_pool = state
+        .device
+        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let q_buf = state
+        .device
+        .new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+    let block_table_buf = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+    let seq_lens_buf = state
+        .device
+        .new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+    let cu_seqlens_q_buf = state
+        .device
+        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
@@ -965,36 +929,24 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
     let block_table: Vec<u32> = vec![0, 1];
     let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
 
-    let key_pool = state.device.new_buffer_with_data(
-        k_pool.as_ptr() as *const _,
-        std::mem::size_of_val(k_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let value_pool = state.device.new_buffer_with_data(
-        v_pool.as_ptr() as *const _,
-        std::mem::size_of_val(v_pool.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let q_buf = state.device.new_buffer_with_data(
-        q_bf16.as_ptr() as *const _,
-        std::mem::size_of_val(q_bf16.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let block_table_buf = state.device.new_buffer_with_data(
-        block_table.as_ptr() as *const _,
-        std::mem::size_of_val(block_table.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let seq_lens_buf = state.device.new_buffer_with_data(
-        seq_lens.as_ptr() as *const _,
-        std::mem::size_of_val(seq_lens.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    let cu_seqlens_q_buf = state.device.new_buffer_with_data(
-        cu_seqlens_q.as_ptr() as *const _,
-        std::mem::size_of_val(cu_seqlens_q.as_slice()) as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
+    let key_pool = state
+        .device
+        .new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let value_pool = state
+        .device
+        .new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared);
+    let q_buf = state
+        .device
+        .new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared);
+    let block_table_buf = state
+        .device
+        .new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared);
+    let seq_lens_buf = state
+        .device
+        .new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared);
+    let cu_seqlens_q_buf = state
+        .device
+        .new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared);
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
     let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;

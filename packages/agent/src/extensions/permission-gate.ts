@@ -7,7 +7,7 @@
  * Behavior (settled design):
  * - Interactive (`ctx.hasUI`): prompt via `ctx.ui.select` with the
  *   command (bash), file path (write/edit), or delegated task (subagent) as the detail line, passed
- *   through `sanitizeDetail` (control-byte encoding + length cap).
+ *   through `sanitizeApprovalDetail` (control-byte encoding + length cap).
  *   "Always (this session)" allow-lists the tool name in memory for the
  *   lifetime of this extension instance.
  * - Non-interactive: allow only when `MLX_AGENT_AUTO_APPROVE=1`,
@@ -25,91 +25,12 @@ import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext, InlineExtension, ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
+import { sanitizeApprovalDetail } from './approval-detail.js';
 import { normalizeSubagentMode } from './subagent.js';
 
 const GATED_TOOLS: ReadonlySet<string> = new Set(['bash', 'write', 'edit', 'subagent']);
 
 const AUTO_APPROVE_ENV = 'MLX_AGENT_AUTO_APPROVE';
-
-/** Longest detail line (in chars) shown in the approval prompt. */
-const DETAIL_MAX_CHARS = 500;
-/** Most detail lines shown before truncation kicks in. */
-const DETAIL_MAX_LINES = 6;
-const TRUNCATION_MARKER = '… [truncated]';
-
-/**
- * Every character that must be rendered visibly instead of reaching the
- * terminal: C0 controls except `\n` and `\t`, DEL, and the C1 range
- * U+0080–U+009F (which contains the raw CSI/OSC/ST bytes U+009B, U+009D
- * and U+009C). Matched one character at a time — deliberately NOT as
- * multi-character escape "sequences": CSI parameters/finals and OSC
- * payloads are ordinary printable bytes that bash still parses and
- * executes, so any sequence-level deletion makes real shell syntax
- * invisible while it still runs (and CSI/OSC/ST termination is ambiguous
- * to parse in the first place — e.g. an unterminated OSC has no defined
- * end).
- */
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHAR_RE = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
-
-/** Render one control character as visible `\xNN` text (e.g. ESC → `\x1b`). */
-function encodeControlChar(ch: string): string {
-  return `\\x${ch.charCodeAt(0).toString(16).padStart(2, '0')}`;
-}
-
-/**
- * Sanitize model-controlled text before it is embedded in the approval
- * prompt. The prompt is this product's only permission UI, so it must not
- * depend on pi's TUI stripping terminal escapes (it does not — pi-tui's
- * `wrapTextWithAnsi` deliberately preserves ANSI): a crafted bash command
- * could otherwise move the cursor, erase lines, or restyle the prompt to
- * disguise what is being approved.
- *
- * Encode, never delete. An earlier deletion-based version stripped whole
- * "escape sequences", but the bytes inside a CSI/OSC-shaped span are
- * still shell syntax that bash executes — a command could display as a
- * safe-looking prefix while a pipe or a second command hid inside what
- * the sanitizer parsed as an escape payload. Instead:
- *
- * - Every printable character is preserved verbatim — nothing bash could
- *   interpret (letters, digits, shell metacharacters, spaces) is removed
- *   or altered.
- * - Every control character (C0 except `\n`/`\t`, DEL, C1) is rendered
- *   as visible `\xNN` text, so no byte that could drive the terminal
- *   survives, and no shell text can hide behind one.
- * - Output is capped at DETAIL_MAX_LINES lines and DETAIL_MAX_CHARS
- *   chars (counted after encoding) with a visible truncation marker, so
- *   a huge command cannot flood the prompt off the screen.
- */
-function sanitizeDetail(text: string): string {
-  let out = text.replace(CONTROL_CHAR_RE, encodeControlChar);
-  let truncated = false;
-
-  const lines = out.split('\n');
-  if (lines.length > DETAIL_MAX_LINES) {
-    out = lines.slice(0, DETAIL_MAX_LINES).join('\n');
-    truncated = true;
-  }
-  if (out.length > DETAIL_MAX_CHARS) {
-    out = out.slice(0, DETAIL_MAX_CHARS);
-    // Do not leave a lone high surrogate behind after the hard cut.
-    const last = out.charCodeAt(out.length - 1);
-    if (last >= 0xd800 && last <= 0xdbff) {
-      out = out.slice(0, -1);
-    }
-    truncated = true;
-  }
-  if (truncated) {
-    out += ` ${TRUNCATION_MARKER}`;
-  }
-  if (out.trim().length === 0 && text.length > 0) {
-    // Control characters always encode to visible text, so this only
-    // fires for whitespace-only input; show something rather than an
-    // approvable-looking blank line.
-    return '(unprintable content)';
-  }
-  return out;
-}
 
 /**
  * Per-layer snapshot of pi's `shellCommandPrefix`: the RAW value contributed by
@@ -400,7 +321,7 @@ export function createPermissionGateExtension(): InlineExtension {
           // eslint-disable-next-line @typescript-eslint/no-base-to-string
           detailSource = raw ? `${String(raw)}\n${command}` : command;
         }
-        const detail = sanitizeDetail(detailSource);
+        const detail = sanitizeApprovalDetail(detailSource);
         const title = toolName === 'subagent' ? 'Allow delegated subagent tool access?' : `Allow ${toolName}?`;
         // Bind the dialog to the active agent operation. Pi's selector only
         // resolves on Ctrl+C/abort when the extension forwards this signal;

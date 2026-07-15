@@ -432,4 +432,76 @@ describe('mlx subagent extension', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('encodes control bytes in project-agent names and source paths before confirmation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-project-sanitize-'));
+    const projectRoot = join(root, 'repo\u001b[31m');
+    const agentName = 'worker\u001b[2J\u009b31m';
+    try {
+      await mkdir(join(projectRoot, '.pi', 'agents'), { recursive: true });
+      await writeFile(
+        join(projectRoot, '.pi', 'agents', 'worker.md'),
+        `---\nname: ${agentName}\ndescription: project worker\n---\nProject-controlled prompt.\n`,
+      );
+      let confirmationDetail = '';
+      const tool = captureTool(createSubagentExtension());
+      await tool.execute(
+        'call-project-controls',
+        { agent: agentName, task: 'work', agentScope: 'project' },
+        undefined,
+        undefined,
+        context({
+          cwd: projectRoot,
+          ui: {
+            confirm: async (_title: string, detail: string) => {
+              confirmationDetail = detail;
+              return false;
+            },
+          } as never,
+        }),
+      );
+
+      expect(confirmationDetail).not.toContain('\u001b');
+      expect(confirmationDetail).not.toContain('\u009b');
+      expect(confirmationDetail).toContain('Agents: worker\\x1b[2J\\x9b31m');
+      expect(confirmationDetail).toContain(`Source: ${join(projectRoot.replace('\u001b', '\\x1b'), '.pi', 'agents')}`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('caps oversized project-agent confirmation details with a visible marker', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-subagent-project-truncate-'));
+    const agentName = `project-worker-${'x'.repeat(600)}-hidden-tail`;
+    try {
+      await mkdir(join(root, '.pi', 'agents'), { recursive: true });
+      await writeFile(
+        join(root, '.pi', 'agents', 'worker.md'),
+        `---\nname: ${agentName}\ndescription: project worker\n---\nProject-controlled prompt.\n`,
+      );
+      let confirmationDetail = '';
+      const tool = captureTool(createSubagentExtension());
+      await tool.execute(
+        'call-project-long-name',
+        { agent: agentName, task: 'work', agentScope: 'project' },
+        undefined,
+        undefined,
+        context({
+          cwd: root,
+          ui: {
+            confirm: async (_title: string, detail: string) => {
+              confirmationDetail = detail;
+              return false;
+            },
+          } as never,
+        }),
+      );
+
+      expect(confirmationDetail).toContain('… [truncated]');
+      expect(confirmationDetail).not.toContain('hidden-tail');
+      expect(confirmationDetail.length).toBeLessThan(520);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

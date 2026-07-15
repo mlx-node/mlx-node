@@ -387,9 +387,9 @@ pub(crate) struct Gemma4Inner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Content hash of the image set associated with the live cache. Used
     /// in Step 5c to detect mid-session image changes (which require a
-    /// full session restart). Cleared after a successful warm text save; use
-    /// `media_session_context` for the media kinds still represented by live
-    /// KV across subsequent continuations.
+    /// full session restart). Preserved with the ordered image-position
+    /// sidecar across successful warm text saves so subsequent registrations
+    /// retain the exact image-aware cache lineage.
     pub(crate) cached_image_key: Option<u64>,
     /// Content hash of the audio set associated with the live cache. Audio
     /// counterpart of `cached_image_key`: set after an audio prefill so a
@@ -442,12 +442,9 @@ pub(crate) struct Gemma4Inner {
     sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
     sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
     /// Media kinds causally represented by the current session's live/persisted
-    /// prefix. Unlike the content-hash keys, this survives every successful
-    /// warm text continuation because those turns extend — rather than replace
-    /// — the media-derived KV. Cleared only when that session is reset or a
-    /// successful turn replaces it (text-only save, or a media cold-start whose
-    /// paged prepare succeeded); a FAILED media prepare must leave it set so
-    /// `session_media()` keeps the stale media-expanded history fail-closed.
+    /// prefix. This survives every successful warm text continuation because
+    /// those turns extend — rather than replace — the media-derived KV. Cleared
+    /// when that session is reset, invalidated, or successfully replaced.
     media_session_context: MediaCapabilities,
     /// Context handed to the currently executing generic paged text turn.
     /// `run_paged_turn` snapshots `TurnPlan::context_media` here so
@@ -5832,7 +5829,7 @@ impl PagedBackend for Gemma4Inner {
                 self.media_session_context = MediaCapabilities::NONE;
                 self.media_session_continuable = false;
             } else {
-                // A warm text delta extended the same live media prefix. The
+                // A warm text delta extended the same live media prefix.
                 // Preserve the exact image key and ordered placeholder sidecar:
                 // subsequent text blocks must keep registering under the same
                 // image-aware lineage, and live continuation needs raw identity.
@@ -9559,12 +9556,12 @@ mod tests {
         );
     }
 
-    /// A warm text save clears the raw image/audio hash keys, but it extends
-    /// the same live media-derived KV. The exact media kinds therefore remain
-    /// visible to the next delta planner across any number of continuations.
-    /// This exercises image-only, audio-only, and combined contexts without a
-    /// real paged adapter; the no-adapter guard also proves the preserved
-    /// context retains the existing modality-specific restart wording.
+    /// A warm text save over a pure-image session extends the same live
+    /// media-derived KV. It must preserve the raw image identity and ordered
+    /// placeholder sidecar so later text blocks keep the same image-aware block
+    /// keys. Audio and mixed turns are deliberately cold/non-continuable and do
+    /// not enter this path. The no-adapter guard also proves the preserved image
+    /// context retains the existing restart wording across repeated saves.
     #[test]
     fn test_media_context_survives_repeated_warm_text_saves() {
         let cfg = paged_tiny_config(Some(false));
@@ -9580,69 +9577,55 @@ mod tests {
             }
         };
 
-        let cases = [
-            (MediaCapabilities::IMAGES, Some(11), None, "image state"),
-            (MediaCapabilities::AUDIO, None, Some(22), "audio state"),
-            (
-                MediaCapabilities::IMAGES_AND_AUDIO,
-                Some(33),
-                Some(44),
-                "audio state",
-            ),
-        ];
+        let image_key = 11;
+        let image_positions = vec![(1, image_key)];
+        inner.publish_media_session_context(Some(image_key), None);
+        inner.cached_paged_image_token_positions = image_positions.clone();
+        inner.media_session_continuable = true;
+        assert_eq!(inner.session_media(), MediaCapabilities::IMAGES);
 
-        for (context, image_key, audio_key, expected_state) in cases {
-            inner.clear_reuse_state();
-            inner.publish_media_session_context(image_key, audio_key);
-            inner.media_session_continuable = true;
-            assert_eq!(inner.session_media(), context);
+        for turn in 0..2u32 {
+            // Mirrors `run_paged_turn` handing the planner's prior context
+            // to `save_paged_history` for a successful warm text delta.
+            inner.paged_text_turn_context = inner.session_media();
+            inner
+                .save_paged_history(&[10, 11, turn], &[20, 21], false, true)
+                .expect("warm text paged save must succeed");
 
-            for turn in 0..2u32 {
-                // Mirrors `run_paged_turn` handing the planner's prior context
-                // to `save_paged_history` for a successful warm text delta.
-                inner.paged_text_turn_context = inner.session_media();
-                inner
-                    .save_paged_history(&[10, 11, turn], &[20, 21], false, true)
-                    .expect("warm text paged save must succeed");
+            assert_eq!(inner.cached_image_key, Some(image_key));
+            assert!(inner.cached_audio_key.is_none());
+            assert_eq!(
+                inner.cached_paged_image_token_positions, image_positions,
+                "turn {turn} must preserve exact image cache lineage"
+            );
+            assert_eq!(
+                inner.session_media(),
+                MediaCapabilities::IMAGES,
+                "turn {turn} must preserve the image-derived context"
+            );
+            assert!(inner.media_session_continuable);
 
-                assert!(inner.cached_image_key.is_none());
-                assert!(inner.cached_audio_key.is_none());
-                assert_eq!(
-                    inner.session_media(),
-                    context,
-                    "turn {turn} must preserve the media-derived context"
-                );
-                assert!(inner.media_session_continuable);
-
-                // This fixture has no adapter, so the guard must reject. Its
-                // unchanged error format should still name the true context
-                // after the raw keys have been cleared.
-                let reject = inner
-                    .text_delta_media_guard("chat_session_continue")
-                    .expect("not-live media context must request a restart");
-                assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
-                assert!(reject.contains(expected_state), "got: {reject}");
-            }
+            // This fixture has no adapter, so the guard must reject. Its
+            // unchanged error format should still name the image context.
+            let reject = inner
+                .text_delta_media_guard("chat_session_continue")
+                .expect("not-live image context must request a restart");
+            assert!(reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX));
+            assert!(reject.contains("image state"), "got: {reject}");
         }
     }
 
-    /// A failed paged media prepare must fail CLOSED. The vision cores disarm
-    /// `media_session_continuable` BEFORE the fallible adapter prepare (a
-    /// stale armed marker could wrongly warm-continue) but clear
-    /// `media_session_context` only after it succeeds, so a `?`-return from
-    /// the prepare leaves exactly: marker disarmed, raw keys `None` (a prior
-    /// warm text save already dropped them), context still set, and the
-    /// media-expanded `cached_token_history` intact. Both delta gates must
-    /// reject from that surviving context alone — `text_delta_media_guard`
-    /// with the typed restart error and `verify_cache_prefix` with a forced
-    /// miss. The counterfactual block pins that the context is load-bearing:
-    /// wiping it (the pre-fix failure state) silently admits the delta.
+    /// A failed paged media prepare must fail CLOSED. The vision core disarms
+    /// `media_session_continuable` before the fallible adapter prepare, and all
+    /// subsequent prepare failures call `invalidate_gemma4_hybrid_session`,
+    /// which releases the request and clears both global and sliding reuse
+    /// state. No media-derived history may survive as a token-only prefix hit.
     ///
     /// The state is built with the real transition functions
-    /// (`publish_media_session_context` → warm `save_paged_history` → the
-    /// marker disarm the vision cores perform ahead of the prepare); driving
-    /// `vision_paged_turn_sync_core` itself to the failing prepare needs a
-    /// real tokenizer file, which unit tests do not have.
+    /// (`publish_media_session_context` → warm `save_paged_history` → marker
+    /// disarm → `invalidate_gemma4_hybrid_session`); driving the complete
+    /// multimodal core to the failing prepare needs a real tokenizer file,
+    /// which unit tests do not have.
     #[test]
     fn test_failed_media_prepare_fails_closed_after_warm_continuation() {
         let cfg = paged_tiny_config(Some(false));
@@ -9664,10 +9647,11 @@ mod tests {
             .init_caches_sync()
             .expect("init_caches_sync must succeed");
 
-        // Warm-continued image session: the media turn's finalize published
-        // keys + context and armed the marker, then a warm text save dropped
-        // the raw keys while preserving the context.
+        // Warm-continued pure-image session: finalize published exact image
+        // identity + context and armed the marker; the warm text save preserves
+        // that image lineage for later image-aware block registration.
         inner.publish_media_session_context(Some(11), None);
+        inner.cached_paged_image_token_positions = vec![(1, 11)];
         inner.media_session_continuable = true;
         inner.paged_text_turn_context = inner.session_media();
         inner
@@ -9675,8 +9659,9 @@ mod tests {
             .expect("warm text paged save must succeed");
         // Mirrors `run_paged_turn` resetting the turn-scoped snapshot.
         inner.paged_text_turn_context = MediaCapabilities::NONE;
-        assert!(inner.cached_image_key.is_none());
+        assert_eq!(inner.cached_image_key, Some(11));
         assert!(inner.cached_audio_key.is_none());
+        assert_eq!(inner.cached_paged_image_token_positions, vec![(1, 11)]);
         assert_eq!(inner.session_media(), MediaCapabilities::IMAGES);
 
         // `keep_all = false` dropped the trailing stop token 104.
@@ -9691,43 +9676,29 @@ mod tests {
             "an armed continuation must not be forced to miss"
         );
 
-        // The next media turn's failure window: the vision cores disarm the
-        // marker, then the paged prepare fails and returns before the
-        // success-only clears — history and context survive untouched.
+        // The next media turn's failure path: the vision core disarms the
+        // marker, then its prepare helper invalidates the complete hybrid
+        // session before returning the error.
         inner.media_session_continuable = false;
+        inner.invalidate_gemma4_hybrid_session("unit-test media prepare failure");
 
-        let reject = inner
-            .text_delta_media_guard("chat_session_continue")
-            .expect("a text delta after a failed media prepare must fail closed");
-        assert!(
-            reject.starts_with(engine::IMAGE_CHANGE_RESTART_PREFIX),
-            "failed-prepare rejection must carry the restart prefix, got: {reject}"
-        );
-        assert!(
-            reject.contains("image state"),
-            "failed-prepare rejection must name the surviving context, got: {reject}"
-        );
+        assert!(inner.caches.is_none());
+        assert!(inner.cached_token_history.is_empty());
+        assert!(inner.cached_image_key.is_none());
+        assert!(inner.cached_audio_key.is_none());
+        assert!(inner.cached_paged_image_token_positions.is_empty());
+        assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+        assert!(!inner.media_session_continuable);
         assert_eq!(
             inner.verify_cache_prefix(&delta_tokens, true),
             0,
-            "the media-expanded history must not seed a text-only prefix hit"
+            "invalidated media history must not seed a text-only prefix hit"
         );
-
-        // Counterfactual — the pre-fix failure state (context wiped alongside
-        // the marker): both gates silently admit the delta over the stale
-        // media-expanded history, which is exactly the fail-open this ordering
-        // prevents.
-        inner.media_session_context = MediaCapabilities::NONE;
         assert!(
             inner
                 .text_delta_media_guard("chat_session_continue")
                 .is_none(),
-            "without the surviving context the guard admits — the context is load-bearing"
-        );
-        assert_eq!(
-            inner.verify_cache_prefix(&delta_tokens, true),
-            inner.cached_token_history.len(),
-            "without the surviving context the stale history reads as a text prefix hit"
+            "a fully invalidated session has no stale media state to guard"
         );
     }
 

@@ -24,6 +24,8 @@ import { StringEnum } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext, InlineExtension } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 
+import { sanitizeApprovalDetail } from './approval-detail.js';
+
 const MAX_PARALLEL_TASKS = 8;
 /** Tool loops can overlap; the shared `MlxModelHost` serializes model calls. */
 const MAX_CONCURRENCY = 4;
@@ -587,7 +589,9 @@ export function createSubagentExtension(options: SubagentExtensionOptions = {}):
             }
             const approved = await ctx.ui.confirm(
               'Run project-local agents?',
-              `Agents: ${projectAgents.map((agent) => agent.name).join(', ')}\nSource: ${discovery.projectAgentsDir}`,
+              sanitizeApprovalDetail(
+                `Agents: ${projectAgents.map((agent) => agent.name).join(', ')}\nSource: ${discovery.projectAgentsDir}`,
+              ),
             );
             if (!approved) {
               return {

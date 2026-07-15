@@ -752,11 +752,9 @@ impl LayerKVPool {
         // Upload slot_mapping as a shared Metal buffer (kernel expects i64).
         let slot_upload_start = trace_enabled.then(std::time::Instant::now);
         let state = MetalState::get()?;
-        let slot_buffer = state.device.new_buffer_with_data(
-            slot_mapping.as_ptr() as *const _,
-            std::mem::size_of_val(slot_mapping) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let slot_buffer = state
+            .device
+            .new_buffer_with_slice(slot_mapping, MTLResourceOptions::StorageModeShared);
         if trace_enabled {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] layer_kv_pool write_kv_slot_upload_done layer={} bytes={} elapsed_ms={:.1}",
@@ -949,17 +947,13 @@ impl LayerKVPool {
 
         // Upload block_tables and context_lens as shared Metal buffers
         // (kernel reads i32 for both).
-        let block_tables_buffer = state.device.new_buffer_with_data(
-            block_ids.as_ptr() as *const _,
-            std::mem::size_of_val(block_ids) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let block_tables_buffer = state
+            .device
+            .new_buffer_with_slice(block_ids, MTLResourceOptions::StorageModeShared);
         let context_lens: [i32; 1] = [num_tokens_in_request as i32];
-        let context_lens_buffer = state.device.new_buffer_with_data(
-            context_lens.as_ptr() as *const _,
-            std::mem::size_of_val(&context_lens) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let context_lens_buffer = state
+            .device
+            .new_buffer_with_slice(&context_lens, MTLResourceOptions::StorageModeShared);
 
         // Stride math (vLLM convention, mirrors AttentionLayer::forward):
         // - q_stride = num_query_heads * head_size  (per-token query stride)
@@ -1251,16 +1245,12 @@ impl LayerKVPool {
         }
 
         let state = MetalState::get()?;
-        let key_staging = state.device.new_buffer_with_data(
-            keys_bytes.as_ptr().cast(),
-            keys_bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let value_staging = state.device.new_buffer_with_data(
-            values_bytes.as_ptr().cast(),
-            values_bytes.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let key_staging = state
+            .device
+            .new_buffer_with_slice(keys_bytes, MTLResourceOptions::StorageModeShared);
+        let value_staging = state
+            .device
+            .new_buffer_with_slice(values_bytes, MTLResourceOptions::StorageModeShared);
         let (key_cache, value_cache) = &self.layers[layer_idx as usize];
         let command_buffer = state.command_queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();

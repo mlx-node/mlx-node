@@ -114,14 +114,12 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     encoder.set_buffer(4, Some(slot_buffer_ref), slot_mapping.offset as u64);
 
     // k_scale and v_scale - use params values for FP8
-    let k_scale_buffer = state.device.new_buffer_with_data(
-        &params.k_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let k_scale_buffer = state.device.new_buffer_with_value(
+        &params.k_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
-    let v_scale_buffer = state.device.new_buffer_with_data(
-        &params.v_scale as *const f32 as *const _,
-        std::mem::size_of::<f32>() as u64,
+    let v_scale_buffer = state.device.new_buffer_with_value(
+        &params.v_scale,
         metal::MTLResourceOptions::StorageModeShared,
     );
     encoder.set_buffer(5, Some(&k_scale_buffer), 0);
@@ -136,11 +134,9 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     let x = params.x;
 
     let create_const_buffer = |value: i32| {
-        state.device.new_buffer_with_data(
-            &value as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
+        state
+            .device
+            .new_buffer_with_value(&value, metal::MTLResourceOptions::StorageModeShared)
     };
 
     let key_stride_buf = create_const_buffer(key_stride);

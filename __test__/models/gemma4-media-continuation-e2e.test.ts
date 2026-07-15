@@ -7,49 +7,35 @@ import { beforeAll, describe, expect, it } from 'vite-plus/test';
 /**
  * Media -> text continuation parity (Gemma 4).
  *
- * A text follow-up after ANY media turn (AUDIO, NON-UNIFIED image, or UNIFIED
- * bidirectional-vision image) MAY warm-continue on the live media KV, but only
- * when the warm restore is numerically FAITHFUL. The eligibility gate admits any
- * image/audio turn; the vision-core finalize keeps the global paged KV
- * registered for reuse and arms `media_session_continuable` ONLY when the
- * sliding-history checkpoint actually STORED. That stored/live gate splits the
- * two checkpoint classes:
+ * A text follow-up may warm-continue only after a PURE-IMAGE turn. The vision
+ * finalizer keeps the global paged KV live and arms
+ * `media_session_continuable` only when the physical sliding-anchor checkpoint
+ * stored successfully. Image identity is part of every affected paged block
+ * key, so a positive `cachedTokens` value proves reuse of the exact ordered
+ * image lineage rather than a token-only placeholder match.
  *
- *  - NON-KV-SHARED (12B audio, `num_kv_shared_layers=0`): every sliding layer is
- *    a plain `Sliding` anchor that physically wrote real audio/image-feature K/V
- *    during the media prefill, so the sliding checkpoint STORES, the marker
- *    arms, and the next delta hits `state="live"` — reusing the in-place
- *    faithful K/V. This is the canonical FAITHFUL warm path.
- *  - KV-SHARED (e2b image, `num_kv_shared_layers=20`): the `SharedOnSliding`
- *    layers never wrote their own flat K/V, so the sliding checkpoint stores
- *    NOTHING (`stored=false`). A warm restore would fall to `state="replay"`,
- *    which rebuilds media-position sliding K/V from `embed_tokens.forward(id)` =
- *    RAW `<|image|>` special-token embeddings, NOT the scattered SigLIP/audio
- *    features — numerically UNFAITHFUL. So the marker is left OFF; the text
- *    follow-up cleanly COLD-RESTARTS through the `ChatSession` Phase-1 catch.
+ * KV sharing does not make an image turn ineligible. E2B's
+ * `SharedOnSliding` alias slots intentionally own no private K/V and are skipped
+ * by checkpoint readiness/storage; their physical non-shared sliding anchors
+ * carry the state for both layers. Both standard SigLIP images (E2B) and unified
+ * bidirectional-vision images therefore warm-continue on faithful live K/V.
  *
- *  (REPLAY is faithful for TEXT positions because a text token's true embedding
- *  IS `embed_tokens.forward(id)`; it cannot reconstruct a MEDIA position's true
- *  embedding, which is a scattered feature.)
+ * Audio and mixed-media identity is not represented in the per-block keys yet.
+ * Those turns deliberately use `skip_lookup` with a zero cache-hit ceiling, do
+ * not publish reusable prefix checkpoints, and leave the continuation marker
+ * off. The native text delta then returns the typed restart error; `ChatSession`
+ * catches it before any token is emitted and cold-replays the complete history.
  *
  * ## What this file asserts
  *
- *  - AUDIO (12B, non-KV-shared): the warm path actually continued
- *    (cachedTokens > 0) and the warm FINAL answer equals the cold FINAL answer.
- *    This is the load-bearing FAITHFUL-warm proof.
- *  - UNIFIED image (12B, non-KV-shared): the warm delta continues
- *    (cachedTokens > 0) and answers coherently. The bidirectional overlay only
- *    edits the IMAGE-span mask during prefill (a no-op over text queries), so the
- *    warm text delta routes through the generic causal text path and is faithful.
- *    Strict warm==cold byte parity is NOT asserted: a deterministic ~1-ULP BF16
- *    cache-hit-kernel reduction-order drift (the documented
- *    `paged_decode_long_context_1ulp` class) flips one early near-tie argmax that
- *    cascades into a different-but-coherent tail. So this block asserts the
- *    faithful-warm contract (cachedTokens>0) plus coherence, not byte parity. The
- *    audio block above happens to dodge the near-tie and stays byte-exact.
- *  - NON-UNIFIED image (e2b, KV-shared): the follow-up cold-restarts; the test
- *    is a single-shot/cold-restart COHERENCE check (coherent, non-degenerate
- *    answer). This is the negative control proving KV-shared still cold-restarts.
+ *  - NON-UNIFIED and UNIFIED image: `cachedTokens > 0` plus a coherent answer.
+ *    E2B additionally pins its known byte-exact warm-vs-cold golden. Unified
+ *    image does not require byte equality: its cache-hit and full-prefill
+ *    kernels can differ by a deterministic ~1-ULP BF16 reduction-order drift
+ *    that flips a near-tie argmax while preserving a coherent answer.
+ *  - AUDIO: `cachedTokens == 0`, proving the follow-up used the deliberate cold
+ *    replay, plus exact FINAL-answer parity against a direct cold replay of the
+ *    same history after resetting the loaded model.
  *
  * Greedy T=0 throughout. Presence-gated on the converted checkpoints + fixtures,
  * mirroring the existing gemma4 e2e tests.
@@ -82,7 +68,7 @@ function findFirst(dirs: string[]): string | null {
 
 const SYSTEM = 'You are a helpful assistant. Be concise.';
 
-const audioModelPath =
+const unifiedModelPath =
   process.env.GEMMA4_UNIFIED_MODEL_PATH && hasWeights(process.env.GEMMA4_UNIFIED_MODEL_PATH)
     ? process.env.GEMMA4_UNIFIED_MODEL_PATH
     : findFirst(['.cache/models/gemma-4-12b-it']);
@@ -124,7 +110,7 @@ async function streamTurn(
       numTokens = event.numTokens;
       rawText = event.rawText;
       cachedTokens = event.cachedTokens;
-    } else {
+    } else if (event.isReasoning !== true) {
       parsedText += event.text;
     }
   }
@@ -132,27 +118,21 @@ async function streamTurn(
 }
 
 /**
- * COLD reference: a fresh model + manually-built media-bearing history driven
- * through the native `chatSessionStart`, cold-prefilling the WHOLE conversation
- * (system + media turn-1 + turn-1 reply + the text delta). Returns turn-2's
- * reply. `assistantTurn1` is the content stored for the prior assistant turn —
- * `rawText` for the byte-exact (no-thinking) case; `parsedText` is equivalent
- * for the audio case since the template strips reasoning either way.
+ * COLD reference: an already-reset model + manually-built media-bearing history
+ * driven through native `chatSessionStart`, cold-prefilling the WHOLE
+ * conversation (system + media turn-1 + turn-1 reply + the text delta). Reusing
+ * the loaded model avoids holding a second multi-gigabyte checkpoint. Returns
+ * turn-2's reply. `assistantTurn1` must be the parsed assistant content committed
+ * by `ChatSession`; the Gemma template strips prior reasoning on both paths.
  */
 async function coldReplayTurn2(
-  modelPath: string,
+  model: SessionCapableModel,
   media: { images?: Uint8Array[]; audio?: Uint8Array[] },
   prompt1: string,
   assistantTurn1: string,
   prompt2: string,
   maxNewTokens: number,
 ): Promise<{ rawText: string; text: string; numTokens: number }> {
-  const model = (await loadModel(modelPath)) as unknown as {
-    chatSessionStart: (
-      messages: UserMessage[],
-      config?: { maxNewTokens?: number; temperature?: number; reportPerformance?: boolean },
-    ) => Promise<{ rawText: string; text: string; numTokens: number }>;
-  };
   const userTurn1: UserMessage = { role: 'user', content: prompt1 };
   if (media.images) userTurn1.images = media.images;
   if (media.audio) userTurn1.audio = media.audio;
@@ -170,11 +150,11 @@ async function coldReplayTurn2(
   return { rawText: r.rawText, text: r.text, numTokens: r.numTokens };
 }
 
-// -- NON-UNIFIED image continuation (e2b, KV-shared): the media->text follow-up
-//    COLD-RESTARTS (the sliding checkpoint does not store -> warm restore would
-//    be unfaithful -> the marker is left off). Coherence check only. --
+// -- NON-UNIFIED image continuation (e2b, KV-shared): alias slots are skipped
+//    while their physical sliding anchors checkpoint the image-feature K/V, so
+//    the media->text follow-up warm-continues on the exact image lineage. --
 describe.skipIf(!imageModelPath || !imageExists)(
-  'Gemma 4 — non-unified image->text continue cold-restarts (KV-shared)',
+  'Gemma 4 — WARM non-unified image->text continuation parity (KV-shared)',
   () => {
     let model: SessionCapableModel;
 
@@ -183,7 +163,7 @@ describe.skipIf(!imageModelPath || !imageExists)(
       model = (await loadModel(imageModelPath)) as unknown as SessionCapableModel;
     }, 300_000);
 
-    it('image -> text continue cold-restarts and still answers coherently', async () => {
+    it('warm text delta reuses the exact image lineage and matches the cold final answer', async () => {
       const images = [readBytes(imagePath)];
       const prompt1 = 'Describe this image.';
       const prompt2 = 'What is the main color?';
@@ -193,25 +173,27 @@ describe.skipIf(!imageModelPath || !imageExists)(
       const turn1 = await streamTurn(session, prompt1, { images }, 48);
       expect(turn1.rawText.length).toBeGreaterThan(0);
 
-      // e2b is KV-shared (`num_kv_shared_layers=20`): the sliding-history
-      // checkpoint stores nothing, so the finalize leaves the marker false. The
-      // native continue throws the IMAGE restart prefix and the TS send()
-      // absorbs it into a cold replay. The observable contract is that the
-      // follow-up still produces a coherent, non-degenerate answer (the
-      // single-shot cold-restart fallback works) — NOT that it warm-continued.
-      const observed = await streamTurn(session, prompt2, {}, maxNew);
+      // E2B is KV-shared (`num_kv_shared_layers=20`), but only the alias slots
+      // lack private K/V. Their physical sliding anchors store the checkpoint;
+      // the exact image hash + ordered positions keep the live global blocks on
+      // the same image-aware lineage for this delta.
+      const warm = await streamTurn(session, prompt2, {}, maxNew);
       await session.reset();
 
+      const cold = await coldReplayTurn2(model, { images }, prompt1, turn1.parsedText, prompt2, maxNew);
+
       // eslint-disable-next-line no-console
-      console.log('[gemma4-cont-image] observed:', JSON.stringify(observed.parsedText));
-      // Cold-restart signal: the vision cold prefill primes with skip_lookup +
-      // max_cache_hit_tokens=0, so a correct cold-restart reports cachedTokens=0.
-      // A regression that wrongly re-armed the marker would warm-continue and
-      // report cachedTokens>0 — so this fails loud on accidental warm reuse.
-      expect(observed.cachedTokens ?? 0).toBe(0);
-      expect(observed.finishReason === 'stop' || observed.finishReason === 'length').toBe(true);
-      expect(observed.numTokens).toBeGreaterThan(0);
-      const words = observed.parsedText.trim().split(/\s+/).filter(Boolean);
+      console.log('[gemma4-cont-image] warm:', JSON.stringify(warm.parsedText), 'cold:', JSON.stringify(cold.text));
+      // The delta path reports the full prior history reused by construction.
+      // The image-aware block keys and exact-position gate make this a stronger
+      // signal than a token-only prefix hit.
+      expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
+      expect(warm.parsedText.trim()).toBe(cold.text.trim());
+      expect(warm.rawText).toBe(cold.rawText);
+      expect(warm.numTokens).toBe(cold.numTokens);
+      expect(warm.finishReason === 'stop' || warm.finishReason === 'length').toBe(true);
+      expect(warm.numTokens).toBeGreaterThan(0);
+      const words = warm.parsedText.trim().split(/\s+/).filter(Boolean);
       expect(words.length).toBeGreaterThan(3);
       // No degenerate single-token loop.
       const counts = new Map<string, number>();
@@ -221,19 +203,18 @@ describe.skipIf(!imageModelPath || !imageExists)(
   },
 );
 
-// -- AUDIO continuation: warm continues + final-answer parity (thinking -> cold
-//    strips it, so a byte-exact golden is ill-posed; see header). This is the
-//    canonical FAITHFUL warm path: 12B is non-KV-shared (`num_kv_shared_layers=0`)
-//    so the sliding caches store -> the next delta hits `state="live"`. --
-describe.skipIf(!audioModelPath || !audioExists)('Gemma 4 — WARM audio->text continuation parity', () => {
+// -- AUDIO continuation: audio identity is not part of paged block keys, so the
+//    follow-up cold-replays the full history and must match a direct cold
+//    reference at the final-answer boundary. --
+describe.skipIf(!unifiedModelPath || !audioExists)('Gemma 4 — COLD audio->text continuation parity', () => {
   let model: SessionCapableModel;
 
   beforeAll(async () => {
-    if (!audioModelPath) return;
-    model = (await loadModel(audioModelPath)) as unknown as SessionCapableModel;
+    if (!unifiedModelPath) return;
+    model = (await loadModel(unifiedModelPath)) as unknown as SessionCapableModel;
   }, 300_000);
 
-  it('warm text delta after an audio turn continues on live KV and matches the cold final answer', async () => {
+  it('text follow-up cold-replays full history and matches a direct cold replay', async () => {
     const audio = [readBytes(audioPath)];
     const prompt1 = 'Briefly describe this audio.';
     const prompt2 = 'In one word, what language is it?';
@@ -242,20 +223,27 @@ describe.skipIf(!audioModelPath || !audioExists)('Gemma 4 — WARM audio->text c
     const session = new ChatSession(model, { system: SYSTEM });
     const turn1 = await streamTurn(session, prompt1, { audio }, 40);
     expect(turn1.rawText.length).toBeGreaterThan(0);
-    const warm = await streamTurn(session, prompt2, {}, maxNew);
+    const replayed = await streamTurn(session, prompt2, {}, maxNew);
     await session.reset();
 
-    // The warm delta continued on the live audio KV (did not cold-restart).
-    expect(warm.cachedTokens ?? 0).toBeGreaterThan(0);
+    // The native media guard rejected the delta before emitting tokens and the
+    // TS session replayed full history. Audio/mixed preparation deliberately
+    // disables cache lookup, so the replay must report zero cached tokens.
+    expect(replayed.cachedTokens ?? 0).toBe(0);
 
-    const cold = await coldReplayTurn2(audioModelPath!, { audio }, prompt1, turn1.parsedText, prompt2, maxNew);
+    const cold = await coldReplayTurn2(model, { audio }, prompt1, turn1.parsedText, prompt2, maxNew);
 
     // eslint-disable-next-line no-console
-    console.log('[gemma4-cont-audio] warm:', JSON.stringify(warm.parsedText), 'cold:', JSON.stringify(cold.text));
-    // FINAL-answer parity (the full token stream differs only by the template's
-    // prior-CoT strip on the cold side, a rendering artifact — see header).
-    expect(warm.parsedText.trim()).toBe(cold.text.trim());
-    expect(warm.parsedText.trim().length).toBeGreaterThan(0);
+    console.log(
+      '[gemma4-cont-audio] replayed:',
+      JSON.stringify(replayed.parsedText),
+      'cold:',
+      JSON.stringify(cold.text),
+    );
+    // The ChatSession replay and the direct cold replay render the same history;
+    // greedy decoding must therefore agree at the parsed final-answer boundary.
+    expect(replayed.parsedText.trim()).toBe(cold.text.trim());
+    expect(replayed.parsedText.trim().length).toBeGreaterThan(0);
   });
 });
 
@@ -276,17 +264,16 @@ describe.skipIf(!audioModelPath || !audioExists)('Gemma 4 — WARM audio->text c
 //    early near-tie argmax that cascades into a different-but-coherent tail. On
 //    this prompt the warm/cold final answers share the prefix "...the main
 //    subject of the image" then diverge on a single token (" provided" vs "."),
-//    both coherently analyzing the same image ("Trunch Parish Council"). The
-//    audio block above happens to dodge a near-tie and stays byte-exact; this
-//    image prompt hits one early. So the unified block asserts the FAITHFUL-warm
-//    contract (cachedTokens>0 + the same coherence checks the e2b cold-restart
-//    block uses) rather than byte parity. --
-describe.skipIf(!audioModelPath || !imageExists)('Gemma 4 — WARM unified image->text continuation', () => {
+//    both coherently analyzing the same image ("Trunch Parish Council"). So the
+//    unified block asserts the FAITHFUL-warm contract (cachedTokens>0 + the same
+//    coherence checks the e2b warm block uses) rather than byte parity. Exact
+//    final-answer equality is asserted only for audio's cold-vs-cold replay. --
+describe.skipIf(!unifiedModelPath || !imageExists)('Gemma 4 — WARM unified image->text continuation', () => {
   let model: SessionCapableModel;
 
   beforeAll(async () => {
-    if (!audioModelPath) return;
-    model = (await loadModel(audioModelPath)) as unknown as SessionCapableModel;
+    if (!unifiedModelPath) return;
+    model = (await loadModel(unifiedModelPath)) as unknown as SessionCapableModel;
   }, 300_000);
 
   it('warm text delta after a unified image turn continues on live KV and answers coherently', async () => {
