@@ -604,6 +604,8 @@ mod run_decode_loop_tests {
     /// Greedy (T=0) params from a default `ChatConfig` plus overrides.
     fn greedy_params(mutate: impl FnOnce(&mut ChatConfig)) -> ChatParams {
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             ..Default::default()
         };

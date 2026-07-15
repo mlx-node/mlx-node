@@ -1393,6 +1393,18 @@ mod tests {
             cache_salt,
             Some(checkpoint),
         );
+        crate::engine::backend::ChatBackend::set_cache_owner_id(
+            &mut inner,
+            "child-session",
+            Some("root-session"),
+        );
+        assert!(
+            inner
+                .find_moe_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, cache_salt,)
+                .is_none(),
+            "an exact token/hash checkpoint owned by another session must not restore"
+        );
+        crate::engine::backend::ChatBackend::set_cache_owner_id(&mut inner, "", None);
         let restored = inner
             .find_moe_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, cache_salt)
             .expect("exact checkpoint restore");

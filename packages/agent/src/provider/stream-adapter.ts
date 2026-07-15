@@ -73,6 +73,7 @@ export interface StreamSimpleHost {
 }
 
 export type PerformanceRecorder = (message: AssistantMessage, performance: PerformanceMetrics) => void;
+export type RootCacheOwnerResolver = () => string | undefined;
 
 /** Property read that must not throw (poisoned getters on a hostile `Model`). */
 function safeString(read: () => string, fallback: string): string {
@@ -129,6 +130,7 @@ function failsafeMessage(model: Model<Api>, reason: 'aborted' | 'error', message
 export function makeMlxStreamSimple(
   host: StreamSimpleHost,
   onPerformance?: PerformanceRecorder,
+  resolveRootCacheOwner?: RootCacheOwnerResolver,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
@@ -142,6 +144,7 @@ export function makeMlxStreamSimple(
     let terminated = false;
     let emitter: TurnEmitter | undefined;
     let signal: AbortSignal | undefined;
+    let rootCacheOwnerId: string | undefined;
     let detachAbort: (() => void) | undefined;
 
     /**
@@ -208,6 +211,10 @@ export function makeMlxStreamSimple(
       // `options`/`Model` getter or a TurnEmitter constructor failure must
       // become a stream terminal, never a synchronous throw into pi.
       signal = options?.signal;
+      // Snapshot the top-level owner before this request can queue behind
+      // another inference. A later /new or /resume must not relabel an older
+      // request that was already submitted under the previous root.
+      rootCacheOwnerId = resolveRootCacheOwner?.();
       emitter = new TurnEmitter(stream, model, onPerformance);
     } catch (err) {
       terminalize('error', err);
@@ -261,7 +268,12 @@ export function makeMlxStreamSimple(
         if (terminated) return;
         try {
           session.primeHistory(contextToChatMessages(context));
-          const config = buildChatConfig(discovered.modelType, options, toolsToDefinitions(context.tools));
+          const config = buildChatConfig(
+            discovered.modelType,
+            options,
+            toolsToDefinitions(context.tools),
+            rootCacheOwnerId,
+          );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {
               if (event.finishReason === 'error') {

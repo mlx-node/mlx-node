@@ -955,6 +955,8 @@ mod mock_backend_tests {
 
     fn greedy_config() -> ChatConfig {
         ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             ..Default::default()
         }
@@ -1151,6 +1153,8 @@ mod mock_backend_tests {
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 temperature: Some(0.0),
                 max_new_tokens: Some(3),
                 ..Default::default()
@@ -1241,6 +1245,8 @@ mod mock_backend_tests {
             ChatCmd::StreamSessionStart {
                 messages: user_messages("hello"),
                 config: ChatConfig {
+                    cache_owner_id: None,
+                    cache_root_owner_id: None,
                     temperature: Some(0.0),
                     include_reasoning: Some(false),
                     ..Default::default()
@@ -1321,6 +1327,8 @@ mod mock_backend_tests {
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 reuse_cache: Some(false),
                 ..Default::default()
             },
@@ -1570,6 +1578,8 @@ mod mock_backend_tests {
 
         // Explicit request value wins over the model default.
         let explicit = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             top_p: Some(0.5),
             ..Default::default()
@@ -1615,6 +1625,8 @@ mod mock_backend_tests {
         };
 
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.9), // explicit → must survive
             top_p: Some(0.8),       // explicit, default is None → must survive
             ..Default::default()
@@ -1662,6 +1674,8 @@ mod mock_backend_tests {
 
         // (b) do_sample:false + explicit request temperature → request wins.
         let mut cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.8),
             ..Default::default()
         };

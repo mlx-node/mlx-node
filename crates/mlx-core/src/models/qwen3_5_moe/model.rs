@@ -24,6 +24,10 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
+use crate::models::qwen3_5::gdn_checkpoint_store::{
+    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
+    compute_paged_prefix_block_hash, compute_paged_prefix_block_hashes, prune_gdn_checkpoints,
+};
 use crate::models::qwen3_5::model::{
     Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
     compute_image_token_counts_per_image, constrain_paged_context_params, eval_layer_caches,
@@ -64,17 +68,36 @@ fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
         .collect()
 }
 
-const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 2;
-
 struct MoeGdnPrefixCheckpoint {
+    owner_id: String,
     prefix_len: u32,
     block_size: u32,
     final_block_hash: u64,
+    block_hashes: Vec<u64>,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
 }
 
+impl GdnCheckpointLineage for MoeGdnPrefixCheckpoint {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        &self.block_hashes
+    }
+}
+
 struct MoeGdnHistoryCheckpoint {
+    owner_id: String,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
 }
@@ -184,42 +207,6 @@ fn clone_moe_linear_layer_caches(
     Some(cloned)
 }
 
-fn compute_paged_prefix_block_hash(
-    tokens: &[u32],
-    prefix_len: u32,
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-    cache_salt: u64,
-) -> Option<u64> {
-    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
-        return None;
-    }
-
-    let prefix_len = prefix_len as usize;
-    let block_size = block_size as usize;
-    if prefix_len > tokens.len() {
-        return None;
-    }
-
-    let num_blocks = prefix_len / block_size;
-    let mut parent_hash = 0;
-    for block_idx in 0..num_blocks {
-        let extra_keys = extra_keys_per_block.get(block_idx)?;
-        let start = block_idx * block_size;
-        let end = start + block_size;
-        parent_hash = if block_idx == 0 && cache_salt != 0 {
-            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
-            salted_keys.extend_from_slice(extra_keys);
-            salted_keys.push(cache_salt);
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
-        } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
-        };
-    }
-
-    Some(parent_hash)
-}
-
 // Import the shared model ID counter from the dense module — dense and MoE
 // share the same C++ weight map, so IDs must be globally unique.
 use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
@@ -251,6 +238,9 @@ pub(crate) struct Qwen35MoeInner {
     /// history into fresh caches. Pure-flat sessions only; the paged path
     /// rolls back its adapter directly.
     pub(crate) flat_mtp_caches_desynced: bool,
+    active_cache_owner_id: String,
+    gdn_root_cache_owner_id: Option<String>,
+    gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
@@ -609,6 +599,9 @@ impl Qwen35MoeInner {
             cached_rope_deltas: None,
             model_id,
             flat_mtp_caches_desynced: false,
+            active_cache_owner_id: String::new(),
+            gdn_root_cache_owner_id: None,
+            gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_adapter,
@@ -870,6 +863,8 @@ impl Qwen35MoeInner {
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
+        self.gdn_root_cache_owner_id = None;
+        self.gdn_root_cache_owner_is_explicit = false;
     }
 
     fn find_moe_gdn_history_checkpoint(
@@ -879,7 +874,9 @@ impl Qwen35MoeInner {
     ) -> Option<Vec<Qwen3_5LayerCache>> {
         let prefix_tokens = tokens.get(..prefix_len as usize)?;
         let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
-        if checkpoint.tokens.as_slice() != prefix_tokens {
+        if checkpoint.owner_id != self.active_cache_owner_id
+            || checkpoint.tokens.as_slice() != prefix_tokens
+        {
             return None;
         }
         clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
@@ -913,14 +910,18 @@ impl Qwen35MoeInner {
         trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
         let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint { tokens, caches });
+        self.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint {
+            owner_id: self.active_cache_owner_id.clone(),
+            tokens,
+            caches,
+        });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
     }
 
     pub(super) fn find_moe_gdn_prefix_checkpoint(
-        &self,
+        &mut self,
         tokens: &[u32],
         prefix_len: u32,
         block_size: u32,
@@ -937,17 +938,21 @@ impl Qwen35MoeInner {
         let prefix_len_usize = prefix_len as usize;
         let prefix_tokens = tokens.get(..prefix_len_usize)?;
 
-        self.gdn_prefix_checkpoints
-            .iter()
-            .rev()
-            .find(|checkpoint| {
-                checkpoint.prefix_len == prefix_len
-                    && checkpoint.block_size == block_size
-                    && checkpoint.final_block_hash == final_block_hash
-                    && checkpoint.tokens.as_slice() == prefix_tokens
-                    && moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-            })
-            .and_then(|checkpoint| clone_moe_linear_layer_caches(&self.config, &checkpoint.caches))
+        let checkpoint_idx = self.gdn_prefix_checkpoints.iter().rposition(|checkpoint| {
+            checkpoint.owner_id == self.active_cache_owner_id
+                && checkpoint.prefix_len == prefix_len
+                && checkpoint.block_size == block_size
+                && checkpoint.final_block_hash == final_block_hash
+                && checkpoint.tokens.as_slice() == prefix_tokens
+                && moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
+        })?;
+        let caches = clone_moe_linear_layer_caches(
+            &self.config,
+            &self.gdn_prefix_checkpoints[checkpoint_idx].caches,
+        )?;
+        let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
+        self.gdn_prefix_checkpoints.push_back(checkpoint);
+        Some(caches)
     }
 
     pub(super) fn remember_moe_gdn_materialized_prefix_checkpoint(
@@ -962,7 +967,7 @@ impl Qwen35MoeInner {
         if !moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
             return false;
         }
-        let Some(final_block_hash) = compute_paged_prefix_block_hash(
+        let Some(block_hashes) = compute_paged_prefix_block_hashes(
             tokens,
             prefix_len,
             block_size,
@@ -971,28 +976,51 @@ impl Qwen35MoeInner {
         ) else {
             return false;
         };
+        let Some(final_block_hash) = block_hashes.last().copied() else {
+            return false;
+        };
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
             return false;
         };
 
         self.gdn_prefix_checkpoints.retain(|existing| {
-            !(existing.prefix_len == prefix_len
+            !(existing.owner_id == self.active_cache_owner_id
+                && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
                 && existing.tokens.as_slice() == prefix_tokens)
         });
         self.gdn_prefix_checkpoints
             .push_back(MoeGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
                 prefix_len,
                 block_size,
                 final_block_hash,
+                block_hashes,
                 tokens: prefix_tokens.to_vec(),
                 caches: checkpoint.caches,
             });
-        while self.gdn_prefix_checkpoints.len() > MOE_GDN_PREFIX_CHECKPOINT_LIMIT {
-            self.gdn_prefix_checkpoints.pop_front();
-        }
+        self.prune_moe_gdn_prefix_checkpoints();
         true
+    }
+
+    fn prune_moe_gdn_prefix_checkpoints(&mut self) {
+        let active_owner_id = self.active_cache_owner_id.clone();
+        let root_owner_id = self
+            .gdn_root_cache_owner_id
+            .get_or_insert(active_owner_id)
+            .clone();
+        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
+            GDN_PREFIX_CHECKPOINT_LIMIT
+        } else {
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER
+        };
+        prune_gdn_checkpoints(
+            &mut self.gdn_prefix_checkpoints,
+            checkpoint_limit,
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            &root_owner_id,
+        );
     }
 
     pub(super) fn publish_moe_gdn_materialized_prefix_checkpoint(
@@ -1026,6 +1054,8 @@ impl Qwen35MoeInner {
             model = "qwen3_5_moe",
             prefix_tokens = prefix_len,
             block_size,
+            cache_owner_id = %self.active_cache_owner_id,
+            cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
             stored,
             retained_checkpoints = self.gdn_prefix_checkpoints.len(),
             "MoE GDN prefix checkpoint stored"
@@ -1045,6 +1075,8 @@ impl Qwen35MoeInner {
         let inference_info_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
         let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
+        let cache_owner_id = self.active_cache_owner_id.clone();
+        let cache_root_owner_id = self.gdn_root_cache_owner_id.clone().unwrap_or_default();
         let finish = |state: &'static str,
                       restored_prefix_tokens: u32,
                       replayed_prefix_tokens: u32|
@@ -1054,6 +1086,8 @@ impl Qwen35MoeInner {
                     target: "mlx_core::inference",
                     event = "gdn_prefix_prepare",
                     model = "qwen3_5_moe",
+                    cache_owner_id = %cache_owner_id,
+                    cache_root_owner_id = %cache_root_owner_id,
                     state,
                     cached_prefix_tokens = cached_prefix_len,
                     restored_prefix_tokens,
@@ -6758,6 +6792,18 @@ impl ChatBackend for Qwen35MoeInner {
         "qwen3_5_moe"
     }
 
+    fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
+        self.active_cache_owner_id.clear();
+        self.active_cache_owner_id.push_str(owner_id);
+        if let Some(root_owner_id) = root_owner_id {
+            self.gdn_root_cache_owner_id = Some(root_owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = true;
+        } else {
+            self.gdn_root_cache_owner_id = Some(owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = false;
+        }
+    }
+
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
@@ -8279,6 +8325,60 @@ mod paged_construction_tests {
     }
 
     #[test]
+    fn test_moe_gdn_root_rotation_retains_new_root() {
+        fn push_checkpoint(
+            inner: &mut Qwen35MoeInner,
+            owner_id: &str,
+            root_owner_id: &str,
+            marker: u32,
+        ) {
+            crate::engine::backend::ChatBackend::set_cache_owner_id(
+                inner,
+                owner_id,
+                Some(root_owner_id),
+            );
+            let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
+            inner
+                .gdn_prefix_checkpoints
+                .push_back(MoeGdnPrefixCheckpoint {
+                    owner_id: inner.active_cache_owner_id.clone(),
+                    prefix_len: 16,
+                    block_size: 16,
+                    final_block_hash: marker as u64,
+                    block_hashes: vec![marker as u64],
+                    tokens,
+                    caches: Vec::new(),
+                });
+            inner.prune_moe_gdn_prefix_checkpoints();
+        }
+
+        let mut inner = Qwen35MoeInner::new(tiny_moe_cfg(false)).expect("construct tiny MoE model");
+        push_checkpoint(&mut inner, "root-0", "root-0", 1);
+        push_checkpoint(&mut inner, "root-1", "root-1", 2);
+        for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
+            .into_iter()
+            .enumerate()
+        {
+            push_checkpoint(&mut inner, owner, "root-1", 10 + index as u32);
+        }
+        assert_eq!(inner.gdn_root_cache_owner_id.as_deref(), Some("root-1"));
+        assert!(inner.gdn_root_cache_owner_is_explicit);
+        assert_eq!(inner.gdn_prefix_checkpoints.len(), 5);
+        assert!(
+            !inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-0")
+        );
+        assert!(
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-1")
+        );
+    }
+
+    #[test]
     fn test_qwen35_moe_media_plan_requires_complete_paged_vision_stack() {
         for has_encoder in [false, true] {
             for has_processor in [false, true] {
@@ -8315,6 +8415,8 @@ mod paged_construction_tests {
     #[test]
     fn test_qwen35_moe_planned_decoder_overrides_raw_mtp_flag() {
         let mut config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(true),
             ..ChatConfig::default()
         };

@@ -17,6 +17,18 @@ use crate::tools::ToolCallResult;
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct ChatConfig {
+    /// Internal logical cache owner. The agent provider forwards Pi's stable
+    /// session id so model-global GDN sidecars can retain parent and child
+    /// branches independently. This does not namespace the physical paged KV
+    /// cache; exact token/extra-key hashes remain shareable across owners.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_owner_id: Option<String>,
+    /// Internal top-level owner for the bounded Qwen3.5 GDN sidecar store.
+    /// `cache_owner_id` may identify a child Pi session; this separately
+    /// identifies the current interactive root so /new and /resume can rotate
+    /// the protected branch without changing PagedAttention cache identity.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_root_owner_id: Option<String>,
     #[napi(ts_type = "number | undefined")]
     pub max_new_tokens: Option<i32>,
     #[napi(ts_type = "number | undefined")]

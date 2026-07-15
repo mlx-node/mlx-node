@@ -649,6 +649,13 @@ pub(crate) trait ChatBackend {
     /// to `DecodeProfiler::new(label, model_type)`.
     fn family_name(&self) -> &'static str;
 
+    /// Select the logical owner for model-global auxiliary cache state for
+    /// this turn. Standard-KV families do not need ownership and keep the
+    /// no-op default. Qwen3.5 dense/MoE use it only for GDN sidecars; it must
+    /// never be folded into PagedAttention's cache salt because physical KV
+    /// blocks remain safely shareable by exact content hash.
+    fn set_cache_owner_id(&mut self, _owner_id: &str, _root_owner_id: Option<&str>) {}
+
     /// Session stop-token id. == the `<|im_end|>` resolution in
     /// `chat_session_start_sync` / `chat_tokens_delta_sync`
     /// (`tokenizer.im_end_id().ok_or(..)`) for the ChatML families;

@@ -32,7 +32,12 @@ import { makeMlxStreamSimple } from './stream-adapter.js';
 export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxModelHost): InlineExtension {
   const resolvedHost = host ?? new MlxModelHost(models.map((m) => m.discovered));
   const performanceStatus = new PerformanceStatus();
-  const streamSimple = makeMlxStreamSimple(resolvedHost, performanceStatus.record);
+  // This closure outlives Pi runtime replacement. Pi creates a replacement
+  // runtime for /new and /resume and reruns inline extension factories; each
+  // new factory's session_start updates the root while child sessions keep
+  // using this registered stream.
+  let rootCacheOwnerId: string | undefined;
+  const streamSimple = makeMlxStreamSimple(resolvedHost, performanceStatus.record, () => rootCacheOwnerId);
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
@@ -42,6 +47,9 @@ export function createMlxProviderExtension(models: MlxModelInfo[], host?: MlxMod
         apiKey: 'mlx-local',
         streamSimple,
         models: models.map((m) => m.piModel),
+      });
+      pi.on('session_start', (_event, ctx) => {
+        rootCacheOwnerId = ctx.sessionManager.getSessionId();
       });
       pi.on('message_end', (event, ctx) => {
         performanceStatus.showMessage(event, ctx);

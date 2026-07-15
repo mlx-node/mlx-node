@@ -5,6 +5,7 @@ pub mod config;
 pub mod decoder_layer;
 pub mod gated_delta;
 pub mod gated_delta_net;
+pub(crate) mod gdn_checkpoint_store;
 pub mod int8_gemm;
 pub mod layer_cache;
 pub mod model;

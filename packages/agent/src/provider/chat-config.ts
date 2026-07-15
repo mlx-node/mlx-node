@@ -65,6 +65,7 @@ export function buildChatConfig(
   modelType: ModelType,
   options: SimpleStreamOptions | undefined,
   tools: ToolDefinition[] | undefined,
+  rootCacheOwnerId?: string,
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
@@ -80,6 +81,15 @@ export function buildChatConfig(
     // requested. The provider keeps it transient and only renders it in TUI.
     reportPerformance: true,
   };
+  // Pi assigns one stable id to the root AgentSession and a distinct id to
+  // every in-memory subagent session. Native Qwen3.5 uses this only to retain
+  // GDN sidecars per logical branch; PagedAttention KV blocks remain shared by
+  // their existing exact content hashes.
+  if (options?.sessionId !== undefined) config.cacheOwnerId = options.sessionId;
+  // The active owner above can be a child AgentSession. Keep the current
+  // top-level session identity separate so a /new or /resume rotation updates
+  // which branch the bounded GDN sidecar store protects from child eviction.
+  if (rootCacheOwnerId !== undefined) config.cacheRootOwnerId = rootCacheOwnerId;
   if (options?.maxTokens !== undefined) config.maxNewTokens = options.maxTokens;
   if (options?.temperature !== undefined) config.temperature = options.temperature;
   if (tools && tools.length > 0) config.tools = tools;

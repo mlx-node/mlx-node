@@ -477,6 +477,7 @@ fn chat_turn_core<B: ChatBackend>(
     // report_performance. Everything below reads the RESOLVED params,
     // never raw config.
     let p = backend.resolve_params(&config);
+    backend.set_cache_owner_id(&p.cache_owner_id, p.cache_root_owner_id.as_deref());
     let reuse_cache = p.reuse_cache;
     let report_perf = p.report_performance;
     let max_new_tokens = p.max_new_tokens;

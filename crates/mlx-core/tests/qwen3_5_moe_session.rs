@@ -27,6 +27,8 @@ use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -385,6 +387,8 @@ async fn moe_stream_session_cancellation_preserves_cache_for_next_turn() {
 
     // Turn 1: run a normal session-start stream to prime the cache.
     let turn1_cfg = ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(128),
         ..chat_config_default(128)
     };

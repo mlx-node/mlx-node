@@ -927,6 +927,8 @@ mod tests {
 
         // T=0 greedy params, profiling OFF, no cutoffs, budget MAX_NEW.
         let config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             max_new_tokens: Some(MAX_NEW),
             max_consecutive_tokens: Some(0),
@@ -1074,6 +1076,8 @@ mod tests {
         };
 
         let config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             max_new_tokens: Some(MAX_NEW),
             max_consecutive_tokens: Some(0),
@@ -1208,6 +1212,8 @@ mod tests {
         };
 
         let config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             max_new_tokens: Some(MAX_NEW),
             max_consecutive_tokens: Some(0),
@@ -1470,6 +1476,8 @@ mod tests {
         };
 
         let config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             temperature: Some(0.0),
             max_new_tokens: Some(max_new),
             max_consecutive_tokens: Some(0),

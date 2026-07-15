@@ -247,6 +247,14 @@ pub(crate) fn apply_generation_defaults(cfg: &mut ChatConfig, d: &ModelGeneratio
 /// Extracted chat parameters with defaults applied.
 #[derive(Clone)]
 pub(crate) struct ChatParams {
+    /// Logical owner for model-global auxiliary caches (currently Qwen3.5
+    /// dense/MoE GDN checkpoints). Empty means an unscoped legacy caller.
+    /// Deliberately separate from the paged-attention cache salt so owners can
+    /// still share content-addressed physical KV blocks.
+    pub cache_owner_id: String,
+    /// Explicit interactive root for the bounded multi-owner sidecar policy.
+    /// `None` preserves the legacy single-owner/two-checkpoint behavior.
+    pub cache_root_owner_id: Option<String>,
     pub max_new_tokens: i32,
     pub repetition_penalty: f64,
     pub repetition_context_size: i32,
@@ -379,6 +387,8 @@ pub(crate) fn resolve_include_reasoning(config: &ChatConfig) -> bool {
 /// Extract ChatConfig fields into flat variables with defaults.
 pub(crate) fn extract_chat_params(config: &ChatConfig) -> ChatParams {
     ChatParams {
+        cache_owner_id: config.cache_owner_id.clone().unwrap_or_default(),
+        cache_root_owner_id: config.cache_root_owner_id.clone(),
         // Nonpositive budgets clamp to 0 (AR-equivalent empty completion)
         // so downstream max_kv_len / cache sizing / the decode macro never
         // see a negative budget. This single point feeds qwen3_5
@@ -494,6 +504,8 @@ mod mtp_params_tests {
 
     fn base_config() -> ChatConfig {
         ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             max_new_tokens: None,
             temperature: None,
             top_k: None,
@@ -527,6 +539,20 @@ mod mtp_params_tests {
         let p = extract_chat_params(&cfg);
         assert!(!p.enable_mtp, "enable_mtp must default to false");
         assert_eq!(p.mtp_depth, 1, "mtp_depth must default to 1");
+    }
+
+    #[test]
+    fn cache_owner_defaults_empty_and_preserves_explicit_session_id() {
+        let defaults = extract_chat_params(&base_config());
+        assert_eq!(defaults.cache_owner_id, "");
+        assert_eq!(defaults.cache_root_owner_id, None);
+
+        let mut cfg = base_config();
+        cfg.cache_owner_id = Some("pi-child-42".to_owned());
+        cfg.cache_root_owner_id = Some("pi-root-7".to_owned());
+        let explicit = extract_chat_params(&cfg);
+        assert_eq!(explicit.cache_owner_id, "pi-child-42");
+        assert_eq!(explicit.cache_root_owner_id.as_deref(), Some("pi-root-7"));
     }
 
     /// User override: `enable_mtp=true`, `mtp_depth=2` flows through.

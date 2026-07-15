@@ -633,6 +633,31 @@ describe('makeMlxStreamSimple', () => {
     expect(session.log).toEqual([]); // the host was never engaged
   });
 
+  it('contains a root-owner resolver failure without engaging the host', async () => {
+    let hostCalls = 0;
+    const host: StreamSimpleHost = {
+      modelInfo: () => DISCOVERED,
+      ...dirtyStubs(),
+      runWithResident: () => {
+        hostCalls += 1;
+        return Promise.reject(new Error('must not run'));
+      },
+    };
+    const streamSimple = makeMlxStreamSimple(host, undefined, () => {
+      throw new Error('root resolver failed');
+    });
+
+    let stream!: AssistantMessageEventStream;
+    expect(() => {
+      stream = streamSimple(MODEL, CONTEXT);
+    }).not.toThrow();
+    const events = await collect(stream);
+
+    expect(types(events)).toEqual(['error']);
+    expect(finalMessage(events).errorMessage).toBe('root resolver failed');
+    expect(hostCalls).toBe(0);
+  });
+
   it('falls back to a TurnEmitter-independent terminal when the error defeats coercion (null-prototype)', async () => {
     // String(err) throws for a null-prototype object, which blows up
     // TurnEmitter.onError itself — the failsafe must still terminalize.
@@ -790,6 +815,43 @@ describe('makeMlxStreamSimple', () => {
       'stream-done',
       'fn2-end:qwen-small',
     ]);
+  });
+
+  it('snapshots each root owner before a request waits on the serialized host', async () => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const releaseFirstPromise = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const seenRoots: Array<string | undefined> = [];
+    const session = new FakeChatSession([
+      async function* (config) {
+        seenRoots.push(config?.cacheRootOwnerId);
+        firstStarted();
+        await releaseFirstPromise;
+        yield finalEvent({ text: 'first' });
+      },
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* (config) {
+        seenRoots.push(config?.cacheRootOwnerId);
+        yield finalEvent({ text: 'second' });
+      },
+    ]);
+    let currentRoot = 'root-0';
+    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), undefined, () => currentRoot);
+
+    const first = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'root-0' }));
+    await firstStartedPromise;
+    currentRoot = 'root-1';
+    const second = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'child-1' }));
+    currentRoot = 'root-2';
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(seenRoots).toEqual(['root-0', 'root-1']);
   });
 
   describe('post-error KV recovery (full reset instead of warm reuse)', () => {

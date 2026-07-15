@@ -67,6 +67,14 @@ describe('buildChatConfig', () => {
     expect(buildChatConfig('qwen3_5', undefined, undefined).reportPerformance).toBe(true);
   });
 
+  it('forwards Pi session ownership without changing PagedAttention cache identity', () => {
+    const child = buildChatConfig('qwen3_5', { sessionId: 'child-session-42' }, undefined, 'root-session-7');
+    expect(child.cacheOwnerId).toBe('child-session-42');
+    expect(child.cacheRootOwnerId).toBe('root-session-7');
+    expect(buildChatConfig('qwen3_5', undefined, undefined).cacheOwnerId).toBeUndefined();
+    expect(buildChatConfig('qwen3_5', undefined, undefined).cacheRootOwnerId).toBeUndefined();
+  });
+
   it('gives lfm2_moe the first-class MoE sampler (LFM2.5-8B-A1B card), NOT the dense lfm2 preset', () => {
     const config = buildChatConfig('lfm2_moe', undefined, undefined);
     // Concrete card values — deliberately not compared against

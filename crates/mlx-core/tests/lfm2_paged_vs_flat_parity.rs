@@ -111,6 +111,8 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -173,6 +175,8 @@ fn assistant_message(content: &str) -> ChatMessage {
 /// token-exact (turn-2's prompt strict-extends the persisted history).
 fn budget_force_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         thinking_token_budget: Some(0),
         include_reasoning: Some(true),
         reuse_cache: Some(true),
@@ -763,6 +767,8 @@ async fn lfm2_paged_vs_flat_prefix_reuse_parity() {
 /// the cap on this checkpoint).
 fn memory_probe_chat_config() -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         thinking_token_budget: Some(128),
         ..parity_chat_config(512)
     }

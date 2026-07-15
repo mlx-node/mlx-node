@@ -34,6 +34,10 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
+use super::gdn_checkpoint_store::{
+    GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
+    compute_paged_prefix_block_hash, compute_paged_prefix_block_hashes, prune_gdn_checkpoints,
+};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
 use super::mtp_decode;
@@ -176,6 +180,8 @@ mod paged_context_capacity_tests {
 
     fn make_params(max_new_tokens: i32) -> engine::ChatParams {
         extract_chat_params(&ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             max_new_tokens: Some(max_new_tokens),
             ..ChatConfig::default()
         })
@@ -210,20 +216,36 @@ mod paged_context_capacity_tests {
     }
 }
 
-// A Qwen3.6-27B GDN sidecar retains roughly 75 MiB of recurrent/conv state.
-// Two entries cover the normal linear agent chain plus one recent branch
-// without quietly pinning the ~600 MiB implied by the old opt-in limit of 8.
-const DENSE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 2;
-
 struct DenseGdnPrefixCheckpoint {
+    owner_id: String,
     prefix_len: u32,
     block_size: u32,
     final_block_hash: u64,
+    block_hashes: Vec<u64>,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
 }
 
+impl GdnCheckpointLineage for DenseGdnPrefixCheckpoint {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        &self.block_hashes
+    }
+}
+
 struct DenseGdnHistoryCheckpoint {
+    owner_id: String,
     tokens: Vec<u32>,
     caches: Vec<Qwen3_5LayerCache>,
 }
@@ -333,42 +355,6 @@ fn clone_dense_linear_layer_caches(
     Some(cloned)
 }
 
-fn compute_paged_prefix_block_hash(
-    tokens: &[u32],
-    prefix_len: u32,
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-    cache_salt: u64,
-) -> Option<u64> {
-    if prefix_len == 0 || block_size == 0 || !prefix_len.is_multiple_of(block_size) {
-        return None;
-    }
-
-    let prefix_len = prefix_len as usize;
-    let block_size = block_size as usize;
-    if prefix_len > tokens.len() {
-        return None;
-    }
-
-    let num_blocks = prefix_len / block_size;
-    let mut parent_hash = 0;
-    for block_idx in 0..num_blocks {
-        let extra_keys = extra_keys_per_block.get(block_idx)?;
-        let start = block_idx * block_size;
-        let end = start + block_size;
-        parent_hash = if block_idx == 0 && cache_salt != 0 {
-            let mut salted_keys = Vec::with_capacity(extra_keys.len() + 1);
-            salted_keys.extend_from_slice(extra_keys);
-            salted_keys.push(cache_salt);
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, &salted_keys)
-        } else {
-            mlx_paged_attn::hash_tokens(&tokens[start..end], parent_hash, extra_keys)
-        };
-    }
-
-    Some(parent_hash)
-}
-
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
 /// No `Arc<RwLock<>>` — the model thread has sole ownership of all inference
@@ -389,6 +375,9 @@ pub(crate) struct Qwen35Inner {
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
+    active_cache_owner_id: String,
+    gdn_root_cache_owner_id: Option<String>,
+    gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
@@ -851,6 +840,9 @@ impl Qwen35Inner {
             cached_image_key: None,
             cached_rope_deltas: None,
             model_id,
+            active_cache_owner_id: String::new(),
+            gdn_root_cache_owner_id: None,
+            gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_adapter,
@@ -1033,6 +1025,8 @@ impl Qwen35Inner {
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
         self.gdn_last_history_checkpoint = None;
+        self.gdn_root_cache_owner_id = None;
+        self.gdn_root_cache_owner_is_explicit = false;
     }
 
     fn find_dense_gdn_history_checkpoint(
@@ -1042,7 +1036,9 @@ impl Qwen35Inner {
     ) -> Option<Vec<Qwen3_5LayerCache>> {
         let prefix_tokens = tokens.get(..prefix_len as usize)?;
         let checkpoint = self.gdn_last_history_checkpoint.as_ref()?;
-        if checkpoint.tokens.as_slice() != prefix_tokens {
+        if checkpoint.owner_id != self.active_cache_owner_id
+            || checkpoint.tokens.as_slice() != prefix_tokens
+        {
             return None;
         }
         clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
@@ -1076,14 +1072,18 @@ impl Qwen35Inner {
         trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
 
         let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint { tokens, caches });
+        self.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
+            owner_id: self.active_cache_owner_id.clone(),
+            tokens,
+            caches,
+        });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
     }
 
     fn find_dense_gdn_prefix_checkpoint(
-        &self,
+        &mut self,
         tokens: &[u32],
         requested_prefix_len: u32,
         block_size: u32,
@@ -1098,19 +1098,22 @@ impl Qwen35Inner {
             cache_salt,
         )?;
         let prefix_tokens = tokens.get(..requested_prefix_len as usize)?;
-        let checkpoint = self
-            .gdn_prefix_checkpoints
-            .iter()
-            .rev()
-            .find(|checkpoint| {
-                checkpoint.prefix_len == requested_prefix_len
-                    && checkpoint.block_size == block_size
-                    && checkpoint.final_block_hash == final_block_hash
-                    && checkpoint.tokens.as_slice() == prefix_tokens
-                    && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-            })?;
-        clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
-            .map(|caches| (checkpoint.prefix_len, caches))
+        let checkpoint_idx = self.gdn_prefix_checkpoints.iter().rposition(|checkpoint| {
+            checkpoint.owner_id == self.active_cache_owner_id
+                && checkpoint.prefix_len == requested_prefix_len
+                && checkpoint.block_size == block_size
+                && checkpoint.final_block_hash == final_block_hash
+                && checkpoint.tokens.as_slice() == prefix_tokens
+                && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
+        })?;
+        let checkpoint = &self.gdn_prefix_checkpoints[checkpoint_idx];
+        let prefix_len = checkpoint.prefix_len;
+        let caches = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)?;
+        // Successful lookup is an LRU touch. The model thread serializes all
+        // turns, so moving the owner entry cannot race another request.
+        let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
+        self.gdn_prefix_checkpoints.push_back(checkpoint);
+        Some((prefix_len, caches))
     }
 
     fn remember_dense_gdn_materialized_prefix_checkpoint(
@@ -1125,7 +1128,7 @@ impl Qwen35Inner {
         if !dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
             return false;
         }
-        let Some(final_block_hash) = compute_paged_prefix_block_hash(
+        let Some(block_hashes) = compute_paged_prefix_block_hashes(
             tokens,
             prefix_len,
             block_size,
@@ -1134,28 +1137,51 @@ impl Qwen35Inner {
         ) else {
             return false;
         };
+        let Some(final_block_hash) = block_hashes.last().copied() else {
+            return false;
+        };
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
             return false;
         };
 
         self.gdn_prefix_checkpoints.retain(|existing| {
-            !(existing.prefix_len == prefix_len
+            !(existing.owner_id == self.active_cache_owner_id
+                && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
                 && existing.tokens.as_slice() == prefix_tokens)
         });
         self.gdn_prefix_checkpoints
             .push_back(DenseGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
                 prefix_len,
                 block_size,
                 final_block_hash,
+                block_hashes,
                 tokens: prefix_tokens.to_vec(),
                 caches: checkpoint.caches,
             });
-        while self.gdn_prefix_checkpoints.len() > DENSE_GDN_PREFIX_CHECKPOINT_LIMIT {
-            self.gdn_prefix_checkpoints.pop_front();
-        }
+        self.prune_dense_gdn_prefix_checkpoints();
         true
+    }
+
+    fn prune_dense_gdn_prefix_checkpoints(&mut self) {
+        let active_owner_id = self.active_cache_owner_id.clone();
+        let root_owner_id = self
+            .gdn_root_cache_owner_id
+            .get_or_insert(active_owner_id)
+            .clone();
+        let checkpoint_limit = if self.gdn_root_cache_owner_is_explicit {
+            GDN_PREFIX_CHECKPOINT_LIMIT
+        } else {
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER
+        };
+        prune_gdn_checkpoints(
+            &mut self.gdn_prefix_checkpoints,
+            checkpoint_limit,
+            GDN_PREFIX_CHECKPOINTS_PER_OWNER,
+            &root_owner_id,
+        );
     }
 
     fn publish_dense_gdn_materialized_prefix_checkpoint(
@@ -1188,6 +1214,8 @@ impl Qwen35Inner {
                 event = "gdn_prefix_checkpoint_store",
                 prefix_tokens = prefix_len,
                 block_size,
+                cache_owner_id = %self.active_cache_owner_id,
+                cache_root_owner_id = %self.gdn_root_cache_owner_id.as_deref().unwrap_or(""),
                 stored,
                 retained_checkpoints = self.gdn_prefix_checkpoints.len(),
                 "dense GDN prefix checkpoint stored"
@@ -1208,6 +1236,8 @@ impl Qwen35Inner {
         let inference_info_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
         let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
+        let cache_owner_id = self.active_cache_owner_id.clone();
+        let cache_root_owner_id = self.gdn_root_cache_owner_id.clone().unwrap_or_default();
         let finish = |state: &'static str,
                       restored_prefix_tokens: u32,
                       replayed_prefix_tokens: u32|
@@ -1216,6 +1246,8 @@ impl Qwen35Inner {
                 tracing::info!(
                     target: "mlx_core::inference",
                     event = "gdn_prefix_prepare",
+                    cache_owner_id = %cache_owner_id,
+                    cache_root_owner_id = %cache_root_owner_id,
                     state,
                     cached_prefix_tokens = cached_prefix_len,
                     restored_prefix_tokens,
@@ -8426,6 +8458,18 @@ impl ChatBackend for Qwen35Inner {
         "qwen3_5"
     }
 
+    fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
+        self.active_cache_owner_id.clear();
+        self.active_cache_owner_id.push_str(owner_id);
+        if let Some(root_owner_id) = root_owner_id {
+            self.gdn_root_cache_owner_id = Some(root_owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = true;
+        } else {
+            self.gdn_root_cache_owner_id = Some(owner_id.to_owned());
+            self.gdn_root_cache_owner_is_explicit = false;
+        }
+    }
+
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
         tok.im_end_id()
             .ok_or_else(|| Error::from_reason("Tokenizer missing <|im_end|> special token"))
@@ -11035,6 +11079,63 @@ mod paged_construction_tests {
     }
 
     #[test]
+    fn test_dense_gdn_root_rotation_and_legacy_retention_policy() {
+        fn push_checkpoint(
+            inner: &mut Qwen35Inner,
+            owner_id: &str,
+            root_owner_id: Option<&str>,
+            marker: u32,
+        ) {
+            crate::engine::backend::ChatBackend::set_cache_owner_id(inner, owner_id, root_owner_id);
+            let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
+            inner
+                .gdn_prefix_checkpoints
+                .push_back(DenseGdnPrefixCheckpoint {
+                    owner_id: inner.active_cache_owner_id.clone(),
+                    prefix_len: 16,
+                    block_size: 16,
+                    final_block_hash: marker as u64,
+                    block_hashes: vec![marker as u64],
+                    tokens,
+                    caches: Vec::new(),
+                });
+            inner.prune_dense_gdn_prefix_checkpoints();
+        }
+
+        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+        push_checkpoint(&mut inner, "root-0", Some("root-0"), 1);
+        push_checkpoint(&mut inner, "root-1", Some("root-1"), 2);
+        for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
+            .into_iter()
+            .enumerate()
+        {
+            push_checkpoint(&mut inner, owner, Some("root-1"), 10 + index as u32);
+        }
+        assert_eq!(inner.gdn_root_cache_owner_id.as_deref(), Some("root-1"));
+        assert!(inner.gdn_root_cache_owner_is_explicit);
+        assert_eq!(inner.gdn_prefix_checkpoints.len(), 5);
+        assert!(
+            !inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-0")
+        );
+        assert!(
+            inner
+                .gdn_prefix_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.owner_id == "root-1")
+        );
+
+        let mut legacy = Qwen35Inner::new(tiny_cfg(false)).expect("construct legacy dense model");
+        for marker in 1..=3 {
+            push_checkpoint(&mut legacy, "", None, marker);
+        }
+        assert!(!legacy.gdn_root_cache_owner_is_explicit);
+        assert_eq!(legacy.gdn_prefix_checkpoints.len(), 2);
+    }
+
+    #[test]
     fn test_qwen35_media_plan_requires_complete_paged_vision_stack() {
         for has_encoder in [false, true] {
             for has_processor in [false, true] {
@@ -11071,6 +11172,8 @@ mod paged_construction_tests {
     #[test]
     fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
         let mut config = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(true),
             ..ChatConfig::default()
         };
@@ -11525,6 +11628,14 @@ mod paged_construction_tests {
             0,
             checkpoint,
         ));
+        inner.active_cache_owner_id = "child-session".to_owned();
+        assert!(
+            inner
+                .find_dense_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, 0)
+                .is_none(),
+            "an exact token/hash checkpoint owned by another session must not restore"
+        );
+        inner.active_cache_owner_id.clear();
         let restored = inner
             .find_dense_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, 0)
             .expect("exact checkpoint restore");

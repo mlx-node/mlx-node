@@ -1087,6 +1087,8 @@ pub(crate) mod tests {
 
     pub(crate) fn chat_config(mtp_depth: Option<i32>) -> ChatConfig {
         ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             mtp_depth,
             ..ChatConfig::default()
         }
@@ -1291,6 +1293,8 @@ pub(crate) mod tests {
 
     pub(crate) fn tiny_turn_config(mtp_depth: Option<i32>, max_new_tokens: i32) -> ChatConfig {
         ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             mtp_depth,
             max_new_tokens: Some(max_new_tokens),
             temperature: Some(0.0),
@@ -1609,6 +1613,8 @@ pub(crate) mod tests {
 
         fn cfg(enable_mtp: bool) -> ChatConfig {
             ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 max_new_tokens: Some(64),
                 temperature: Some(0.0),
                 include_reasoning: Some(false),

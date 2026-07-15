@@ -49,6 +49,8 @@ const PREFILL_STEP_SIZE: usize = 2048;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         // Deterministic greedy decoding: temperature=0 collapses sampling
         // to argmax, and top_k=1 + top_p=1.0 keeps only the argmax token.
         // This is what makes the "matches single-shot" assertion meaningful.

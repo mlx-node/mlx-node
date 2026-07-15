@@ -90,6 +90,8 @@ fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
         temperature: Some(0.0),
         top_k: None,
@@ -533,6 +535,8 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     // Turn 1: run a normal session-start stream to prime the cache.
     // Use 128 tokens so cancellation has room to hit mid-stream.
     let turn1_cfg = ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(128),
         ..chat_config_default(128)
     };
@@ -850,6 +854,8 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
 
     // Build a config with an explicit MTP toggle and a given budget.
     let cfg_with = |max_new_tokens: i32, enable_mtp: bool| ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         enable_mtp: Some(enable_mtp),
         ..chat_config_default(max_new_tokens)
     };
@@ -1083,6 +1089,8 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
         .chat_session_start(
             vec![user_message("Count from 1 to 12, space separated.")],
             Some(ChatConfig {
+                cache_owner_id: None,
+                cache_root_owner_id: None,
                 enable_mtp: Some(true),
                 ..chat_config_default(16)
             }),
@@ -1129,6 +1137,8 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
             Turn1Stop::CancelAfter(_) => 64,
         };
         let turn1_cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(enable_mtp),
             include_reasoning: Some(true),
             ..chat_config_default(max_new)
@@ -1168,6 +1178,8 @@ async fn cancel_midcycle_then_continue_mtp_matches_uncancelled() {
 
         // Turn 2: follow-up delta on top of the (possibly desynced) caches.
         let turn2_cfg = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(enable_mtp),
             include_reasoning: Some(true),
             ..chat_config_default(24)
@@ -1317,6 +1329,8 @@ async fn desync_heal_reprefills_to_uncancelled() {
     // identically for the heal and warm arms and cannot distinguish them.
     async fn run(model: &Qwen3_5Model, budget: i32, arm_desync: bool) -> (usize, String, bool) {
         let cfg1 = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(true),
             include_reasoning: Some(true),
             ..chat_config_default(budget)
@@ -1346,6 +1360,8 @@ async fn desync_heal_reprefills_to_uncancelled() {
         }
 
         let cfg2 = ChatConfig {
+            cache_owner_id: None,
+            cache_root_owner_id: None,
             enable_mtp: Some(true),
             include_reasoning: Some(true),
             ..chat_config_default(24)

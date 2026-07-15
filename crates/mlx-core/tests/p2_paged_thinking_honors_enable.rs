@@ -97,6 +97,8 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
 /// thinking (when ON) is not artificially truncated to zero.
 fn chat_config(reasoning_effort: Option<&str>) -> ChatConfig {
     ChatConfig {
+        cache_owner_id: None,
+        cache_root_owner_id: None,
         max_new_tokens: Some(96),
         temperature: Some(0.0),
         top_k: None,
