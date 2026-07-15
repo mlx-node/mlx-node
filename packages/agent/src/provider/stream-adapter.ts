@@ -108,6 +108,37 @@ function publishEffectiveContextWindow(model: Model<Api>, session: ChatSession):
 }
 
 /**
+ * Publish the loaded model's authoritative image capability onto Pi's shared
+ * model object. Discovery stays conservatively text-only; the first resident
+ * load upgrades the same object before Pi executes any tool call emitted by
+ * that inference turn. Return the native truth separately so a hostile/frozen
+ * Pi model object cannot prevent image bytes from reaching the provider.
+ */
+function publishImageCapability(model: Model<Api>, session: ChatSession): boolean {
+  let supportsImages = false;
+  try {
+    supportsImages = session.supportsImages();
+  } catch {
+    return false;
+  }
+
+  try {
+    const advertisesImages = model.input.includes('image');
+    if (supportsImages && !advertisesImages) {
+      model.input = [...model.input, 'image'];
+    } else if (!supportsImages && advertisesImages) {
+      // Pi reuses model objects across resident swaps. Reconcile a stale
+      // positive capability without disturbing any other inputs or their
+      // order, so its tools do not return image blocks to a text-only model.
+      model.input = model.input.filter((input) => input !== 'image');
+    }
+  } catch {
+    // Native capability remains authoritative for this turn's conversion.
+  }
+  return supportsImages;
+}
+
+/**
  * Minimal terminal `AssistantMessage` for the TurnEmitter-independent
  * failsafe path. Every field read is guarded — this must stay
  * constructible even when the `Model` object itself is hostile (it may be
@@ -246,6 +277,7 @@ export function makeMlxStreamSimple(
         // session work (no warm-reset, no prime, no stream).
         if (terminated) return;
         publishEffectiveContextWindow(model, session);
+        const supportsImages = publishImageCapability(model, session);
         const discovered = host.modelInfo(model.id);
         if (!discovered) {
           throw new Error(`mlx streamSimple: no discovery record for model "${model.id}"`);
@@ -267,7 +299,7 @@ export function makeMlxStreamSimple(
         }
         if (terminated) return;
         try {
-          session.primeHistory(contextToChatMessages(context));
+          session.primeHistory(contextToChatMessages(context, supportsImages));
           const config = buildChatConfig(
             discovered.modelType,
             options,

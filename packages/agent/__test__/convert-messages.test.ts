@@ -87,7 +87,7 @@ describe('contextToChatMessages', () => {
     expect(converted).toEqual([{ role: 'user', content: 'hi' }]);
   });
 
-  it('replaces image parts with [image omitted] placeholder lines', () => {
+  it('replaces image parts with [image omitted] placeholder lines for text-only models', () => {
     const context: Context = {
       messages: [
         userMsg([
@@ -105,6 +105,177 @@ describe('contextToChatMessages', () => {
     const [user, , tool] = contextToChatMessages(context);
     expect(user!.content).toBe('What is in this picture?\n[image omitted]');
     expect(tool!.content).toBe('[image omitted]\ncaptured');
+    expect(user!.images).toBeUndefined();
+    expect(tool!.images).toBeUndefined();
+  });
+
+  it('keeps user images direct and moves tool-result images to a synthetic user message', () => {
+    const context: Context = {
+      messages: [
+        userMsg([
+          { type: 'text', text: 'What is in this picture?' },
+          { type: 'image', data: 'aGk=', mimeType: 'image/png' },
+          { type: 'text', text: 'Be concise.' },
+        ]),
+        assistantMsg([{ type: 'toolCall', id: 'call_1', name: 'screenshot', arguments: {} }], 'toolUse'),
+        toolResultMsg('call_1', [
+          { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          { type: 'text', text: 'captured' },
+          { type: 'image', data: 'BAU=', mimeType: 'image/jpeg' },
+        ]),
+      ],
+    };
+
+    const [user, , tool, toolImages] = contextToChatMessages(context, true);
+    expect(user).toMatchObject({ role: 'user', content: 'What is in this picture?\nBe concise.' });
+    expect(user!.images?.map((image) => [...image])).toEqual([[104, 105]]);
+    expect(tool).toMatchObject({ role: 'tool', content: 'captured', toolCallId: 'call_1', isError: false });
+    expect(tool!.images).toBeUndefined();
+    expect(toolImages).toMatchObject({ role: 'user', content: 'Attached image(s) from tool result:' });
+    expect(toolImages!.images?.map((image) => [...image])).toEqual([
+      [1, 2, 3],
+      [4, 5],
+    ]);
+  });
+
+  it('groups consecutive tool-result images after all parallel textual results', () => {
+    const converted = contextToChatMessages(
+      {
+        messages: [
+          assistantMsg(
+            [
+              { type: 'toolCall', id: 'call_1', name: 'read_first', arguments: {} },
+              { type: 'toolCall', id: 'call_2', name: 'read_second', arguments: {} },
+            ],
+            'toolUse',
+          ),
+          toolResultMsg('call_1', [
+            { type: 'image', data: 'AQ==', mimeType: 'image/png' },
+            { type: 'image', data: 'Ag==', mimeType: 'image/png' },
+          ]),
+          toolResultMsg(
+            'call_2',
+            [
+              { type: 'text', text: 'second result' },
+              { type: 'image', data: 'Aw==', mimeType: 'image/jpeg' },
+            ],
+            true,
+          ),
+        ],
+      },
+      true,
+    );
+
+    expect(converted).toHaveLength(4);
+    expect(converted[0]).toMatchObject({ role: 'assistant' });
+    expect(converted[1]).toEqual({
+      role: 'tool',
+      content: '(see attached image)',
+      toolCallId: 'call_1',
+      isError: false,
+    });
+    expect(converted[2]).toEqual({
+      role: 'tool',
+      content: 'second result',
+      toolCallId: 'call_2',
+      isError: true,
+    });
+    expect(converted[3]).toMatchObject({ role: 'user', content: 'Attached image(s) from tool result:' });
+    expect(converted[3]!.images?.map((image) => [...image])).toEqual([[1], [2], [3]]);
+  });
+
+  it('repairs a missing sibling tool result before the grouped image user turn', () => {
+    const converted = contextToChatMessages(
+      {
+        messages: [
+          assistantMsg(
+            [
+              { type: 'toolCall', id: 'call_1', name: 'read_first', arguments: {} },
+              { type: 'toolCall', id: 'call_2', name: 'read_second', arguments: {} },
+            ],
+            'toolUse',
+          ),
+          toolResultMsg('call_1', [{ type: 'image', data: 'AQ==', mimeType: 'image/png' }]),
+          userMsg('continue'),
+        ],
+      },
+      true,
+    );
+
+    expect(converted.slice(1)).toEqual([
+      { role: 'tool', content: '(see attached image)', toolCallId: 'call_1', isError: false },
+      { role: 'tool', content: 'No result provided', toolCallId: 'call_2', isError: true },
+      {
+        role: 'user',
+        content: 'Attached image(s) from tool result:',
+        images: [Buffer.from([1])],
+      },
+      { role: 'user', content: 'continue' },
+    ]);
+  });
+
+  it("strips Pi's stale non-vision note from an image-bearing tool result", () => {
+    const note = '[Current model does not support images. The image will be omitted from this request.]';
+    const converted = contextToChatMessages(
+      {
+        messages: [
+          toolResultMsg('call_image', [
+            { type: 'text', text: `Read image file [image/png]\n${note}` },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ]),
+          userMsg([{ type: 'text', text: `Literal text without an image:\n${note}` }]),
+        ],
+      },
+      true,
+    );
+
+    expect(converted[0]).toMatchObject({ role: 'tool', content: 'Read image file [image/png]' });
+    expect(converted[0]!.images).toBeUndefined();
+    expect(converted[1]).toMatchObject({ role: 'user', content: 'Attached image(s) from tool result:' });
+    expect(converted[1]!.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
+    expect(converted[2]?.content).toBe(`Literal text without an image:\n${note}`);
+  });
+
+  it("strips Pi's stale non-vision note from a failed text-only image tool result", () => {
+    const note = '[Current model does not support images. The image will be omitted from this request.]';
+    const processingFailure = '[Image omitted: Failed to process image bytes]';
+    const converted = contextToChatMessages(
+      {
+        messages: [
+          toolResultMsg('call_failed_image', [
+            { type: 'text', text: `Read image file [image/png]\n${processingFailure}\n${note}` },
+          ]),
+        ],
+      },
+      true,
+    );
+
+    expect(converted).toEqual([
+      {
+        role: 'tool',
+        content: `Read image file [image/png]\n${processingFailure}`,
+        toolCallId: 'call_failed_image',
+        isError: false,
+      },
+    ]);
+  });
+
+  it("preserves Pi's non-vision note when it is literal direct-user text beside an image", () => {
+    const note = '[Current model does not support images. The image will be omitted from this request.]';
+    const converted = contextToChatMessages(
+      {
+        messages: [
+          userMsg([
+            { type: 'text', text: `Do not rewrite this literal line:\n${note}` },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ]),
+        ],
+      },
+      true,
+    );
+
+    expect(converted[0]?.content).toBe(`Do not rewrite this literal line:\n${note}`);
+    expect(converted[0]!.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
   });
 
   it('joins multiple user text parts with newlines', () => {

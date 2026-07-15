@@ -1245,6 +1245,14 @@ export declare class Qwen35Model {
    */
   hasMtpWeights(): boolean;
   /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a `config.json`
+   * family guess: it requires a loaded vision encoder, image processor,
+   * and the block-paged KV adapter used by the dense vision path.
+   */
+  supportsImages(): boolean;
+  /**
    * Synchronous snapshot used by higher layers to preflight rendered
    * prompts and clamp output before native cache allocation.
    */
@@ -1393,6 +1401,14 @@ export declare class Qwen35MoeModel {
    * the per-request `enableMtp` flag.
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether this loaded model instance can execute image-bearing turns.
+   *
+   * This is an authoritative load-time snapshot, not a model-family guess:
+   * it requires the loaded vision encoder, image processor, and block-paged
+   * KV adapter used by the MoE vision path.
+   */
+  supportsImages(): boolean;
   /** Synchronous active-context snapshot shared with the dense wrapper. */
   contextLimits(): Qwen35ContextLimits;
   /** Load a pretrained model from a directory. */

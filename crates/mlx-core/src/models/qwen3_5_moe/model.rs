@@ -295,12 +295,21 @@ pub(crate) struct Qwen35MoeInner {
 /// Build the MoE media admission contract from this loaded family's own
 /// components. Image execution needs the encoder, processor, and paged KV
 /// adapter; incomplete stacks still enter the backend for its precise error.
+pub(crate) const fn qwen35_moe_vision_active(
+    has_vision_encoder: bool,
+    has_image_processor: bool,
+    has_paged_adapter: bool,
+) -> bool {
+    has_vision_encoder && has_image_processor && has_paged_adapter
+}
+
 const fn qwen35_moe_media_plan(
     has_vision_encoder: bool,
     has_image_processor: bool,
     has_paged_adapter: bool,
 ) -> MediaPlan {
-    let images_available = has_vision_encoder && has_image_processor && has_paged_adapter;
+    let images_available =
+        qwen35_moe_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
     MediaPlan::with_backend_validation(
         MediaCapabilities {
             images: images_available,
@@ -7673,6 +7682,12 @@ pub struct Qwen3_5MoeModel {
     /// `enableMtp = true` for checkpoints that ship an MTP head without
     /// round-tripping through the model thread.
     pub(crate) mtp_active: bool,
+    /// Snapshot of the fully loaded image execution stack. `true` only when
+    /// the vision encoder and image processor were both installed and the
+    /// block-paged adapter required by MoE image turns is active. This must be
+    /// derived from loaded components rather than `vision_config`, because
+    /// sym8 deliberately strips its incompatible vision tower.
+    pub(crate) vision_active: bool,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
@@ -7711,6 +7726,16 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
+    }
+
+    /// Whether this loaded model instance can execute image-bearing turns.
+    ///
+    /// This is an authoritative load-time snapshot, not a model-family guess:
+    /// it requires the loaded vision encoder, image processor, and block-paged
+    /// KV adapter used by the MoE vision path.
+    #[napi]
+    pub fn supports_images(&self) -> bool {
+        self.vision_active
     }
 
     /// Synchronous active-context snapshot shared with the dense wrapper.

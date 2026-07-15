@@ -151,3 +151,41 @@ impl Qwen35VLImageProcessor {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ImageProcessorConfig, Qwen35VLImageProcessor};
+    use crate::models::gemma4::image_processor::Gemma4ImageProcessor;
+
+    // Valid 1x1 GIF89a image with a two-entry global color table.
+    const ONE_PIXEL_GIF: &[u8] = &[
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+    ];
+
+    #[test]
+    fn qwen35_and_gemma4_processors_accept_gif_bytes() {
+        let qwen = Qwen35VLImageProcessor::new(Some(ImageProcessorConfig {
+            min_pixels: 16 * 16,
+            max_pixels: 16 * 16,
+            patch_size: 16,
+            temporal_patch_size: 2,
+            merge_size: 1,
+            image_mean: vec![0.5; 3],
+            image_std: vec![0.5; 3],
+            do_rescale: true,
+            do_normalize: true,
+        }));
+        let qwen_image = qwen
+            .process_bytes(ONE_PIXEL_GIF)
+            .expect("Qwen3.5 GIF decode");
+        assert_eq!(qwen_image.image_grid_thw(), vec![1, 1, 1]);
+
+        let gemma = Gemma4ImageProcessor::new(1, 1, 1);
+        let gemma_image = gemma
+            .process_bytes(ONE_PIXEL_GIF)
+            .expect("Gemma4 GIF decode");
+        assert_eq!(gemma_image.num_soft_tokens, 1);
+    }
+}

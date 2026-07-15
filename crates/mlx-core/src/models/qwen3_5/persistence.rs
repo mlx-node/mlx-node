@@ -1830,6 +1830,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let vision_active = super::model::qwen35_dense_vision_active(
+                inner.vision_encoder.is_some(),
+                inner.image_processor.is_some(),
+                paged_active,
+            );
             let context_limits =
                 super::model::Qwen3_5ContextLimits::from_tuple(inner.paged_context_limits());
 
@@ -1843,6 +1848,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    vision_active,
                     context_limits,
                 ),
             ))
@@ -1858,6 +1864,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         cache_limit_guard,
         paged_active,
         mtp_active,
+        vision_active,
         context_limits,
     ) = init_rx
         .await
@@ -1868,6 +1875,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         config,
         paged_active,
         mtp_active,
+        vision_active,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
@@ -2083,19 +2091,21 @@ pub(crate) fn load_vision_weights(
 
     let get_opt = |key: &str| -> Option<&MxArray> { params.get(key) };
 
-    // Patch embedding: handle both 4D Conv2d [out, kH, kW, in] and
-    // 5D Conv3d [out, kD, kH, kW, in] formats. For Conv3d, the static frame is
-    // duplicated across the temporal axis, so the effective 2D kernel is the
-    // sum of the temporal slices (not a single slice).
-    if let Some(pe_weight) = get_opt("patch_embed.proj.weight") {
-        let pe_bias = get_opt("patch_embed.proj.bias");
-        let ndim = pe_weight.ndim()?;
-        if ndim == 5 {
-            let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
-            encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
-        } else {
-            encoder.set_patch_embed(pe_weight, pe_bias)?;
-        }
+    // Patch embedding is the required load anchor: the encoder constructor
+    // starts with a zero-valued placeholder, so silently accepting a missing
+    // projection would install an image-blind tower. Check the already
+    // normalized key used by both dense and MoE loaders. Keep both supported
+    // checkpoint layouts: 4D Conv2d [out, kH, kW, in] and 5D Conv3d
+    // [out, kD, kH, kW, in]. For Conv3d, the static frame is duplicated across
+    // the temporal axis, so the effective 2D kernel is the sum of its slices.
+    let pe_weight = get("patch_embed.proj.weight")?;
+    let pe_bias = get_opt("patch_embed.proj.bias");
+    let ndim = pe_weight.ndim()?;
+    if ndim == 5 {
+        let conv2d_weight = collapse_patch_embed_conv3d(pe_weight)?;
+        encoder.set_patch_embed(&conv2d_weight, pe_bias)?;
+    } else {
+        encoder.set_patch_embed(pe_weight, pe_bias)?;
     }
 
     // Position embedding
@@ -2332,6 +2342,49 @@ mod tests {
                 (g - e).abs() < 1e-5,
                 "element {i}: collapsed {g} != slice0+slice1 {e}"
             );
+        }
+    }
+
+    #[test]
+    fn vision_patch_embed_anchor_is_required_and_accepts_4d_or_5d() {
+        let config = Qwen3_5VisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_heads: 1,
+            num_layers: 0,
+            patch_size: 1,
+            spatial_merge_size: 1,
+            image_size: 1,
+            out_hidden_size: 4,
+        };
+        let mut missing_encoder =
+            Qwen3_5VisionEncoder::new(config.clone()).expect("construct tiny vision encoder");
+        let err = load_vision_weights(&mut missing_encoder, &HashMap::new(), &config)
+            .expect_err("a partial vision tower must not retain the zero patch projection");
+        assert_eq!(
+            err.reason, "Missing vision weight: patch_embed.proj.weight",
+            "the required anchor uses the normalized vision key"
+        );
+
+        let array = |shape: &[i64]| {
+            let len = shape.iter().map(|dim| *dim as usize).product();
+            MxArray::from_float32(&vec![0.0; len], shape).expect("construct tiny vision weight")
+        };
+        let patch_shapes: [&[i64]; 2] = [&[4, 1, 1, 3], &[4, 2, 1, 1, 3]];
+        for patch_shape in patch_shapes {
+            let mut params = HashMap::new();
+            params.insert("patch_embed.proj.weight".to_string(), array(patch_shape));
+            params.insert("merger.norm.weight".to_string(), array(&[4]));
+            params.insert("merger.norm.bias".to_string(), array(&[4]));
+            params.insert("merger.linear_fc1.weight".to_string(), array(&[4, 4]));
+            params.insert("merger.linear_fc1.bias".to_string(), array(&[4]));
+            params.insert("merger.linear_fc2.weight".to_string(), array(&[4, 4]));
+            params.insert("merger.linear_fc2.bias".to_string(), array(&[4]));
+
+            let mut encoder =
+                Qwen3_5VisionEncoder::new(config.clone()).expect("construct tiny vision encoder");
+            load_vision_weights(&mut encoder, &params, &config)
+                .unwrap_or_else(|err| panic!("{patch_shape:?} patch anchor must load: {err}"));
         }
     }
 

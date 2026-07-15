@@ -34,7 +34,7 @@ regex = "1.11"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
 rust_xlsxwriter = "0.95.0"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # NAPI-RS

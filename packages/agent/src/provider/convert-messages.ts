@@ -12,20 +12,79 @@ import type { Context, ImageContent, Message, TextContent, Tool } from '@earendi
 import type { ChatMessage, ToolDefinition } from '@mlx-node/lm';
 
 const IMAGE_PLACEHOLDER = '[image omitted]';
+const PI_NON_VISION_IMAGE_NOTE =
+  '[Current model does not support images. The image will be omitted from this request.]';
+const TOOL_RESULT_IMAGE_PLACEHOLDER = '(see attached image)';
+const TOOL_RESULT_IMAGE_PROMPT = 'Attached image(s) from tool result:';
 
-function joinParts(parts: ReadonlyArray<TextContent | ImageContent>): string {
-  return parts.map((part) => (part.type === 'image' ? IMAGE_PLACEHOLDER : part.text)).join('\n');
+interface ConvertedParts {
+  content: string;
+  images?: Uint8Array[];
+}
+
+interface ConvertedMessage {
+  message: ChatMessage;
+  toolResultImages?: Uint8Array[];
+}
+
+/**
+ * Convert Pi's mixed text/image blocks into the native message shape.
+ *
+ * Text-only models retain the historical byte-stable placeholder rendering.
+ * Image-capable models keep text order and image order independently — the
+ * most ordering the native `ChatMessage { content, images }` shape can express
+ * — while decoding Pi's base64 payloads into the bytes consumed by NAPI.
+ */
+function convertParts(
+  parts: ReadonlyArray<TextContent | ImageContent>,
+  supportsImages: boolean,
+  stripStaleToolImageNote = false,
+): ConvertedParts {
+  if (!supportsImages) {
+    return {
+      content: parts.map((part) => (part.type === 'image' ? IMAGE_PLACEHOLDER : part.text)).join('\n'),
+    };
+  }
+
+  const text: string[] = [];
+  const images: Uint8Array[] = [];
+  for (const part of parts) {
+    if (part.type === 'image') {
+      images.push(Buffer.from(part.data, 'base64'));
+    } else {
+      // Pi added this exact standalone line to image tool results before the
+      // loaded native capability could be published. A resumed pre-fix history
+      // still contains it; replaying the warning contradicts the now-loaded
+      // capability even when image processing failed before producing bytes.
+      // Scope cleanup to tool results: identical direct-user text is literal.
+      text.push(
+        stripStaleToolImageNote
+          ? part.text
+              .split('\n')
+              .filter((line) => line !== PI_NON_VISION_IMAGE_NOTE)
+              .join('\n')
+          : part.text,
+      );
+    }
+  }
+  return {
+    content: text.join('\n'),
+    ...(images.length > 0 ? { images } : {}),
+  };
 }
 
 /** Per-message conversion (byte-stable joins). Never drops — the drop / orphan
- * repair lives in {@link contextToChatMessages}, mirroring pi's transformMessages. */
-function convertMessage(message: Message): ChatMessage {
+ * repair and grouped tool-result image turn live in
+ * {@link contextToChatMessages}, mirroring pi's transformMessages and OpenAI
+ * provider conversion. */
+function convertMessage(message: Message, supportsImages: boolean): ConvertedMessage {
   switch (message.role) {
-    case 'user':
-      return {
-        role: 'user',
-        content: typeof message.content === 'string' ? message.content : joinParts(message.content),
-      };
+    case 'user': {
+      if (typeof message.content === 'string') {
+        return { message: { role: 'user', content: message.content } };
+      }
+      return { message: { role: 'user', ...convertParts(message.content, supportsImages) } };
+    }
     case 'assistant': {
       // Thinking blocks are dropped: the native chat template re-renders
       // reasoning through its own <think> handling, and replayed thinking
@@ -39,15 +98,26 @@ function convertMessage(message: Message): ChatMessage {
         .map((part) => ({ id: part.id, name: part.name, arguments: JSON.stringify(part.arguments) }));
       const converted: ChatMessage = { role: 'assistant', content: text };
       if (toolCalls.length > 0) converted.toolCalls = toolCalls;
-      return converted;
+      return { message: converted };
     }
-    case 'toolResult':
+    case 'toolResult': {
+      const converted = convertParts(message.content, supportsImages, true);
+      const images = converted.images ?? [];
       return {
-        role: 'tool',
-        content: joinParts(message.content),
-        toolCallId: message.toolCallId,
-        isError: message.isError,
+        message: {
+          role: 'tool',
+          content:
+            converted.content.length > 0
+              ? converted.content
+              : images.length > 0
+                ? TOOL_RESULT_IMAGE_PLACEHOLDER
+                : converted.content,
+          toolCallId: message.toolCallId,
+          isError: message.isError,
+        },
+        ...(images.length > 0 ? { toolResultImages: images } : {}),
       };
+    }
   }
 }
 
@@ -56,7 +126,13 @@ function convertMessage(message: Message): ChatMessage {
  * `ChatSession.primeHistory()`.
  *
  * - `systemPrompt` becomes the leading `system` message.
- * - Image parts become literal `[image omitted]` lines (v1 — no VLM plumbing).
+ * - For text-only models (the default), image parts become literal
+ *   `[image omitted]` lines.
+ * - For an image-capable loaded model, user images stay on their native user
+ *   message. Images from a consecutive tool-result run are decoded, collected
+ *   in source order, and emitted on one synthetic user message after every
+ *   textual tool message in that run. This mirrors pi's OpenAI conversion and
+ *   avoids templates that ignore images attached to the `tool` role.
  *
  * Two-pass mirror of pi's canonical `transformMessages` (pi-ai
  * `dist/api/transform-messages.js`). That transform normally sanitizes the
@@ -81,7 +157,7 @@ function convertMessage(message: Message): ChatMessage {
  * untouched, so the byte-stable joins that keep the replayed KV prefix stable
  * are preserved.
  */
-export function contextToChatMessages(context: Context): ChatMessage[] {
+export function contextToChatMessages(context: Context, supportsImages = false): ChatMessage[] {
   const messages: ChatMessage[] = [];
   if (context.systemPrompt) {
     messages.push({ role: 'system', content: context.systemPrompt });
@@ -91,6 +167,7 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
   // recent RETAINED assistant, and the result ids seen since.
   let pendingToolCallIds: string[] = [];
   let seenToolResultIds = new Set<string>();
+  let pendingToolResultImages: Uint8Array[] = [];
 
   const flushOrphans = (): void => {
     if (pendingToolCallIds.length === 0) return;
@@ -103,18 +180,36 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
     seenToolResultIds = new Set();
   };
 
+  const flushToolResultImages = (): void => {
+    if (pendingToolResultImages.length === 0) return;
+    messages.push({
+      role: 'user',
+      content: TOOL_RESULT_IMAGE_PROMPT,
+      images: pendingToolResultImages,
+    });
+    pendingToolResultImages = [];
+  };
+
+  const flushToolResultBoundary = (): void => {
+    // A grouped image attachment is logically a user turn. Repair any missing
+    // sibling tool result before that boundary, then append the single image
+    // turn after every real/synthetic tool result.
+    flushOrphans();
+    flushToolResultImages();
+  };
+
   for (const message of context.messages) {
     switch (message.role) {
       case 'user':
-        flushOrphans();
-        messages.push(convertMessage(message));
+        flushToolResultBoundary();
+        messages.push(convertMessage(message, supportsImages).message);
         break;
       case 'assistant': {
-        flushOrphans();
+        flushToolResultBoundary();
         if (message.stopReason === 'error' || message.stopReason === 'aborted') {
           break; // dropped: not primed, and its tool calls are NOT tracked
         }
-        const converted = convertMessage(message);
+        const converted = convertMessage(message, supportsImages).message;
         messages.push(converted);
         if (converted.toolCalls && converted.toolCalls.length > 0) {
           // Native ToolCall.id is optional; only ids can be matched against a
@@ -124,13 +219,18 @@ export function contextToChatMessages(context: Context): ChatMessage[] {
         }
         break;
       }
-      case 'toolResult':
+      case 'toolResult': {
         seenToolResultIds.add(message.toolCallId);
-        messages.push(convertMessage(message));
+        const converted = convertMessage(message, supportsImages);
+        messages.push(converted.message);
+        if (converted.toolResultImages) {
+          pendingToolResultImages.push(...converted.toolResultImages);
+        }
         break;
+      }
     }
   }
-  flushOrphans();
+  flushToolResultBoundary();
   return messages;
 }
 

@@ -85,6 +85,8 @@ class FakeChatSession {
   resetCalls = 0;
   /** When set, `reset()` throws (post-error reset failure → resident invalidation). */
   resetShouldThrow = false;
+  /** Authoritative loaded-model media capability exposed through ChatSession. */
+  imageSupport = false;
 
   constructor(
     private readonly scripts: Script[],
@@ -94,6 +96,10 @@ class FakeChatSession {
 
   contextLimits(): SessionContextLimits | undefined {
     return this.limits;
+  }
+
+  supportsImages(): boolean {
+    return this.imageSupport;
   }
 
   /**
@@ -244,6 +250,125 @@ describe('makeMlxStreamSimple', () => {
 
     expect(sharedModel.contextWindow).toBe(12288);
     expect(sharedModel.maxTokens).toBe(12288);
+  });
+
+  it('publishes image capability and primes user/tool images with template-safe roles', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    session.imageSupport = true;
+    const sharedModel: Model<Api> = { ...MODEL, input: [...MODEL.input] };
+    const priorAssistant: AssistantMessage = {
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: 'call_image', name: 'read', arguments: {} }],
+      api: 'mlx',
+      provider: 'mlx',
+      model: 'qwen-small',
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'toolUse',
+      timestamp: 2,
+    };
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this.' },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ],
+          timestamp: 1,
+        },
+        priorAssistant,
+        {
+          role: 'toolResult',
+          toolCallId: 'call_image',
+          toolName: 'read',
+          content: [{ type: 'image', data: 'BAU=', mimeType: 'image/png' }],
+          isError: false,
+          timestamp: 3,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
+
+    expect(sharedModel.input).toEqual(['text', 'image']);
+    expect(session.primedWith).toHaveLength(4);
+    expect(session.primedWith?.[0]).toMatchObject({ role: 'user', content: 'Describe this.' });
+    expect(session.primedWith?.[0]?.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
+    expect(session.primedWith?.[2]).toEqual({
+      role: 'tool',
+      content: '(see attached image)',
+      toolCallId: 'call_image',
+      isError: false,
+    });
+    expect(session.primedWith?.[3]).toMatchObject({
+      role: 'user',
+      content: 'Attached image(s) from tool result:',
+    });
+    expect(session.primedWith?.[3]?.images?.map((image) => [...image])).toEqual([[4, 5]]);
+  });
+
+  it('removes a stale image advertisement when the loaded session is text-only', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const sharedModel: Model<Api> = { ...MODEL, input: ['text', 'image'] };
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this.' },
+            { type: 'image', data: 'AQID', mimeType: 'image/png' },
+          ],
+          timestamp: 1,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(sharedModel, imageContext));
+
+    expect(sharedModel.input).toEqual(['text']);
+    expect(session.primedWith).toEqual([{ role: 'user', content: 'Describe this.\n[image omitted]' }]);
+  });
+
+  it('contains frozen image metadata while retaining authoritative native conversion', async () => {
+    const session = new FakeChatSession([
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    session.imageSupport = true;
+    const frozenModel = Object.freeze({ ...MODEL, input: Object.freeze(['text']) }) as unknown as Model<Api>;
+    const imageContext: Context = {
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', data: 'AQID', mimeType: 'image/png' }],
+          timestamp: 1,
+        },
+      ],
+    };
+
+    await collect(makeMlxStreamSimple(makeFakeHost(session))(frozenModel, imageContext));
+
+    expect(frozenModel.input).toEqual(['text']);
+    expect(session.primedWith?.[0]?.images?.map((image) => [...image])).toEqual([[1, 2, 3]]);
   });
 
   it('streams a happy text turn in order with stopReason stop', async () => {

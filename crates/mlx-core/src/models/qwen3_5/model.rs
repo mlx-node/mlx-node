@@ -460,12 +460,21 @@ pub(crate) struct Qwen35Inner {
 /// Image execution needs all three pieces. Missing combinations remain
 /// backend-validated so the family core preserves its established diagnostic
 /// instead of the engine replacing it with a generic unsupported-media error.
+pub(crate) const fn qwen35_dense_vision_active(
+    has_vision_encoder: bool,
+    has_image_processor: bool,
+    has_paged_adapter: bool,
+) -> bool {
+    has_vision_encoder && has_image_processor && has_paged_adapter
+}
+
 const fn qwen35_dense_media_plan(
     has_vision_encoder: bool,
     has_image_processor: bool,
     has_paged_adapter: bool,
 ) -> MediaPlan {
-    let images_available = has_vision_encoder && has_image_processor && has_paged_adapter;
+    let images_available =
+        qwen35_dense_vision_active(has_vision_encoder, has_image_processor, has_paged_adapter);
     MediaPlan::with_backend_validation(
         MediaCapabilities {
             images: images_available,
@@ -8894,6 +8903,13 @@ pub struct Qwen3_5Model {
     /// auto-default `enableMtp = true` for checkpoints that ship an MTP
     /// head without round-tripping through the model thread.
     pub(crate) mtp_active: bool,
+    /// Snapshot of the fully loaded image execution stack. `true` only when
+    /// the vision encoder and image processor were both installed and the
+    /// block-paged adapter required by the Qwen3.5 vision core is active.
+    /// Config metadata alone is insufficient: sym8 checkpoints can retain a
+    /// `vision_config` while deliberately dropping the incompatible vision
+    /// weights at load time.
+    pub(crate) vision_active: bool,
     pub(crate) context_limits: Qwen3_5ContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
@@ -8932,6 +8948,16 @@ impl Qwen3_5Model {
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
+    }
+
+    /// Whether this loaded model instance can execute image-bearing turns.
+    ///
+    /// This is an authoritative load-time snapshot, not a `config.json`
+    /// family guess: it requires a loaded vision encoder, image processor,
+    /// and the block-paged KV adapter used by the dense vision path.
+    #[napi]
+    pub fn supports_images(&self) -> bool {
+        self.vision_active
     }
 
     /// Synchronous snapshot used by higher layers to preflight rendered

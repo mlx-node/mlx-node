@@ -44,6 +44,15 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
+  it('forwards the loaded model image capability through ChatSession', async () => {
+    const loader = vi.fn(async () => ({ supportsImages: () => true }) as unknown as LoadableModel);
+    const host = new MlxModelHost(MODELS, { loadModelFn: loader });
+
+    const session = await getSession(host, 'qwen-small');
+
+    expect(session.supportsImages()).toBe(true);
+  });
+
   it('resolves the model path inside the serialized load before invoking the loader', async () => {
     const events: string[] = [];
     const resolveModelPathFn = vi.fn(async (model: DiscoveredModelLike) => {
@@ -88,10 +97,10 @@ describe('MlxModelHost', () => {
           hasMtpWeights: () => true,
         }) as unknown as LoadableModel,
     );
-    const host = new MlxModelHost(
-      [{ name: 'qwen-moe-mtp', path: '/models/qwen-moe-mtp', modelType: 'qwen3_5_moe' }],
-      { loadModelFn: loader, requirePagedCache: true },
-    );
+    const host = new MlxModelHost([{ name: 'qwen-moe-mtp', path: '/models/qwen-moe-mtp', modelType: 'qwen3_5_moe' }], {
+      loadModelFn: loader,
+      requirePagedCache: true,
+    });
 
     await expect(getSession(host, 'qwen-moe-mtp')).rejects.toThrow(
       /cannot combine MTP with PagedAttention.*refusing to silently downgrade/s,

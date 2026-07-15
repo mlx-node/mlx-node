@@ -277,6 +277,15 @@ export interface SessionCapableModel {
    * Qwen3.5 dense/MoE expose this when adaptive paged-cache sizing is active.
    */
   contextLimits?(): SessionContextLimits;
+  /**
+   * Whether this loaded model instance has a complete image-input path.
+   *
+   * Optional so text-only and older wrappers continue to satisfy the
+   * structural contract. Supporting native wrappers snapshot this value after
+   * load, once the vision encoder/processor and any required cache backend are
+   * known to be available.
+   */
+  supportsImages?(): boolean;
   chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
   chatSessionContinue(
     userMessage: string,
@@ -652,6 +661,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /** Load-time physical context snapshot, when exposed by the model. */
   contextLimits(): SessionContextLimits | undefined {
     return this.model.contextLimits?.();
+  }
+
+  /** Authoritative image-input capability of the loaded native model. */
+  supportsImages(): boolean {
+    return this.model.supportsImages?.() === true;
   }
 
   /**

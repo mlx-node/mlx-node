@@ -1681,6 +1681,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
             let mtp_active = inner.has_mtp_weights();
+            let vision_active = super::model::qwen35_moe_vision_active(
+                inner.vision_encoder.is_some(),
+                inner.image_processor.is_some(),
+                paged_active,
+            );
             let context_limits = crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_tuple(
                 inner.paged_context_limits(),
             );
@@ -1695,6 +1700,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     cache_limit_guard,
                     paged_active,
                     mtp_active,
+                    vision_active,
                     context_limits,
                 ),
             ))
@@ -1710,6 +1716,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         cache_limit_guard,
         paged_active,
         mtp_active,
+        vision_active,
         context_limits,
     ) = init_rx
         .await
@@ -1720,6 +1727,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         config,
         paged_active,
         mtp_active,
+        vision_active,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
