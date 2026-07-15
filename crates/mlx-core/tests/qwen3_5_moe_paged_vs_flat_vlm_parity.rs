@@ -41,8 +41,10 @@
 //! ```
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel;
 use mlx_core::tokenizer::ChatMessage;
@@ -164,6 +166,59 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+fn assistant_message(content: &str) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: content.to_string(),
+        tool_calls: None,
+        tool_call_id: None,
+        is_error: None,
+        reasoning_content: None,
+        images: None,
+        audio: None,
+    }
+}
+
+fn cache_lifecycle_chat_config() -> ChatConfig {
+    let mut config = correctness_chat_config(16);
+    // Full-history replay reconstructs prior assistant turns from the public
+    // result. Disable hidden reasoning so that text contains every content
+    // token needed to reproduce the committed prompt prefix exactly.
+    config.thinking_token_budget = Some(0);
+    config.include_reasoning = Some(false);
+    config
+}
+
+fn cache_lifecycle_chat_config_for_owner(owner: &str) -> ChatConfig {
+    let mut config = cache_lifecycle_chat_config();
+    config.cache_owner_id = Some(owner.to_owned());
+    config.cache_root_owner_id = Some("qwen35-moe-vlm-lifecycle-root".to_owned());
+    config
+}
+
+/// Change the image content without changing its decoded dimensions. Both
+/// prompts therefore expand to the same token shape, isolating the per-image
+/// cache identity as the only reason for cache-chain backoff.
+fn same_shape_image_variant(bytes: &[u8]) -> Vec<u8> {
+    let original = image::load_from_memory(bytes).expect("test image must decode");
+    let original_dimensions = original.dimensions();
+    let mut rgba = original.to_rgba8();
+    let pixel = rgba.get_pixel_mut(0, 0);
+    pixel.0[0] = pixel.0[0].wrapping_add(1);
+
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode same-shape image variant");
+    let changed = encoded.into_inner();
+    let changed_dimensions = image::load_from_memory(&changed)
+        .expect("encoded image variant must decode")
+        .dimensions();
+    assert_eq!(original_dimensions, changed_dimensions);
+    assert_ne!(bytes, changed.as_slice());
+    changed
+}
+
 const PROMPT: &str = "Describe this image briefly.";
 
 /// Resolve the test image: `MLX_TEST_VLM_IMAGE_PATH` else `examples/ocr.png`
@@ -255,6 +310,173 @@ async fn qwen3_5_moe_paged_vlm_correctness() {
     eprintln!(
         "Qwen3.5-MoE-VL paged-VLM correctness: coherence + determinism + \
          image-dependence all passed"
+    );
+}
+
+/// MoE twin of the dense image-aware paged-prefix lifecycle regression.
+/// It follows the public stateless-agent/full-history flow and pins cold start,
+/// owner A -> owner B -> owner A sidecar restoration, same-image reuse,
+/// image-identity retention across a text continuation, and same-token-shape
+/// cache backoff after changing only the image bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs MLX_TEST_QWEN35MOE_VL_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH"]
+async fn qwen3_5_moe_paged_vlm_image_prefix_cache_lifecycle() {
+    let Ok(model_path) = std::env::var("MLX_TEST_QWEN35MOE_VL_MODEL_PATH") else {
+        eprintln!("skipping: MLX_TEST_QWEN35MOE_VL_MODEL_PATH unset");
+        return;
+    };
+    let src = PathBuf::from(&model_path);
+    if !src.exists() {
+        eprintln!(
+            "skipping: MLX_TEST_QWEN35MOE_VL_MODEL_PATH does not exist: {}",
+            src.display()
+        );
+        return;
+    }
+    let Some(image_path) = resolve_image_path() else {
+        eprintln!("skipping: no test image (set MLX_TEST_VLM_IMAGE_PATH or add examples/ocr.png)");
+        return;
+    };
+    let image_a = std::fs::read(&image_path).expect("failed to read test image");
+    let image_b = same_shape_image_variant(&image_a);
+
+    let paged_dir = clone_model_dir(&src, "qwen35moe-vlm-image-prefix-cache", true)
+        .expect("clone paged model dir failed");
+    let model = Qwen3_5MoeModel::load(paged_dir.to_string_lossy().to_string())
+        .await
+        .expect("failed to load paged-path Qwen3.5-MoE-VL model");
+
+    // 1. No live or published blocks exist on a newly loaded model.
+    let first = model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image_a)],
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("first image turn failed");
+    assert_eq!(
+        first.cached_tokens, 0,
+        "first image turn must cold-prefill: {first:?}"
+    );
+
+    // Force the live adapter request and recurrent caches away from owner A.
+    // Owner A's content-addressed K/V blocks and exact GDN sidecar must remain
+    // available independently of owner B's active state.
+    let owner_b = model
+        .chat_session_start(
+            vec![user_message_with_image(
+                "State the dominant color in this image.",
+                &image_b,
+            )],
+            Some(cache_lifecycle_chat_config_for_owner("owner-b")),
+        )
+        .await
+        .expect("owner B displacement turn failed");
+    assert!(
+        owner_b.num_tokens > 0,
+        "owner B produced no output: {owner_b:?}"
+    );
+
+    let owner_a_replay = model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image_a)],
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("owner A same-image replay after owner B failed");
+    assert_eq!(
+        owner_a_replay.text, first.text,
+        "owner displacement changed exact T=0 output"
+    );
+    assert_eq!(owner_a_replay.num_tokens, first.num_tokens);
+    assert!(
+        owner_a_replay.cached_tokens > 0,
+        "owner A replay after owner B must restore an exact cached prefix: {owner_a_replay:?}"
+    );
+
+    // 2. Re-render the full committed transcript with the identical image.
+    let followup = "Name one visible detail.";
+    let same_history = vec![
+        user_message_with_image(PROMPT, &image_a),
+        assistant_message(&first.text),
+        user_message(followup),
+    ];
+    let replay = model
+        .chat_session_start(
+            same_history,
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("same-image full-history replay failed");
+    assert!(
+        replay.cached_tokens > 0,
+        "identical image full-history replay must reuse cached blocks: {replay:?}"
+    );
+
+    // 3. The paged text continuation must keep the original image hashes on
+    // its re-published block chain.
+    let continuation = "Now answer with a short noun.";
+    let continued = model
+        .chat_session_continue(
+            continuation.to_string(),
+            None,
+            None,
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("text continuation after image replay failed");
+    assert!(
+        continued.cached_tokens > 0,
+        "text continuation must reuse the image-bearing live prefix: {continued:?}"
+    );
+
+    let final_question = "Confirm in one word.";
+    let extended_history_a = vec![
+        user_message_with_image(PROMPT, &image_a),
+        assistant_message(&first.text),
+        user_message(followup),
+        assistant_message(&replay.text),
+        user_message(continuation),
+        assistant_message(&continued.text),
+        user_message(final_question),
+    ];
+    let after_text = model
+        .chat_session_start(
+            extended_history_a,
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("same-image replay after text continuation failed");
+    assert!(
+        after_text.cached_tokens > 0,
+        "text continuation lost the image block identity: {after_text:?}"
+    );
+
+    // 4. Only the raw content changes; the image geometry and entire rendered
+    // text history remain identical. Leading text-only blocks may still hit,
+    // but reuse must stop at the first image-conditioned block.
+    let extended_history_b = vec![
+        user_message_with_image(PROMPT, &image_b),
+        assistant_message(&first.text),
+        user_message(followup),
+        assistant_message(&replay.text),
+        user_message(continuation),
+        assistant_message(&continued.text),
+        user_message(final_question),
+    ];
+    let changed = model
+        .chat_session_start(
+            extended_history_b,
+            Some(cache_lifecycle_chat_config_for_owner("owner-a")),
+        )
+        .await
+        .expect("changed-image full-history replay failed");
+    assert!(
+        changed.cached_tokens < after_text.cached_tokens,
+        "same-shape changed image reused through the image-conditioned prefix: \
+         same-image cached_tokens={} changed-image cached_tokens={} changed={changed:?}",
+        after_text.cached_tokens,
+        changed.cached_tokens,
     );
 }
 

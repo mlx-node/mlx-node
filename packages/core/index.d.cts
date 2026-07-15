@@ -165,6 +165,11 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Whether this loaded instance can execute image-bearing chat turns.
+   * Config-only stubs and incomplete/non-paged physical paths return false.
+   */
+  supportsImages(): boolean;
   modelId(): number;
   /**
    * Whether a draft model — DSpark or Google assistant — is loaded on

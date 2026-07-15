@@ -574,6 +574,106 @@ fn validate_required_weights(
         ));
     }
 
+    // Standard SigLIP vision tower. `sanitize_weights` removes a leading
+    // `model.` and normalizes the checkpoint's `*.linear.weight` names to
+    // `*.weight`, so these are the exact keys consumed by
+    // `apply_vision_weights`. That apply path installs every tensor only when
+    // present; without a fail-closed check, a truncated vision shard leaves
+    // constructor-initialized projections/norms (or unbounded clipping) while
+    // the language model still loads successfully.
+    if let Some(vc) = config.vision_config.as_ref() {
+        for key in [
+            "vision_tower.patch_embedder.input_proj.weight",
+            "vision_tower.patch_embedder.position_embedding_table",
+        ] {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        for i in 0..vc.num_hidden_layers as usize {
+            let prefix = format!("vision_tower.encoder.layers.{}", i);
+
+            // All seven vision projections are dense ClippableLinear weights.
+            // When clipping is enabled, all four scalar bounds are semantic
+            // checkpoint state; a partial group is ignored by the apply path,
+            // so require the complete group here.
+            for projection in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                let projection = format!("{}.{}", prefix, projection);
+                let weight_key = format!("{}.weight", projection);
+                if !has(&weight_key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {}",
+                        weight_key
+                    )));
+                }
+
+                if vc.use_clipped_linears {
+                    for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                        let key = format!("{}.{}", projection, bound);
+                        if !has(&key) {
+                            return Err(Error::from_reason(format!(
+                                "Missing required weight: {}",
+                                key
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // Q/K use learned VisionRMSNorm scales; V and the multimodal
+            // pre-projection norm are parameter-free.
+            for norm in [
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight",
+            ] {
+                let key = format!("{}.{}", prefix, norm);
+                if !has(&key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {}",
+                        key
+                    )));
+                }
+            }
+        }
+
+        if vc.standardize {
+            for key in ["vision_tower.std_bias", "vision_tower.std_scale"] {
+                if !has(key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {}",
+                        key
+                    )));
+                }
+            }
+        }
+
+        // Dense and supported affine-quantized projections both carry the
+        // payload under `.weight`. `.scales` selects the quantized apply path;
+        // `.biases` is optional there, so neither sidecar is universally
+        // required by this presence validator.
+        if !has("embed_vision.embedding_projection.weight") {
+            return Err(Error::from_reason(
+                "Missing required weight: embed_vision.embedding_projection.weight",
+            ));
+        }
+    }
+
     // Unified encoder-free vision embedder. When the checkpoint declares a
     // unified vision config, the loader (`apply_unified_vision_embedder_weights`
     // + `apply_embed_vision_projection`) installs each tensor only `if let
@@ -2323,7 +2423,7 @@ impl Gemma4Model {
                     Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
                 let model_id = inner.model_id;
-                let has_vision = inner.image_processor.is_some();
+                let has_vision = inner.image_path_loaded();
                 let has_audio = inner.embed_audio.is_some();
                 let paged_active = inner.paged_adapter.is_some();
                 let draft_active = inner.draft.is_some();
@@ -3582,6 +3682,272 @@ mod tests {
         );
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.gate_up_proj"));
         assert!(!per_layer_quant.contains_key("layers.0.mlp.experts.down_proj"));
+    }
+
+    /// The standard Gemma4 SigLIP path must fail closed over exactly the keys
+    /// consumed by `apply_vision_weights`. The configured vision depth is
+    /// independent of the text depth, clip scalars exist only when
+    /// `use_clipped_linears=true`, and standardization buffers exist only when
+    /// `standardize=true`.
+    #[test]
+    fn validate_required_weights_standard_siglip_fails_closed() {
+        let make_config = |use_clipped_linears: bool, standardize: bool| -> Gemma4Config {
+            serde_json::from_value(serde_json::json!({
+                "vocab_size": 8,
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "intermediate_size": 16,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": false,
+                "max_position_embeddings": 64,
+                "vision_config": {
+                    "hidden_size": 16,
+                    "intermediate_size": 16,
+                    // Deliberately differs from the one-layer text model so the
+                    // validator is pinned to the vision config's depth.
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                    "patch_size": 2,
+                    "position_embedding_size": 4,
+                    "default_output_length": 4,
+                    "pooling_kernel_size": 1,
+                    "use_clipped_linears": use_clipped_linears,
+                    "rope_theta": 100.0,
+                    "standardize": standardize
+                }
+            }))
+            .expect("standard SigLIP Gemma4Config")
+        };
+
+        let standard_vision_keys = |config: &Gemma4Config| -> Vec<String> {
+            let vc = config.vision_config.as_ref().expect("vision config");
+            let mut keys = vec![
+                "vision_tower.patch_embedder.input_proj.weight".to_string(),
+                "vision_tower.patch_embedder.position_embedding_table".to_string(),
+                "embed_vision.embedding_projection.weight".to_string(),
+            ];
+            for i in 0..vc.num_hidden_layers as usize {
+                let prefix = format!("vision_tower.encoder.layers.{i}");
+                for projection in [
+                    "self_attn.q_proj",
+                    "self_attn.k_proj",
+                    "self_attn.v_proj",
+                    "self_attn.o_proj",
+                    "mlp.gate_proj",
+                    "mlp.up_proj",
+                    "mlp.down_proj",
+                ] {
+                    let projection = format!("{prefix}.{projection}");
+                    keys.push(format!("{projection}.weight"));
+                    if vc.use_clipped_linears {
+                        for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                            keys.push(format!("{projection}.{bound}"));
+                        }
+                    }
+                }
+                for norm in [
+                    "self_attn.q_norm.weight",
+                    "self_attn.k_norm.weight",
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                ] {
+                    keys.push(format!("{prefix}.{norm}"));
+                }
+            }
+            if vc.standardize {
+                keys.push("vision_tower.std_bias".to_string());
+                keys.push("vision_tower.std_scale".to_string());
+            }
+            keys
+        };
+
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+        let full = |config: &Gemma4Config| -> HashMap<String, MxArray> {
+            let mut params = HashMap::new();
+            for key in [
+                "embed_tokens.weight",
+                "norm.weight",
+                "lm_head.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+            ] {
+                params.insert(key.to_string(), dummy());
+            }
+            for key in standard_vision_keys(config) {
+                params.insert(key, dummy());
+            }
+            params
+        };
+
+        // Unclipped, non-standardized checkpoints require only learned tower
+        // tensors. Every one, including the second vision layer, is mandatory.
+        let base = make_config(false, false);
+        validate_required_weights(&full(&base), &base)
+            .expect("complete standard SigLIP key set must validate");
+        for missing in standard_vision_keys(&base) {
+            let mut params = full(&base);
+            params.remove(&missing);
+            let err = validate_required_weights(&params, &base).unwrap_err();
+            assert!(
+                format!("{err}").contains(&missing),
+                "missing standard vision key '{missing}' must fail closed and name the key, got: {err}"
+            );
+        }
+
+        // Dense projection: `.weight` alone is valid. Supported affine-packed
+        // projection: `.weight + .scales` is valid and `.biases` is optional.
+        let mut quantized_projection = full(&base);
+        quantized_projection.insert(
+            "embed_vision.embedding_projection.scales".to_string(),
+            dummy(),
+        );
+        validate_required_weights(&quantized_projection, &base)
+            .expect("quantized vision projection may omit affine biases");
+        quantized_projection.insert(
+            "embed_vision.embedding_projection.biases".to_string(),
+            dummy(),
+        );
+        validate_required_weights(&quantized_projection, &base)
+            .expect("quantized vision projection with affine biases must validate");
+        quantized_projection.remove("embed_vision.embedding_projection.weight");
+        let err = validate_required_weights(&quantized_projection, &base)
+            .expect_err("projection sidecars without payload weight must fail closed");
+        assert!(
+            format!("{err}").contains("embed_vision.embedding_projection.weight"),
+            "projection error must name its missing payload weight, got: {err}"
+        );
+
+        // Clipping and standardization are config-gated, but complete and
+        // mandatory when enabled. Removing any conditional tensor must fail.
+        let conditioned = make_config(true, true);
+        validate_required_weights(&full(&conditioned), &conditioned)
+            .expect("complete clipped+standardized SigLIP key set must validate");
+        let conditional_keys: Vec<String> = standard_vision_keys(&conditioned)
+            .into_iter()
+            .filter(|key| {
+                key.ends_with("input_min")
+                    || key.ends_with("input_max")
+                    || key.ends_with("output_min")
+                    || key.ends_with("output_max")
+                    || key == "vision_tower.std_bias"
+                    || key == "vision_tower.std_scale"
+            })
+            .collect();
+        for missing in conditional_keys {
+            let mut params = full(&conditioned);
+            params.remove(&missing);
+            let err = validate_required_weights(&params, &conditioned).unwrap_err();
+            assert!(
+                format!("{err}").contains(&missing),
+                "missing conditional vision key '{missing}' must fail closed and name the key, got: {err}"
+            );
+        }
+    }
+
+    /// Pin the raw-HF/converted checkpoint spelling at the sanitizer seam:
+    /// `model.vision_tower.*.linear.weight` becomes the exact
+    /// `vision_tower.*.weight` names required by the standard validator, while
+    /// non-linear vision buffers retain their suffixes.
+    #[test]
+    fn sanitize_standard_siglip_keys_match_required_validator() {
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 64,
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": true,
+                "rope_theta": 100.0,
+                "standardize": true
+            }
+        }))
+        .expect("standard SigLIP sanitizer config");
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+        let mut raw = HashMap::new();
+        for key in [
+            "model.language_model.model.embed_tokens.weight",
+            "model.language_model.model.norm.weight",
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.embed_vision.embedding_projection.weight",
+        ] {
+            raw.insert(key.to_string(), dummy());
+        }
+        let prefix = "model.vision_tower.encoder.layers.0";
+        for projection in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ] {
+            raw.insert(format!("{prefix}.{projection}.linear.weight"), dummy());
+            for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                raw.insert(format!("{prefix}.{projection}.{bound}"), dummy());
+            }
+        }
+        for norm in [
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+        ] {
+            raw.insert(format!("{prefix}.{norm}"), dummy());
+        }
+
+        let sanitized = sanitize_weights(&mut raw, &config).expect("sanitize standard SigLIP");
+        assert!(raw.is_empty(), "sanitizer consumes the input map");
+        assert!(
+            sanitized
+                .keys()
+                .all(|key| !key.starts_with("model.") && !key.contains(".linear.weight")),
+            "sanitized SigLIP keys must use loader-internal names"
+        );
+        validate_required_weights(&sanitized, &config)
+            .expect("sanitized raw SigLIP key set must satisfy the validator");
     }
 
     /// Unified vision loader must fail closed. The encoder-free vision path

@@ -598,6 +598,18 @@ pub struct PagedTurnPlan {
     pub reason: PagedTurnPlanReason,
 }
 
+/// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
+///
+/// The turn lifecycle itself (live continuation, reset, suffix allocation,
+/// and plan reporting) is identical for both variants. Only the cold
+/// prefix-cache lookup differs: text-only callers use one uniform key vector,
+/// while multimodal callers use image-aware keys for each block.
+#[derive(Clone, Copy)]
+enum PreparePrefixKeys<'a> {
+    Uniform(&'a [u64]),
+    PerBlock(&'a [Vec<u64>]),
+}
+
 /// Process-local Metal/MLX memory counters captured once for a prefill chunk.
 ///
 /// `metal_current_allocated_bytes` includes buffers allocated outside MLX's
@@ -927,7 +939,7 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            extra_keys,
+            PreparePrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             None,
@@ -958,10 +970,86 @@ impl PagedKVCacheAdapter {
             prompt_tokens,
             total_budget,
             reuse_cache,
-            extra_keys,
+            PreparePrefixKeys::Uniform(extra_keys),
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
+        )
+    }
+
+    /// Per-block-extra-keys variant of
+    /// [`Self::prepare_turn_with_max_cache_hit_tokens`].
+    ///
+    /// This preserves the exact active-turn lifecycle of the uniform-key API:
+    /// a compatible live request continues in place; otherwise the old request
+    /// is released, a fresh request is installed, a capped prefix lookup runs,
+    /// and enough blocks are allocated for `total_budget`. The only difference
+    /// is that a cold lookup uses
+    /// [`Self::find_cached_prefix_per_block_with_max_tokens`], so image-bearing
+    /// prompts can isolate blocks by image content.
+    ///
+    /// Callers must use the same per-block key construction when publishing the
+    /// completed request via [`Self::finalize_turn_keep_live_per_block`]. The
+    /// vector must cover every full block the lookup may scan; a missing entry
+    /// is treated as a cache-chain miss by the allocator. Finalization has the
+    /// stricter convention that its key vector must cover every full block in
+    /// the completed request.
+    ///
+    /// Live continuation does not perform a prefix-cache read and therefore
+    /// does not compare `extra_keys_per_block`. The caller remains responsible
+    /// for authorizing live continuation only when non-token inputs (for
+    /// example, the ordered image-byte identity) still match the live request;
+    /// pass `reuse_cache = false` after a media change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_turn_per_block_with_max_cache_hit_tokens(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<PagedTurnPlan, String> {
+        self.prepare_turn_inner(
+            seq_id,
+            prompt_tokens,
+            total_budget,
+            reuse_cache,
+            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            skip_lookup,
+            Some(max_cache_hit_tokens),
+        )
+    }
+
+    /// Discard a prepared cache-hit/live-continuation candidate and restart the
+    /// same per-block-keyed request as a clean cold prefill.
+    ///
+    /// Hybrid VLMs use this after the paged K/V lookup succeeds but the
+    /// corresponding recurrent-state sidecar does not. Reusing only the K/V
+    /// half would produce a model state that never existed, so this helper
+    /// releases every candidate block reference, skips the shared prefix cache,
+    /// and allocates the full prompt from position zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restart_prepared_turn_cold_per_block(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Result<PagedTurnPlan, String> {
+        self.prepare_turn_inner(
+            seq_id,
+            prompt_tokens,
+            total_budget,
+            /* reuse_cache */ false,
+            PreparePrefixKeys::PerBlock(extra_keys_per_block),
+            cache_salt,
+            /* skip_lookup */ true,
+            /* max_cache_hit_tokens */ Some(0),
         )
     }
 
@@ -972,7 +1060,39 @@ impl PagedKVCacheAdapter {
         prompt_tokens: &[u32],
         total_budget: u32,
         reuse_cache: bool,
-        extra_keys: &[u64],
+        prefix_keys: PreparePrefixKeys<'_>,
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+    ) -> Result<PagedTurnPlan, String> {
+        let result = self.prepare_turn_inner_mutating(
+            seq_id,
+            prompt_tokens,
+            total_budget,
+            reuse_cache,
+            prefix_keys,
+            cache_salt,
+            skip_lookup,
+            max_cache_hit_tokens,
+        );
+        if result.is_err() {
+            // Prefix lookup attaches cache-owned block references before suffix
+            // allocation. A later allocation failure must not leave those
+            // references (or an empty live request) pinned until another turn
+            // happens to clean them up.
+            let _ = self.release_request();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_turn_inner_mutating(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        prefix_keys: PreparePrefixKeys<'_>,
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
@@ -998,9 +1118,9 @@ impl PagedKVCacheAdapter {
                     Err(_) => {
                         let _ = self.release_request();
                         self.reset_for_new_request(seq_id)?;
-                        let prefix = self.find_cached_prefix_inner(
+                        let prefix = self.find_cached_prefix_for_prepare(
                             prompt_tokens,
-                            extra_keys,
+                            prefix_keys,
                             cache_salt,
                             skip_lookup,
                             max_cache_hit_tokens,
@@ -1020,9 +1140,9 @@ impl PagedKVCacheAdapter {
                     let _ = self.release_request();
                 }
                 self.reset_for_new_request(seq_id)?;
-                let prefix = self.find_cached_prefix_inner(
+                let prefix = self.find_cached_prefix_for_prepare(
                     prompt_tokens,
-                    extra_keys,
+                    prefix_keys,
                     cache_salt,
                     skip_lookup,
                     max_cache_hit_tokens,
@@ -1053,6 +1173,33 @@ impl PagedKVCacheAdapter {
             suffix_len,
             reason,
         })
+    }
+
+    fn find_cached_prefix_for_prepare(
+        &mut self,
+        prompt_tokens: &[u32],
+        prefix_keys: PreparePrefixKeys<'_>,
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: Option<u32>,
+    ) -> Result<CachedPrefix, String> {
+        match prefix_keys {
+            PreparePrefixKeys::Uniform(extra_keys) => self.find_cached_prefix_inner(
+                prompt_tokens,
+                extra_keys,
+                cache_salt,
+                skip_lookup,
+                max_cache_hit_tokens,
+            ),
+            PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
+                .find_cached_prefix_per_block_inner(
+                    prompt_tokens,
+                    extra_keys_per_block,
+                    cache_salt,
+                    skip_lookup,
+                    max_cache_hit_tokens,
+                ),
+        }
     }
 
     /// Look up the longest cached prefix matching `prompt_tokens` and
@@ -5144,6 +5291,31 @@ mod tests {
         }
     }
 
+    fn seed_prefix_cache_per_block(
+        allocator: &Arc<Mutex<BlockAllocator>>,
+        tokens: &[u32],
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+    ) {
+        let mut guard = allocator.lock().unwrap();
+        let block_size_us = block_size as usize;
+        let num_full = tokens.len() / block_size_us;
+        let mut blocks = Vec::with_capacity(num_full);
+        for _ in 0..num_full {
+            blocks.push(
+                guard
+                    .allocate()
+                    .expect("seed_prefix_cache_per_block: free block"),
+            );
+        }
+        guard
+            .cache_full_blocks_per_block(tokens, &blocks, block_size, extra_keys_per_block, 0)
+            .expect("seed_prefix_cache_per_block: cache_full_blocks_per_block");
+        for block in blocks {
+            guard.free(block);
+        }
+    }
+
     #[test]
     fn test_new_validates_block_size() {
         let allocator = new_allocator(8, 4);
@@ -8126,6 +8298,116 @@ mod tests {
         assert_eq!(adapter.current_token_count(), 4);
 
         adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_restart_prepared_turn_cold_per_block_discards_candidate_hit() {
+        let allocator = new_allocator(6, 4);
+        let tokens: Vec<u32> = (1..=8).collect();
+        let per_block = vec![vec![0xA11C_E001], Vec::new()];
+        seed_prefix_cache_per_block(&allocator, &tokens, 4, &per_block);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_restart_prepared_turn_cold_per_block_discards_candidate_hit: Metal unavailable"
+            );
+            return;
+        };
+
+        let candidate = adapter
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                7,
+                &tokens,
+                tokens.len() as u32,
+                true,
+                &per_block,
+                0,
+                false,
+                tokens.len() as u32 - 1,
+            )
+            .expect("prepare image-keyed cache candidate");
+        assert_eq!(candidate.cached_prefix_len, 4);
+        assert_eq!(adapter.request_tokens(), &tokens[..4]);
+
+        let cold = adapter
+            .restart_prepared_turn_cold_per_block(7, &tokens, tokens.len() as u32, &per_block, 0)
+            .expect("downgrade candidate to cold prefill");
+        assert_eq!(cold.cached_prefix_len, 0);
+        assert_eq!(cold.cached_blocks, 0);
+        assert_eq!(cold.allocated_blocks, 2);
+        assert_eq!(cold.suffix_len, tokens.len() as u32);
+        assert!(adapter.request_tokens().is_empty());
+        assert_eq!(adapter.block_table().unwrap().num_blocks(), 2);
+        adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_prepare_turn_allocation_error_releases_attached_prefix_blocks() {
+        // The candidate occupies one cached block while an unrelated cached
+        // chain occupies the remaining two physical blocks. The candidate hit
+        // therefore attaches successfully, but its one-block suffix cannot be
+        // allocated. Preparation must detach the candidate request reference
+        // before returning the error.
+        let allocator = new_allocator(3, 4);
+        let cached_tokens: Vec<u32> = (1..=4).collect();
+        let prompt_tokens: Vec<u32> = (1..=8).collect();
+        let cached_keys = vec![vec![0xA11C_E001]];
+        let prompt_keys = vec![vec![0xA11C_E001], Vec::new()];
+        seed_prefix_cache_per_block(&allocator, &cached_tokens, 4, &cached_keys);
+        let unrelated_tokens: Vec<u32> = (101..=108).collect();
+        let unrelated_keys = vec![vec![0xDEAD_BEEF], Vec::new()];
+        seed_prefix_cache_per_block(&allocator, &unrelated_tokens, 4, &unrelated_keys);
+        let held_unrelated = {
+            let mut guard = allocator.lock().unwrap();
+            let (blocks, cached) =
+                guard.find_longest_cache_hit_per_block(&unrelated_tokens, 4, &unrelated_keys, 0);
+            assert_eq!(cached, unrelated_tokens.len());
+            blocks
+        };
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_prepare_turn_allocation_error_releases_attached_prefix_blocks: Metal unavailable"
+            );
+            return;
+        };
+
+        let error = adapter
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                9,
+                &prompt_tokens,
+                prompt_tokens.len() as u32,
+                true,
+                &prompt_keys,
+                0,
+                false,
+                prompt_tokens.len() as u32 - 1,
+            )
+            .expect_err("one-block suffix must exhaust the fully cached pool");
+        assert!(error.contains("could not reserve 1 block(s)"), "{error}");
+        assert!(adapter.block_table().is_none());
+        assert!(adapter.request_tokens().is_empty());
+        assert_eq!(adapter.cached_token_count(), 0);
+        assert_eq!(adapter.release_request().unwrap(), 0);
+
+        // The prefix-cache's logical reference remains valid; only the failed
+        // request reference was removed.
+        let retry = adapter
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                10,
+                &cached_tokens,
+                cached_tokens.len() as u32,
+                true,
+                &cached_keys,
+                0,
+                false,
+                cached_tokens.len() as u32,
+            )
+            .expect("cached prefix remains reusable after failed request cleanup");
+        assert_eq!(retry.cached_prefix_len, cached_tokens.len() as u32);
+        adapter.release_request().unwrap();
+        let mut guard = allocator.lock().unwrap();
+        for block in held_unrelated {
+            guard.free(block);
+        }
     }
 
     /// `continue_turn` rejects a prompt that does NOT strictly extend

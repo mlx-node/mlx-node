@@ -28,7 +28,7 @@
 use std::sync::{Arc, Mutex};
 
 use mlx_core::transformer::paged_kv_cache_adapter::{
-    PagedKVCacheAdapter, compute_per_block_image_extra_keys,
+    PagedKVCacheAdapter, PagedTurnPlanReason, compute_per_block_image_extra_keys,
 };
 use mlx_paged_attn::{BlockAllocator, LayerKVPool, PagedAttentionConfig, metal::MetalDtype};
 
@@ -94,6 +94,245 @@ fn run_request(
     }
     adapter.release_request().expect("release_request");
     cached
+}
+
+/// Seed the shared prefix cache through the production per-block turn
+/// lifecycle, including its matching keep-live finalizer convention.
+fn register_request_with_prepare(
+    adapter: &mut PagedKVCacheAdapter,
+    seq_id: u32,
+    tokens: &[u32],
+    per_block: &[Vec<u64>],
+) {
+    let plan = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            seq_id,
+            tokens,
+            tokens.len() as u32,
+            true,
+            per_block,
+            0,
+            false,
+            tokens.len() as u32,
+        )
+        .expect("prepare first per-block request");
+    assert_eq!(plan.cached_prefix_len, 0, "seed request must miss");
+    adapter.record_tokens(tokens).expect("record seed request");
+    adapter
+        .finalize_turn_keep_live_per_block(per_block, 0)
+        .expect("finalize seed request with matching per-block keys");
+    adapter.release_request().expect("release seed request");
+}
+
+/// The unified prepare lifecycle must consume blocks published by the matching
+/// per-block finalizer when both token and image identities are unchanged.
+#[test]
+fn prepare_turn_per_block_same_image_hits_registered_prefix() {
+    let mut adapter = build_adapter();
+    let tokens: Vec<u32> = (1..=16).collect();
+    let image_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xAAAA_AAAA)).collect();
+    let per_block = compute_per_block_image_extra_keys(&image_positions, 2, BLOCK_SIZE);
+
+    register_request_with_prepare(&mut adapter, 0, &tokens, &per_block);
+
+    let plan = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            1,
+            &tokens,
+            tokens.len() as u32,
+            true,
+            &per_block,
+            0,
+            false,
+            tokens.len() as u32,
+        )
+        .expect("prepare same-image request");
+
+    assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+    assert!(!plan.continued_live_prefix);
+    assert_eq!(plan.cached_prefix_len, tokens.len() as u32);
+    assert_eq!(plan.cached_blocks, 2);
+    assert_eq!(plan.allocated_blocks, 0);
+    assert_eq!(plan.suffix_len, 0);
+    assert_eq!(adapter.request_tokens(), tokens.as_slice());
+    adapter.release_request().expect("release same-image hit");
+}
+
+/// A changed image identity in the first block must break the cold lookup at
+/// block zero even when every prompt token is identical.
+#[test]
+fn prepare_turn_per_block_different_image_misses() {
+    let mut adapter = build_adapter();
+    let tokens: Vec<u32> = (1..=16).collect();
+    let image_a_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xAAAA_AAAA)).collect();
+    let image_b_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xBBBB_BBBB)).collect();
+    let keys_a = compute_per_block_image_extra_keys(&image_a_positions, 2, BLOCK_SIZE);
+    let keys_b = compute_per_block_image_extra_keys(&image_b_positions, 2, BLOCK_SIZE);
+
+    register_request_with_prepare(&mut adapter, 0, &tokens, &keys_a);
+
+    let plan = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            1,
+            &tokens,
+            tokens.len() as u32,
+            true,
+            &keys_b,
+            0,
+            false,
+            tokens.len() as u32,
+        )
+        .expect("prepare different-image request");
+
+    assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+    assert_eq!(plan.cached_prefix_len, 0);
+    assert_eq!(plan.cached_blocks, 0);
+    assert_eq!(plan.allocated_blocks, 2);
+    assert_eq!(plan.suffix_len, tokens.len() as u32);
+    assert!(adapter.request_tokens().is_empty());
+    adapter
+        .release_request()
+        .expect("release different-image miss");
+}
+
+/// The exact-prefix cap must be applied before the per-block allocator walk,
+/// leaving one whole block to recompute when the cap lands inside that block.
+#[test]
+fn prepare_turn_per_block_honors_max_cache_hit_tokens() {
+    let mut adapter = build_adapter();
+    let tokens: Vec<u32> = (1..=24).collect();
+    let image_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xAAAA_AAAA)).collect();
+    let per_block = compute_per_block_image_extra_keys(&image_positions, 3, BLOCK_SIZE);
+
+    register_request_with_prepare(&mut adapter, 0, &tokens, &per_block);
+
+    let plan = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            1,
+            &tokens,
+            tokens.len() as u32,
+            true,
+            &per_block,
+            0,
+            false,
+            17,
+        )
+        .expect("prepare capped same-image request");
+
+    assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+    assert_eq!(plan.cached_prefix_len, 16);
+    assert_eq!(plan.cached_blocks, 2);
+    assert_eq!(plan.allocated_blocks, 1);
+    assert_eq!(plan.suffix_len, 8);
+    assert_eq!(adapter.request_tokens(), &tokens[..16]);
+    adapter.release_request().expect("release capped hit");
+}
+
+/// A text-only continuation extends the live request without introducing new
+/// image positions. When that longer request is finalized, the original image
+/// keys must remain attached to the earlier blocks so a later cold replay can
+/// recover the whole extended prefix under the same image identity.
+#[test]
+fn text_continuation_republishes_original_image_block_identity() {
+    let mut adapter = build_adapter();
+    let first_turn: Vec<u32> = (1..=16).collect();
+    let full_history: Vec<u32> = (1..=24).collect();
+    let image_a_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xAAAA_AAAA)).collect();
+    let image_b_positions: Vec<(u32, u64)> =
+        (4u32..8).map(|position| (position, 0xBBBB_BBBB)).collect();
+    let first_keys = compute_per_block_image_extra_keys(&image_a_positions, 2, BLOCK_SIZE);
+    let continued_keys = compute_per_block_image_extra_keys(&image_a_positions, 3, BLOCK_SIZE);
+
+    let cold = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            0,
+            &first_turn,
+            first_turn.len() as u32,
+            true,
+            &first_keys,
+            0,
+            false,
+            first_turn.len() as u32,
+        )
+        .expect("prepare cold image turn");
+    assert_eq!(cold.cached_prefix_len, 0);
+    adapter
+        .record_tokens(&first_turn)
+        .expect("record cold image turn");
+    adapter
+        .finalize_turn_keep_live_per_block(&first_keys, 0)
+        .expect("finalize cold image turn");
+
+    let continuation = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            0,
+            &full_history,
+            full_history.len() as u32,
+            true,
+            &continued_keys,
+            0,
+            false,
+            full_history.len() as u32,
+        )
+        .expect("prepare live text continuation");
+    assert_eq!(
+        continuation.reason,
+        PagedTurnPlanReason::ContinuedLivePrefix
+    );
+    assert!(continuation.continued_live_prefix);
+    assert_eq!(continuation.cached_prefix_len, first_turn.len() as u32);
+    assert_eq!(continuation.suffix_len, 8);
+    adapter
+        .record_tokens(&full_history[first_turn.len()..])
+        .expect("record text continuation");
+    adapter
+        .finalize_turn_keep_live_per_block(&continued_keys, 0)
+        .expect("re-finalize extended history with original image keys");
+    adapter
+        .release_request()
+        .expect("release extended live request");
+
+    let replay = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            1,
+            &full_history,
+            full_history.len() as u32,
+            true,
+            &continued_keys,
+            0,
+            false,
+            full_history.len() as u32,
+        )
+        .expect("prepare cold same-image full-history replay");
+    assert_eq!(replay.reason, PagedTurnPlanReason::FreshReset);
+    assert_eq!(replay.cached_prefix_len, full_history.len() as u32);
+    assert_eq!(replay.cached_blocks, 3);
+    adapter
+        .release_request()
+        .expect("release same-image full-history replay");
+
+    let changed_keys = compute_per_block_image_extra_keys(&image_b_positions, 3, BLOCK_SIZE);
+    let changed = adapter
+        .prepare_turn_per_block_with_max_cache_hit_tokens(
+            2,
+            &full_history,
+            full_history.len() as u32,
+            true,
+            &changed_keys,
+            0,
+            false,
+            full_history.len() as u32,
+        )
+        .expect("prepare changed-image full-history replay");
+    assert_eq!(changed.cached_prefix_len, 0);
+    adapter
+        .release_request()
+        .expect("release changed-image replay");
 }
 
 /// Two requests with the SAME text and SAME image produce a cache hit.

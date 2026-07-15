@@ -23,7 +23,7 @@ use crate::vision::projector::SpatialProjector;
 
 use crate::engine::persistence::{
     dequant_fp8_weights, get_config_bool, get_config_f64, get_config_i32, load_all_safetensors,
-    prewarm_checkpoint_pages_with,
+    prewarm_checkpoint_pages_with, strip_qwen35_vision_weight_prefix,
 };
 
 use super::config::Qwen3_5Config;
@@ -1612,18 +1612,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Split vision/text weights
                 let has_vision = raw_params
                     .keys()
-                    .any(|k| k.starts_with("vision_tower.") || k.starts_with("visual."));
+                    .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
 
                 let (text_raw_params, vision_params) = if has_vision {
                     let mut vision_params: HashMap<String, MxArray> = HashMap::new();
                     let mut text_params: HashMap<String, MxArray> = HashMap::new();
                     for (name, array) in raw_params {
-                        if name.starts_with("vision_tower.") || name.starts_with("visual.") {
-                            let vkey = name
-                                .strip_prefix("vision_tower.")
-                                .or_else(|| name.strip_prefix("visual."))
-                                .unwrap_or(&name)
-                                .to_string();
+                        if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+                            let vkey = vkey.to_string();
                             vision_params.insert(vkey, array);
                         } else {
                             text_params.insert(name, array);

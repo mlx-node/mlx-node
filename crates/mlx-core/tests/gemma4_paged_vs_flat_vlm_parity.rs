@@ -36,8 +36,10 @@
 //! ```
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use mlx_core::engine::types::ChatConfig;
 use mlx_core::models::gemma4::model::Gemma4Model;
 use mlx_core::tokenizer::ChatMessage;
@@ -157,6 +159,31 @@ fn user_message(content: &str) -> ChatMessage {
     }
 }
 
+/// Produce different valid image bytes with identical decoded geometry, so a
+/// cache miss can only come from image-content identity rather than expansion
+/// length.
+fn same_shape_image_variant(bytes: &[u8]) -> Vec<u8> {
+    let original = image::load_from_memory(bytes).expect("test image must decode");
+    let original_dimensions = original.dimensions();
+    let mut rgba = original.to_rgba8();
+    let changed_red = rgba.get_pixel(0, 0).0[0].wrapping_add(1);
+    rgba.get_pixel_mut(0, 0).0[0] = changed_red;
+
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode same-shape image variant");
+    let changed = encoded.into_inner();
+    assert_eq!(
+        original_dimensions,
+        image::load_from_memory(&changed)
+            .expect("encoded image variant must decode")
+            .dimensions()
+    );
+    assert_ne!(bytes, changed.as_slice());
+    changed
+}
+
 const PROMPT: &str = "Describe this image briefly.";
 
 /// Resolve the test image: `MLX_TEST_VLM_IMAGE_PATH` else `examples/ocr.png`
@@ -191,6 +218,7 @@ async fn gemma4_paged_vlm_correctness() {
         return;
     };
     let image = std::fs::read(&image_path).expect("failed to read test image");
+    let changed_image = same_shape_image_variant(&image);
 
     let paged_dir =
         clone_model_dir(&src, "gemma4-vlm-paged", true).expect("clone paged model dir failed");
@@ -198,6 +226,10 @@ async fn gemma4_paged_vlm_correctness() {
     let paged_model = Gemma4Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Gemma-4-VL model");
+    assert!(
+        paged_model.supports_images(),
+        "complete paged Gemma image path must advertise image support"
+    );
 
     // --- 1. COHERENCE: paged(image) produces real output. ---
     let paged_a = paged_model
@@ -211,9 +243,10 @@ async fn gemma4_paged_vlm_correctness() {
         paged_a.num_tokens > 0,
         "paged(image) produced zero tokens: {paged_a:?}"
     );
+    assert_eq!(paged_a.cached_tokens, 0, "first image turn must be cold");
 
-    // --- 2. DETERMINISM: paged(image) at T=0 is byte-identical run-to-run. ---
-    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    // --- 2. SAME-IMAGE WARM REPLAY: no reset, so image-aware blocks and the
+    // matching sliding checkpoint must be reused. ---
     let paged_b = paged_model
         .chat_session_start(
             vec![user_message_with_image(PROMPT, &image)],
@@ -221,6 +254,10 @@ async fn gemma4_paged_vlm_correctness() {
         )
         .await
         .expect("paged(image) re-run chat_session_start failed");
+    assert!(
+        paged_b.cached_tokens > 0,
+        "same-image replay must reuse image-aware prompt blocks: {paged_b:?}"
+    );
     assert_eq!(
         paged_a.text, paged_b.text,
         "paged(image) is not deterministic at T=0:\nrun A={:?}\nrun B={:?}",
@@ -231,7 +268,57 @@ async fn gemma4_paged_vlm_correctness() {
         "paged(image) num_tokens not deterministic at T=0",
     );
 
-    // --- 3. IMAGE-DEPENDENCE: paged(image) differs from paged(no-image). ---
+    // --- 3. IMAGE ISOLATION + A -> B -> A RETENTION. The changed image has
+    // identical geometry and token ids, but a different per-image block key.
+    let paged_changed = paged_model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &changed_image)],
+            Some(correctness_chat_config(64)),
+        )
+        .await
+        .expect("changed-image chat_session_start failed");
+    assert!(
+        paged_changed.cached_tokens < paged_b.cached_tokens,
+        "changed image reused through image-conditioned blocks: same={} changed={}",
+        paged_b.cached_tokens,
+        paged_changed.cached_tokens
+    );
+
+    let paged_a_again = paged_model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image)],
+            Some(correctness_chat_config(64)),
+        )
+        .await
+        .expect("A-after-B image replay failed");
+    assert!(
+        paged_a_again.cached_tokens > paged_changed.cached_tokens,
+        "A prompt checkpoint was displaced by B: A-again={} B={}",
+        paged_a_again.cached_tokens,
+        paged_changed.cached_tokens
+    );
+    assert_eq!(
+        paged_a.text, paged_a_again.text,
+        "A -> B -> A changed output"
+    );
+
+    // --- 4. EXPLICIT RESET: clears both paged entries owned by the session and
+    // Gemma's sliding sidecars, so the next identical image turn is cold. ---
+    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    let paged_after_reset = paged_model
+        .chat_session_start(
+            vec![user_message_with_image(PROMPT, &image)],
+            Some(correctness_chat_config(64)),
+        )
+        .await
+        .expect("post-reset image replay failed");
+    assert_eq!(
+        paged_after_reset.cached_tokens, 0,
+        "explicit reset must force a cold image turn"
+    );
+    assert_eq!(paged_a.text, paged_after_reset.text);
+
+    // --- 5. IMAGE-DEPENDENCE: paged(image) differs from paged(no-image). ---
     tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
     let paged_no_image = paged_model
         .chat_session_start(
@@ -252,21 +339,12 @@ async fn gemma4_paged_vlm_correctness() {
     );
 }
 
-/// Regression: a paged IMAGE turn must leave the session in gemma4's
-/// image-held state so a following text-only `chat_session_continue` is
-/// REJECTED with the restart-required prefix — matching gemma4's FLAT contract.
-///
-/// Unlike qwen3.5 (which preserves image context across a continue), gemma4's
-/// prefix reuse is text-only: a text delta on top of an image session would
-/// prefill on caches whose positions include expanded image tokens the history
-/// bookkeeping does not model. So gemma4's `text_delta_image_guard` rejects
-/// (keyed on `cached_image_key.is_some()`). The paged image core MUST arm that
-/// key (`cached_image_key = Some(...)`) at the end; otherwise the guard would
-/// not fire and the continue would silently drop the image. This locks the
-/// reject in for the paged path.
+/// Regression: a paged image turn leaves both global paged K/V and the physical
+/// sliding-anchor checkpoint live, so a following text delta preserves image
+/// context and reports a warm prefix hit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_GEMMA4_VL_MODEL_PATH + MLX_TEST_VLM_IMAGE_PATH"]
-async fn gemma4_paged_vlm_continue_is_rejected() {
+async fn gemma4_paged_vlm_continue_preserves_image_context() {
     let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_VL_MODEL_PATH") else {
         eprintln!("skipping: MLX_TEST_GEMMA4_VL_MODEL_PATH unset");
         return;
@@ -301,8 +379,7 @@ async fn gemma4_paged_vlm_continue_is_rejected() {
         .expect("paged(image) chat_session_start failed");
     assert!(r1.num_tokens > 0, "image turn produced zero tokens: {r1:?}");
 
-    // Turn 2: text-only continue must be REJECTED with the restart-required
-    // prefix (gemma4 keeps `cached_image_key` armed so the guard fires).
+    // Turn 2: text-only continue must extend the live image-bearing prefix.
     let cont = paged_model
         .chat_session_continue(
             "Answer in one word: is there text?".to_string(),
@@ -310,20 +387,14 @@ async fn gemma4_paged_vlm_continue_is_rejected() {
             None,
             Some(correctness_chat_config(48)),
         )
-        .await;
-    let err = cont.expect_err(
-        "gemma4 must REJECT a text continue on a paged image session (matching its flat contract)",
-    );
+        .await
+        .expect("text continuation after Gemma image turn failed");
     assert!(
-        err.reason.contains("IMAGE_CHANGE_REQUIRES_SESSION_RESTART"),
-        "expected image-session restart rejection, got: {}",
-        err.reason
+        cont.cached_tokens > 0,
+        "text continuation must reuse the image-bearing live prefix: {cont:?}"
     );
 
-    eprintln!(
-        "Gemma-4-VL paged-VLM continue: text continue correctly REJECTED \
-         (image session demands restart)"
-    );
+    eprintln!("Gemma-4-VL paged-VLM continue preserved image context");
 }
 
 /// Error contract: a model loaded WITHOUT a paged adapter
@@ -358,6 +429,10 @@ async fn gemma4_image_turn_without_paged_adapter_errors() {
     let flat_model = Gemma4Model::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load no-paged Gemma-4-VL model");
+    assert!(
+        !flat_model.supports_images(),
+        "Gemma without the paged image executor must not advertise images"
+    );
 
     let result = flat_model
         .chat_session_start(

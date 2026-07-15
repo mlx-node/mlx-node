@@ -35,6 +35,55 @@ pub(crate) fn compiled_forward_backend_available() -> bool {
     *AVAILABLE.get_or_init(|| unsafe { mlx_sys::mlx_metal_is_available() })
 }
 
+/// Strip the known Qwen3.5 vision-tower wrappers from a checkpoint key.
+///
+/// Converted mlx-vlm artifacts commonly use `visual.*` or
+/// `vision_tower.*`, while official Hugging Face Qwen3.5/3.6 checkpoints use
+/// `model.visual.*`. Vision detection and splitting happen before the text
+/// sanitizer removes `model.` wrappers, so all layouts must be recognized at
+/// this boundary or an official multimodal checkpoint is silently loaded as
+/// text-only.
+pub(crate) fn strip_qwen35_vision_weight_prefix(name: &str) -> Option<&str> {
+    name.strip_prefix("model.vision_tower.")
+        .or_else(|| name.strip_prefix("model.visual."))
+        .or_else(|| name.strip_prefix("vision_tower."))
+        .or_else(|| name.strip_prefix("visual."))
+}
+
+#[cfg(test)]
+mod qwen35_vision_weight_prefix_tests {
+    use super::strip_qwen35_vision_weight_prefix;
+
+    #[test]
+    fn recognizes_official_and_converted_vision_layouts() {
+        for (key, expected) in [
+            (
+                "model.visual.blocks.0.attn.qkv.weight",
+                "blocks.0.attn.qkv.weight",
+            ),
+            (
+                "model.vision_tower.blocks.0.attn.qkv.weight",
+                "blocks.0.attn.qkv.weight",
+            ),
+            ("visual.patch_embed.proj.weight", "patch_embed.proj.weight"),
+            ("vision_tower.pos_embed.weight", "pos_embed.weight"),
+        ] {
+            assert_eq!(strip_qwen35_vision_weight_prefix(key), Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_language_model_and_substring_false_positives() {
+        for key in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "some.model.visual.blocks.0.attn.qkv.weight",
+            "visual_encoder.blocks.0.attn.qkv.weight",
+        ] {
+            assert_eq!(strip_qwen35_vision_weight_prefix(key), None);
+        }
+    }
+}
+
 /// Load all safetensors files from a directory (supports sharded checkpoints).
 /// Uses MLX's native mmap-backed lazy loader — arrays are backed by deferred disk
 /// reads and data is only materialized on eval. This makes loading near-instant

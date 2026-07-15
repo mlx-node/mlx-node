@@ -3,6 +3,8 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use crate::transformer::paged_kv_cache_adapter::PagedTurnPlan;
+
 /// Load-bearing typed error prefix used when `chat_session_continue_sync`
 /// rejects an image parameter because images are changing mid-session.
 ///
@@ -19,11 +21,77 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 /// boundary.
 pub(crate) const IMAGE_CHANGE_RESTART_PREFIX: &str = "IMAGE_CHANGE_REQUIRES_SESSION_RESTART:";
 
+/// Candidate-vs-effective prefix decision for a hybrid image prefill.
+///
+/// Paged K/V and recurrent GDN state form one logical cache entry. A K/V hit is
+/// only effective when the matching GDN sidecar was restored; otherwise the
+/// caller must restart the adapter cold while retaining the already prepared
+/// vision embeddings for a position-zero prefill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VlmPagedPrefixResolution {
+    pub candidate_cached_prefix_len: u32,
+    pub effective_plan: PagedTurnPlan,
+    pub gdn_prefix_already_primed: bool,
+    pub downgraded_to_cold: bool,
+}
+
+pub(crate) fn vlm_prefix_requires_cold_restart(
+    candidate_cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+) -> bool {
+    candidate_cached_prefix_len > 0 && !gdn_prefix_already_primed
+}
+
+pub(crate) fn resolve_vlm_paged_prefix(
+    candidate_plan: PagedTurnPlan,
+    gdn_prefix_already_primed: bool,
+    restart_cold: impl FnOnce() -> Result<PagedTurnPlan, String>,
+) -> Result<VlmPagedPrefixResolution, String> {
+    let downgraded_to_cold = vlm_prefix_requires_cold_restart(
+        candidate_plan.cached_prefix_len,
+        gdn_prefix_already_primed,
+    );
+    let effective_plan = if downgraded_to_cold {
+        let cold_plan = restart_cold()?;
+        if cold_plan.cached_prefix_len != 0 {
+            return Err(format!(
+                "VLM cold restart retained {} cached token(s)",
+                cold_plan.cached_prefix_len
+            ));
+        }
+        cold_plan
+    } else {
+        candidate_plan
+    };
+
+    Ok(VlmPagedPrefixResolution {
+        candidate_cached_prefix_len: candidate_plan.cached_prefix_len,
+        effective_plan,
+        gdn_prefix_already_primed: !downgraded_to_cold && gdn_prefix_already_primed,
+        downgraded_to_cold,
+    })
+}
+
 /// Hash raw image bytes to a u64 key for cache lookup.
 fn hash_image_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Compute the combined image-set key and one content hash per raw image.
+///
+/// The returned vector preserves input order and is the identity used by
+/// image-aware paged-prefix cache keys. The first tuple field combines that same
+/// vector for the live-session image key. Each raw image is hashed exactly once:
+/// callers needing both identities must use this helper instead of computing the
+/// combined and per-image keys independently.
+pub(crate) fn compute_image_cache_keys<T: AsRef<[u8]>>(all_images: &[T]) -> (u64, Vec<u64>) {
+    let per_image_hashes = all_images
+        .iter()
+        .map(|image| hash_image_bytes(image.as_ref()))
+        .collect::<Vec<_>>();
+    (combine_image_hashes(&per_image_hashes), per_image_hashes)
 }
 
 /// Combine individual image hashes into a single cache key.
@@ -38,8 +106,79 @@ fn combine_image_hashes(hashes: &[u64]) -> u64 {
 
 /// Compute a combined cache key from raw image bytes.
 pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
-    let individual_hashes: Vec<u64> = all_images.iter().map(|img| hash_image_bytes(img)).collect();
-    combine_image_hashes(&individual_hashes)
+    compute_image_cache_keys(all_images).0
+}
+
+/// Associate every expanded image-placeholder token with its source image hash.
+///
+/// Qwen-style VLM preprocessing expands each logical image into a known number
+/// of placeholder tokens. The counts and hashes are both ordered exactly like
+/// the raw image list. This helper walks the already-expanded prompt in absolute
+/// token order and emits the `(token_position, image_hash)` input expected by
+/// `compute_per_block_image_extra_keys`, assigning the first image's hash to its
+/// first `count` placeholders, then the second image's hash, and so on.
+///
+/// The placeholder token id is an argument so this generic cache module does
+/// not depend on a Qwen model constant. The mapping rejects ambiguous metadata:
+/// there must be one positive token count per image hash, and the total count
+/// must exactly equal the number of placeholder ids in `expanded_tokens`.
+pub(crate) fn map_expanded_image_token_positions(
+    expanded_tokens: &[u32],
+    image_token_id: u32,
+    per_image_token_counts: &[usize],
+    per_image_hashes: &[u64],
+) -> Result<Vec<(u32, u64)>, String> {
+    if per_image_token_counts.len() != per_image_hashes.len() {
+        return Err(format!(
+            "image metadata cardinality mismatch: {} token counts for {} image hashes",
+            per_image_token_counts.len(),
+            per_image_hashes.len(),
+        ));
+    }
+
+    if let Some((image_index, _)) = per_image_token_counts
+        .iter()
+        .enumerate()
+        .find(|(_, count)| **count == 0)
+    {
+        return Err(format!(
+            "image metadata contains zero expanded tokens for image {image_index}",
+        ));
+    }
+
+    let expected_placeholders = per_image_token_counts
+        .iter()
+        .try_fold(0usize, |total, &count| total.checked_add(count))
+        .ok_or_else(|| "expanded image placeholder count overflow".to_string())?;
+    let actual_placeholders = expanded_tokens
+        .iter()
+        .filter(|&&token| token == image_token_id)
+        .count();
+    if actual_placeholders != expected_placeholders {
+        return Err(format!(
+            "expanded image placeholder mismatch: prompt contains {actual_placeholders}, image metadata requires {expected_placeholders}",
+        ));
+    }
+
+    let ordered_hashes = per_image_token_counts
+        .iter()
+        .copied()
+        .zip(per_image_hashes.iter().copied())
+        .flat_map(|(count, image_hash)| std::iter::repeat_n(image_hash, count));
+    expanded_tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| **token == image_token_id)
+        .zip(ordered_hashes)
+        .map(|((token_position, _), image_hash)| {
+            let token_position = u32::try_from(token_position).map_err(|_| {
+                format!(
+                    "expanded image placeholder position {token_position} exceeds the u32 cache-key range",
+                )
+            })?;
+            Ok((token_position, image_hash))
+        })
+        .collect()
 }
 
 /// Build per-block extra_keys for the paged adapter's prefix-cache walk.
@@ -58,11 +197,8 @@ pub(crate) fn compute_image_cache_key(all_images: &[Vec<u8>]) -> u64 {
 ///
 /// `token_image_positions` should be sorted by `token_pos` for stable
 /// hashes (the helper preserves input order; reordered inputs would
-/// produce different hashes). Today's Qwen3.5 paged dispatch is text-only
-/// (image-bearing turns are routed to the flat path), so the production
-/// call always passes `&[]` here. The hook stays in place so that when
-/// VLM-paged forward integration lands, the call site only needs to swap
-/// in the real image positions.
+/// produce different hashes). [`map_expanded_image_token_positions`] produces
+/// this sorted form directly for Qwen-style expanded placeholder runs.
 pub(crate) fn build_paged_extra_keys(
     total_tokens: usize,
     block_size: u32,
@@ -280,6 +416,178 @@ pub(crate) fn verify_cache_prefix_direct(
         cached.len()
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod image_cache_identity_tests {
+    use super::{
+        combine_image_hashes, compute_image_cache_key, compute_image_cache_keys,
+        map_expanded_image_token_positions, resolve_vlm_paged_prefix,
+        vlm_prefix_requires_cold_restart,
+    };
+    use crate::transformer::paged_kv_cache_adapter::{PagedTurnPlan, PagedTurnPlanReason};
+
+    const IMAGE_TOKEN_ID: u32 = 248_056;
+
+    #[test]
+    fn image_kv_candidate_requires_cold_restart_without_gdn_sidecar() {
+        assert!(!vlm_prefix_requires_cold_restart(0, false));
+        assert!(!vlm_prefix_requires_cold_restart(16, true));
+        assert!(vlm_prefix_requires_cold_restart(16, false));
+
+        let candidate = PagedTurnPlan {
+            cached_prefix_len: 16,
+            continued_live_prefix: false,
+            allocated_blocks: 1,
+            cached_blocks: 1,
+            total_budget: 32,
+            suffix_len: 16,
+            reason: PagedTurnPlanReason::FreshReset,
+        };
+        let cold = PagedTurnPlan {
+            cached_prefix_len: 0,
+            continued_live_prefix: false,
+            allocated_blocks: 2,
+            cached_blocks: 0,
+            total_budget: 32,
+            suffix_len: 32,
+            reason: PagedTurnPlanReason::FreshReset,
+        };
+        let mut restarted = false;
+        let resolution = resolve_vlm_paged_prefix(candidate, false, || {
+            restarted = true;
+            Ok(cold)
+        })
+        .unwrap();
+        assert!(restarted);
+        assert!(resolution.downgraded_to_cold);
+        assert_eq!(resolution.candidate_cached_prefix_len, 16);
+        assert_eq!(resolution.effective_plan, cold);
+        assert!(!resolution.gdn_prefix_already_primed);
+
+        let mut restarted_exact = false;
+        let exact = resolve_vlm_paged_prefix(candidate, true, || {
+            restarted_exact = true;
+            Ok(cold)
+        })
+        .unwrap();
+        assert!(!restarted_exact);
+        assert!(!exact.downgraded_to_cold);
+        assert_eq!(exact.effective_plan, candidate);
+        assert!(exact.gdn_prefix_already_primed);
+    }
+
+    #[test]
+    fn per_image_hashes_are_content_stable_and_preserve_order() {
+        let image_a: &[u8] = &[1, 2, 3, 4];
+        let image_b: &[u8] = &[9, 8, 7];
+
+        let (_, first) = compute_image_cache_keys(&[image_a, image_b]);
+        let (_, same_bytes_new_slices) =
+            compute_image_cache_keys(&[&[1, 2, 3, 4][..], &[9, 8, 7][..]]);
+        let (_, reversed) = compute_image_cache_keys(&[image_b, image_a]);
+
+        assert_eq!(first, same_bytes_new_slices);
+        assert_ne!(first[0], first[1]);
+        assert_eq!(reversed, vec![first[1], first[0]]);
+    }
+
+    #[test]
+    fn combined_key_reuses_per_image_hash_basis_and_is_order_sensitive() {
+        let images = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        let (combined, individual) = compute_image_cache_keys(&images);
+        assert_eq!(combined, combine_image_hashes(&individual));
+        assert_eq!(compute_image_cache_key(&images), combined);
+
+        let reversed = vec![images[1].clone(), images[0].clone()];
+        let (reversed_combined, reversed_individual) = compute_image_cache_keys(&reversed);
+        assert_eq!(reversed_individual, vec![individual[1], individual[0]]);
+        assert_ne!(
+            combined, reversed_combined,
+            "combined image-set key must preserve image order",
+        );
+    }
+
+    #[test]
+    fn expanded_placeholders_map_to_each_image_hash_in_prompt_order() {
+        let expanded_tokens = [
+            1,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+            200,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+            IMAGE_TOKEN_ID,
+            201,
+        ];
+        let positions = map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_TOKEN_ID,
+            &[2, 3],
+            &[0xAAAA, 0xBBBB],
+        )
+        .expect("valid expanded image metadata");
+
+        assert_eq!(
+            positions,
+            vec![
+                (1, 0xAAAA),
+                (2, 0xAAAA),
+                (4, 0xBBBB),
+                (5, 0xBBBB),
+                (6, 0xBBBB),
+            ],
+        );
+    }
+
+    #[test]
+    fn expanded_placeholder_mapping_rejects_image_metadata_cardinality_mismatch() {
+        let error = map_expanded_image_token_positions(
+            &[1, IMAGE_TOKEN_ID],
+            IMAGE_TOKEN_ID,
+            &[1, 1],
+            &[0xAAAA],
+        )
+        .expect_err("counts and hashes must have identical cardinality");
+
+        assert!(error.contains("2 token counts for 1 image hashes"));
+    }
+
+    #[test]
+    fn expanded_placeholder_mapping_rejects_prompt_count_mismatch() {
+        let too_few = map_expanded_image_token_positions(
+            &[1, IMAGE_TOKEN_ID, 200],
+            IMAGE_TOKEN_ID,
+            &[2],
+            &[0xAAAA],
+        )
+        .expect_err("metadata requiring two placeholders must reject one placeholder");
+        assert!(too_few.contains("prompt contains 1, image metadata requires 2"));
+
+        let too_many = map_expanded_image_token_positions(
+            &[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 200],
+            IMAGE_TOKEN_ID,
+            &[1],
+            &[0xAAAA],
+        )
+        .expect_err("metadata requiring one placeholder must reject two placeholders");
+        assert!(too_many.contains("prompt contains 2, image metadata requires 1"));
+    }
+
+    #[test]
+    fn expanded_placeholder_mapping_rejects_zero_count_images() {
+        let error = map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[0], &[0xAAAA])
+            .expect_err("an image hash without an expanded token span is ambiguous");
+
+        assert!(error.contains("zero expanded tokens for image 0"));
+    }
+
+    #[test]
+    fn expanded_placeholder_mapping_accepts_empty_text_only_metadata() {
+        let positions = map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[], &[])
+            .expect("empty image metadata must preserve the text-only baseline");
+        assert!(positions.is_empty());
     }
 }
 

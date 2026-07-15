@@ -131,6 +131,7 @@ describe('Gemma4Model(config) stub (round-5 Finding B)', () => {
   it('returns an object with isInitialized=false and a numeric modelId', () => {
     const stub = new Gemma4ModelNative(stubConfig());
     expect(stub.isInitialized).toBe(false);
+    expect(stub.supportsImages()).toBe(false);
     expect(typeof stub.modelId()).toBe('number');
   });
 
@@ -224,6 +225,7 @@ describe('Gemma4Model.load() shape (round-5 Finding B)', () => {
     expect(typeof proto.chatStreamSessionStart).toBe('function');
     expect(typeof proto.chatStreamSessionContinue).toBe('function');
     expect(typeof proto.chatStreamSessionContinueTool).toBe('function');
+    expect(typeof proto.supportsImages).toBe('function');
     expect(typeof proto.resetCaches).toBe('function');
   });
 });
