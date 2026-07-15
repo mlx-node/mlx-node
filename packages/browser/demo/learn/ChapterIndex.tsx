@@ -8,8 +8,10 @@ import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Textarea } from '../components/ui/textarea';
+import { detectModelBlockReason } from '../lib/device-capability';
 import { useLocale } from '../lib/i18n-react';
 import { runForInspector } from '../lib/inspector-client';
+import { modelBlockedDetail, modelBlockedTitle } from '../lib/model-blocked-copy';
 import { useModelLoader } from '../providers/model-loader';
 import { findChapter, type ChapterMeta } from './chapters';
 import { localizedChapters } from './i18n/localized';
@@ -287,6 +289,13 @@ type ForwardPassFlowProps = {
 
 function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoadModel }: ForwardPassFlowProps) {
   const ui = useUiStrings();
+  const locale = useLocale();
+  // On a device that can't run the model (iOS Safari, low-RAM, no WebGPU) the
+  // /chapters auto-load is suppressed, so this hero would otherwise sit on an
+  // infinite "preparing model" spinner (the load it waits for never fires).
+  // Show the same "run on desktop" card the chapter demos use instead. Null on
+  // desktop → the normal loading/consent flow below is unchanged.
+  const blockReason = detectModelBlockReason();
   const [prompt, setPrompt] = React.useState<string>(DEFAULT_PROMPT);
   const [status, setStatus] = React.useState<RunStatus>({ kind: 'idle' });
   const [run, setRun] = React.useState<AttentionRun | null>(null);
@@ -613,6 +622,27 @@ function ForwardPassFlow({ onOpenChapter, workerRef, abortRef, modelReady, onLoa
   // run has captured a trace (`run != null`) we keep the full interactive view
   // even if the worker is later torn down.
   if (!modelReady && run == null) {
+    // Blocked device (iOS Safari / low-RAM / no WebGPU): the auto-load was
+    // suppressed, so no load is coming and the spinner below would spin forever.
+    // Explain instead, and make clear the chapters still work as you read.
+    // Desktops fall through (blockReason === null).
+    if (blockReason) {
+      return (
+        <div className="mb-8 space-y-3 rounded-md border border-border bg-background p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <div className="font-mono text-xs uppercase tracking-[0.15em] text-muted-foreground">
+              {ui.forwardPass.heroTitle}
+            </div>
+          </div>
+          <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
+            <p className="text-sm font-medium text-foreground">{modelBlockedTitle(locale)}</p>
+            <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
+              {modelBlockedDetail(locale, blockReason)}
+            </p>
+          </div>
+        </div>
+      );
+    }
     // The /chapters route auto-starts the model load on entry. So a not-ready
     // hero almost always means "loading", not "waiting for a click": the load
     // is in flight (loaderStatus === 'loading'), about to fire, or the hosted

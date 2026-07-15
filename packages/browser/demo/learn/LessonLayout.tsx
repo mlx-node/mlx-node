@@ -3,6 +3,7 @@ import * as React from 'react';
 
 import { LanguageSwitcher } from '../components/LanguageSwitcher';
 import { Button } from '../components/ui/button';
+import { detectModelBlockReason } from '../lib/device-capability';
 import { useLocale } from '../lib/i18n-react';
 import type { ChapterMeta, SectionMeta } from './chapters';
 import { localizedChapters } from './i18n/localized';
@@ -85,6 +86,11 @@ export function LessonLayout({
 
   const hasTryIt = Boolean(tryItPanel);
   const ui = useUiStrings();
+  // On a device that can't run the model (iOS Safari, low-RAM, no WebGPU) the
+  // header "Load model" button is inert (its handler is gated). Hide it — it is
+  // CSS-hidden on a narrow phone but would otherwise show as a dead button on an
+  // iPad. The chapter's Try-it panel already renders the "run on desktop" card.
+  const modelBlocked = detectModelBlockReason() != null;
 
   return (
     <div className="absolute inset-0 z-10 flex flex-col bg-background">
@@ -131,7 +137,7 @@ export function LessonLayout({
           {/* Hidden on mobile: the interactive "Try it now" panel (and the chat
               overlay) each carry their own load CTA there, so the header stays
               uncluttered and the breadcrumb keeps its width. */}
-          {onLoadModel && !modelReady ? (
+          {onLoadModel && !modelReady && !modelBlocked ? (
             <Button variant="outline" size="sm" onClick={onLoadModel} className="hidden gap-2 sm:inline-flex">
               <DownloadIcon className="size-4" />
               <span className="sr-only sm:not-sr-only">{ui.lessonLayout.loadModel}</span>
