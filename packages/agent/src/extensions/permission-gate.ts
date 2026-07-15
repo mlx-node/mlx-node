@@ -402,7 +402,13 @@ export function createPermissionGateExtension(): InlineExtension {
         }
         const detail = sanitizeDetail(detailSource);
         const title = toolName === 'subagent' ? 'Allow delegated subagent tool access?' : `Allow ${toolName}?`;
-        const choice = await ctx.ui.select(`${title}\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No']);
+        // Bind the dialog to the active agent operation. Pi's selector only
+        // resolves on Ctrl+C/abort when the extension forwards this signal;
+        // otherwise the UI can disappear while this awaited tool_call hook
+        // remains pending and keeps the whole tool batch suspended.
+        const choice = await ctx.ui.select(`${title}\n\n  ${detail}`, ['Yes', 'Always (this session)', 'No'], {
+          signal: ctx.signal,
+        });
 
         if (choice === 'Yes') {
           return undefined;

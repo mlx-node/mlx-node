@@ -187,6 +187,43 @@ describe('createPermissionGateExtension', () => {
     expect(selectCalls[0]!.options).toEqual(['Yes', 'Always (this session)', 'No']);
   });
 
+  it('binds a pending approval dialog to the active agent abort signal and fails closed', async () => {
+    const handler = loadGateHandler();
+    const abort = new AbortController();
+    let notifySelectStarted!: () => void;
+    const selectStarted = new Promise<void>((resolve) => {
+      notifySelectStarted = resolve;
+    });
+    let forwardedSignal: AbortSignal | undefined;
+    const ctx = {
+      hasUI: true,
+      signal: abort.signal,
+      ui: {
+        select: (_title: string, _options: string[], opts?: { signal?: AbortSignal }): Promise<string | undefined> => {
+          forwardedSignal = opts?.signal;
+          notifySelectStarted();
+          return new Promise((resolve) => {
+            if (forwardedSignal?.aborted) {
+              resolve(undefined);
+              return;
+            }
+            forwardedSignal?.addEventListener('abort', () => resolve(undefined), { once: true });
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const pending = handler(toolCallEvent('bash', { command: 'sleep 30' }), ctx);
+    await selectStarted;
+    expect(forwardedSignal).toBe(abort.signal);
+
+    abort.abort();
+    await expect(pending).resolves.toEqual({
+      block: true,
+      reason: 'Blocked by user',
+    });
+  });
+
   it('gates subagent delegation and discloses child tool access', async () => {
     const handler = loadGateHandler();
     const { ctx, selectCalls } = makeCtx(true, 'Yes');
