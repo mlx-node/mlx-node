@@ -24,9 +24,12 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::model_thread::ResponseTx;
+#[cfg(test)]
+use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hash;
 use crate::models::qwen3_5::gdn_checkpoint_store::{
     GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    compute_paged_prefix_block_hash, compute_paged_prefix_block_hashes, prune_gdn_checkpoints,
+    compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
+    prune_gdn_checkpoints, replay_gdn_cache_and_commit,
 };
 use crate::models::qwen3_5::model::{
     Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
@@ -83,8 +86,16 @@ impl GdnCheckpointLineage for MoeGdnPrefixCheckpoint {
         &self.owner_id
     }
 
+    fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
     fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    fn final_block_hash(&self) -> u64 {
+        self.final_block_hash
     }
 
     fn tokens(&self) -> &[u32] {
@@ -927,32 +938,25 @@ impl Qwen35MoeInner {
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> Option<Vec<Qwen3_5LayerCache>> {
-        let final_block_hash = compute_paged_prefix_block_hash(
+    ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
+        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
+            &self.gdn_prefix_checkpoints,
+            &self.active_cache_owner_id,
             tokens,
             prefix_len,
             block_size,
             extra_keys_per_block,
             cache_salt,
+            |checkpoint| moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
         )?;
-        let prefix_len_usize = prefix_len as usize;
-        let prefix_tokens = tokens.get(..prefix_len_usize)?;
-
-        let checkpoint_idx = self.gdn_prefix_checkpoints.iter().rposition(|checkpoint| {
-            checkpoint.owner_id == self.active_cache_owner_id
-                && checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens.as_slice() == prefix_tokens
-                && moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-        })?;
+        let restored_prefix_len = self.gdn_prefix_checkpoints[checkpoint_idx].prefix_len;
         let caches = clone_moe_linear_layer_caches(
             &self.config,
             &self.gdn_prefix_checkpoints[checkpoint_idx].caches,
         )?;
         let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
         self.gdn_prefix_checkpoints.push_back(checkpoint);
-        Some(caches)
+        Some((restored_prefix_len, caches))
     }
 
     pub(super) fn remember_moe_gdn_materialized_prefix_checkpoint(
@@ -1159,13 +1163,44 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
         );
-        if let Some(checkpoint) = prefix_checkpoint {
-            self.caches = Some(checkpoint);
-            return Ok(finish("checkpoint", cached_prefix_len, 0));
+        if let Some((restored_prefix_len, checkpoint)) = prefix_checkpoint {
+            let replayed_prefix_len = cached_prefix_len
+                .checked_sub(restored_prefix_len)
+                .ok_or_else(|| {
+                    Error::from_reason("MoE GDN checkpoint is longer than the cached paged prefix")
+                })?;
+            if replayed_prefix_len == 0 {
+                self.caches = Some(checkpoint);
+                return Ok(finish("checkpoint", restored_prefix_len, 0));
+            }
+
+            let replay_suffix = tokens
+                .get(restored_prefix_len as usize..cached_prefix_len as usize)
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "MoE paged GDN checkpoint replay range exceeds prompt length",
+                    )
+                })?;
+            let embed = self.embedding.clone();
+            let layers = &mut self.layers;
+            replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
+                super::paged_forward::run_gdn_only_prefill_materialized(
+                    replay_suffix,
+                    &embed,
+                    layers,
+                    staged,
+                )
+            })?;
+            return Ok(finish(
+                "checkpoint_replay_materialized",
+                restored_prefix_len,
+                replayed_prefix_len,
+            ));
         }
 
-        self.caches = Some(fresh_moe_layer_caches(&self.config));
+        let fresh_caches = fresh_moe_layer_caches(&self.config);
         if cached_prefix_len == 0 {
+            self.caches = Some(fresh_caches);
             return Ok(finish("cold", 0, 0));
         }
 
@@ -1174,16 +1209,10 @@ impl Qwen35MoeInner {
             Error::from_reason("MoE paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("MoE paged GDN prefix caches not initialized"))?;
-        super::paged_forward::run_gdn_only_prefill_materialized(
-            prefix,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-        )?;
+        let layers = &mut self.layers;
+        replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
+            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+        })?;
         Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
 

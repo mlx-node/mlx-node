@@ -34,9 +34,12 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
+#[cfg(test)]
+use super::gdn_checkpoint_store::compute_paged_prefix_block_hash;
 use super::gdn_checkpoint_store::{
     GDN_PREFIX_CHECKPOINT_LIMIT, GDN_PREFIX_CHECKPOINTS_PER_OWNER, GdnCheckpointLineage,
-    compute_paged_prefix_block_hash, compute_paged_prefix_block_hashes, prune_gdn_checkpoints,
+    compute_paged_prefix_block_hashes, find_longest_valid_gdn_checkpoint_index,
+    prune_gdn_checkpoints, replay_gdn_cache_and_commit,
 };
 use super::layer_cache::Qwen3_5LayerCache;
 use super::mtp::Qwen3_5MTPModule;
@@ -231,8 +234,16 @@ impl GdnCheckpointLineage for DenseGdnPrefixCheckpoint {
         &self.owner_id
     }
 
+    fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
     fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    fn final_block_hash(&self) -> u64 {
+        self.final_block_hash
     }
 
     fn tokens(&self) -> &[u32] {
@@ -1090,22 +1101,16 @@ impl Qwen35Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Option<(u32, Vec<Qwen3_5LayerCache>)> {
-        let final_block_hash = compute_paged_prefix_block_hash(
+        let checkpoint_idx = find_longest_valid_gdn_checkpoint_index(
+            &self.gdn_prefix_checkpoints,
+            &self.active_cache_owner_id,
             tokens,
             requested_prefix_len,
             block_size,
             extra_keys_per_block,
             cache_salt,
+            |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
         )?;
-        let prefix_tokens = tokens.get(..requested_prefix_len as usize)?;
-        let checkpoint_idx = self.gdn_prefix_checkpoints.iter().rposition(|checkpoint| {
-            checkpoint.owner_id == self.active_cache_owner_id
-                && checkpoint.prefix_len == requested_prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens.as_slice() == prefix_tokens
-                && dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches))
-        })?;
         let checkpoint = &self.gdn_prefix_checkpoints[checkpoint_idx];
         let prefix_len = checkpoint.prefix_len;
         let caches = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)?;
@@ -1256,12 +1261,18 @@ impl Qwen35Inner {
                     "dense GDN prefix state prepared"
                 );
             }
-            DenseGdnPrefixPreparation {
+            let preparation = DenseGdnPrefixPreparation {
                 state,
                 already_primed: cached_prefix_len > 0,
                 restored_prefix_tokens,
                 replayed_prefix_tokens,
-            }
+            };
+            debug_assert_eq!(
+                preparation.already_primed,
+                preparation.restored_prefix_tokens > 0 || preparation.replayed_prefix_tokens > 0,
+                "dense GDN prefix preparation must account for every primed prefix"
+            );
+            preparation
         };
         let gdn_caches_ready =
             dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
@@ -1308,7 +1319,6 @@ impl Qwen35Inner {
             }
         }
 
-        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
         let prefix_checkpoint = self.find_dense_gdn_prefix_checkpoint(
             tokens,
             cached_prefix_len,
@@ -1316,15 +1326,46 @@ impl Qwen35Inner {
             extra_keys_per_block,
             cache_salt,
         );
-        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
         if let Some((restored_prefix_len, checkpoint)) = prefix_checkpoint {
-            debug_assert_eq!(restored_prefix_len, cached_prefix_len);
-            self.caches = Some(checkpoint);
-            return Ok(finish("checkpoint", restored_prefix_len, 0));
+            let replayed_prefix_len = cached_prefix_len
+                .checked_sub(restored_prefix_len)
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "dense GDN checkpoint is longer than the cached paged prefix",
+                    )
+                })?;
+            if replayed_prefix_len == 0 {
+                self.caches = Some(checkpoint);
+                return Ok(finish("checkpoint", restored_prefix_len, 0));
+            }
+
+            let replay_suffix = tokens
+                .get(restored_prefix_len as usize..cached_prefix_len as usize)
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "dense paged GDN checkpoint replay range exceeds prompt length",
+                    )
+                })?;
+            let embed = self.embedding.clone();
+            let layers = &mut self.layers;
+            replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
+                super::paged_forward::run_gdn_only_prefill_materialized(
+                    replay_suffix,
+                    &embed,
+                    layers,
+                    staged,
+                )
+            })?;
+            return Ok(finish(
+                "checkpoint_replay_materialized",
+                restored_prefix_len,
+                replayed_prefix_len,
+            ));
         }
 
-        self.caches = Some(fresh_dense_layer_caches(&self.config));
+        let fresh_caches = fresh_dense_layer_caches(&self.config);
         if cached_prefix_len == 0 {
+            self.caches = Some(fresh_caches);
             return Ok(finish("cold", 0, 0));
         }
 
@@ -1332,17 +1373,10 @@ impl Qwen35Inner {
             Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("dense paged GDN prefix caches not initialized"))?;
-        super::paged_forward::run_gdn_only_prefill_materialized(
-            prefix,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-        )?;
-        let _ = prefix_lookup_ms;
+        let layers = &mut self.layers;
+        replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
+            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+        })?;
         Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
 
@@ -11586,9 +11620,10 @@ mod paged_construction_tests {
         adapter.release_request().expect("release_request");
     }
 
-    /// Regression coverage for Pi-style agent turns: normal full prefill must
-    /// retain exact GDN state at the final complete paged block (32 of 33
-    /// tokens here), and the token/hash lookup must restore that sidecar.
+    /// Regression coverage for Pi-style agent turns: a block-aligned prefill
+    /// must retain GDN state at the largest reusable paged-block boundary (16
+    /// of 32 tokens here). A one-block rollback restores exactly, while a
+    /// full-boundary hit replays only one GDN block.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_dense_paged_prefill_captures_exact_gdn_block_checkpoint() {
@@ -11599,7 +11634,7 @@ mod paged_construction_tests {
         };
         cast_qwen35_inner_weights_bf16(&mut inner);
 
-        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 13 + 9) % 257).collect();
+        let prompt: Vec<u32> = (0u32..32).map(|i| (i * 13 + 9) % 257).collect();
         reset_paged_request(&mut inner, &prompt);
 
         let (logits, checkpoint) = run_dense_paged_prefill_with_size_and_checkpoint(
@@ -11608,8 +11643,8 @@ mod paged_construction_tests {
         .expect("dense paged checkpoint prefill");
         assert_finite_vocab_logits(&logits, cfg.vocab_size, "checkpoint prefill logits");
 
-        let checkpoint = checkpoint.expect("final full-block GDN checkpoint");
-        assert_eq!(checkpoint.prefix_len, 32);
+        let checkpoint = checkpoint.expect("stable reusable-block GDN checkpoint");
+        assert_eq!(checkpoint.prefix_len, 16);
         assert!(dense_paged_linear_caches_ready(
             &inner.config,
             Some(&checkpoint.caches)
@@ -11631,26 +11666,34 @@ mod paged_construction_tests {
         inner.active_cache_owner_id = "child-session".to_owned();
         assert!(
             inner
-                .find_dense_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, 0)
+                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
                 .is_none(),
             "an exact token/hash checkpoint owned by another session must not restore"
         );
         inner.active_cache_owner_id.clear();
         let restored = inner
-            .find_dense_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, 0)
+            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
             .expect("exact checkpoint restore");
-        assert_eq!(restored.0, 32);
+        assert_eq!(restored.0, 16);
         assert!(dense_paged_linear_caches_ready(
             &inner.config,
             Some(&restored.1)
         ));
         let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
-            .expect("prepare exact checkpoint");
+            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, 0, false)
+            .expect("prepare one-block rollback checkpoint");
         assert_eq!(prepared.state, "checkpoint");
         assert!(prepared.already_primed);
-        assert_eq!(prepared.restored_prefix_tokens, 32);
+        assert_eq!(prepared.restored_prefix_tokens, 16);
         assert_eq!(prepared.replayed_prefix_tokens, 0);
+
+        let prepared = inner
+            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
+            .expect("prepare full-boundary hit from stable checkpoint");
+        assert_eq!(prepared.state, "checkpoint_replay_materialized");
+        assert!(prepared.already_primed);
+        assert_eq!(prepared.restored_prefix_tokens, 16);
+        assert_eq!(prepared.replayed_prefix_tokens, 16);
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);

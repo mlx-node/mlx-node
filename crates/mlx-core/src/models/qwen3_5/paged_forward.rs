@@ -153,9 +153,15 @@ pub(crate) fn snapshot_materialized_linear_layer_caches(
     Some(snapshot)
 }
 
-/// The paged prefix cache only publishes complete blocks. Capturing GDN state
-/// at the same final full-block boundary makes the next turn's usual prefix
-/// hit an exact sidecar restore instead of an O(total-history) GDN replay.
+/// Return the largest complete paged-block boundary strictly before the end of
+/// the prompt.
+///
+/// Production prefix lookup is capped at `prompt.len() - 1` so at least one
+/// suffix token remains for prefill. Mirroring that cap here keeps the GDN
+/// sidecar on a boundary the next turn can actually restore. This differs from
+/// the final complete block only when the prompt itself is block-aligned; in
+/// that case it deliberately backs off one block instead of publishing an
+/// unreachable checkpoint.
 pub(crate) fn gdn_checkpoint_target(
     full_tokens_len: usize,
     cached_prefix_len: u32,
@@ -165,7 +171,8 @@ pub(crate) fn gdn_checkpoint_target(
         return None;
     }
     let full_tokens_len = u32::try_from(full_tokens_len).ok()?;
-    let target = full_tokens_len / block_size * block_size;
+    let max_cache_hit_tokens = full_tokens_len.checked_sub(1)?;
+    let target = max_cache_hit_tokens / block_size * block_size;
     (target > cached_prefix_len).then_some(target)
 }
 
@@ -328,8 +335,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     }
 
     // Preserve the public `0 = legacy single-shot` contract. Capturing a
-    // block-boundary sidecar requires splitting before a trailing partial
-    // block, so it is intentionally available only when chunking is enabled.
+    // sidecar at the stable reusable-block boundary may require splitting
+    // before the final chunk, so it is intentionally available only when
+    // chunking is enabled.
     if chunk_size <= 0 {
         return run_paged_prefill_single_shot(
             full_tokens,
@@ -1526,20 +1534,39 @@ mod gdn_checkpoint_tests {
     }
 
     #[test]
-    fn checkpoint_target_is_final_complete_block() {
+    fn checkpoint_target_matches_largest_reusable_block_boundary() {
         assert_eq!(gdn_checkpoint_target(37, 0, 16), Some(32));
-        assert_eq!(gdn_checkpoint_target(32, 0, 16), Some(32));
+        assert_eq!(gdn_checkpoint_target(33, 0, 16), Some(32));
+        assert_eq!(gdn_checkpoint_target(32, 0, 16), Some(16));
+        assert_eq!(gdn_checkpoint_target(17, 0, 16), Some(16));
         assert_eq!(gdn_checkpoint_target(37, 16, 16), Some(32));
-        assert_eq!(gdn_checkpoint_target(31, 16, 16), None);
+        assert_eq!(gdn_checkpoint_target(37, 32, 16), None);
+        assert_eq!(gdn_checkpoint_target(37, 33, 16), None);
+        assert_eq!(gdn_checkpoint_target(32, 16, 16), None);
         assert_eq!(gdn_checkpoint_target(16, 16, 16), None);
+        assert_eq!(gdn_checkpoint_target(16, 0, 16), None);
+        assert_eq!(gdn_checkpoint_target(1, 0, 16), None);
+        assert_eq!(gdn_checkpoint_target(0, 0, 16), None);
         assert_eq!(gdn_checkpoint_target(37, 0, 0), None);
+
+        // These block-aligned boundaries are the three costly rollback cases
+        // observed in the live agent trace.
+        assert_eq!(gdn_checkpoint_target(41_216, 0, 16), Some(41_200));
+        assert_eq!(gdn_checkpoint_target(45_360, 0, 16), Some(45_344));
+        assert_eq!(gdn_checkpoint_target(47_488, 0, 16), Some(47_472));
     }
 
     #[test]
     fn prefill_ranges_split_at_checkpoint_inside_chunk() {
-        let ranges = paged_prefill_ranges(37, 2048, Some(32));
+        let non_aligned_target = gdn_checkpoint_target(37, 0, 16);
+        let ranges = paged_prefill_ranges(37, 2048, non_aligned_target.map(|v| v as usize));
         assert_eq!(ranges, vec![0..32, 32..37]);
         assert_contiguous_cover(&ranges, 37);
+
+        let aligned_target = gdn_checkpoint_target(32, 0, 16);
+        let ranges = paged_prefill_ranges(32, 2048, aligned_target.map(|v| v as usize));
+        assert_eq!(ranges, vec![0..16, 16..32]);
+        assert_contiguous_cover(&ranges, 32);
 
         // Cached prefix 16, full prompt 37: checkpoint 32 is suffix offset 16.
         let ranges = paged_prefill_ranges(21, 2048, Some(16));

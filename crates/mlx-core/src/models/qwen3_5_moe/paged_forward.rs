@@ -114,9 +114,10 @@ fn run_gdn_only_prefill_materialized_with_chunk_size(
 ///
 /// Reads `MLX_PAGED_PREFILL_CHUNK_SIZE` once and forwards into the
 /// chunk-size-parameterized worker. Positive chunk sizes split the suffix at
-/// both the configured chunk limit and the final complete paged-block
-/// boundary, so the caller can retain exact GDN state for the reusable KV
-/// prefix. Each chunk runs through every layer
+/// both the configured chunk limit and the largest complete paged-block
+/// boundary strictly before the prompt end, matching the prefix lookup's
+/// `prompt.len() - 1` cap. The caller can therefore retain GDN state for a KV
+/// prefix the next turn can actually reuse. Each chunk runs through every layer
 /// (GDN linear-attention layers' recurrent state propagates in-place
 /// across chunks; full-attention layers write K/V into the paged
 /// pool). The hidden state is materialized + the MLX cache cleared
@@ -205,7 +206,7 @@ pub(crate) fn run_paged_prefill_chunk_with_checkpoint(
 ///
 /// `chunk_size <= 0` takes the legacy single-shot path
 /// (`run_paged_prefill_single_shot`). Positive sizes use the single-shot path
-/// only when the suffix fits and there is no full-block GDN checkpoint to
+/// only when the suffix fits and there is no reusable-block GDN checkpoint to
 /// capture; otherwise the worker splits at both chunk and checkpoint
 /// boundaries.
 ///
@@ -1295,9 +1296,9 @@ mod tests {
         assert_logit_parity_relaxed(&single_vec, &chunked_vec, "MoE chunked-vs-single-shot");
     }
 
-    /// A short suffix still splits at the final complete paged block so the
-    /// next agent turn can restore exact GDN state instead of replaying the
-    /// full cached prefix.
+    /// A block-aligned prompt snapshots one block before its end, matching the
+    /// prefix lookup's `prompt.len() - 1` cap. A one-block rollback therefore
+    /// restores exactly, while a full-boundary hit replays only one GDN block.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn test_moe_paged_prefill_captures_exact_gdn_block_checkpoint() {
@@ -1311,7 +1312,7 @@ mod tests {
             .expect("initialize paged adapter");
         cast_moe_inner_weights_bf16(&mut inner);
 
-        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 13 + 9) % 128).collect();
+        let prompt: Vec<u32> = (0u32..32).map(|i| (i * 13 + 9) % 128).collect();
         let single_shot_logits = run_one(&mut inner, &prompt, 0)
             .expect("single-shot prefill")
             .expect("Metal-backed single-shot logits");
@@ -1362,12 +1363,12 @@ mod tests {
             assert_logit_parity_relaxed(
                 &single_shot_logits,
                 &checkpoint_logits,
-                "MoE 32+1 checkpoint split vs single-shot",
+                "MoE stable checkpoint split vs single-shot",
             );
         }
 
-        let checkpoint = checkpoint.expect("final complete-block GDN checkpoint");
-        assert_eq!(checkpoint.prefix_len, 32);
+        let checkpoint = checkpoint.expect("stable reusable-block GDN checkpoint");
+        assert_eq!(checkpoint.prefix_len, 16);
         for (layer, cache) in inner.layers.iter().zip(&checkpoint.caches) {
             if !layer.is_linear() {
                 continue;
@@ -1400,23 +1401,32 @@ mod tests {
         );
         assert!(
             inner
-                .find_moe_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, cache_salt,)
+                .find_moe_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt,)
                 .is_none(),
             "an exact token/hash checkpoint owned by another session must not restore"
         );
         crate::engine::backend::ChatBackend::set_cache_owner_id(&mut inner, "", None);
         let restored = inner
-            .find_moe_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, cache_salt)
+            .find_moe_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt)
             .expect("exact checkpoint restore");
-        assert_eq!(restored.len(), inner.layers.len());
+        assert_eq!(restored.0, 16);
+        assert_eq!(restored.1.len(), inner.layers.len());
+
+        let prepared = inner
+            .prepare_moe_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, cache_salt, false)
+            .expect("prepare one-block rollback checkpoint");
+        assert_eq!(prepared.state, "checkpoint");
+        assert!(prepared.already_primed);
+        assert_eq!(prepared.restored_prefix_tokens, 16);
+        assert_eq!(prepared.replayed_prefix_tokens, 0);
 
         let prepared = inner
             .prepare_moe_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, cache_salt, false)
-            .expect("prepare exact checkpoint");
-        assert_eq!(prepared.state, "checkpoint");
+            .expect("prepare full-boundary hit from stable checkpoint");
+        assert_eq!(prepared.state, "checkpoint_replay_materialized");
         assert!(prepared.already_primed);
-        assert_eq!(prepared.restored_prefix_tokens, 32);
-        assert_eq!(prepared.replayed_prefix_tokens, 0);
+        assert_eq!(prepared.restored_prefix_tokens, 16);
+        assert_eq!(prepared.replayed_prefix_tokens, 16);
 
         let mut mutated_prompt = prompt.clone();
         mutated_prompt[7] ^= 1;
@@ -1424,7 +1434,7 @@ mod tests {
             inner
                 .find_moe_gdn_prefix_checkpoint(
                     &mutated_prompt,
-                    32,
+                    16,
                     block_size,
                     &extra_keys,
                     cache_salt,
@@ -1436,7 +1446,7 @@ mod tests {
             inner
                 .find_moe_gdn_prefix_checkpoint(
                     &prompt,
-                    32,
+                    16,
                     block_size,
                     &extra_keys,
                     cache_salt + 1,
