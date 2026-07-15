@@ -22,6 +22,7 @@ import { workerAssetUrl } from '../src/worker-asset-url.js';
 import { InlinePreviewCard } from './components/chat/InlinePreviewCard';
 import { type LoadingProgress } from './components/loading/Loading';
 import { BrowserChatSessionAdapter, type BrowserChatMessage } from './lib/browser-chat-session';
+import { canAutoLoadModel } from './lib/device-capability';
 import { type ProfileLikeStats, type ReasoningEffort, cycleReasoningEffort } from './lib/display-helpers';
 import { deriveModelLoaderStatus, isClearableLoadError } from './lib/model-loader-state';
 import { FreeChatProvider, type FreeChatContextValue } from './providers/free-chat';
@@ -2081,6 +2082,12 @@ function App() {
   }, [modelReady]);
 
   const kickoffLoad = useCallback(() => {
+    // Hard safety net: never start a load on a device that would OOM/crash the
+    // tab (iOS Safari's ~2 GB cap, low-RAM, no WebGPU). This backstops EVERY
+    // entry point — the auto-kickoff effects, the landing "Load model" button,
+    // the chat overlay, and retries — so no gesture can trigger the crash. The
+    // relevant surfaces (ModelConsentLayer) show a "run on desktop" message.
+    if (!canAutoLoadModel()) return;
     // Mirror the prior Landing/ChapterIndex/LessonLayout handlers so route
     // components only need to call kickoffLoad() (instead of inlining the
     // state reset). Allow a new kickoff only when status is 'idle' or 'error'
@@ -2136,6 +2143,10 @@ function App() {
   // device-only Retry through kickoffLoad would instead trigger a full ~1.6 GB
   // model download, which is wrong for a DEVICE_ONLY chapter.
   const kickoffDeviceOnly = useCallback(() => {
+    // Same hard safety net as kickoffLoad: a blocked device (iOS Safari,
+    // low-RAM, no WebGPU) never even brings the WebGPU device up, since the
+    // shared-memory / device init can itself OOM-kill the tab there.
+    if (!canAutoLoadModel()) return;
     if (modelReadyRef.current) return; // full model up -> device already up
     const hasError = errorBannerRef.current != null;
     // No error and a bring-up already happened (in-flight or complete) -> no-op.

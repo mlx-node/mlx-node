@@ -8,6 +8,7 @@ import { useNavigate } from '@tanstack/react-router';
 import * as React from 'react';
 
 import { Landing } from '../../components/landing/Landing';
+import { detectModelBlockReason } from '../../lib/device-capability';
 import { storeLocale } from '../../lib/i18n';
 import { useLocale } from '../../lib/i18n-react';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
@@ -69,6 +70,7 @@ export function LandingPage() {
       errorBanner={errorBanner}
       hostedModelAvailable={hostedModelAvailable}
       modelReady={status === 'ready'}
+      modelBlockReason={detectModelBlockReason()}
     />
   );
 }

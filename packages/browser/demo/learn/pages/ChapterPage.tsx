@@ -13,6 +13,7 @@ import { useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 
 import { ModelConsentLayer } from '../../components/loading/ModelConsentLayer';
+import { canAutoLoadModel } from '../../lib/device-capability';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
 import { useLocale } from '../../lib/i18n-react';
 import { useLocaleNavigate } from '../../lib/locale-navigate';
@@ -98,6 +99,10 @@ export function ChapterPage({ chapter }: { chapter: ChapterMeta }) {
   // CTA stays as the manual fallback (notably the local-picker path above).
   useEffect(() => {
     if (status !== 'idle') return;
+    // Devices that would OOM/crash (iOS Safari, low-RAM, no WebGPU) never
+    // auto-start a load — ModelConsentLayer shows a "run on desktop" message
+    // instead. Desktops are unaffected (canAutoLoadModel() === true).
+    if (!canAutoLoadModel()) return;
     if (isDeviceOnlyChapter) {
       kickoffDeviceOnly();
     } else if (isModelPanelChapter && hostedModelAvailable === true) {

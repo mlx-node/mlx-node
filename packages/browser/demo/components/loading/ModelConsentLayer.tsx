@@ -17,9 +17,11 @@
 
 import type { ReactNode } from 'react';
 
+import { detectModelBlockReason } from '../../lib/device-capability';
 import type { Locale } from '../../lib/i18n';
 import { useLocale } from '../../lib/i18n-react';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
+import { modelBlockedDetail, modelBlockedTitle } from '../../lib/model-blocked-copy';
 import { type ConsentMode, selectConsentLayerState } from '../../lib/model-loader-state';
 import { useModelLoader } from '../../providers/model-loader';
 import { PanelLoading } from './PanelLoading';
@@ -110,6 +112,22 @@ export function ModelConsentLayer({ mode, children }: ModelConsentLayerProps) {
   // preserving the invariant that demos see a live worker at mount.
   if (state === 'ready') {
     return <>{children}</>;
+  }
+
+  // Blocked device (iOS Safari / low-RAM / no WebGPU): the auto-kickoff was
+  // suppressed (see ChapterPage/ChaptersHubPage), so a load is NOT coming and
+  // the 'prompt'→'loading' spinner below would spin forever. Explain instead,
+  // and make clear the prose still works. Desktops return null here (no gate).
+  const blockReason = detectModelBlockReason();
+  if (blockReason) {
+    return (
+      <div className="flex flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-5">
+        <p className="text-sm font-medium text-foreground">{modelBlockedTitle(locale)}</p>
+        <p className="max-w-prose text-xs leading-relaxed text-muted-foreground">
+          {modelBlockedDetail(locale, blockReason)}
+        </p>
+      </div>
+    );
   }
 
   const copy = COPY[locale][mode];

@@ -16,6 +16,7 @@
 import { useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 
+import { canAutoLoadModel } from '../../lib/device-capability';
 import { triggerLocalPicker } from '../../lib/local-model-picker';
 import { useLocaleNavigate } from '../../lib/locale-navigate';
 import { useFreeChat } from '../../providers/free-chat';
@@ -36,6 +37,10 @@ export function ChaptersHubPage() {
   // gesture). kickoffLoad is idempotent, so a re-run is harmless.
   useEffect(() => {
     if (status !== 'idle') return;
+    // Never auto-start the load on a device that would OOM/crash (iOS Safari,
+    // low-RAM, no WebGPU). ModelConsentLayer shows a "run on desktop" message
+    // there instead. Desktops are unaffected (canAutoLoadModel() === true).
+    if (!canAutoLoadModel()) return;
     if (hostedModelAvailable === true) kickoffLoad();
   }, [status, hostedModelAvailable, kickoffLoad]);
 

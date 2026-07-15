@@ -1,5 +1,8 @@
 import { CHAPTERS } from '../../learn/chapters';
 import { useUiStrings } from '../../learn/i18n/ui-react';
+import type { ModelBlockReason } from '../../lib/device-capability';
+import { useLocale } from '../../lib/i18n-react';
+import { modelBlockedShort } from '../../lib/model-blocked-copy';
 import { LanguageSwitcher } from '../LanguageSwitcher';
 import { DriftingLibrary } from './DriftingLibrary';
 
@@ -11,6 +14,10 @@ export type LandingProps = {
   errorBanner: string | null;
   hostedModelAvailable?: boolean | null;
   loadDisabled?: boolean;
+  /** Non-null when this device can't run the in-browser model (iOS Safari,
+   *  low-RAM, no WebGPU). We disable the "Load model" CTA and show a short
+   *  "open on desktop" note instead of a button that silently no-ops. */
+  modelBlockReason?: ModelBlockReason;
   /** When true, the model is already loaded in the worker. We flip the
    *  primary CTA label to "Open Chat →" so a returning user (or anyone
    *  who already loaded the model on a previous visit and got cached
@@ -30,8 +37,11 @@ export function Landing({
   hostedModelAvailable = null,
   loadDisabled = false,
   modelReady = false,
+  modelBlockReason = null,
 }: LandingProps) {
   const ui = useUiStrings();
+  const locale = useLocale();
+  const blocked = modelBlockReason != null;
 
   const primaryLabel =
     hostedModelAvailable === false ? (
@@ -89,7 +99,7 @@ export function Landing({
             type="button"
             className="btn-load"
             onClick={onLoad}
-            disabled={loadDisabled || hostedModelAvailable === null}
+            disabled={loadDisabled || hostedModelAvailable === null || blocked}
           >
             {hostedModelAvailable === null ? ui.landing.checkingModel : primaryLabel}
           </button>
@@ -99,11 +109,12 @@ export function Landing({
             title={ui.landing.localPickerTitle}
             aria-label={ui.landing.localPickerTitle}
             onClick={onLocalModel}
-            disabled={loadDisabled}
+            disabled={loadDisabled || blocked}
           >
             ▾
           </button>
         </div>
+        {blocked && <p className="landing-learn-hint">{modelBlockedShort(locale)}</p>}
 
         <button type="button" className="btn-start-learning" onClick={onStartLearning}>
           {ui.landing.startLearning}
