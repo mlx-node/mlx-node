@@ -137,9 +137,15 @@ export function Landing({
       <div className="landing-footer">
         {ui.landing.builtWith} <code>@mlx-node/browser</code>
         <span className="landing-footer-void">{ui.landing.hostedOnVoid}</span>
-        <span className="local-link" onClick={onLocalModel}>
-          {ui.landing.localModelLink}
-        </span>
+        {/* The local-model picker starts the same WebGPU load, so a blocked
+            device (iOS/low-RAM/no-WebGPU) can't use it — hide this footer link
+            there so it isn't a dead affordance. The blocked hint under the CTA
+            already tells the user to open the page on a desktop. */}
+        {!blocked && (
+          <span className="local-link" onClick={onLocalModel}>
+            {ui.landing.localModelLink}
+          </span>
+        )}
       </div>
     </div>
   );

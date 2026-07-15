@@ -396,6 +396,13 @@ function App() {
     const source = modelSourceFromLocalFiles(Array.from(event.currentTarget.files ?? []));
     event.currentTarget.value = '';
     if (!source) return;
+    // Hard safety net: never start the heavy WebGPU load on a device that would
+    // OOM-crash the tab (iOS Safari's ~2 GB cap, low-RAM, no WebGPU) — even via a
+    // local-model pick. This is the THIRD (and only other) setLoadKickoff site;
+    // kickoffLoad and kickoffDeviceOnly already early-return here, so gating this
+    // one closes the last load path. triggerLocalPicker is gated too, but this
+    // backstops the trigger itself (the picker's <input> could fire regardless).
+    if (!canAutoLoadModel()) return;
     // This init is meant to LOAD A MODEL. If a DEVICE_ONLY chapter (Training)
     // previously brought the device up in device-only mode, deviceOnlyRef is
     // still true; clear it BEFORE bumping the kickoff so startWorker reads

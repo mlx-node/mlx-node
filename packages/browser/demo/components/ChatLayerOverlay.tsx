@@ -9,7 +9,10 @@
 // Wired in Phase 2.C alongside the RouterProvider mount. Visibility is
 // controlled from __root.tsx based on the current pathname (=== '/chat').
 
+import { detectModelBlockReason } from '../lib/device-capability';
+import { useLocale } from '../lib/i18n-react';
 import { triggerLocalPicker } from '../lib/local-model-picker';
+import { modelBlockedDetail, modelBlockedTitle } from '../lib/model-blocked-copy';
 import { useFreeChat } from '../providers/free-chat';
 import { useModelLoader } from '../providers/model-loader';
 import { useTelemetry } from '../providers/telemetry';
@@ -44,12 +47,19 @@ export function ChatLayerOverlay({ visible }: { visible: boolean }) {
   } = useFreeChat();
   const { stats, prefillTokensPerSecond, decodeTokensPerSecond, modelLine } = useTelemetry();
   const { status, loadingText, loadingProgress, hostedModelAvailable, kickoffLoad } = useModelLoader();
+  const locale = useLocale();
 
   // The chat needs the full model. Opening /chat no longer auto-downloads it,
   // so when it isn't ready we surface an explicit "Load model to chat"
   // affordance (or a loading panel) over the message area rather than leaving
   // the composer silently disabled.
   const modelReady = status === 'ready';
+
+  // On a device that can't run the model (iOS Safari, low-RAM, no WebGPU) every
+  // load path early-returns, so the "Load model" button below would be a silent
+  // no-op. Show the same "run on desktop" explanation the chapter demos and the
+  // landing use, instead of a dead button. Null on desktop → no change.
+  const blockReason = detectModelBlockReason();
 
   return (
     <div className={`chat-layer ${visible ? 'visible' : ''}`}>
@@ -65,7 +75,14 @@ export function ChatLayerOverlay({ visible }: { visible: boolean }) {
         */}
         {!modelReady ? (
           <div className="shrink-0 px-4 pt-4">
-            {status === 'loading' ? (
+            {blockReason ? (
+              <div className="mx-auto flex max-w-md flex-col items-start gap-3 rounded-lg border border-border bg-muted/20 p-6">
+                <p className="text-sm font-medium text-foreground">{modelBlockedTitle(locale)}</p>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {modelBlockedDetail(locale, blockReason)}
+                </p>
+              </div>
+            ) : status === 'loading' ? (
               <PanelLoading status={loadingText || null} progress={loadingProgress} />
             ) : (
               <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-lg border border-border bg-muted/20 p-6 text-center">
