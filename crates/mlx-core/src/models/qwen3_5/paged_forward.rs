@@ -120,7 +120,7 @@ pub(crate) struct MaterializedGdnPrefixCheckpoint {
     pub(crate) caches: Vec<Qwen3_5LayerCache>,
 }
 
-fn materialize_linear_layer_caches(caches: &[Qwen3_5LayerCache]) -> Result<()> {
+pub(crate) fn materialize_linear_layer_caches(caches: &[Qwen3_5LayerCache]) -> Result<()> {
     let mut arrays = Vec::new();
     for cache in caches {
         if matches!(cache, Qwen3_5LayerCache::Linear(_)) {
@@ -133,7 +133,7 @@ fn materialize_linear_layer_caches(caches: &[Qwen3_5LayerCache]) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_materialized_linear_layer_caches(
+pub(crate) fn snapshot_materialized_linear_layer_caches(
     caches: &[Qwen3_5LayerCache],
 ) -> Option<Vec<Qwen3_5LayerCache>> {
     let mut snapshot = Vec::with_capacity(caches.len());
@@ -156,7 +156,7 @@ fn snapshot_materialized_linear_layer_caches(
 /// The paged prefix cache only publishes complete blocks. Capturing GDN state
 /// at the same final full-block boundary makes the next turn's usual prefix
 /// hit an exact sidecar restore instead of an O(total-history) GDN replay.
-fn gdn_checkpoint_target(
+pub(crate) fn gdn_checkpoint_target(
     full_tokens_len: usize,
     cached_prefix_len: u32,
     block_size: u32,
@@ -169,7 +169,7 @@ fn gdn_checkpoint_target(
     (target > cached_prefix_len).then_some(target)
 }
 
-fn paged_prefill_ranges(
+pub(crate) fn paged_prefill_ranges(
     suffix_len: usize,
     chunk_size: usize,
     checkpoint_suffix_offset: Option<usize>,

@@ -13,6 +13,10 @@ use crate::engine::vision::VisionMerge;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
+use crate::models::qwen3_5::paged_forward::{
+    MaterializedGdnPrefixCheckpoint, gdn_checkpoint_target, materialize_linear_layer_caches,
+    paged_prefill_ranges, snapshot_materialized_linear_layer_caches,
+};
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
@@ -62,12 +66,57 @@ pub(crate) fn run_gdn_only_prefill(
     Ok(())
 }
 
+/// Replay a GDN prefix in bounded chunks and materialize recurrent state after
+/// each chunk. This remains O(prefix) on a checkpoint miss, but avoids folding
+/// one unbounded lazy replay graph into the first suffix evaluation.
+pub(crate) fn run_gdn_only_prefill_materialized(
+    prefix_tokens: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+) -> Result<()> {
+    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
+    let chunk_size = if configured_chunk_size > 0 {
+        configured_chunk_size as usize
+    } else {
+        2048
+    };
+    run_gdn_only_prefill_materialized_with_chunk_size(
+        prefix_tokens,
+        embed,
+        layers,
+        caches,
+        chunk_size,
+    )
+}
+
+fn run_gdn_only_prefill_materialized_with_chunk_size(
+    prefix_tokens: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    chunk_size: usize,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(Error::from_reason(
+            "MoE GDN materialized replay chunk size must be positive",
+        ));
+    }
+    for chunk in prefix_tokens.chunks(chunk_size) {
+        run_gdn_only_prefill(chunk, embed, layers, caches)?;
+        materialize_linear_layer_caches(caches)?;
+        crate::array::synchronize_and_clear_cache();
+    }
+    Ok(())
+}
+
 /// Public entry point for paged prefill of a (cached_prefix + suffix) pair.
 ///
 /// Reads `MLX_PAGED_PREFILL_CHUNK_SIZE` once and forwards into the
-/// chunk-size-parameterized worker. When `chunk_size > 0` AND
-/// `suffix_tokens.len() > chunk_size`, the suffix is sliced into
-/// `chunk_size`-token chunks; each chunk runs through every layer
+/// chunk-size-parameterized worker. Positive chunk sizes split the suffix at
+/// both the configured chunk limit and the final complete paged-block
+/// boundary, so the caller can retain exact GDN state for the reusable KV
+/// prefix. Each chunk runs through every layer
 /// (GDN linear-attention layers' recurrent state propagates in-place
 /// across chunks; full-attention layers write K/V into the paged
 /// pool). The hidden state is materialized + the MLX cache cleared
@@ -83,6 +132,7 @@ pub(crate) fn run_gdn_only_prefill(
 /// `MLX_PAGED_PREFILL_CHUNK_SIZE=1024` the per-chunk working set
 /// drops to ~1024 * hidden_dim, dramatically reducing peak memory.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn run_paged_prefill_chunk(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
@@ -98,8 +148,42 @@ pub(crate) fn run_paged_prefill_chunk(
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
 ) -> Result<MxArray> {
+    run_paged_prefill_chunk_with_checkpoint(
+        full_tokens,
+        suffix_tokens,
+        cached_prefix_len,
+        gdn_prefix_already_primed,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight,
+        layer_kinds,
+        paged_adapter,
+        cached_rope_deltas,
+    )
+    .map(|(logits, _)| logits)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_paged_prefill_chunk_with_checkpoint(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    cached_rope_deltas: i32,
+) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     let chunk_size = crate::array::paged_prefill_chunk_size();
-    run_paged_prefill_chunk_with_size(
+    run_paged_prefill_chunk_with_size_and_checkpoint(
         full_tokens,
         suffix_tokens,
         cached_prefix_len,
@@ -119,9 +203,11 @@ pub(crate) fn run_paged_prefill_chunk(
 
 /// Chunk-size-parameterized worker for `run_paged_prefill_chunk`.
 ///
-/// `chunk_size <= 0` OR `suffix_tokens.len() <= chunk_size` takes the
-/// legacy single-shot path (`run_paged_prefill_single_shot`). Anything
-/// else loops over `suffix_tokens.chunks(chunk_size)`.
+/// `chunk_size <= 0` takes the legacy single-shot path
+/// (`run_paged_prefill_single_shot`). Positive sizes use the single-shot path
+/// only when the suffix fits and there is no full-block GDN checkpoint to
+/// capture; otherwise the worker splits at both chunk and checkpoint
+/// boundaries.
 ///
 /// Critical correctness notes:
 ///
@@ -154,6 +240,7 @@ pub(crate) fn run_paged_prefill_chunk(
 ///      adapter's cursor is `P + chunk.len()` after; the layer's K/V
 ///      write goes to slots `[P, P+chunk.len())`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn run_paged_prefill_chunk_with_size(
     full_tokens: &[u32],
     suffix_tokens: &[u32],
@@ -170,6 +257,42 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     chunk_size: i32,
     cached_rope_deltas: i32,
 ) -> Result<MxArray> {
+    run_paged_prefill_chunk_with_size_and_checkpoint(
+        full_tokens,
+        suffix_tokens,
+        cached_prefix_len,
+        gdn_prefix_already_primed,
+        embed,
+        layers,
+        caches,
+        final_norm,
+        lm_head,
+        embedding_weight,
+        layer_kinds,
+        paged_adapter,
+        chunk_size,
+        cached_rope_deltas,
+    )
+    .map(|(logits, _)| logits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paged_prefill_chunk_with_size_and_checkpoint(
+    full_tokens: &[u32],
+    suffix_tokens: &[u32],
+    cached_prefix_len: u32,
+    gdn_prefix_already_primed: bool,
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    final_norm: &RMSNorm,
+    lm_head: &Option<LinearProj>,
+    embedding_weight: &MxArray,
+    layer_kinds: &[Qwen3_5LayerKind],
+    paged_adapter: &mut PagedKVCacheAdapter,
+    chunk_size: i32,
+    cached_rope_deltas: i32,
+) -> Result<(MxArray, Option<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
             "MoE run_paged_prefill_chunk called with empty suffix",
@@ -178,7 +301,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
 
     let trace_enabled = inference_trace_enabled();
 
-    if chunk_size <= 0 || suffix_tokens.len() <= chunk_size as usize {
+    if chunk_size <= 0 {
         return run_paged_prefill_single_shot(
             full_tokens,
             suffix_tokens,
@@ -193,10 +316,35 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
-        );
+        )
+        .map(|logits| (logits, None));
     }
 
     let chunk_size_usize = chunk_size as usize;
+    let checkpoint_target = gdn_checkpoint_target(
+        full_tokens.len(),
+        cached_prefix_len,
+        paged_adapter.block_size(),
+    );
+
+    if checkpoint_target.is_none() && suffix_tokens.len() <= chunk_size_usize {
+        return run_paged_prefill_single_shot(
+            full_tokens,
+            suffix_tokens,
+            cached_prefix_len,
+            gdn_prefix_already_primed,
+            embed,
+            layers,
+            caches,
+            final_norm,
+            lm_head,
+            embedding_weight,
+            layer_kinds,
+            paged_adapter,
+            cached_rope_deltas,
+        )
+        .map(|logits| (logits, None));
+    }
 
     // GDN pre-pass over the cached prefix runs ONCE, before any suffix
     // chunking. The GDN linear-attention layers consume the prefix in
@@ -219,11 +367,21 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         }
     }
 
-    let total_chunks = suffix_tokens.len().div_ceil(chunk_size_usize);
+    let checkpoint_suffix_offset = checkpoint_target
+        .and_then(|target| target.checked_sub(cached_prefix_len))
+        .map(|offset| offset as usize);
+    let chunk_ranges = paged_prefill_ranges(
+        suffix_tokens.len(),
+        chunk_size_usize,
+        checkpoint_suffix_offset,
+    );
+    let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
+    let mut checkpoint = None;
     let mut chunk_start_position: u32 = cached_prefix_len;
 
-    for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+    for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
 
@@ -257,6 +415,9 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             cached_rope_deltas,
         )?;
 
+        let context_after = chunk_start_position + chunk.len() as u32;
+        let capture_checkpoint = checkpoint_target == Some(context_after);
+
         if is_last_chunk {
             // Last chunk: project final_norm + lm_head and extract
             // last-token logits.
@@ -267,6 +428,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 embed,
                 embedding_weight,
             )?);
+            if capture_checkpoint {
+                materialize_linear_layer_caches(caches)?;
+                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                    MaterializedGdnPrefixCheckpoint {
+                        prefix_len: context_after,
+                        caches,
+                    }
+                });
+            }
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
                 let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
@@ -295,6 +465,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
             // on intermediate chunks matches vLLM's `is_prefill_chunk`
             // skip — those projections would be discarded anyway.
             hidden.eval();
+            if capture_checkpoint {
+                materialize_linear_layer_caches(caches)?;
+                checkpoint = snapshot_materialized_linear_layer_caches(caches).map(|caches| {
+                    MaterializedGdnPrefixCheckpoint {
+                        prefix_len: context_after,
+                        caches,
+                    }
+                });
+            }
             crate::array::synchronize_and_clear_cache();
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);
@@ -325,17 +504,19 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         chunk_start_position += chunk.len() as u32;
     }
 
-    last_logits.ok_or_else(|| {
-        Error::from_reason(
-            "MoE chunked prefill produced no last chunk (unreachable for non-empty suffix)",
-        )
-    })
+    last_logits
+        .ok_or_else(|| {
+            Error::from_reason(
+                "MoE chunked prefill produced no last chunk (unreachable for non-empty suffix)",
+            )
+        })
+        .map(|logits| (logits, checkpoint))
 }
 
 /// Single-shot prefill: feed the entire suffix through every layer in
 /// one forward pass. Identical to the pre-chunking implementation.
-/// Used both by the legacy code path (chunk_size <= 0) and the
-/// chunked driver's "small enough to skip chunking" fast path.
+/// Used both by the legacy code path (chunk_size <= 0) and the chunked
+/// driver's fast path when no checkpoint boundary needs to be captured.
 ///
 /// The empty-suffix check is performed by the caller
 /// (`run_paged_prefill_chunk_with_size`); this helper trusts its input.
@@ -904,6 +1085,31 @@ mod tests {
             .collect()
     }
 
+    fn materialized_linear_cache_values(caches: &[Qwen3_5LayerCache]) -> Vec<Vec<f32>> {
+        let mut values = Vec::new();
+        for cache in caches {
+            let Qwen3_5LayerCache::Linear(arrays) = cache else {
+                continue;
+            };
+            for slot in 0..2 {
+                let array = arrays.get(slot).expect("materialized linear cache slot");
+                let array = array.astype(DType::Float32).expect("cache astype f32");
+                array.eval();
+                let size = array.size().expect("cache size") as usize;
+                values.push(
+                    (0..size)
+                        .map(|index| {
+                            array
+                                .item_at_float32(index)
+                                .expect("materialized cache item")
+                        })
+                        .collect(),
+                );
+            }
+        }
+        values
+    }
+
     /// Run the prefill against a freshly-reset adapter via the public
     /// `run_paged_prefill_chunk_with_size` helper. Encapsulates the
     /// boilerplate (init caches, reset adapter, allocate suffix) so
@@ -1087,6 +1293,207 @@ mod tests {
         assert_eq!(chunked_vec.len(), cfg.vocab_size as usize);
 
         assert_logit_parity_relaxed(&single_vec, &chunked_vec, "MoE chunked-vs-single-shot");
+    }
+
+    /// A short suffix still splits at the final complete paged block so the
+    /// next agent turn can restore exact GDN state instead of replaying the
+    /// full cached prefix.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_moe_paged_prefill_captures_exact_gdn_block_checkpoint() {
+        unsafe {
+            mlx_sys::mlx_seed(0xC0DEC0DE);
+        }
+        let cfg = moe_paged_tiny_config();
+        let mut inner = Qwen35MoeInner::new(cfg.clone()).expect("construct tiny MoE model");
+        inner
+            .initialize_paged_adapter()
+            .expect("initialize paged adapter");
+        cast_moe_inner_weights_bf16(&mut inner);
+
+        let prompt: Vec<u32> = (0u32..33).map(|i| (i * 13 + 9) % 128).collect();
+        let single_shot_logits = run_one(&mut inner, &prompt, 0)
+            .expect("single-shot prefill")
+            .expect("Metal-backed single-shot logits");
+
+        inner.reset_caches_sync().expect("reset MoE caches");
+        inner.init_caches_sync().expect("initialize MoE caches");
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            adapter.reset_for_new_request(0).expect("reset request");
+            let prefix = adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .expect("find cached prefix");
+            assert_eq!(prefix.cached_token_count, 0);
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32)
+                .expect("allocate suffix blocks");
+        }
+
+        let layer_kinds = compute_layer_kinds(inner.config.num_layers as usize, |i| {
+            inner.config.is_linear_layer(i)
+        });
+        let (logits, checkpoint) = {
+            let embed = inner.embedding.clone();
+            let embedding_weight = embed.get_weight();
+            let caches = inner.caches.as_mut().expect("caches");
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            super::run_paged_prefill_chunk_with_size_and_checkpoint(
+                &prompt,
+                &prompt,
+                0,
+                false,
+                &embed,
+                &mut inner.layers,
+                caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+                2048,
+                0,
+            )
+            .expect("MoE checkpoint prefill")
+        };
+        let checkpoint_logits = logits_to_f32_vec(&logits);
+        assert_eq!(checkpoint_logits.len(), cfg.vocab_size as usize);
+        if !crate::test_support::half_gemm_untrustworthy() {
+            assert_logit_parity_relaxed(
+                &single_shot_logits,
+                &checkpoint_logits,
+                "MoE 32+1 checkpoint split vs single-shot",
+            );
+        }
+
+        let checkpoint = checkpoint.expect("final complete-block GDN checkpoint");
+        assert_eq!(checkpoint.prefix_len, 32);
+        for (layer, cache) in inner.layers.iter().zip(&checkpoint.caches) {
+            if !layer.is_linear() {
+                continue;
+            }
+            let Qwen3_5LayerCache::Linear(arrays) = cache else {
+                panic!("linear layer checkpoint used a full-attention cache");
+            };
+            assert!(arrays.get(0).is_some(), "missing convolution state");
+            assert!(arrays.get(1).is_some(), "missing recurrent state");
+        }
+
+        let block_size = inner
+            .paged_adapter
+            .as_ref()
+            .expect("paged_adapter")
+            .block_size();
+        let cache_salt = 0x51DE_CAFE;
+        let extra_keys =
+            crate::engine::build_paged_extra_keys(prompt.len(), block_size, &[(0, 0xA63B_1280)]);
+        inner.publish_moe_gdn_materialized_prefix_checkpoint(
+            &prompt,
+            &extra_keys,
+            cache_salt,
+            Some(checkpoint),
+        );
+        let restored = inner
+            .find_moe_gdn_prefix_checkpoint(&prompt, 32, block_size, &extra_keys, cache_salt)
+            .expect("exact checkpoint restore");
+        assert_eq!(restored.len(), inner.layers.len());
+
+        let prepared = inner
+            .prepare_moe_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, cache_salt, false)
+            .expect("prepare exact checkpoint");
+        assert_eq!(prepared.state, "checkpoint");
+        assert!(prepared.already_primed);
+        assert_eq!(prepared.restored_prefix_tokens, 32);
+        assert_eq!(prepared.replayed_prefix_tokens, 0);
+
+        let mut mutated_prompt = prompt.clone();
+        mutated_prompt[7] ^= 1;
+        assert!(
+            inner
+                .find_moe_gdn_prefix_checkpoint(
+                    &mutated_prompt,
+                    32,
+                    block_size,
+                    &extra_keys,
+                    cache_salt,
+                )
+                .is_none(),
+            "a token mutation inside the cached prefix must reject the sidecar"
+        );
+        assert!(
+            inner
+                .find_moe_gdn_prefix_checkpoint(
+                    &prompt,
+                    32,
+                    block_size,
+                    &extra_keys,
+                    cache_salt + 1,
+                )
+                .is_none(),
+            "a different cache namespace must reject the sidecar"
+        );
+
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged_adapter")
+            .release_request()
+            .expect("release request");
+    }
+
+    /// A checkpoint miss replays the cached GDN prefix in bounded,
+    /// materialized chunks. The resulting recurrent state must match the
+    /// original one-shot replay before it is used to prefill the suffix.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_moe_materialized_gdn_replay_matches_one_shot_state() {
+        unsafe {
+            mlx_sys::mlx_seed(0xC0DEC0DE);
+        }
+        let cfg = moe_paged_tiny_config();
+        let mut inner = Qwen35MoeInner::new(cfg).expect("construct tiny MoE model");
+        cast_moe_inner_weights_bf16(&mut inner);
+        inner.init_caches_sync().expect("initialize MoE caches");
+        let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+
+        {
+            let embed = inner.embedding.clone();
+            let caches = inner.caches.as_mut().expect("one-shot caches");
+            super::run_gdn_only_prefill(&prompt, &embed, &mut inner.layers, caches)
+                .expect("one-shot GDN replay");
+            materialize_linear_layer_caches(caches).expect("materialize one-shot GDN state");
+        }
+        let one_shot = materialized_linear_cache_values(inner.caches.as_ref().expect("caches"));
+
+        inner.reset_caches_sync().expect("reset MoE caches");
+        inner.init_caches_sync().expect("reinitialize MoE caches");
+        {
+            let embed = inner.embedding.clone();
+            let caches = inner.caches.as_mut().expect("chunked caches");
+            super::run_gdn_only_prefill_materialized_with_chunk_size(
+                &prompt,
+                &embed,
+                &mut inner.layers,
+                caches,
+                7,
+            )
+            .expect("bounded GDN replay");
+        }
+        let chunked = materialized_linear_cache_values(inner.caches.as_ref().expect("caches"));
+
+        assert_eq!(one_shot.len(), chunked.len());
+        let mut max_abs_diff = 0.0f32;
+        for (slot, (expected, actual)) in one_shot.iter().zip(&chunked).enumerate() {
+            assert_eq!(expected.len(), actual.len(), "cache slot {slot} length");
+            for (&expected, &actual) in expected.iter().zip(actual) {
+                assert!(expected.is_finite() && actual.is_finite());
+                max_abs_diff = max_abs_diff.max((expected - actual).abs());
+            }
+        }
+        assert!(
+            max_abs_diff <= 0.25,
+            "bounded GDN replay diverged from one-shot state: max_abs_diff={max_abs_diff}"
+        );
     }
 
     /// **Uneven-tail parity test**: 97-token prompt with chunk_size=16

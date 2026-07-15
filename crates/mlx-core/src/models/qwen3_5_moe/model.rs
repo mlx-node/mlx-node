@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -64,7 +64,7 @@ fn fresh_moe_layer_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
         .collect()
 }
 
-const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 8;
+const MOE_GDN_PREFIX_CHECKPOINT_LIMIT: usize = 2;
 
 struct MoeGdnPrefixCheckpoint {
     prefix_len: u32,
@@ -79,15 +79,16 @@ struct MoeGdnHistoryCheckpoint {
     caches: Vec<Qwen3_5LayerCache>,
 }
 
-struct MoeGdnPrefixPreparation {
-    state: &'static str,
-    already_primed: bool,
+pub(super) struct MoeGdnPrefixPreparation {
+    pub(super) state: &'static str,
+    pub(super) already_primed: bool,
+    pub(super) restored_prefix_tokens: u32,
+    pub(super) replayed_prefix_tokens: u32,
 }
 
 #[derive(Default)]
 struct MoeGdnCheckpointStoreTrace {
     stored: bool,
-    hash_ms: f64,
     eval_ms: f64,
     clone_ms: f64,
     token_clone_ms: f64,
@@ -100,13 +101,6 @@ impl MoeGdnCheckpointStoreTrace {
         self.total_ms = start.map(elapsed_ms).unwrap_or(0.0);
         self
     }
-}
-
-fn moe_gdn_store_replayed_prefix_checkpoint_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled("MLX_MOE_GDN_REPLAY_PREFIX_CHECKPOINT")
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -925,7 +919,7 @@ impl Qwen35MoeInner {
         Ok(trace.finish(total_start))
     }
 
-    fn find_moe_gdn_prefix_checkpoint(
+    pub(super) fn find_moe_gdn_prefix_checkpoint(
         &self,
         tokens: &[u32],
         prefix_len: u32,
@@ -956,18 +950,18 @@ impl Qwen35MoeInner {
             .and_then(|checkpoint| clone_moe_linear_layer_caches(&self.config, &checkpoint.caches))
     }
 
-    fn remember_moe_gdn_prefix_checkpoint(
+    pub(super) fn remember_moe_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
-        prefix_len: u32,
         block_size: u32,
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
-    ) -> Result<MoeGdnCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = MoeGdnCheckpointStoreTrace::default();
-        let hash_start = trace_enabled.then(std::time::Instant::now);
+        checkpoint: crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint,
+    ) -> bool {
+        let prefix_len = checkpoint.prefix_len;
+        if !moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)) {
+            return false;
+        }
         let Some(final_block_hash) = compute_paged_prefix_block_hash(
             tokens,
             prefix_len,
@@ -975,56 +969,70 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
         ) else {
-            trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
+            return false;
         };
-        trace.hash_ms = hash_start.map(elapsed_ms).unwrap_or(0.0);
         let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
+            return false;
         };
 
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_layer_caches(&self.caches)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-        let clone_start = trace_enabled.then(std::time::Instant::now);
-        let Some(caches) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_moe_linear_layer_caches(&self.config, caches))
-        else {
-            trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.clone_ms = clone_start.map(elapsed_ms).unwrap_or(0.0);
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.gdn_prefix_checkpoints.retain(|checkpoint| {
-            !(checkpoint.prefix_len == prefix_len
-                && checkpoint.block_size == block_size
-                && checkpoint.final_block_hash == final_block_hash
-                && checkpoint.tokens == prefix_tokens)
+        self.gdn_prefix_checkpoints.retain(|existing| {
+            !(existing.prefix_len == prefix_len
+                && existing.block_size == block_size
+                && existing.final_block_hash == final_block_hash
+                && existing.tokens.as_slice() == prefix_tokens)
         });
         self.gdn_prefix_checkpoints
             .push_back(MoeGdnPrefixCheckpoint {
                 prefix_len,
                 block_size,
                 final_block_hash,
-                tokens: prefix_tokens,
-                caches,
+                tokens: prefix_tokens.to_vec(),
+                caches: checkpoint.caches,
             });
         while self.gdn_prefix_checkpoints.len() > MOE_GDN_PREFIX_CHECKPOINT_LIMIT {
             self.gdn_prefix_checkpoints.pop_front();
         }
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-
-        Ok(trace.finish(total_start))
+        true
     }
 
-    fn prepare_moe_gdn_prefix_state(
+    pub(super) fn publish_moe_gdn_materialized_prefix_checkpoint(
+        &mut self,
+        tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        checkpoint: Option<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    ) {
+        let Some(checkpoint) = checkpoint else {
+            return;
+        };
+        let prefix_len = checkpoint.prefix_len;
+        let Some(block_size) = self
+            .paged_adapter
+            .as_ref()
+            .map(|adapter| adapter.block_size())
+        else {
+            return;
+        };
+        let stored = self.remember_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            checkpoint,
+        );
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "gdn_prefix_checkpoint_store",
+            model = "qwen3_5_moe",
+            prefix_tokens = prefix_len,
+            block_size,
+            stored,
+            retained_checkpoints = self.gdn_prefix_checkpoints.len(),
+            "MoE GDN prefix checkpoint stored"
+        );
+    }
+
+    pub(super) fn prepare_moe_gdn_prefix_state(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -1034,39 +1042,49 @@ impl Qwen35MoeInner {
         continued_live_prefix: bool,
     ) -> Result<MoeGdnPrefixPreparation> {
         let trace_enabled = inference_trace_enabled();
-        let prepare_trace_start = trace_enabled.then(std::time::Instant::now);
+        let inference_info_enabled =
+            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+        let prepare_start = (trace_enabled || inference_info_enabled).then(std::time::Instant::now);
+        let finish = |state: &'static str,
+                      restored_prefix_tokens: u32,
+                      replayed_prefix_tokens: u32|
+         -> MoeGdnPrefixPreparation {
+            if inference_info_enabled {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "gdn_prefix_prepare",
+                    model = "qwen3_5_moe",
+                    state,
+                    cached_prefix_tokens = cached_prefix_len,
+                    restored_prefix_tokens,
+                    replayed_prefix_tokens,
+                    elapsed_ms = prepare_start.map(elapsed_ms).unwrap_or(0.0),
+                    "MoE GDN prefix state prepared"
+                );
+            }
+            let preparation = MoeGdnPrefixPreparation {
+                state,
+                already_primed: cached_prefix_len > 0,
+                restored_prefix_tokens,
+                replayed_prefix_tokens,
+            };
+            debug_assert_eq!(
+                preparation.already_primed,
+                preparation.restored_prefix_tokens > 0 || preparation.replayed_prefix_tokens > 0,
+                "MoE GDN prefix preparation must account for every primed prefix"
+            );
+            preparation
+        };
         let gdn_caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=live \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "live",
-                already_primed: true,
-            });
+            return Ok(finish("live", cached_prefix_len, 0));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if gdn_caches_ready && gdn_prefix_from_history {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history \
-                     cached_prefix_tokens={} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "last_history",
-                already_primed: true,
-            });
+            return Ok(finish("last_history", cached_prefix_len, 0));
         }
         if cached_prefix_len > 0 {
             let history_lookup_start = trace_enabled.then(std::time::Instant::now);
@@ -1075,19 +1093,7 @@ impl Qwen35MoeInner {
             let history_lookup_ms = history_lookup_start.map(elapsed_ms);
             if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
-                if let Some(start) = prepare_trace_start {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=last_history_checkpoint \
-                         cached_prefix_tokens={} history_lookup_ms={:.1} elapsed_ms={:.1}",
-                        cached_prefix_len,
-                        history_lookup_ms.unwrap_or(0.0),
-                        elapsed_ms(start)
-                    ));
-                }
-                return Ok(MoeGdnPrefixPreparation {
-                    state: "last_history_checkpoint",
-                    already_primed: true,
-                });
+                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
             } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
@@ -1112,7 +1118,6 @@ impl Qwen35MoeInner {
             }
         }
 
-        let prefix_lookup_start = trace_enabled.then(std::time::Instant::now);
         let prefix_checkpoint = self.find_moe_gdn_prefix_checkpoint(
             tokens,
             cached_prefix_len,
@@ -1120,38 +1125,14 @@ impl Qwen35MoeInner {
             extra_keys_per_block,
             cache_salt,
         );
-        let prefix_lookup_ms = prefix_lookup_start.map(elapsed_ms);
         if let Some(checkpoint) = prefix_checkpoint {
             self.caches = Some(checkpoint);
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=checkpoint \
-                     cached_prefix_tokens={} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "checkpoint",
-                already_primed: true,
-            });
+            return Ok(finish("checkpoint", cached_prefix_len, 0));
         }
 
         self.caches = Some(fresh_moe_layer_caches(&self.config));
         if cached_prefix_len == 0 {
-            if let Some(start) = prepare_trace_start {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state=replay \
-                     cached_prefix_tokens=0 prefix_lookup_ms={:.1} elapsed_ms={:.1}",
-                    prefix_lookup_ms.unwrap_or(0.0),
-                    elapsed_ms(start)
-                ));
-            }
-            return Ok(MoeGdnPrefixPreparation {
-                state: "replay",
-                already_primed: false,
-            });
+            return Ok(finish("cold", 0, 0));
         }
 
         let cached_prefix_len_usize = cached_prefix_len as usize;
@@ -1163,54 +1144,13 @@ impl Qwen35MoeInner {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("MoE paged GDN prefix caches not initialized"))?;
-        let replay_trace_start = trace_enabled.then(std::time::Instant::now);
-        super::paged_forward::run_gdn_only_prefill(prefix, &embed, &mut self.layers, caches_ref)?;
-        let replay_ms = replay_trace_start.map(elapsed_ms);
-        let store_trace = if moe_gdn_store_replayed_prefix_checkpoint_enabled() {
-            self.remember_moe_gdn_prefix_checkpoint(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        } else {
-            MoeGdnCheckpointStoreTrace::default()
-        };
-        if let Some(start) = prepare_trace_start {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-moe gdn_prefix_prepare_done state={} \
-                 cached_prefix_tokens={} prefix_lookup_ms={:.1} replay_ms={:.1} stored={} \
-                 store_hash_ms={:.1} store_eval_ms={:.1} store_clone_ms={:.1} \
-                 store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} \
-                 elapsed_ms={:.1}",
-                if store_trace.stored {
-                    "replay_store"
-                } else {
-                    "replay"
-                },
-                cached_prefix_len,
-                prefix_lookup_ms.unwrap_or(0.0),
-                replay_ms.unwrap_or(0.0),
-                store_trace.stored,
-                store_trace.hash_ms,
-                store_trace.eval_ms,
-                store_trace.clone_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms,
-                elapsed_ms(start)
-            ));
-        }
-
-        Ok(MoeGdnPrefixPreparation {
-            state: if store_trace.stored {
-                "replay_store"
-            } else {
-                "replay"
-            },
-            already_primed: true,
-        })
+        super::paged_forward::run_gdn_only_prefill_materialized(
+            prefix,
+            &embed,
+            &mut self.layers,
+            caches_ref,
+        )?;
+        Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
 
     /// Set the tokenizer.
@@ -2513,6 +2453,8 @@ impl Qwen35MoeInner {
             report_perf,
             &mut first_token_instant,
             gdn_prefix_already_primed,
+            &lookup_extra_keys,
+            cache_salt,
         );
 
         let (generated_tokens, finish_reason) = match forward_result {
@@ -2599,6 +2541,8 @@ impl Qwen35MoeInner {
         report_perf: bool,
         first_token_instant: &mut Option<std::time::Instant>,
         gdn_prefix_already_primed: bool,
+        checkpoint_extra_keys: &[Vec<u64>],
+        checkpoint_cache_salt: u64,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
@@ -2619,7 +2563,7 @@ impl Qwen35MoeInner {
         // the GDN linear caches in `Qwen3_5LayerCache::Linear(ArraysCache)`.
         // Both are exactly what the pure-Rust paged decode steps
         // (`paged_forward::run_paged_decode_step`) read as inputs.
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -2628,7 +2572,7 @@ impl Qwen35MoeInner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_sync_core_inner: paged_adapter dropped")
             })?;
-            super::paged_forward::run_paged_prefill_chunk(
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                 tokens,
                 suffix,
                 cached_prefix_len,
@@ -2644,6 +2588,12 @@ impl Qwen35MoeInner {
                 self.cached_rope_deltas.unwrap_or(0),
             )?
         };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            checkpoint_extra_keys,
+            checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -2912,6 +2862,8 @@ impl Qwen35MoeInner {
             cancelled,
             gdn_prefix_already_primed,
             prefill_trace_start,
+            &lookup_extra_keys,
+            cache_salt,
         );
 
         if let Some(start) = request_trace_start {
@@ -3085,6 +3037,8 @@ impl Qwen35MoeInner {
         cancelled: &AtomicBool,
         gdn_prefix_already_primed: bool,
         prefill_trace_start: Option<std::time::Instant>,
+        checkpoint_extra_keys: &[Vec<u64>],
+        checkpoint_cache_salt: u64,
     ) -> Result<(Vec<u32>, String)> {
         // Invariant: caller-applied vLLM cap guarantees suffix_len > 0.
         debug_assert!(
@@ -3102,7 +3056,7 @@ impl Qwen35MoeInner {
         // Pure-Rust paged prefill — see `paged_turn_sync_core_inner` for
         // the data-flow contract this populates (pool K/V + GDN linear
         // caches).
-        let last_logits = {
+        let (last_logits, gdn_checkpoint) = {
             let embed = self.embedding.clone();
             let embedding_weight = embed.get_weight();
             let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -3111,7 +3065,7 @@ impl Qwen35MoeInner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_stream_core_inner: paged_adapter dropped")
             })?;
-            super::paged_forward::run_paged_prefill_chunk(
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
                 tokens,
                 suffix,
                 cached_prefix_len,
@@ -3127,6 +3081,12 @@ impl Qwen35MoeInner {
                 self.cached_rope_deltas.unwrap_or(0),
             )?
         };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
+            tokens,
+            checkpoint_extra_keys,
+            checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -6437,6 +6397,8 @@ pub(crate) struct Qwen35MoePrefixState {
     suffix_len: usize,
     full_tokens: Vec<u32>,
     gdn_prefix_already_primed: bool,
+    checkpoint_extra_keys: Vec<Vec<u64>>,
+    checkpoint_cache_salt: u64,
 }
 
 impl PagedPrefix for Qwen35MoePrefixState {
@@ -6579,6 +6541,8 @@ impl PagedBackend for Qwen35MoeInner {
             suffix_len,
             full_tokens: plan.to_vec(),
             gdn_prefix_already_primed,
+            checkpoint_extra_keys: lookup_extra_keys,
+            checkpoint_cache_salt: cache_salt,
         })
     }
 
@@ -6605,29 +6569,38 @@ impl PagedBackend for Qwen35MoeInner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-        super::paged_forward::run_paged_prefill_chunk(
+        let (logits, gdn_checkpoint) = {
+            let caches_ref = self
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
+            let adapter = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
+            super::paged_forward::run_paged_prefill_chunk_with_checkpoint(
+                &prefix.full_tokens,
+                suffix_tokens,
+                prefix.effective_cached_prefix_len as u32,
+                prefix.gdn_prefix_already_primed,
+                &embed,
+                &mut self.layers,
+                caches_ref,
+                &self.final_norm,
+                &self.lm_head,
+                &embedding_weight,
+                &layer_kinds,
+                adapter,
+                rope_deltas,
+            )?
+        };
+        self.publish_moe_gdn_materialized_prefix_checkpoint(
             &prefix.full_tokens,
-            suffix_tokens,
-            prefix.effective_cached_prefix_len as u32,
-            prefix.gdn_prefix_already_primed,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-            &self.final_norm,
-            &self.lm_head,
-            &embedding_weight,
-            &layer_kinds,
-            adapter,
-            rope_deltas,
-        )
+            &prefix.checkpoint_extra_keys,
+            prefix.checkpoint_cache_salt,
+            gdn_checkpoint,
+        );
+        Ok(logits)
     }
 
     fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
