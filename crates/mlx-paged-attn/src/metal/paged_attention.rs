@@ -148,13 +148,19 @@ fn grouped_qwen35_shape_matches(
     query_rows: u32,
     max_context_len: u32,
 ) -> bool {
-    let min_context = if query_rows == 1 { 16_384 } else { 8_192 };
+    let dense_heads = (num_heads, num_kv_heads) == (24, 4);
+    let moe_heads = (num_heads, num_kv_heads) == (16, 2);
+    let min_context = match (query_rows, moe_heads) {
+        (1, true) => 32_768,
+        (2, true) => 16_384,
+        (1, false) => 16_384,
+        _ => 8_192,
+    };
     enabled
         && io_dtype == MetalDtype::BFloat16
         && cache_dtype == MetalDtype::BFloat16
         && num_seqs == 1
-        && num_heads == 24
-        && num_kv_heads == 4
+        && (dense_heads || moe_heads)
         && head_size == 256
         && block_size == 16
         && matches!(query_rows, 1 | 2)
@@ -187,15 +193,19 @@ fn use_grouped_qwen35_paged_attention(
     )
 }
 
-fn grouped_qwen35_pipelines_supported(state: &MetalState) -> bool {
+fn grouped_qwen35_pipelines_supported(
+    state: &MetalState,
+    num_heads: u32,
+    num_kv_heads: u32,
+) -> bool {
     // MetalState owns one process-wide device. Cache this immutable
     // capability result so dispatch does not take two extra pipeline-cache
     // locks per layer and token after the first grouped candidate.
     // A missing/invalid specialized pipeline is an optional-optimization
     // failure, not an inference failure. Cache `false`, warn once through the
     // normal tracing subscriber, and leave every later token on generic V2.
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
+    static LIMITS: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let Some((stage_threads, reduce_threads)) = *LIMITS.get_or_init(|| {
         let stage = match state
             .get_pipeline(MetalState::paged_attention_grouped_qwen35_kernel_name())
         {
@@ -206,7 +216,7 @@ fn grouped_qwen35_pipelines_supported(state: &MetalState) -> bool {
                     %error,
                     "grouped Qwen3.5 paged-attention stage pipeline unavailable; using generic V2"
                 );
-                return false;
+                return None;
             }
         };
         let reduce = match state
@@ -219,22 +229,33 @@ fn grouped_qwen35_pipelines_supported(state: &MetalState) -> bool {
                     %error,
                     "grouped Qwen3.5 paged-attention reducer pipeline unavailable; using generic V2"
                 );
-                return false;
+                return None;
             }
         };
         let stage_threads = stage.max_total_threads_per_threadgroup();
         let reduce_threads = reduce.max_total_threads_per_threadgroup();
-        let supported = stage_threads >= 192 && reduce_threads >= 1024;
-        if !supported {
+        Some((stage_threads, reduce_threads))
+    }) else {
+        return false;
+    };
+    if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
+        return false;
+    }
+    let required_stage_threads = u64::from(32 * (num_heads / num_kv_heads));
+    let supported = stage_threads >= required_stage_threads && reduce_threads >= 1024;
+    if !supported {
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
             tracing::warn!(
                 target: "mlx_paged_attn::metal",
                 stage_threads,
+                required_stage_threads,
                 reduce_threads,
                 "grouped Qwen3.5 paged-attention threadgroup limits unsupported; using generic V2"
             );
-        }
-        supported
-    })
+        });
+    }
+    supported
 }
 
 #[cfg(test)]
@@ -250,28 +271,34 @@ mod grouped_qwen35_selection_tests {
     }
 
     #[test]
-    fn exact_qwen35_dense_shapes_select_only_when_enabled() {
-        let matches = |enabled, query_rows, max_context_len| {
+    fn exact_qwen35_dense_and_moe_shapes_select_only_when_enabled() {
+        let matches = |enabled, num_heads, num_kv_heads, query_rows, max_context_len| {
             grouped_qwen35_shape_matches(
                 enabled,
                 MetalDtype::BFloat16,
                 MetalDtype::BFloat16,
                 1,
-                24,
-                4,
+                num_heads,
+                num_kv_heads,
                 256,
                 16,
                 query_rows,
                 max_context_len,
             )
         };
-        assert!(matches(true, 1, 16_384));
-        assert!(!matches(true, 1, 16_383));
-        assert!(matches(true, 2, 8_192));
-        assert!(!matches(true, 2, 8_191));
-        assert!(!matches(false, 1, 16_384));
-        assert!(!matches(false, 2, 8_192));
-        assert!(!matches(true, 3, 16_384));
+        for (num_heads, num_kv_heads, decode_min, verify_min) in
+            [(24, 4, 16_384, 8_192), (16, 2, 32_768, 16_384)]
+        {
+            assert!(matches(true, num_heads, num_kv_heads, 1, decode_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 1, decode_min - 1));
+            assert!(matches(true, num_heads, num_kv_heads, 2, verify_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 2, verify_min - 1));
+            assert!(!matches(false, num_heads, num_kv_heads, 1, decode_min));
+            assert!(!matches(false, num_heads, num_kv_heads, 2, verify_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 3, decode_min));
+        }
+        assert!(!matches(true, 16, 4, 1, 16_384));
+        assert!(!matches(true, 24, 2, 1, 16_384));
 
         assert!(!grouped_qwen35_shape_matches(
             true,
@@ -294,6 +321,18 @@ mod grouped_qwen35_selection_tests {
             4,
             128,
             16,
+            1,
+            16_384,
+        ));
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::BFloat16,
+            MetalDtype::BFloat16,
+            1,
+            16,
+            2,
+            256,
+            32,
             1,
             16_384,
         ));
@@ -719,7 +758,8 @@ pub unsafe fn dispatch_paged_attention_v2_raw(
         1,
         params.max_seq_len,
     );
-    let use_grouped = grouped_shape && grouped_qwen35_pipelines_supported(state);
+    let use_grouped = grouped_shape
+        && grouped_qwen35_pipelines_supported(state, params.num_heads, params.num_kv_heads);
     let max_num_partitions = if use_grouped {
         grouped_qwen35_stripe_count(params.max_seq_len)
     } else {
@@ -1275,7 +1315,8 @@ pub unsafe fn dispatch_paged_attention_varlen_v2_raw(
             params.total_queries,
             params.max_seq_len,
         );
-    let use_grouped = grouped_shape && grouped_qwen35_pipelines_supported(state);
+    let use_grouped = grouped_shape
+        && grouped_qwen35_pipelines_supported(state, params.num_heads, params.num_kv_heads);
 
     // Sized off the worst-case effective_context_len (the caller's
     // `max_seq_len`), so every query token fits in the allocated grid.

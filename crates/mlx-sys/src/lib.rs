@@ -1301,8 +1301,13 @@ unsafe extern "C-unwind" {
 
     /// Model-free exact-shape graph-native numerical parity probe for the
     /// grouped Qwen3.5/3.6 paged decode kernel. Pass 1 for normal decode or 2
-    /// for the varlen MTP verifier. Returns 1 on success, -3 without Metal.
-    pub fn mlx_paged_grouped_qwen35_graph_parity(query_rows: i32) -> i32;
+    /// for the varlen MTP verifier, plus 24/4 or 16/2 for the head shape.
+    /// Returns 1 on success, -3 without Metal.
+    pub fn mlx_paged_grouped_qwen35_graph_parity(
+        query_rows: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+    ) -> i32;
 
     /// Reset/read the environment-gated grouped-route test probe. Production
     /// dispatch only touches its atomic counter when
@@ -1313,6 +1318,8 @@ unsafe extern "C-unwind" {
     /// Pure shape/threshold guard used to pin the grouped Qwen3.5/3.6 route.
     /// This bypasses the environment escape hatch and GPU capability check.
     pub fn mlx_paged_grouped_qwen35_shape_guard_for_test(
+        num_q_heads: i32,
+        num_kv_heads: i32,
         query_rows: i32,
         max_context_len: i32,
     ) -> i32;

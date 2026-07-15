@@ -303,7 +303,8 @@ const std::string& paged_attention_v2_reduce_kernel_name(
 
 const std::string& paged_attention_grouped_qwen35_kernel_name() {
   // Deliberately concrete: the Metal entry point is a narrow BF16
-  // D256/BS16/GQA6 specialization for Qwen3.5/3.6 dense long-context decode.
+  // D256/BS16 GQA6/GQA8 specialization for Qwen3.5/3.6 dense and MoE
+  // long-context decode.
   static const std::string name =
       "paged_attention_grouped_bfloat16_hs256_bs16_striped";
   return name;
@@ -359,13 +360,17 @@ bool grouped_qwen35_shape_matches(
     int block_size,
     int query_rows,
     int max_context_len) {
-  // Model-free A/B break-even on the target Apple GPU. Decode is deliberately
-  // more conservative; the two-row verifier benefits sooner because the
-  // generic path repeats more partition work.
-  const int min_context = query_rows == 1 ? 16384 : 8192;
+  // Model-free A/B break-even on the target Apple GPU. GQA8 needs a more
+  // conservative cutoff than dense GQA6; the two-row verifier benefits sooner
+  // because the generic path repeats more partition work.
+  const bool dense_heads = num_q_heads == 24 && num_kv_heads == 4;
+  const bool moe_heads = num_q_heads == 16 && num_kv_heads == 2;
+  const int min_context = query_rows == 1
+      ? (moe_heads ? 32768 : 16384)
+      : (moe_heads ? 16384 : 8192);
   return enabled &&
       io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
-      num_seqs == 1 && num_q_heads == 24 && num_kv_heads == 4 &&
+      num_seqs == 1 && (dense_heads || moe_heads) &&
       head_size == 256 && block_size == 16 &&
       (query_rows == 1 || query_rows == 2) &&
       max_context_len >= min_context;
@@ -476,8 +481,16 @@ MTL::ComputePipelineState* load_pipeline(
   return device.get_kernel(kernel_name, lib);
 }
 
+struct GroupedQwen35PipelineLimits {
+  size_t stage_threads;
+  size_t reduce_threads;
+  bool available;
+};
+
 bool grouped_qwen35_pipelines_supported(
-    mlx::core::metal::Device& device) {
+    mlx::core::metal::Device& device,
+    int num_q_heads,
+    int num_kv_heads) {
   // There is one active Metal device in this backend. Cache the immutable
   // pipeline capability after first use so every attention layer/token does
   // not take two additional pipeline-cache locks merely to re-read it.
@@ -485,7 +498,7 @@ bool grouped_qwen35_pipelines_supported(
   // permanently select generic V2 instead of failing inference or retrying
   // pipeline creation for every layer/token. Static initialization completes
   // even on failure, so this warning can appear at most once in a process.
-  static const bool supported = [&device]() noexcept {
+  static const GroupedQwen35PipelineLimits limits = [&device]() noexcept {
     try {
       auto* stage = load_pipeline(
           device, paged_attention_grouped_qwen35_kernel_name());
@@ -496,35 +509,51 @@ bool grouped_qwen35_pipelines_supported(
             stderr,
             "[mlx][warn] grouped Qwen3.5 paged-attention pipeline lookup "
             "returned null; using generic V2\n");
-        return false;
+        return GroupedQwen35PipelineLimits{0, 0, false};
       }
       const auto stage_threads = stage->maxTotalThreadsPerThreadgroup();
       const auto reduce_threads = reduce->maxTotalThreadsPerThreadgroup();
-      if (stage_threads < 192 || reduce_threads < 1024) {
-        std::fprintf(
-            stderr,
-            "[mlx][warn] grouped Qwen3.5 paged-attention threadgroup limits "
-            "unsupported (stage=%lu, reducer=%lu); using generic V2\n",
-            static_cast<unsigned long>(stage_threads),
-            static_cast<unsigned long>(reduce_threads));
-        return false;
-      }
-      return true;
+      return GroupedQwen35PipelineLimits{
+          static_cast<size_t>(stage_threads),
+          static_cast<size_t>(reduce_threads),
+          true};
     } catch (const std::exception& error) {
       std::fprintf(
           stderr,
           "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable "
           "(%s); using generic V2\n",
           error.what());
-      return false;
+      return GroupedQwen35PipelineLimits{0, 0, false};
     } catch (...) {
       std::fprintf(
           stderr,
           "[mlx][warn] grouped Qwen3.5 paged-attention pipelines unavailable; "
           "using generic V2\n");
-      return false;
+      return GroupedQwen35PipelineLimits{0, 0, false};
     }
   }();
+  if (!limits.available || num_kv_heads <= 0 ||
+      num_q_heads % num_kv_heads != 0) {
+    return false;
+  }
+  const size_t required_stage_threads =
+      static_cast<size_t>(32 * (num_q_heads / num_kv_heads));
+  const bool supported =
+      limits.stage_threads >= required_stage_threads &&
+      limits.reduce_threads >= 1024;
+  if (!supported) {
+    static std::once_flag warning_once;
+    std::call_once(warning_once, [&]() {
+      std::fprintf(
+          stderr,
+          "[mlx][warn] grouped Qwen3.5 paged-attention threadgroup limits "
+          "unsupported (stage=%lu, required_stage=%lu, reducer=%lu); "
+          "using generic V2\n",
+          static_cast<unsigned long>(limits.stage_threads),
+          static_cast<unsigned long>(required_stage_threads),
+          static_cast<unsigned long>(limits.reduce_threads));
+    });
+  }
   return supported;
 }
 
@@ -562,6 +591,8 @@ extern "C" uint64_t mlx_paged_grouped_qwen35_test_probe_count() {
 }
 
 extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
+    int num_q_heads,
+    int num_kv_heads,
     int query_rows,
     int max_context_len) {
   return grouped_qwen35_shape_matches(
@@ -569,8 +600,8 @@ extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
       KvDtype::Bf16,
       KvDtype::Bf16,
       /*num_seqs=*/1,
-      /*num_q_heads=*/24,
-      /*num_kv_heads=*/4,
+      num_q_heads,
+      num_kv_heads,
       /*head_size=*/256,
       /*block_size=*/16,
       query_rows,
@@ -806,7 +837,8 @@ void dispatch_paged_attention_v2_inner(
       /*query_rows=*/1,
       max_context_len);
   const bool use_grouped = grouped_shape &&
-      grouped_qwen35_pipelines_supported(device);
+      grouped_qwen35_pipelines_supported(
+          device, num_q_heads, num_kv_heads);
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
@@ -1222,7 +1254,8 @@ void dispatch_paged_attention_varlen_v2_inner(
           total_queries,
           max_context_len);
   const bool use_grouped = grouped_shape &&
-      grouped_qwen35_pipelines_supported(device);
+      grouped_qwen35_pipelines_supported(
+          device, num_q_heads, num_kv_heads);
   const uint32_t max_num_partitions = use_grouped
       ? grouped_qwen35_stripe_count(max_context_len)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
@@ -1306,9 +1339,10 @@ void dispatch_paged_attention_varlen_v2_inner(
     encoder.set_input_array(cu_seqlens_q, 19);
     encoder.set_bytes<int32_t>(num_seqs, 20);
 
-    // Keep one 192-thread group per query row. A 384-thread q_len=2 group
-    // cuts occupancy sharply on Apple GPUs; adjacent y groups still traverse
-    // identical pages and retain cache locality.
+    // Keep one GQA-sized threadgroup per query row (192 threads for GQA6 or
+    // 256 for GQA8). Combining both q_len=2 rows would cut occupancy sharply
+    // on Apple GPUs; adjacent y groups still traverse identical pages and
+    // retain cache locality.
     const int gqa_factor = num_q_heads / num_kv_heads;
     MTL::Size group = use_grouped
         ? MTL::Size::Make(

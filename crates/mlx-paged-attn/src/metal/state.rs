@@ -240,7 +240,8 @@ impl MetalState {
     }
 
     /// Concrete long-context grouped-GQA stage-1 specialization used by
-    /// Qwen3.5/3.6 dense decode (BF16, D256, block size 16, 24Q/4KV).
+    /// Qwen3.5/3.6 dense and MoE decode (BF16, D256, block size 16,
+    /// 24Q/4KV or 16Q/2KV).
     pub fn paged_attention_grouped_qwen35_kernel_name() -> &'static str {
         "paged_attention_grouped_bfloat16_hs256_bs16_striped"
     }

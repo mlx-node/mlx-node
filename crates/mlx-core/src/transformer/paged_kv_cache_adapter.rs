@@ -154,15 +154,15 @@ pub(crate) fn paged_attention_v2_partition_upper_bound(
     head_size: u32,
 ) -> u64 {
     let generic = (max_context_len as u64).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
-    let grouped_qwen35_candidate = num_query_heads == 24
-        && num_kv_heads == 4
-        && head_size == 256
-        && match layout {
-            PagedAttentionV2Layout::SingleRowBatch => {
-                num_new_tokens == 1 && max_context_len >= 16_384
-            }
-            PagedAttentionV2Layout::Varlen => num_new_tokens == 2 && max_context_len >= 8_192,
-        };
+    let grouped_qwen35_min_context = match (num_query_heads, num_kv_heads, layout, num_new_tokens) {
+        (24, 4, PagedAttentionV2Layout::SingleRowBatch, 1) => Some(16_384),
+        (24, 4, PagedAttentionV2Layout::Varlen, 2) => Some(8_192),
+        (16, 2, PagedAttentionV2Layout::SingleRowBatch, 1) => Some(32_768),
+        (16, 2, PagedAttentionV2Layout::Varlen, 2) => Some(16_384),
+        _ => None,
+    };
+    let grouped_qwen35_candidate = head_size == 256
+        && grouped_qwen35_min_context.is_some_and(|minimum| max_context_len >= minimum);
     if grouped_qwen35_candidate {
         let grouped = match max_context_len {
             0..=4_096 => 32,
@@ -4768,7 +4768,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen27b_aux_upper_bound_tracks_dispatch_layout() {
+    fn qwen35_dense_and_moe_aux_upper_bound_tracks_dispatch_layout() {
         assert_eq!(
             paged_attention_v2_partition_upper_bound(
                 PagedAttentionV2Layout::SingleRowBatch,
@@ -4836,6 +4836,90 @@ mod tests {
                 256,
             ),
             1_024
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                1,
+                16,
+                2,
+                65_537,
+                256,
+            ),
+            1_024,
+            "Qwen3.5 MoE decode must reserve the grouped-stripe upper bound"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                1,
+                16,
+                2,
+                32_767,
+                256,
+            ),
+            64,
+            "Qwen3.5 MoE decode must retain the generic bound below its measured cutoff"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                1,
+                16,
+                2,
+                32_768,
+                256,
+            ),
+            256,
+            "Qwen3.5 MoE decode must switch bounds at its measured cutoff"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                16,
+                2,
+                16_383,
+                256,
+            ),
+            32,
+            "Qwen3.5 MoE verifier must retain the generic bound below its measured cutoff"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                16,
+                2,
+                16_384,
+                256,
+            ),
+            256,
+            "Qwen3.5 MoE verifier must switch bounds at its measured cutoff"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::Varlen,
+                2,
+                16,
+                2,
+                65_537,
+                256,
+            ),
+            1_024,
+            "Qwen3.5 MoE verifier must reserve the grouped-stripe upper bound"
+        );
+        assert_eq!(
+            paged_attention_v2_partition_upper_bound(
+                PagedAttentionV2Layout::SingleRowBatch,
+                1,
+                16,
+                4,
+                65_537,
+                256,
+            ),
+            129,
+            "nearby unsupported head shapes must retain the generic bound"
         );
         assert_eq!(
             paged_attention_v2_partition_upper_bound(

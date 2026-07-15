@@ -1189,11 +1189,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
 // ========================================== Grouped GQA paged attention
 //
-// Long-context Qwen3.5/3.6 dense decode uses 24 query heads, 4 KV heads,
-// head_dim=256, and block_size=16.  The generic kernel above launches one
-// 256-thread threadgroup per *query* head.  Consequently the six query heads
-// mapped to one KV head traverse the same paged K/V range in six independent
-// threadgroups.
+// Long-context Qwen3.5/3.6 dense and MoE decode use 24Q/4KV or 16Q/2KV,
+// respectively, with head_dim=256 and block_size=16. The generic kernel above
+// launches one 256-thread threadgroup per *query* head. Consequently the six
+// or eight query heads mapped to one KV head traverse the same paged K/V range
+// in independent threadgroups.
 //
 // This deliberately narrow two-pass specialization mirrors MLX's
 // `sdpa_vector_2pass_1/2` geometry: one threadgroup is keyed by a KV head and
@@ -1205,8 +1205,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 // long-context parallelism, with no threadgroup staging or barriers.
 //
 // The host dispatcher only selects this entry point for the exact BF16
-// D256/BS16/GQA6 shape, one sequence, and q_len 1 or 2.  Keeping the entry
-// point concrete avoids growing the already-large generic instantiation
+// D256/BS16/GQA6-or-GQA8 shapes, one sequence, and q_len 1 or 2. Keeping the
+// entry point concrete avoids growing the already-large generic instantiation
 // matrix and leaves every other model/configuration on the proven fallback.
 
 [[kernel]] void paged_attention_grouped_bfloat16_hs256_bs16_striped(
@@ -1241,8 +1241,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
   const int kv_head_idx = int(threadgroup_position_in_grid.x);
   // The exact guard fixes num_seqs=1. Query rows occupy grid.y rather than
-  // threadgroup.z so q_len=2 keeps the same 192-thread occupancy as decode;
-  // adjacent row groups still traverse identical pages and share GPU caches.
+  // threadgroup.z so q_len=2 keeps the same per-layout threadgroup occupancy
+  // as decode (192 threads for GQA6 or 256 for GQA8); adjacent row groups
+  // still traverse identical pages and share GPU caches.
   const int seq_idx = 0;
   const int stripe_idx = int(threadgroup_position_in_grid.z);
   const int num_stripes = int(threadgroups_per_grid.z);
@@ -1251,9 +1252,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int q_len = int(threadgroups_per_grid.y);
   const int lane = int(thread_position_in_threadgroup.x);
 
-  // The dispatch guard fixes GQA=6, but derive the global query-head index
-  // from the actual threadgroup geometry so a host/kernel mismatch fails by
-  // producing an obviously invalid launch rather than silently aliasing heads.
+  // The dispatch guard fixes GQA to 6 or 8, but derive the global query-head
+  // index from the actual threadgroup geometry so a host/kernel mismatch fails
+  // by producing an obviously invalid launch rather than silently aliasing
+  // heads.
   const int gqa_factor = int(threads_per_threadgroup.y);
   const int head_idx = kv_head_idx * gqa_factor + local_q_head;
   const int num_heads = q_stride / HEAD_SIZE;

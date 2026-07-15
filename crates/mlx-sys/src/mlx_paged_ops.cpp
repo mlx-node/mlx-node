@@ -6564,25 +6564,32 @@ int mlx_paged_attention_varlen_compile_trace_smoke() {
 }
 
 /// Exact-shape, model-free numerical parity probe for the graph-native
-/// Qwen3.5/3.6 grouped-GQA V2 path. `query_rows=1` exercises normal decode;
-/// `query_rows=2` exercises the varlen MTP verifier. The block table is a
-/// non-identity physical permutation and unused slots in the final physical
-/// block are NaNs, so an addressing or causal-mask regression fails loudly.
+/// Qwen3.5/3.6 grouped-GQA V2 path. The supported head pairs are 24Q/4KV and
+/// 16Q/2KV. `query_rows=1` exercises normal decode; `query_rows=2` exercises
+/// the varlen MTP verifier. The block table is a non-identity physical
+/// permutation and unused slots in the final physical block are NaNs, so an
+/// addressing or causal-mask regression fails loudly.
 ///
 /// Returns 1 on success, -3 when Metal is unavailable, and -1 on failure.
-int mlx_paged_grouped_qwen35_graph_parity(int query_rows) {
+int mlx_paged_grouped_qwen35_graph_parity(
+    int query_rows,
+    int num_q_heads,
+    int num_kv_heads) {
   using namespace mlx::core;
   using namespace mlx::core::fast;
 
   if (!mlx::core::metal::is_available()) {
     return -3;
   }
-  if (query_rows != 1 && query_rows != 2) {
+  const bool supported_heads =
+      (num_q_heads == 24 && num_kv_heads == 4) ||
+      (num_q_heads == 16 && num_kv_heads == 2);
+  if ((query_rows != 1 && query_rows != 2) || !supported_heads) {
     return -1;
   }
 
-  constexpr int kNumQHeads = 24;
-  constexpr int kNumKvHeads = 4;
+  const int kNumQHeads = num_q_heads;
+  const int kNumKvHeads = num_kv_heads;
   constexpr int kHeadSize = 256;
   constexpr int kBlockSize = 16;
   constexpr int kXPack = 8;
@@ -6591,7 +6598,10 @@ int mlx_paged_grouped_qwen35_graph_parity(int query_rows) {
   // These lengths are deliberately at/above the measured selector
   // thresholds, so this fixture exercises the grouped graph route rather
   // than merely proving parity for the generic fallback.
-  const int context_len = query_rows == 1 ? 16385 : 8194;
+  const bool moe_shape = kNumQHeads == 16;
+  const int context_len = query_rows == 1
+      ? (moe_shape ? 32769 : 16385)
+      : (moe_shape ? 16386 : 8194);
   const int logical_blocks =
       (context_len + kBlockSize - 1) / kBlockSize;
   const int num_physical_blocks = logical_blocks + 3;
@@ -6810,8 +6820,10 @@ int mlx_paged_grouped_qwen35_graph_parity(int query_rows) {
     if (!std::isfinite(max_diff) || max_diff > 0.01f) {
       fprintf(
           stderr,
-          "[mlx_paged_grouped_qwen35_graph_parity] rows=%d max_diff=%g "
-          "at output index %zu\n",
+          "[mlx_paged_grouped_qwen35_graph_parity] q=%d kv=%d rows=%d "
+          "max_diff=%g at output index %zu\n",
+          kNumQHeads,
+          kNumKvHeads,
           query_rows,
           static_cast<double>(max_diff),
           max_idx);
@@ -6821,7 +6833,10 @@ int mlx_paged_grouped_qwen35_graph_parity(int query_rows) {
   } catch (const std::exception& e) {
     fprintf(
         stderr,
-        "[mlx_paged_grouped_qwen35_graph_parity] rows=%d threw: %s\n",
+        "[mlx_paged_grouped_qwen35_graph_parity] q=%d kv=%d rows=%d "
+        "threw: %s\n",
+        kNumQHeads,
+        kNumKvHeads,
         query_rows,
         e.what());
     return -1;

@@ -1,11 +1,11 @@
-//! Exact-shape coverage for the grouped Qwen3.5/Qwen3.6 dense paged-attention
+//! Exact-shape coverage for the grouped Qwen3.5/Qwen3.6 paged-attention
 //! specialization.
 //!
 //! The optimized stage-1 kernel is selected only for BF16 Q/K/V with one
-//! sequence, 24 query heads, 4 KV heads, D256, BS16, and either one decode
-//! query or two varlen/MTP queries. This test drives both raw V2 dispatches
-//! at the measured grouped-route context thresholds and compares every output
-//! head/dimension against a host reference.
+//! sequence, either the dense 24Q/4KV or MoE 16Q/2KV head layout, D256, BS16,
+//! and either one decode query or two varlen/MTP queries. This test drives both
+//! raw V2 dispatches at each layout's measured grouped-route context thresholds
+//! and compares every output head/dimension against a host reference.
 //!
 //! The physical pool contains poisoned holes and the block table is an affine
 //! permutation into that pool. This catches code that accidentally treats a
@@ -46,6 +46,32 @@ const BLOCK_SIZE: u32 = 16;
 const X_PACK: usize = 8;
 const SCALE: f32 = 1.0 / 16.0;
 
+#[derive(Clone, Copy)]
+struct ExactShape {
+    label: &'static str,
+    num_heads: u32,
+    num_kv_heads: u32,
+    decode_context_len: usize,
+    varlen_context_len: usize,
+}
+
+const EXACT_SHAPES: [ExactShape; 2] = [
+    ExactShape {
+        label: "dense 24Q/4KV",
+        num_heads: 24,
+        num_kv_heads: 4,
+        decode_context_len: 16_385,
+        varlen_context_len: 8_194,
+    },
+    ExactShape {
+        label: "MoE 16Q/2KV",
+        num_heads: 16,
+        num_kv_heads: 2,
+        decode_context_len: 32_769,
+        varlen_context_len: 16_386,
+    },
+];
+
 fn f32_to_bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounding_bias = 0x7fff + ((bits >> 16) & 1);
@@ -76,6 +102,7 @@ fn synthetic_q(row: usize, head: usize, dim: usize) -> f32 {
 }
 
 struct ExactShapeInputs {
+    shape: ExactShape,
     context_len: usize,
     block_table: Vec<u32>,
     q_bf16: Vec<u16>,
@@ -87,13 +114,12 @@ struct ExactShapeInputs {
 }
 
 impl ExactShapeInputs {
-    fn new(context_len: usize, query_rows: usize) -> Self {
+    fn new(shape: ExactShape, context_len: usize, query_rows: usize) -> Self {
         let logical_blocks = context_len.div_ceil(BLOCK_SIZE as usize);
 
-        // Both correctness cases below have 34 logical blocks. Forty-one is
-        // prime, so `(logical * 7 + 3) % 41` is injective while leaving seven
-        // unused physical blocks. Keep the formula general by finding an odd
-        // pool size that is coprime with seven.
+        // Leave seven physical blocks unused and choose a pool size coprime
+        // with seven so the affine mapping remains injective at every tested
+        // context length.
         let mut physical_blocks = logical_blocks + 7;
         while physical_blocks.is_multiple_of(7) {
             physical_blocks += 1;
@@ -112,12 +138,12 @@ impl ExactShapeInputs {
                 .any(|(i, &p)| i != p as usize)
         );
 
-        let logical_kv_len = context_len * NUM_KV_HEADS as usize * HEAD_SIZE as usize;
+        let logical_kv_len = context_len * shape.num_kv_heads as usize * HEAD_SIZE as usize;
         let mut logical_k = vec![0.0f32; logical_kv_len];
         let mut logical_v = vec![0.0f32; logical_kv_len];
 
         let elements_per_physical_block =
-            NUM_KV_HEADS as usize * HEAD_SIZE as usize * BLOCK_SIZE as usize;
+            shape.num_kv_heads as usize * HEAD_SIZE as usize * BLOCK_SIZE as usize;
         // Poison every unused slot. If the kernel ignores the block table or
         // reads beyond the partial tail, the result diverges dramatically.
         let poison = f32_to_bf16_bits(37.0);
@@ -128,10 +154,10 @@ impl ExactShapeInputs {
             let logical_block = token / BLOCK_SIZE as usize;
             let block_offset = token % BLOCK_SIZE as usize;
             let physical_block = block_table[logical_block] as usize;
-            for kv_head in 0..NUM_KV_HEADS as usize {
+            for kv_head in 0..shape.num_kv_heads as usize {
                 for dim in 0..HEAD_SIZE as usize {
                     let logical_idx =
-                        (token * NUM_KV_HEADS as usize + kv_head) * HEAD_SIZE as usize + dim;
+                        (token * shape.num_kv_heads as usize + kv_head) * HEAD_SIZE as usize + dim;
                     let k = synthetic_k(token, kv_head, dim);
                     let v = synthetic_v(token, kv_head, dim);
                     logical_k[logical_idx] = k;
@@ -154,11 +180,11 @@ impl ExactShapeInputs {
             }
         }
 
-        let q_len = query_rows * NUM_HEADS as usize * HEAD_SIZE as usize;
+        let q_len = query_rows * shape.num_heads as usize * HEAD_SIZE as usize;
         let mut q_f32 = Vec::with_capacity(q_len);
         let mut q_bf16 = Vec::with_capacity(q_len);
         for row in 0..query_rows {
-            for head in 0..NUM_HEADS as usize {
+            for head in 0..shape.num_heads as usize {
                 for dim in 0..HEAD_SIZE as usize {
                     let q = synthetic_q(row, head, dim);
                     q_f32.push(q);
@@ -168,6 +194,7 @@ impl ExactShapeInputs {
         }
 
         Self {
+            shape,
             context_len,
             block_table,
             q_bf16,
@@ -180,7 +207,9 @@ impl ExactShapeInputs {
     }
 
     fn host_reference(&self, query_rows: usize, sliding_window: i32) -> Vec<f32> {
-        let mut output = vec![0.0f32; query_rows * NUM_HEADS as usize * HEAD_SIZE as usize];
+        let mut output =
+            vec![0.0f32; query_rows * self.shape.num_heads as usize * HEAD_SIZE as usize];
+        let gqa_factor = (self.shape.num_heads / self.shape.num_kv_heads) as usize;
 
         for row in 0..query_rows {
             let effective_context = self.context_len - query_rows + row + 1;
@@ -190,13 +219,14 @@ impl ExactShapeInputs {
                 0
             };
 
-            for head in 0..NUM_HEADS as usize {
-                let kv_head = head / GQA_FACTOR;
-                let q_start = (row * NUM_HEADS as usize + head) * HEAD_SIZE as usize;
+            for head in 0..self.shape.num_heads as usize {
+                let kv_head = head / gqa_factor;
+                let q_start = (row * self.shape.num_heads as usize + head) * HEAD_SIZE as usize;
                 let q = &self.q_f32[q_start..q_start + HEAD_SIZE as usize];
                 let mut scores = Vec::with_capacity(effective_context - lower);
                 for token in lower..effective_context {
-                    let kv_start = (token * NUM_KV_HEADS as usize + kv_head) * HEAD_SIZE as usize;
+                    let kv_start =
+                        (token * self.shape.num_kv_heads as usize + kv_head) * HEAD_SIZE as usize;
                     let k = &self.logical_k[kv_start..kv_start + HEAD_SIZE as usize];
                     let dot = q.iter().zip(k).map(|(&qv, &kv)| qv * kv).sum::<f32>();
                     scores.push(dot * SCALE);
@@ -213,13 +243,14 @@ impl ExactShapeInputs {
                     *score *= inv_sum;
                 }
 
-                let out_start = (row * NUM_HEADS as usize + head) * HEAD_SIZE as usize;
+                let out_start = (row * self.shape.num_heads as usize + head) * HEAD_SIZE as usize;
                 for dim in 0..HEAD_SIZE as usize {
                     let mut acc = 0.0f32;
                     for (weight_idx, &weight) in scores.iter().enumerate() {
                         let token = lower + weight_idx;
-                        let v_idx =
-                            (token * NUM_KV_HEADS as usize + kv_head) * HEAD_SIZE as usize + dim;
+                        let v_idx = (token * self.shape.num_kv_heads as usize + kv_head)
+                            * HEAD_SIZE as usize
+                            + dim;
                         acc += weight * self.logical_v[v_idx];
                     }
                     output[out_start + dim] = acc;
@@ -277,10 +308,10 @@ impl MetalInputs {
     }
 }
 
-fn common_strides() -> (i32, i32, i32) {
+fn common_strides(num_heads: u32, num_kv_heads: u32) -> (i32, i32, i32) {
     (
-        (NUM_HEADS * HEAD_SIZE) as i32,
-        (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32,
+        (num_heads * HEAD_SIZE) as i32,
+        (num_kv_heads * HEAD_SIZE * BLOCK_SIZE) as i32,
         (HEAD_SIZE * BLOCK_SIZE) as i32,
     )
 }
@@ -306,11 +337,12 @@ fn dispatch_decode(
     sliding_window: i32,
 ) -> (Vec<f32>, bool) {
     let metal = MetalInputs::new(state, inputs);
-    let (q_stride, kv_block_stride, kv_head_stride) = common_strides();
+    let (q_stride, kv_block_stride, kv_head_stride) =
+        common_strides(inputs.shape.num_heads, inputs.shape.num_kv_heads);
     let params = PagedAttentionParams {
         num_seqs: NUM_SEQS,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
+        num_heads: inputs.shape.num_heads,
+        num_kv_heads: inputs.shape.num_kv_heads,
         head_size: HEAD_SIZE,
         block_size: BLOCK_SIZE,
         max_seq_len: inputs.context_len as u32,
@@ -346,7 +378,7 @@ fn dispatch_decode(
         read_bf16_output(
             state,
             &output.buffer,
-            NUM_HEADS as usize * HEAD_SIZE as usize,
+            inputs.shape.num_heads as usize * HEAD_SIZE as usize,
         ),
         used_grouped,
     )
@@ -364,12 +396,13 @@ fn dispatch_varlen_two_rows(
         std::mem::size_of_val(cu_seqlens.as_slice()) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let (q_stride, kv_block_stride, kv_head_stride) = common_strides();
+    let (q_stride, kv_block_stride, kv_head_stride) =
+        common_strides(inputs.shape.num_heads, inputs.shape.num_kv_heads);
     let params = PagedAttentionVarlenParams {
         num_seqs: NUM_SEQS,
         total_queries: 2,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
+        num_heads: inputs.shape.num_heads,
+        num_kv_heads: inputs.shape.num_kv_heads,
         head_size: HEAD_SIZE,
         block_size: BLOCK_SIZE,
         max_seq_len: inputs.context_len as u32,
@@ -406,17 +439,23 @@ fn dispatch_varlen_two_rows(
         read_bf16_output(
             state,
             &output.buffer,
-            2 * NUM_HEADS as usize * HEAD_SIZE as usize,
+            2 * inputs.shape.num_heads as usize * HEAD_SIZE as usize,
         ),
         used_grouped,
     )
 }
 
-fn assert_matches_host(label: &str, actual: &[f32], expected: &[f32]) {
+fn assert_matches_host(label: &str, num_heads: u32, actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len());
     let mut worst = (0.0f32, 0usize);
     for (index, (&actual_value, &expected_value)) in actual.iter().zip(expected).enumerate() {
         let diff = (actual_value - expected_value).abs();
+        if !actual_value.is_finite() || !diff.is_finite() {
+            panic!(
+                "{label}: non-finite output at flat index {index}: actual={actual_value}, \
+                 expected={expected_value}, abs_diff={diff}"
+            );
+        }
         if diff > worst.0 {
             worst = (diff, index);
         }
@@ -431,8 +470,8 @@ fn assert_matches_host(label: &str, actual: &[f32], expected: &[f32]) {
         "{label}: worst mismatch at flat index {} (row={}, head={}, dim={}): actual={}, \
          expected={}, abs_diff={} > {}",
         worst.1,
-        worst.1 / (NUM_HEADS as usize * HEAD_SIZE as usize),
-        (worst.1 / HEAD_SIZE as usize) % NUM_HEADS as usize,
+        worst.1 / (num_heads as usize * HEAD_SIZE as usize),
+        (worst.1 / HEAD_SIZE as usize) % num_heads as usize,
         worst.1 % HEAD_SIZE as usize,
         actual[worst.1],
         expected[worst.1],
@@ -452,41 +491,57 @@ fn grouped_qwen35_decode_and_varlen_match_host_reference() {
         Err(error) => panic!("unexpected MetalState::get failure: {error}"),
     };
 
-    // 16,385 selects the q_len=1 grouped path (S=256) and ends one token into
-    // a physical block. Scope each large exact-shape pool so q1 and q2 never
-    // coexist in memory.
-    {
-        let decode_inputs = ExactShapeInputs::new(16_385, 1);
-        let decode_expected = decode_inputs.host_reference(1, 73);
-        let (decode_actual, used_grouped) = dispatch_decode(state, &decode_inputs, 73);
+    for shape in EXACT_SHAPES {
+        // Each q_len=1 context is one token past its measured grouped-route
+        // threshold and one token into a physical block. Scope every large
+        // pool so no two exact-shape fixtures coexist in memory.
+        {
+            let decode_inputs = ExactShapeInputs::new(shape, shape.decode_context_len, 1);
+            let decode_expected = decode_inputs.host_reference(1, 73);
+            let (decode_actual, used_grouped) = dispatch_decode(state, &decode_inputs, 73);
+            assert!(
+                used_grouped,
+                "{} q_len=1 parity silently used the generic V2 route",
+                shape.label
+            );
+            assert_matches_host(
+                &format!("{} q_len=1 sliding decode", shape.label),
+                shape.num_heads,
+                &decode_actual,
+                &decode_expected,
+            );
+        }
+
+        // The q_len=2 context is two tokens past its route threshold. Row 0
+        // and row 1 have distinct causal tails; the same bounded window still
+        // crosses several physical pages.
+        let varlen_inputs = ExactShapeInputs::new(shape, shape.varlen_context_len, 2);
+        let varlen_expected = varlen_inputs.host_reference(2, 73);
+        let (varlen_actual, used_grouped) = dispatch_varlen_two_rows(state, &varlen_inputs, 73);
         assert!(
             used_grouped,
-            "q_len=1 parity silently used the generic V2 route"
+            "{} q_len=2 parity silently used the generic V2 route",
+            shape.label
         );
-        assert_matches_host("q_len=1 sliding decode", &decode_actual, &decode_expected);
+        assert_matches_host(
+            &format!("{} q_len=2 causal varlen", shape.label),
+            shape.num_heads,
+            &varlen_actual,
+            &varlen_expected,
+        );
+
+        let row_size = shape.num_heads as usize * HEAD_SIZE as usize;
+        let row_difference = varlen_actual[..row_size]
+            .iter()
+            .zip(&varlen_actual[row_size..])
+            .map(|(&left, &right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            row_difference > 1.0e-3,
+            "{} causal rows unexpectedly produced identical output",
+            shape.label
+        );
     }
-
-    // 8,194 selects q_len=2 (S=128). Row 0 and row 1 have distinct causal
-    // tails; the same bounded window still crosses several physical pages.
-    let varlen_inputs = ExactShapeInputs::new(8_194, 2);
-    let varlen_expected = varlen_inputs.host_reference(2, 73);
-    let (varlen_actual, used_grouped) = dispatch_varlen_two_rows(state, &varlen_inputs, 73);
-    assert!(
-        used_grouped,
-        "q_len=2 parity silently used the generic V2 route"
-    );
-    assert_matches_host("q_len=2 causal varlen", &varlen_actual, &varlen_expected);
-
-    let row_size = NUM_HEADS as usize * HEAD_SIZE as usize;
-    let row_difference = varlen_actual[..row_size]
-        .iter()
-        .zip(&varlen_actual[row_size..])
-        .map(|(&left, &right)| (left - right).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        row_difference > 1.0e-3,
-        "the two causal rows unexpectedly produced identical output"
-    );
 }
 
 fn full_context_block_numerator(logical_block: usize) -> i32 {
@@ -660,7 +715,7 @@ fn run_full_context_stage1_case(state: &MetalState, context_len: usize) {
         ptr: q.as_ptr() as *mut c_void,
         offset: 0,
     };
-    let (q_stride, kv_block_stride, kv_head_stride) = common_strides();
+    let (q_stride, kv_block_stride, kv_head_stride) = common_strides(NUM_HEADS, NUM_KV_HEADS);
     let params = PagedAttentionParams {
         num_seqs: NUM_SEQS,
         num_heads: NUM_HEADS,
@@ -793,7 +848,7 @@ fn benchmark_context(state: &MetalState, context_len: u32) {
         ptr: q.as_ptr() as *mut c_void,
         offset: 0,
     };
-    let (q_stride, kv_block_stride, kv_head_stride) = common_strides();
+    let (q_stride, kv_block_stride, kv_head_stride) = common_strides(NUM_HEADS, NUM_KV_HEADS);
 
     let decode_params = PagedAttentionParams {
         num_seqs: 1,
